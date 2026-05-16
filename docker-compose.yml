@@ -1,0 +1,25 @@
+services:
+  syncsage:
+    image: ghcr.io/syncsage/syncsage:latest
+    container_name: syncsage
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      SYNCSAGE_CONFIG: /config/syncsage.yaml
+    volumes:
+      - ./syncsage.yaml:/config/syncsage.yaml:ro
+      - ~/projects:/workspace:ro
+      - ~/SyncSageVault:/vault
+      - syncsage-state:/state
+      - syncsage-exports:/exports
+    healthcheck:
+      test: ["CMD", "python", "-m", "syncsage", "healthcheck", "--url", "http://localhost:8765/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  syncsage-state:
+  syncsage-exports:

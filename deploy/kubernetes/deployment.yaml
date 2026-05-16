@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: syncsage
+  namespace: syncsage
+  labels:
+    app.kubernetes.io/name: syncsage
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: syncsage
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: syncsage
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: syncsage
+          image: ghcr.io/syncsage/syncsage:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8765
+          env:
+            - name: SYNCSAGE_CONFIG
+              value: /config/syncsage.yaml
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: state
+              mountPath: /state
+            - name: vault
+              mountPath: /vault
+            - name: workspace
+              mountPath: /workspace
+              readOnly: true
+            - name: exports
+              mountPath: /exports
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: config
+          configMap:
+            name: syncsage-config
+        - name: state
+          persistentVolumeClaim:
+            claimName: syncsage-state
+        - name: vault
+          persistentVolumeClaim:
+            claimName: syncsage-vault
+        - name: workspace
+          emptyDir: {}
+        - name: exports
+          emptyDir: {}

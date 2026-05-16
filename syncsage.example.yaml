@@ -1,0 +1,201 @@
+syncsage:
+  name: local-syncsage
+  description: Lightweight MCP knowledge graph and retrieval server
+  environment: local
+  log_level: INFO
+  state_path: /state
+  vault_path: /vault
+  workspace_root: /workspace
+  exports_path: /exports
+
+server:
+  host: 0.0.0.0
+  port: 8765
+  mcp:
+    enabled: true
+    transports:
+      stdio: true
+      streamable_http: true
+      sse: false
+  api:
+    enabled: true
+    openapi: true
+  ui:
+    enabled: true
+    graph_visualization: true
+
+storage:
+  graph_format: node_link_json
+  graph_snapshot_interval_seconds: 900
+  sqlite_path: /state/syncsage.db
+  graph_path: /state/graphs
+  manifest_path: /state/manifests
+  max_state_size_gb: 10
+  compression:
+    enabled: true
+    algorithm: zstd
+  retention:
+    keep_snapshots: 10
+    keep_event_days: 30
+
+search:
+  default_mode: hybrid
+  keyword:
+    enabled: true
+    engine: sqlite_fts5
+  embeddings:
+    enabled: false
+    provider: local
+    model: sentence-transformers/all-MiniLM-L6-v2
+  vector_store:
+    enabled: false
+    engine: chroma
+    path: /state/vector
+  ranking:
+    prefer_exact_path_matches: true
+    prefer_recent_commits: true
+    graph_neighbor_boost: true
+    max_results_default: 10
+
+sync:
+  startup:
+    full_validation: true
+    repair_missing_indexes: true
+  watcher:
+    enabled: true
+    max_watch_paths: 100
+    debounce_ms: 1500
+    batch_window_ms: 5000
+  git:
+    enabled: true
+    detect_commit_changes: true
+    detect_branch_switch: true
+    reindex_on_commit: true
+    reindex_on_branch_switch: validate_only
+  scheduler:
+    enabled: true
+    interval_seconds: 900
+  idempotency:
+    hash_algorithm: sha256
+    compare_size_mtime_hash: true
+    skip_unchanged_files: true
+  concurrency:
+    max_parallel_sources: 4
+    max_parallel_files: 8
+    lock_timeout_seconds: 120
+
+obsidian:
+  enabled: true
+  write_mode: upsert
+  note_root: SyncSage
+  create_index_notes: true
+  create_source_notes: true
+  create_file_notes: true
+  create_chunk_notes: false
+  create_canvas: true
+  frontmatter:
+    include_source_id: true
+    include_hash: true
+    include_last_indexed: true
+    include_graph_node_id: true
+  backlinks:
+    enabled: true
+    style: wikilink
+  tags:
+    base:
+      - syncsage
+    by_source_type: true
+
+security:
+  allow_workspace_roots:
+    - /workspace
+    - /vault
+  read_only_sources: true
+  deny_path_traversal: true
+  default_exclude_secrets: true
+
+sources:
+  - name: syncsage-codebase
+    type: repository
+    path: /workspace/syncsage
+    description: SyncSage project repository
+    enabled: true
+    include:
+      - "**/*.py"
+      - "**/*.md"
+      - "**/*.yaml"
+      - "**/*.yml"
+      - "**/*.toml"
+      - "**/Dockerfile"
+    exclude:
+      - "**/.git/**"
+      - "**/.env"
+      - "**/.env.*"
+      - "**/*id_rsa*"
+      - "**/*id_ed25519*"
+      - "**/*.pem"
+      - "**/*.key"
+      - "**/__pycache__/**"
+      - "**/.venv/**"
+      - "**/node_modules/**"
+      - "**/dist/**"
+      - "**/build/**"
+    repo:
+      branch_policy: current
+      include_uncommitted: true
+      commit_trigger: true
+      dependency_graph:
+        enabled: true
+        languages:
+          python: true
+          javascript: false
+          typescript: false
+    chunking:
+      strategy: semantic
+      max_chars: 4000
+      overlap_chars: 400
+    sync:
+      on_startup: true
+      on_file_change: debounce
+      on_git_commit: true
+      interval_seconds: 900
+
+  - name: architecture-vault
+    type: obsidian_vault
+    path: /vault
+    enabled: true
+    include:
+      - "**/*.md"
+      - "**/*.canvas"
+    exclude:
+      - "**/.obsidian/**"
+      - "**/.trash/**"
+    sync:
+      on_startup: true
+      on_file_change: debounce
+
+  - name: documents
+    type: document_folder
+    path: /workspace/documents
+    enabled: true
+    include:
+      - "**/*.pdf"
+      - "**/*.docx"
+      - "**/*.txt"
+      - "**/*.md"
+      - "**/*.html"
+      - "**/*.xml"
+    exclude:
+      - "**/~$*"
+      - "**/.git/**"
+      - "**/.env*"
+      - "**/*.pem"
+      - "**/*.key"
+    chunking:
+      strategy: heading_or_page
+      max_chars: 5000
+      overlap_chars: 500
+    sync:
+      on_startup: true
+      on_file_change: debounce
+      interval_seconds: 3600

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: syncsage
+  namespace: syncsage
+  labels:
+    app.kubernetes.io/name: syncsage
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: syncsage
+  ports:
+    - name: http
+      port: 8765
+      targetPort: http

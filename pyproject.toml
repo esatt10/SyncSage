@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "syncsage"
+version = "0.1.0"
+description = "Docker-first MCP knowledge graph indexer and agentic retrieval layer"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "SyncSage Contributors" }]
+dependencies = [
+  "fastapi>=0.111",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.7",
+  "PyYAML>=6.0",
+  "networkx>=3.3",
+  "typer>=0.12",
+  "watchdog>=4.0",
+  "markdown-it-py>=3.0",
+  "beautifulsoup4>=4.12",
+  "python-docx>=1.1",
+  "pymupdf>=1.24",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2"]
+dev = ["pytest>=8.2", "pytest-asyncio>=0.23", "httpx>=0.27", "ruff>=0.5"]
+
+[project.scripts]
+syncsage = "syncsage.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/syncsage"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]
