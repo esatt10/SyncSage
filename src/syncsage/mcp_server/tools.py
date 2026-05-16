@@ -1,0 +1,72 @@
+from __future__ import annotations
+
+from syncsage.config.schema import SyncSageConfig
+from syncsage.obsidian.exporter import ObsidianExporter
+from syncsage.persistence.paths import StatePaths
+from syncsage.persistence.state_store import StateStore
+from syncsage.registry.knowledge_base_registry import KnowledgeBaseRegistry
+from syncsage.search.hybrid import HybridSearch
+from syncsage.search.sqlite_store import SearchStore
+from syncsage.sync.engine import SyncEngine
+
+
+class SyncSageTools:
+    def __init__(self, config: SyncSageConfig):
+        self.config = config
+        self.paths = StatePaths.from_config(config)
+        self.paths.ensure()
+        self.state = StateStore(self.paths.sqlite)
+        self.state.migrate()
+        self.engine = SyncEngine(config, self.paths, self.state)
+        self.searcher = HybridSearch(SearchStore(self.state))
+
+    def list_knowledge_bases(self) -> dict:
+        return {"knowledge_bases": KnowledgeBaseRegistry(self.state).list()}
+
+    def sync_source(self, knowledge_base: str, source_name: str, mode: str = "incremental") -> dict:
+        return self.engine.sync_source(source_name, mode).__dict__  # type: ignore[arg-type]
+
+    def sync_all(self, knowledge_base: str, mode: str = "incremental") -> dict:
+        return {"results": [r.__dict__ for r in self.engine.sync_all(mode)]}  # type: ignore[arg-type]
+
+    def search_context(self, knowledge_base: str, query: str, mode: str = "hybrid", max_results: int = 10, include_chunks: bool = True, include_graph_neighbors: bool = True) -> dict:
+        return self.searcher.search_context(knowledge_base or self.config.knowledge_base_id, query, mode, max_results)
+
+    def get_relevant_files(self, knowledge_base: str, task: str, source_name: str | None = None, max_files: int = 8) -> dict:
+        payload = self.searcher.search_context(knowledge_base or self.config.knowledge_base_id, task, "hybrid", max_files, source_name)
+        return {"files": payload["results"]}
+
+    def get_graph_neighbors(self, knowledge_base: str, node_id: str, depth: int = 1, edge_types: list[str] | None = None) -> dict:
+        graph = self.engine.graph_builder.graph
+        if node_id not in graph:
+            return {"node_id": node_id, "neighbors": []}
+        neighbors = []
+        for target in graph.neighbors(node_id):
+            edge_data = graph.get_edge_data(node_id, target, default={})
+            types = [data.get("type") for data in edge_data.values()]
+            if edge_types and not set(types).intersection(edge_types):
+                continue
+            neighbors.append({"node_id": target, "edge_types": types, "node": dict(graph.nodes[target])})
+        return {"node_id": node_id, "depth": depth, "neighbors": neighbors}
+
+    def get_file_summary(self, knowledge_base: str, path: str, source_name: str | None = None) -> dict:
+        rows = self.state.rows("""SELECT artifacts.*, GROUP_CONCAT(chunks.summary, '\n') AS summary FROM artifacts
+        LEFT JOIN chunks ON chunks.artifact_id=artifacts.id WHERE artifacts.relative_path=? AND (? IS NULL OR artifacts.source_id=?) GROUP BY artifacts.id LIMIT 1""", (path, source_name, source_name))
+        return dict(rows[0]) if rows else {"path": path, "summary": None}
+
+    def get_repo_map(self, knowledge_base: str, source_name: str, depth: int = 3) -> dict:
+        rows = self.state.rows("SELECT relative_path,type,size_bytes FROM artifacts WHERE source_id=? ORDER BY relative_path", (source_name,))
+        return {"source_name": source_name, "files": [dict(row) for row in rows]}
+
+    def explain_node(self, knowledge_base: str, node_id: str) -> dict:
+        graph = self.engine.graph_builder.graph
+        if node_id not in graph:
+            return {"node_id": node_id, "explanation": "Node is not present in the current graph."}
+        node = dict(graph.nodes[node_id])
+        return {"node_id": node_id, "type": node.get("type"), "label": node.get("label"), "explanation": f"{node.get('label')} is a {node.get('type')} node indexed by SyncSage.", "provenance": node.get("provenance")}
+
+    def export_obsidian_notes(self, knowledge_base: str, source_name: str | None = None, scope: str = "knowledge_base") -> dict:
+        return ObsidianExporter(self.config, self.state).export(source_name)
+
+    def get_sync_status(self, knowledge_base: str) -> dict:
+        return {"sources": [dict(row) for row in self.state.rows("SELECT name,last_status,last_indexed_at FROM sources ORDER BY name")]}

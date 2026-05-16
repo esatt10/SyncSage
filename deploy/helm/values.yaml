@@ -1,0 +1,73 @@
+image:
+  repository: ghcr.io/syncsage/syncsage
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 8765
+
+config:
+  syncsageYaml: |
+    syncsage:
+      name: helm-syncsage
+      environment: kubernetes
+      state_path: /state
+      vault_path: /vault
+      workspace_root: /workspace
+      exports_path: /exports
+    server:
+      host: 0.0.0.0
+      port: 8765
+      mcp:
+        enabled: true
+        transports:
+          streamable_http: true
+      api:
+        enabled: true
+    storage:
+      sqlite_path: /state/syncsage.db
+      graph_path: /state/graphs
+      manifest_path: /state/manifests
+    search:
+      default_mode: hybrid
+    sync:
+      startup:
+        full_validation: true
+      scheduler:
+        enabled: true
+        interval_seconds: 900
+    obsidian:
+      enabled: true
+      note_root: SyncSage
+    sources: []
+
+persistence:
+  state:
+    enabled: true
+    size: 10Gi
+  vault:
+    enabled: true
+    size: 5Gi
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL

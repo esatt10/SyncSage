@@ -1,0 +1,1 @@
+"""SyncSage acceptance test package."""
