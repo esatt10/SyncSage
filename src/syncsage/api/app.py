@@ -16,6 +16,7 @@ from syncsage.registry.source_registry import SourceRegistry
 from syncsage.search.hybrid import HybridSearch
 from syncsage.search.sqlite_store import SearchStore
 from syncsage.sync.engine import SyncEngine
+from syncsage.version import __version__
 
 
 class SearchRequest(BaseModel):
@@ -42,7 +43,7 @@ def create_app(config: SyncSageConfig | None = None, config_path: str | Path | N
     SourceRegistry(config, state).initialize()
     engine = SyncEngine(config, paths, state)
     search = HybridSearch(SearchStore(state))
-    app = FastAPI(title="SyncSage", version="0.1.0")
+    app = FastAPI(title="SyncSage", version=__version__)
     app.state.config = config
     app.state.state = state
     app.state.engine = engine

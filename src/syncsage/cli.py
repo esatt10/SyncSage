@@ -3,13 +3,13 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from syncsage.config.loader import load_config, validate_source_paths
-from syncsage.persistence.paths import StatePaths
-from syncsage.persistence.state_store import StateStore
-from syncsage.sync.engine import SyncEngine
 
+def _engine(config_path: Path):
+    from syncsage.config.loader import load_config
+    from syncsage.persistence.paths import StatePaths
+    from syncsage.persistence.state_store import StateStore
+    from syncsage.sync.engine import SyncEngine
 
-def _engine(config_path: Path) -> SyncEngine:
     cfg = load_config(config_path)
     paths = StatePaths.from_config(cfg)
     paths.ensure()
@@ -40,14 +40,19 @@ def main(argv: list[str] | None = None) -> int:
     vscode_p.add_argument("--mode", choices=("docker-exec", "docker-run"), default="docker-exec")
     vscode_p.add_argument("--server-name", default="syncsage")
     vscode_p.add_argument("--container-name", default="syncsage")
-    vscode_p.add_argument("--image", default="ghcr.io/esatt10/syncsage:latest")
+    vscode_p.add_argument("--image")
     vscode_p.add_argument("--output", "-o")
+    compose_env_p = sub.add_parser("compose-env")
+    compose_env_p.add_argument("config", nargs="?", default="syncsage.yaml")
+    compose_env_p.add_argument("--output", "-o")
     repair_p = sub.add_parser("repair")
     repair_p.add_argument("--config", "-c", default="syncsage.example.yaml")
     args = parser.parse_args(argv)
     if args.command in {None, "--help"}:
         parser.print_help(); return 0
     if args.command == "validate":
+        from syncsage.config.loader import load_config, validate_source_paths
+
         cfg = load_config(Path(args.config))
         errors = validate_source_paths(cfg, require_exists=not args.no_require_paths)
         if errors:
@@ -72,11 +77,13 @@ def main(argv: list[str] | None = None) -> int:
         _engine(Path(args.config)).sync_all("full"); print("Repair complete"); return 0
     if args.command == "serve":
         from syncsage.api.app import create_app
+        from syncsage.config.loader import load_config
         import uvicorn
         cfg = load_config(Path(args.config))
         uvicorn.run(create_app(cfg), host=cfg.server.host, port=cfg.server.port)
         return 0
     if args.command == "mcp":
+        from syncsage.config.loader import load_config
         from syncsage.mcp_server.server import run_mcp_server
         cfg = load_config(Path(args.config))
         run_mcp_server(cfg, args.transport)
@@ -96,6 +103,17 @@ def main(argv: list[str] | None = None) -> int:
             else docker_run_stdio_config(args.server_name, args.image)
         )
         rendered = render_vscode_mcp_json(payload)
+        if args.output:
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+        else:
+            print(rendered, end="")
+        return 0
+    if args.command == "compose-env":
+        from syncsage.deployment.compose_env import load_compose_environment, render_env_file
+
+        rendered = render_env_file(load_compose_environment(args.config))
         if args.output:
             output_path = Path(args.output)
             output_path.parent.mkdir(parents=True, exist_ok=True)

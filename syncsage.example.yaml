@@ -1,3 +1,10 @@
+deployment:
+  compose:
+    image_repository: ghcr.io/esatt10/syncsage
+    image_tag: 0.1.0
+    workspace_path: ./workspace
+    vault_path: ./vault
+
 syncsage:
   name: local-syncsage
   description: Lightweight MCP knowledge graph and retrieval server

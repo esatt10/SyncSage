@@ -10,7 +10,7 @@ Create local config first:
 cp syncsage.example.yaml syncsage.yaml
 ```
 
-`syncsage.yaml` is ignored by git. Edit source paths so they point at container paths under `/workspace` or `/vault`.
+`syncsage.yaml` is ignored by git. Edit source paths so they point at container paths under `/workspace` or `/vault`, and edit `deployment.compose` if your host workspace or vault lives somewhere else.
 
 ```bash
 docker run --rm \
@@ -20,24 +20,24 @@ docker run --rm \
   -v "$HOME/projects:/workspace:ro" \
   -v "$HOME/SyncSageVault:/vault" \
   -v syncsage-state:/state \
-  ghcr.io/esatt10/syncsage:latest
+  ghcr.io/esatt10/syncsage:<pyproject-version>
 ```
 
 ## Docker Compose
 
 ```bash
 cp syncsage.example.yaml syncsage.yaml
-cp .env.example .env
-docker compose up -d
+syncsage compose-env syncsage.yaml --output .syncsage/compose.env
+docker compose --env-file .syncsage/compose.env up -d
 ```
 
-By default Compose mounts:
+`syncsage compose-env` renders the Docker Compose interpolation variables from the selected YAML. By default Compose mounts:
 
 | Host value | Container path | Purpose |
 |---|---|---|
-| `SYNCSAGE_CONFIG_PATH=./syncsage.yaml` | `/config/syncsage.yaml` | Runtime config, read-only. |
-| `SYNCSAGE_WORKSPACE_PATH=./workspace` | `/workspace` | Indexed repositories and documents, read-only. |
-| `SYNCSAGE_VAULT_PATH=./vault` | `/vault` | Generated Obsidian notes, read/write. |
+| selected config path | `/config/syncsage.yaml` | Runtime config, read-only. |
+| `deployment.compose.workspace_path` | `/workspace` | Indexed repositories and documents, read-only. |
+| `deployment.compose.vault_path` | `/vault` | Generated Obsidian notes, read/write. |
 | `syncsage-state` volume | `/state` | SQLite, manifests, graph snapshots. |
 | `syncsage-exports` volume | `/exports` | JSON/canvas exports. |
 
@@ -53,7 +53,8 @@ curl http://localhost:8765/ready
 For the primary VS Code workflow, start SyncSage with Compose and let VS Code attach to a foreground stdio MCP process inside the running container:
 
 ```bash
-docker compose up -d
+syncsage compose-env syncsage.yaml --output .syncsage/compose.env
+docker compose --env-file .syncsage/compose.env up -d
 docker exec -i syncsage python -m syncsage mcp --config /config/syncsage.yaml --transport stdio
 ```
 
@@ -90,19 +91,22 @@ helm template syncsage deploy/helm --namespace syncsage
 helm install syncsage deploy/helm --namespace syncsage --create-namespace
 ```
 
-The plain Kubernetes manifests and Helm defaults both pull `ghcr.io/esatt10/syncsage:latest`.
-Override the Helm image with `--set image.repository=... --set image.tag=...` when installing from a fork or a pinned release.
+The plain Kubernetes manifests and Helm defaults pin the current `pyproject.toml` version. Override the Helm image with `--set image.repository=... --set image.tag=...` when installing from a fork or a different release.
 
 ## CI and container registry
 
 The GitHub Actions workflow at `.github/workflows/container.yml` validates pull requests, builds the root `Dockerfile`, and pushes passing builds to GitHub Container Registry. The separate `.github/workflows/release-tag.yml` workflow checks release labeling without rerunning container CI on label changes.
 
 - Pull request to `main`: runs ruff correctness lint, dependency checks, source compilation, pytest on Python 3.11 and 3.12, package build, Docker Compose validation, Docker image build, and image smoke tests.
-- Pull request release labeling: exactly one PR label must match `#.#.#`, such as `1.2.3`; labels like `v1.2.3` are rejected. Adding or removing labels reruns only the release-label workflow.
-- Merged PR or direct patch to `main`: runs the same checks, then publishes `ghcr.io/esatt10/syncsage:latest` and `ghcr.io/esatt10/syncsage:sha-<commit>`.
+- Pull request release labeling: exactly one PR label must match the `pyproject.toml` version, such as `1.2.3`; labels like `v1.2.3` are rejected. Adding or removing labels reruns only the release-label workflow.
+- Merged PR or direct patch to `main`: runs the same checks, then publishes `ghcr.io/esatt10/syncsage:<pyproject version>`, `ghcr.io/esatt10/syncsage:v<pyproject version>`, `ghcr.io/esatt10/syncsage:latest`, and `ghcr.io/esatt10/syncsage:sha-<commit>`.
 - The workflow uses repository `GITHUB_TOKEN` permissions with `packages: write`.
 
-For public local installs, make the package public from the GitHub package settings after the first image is published. To block merges without a release label, require the `Release tag check` status check in branch protection for `main`.
+For public local installs, make the package public from the GitHub package settings after the first image is published. To block merges without a matching release label, require the `Release tag check` status check in branch protection for `main`.
+
+## Version alignment
+
+`pyproject.toml` is the single manual semver source. Run `python scripts/sync_version.py --bump patch`, `--bump minor`, `--bump major`, or `--set 1.2.3` to update it and refresh generated deployment defaults. CI runs `python scripts/sync_version.py --check` before publishing.
 
 ## Probes and ports
 

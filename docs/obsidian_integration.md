@@ -5,15 +5,16 @@ Obsidian is an optional human-readable projection layer. SyncSage does not requi
 ## Connect Obsidian
 
 1. Pick a host folder for the managed vault, for example `./vault` in the repository or another folder outside the repo.
-2. Set `SYNCSAGE_VAULT_PATH` in `.env` to that host folder.
+2. Set `deployment.compose.vault_path` in `syncsage.yaml` to that host folder.
 3. Keep `syncsage.vault_path: /vault` and `obsidian.note_root: SyncSage` in `syncsage.yaml`.
 4. Start SyncSage:
 
    ```bash
-   docker compose up -d
+   syncsage compose-env syncsage.yaml --output .syncsage/compose.env
+   docker compose --env-file .syncsage/compose.env up -d
    ```
 
-5. In Obsidian desktop, open the host folder from `SYNCSAGE_VAULT_PATH` as a vault.
+5. In Obsidian desktop, open the host folder from `deployment.compose.vault_path` as a vault.
 6. Export notes after indexing:
 
    ```bash

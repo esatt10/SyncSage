@@ -13,7 +13,8 @@ syncsage mcp --config /config/syncsage.yaml --transport stdio
 For VS Code, keep SyncSage running with Docker Compose and let VS Code start the MCP protocol process inside that container:
 
 ```bash
-docker compose up -d
+syncsage compose-env syncsage.yaml --output .syncsage/compose.env
+docker compose --env-file .syncsage/compose.env up -d
 docker exec -i syncsage python -m syncsage mcp --config /config/syncsage.yaml --transport stdio
 ```
 
