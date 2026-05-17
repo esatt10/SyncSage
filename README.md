@@ -54,8 +54,8 @@ The compose file mounts `./syncsage.yaml` into `/config/syncsage.yaml`, `~/proje
 The repository validates pull requests and publishes the Docker image with the workflow in `.github/workflows/container.yml`.
 
 - Pull requests to `main` run ruff correctness lint, dependency checks, source compilation, pytest on Python 3.11 and 3.12, package build, Docker Compose validation, Docker image build, and image smoke tests.
-- Pushes to `main` run the same checks, then publish `ghcr.io/esatt10/syncsage:latest` and a `sha-<commit>` tag.
-- Version tags like `v0.1.0` publish a matching GHCR image tag.
+- Pull requests must have exactly one release label matching `#.#.#`, such as `1.2.3`; labels like `v1.2.3` are rejected.
+- Merged PRs and direct patches to `main` run the same checks, then publish `ghcr.io/esatt10/syncsage:latest` and a `sha-<commit>` tag.
 - The workflow uses `GITHUB_TOKEN` with `packages: write`; no separate registry secret is required for this repository.
 
 After the first workflow run, set the package visibility in GitHub Packages if the image should be publicly pullable without authentication.
