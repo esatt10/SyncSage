@@ -209,6 +209,17 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# SyncSage local runtime/config
+syncsage.yaml
+syncsage.local.yaml
+syncsage.*.local.yaml
+.vscode/mcp.json
+.syncsage/
+workspace/
+state/
+vault/
+exports/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

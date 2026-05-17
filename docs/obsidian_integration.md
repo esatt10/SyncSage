@@ -2,6 +2,28 @@
 
 Obsidian is an optional human-readable projection layer. SyncSage does not require the Obsidian app or plugins at runtime.
 
+## Connect Obsidian
+
+1. Pick a host folder for the managed vault, for example `./vault` in the repository or another folder outside the repo.
+2. Set `SYNCSAGE_VAULT_PATH` in `.env` to that host folder.
+3. Keep `syncsage.vault_path: /vault` and `obsidian.note_root: SyncSage` in `syncsage.yaml`.
+4. Start SyncSage:
+
+   ```bash
+   docker compose up -d
+   ```
+
+5. In Obsidian desktop, open the host folder from `SYNCSAGE_VAULT_PATH` as a vault.
+6. Export notes after indexing:
+
+   ```bash
+   curl -X POST http://localhost:8765/obsidian/export
+   ```
+
+   Or call the MCP tool `export_obsidian_notes` from VS Code.
+
+SyncSage owns the generated `SyncSage/` folder inside the vault. User-authored notes can live outside that folder. If you also want SyncSage to index an existing Obsidian vault, mount that vault under `/workspace` and add it as an `obsidian_vault` source; do not point that source at the generated `/vault/SyncSage` output unless you intentionally want to index generated notes.
+
 ## Default vault layout
 
 ```text

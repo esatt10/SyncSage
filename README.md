@@ -16,21 +16,19 @@ SyncSage is a lightweight, Docker-first MCP knowledge graph server for indexing 
 
    ```bash
    cp syncsage.example.yaml syncsage.yaml
+   cp .env.example .env
    ```
 
-2. Edit source paths in `syncsage.yaml` so they match folders mounted into `/workspace`, `/vault`, and `/state`.
+2. Edit `syncsage.yaml` and `.env` for your machine:
+
+   - `SYNCSAGE_WORKSPACE_PATH` is mounted read-only at `/workspace`.
+   - `SYNCSAGE_VAULT_PATH` is mounted read/write at `/vault` for generated Obsidian notes.
+   - Source paths in `syncsage.yaml` should use container paths such as `/workspace/repository`.
 
 3. Run the container:
 
    ```bash
-   docker run --rm \
-     --name syncsage \
-     -p 8765:8765 \
-     -v "$PWD/syncsage.yaml:/config/syncsage.yaml:ro" \
-     -v "$HOME/projects:/workspace" \
-     -v "$HOME/SyncSageVault:/vault" \
-     -v syncsage-state:/state \
-     ghcr.io/esatt10/syncsage:latest
+   docker compose up -d
    ```
 
 4. Check health endpoints:
@@ -40,14 +38,45 @@ SyncSage is a lightweight, Docker-first MCP knowledge graph server for indexing 
    curl http://localhost:8765/ready
    ```
 
+`syncsage.yaml`, `.env`, `.vscode/mcp.json`, local state, and local vault output are ignored by git. Commit `syncsage.example.yaml`, `.env.example`, and files under `examples/` or `docs/` when you want to share a generalized setup.
+
 ## Docker Compose
 
 ```bash
 cp syncsage.example.yaml syncsage.yaml
-docker compose up
+cp .env.example .env
+docker compose up -d
 ```
 
-The compose file mounts `./syncsage.yaml` into `/config/syncsage.yaml`, `~/projects` into `/workspace`, and `~/SyncSageVault` into `/vault`.
+The compose file mounts `./syncsage.yaml` into `/config/syncsage.yaml`, `./workspace` into `/workspace`, and `./vault` into `/vault` by default. Change those host paths in `.env`.
+
+## VS Code MCP Client
+
+The primary client setup is VS Code connected to the MCP server running inside the SyncSage Docker container.
+
+1. Start the container:
+
+   ```bash
+   docker compose up -d
+   ```
+
+2. Generate or copy the VS Code MCP config:
+
+   ```bash
+   syncsage client-config vscode --output .vscode/mcp.json
+   ```
+
+   If the local CLI is not installed, copy `examples/vscode/mcp.json` to `.vscode/mcp.json`.
+
+3. In VS Code, run `MCP: List Servers`, start `syncsage`, and enable the tools in Agent mode.
+
+The generated config uses `docker exec -i syncsage python -m syncsage mcp --config /config/syncsage.yaml --transport stdio`. Keep the compose container name as `syncsage`, or regenerate the config with `--container-name`.
+
+For a one-off foreground MCP server without the API container:
+
+```bash
+syncsage client-config vscode --mode docker-run --output .vscode/mcp.json
+```
 
 ## Publishing the container image
 
@@ -75,7 +104,13 @@ See [docs/configuration.md](docs/configuration.md) for details.
 
 ## MCP interface
 
-The intended agent-facing tools are:
+The MCP server runs with:
+
+```bash
+docker exec -i syncsage python -m syncsage mcp --config /config/syncsage.yaml --transport stdio
+```
+
+The agent-facing tools are:
 
 - `list_knowledge_bases`
 - `register_source`
@@ -91,6 +126,10 @@ The intended agent-facing tools are:
 - `get_sync_status`
 
 Every retrieval response should include provenance such as source ID, path, branch/commit when available, timestamps, and reason/confidence metadata. See [docs/mcp_tools.md](docs/mcp_tools.md).
+
+## Obsidian Workflow
+
+SyncSage writes generated Markdown into the mounted `/vault` path, under `SyncSage/` by default. Open the host folder from `SYNCSAGE_VAULT_PATH` as an Obsidian vault. After indexing, call the MCP tool `export_obsidian_notes` or the API endpoint `POST /obsidian/export` to update the managed notes.
 
 ## Deployment paths
 
@@ -108,6 +147,7 @@ See [docs/deployment.md](docs/deployment.md).
 - [Configuration](docs/configuration.md)
 - [Graph model](docs/graph_model.md)
 - [MCP tools](docs/mcp_tools.md)
+- [MCP client setup](docs/mcp_client.md)
 - [Deployment](docs/deployment.md)
 - [Agentic workflows](docs/agentic_workflows.md)
 - [Obsidian integration](docs/obsidian_integration.md)

@@ -1,6 +1,6 @@
 services:
   syncsage:
-    image: ghcr.io/esatt10/syncsage:latest
+    image: ${SYNCSAGE_IMAGE:-ghcr.io/esatt10/syncsage:latest}
     container_name: syncsage
     restart: unless-stopped
     ports:
@@ -8,9 +8,9 @@ services:
     environment:
       SYNCSAGE_CONFIG: /config/syncsage.yaml
     volumes:
-      - ./syncsage.yaml:/config/syncsage.yaml:ro
-      - ~/projects:/workspace:ro
-      - ~/SyncSageVault:/vault
+      - ${SYNCSAGE_CONFIG_PATH:-./syncsage.yaml}:/config/syncsage.yaml:ro
+      - ${SYNCSAGE_WORKSPACE_PATH:-./workspace}:/workspace:ro
+      - ${SYNCSAGE_VAULT_PATH:-./vault}:/vault
       - syncsage-state:/state
       - syncsage-exports:/exports
     healthcheck:

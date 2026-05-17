@@ -1,0 +1,21 @@
+{
+  "servers": {
+    "syncsage": {
+      "type": "stdio",
+      "command": "docker",
+      "args": [
+        "exec",
+        "-i",
+        "syncsage",
+        "python",
+        "-m",
+        "syncsage",
+        "mcp",
+        "--config",
+        "/config/syncsage.yaml",
+        "--transport",
+        "stdio"
+      ]
+    }
+  }
+}

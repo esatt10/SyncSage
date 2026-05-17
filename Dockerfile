@@ -27,7 +27,8 @@ RUN pip install --no-cache-dir \
     "markdown-it-py>=3.0" \
     "beautifulsoup4>=4.12" \
     "python-docx>=1.1" \
-    "pymupdf>=1.24"
+    "pymupdf>=1.24" \
+    "mcp>=1.27,<2"
 
 COPY pyproject.toml README.md LICENSE /app/
 COPY src /app/src

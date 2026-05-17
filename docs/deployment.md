@@ -4,6 +4,14 @@ SyncSage is packaged as one container image and can run locally, with Docker Com
 
 ## Local Docker
 
+Create local config first:
+
+```bash
+cp syncsage.example.yaml syncsage.yaml
+```
+
+`syncsage.yaml` is ignored by git. Edit source paths so they point at container paths under `/workspace` or `/vault`.
+
 ```bash
 docker run --rm \
   --name syncsage \
@@ -19,7 +27,50 @@ docker run --rm \
 
 ```bash
 cp syncsage.example.yaml syncsage.yaml
-docker compose up
+cp .env.example .env
+docker compose up -d
+```
+
+By default Compose mounts:
+
+| Host value | Container path | Purpose |
+|---|---|---|
+| `SYNCSAGE_CONFIG_PATH=./syncsage.yaml` | `/config/syncsage.yaml` | Runtime config, read-only. |
+| `SYNCSAGE_WORKSPACE_PATH=./workspace` | `/workspace` | Indexed repositories and documents, read-only. |
+| `SYNCSAGE_VAULT_PATH=./vault` | `/vault` | Generated Obsidian notes, read/write. |
+| `syncsage-state` volume | `/state` | SQLite, manifests, graph snapshots. |
+| `syncsage-exports` volume | `/exports` | JSON/canvas exports. |
+
+Check the API container:
+
+```bash
+curl http://localhost:8765/health
+curl http://localhost:8765/ready
+```
+
+## MCP server inside Docker
+
+For the primary VS Code workflow, start SyncSage with Compose and let VS Code attach to a foreground stdio MCP process inside the running container:
+
+```bash
+docker compose up -d
+docker exec -i syncsage python -m syncsage mcp --config /config/syncsage.yaml --transport stdio
+```
+
+That command is normally launched by `.vscode/mcp.json`, not by hand. It must stay in the foreground because stdio is the transport.
+
+To generate the VS Code config:
+
+```bash
+syncsage client-config vscode --output .vscode/mcp.json
+```
+
+If the local CLI is not installed, copy `examples/vscode/mcp.json` to `.vscode/mcp.json`.
+
+For a one-off MCP-only container, use the generated Docker-run profile:
+
+```bash
+syncsage client-config vscode --mode docker-run --output .vscode/mcp.json
 ```
 
 ## Kubernetes manifests
