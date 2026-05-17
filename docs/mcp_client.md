@@ -7,22 +7,21 @@ VS Code is the primary SyncSage MCP client. The shared setup keeps host-specific
 | File | Commit? | Purpose |
 |---|---:|---|
 | `syncsage.example.yaml` | Yes | Shared SyncSage config pattern. |
-| `.env.example` | Yes | Shared Docker Compose host-path variables. |
 | `examples/vscode/mcp.json` | Yes | Reusable VS Code MCP template. |
 | `syncsage.yaml` | No | User-specific runtime config. |
-| `.env` | No | User-specific host paths and image override. |
+| `.syncsage/compose.env` | No | Generated Docker Compose env file. |
 | `.vscode/mcp.json` | No | User-specific MCP client config. |
 
 ## Docker Service
 
 ```bash
 cp syncsage.example.yaml syncsage.yaml
-cp .env.example .env
-docker compose up -d
+syncsage compose-env syncsage.yaml --output .syncsage/compose.env
+docker compose --env-file .syncsage/compose.env up -d
 curl http://localhost:8765/ready
 ```
 
-Edit `.env` so `SYNCSAGE_WORKSPACE_PATH` points at the host folder containing repositories, notes, and documents to index. Edit `syncsage.yaml` so source paths use container paths such as `/workspace/repository`.
+Edit `deployment.compose.workspace_path` in `syncsage.yaml` so it points at the host folder containing repositories, notes, and documents to index. Source paths should still use container paths such as `/workspace/repository`.
 
 ## VS Code
 
@@ -60,4 +59,4 @@ syncsage client-config vscode --container-name <name> --output .vscode/mcp.json
 
 ## Obsidian
 
-Set `SYNCSAGE_VAULT_PATH` in `.env` to the host folder you want to open in Obsidian. SyncSage writes managed notes to `/vault/SyncSage`, which appears as `SyncSage/` in that host folder. Open the host folder in Obsidian and use `export_obsidian_notes` after indexing.
+Set `deployment.compose.vault_path` in `syncsage.yaml` to the host folder you want to open in Obsidian. SyncSage writes managed notes to `/vault/SyncSage`, which appears as `SyncSage/` in that host folder. Open the host folder in Obsidian and use `export_obsidian_notes` after indexing.

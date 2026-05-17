@@ -16,19 +16,19 @@ SyncSage is a lightweight, Docker-first MCP knowledge graph server for indexing 
 
    ```bash
    cp syncsage.example.yaml syncsage.yaml
-   cp .env.example .env
    ```
 
-2. Edit `syncsage.yaml` and `.env` for your machine:
+2. Edit `syncsage.yaml` for your machine:
 
-   - `SYNCSAGE_WORKSPACE_PATH` is mounted read-only at `/workspace`.
-   - `SYNCSAGE_VAULT_PATH` is mounted read/write at `/vault` for generated Obsidian notes.
+   - `deployment.compose.workspace_path` is mounted read-only at `/workspace`.
+   - `deployment.compose.vault_path` is mounted read/write at `/vault` for generated Obsidian notes.
    - Source paths in `syncsage.yaml` should use container paths such as `/workspace/repository`.
 
-3. Run the container:
+3. Render the Compose env file from that YAML and run the container:
 
    ```bash
-   docker compose up -d
+   syncsage compose-env syncsage.yaml --output .syncsage/compose.env
+   docker compose --env-file .syncsage/compose.env up -d
    ```
 
 4. Check health endpoints:
@@ -38,17 +38,17 @@ SyncSage is a lightweight, Docker-first MCP knowledge graph server for indexing 
    curl http://localhost:8765/ready
    ```
 
-`syncsage.yaml`, `.env`, `.vscode/mcp.json`, local state, and local vault output are ignored by git. Commit `syncsage.example.yaml`, `.env.example`, and files under `examples/` or `docs/` when you want to share a generalized setup.
+`syncsage.yaml`, `.syncsage/compose.env`, `.vscode/mcp.json`, local state, and local vault output are ignored by git. Commit `syncsage.example.yaml` and files under `examples/` or `docs/` when you want to share a generalized setup.
 
 ## Docker Compose
 
 ```bash
 cp syncsage.example.yaml syncsage.yaml
-cp .env.example .env
-docker compose up -d
+syncsage compose-env syncsage.yaml --output .syncsage/compose.env
+docker compose --env-file .syncsage/compose.env up -d
 ```
 
-The compose file mounts `./syncsage.yaml` into `/config/syncsage.yaml`, `./workspace` into `/workspace`, and `./vault` into `/vault` by default. Change those host paths in `.env`.
+The compose file gets its image and host mount values from the generated env file. Change those values under `deployment.compose` in the selected YAML.
 
 ## VS Code MCP Client
 
@@ -57,7 +57,8 @@ The primary client setup is VS Code connected to the MCP server running inside t
 1. Start the container:
 
    ```bash
-   docker compose up -d
+   syncsage compose-env syncsage.yaml --output .syncsage/compose.env
+   docker compose --env-file .syncsage/compose.env up -d
    ```
 
 2. Generate or copy the VS Code MCP config:
@@ -80,11 +81,11 @@ syncsage client-config vscode --mode docker-run --output .vscode/mcp.json
 
 ## CI and container publishing
 
-The repository validates pull requests and publishes the Docker image with `.github/workflows/container.yml`. Release labeling is checked separately by `.github/workflows/release-tag.yml`.
+The repository validates pull requests and publishes the Docker image with `.github/workflows/container.yml`.
 
 - Pull requests to `main` run ruff correctness lint, dependency checks, source compilation, pytest on Python 3.11 and 3.12, package build, Docker Compose validation, Docker image build, and image smoke tests.
-- Pull requests must have exactly one release label matching `#.#.#`, such as `1.2.3`; labels like `v1.2.3` are rejected. Adding or removing labels reruns only the lightweight release-label workflow.
-- Merged PRs and direct patches to `main` run the same checks, then publish `ghcr.io/esatt10/syncsage:latest` and a `sha-<commit>` tag.
+- Pull requests must set `pyproject.toml` to a stable semver version that is greater than the highest published GHCR semver tag and has not already been published as either `#.#.#` or `v#.#.#`.
+- Merged PRs and direct patches to `main` run the same checks, then publish `ghcr.io/esatt10/syncsage:<pyproject version>`, `ghcr.io/esatt10/syncsage:v<pyproject version>`, `latest`, and `sha-<commit>` tags.
 - The workflow uses `GITHUB_TOKEN` with `packages: write`; no separate registry secret is required for this repository.
 
 After the first workflow run, set the package visibility in GitHub Packages if the image should be publicly pullable without authentication.
@@ -99,6 +100,7 @@ SyncSage reads `/config/syncsage.yaml` by default. The example file includes the
 - `search`: keyword, path, graph, hybrid, optional embeddings, and ranking settings.
 - `sync`: startup validation, watcher, git monitor, scheduler, idempotency, and concurrency settings.
 - `obsidian`: optional vault note and canvas export settings.
+- `deployment`: local deployment helper values used to render Docker Compose env files.
 - `sources`: repositories, Markdown folders, Obsidian vaults, document folders, web collections, or single files.
 
 See [docs/configuration.md](docs/configuration.md) for details.
@@ -130,7 +132,7 @@ Every retrieval response should include provenance such as source ID, path, bran
 
 ## Obsidian Workflow
 
-SyncSage writes generated Markdown into the mounted `/vault` path, under `SyncSage/` by default. Open the host folder from `SYNCSAGE_VAULT_PATH` as an Obsidian vault. After indexing, call the MCP tool `export_obsidian_notes` or the API endpoint `POST /obsidian/export` to update the managed notes.
+SyncSage writes generated Markdown into the mounted `/vault` path, under `SyncSage/` by default. Open the host folder from `deployment.compose.vault_path` as an Obsidian vault. After indexing, call the MCP tool `export_obsidian_notes` or the API endpoint `POST /obsidian/export` to update the managed notes.
 
 ## Deployment paths
 
@@ -158,6 +160,16 @@ See [docs/deployment.md](docs/deployment.md).
 ## Development phases
 
 The v0.1 MVP is complete when SyncSage can load config, index at least one repository plus Markdown/document folders, persist graph/search state, expose MCP retrieval/sync tools, re-index idempotently, detect file/git changes, export useful Obsidian notes, and run through Docker/Kubernetes examples.
+
+## Versioning
+
+`pyproject.toml` is the canonical semver source. To bump it and refresh generated deployment defaults:
+
+```bash
+python scripts/sync_version.py --bump patch
+```
+
+CI runs `python scripts/sync_version.py --check` and checks existing GHCR image tags before publishing. Helm, Kubernetes, Compose, and example image tags cannot drift from the version that will be published to GHCR.
 
 ## License
 

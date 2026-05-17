@@ -2,12 +2,13 @@
 
 SyncSage reads YAML from `/config/syncsage.yaml` by default. Start from `syncsage.example.yaml` and mount it read-only into the container.
 
-The local `syncsage.yaml` copy is intentionally ignored by git because it contains host-specific mount assumptions. Commit changes to `syncsage.example.yaml` when you want to update the shared pattern. Commit `.env.example`, but not `.env`.
+The local `syncsage.yaml` copy is intentionally ignored by git because it contains host-specific mount assumptions. Commit changes to `syncsage.example.yaml` when you want to update the shared pattern. Docker Compose env files generated under `.syncsage/` are ignored.
 
 ## Top-level sections
 
 | Section | Purpose |
 |---|---|
+| `deployment` | Local deployment helper values, including Docker Compose image and host mount paths. |
 | `syncsage` | Instance name, environment, workspace, state, vault, export paths, and logging. |
 | `server` | API/MCP/UI host, port, OpenAPI, and transport settings. |
 | `storage` | SQLite, graph, manifest, snapshot, compression, retention, and size limits. |

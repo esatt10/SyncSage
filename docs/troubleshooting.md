@@ -8,7 +8,7 @@
 
 ## Image pull fails
 
-- Confirm the image exists at `ghcr.io/esatt10/syncsage:latest`.
+- Confirm the image exists at the semver tag from `pyproject.toml`.
 - Check the GitHub Actions container publish workflow completed successfully.
 - If the package is private, authenticate Docker with a token that can read GitHub Packages or make the package public in GitHub Packages.
 

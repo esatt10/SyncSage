@@ -3,6 +3,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from syncsage.version import __version__
+
+
+DEFAULT_IMAGE_REPOSITORY = "ghcr.io/esatt10/syncsage"
+DEFAULT_IMAGE = f"{DEFAULT_IMAGE_REPOSITORY}:{__version__}"
+
 
 def docker_exec_stdio_config(
     server_name: str = "syncsage",
@@ -36,7 +42,7 @@ def docker_exec_stdio_config(
 
 def docker_run_stdio_config(
     server_name: str = "syncsage",
-    image: str = "ghcr.io/esatt10/syncsage:latest",
+    image: str | None = None,
     config_mount: str = "${workspaceFolder}/syncsage.yaml",
     workspace_mount: str = "${workspaceFolder}",
     vault_mount: str = "${workspaceFolder}/vault",
@@ -44,6 +50,8 @@ def docker_run_stdio_config(
     exports_volume: str = "syncsage-exports",
 ) -> dict[str, Any]:
     """Return a VS Code MCP server config that starts a foreground Docker container."""
+
+    image = image or DEFAULT_IMAGE
 
     return {
         "servers": {

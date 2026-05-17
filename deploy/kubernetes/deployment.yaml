@@ -21,7 +21,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: syncsage
-          image: ghcr.io/esatt10/syncsage:latest
+          image: ghcr.io/esatt10/syncsage:0.1.1
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
