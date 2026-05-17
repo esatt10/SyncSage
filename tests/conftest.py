@@ -132,13 +132,27 @@ def vault_path(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def config_path(tmp_path: Path, workspace_copy: Path, state_path: Path, vault_path: Path) -> Path:
+def exports_path(tmp_path: Path) -> Path:
+    path = tmp_path / "exports"
+    path.mkdir()
+    return path
+
+
+@pytest.fixture()
+def config_path(
+    tmp_path: Path,
+    workspace_copy: Path,
+    state_path: Path,
+    vault_path: Path,
+    exports_path: Path,
+) -> Path:
     """Render the acceptance-test YAML config with temporary paths."""
 
     rendered = CONFIG_TEMPLATE.read_text(encoding="utf-8").format(
         workspace_path=workspace_copy.as_posix(),
         state_path=state_path.as_posix(),
         vault_path=vault_path.as_posix(),
+        exports_path=exports_path.as_posix(),
     )
     path = tmp_path / "syncsage.yaml"
     path.write_text(rendered, encoding="utf-8")

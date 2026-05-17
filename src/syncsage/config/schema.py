@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Any
 
 DEFAULT_EXCLUDES = [
     "**/.git/**", "**/.env", "**/.env.*", "**/*id_rsa*", "**/*id_ed25519*", "**/*.pem", "**/*.key",
