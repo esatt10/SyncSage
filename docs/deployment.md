@@ -98,16 +98,16 @@ The plain Kubernetes manifests and Helm defaults pin the current `pyproject.toml
 Validation and publishing are intentionally split across workflows.
 
 - `.github/workflows/ci.yml`: runs ruff correctness lint, dependency checks, source compilation, pytest on Python 3.11 and 3.12, package build, Docker Compose validation, Docker image build, and image smoke tests.
-- `.github/workflows/release-version.yml`: runs from trusted base-branch code, comments on PRs with valid release increments, and requires a maintainer comment such as `patch`, `minor`, `major`, `3`, `2`, or `1`.
+- `.github/workflows/release-version.yml`: runs from trusted base-branch code, comments on PRs with valid release increments, and defaults to `patch` / `3` unless a maintainer comments with `minor`, `major`, `2`, or `1`.
 - `.github/workflows/container.yml`: publishes after CI passes on a push to `main`; it reads the merged PR release increment, bumps `pyproject.toml` and generated deployment tags on `main`, then builds the image.
 - Merged PR to `main`: publishes `ghcr.io/esatt10/syncsage:<pyproject version>`. Direct pushes to `main` are not releaseable because there is no PR release-increment comment to read.
 - The workflow uses repository `GITHUB_TOKEN` permissions with `packages: write`.
 
-For public local installs, make the package public from the GitHub package settings after the first image is published. To block merges without validation and a selected release increment, require the CI checks and the `Release version selection` status in branch protection for `main`.
+For public local installs, make the package public from the GitHub package settings after the first image is published. To block merges without validation and a checked release increment, require the CI checks and the `Release version selection` status in branch protection for `main`.
 
 ## Version alignment
 
-`pyproject.toml` is the single source for the released semver. For local maintenance you can run `python scripts/sync_version.py --bump patch`, `--bump minor`, `--bump major`, or `--set 1.2.3` to update it and refresh generated deployment defaults. For PR releases, comment with the release increment and let the publish workflow update `main` before building the container.
+`pyproject.toml` is the single source for the released semver. For local maintenance you can run `python scripts/sync_version.py --bump patch`, `--bump minor`, `--bump major`, or `--set 1.2.3` to update it and refresh generated deployment defaults. For PR releases, `patch` is selected by default; comment with a different release increment to override it and let the publish workflow update `main` before building the container.
 
 ## Probes and ports
 

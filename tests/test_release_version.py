@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from scripts.release_version import normalize_bump_selection, release_options, selected_release_bump
+from scripts.release_version import (
+    effective_release_bump,
+    normalize_bump_selection,
+    release_options,
+    render_prompt,
+    selected_release_bump,
+)
 
 
 def test_normalize_bump_selection_accepts_words_and_numbers() -> None:
@@ -21,6 +27,31 @@ def test_selected_release_bump_ignores_bot_prompt() -> None:
     ]
 
     assert selected_release_bump(comments)[0] == "minor"  # type: ignore[index]
+
+
+def test_effective_release_bump_defaults_to_patch() -> None:
+    selection, defaulted = effective_release_bump([], {"patch": "1.2.4", "minor": "1.3.0"})
+
+    assert selection == "patch"
+    assert defaulted is True
+
+
+def test_effective_release_bump_comment_overrides_patch_default() -> None:
+    comments = [{"user": {"type": "User"}, "body": "2"}]
+    selection, defaulted = effective_release_bump(
+        comments,
+        {"patch": "1.2.4", "minor": "1.3.0"},
+    )
+
+    assert selection == "minor"
+    assert defaulted is False
+
+
+def test_render_prompt_discloses_patch_default() -> None:
+    rendered = render_prompt({"patch": "1.2.4"}, "patch", defaulted=True)
+
+    assert "Patch is selected by default" in rendered
+    assert "`3` / `patch` (default) -> `1.2.4`" in rendered
 
 
 def test_release_options_are_incremented_from_highest_existing_tag() -> None:
