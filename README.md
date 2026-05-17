@@ -84,7 +84,7 @@ syncsage client-config vscode --mode docker-run --output .vscode/mcp.json
 The repository keeps validation and publishing in separate workflows.
 
 - `.github/workflows/ci.yml` runs ruff correctness lint, dependency checks, source compilation, pytest on Python 3.11 and 3.12, package build, Docker Compose validation, Docker image build, and image smoke tests.
-- `.github/workflows/release-version.yml` runs from trusted base-branch code, comments on PRs with valid release increments, and requires a maintainer comment such as `patch`, `minor`, `major`, `3`, `2`, or `1`.
+- `.github/workflows/release-version.yml` runs from trusted base-branch code, comments on PRs with valid release increments, and defaults to `patch` / `3` unless a maintainer comments with `minor`, `major`, `2`, or `1`.
 - `.github/workflows/container.yml` publishes only after CI passes on a push to `main`; it reads the merged PR release increment, bumps `pyproject.toml` and generated deployment tags on `main`, then builds the image.
 - Merged PRs publish one canonical image tag: `ghcr.io/esatt10/syncsage:<pyproject version>`. Direct pushes to `main` are not releaseable because there is no PR release-increment comment to read.
 - The workflow uses `GITHUB_TOKEN` with `packages: write`; no separate registry secret is required for this repository.
@@ -170,7 +170,7 @@ The v0.1 MVP is complete when SyncSage can load config, index at least one repos
 python scripts/sync_version.py --bump patch
 ```
 
-For PR releases, comment with the release increment instead of manually editing version files. The publish workflow applies the selected increment to `main` before building the release image. CI runs `python scripts/sync_version.py --check`, and the release-version workflow checks existing GHCR image tags.
+For PR releases, `patch` is selected by default. Comment with a different release increment to override it; each new comment reruns the release-version check against the current valid options. The publish workflow applies the selected increment to `main` before building the release image.
 
 ## License
 

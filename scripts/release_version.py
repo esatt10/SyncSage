@@ -32,6 +32,7 @@ except ModuleNotFoundError:
 BOT_COMMENT_MARKER = "<!-- syncsage-release-version-selection -->"
 STATUS_CONTEXT = "Release version selection"
 BUMP_ORDER = ("major", "minor", "patch")
+DEFAULT_BUMP = "patch"
 BUMP_ALIASES = {
     "1": "major",
     "2": "minor",
@@ -164,6 +165,18 @@ def selected_release_bump(comments: list[dict[str, Any]]) -> tuple[str, dict[str
     return None
 
 
+def effective_release_bump(
+    comments: list[dict[str, Any]],
+    options: dict[str, str],
+) -> tuple[str | None, bool]:
+    selected = selected_release_bump(comments)
+    if selected:
+        return selected[0], False
+    if DEFAULT_BUMP in options:
+        return DEFAULT_BUMP, True
+    return None, True
+
+
 def pr_number_from_event(event: Mapping[str, Any]) -> int | None:
     if "pull_request" in event:
         return int(event["pull_request"]["number"])
@@ -203,22 +216,33 @@ def update_pr_status(
     github_api("POST", f"{api_url}/repos/{repo}/statuses/{sha}", token, payload)
 
 
-def render_prompt(options: dict[str, str], selection: str | None = None) -> str:
+def render_prompt(
+    options: dict[str, str],
+    selection: str | None = None,
+    defaulted: bool = False,
+) -> str:
     option_lines = "\n".join(
         f"- `{index}` or `{part}` -> `{version}`"
         for index, part in enumerate(BUMP_ORDER, start=1)
         if (version := options.get(part))
     )
-    selected_line = (
-        f"\nCurrent selection: `{selection}` -> `{options[selection]}`\n" if selection else ""
-    )
+    if selection and defaulted:
+        selected_line = (
+            f"\nCurrent selection: `3` / `patch` (default) -> `{options[selection]}`\n"
+        )
+    elif selection:
+        selected_line = f"\nCurrent selection: `{selection}` -> `{options[selection]}`\n"
+    else:
+        selected_line = ""
     return (
         f"{BOT_COMMENT_MARKER}\n"
-        "Select the release increment for this PR by commenting with one value:\n\n"
+        "Review the release increment for this PR. Patch is selected by default; "
+        "comment with one value to override it:\n\n"
         f"{option_lines}\n"
         f"{selected_line}\n"
         "Accepted forms include `patch`, `minor`, `major`, `3`, `2`, `1`, "
-        "or `/release patch`."
+        "or `/release patch`. Each new comment rechecks this selection against "
+        "the currently valid release options."
     )
 
 
@@ -230,8 +254,9 @@ def upsert_prompt_comment(
     api_url: str,
     options: dict[str, str],
     selection: str | None,
+    defaulted: bool = False,
 ) -> None:
-    body = render_prompt(options, selection)
+    body = render_prompt(options, selection, defaulted)
     for comment in comments:
         user = comment.get("user") or {}
         if user.get("type") == "Bot" and BOT_COMMENT_MARKER in str(comment.get("body") or ""):
@@ -271,9 +296,17 @@ def validate_pr_selection(args: argparse.Namespace) -> int:
         print("No valid semver increment is available.")
         return 0
 
-    selected = selected_release_bump(comments)
-    selection = selected[0] if selected else None
-    upsert_prompt_comment(args.repo, number, comments, args.token, args.api_url, options, selection)
+    selection, defaulted = effective_release_bump(comments, options)
+    upsert_prompt_comment(
+        args.repo,
+        number,
+        comments,
+        args.token,
+        args.api_url,
+        options,
+        selection,
+        defaulted,
+    )
     if not selection:
         update_pr_status(
             args.repo,
@@ -281,9 +314,9 @@ def validate_pr_selection(args: argparse.Namespace) -> int:
             args.token,
             args.api_url,
             "failure",
-            "Comment with major, minor, patch, 1, 2, or 3",
+            "Default patch is unavailable; comment with major, minor, 1, or 2",
         )
-        print("Release increment selection is required.")
+        print("Default patch is unavailable and no valid release increment was selected.")
         return 0
     if selection not in options:
         update_pr_status(
@@ -297,15 +330,20 @@ def validate_pr_selection(args: argparse.Namespace) -> int:
         print(f"Selected {selection} increment is not valid.")
         return 0
 
+    description = (
+        f"Release increment selected: {selection} -> {options[selection]}"
+        if not defaulted
+        else f"Default release increment: patch -> {options[selection]}"
+    )
     update_pr_status(
         args.repo,
         sha,
         args.token,
         args.api_url,
         "success",
-        f"Release increment selected: {selection} -> {options[selection]}",
+        description,
     )
-    print(f"Release increment selected: {selection} -> {options[selection]}")
+    print(description)
     return 0
 
 
@@ -327,14 +365,13 @@ def print_merged_pr_bump(args: argparse.Namespace) -> int:
         raise SystemExit(f"No pull request is associated with merge commit {args.sha}.")
     number = int(pr["number"])
     comments = comments_for_pr(args.repo, number, args.token, args.api_url)
-    selected = selected_release_bump(comments)
-    if not selected:
-        raise SystemExit(f"PR #{number} does not have a release increment comment.")
-    bump_part = selected[0]
     tags = container_tags(
         fetch_container_versions(args.owner, args.package, args.token, args.api_url)
     )
     options = release_options(tags)
+    bump_part, _defaulted = effective_release_bump(comments, options)
+    if not bump_part:
+        raise SystemExit(f"PR #{number} does not have a valid release increment.")
     if bump_part not in options:
         raise SystemExit(f"Selected {bump_part} increment is no longer valid for PR #{number}.")
     version = options[bump_part]
