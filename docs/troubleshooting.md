@@ -6,6 +6,12 @@
 - Check `SYNCSAGE_CONFIG` points to `/config/syncsage.yaml`.
 - Confirm `/state` is writable.
 
+## Image pull fails
+
+- Confirm the image exists at `ghcr.io/esatt10/syncsage:latest`.
+- Check the GitHub Actions container publish workflow completed successfully.
+- If the package is private, authenticate Docker with a token that can read GitHub Packages or make the package public in GitHub Packages.
+
 ## Sources are not indexed
 
 - Verify source paths exist inside the container, not just on the host.

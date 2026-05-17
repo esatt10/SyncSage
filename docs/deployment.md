@@ -12,7 +12,7 @@ docker run --rm \
   -v "$HOME/projects:/workspace:ro" \
   -v "$HOME/SyncSageVault:/vault" \
   -v syncsage-state:/state \
-  ghcr.io/syncsage/syncsage:latest
+  ghcr.io/esatt10/syncsage:latest
 ```
 
 ## Docker Compose
@@ -38,6 +38,19 @@ The manifests assume one instance per namespace and one PVC-backed `/state` volu
 helm template syncsage deploy/helm --namespace syncsage
 helm install syncsage deploy/helm --namespace syncsage --create-namespace
 ```
+
+The plain Kubernetes manifests and Helm defaults both pull `ghcr.io/esatt10/syncsage:latest`.
+Override the Helm image with `--set image.repository=... --set image.tag=...` when installing from a fork or a pinned release.
+
+## Container registry
+
+The GitHub Actions workflow at `.github/workflows/container.yml` builds the root `Dockerfile` and pushes to GitHub Container Registry.
+
+- Push to `main`: publishes `ghcr.io/esatt10/syncsage:latest` and `ghcr.io/esatt10/syncsage:sha-<commit>`.
+- Push a version tag such as `v0.1.0`: publishes `ghcr.io/esatt10/syncsage:v0.1.0`.
+- The workflow uses repository `GITHUB_TOKEN` permissions with `packages: write`.
+
+For public local installs, make the package public from the GitHub package settings after the first image is published.
 
 ## Probes and ports
 

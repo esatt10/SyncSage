@@ -30,7 +30,7 @@ SyncSage is a lightweight, Docker-first MCP knowledge graph server for indexing 
      -v "$HOME/projects:/workspace" \
      -v "$HOME/SyncSageVault:/vault" \
      -v syncsage-state:/state \
-     ghcr.io/syncsage/syncsage:latest
+     ghcr.io/esatt10/syncsage:latest
    ```
 
 4. Check health endpoints:
@@ -48,6 +48,16 @@ docker compose up
 ```
 
 The compose file mounts `./syncsage.yaml` into `/config/syncsage.yaml`, `~/projects` into `/workspace`, and `~/SyncSageVault` into `/vault`.
+
+## Publishing the container image
+
+The repository publishes the Docker image to GitHub Container Registry with the workflow in `.github/workflows/container.yml`.
+
+- Pushes to `main` publish `ghcr.io/esatt10/syncsage:latest` and a `sha-<commit>` tag.
+- Version tags like `v0.1.0` publish a matching GHCR image tag.
+- The workflow uses `GITHUB_TOKEN` with `packages: write`; no separate registry secret is required for this repository.
+
+After the first workflow run, set the package visibility in GitHub Packages if the image should be publicly pullable without authentication.
 
 ## Configuration overview
 

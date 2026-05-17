@@ -1,6 +1,6 @@
 services:
   syncsage:
-    image: ghcr.io/syncsage/syncsage:latest
+    image: ghcr.io/esatt10/syncsage:latest
     container_name: syncsage
     restart: unless-stopped
     ports:
@@ -14,7 +14,7 @@ services:
       - syncsage-state:/state
       - syncsage-exports:/exports
     healthcheck:
-      test: ["CMD", "python", "-m", "syncsage", "healthcheck", "--url", "http://localhost:8765/health"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3

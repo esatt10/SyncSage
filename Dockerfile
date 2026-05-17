@@ -1,5 +1,10 @@
 FROM python:3.12-slim AS runtime
 
+LABEL org.opencontainers.image.title="SyncSage" \
+      org.opencontainers.image.description="Docker-first MCP knowledge graph indexer and agentic retrieval layer" \
+      org.opencontainers.image.source="https://github.com/esatt10/SyncSage" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src \
@@ -12,17 +17,17 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
-    fastapi>=0.111 \
+    "fastapi>=0.111" \
     "uvicorn[standard]>=0.30" \
-    pydantic>=2.7 \
-    PyYAML>=6.0 \
-    networkx>=3.3 \
-    typer>=0.12 \
-    watchdog>=4.0 \
-    markdown-it-py>=3.0 \
-    beautifulsoup4>=4.12 \
-    python-docx>=1.1 \
-    pymupdf>=1.24
+    "pydantic>=2.7" \
+    "PyYAML>=6.0" \
+    "networkx>=3.3" \
+    "typer>=0.12" \
+    "watchdog>=4.0" \
+    "markdown-it-py>=3.0" \
+    "beautifulsoup4>=4.12" \
+    "python-docx>=1.1" \
+    "pymupdf>=1.24"
 
 COPY pyproject.toml README.md LICENSE /app/
 COPY src /app/src
