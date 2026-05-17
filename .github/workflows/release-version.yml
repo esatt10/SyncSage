@@ -8,13 +8,16 @@ on:
       - opened
       - synchronize
       - reopened
-  push:
-    branches:
-      - main
+  issue_comment:
+    types:
+      - created
+      - edited
 
 permissions:
   contents: read
+  issues: write
   packages: read
+  statuses: write
 
 env:
   IMAGE_NAME: syncsage
@@ -23,6 +26,7 @@ jobs:
   release-version:
     name: Release version check
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event.issue.pull_request
 
     steps:
       - name: Check out repository
@@ -36,12 +40,13 @@ jobs:
       - name: Check version alignment
         run: python scripts/sync_version.py --check
 
-      - name: Check GHCR semver increment
+      - name: Check release increment selection
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python scripts/sync_version.py \
-            --check-ghcr-tags \
+          python scripts/release_version.py pr-gate \
+            --event-path "${GITHUB_EVENT_PATH}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --owner "${GITHUB_REPOSITORY_OWNER}" \
             --package "${IMAGE_NAME}" \
             --token "${GITHUB_TOKEN}"

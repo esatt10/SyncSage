@@ -10,12 +10,18 @@ on:
       - completed
 
 permissions:
-  contents: read
+  contents: write
+  issues: read
   packages: write
+  pull-requests: read
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: syncsage
+
+concurrency:
+  group: publish-container-main
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -29,7 +35,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -39,6 +45,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Ensure CI head is still main
+        shell: bash
+        run: |
+          current_sha="$(git rev-parse HEAD)"
+          if [ "$current_sha" != "${{ github.event.workflow_run.head_sha }}" ]; then
+            echo "main has moved since this CI run; refusing to publish a superseded build."
+            exit 1
+          fi
+
       - name: Resolve image name
         id: image
         shell: bash
@@ -46,25 +61,48 @@ jobs:
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           echo "ref=${REGISTRY}/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve project version
+      - name: Check version alignment
+        run: python scripts/sync_version.py --check
+
+      - name: Resolve release increment
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/release_version.py merged-pr-bump \
+            --repo "${GITHUB_REPOSITORY}" \
+            --sha "${{ github.event.workflow_run.head_sha }}" \
+            --owner "${GITHUB_REPOSITORY_OWNER}" \
+            --package "${IMAGE_NAME}" \
+            --token "${GITHUB_TOKEN}"
+
+      - name: Apply semver target on main
         id: version
         shell: bash
         run: |
+          python scripts/sync_version.py --set "${{ steps.release.outputs.version }}"
           version="$(python scripts/sync_version.py --print)"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-
-      - name: Check version alignment
-        run: python scripts/sync_version.py --check
 
       - name: Check release image version
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python scripts/sync_version.py \
+            --check \
             --check-ghcr-tags \
             --owner "${GITHUB_REPOSITORY_OWNER}" \
             --package "${IMAGE_NAME}" \
             --token "${GITHUB_TOKEN}"
+
+      - name: Commit release version to main
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml deploy/helm/Chart.yaml deploy/helm/values.yaml deploy/kubernetes/deployment.yaml docker-compose.yml syncsage.example.yaml
+          git commit -m "chore: release ${{ steps.version.outputs.version }} [skip ci]"
+          git push origin HEAD:main
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
