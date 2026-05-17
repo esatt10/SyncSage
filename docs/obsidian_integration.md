@@ -4,13 +4,22 @@ Obsidian is an optional human-readable projection layer. SyncSage does not requi
 
 ## Connect Obsidian
 
+The one-command local setup creates the default vault folder and runs an initial
+export:
+
+```bash
+python scripts/bootstrap.py
+```
+
+Manual setup:
+
 1. Pick a host folder for the managed vault, for example `./vault` in the repository or another folder outside the repo.
 2. Set `deployment.compose.vault_path` in `syncsage.yaml` to that host folder.
 3. Keep `syncsage.vault_path: /vault` and `obsidian.note_root: SyncSage` in `syncsage.yaml`.
 4. Start SyncSage:
 
    ```bash
-   syncsage compose-env syncsage.yaml --output .syncsage/compose.env
+   python -m syncsage compose-env syncsage.yaml --output .syncsage/compose.env
    docker compose --env-file .syncsage/compose.env up -d
    ```
 

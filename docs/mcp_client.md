@@ -2,6 +2,18 @@
 
 VS Code is the primary SyncSage MCP client. The shared setup keeps host-specific paths out of source control.
 
+The bootstrap command installs the local MCP-capable Python environment and
+generates the VS Code MCP config:
+
+```bash
+python scripts/bootstrap.py
+```
+
+When running commands manually from a source checkout, use `python -m syncsage`
+from the repository root after dependencies are installed. The shorter `syncsage`
+command is available only after installing the package, for example with
+`python -m pip install -e ".[mcp]"`.
+
 ## Files
 
 | File | Commit? | Purpose |
@@ -16,7 +28,8 @@ VS Code is the primary SyncSage MCP client. The shared setup keeps host-specific
 
 ```bash
 cp syncsage.example.yaml syncsage.yaml
-syncsage compose-env syncsage.yaml --output .syncsage/compose.env
+python -m syncsage compose-env syncsage.yaml --output .syncsage/compose.env
+docker compose --env-file .syncsage/compose.env pull
 docker compose --env-file .syncsage/compose.env up -d
 curl http://localhost:8765/ready
 ```
@@ -25,7 +38,8 @@ Edit `deployment.compose.workspace_path` in `syncsage.yaml` so it points at the 
 
 ## VS Code
 
-Create the local MCP config:
+Bootstrap creates `.vscode/mcp.json` automatically. To create the local MCP config
+manually:
 
 ```bash
 mkdir -p .vscode
@@ -35,7 +49,7 @@ cp examples/vscode/mcp.json .vscode/mcp.json
 Or generate it:
 
 ```bash
-syncsage client-config vscode --output .vscode/mcp.json
+python -m syncsage client-config vscode --output .vscode/mcp.json
 ```
 
 The default config starts this command when VS Code starts the MCP server:
@@ -54,7 +68,7 @@ Then in VS Code:
 If you change the compose container name, regenerate the config with:
 
 ```bash
-syncsage client-config vscode --container-name <name> --output .vscode/mcp.json
+python -m syncsage client-config vscode --container-name <name> --output .vscode/mcp.json
 ```
 
 ## Obsidian

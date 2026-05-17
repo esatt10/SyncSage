@@ -111,9 +111,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push semver image
+      - name: Push image tags
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.image.outputs.ref }}:${{ steps.version.outputs.version }}
+          tags: |
+            ${{ steps.image.outputs.ref }}:${{ steps.version.outputs.version }}
+            ${{ steps.image.outputs.ref }}:latest

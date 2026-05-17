@@ -10,41 +10,44 @@ SyncSage is a lightweight, Docker-first MCP knowledge graph server for indexing 
 - Optional Obsidian-compatible Markdown exports with stable note names.
 - Local Docker, Docker Compose, Kubernetes, and Helm deployment examples.
 
-## Quick start with Docker
+## One-command local start
 
-1. Copy the example configuration:
+Prerequisites: Python 3.11+ and Docker Desktop or Docker Engine.
 
-   ```bash
-   cp syncsage.example.yaml syncsage.yaml
-   ```
+```bash
+python scripts/bootstrap.py
+```
 
-2. Edit `syncsage.yaml` for your machine:
+The bootstrap is idempotent. It creates `syncsage.yaml` from `syncsage.example.yaml`
+if needed, creates `.venv`, installs SyncSage with the MCP extra, renders
+`.syncsage/compose.env`, creates the default workspace/vault folders, pulls the
+configured GHCR image, starts Docker Compose, generates `.vscode/mcp.json`, runs an
+initial sync, exports Obsidian notes, and prints the API, VS Code MCP, and Obsidian
+validation paths.
 
-   - `deployment.compose.workspace_path` is mounted read-only at `/workspace`.
-   - `deployment.compose.vault_path` is mounted read/write at `/vault` for generated Obsidian notes.
-   - Source paths in `syncsage.yaml` should use container paths such as `/workspace/repository`.
+If `uv` is installed, bootstrap uses it for the virtual environment and package
+install. Otherwise it falls back to stdlib `venv` and `pip`.
 
-3. Render the Compose env file from that YAML and run the container:
+By default the image is the semver tag declared in `syncsage.yaml`. To opt into
+the moving GHCR `latest` tag:
 
-   ```bash
-   syncsage compose-env syncsage.yaml --output .syncsage/compose.env
-   docker compose --env-file .syncsage/compose.env up -d
-   ```
-
-4. Check health endpoints:
-
-   ```bash
-   curl http://localhost:8765/health
-   curl http://localhost:8765/ready
-   ```
+```bash
+python scripts/bootstrap.py --image ghcr.io/esatt10/syncsage:latest
+```
 
 `syncsage.yaml`, `.syncsage/compose.env`, `.vscode/mcp.json`, local state, and local vault output are ignored by git. Commit `syncsage.example.yaml` and files under `examples/` or `docs/` when you want to share a generalized setup.
 
 ## Docker Compose
 
+Manual equivalent:
+
 ```bash
 cp syncsage.example.yaml syncsage.yaml
-syncsage compose-env syncsage.yaml --output .syncsage/compose.env
+python -m venv .venv
+# Activate .venv, then:
+python -m pip install -e ".[mcp]"
+python -m syncsage compose-env syncsage.yaml --output .syncsage/compose.env
+docker compose --env-file .syncsage/compose.env pull
 docker compose --env-file .syncsage/compose.env up -d
 ```
 
@@ -57,14 +60,20 @@ The primary client setup is VS Code connected to the MCP server running inside t
 1. Start the container:
 
    ```bash
-   syncsage compose-env syncsage.yaml --output .syncsage/compose.env
+   python scripts/bootstrap.py
+   ```
+
+   Or, manually:
+
+   ```bash
+   python -m syncsage compose-env syncsage.yaml --output .syncsage/compose.env
    docker compose --env-file .syncsage/compose.env up -d
    ```
 
 2. Generate or copy the VS Code MCP config:
 
    ```bash
-   syncsage client-config vscode --output .vscode/mcp.json
+   python -m syncsage client-config vscode --output .vscode/mcp.json
    ```
 
    If the local CLI is not installed, copy `examples/vscode/mcp.json` to `.vscode/mcp.json`.
@@ -76,8 +85,56 @@ The generated config uses `docker exec -i syncsage python -m syncsage mcp --conf
 For a one-off foreground MCP server without the API container:
 
 ```bash
-syncsage client-config vscode --mode docker-run --output .vscode/mcp.json
+python -m syncsage client-config vscode --mode docker-run --output .vscode/mcp.json
 ```
+
+## Local CLI
+
+After bootstrap, run the CLI from the local virtual environment:
+
+```bash
+.venv/bin/syncsage --help
+```
+
+On Windows PowerShell, use `.venv\Scripts\syncsage.exe` instead. To make the
+shorter `syncsage` command available in your active shell, activate the virtual
+environment or install the package in your user environment:
+
+```bash
+python -m pip install -e ".[mcp]"
+```
+
+See [docs/cli.md](docs/cli.md) for operator commands.
+
+## Extending the Knowledge Base
+
+Edit `syncsage.yaml` and add entries under `sources`. Host folders are mounted by
+`deployment.compose.workspace_path`; source paths should use the container path
+under `/workspace`.
+
+```yaml
+sources:
+  - name: my-service
+    type: repository
+    path: /workspace/my-service
+    include:
+      - "**/*.py"
+      - "**/*.md"
+    exclude:
+      - "**/.git/**"
+      - "**/.venv/**"
+      - "**/node_modules/**"
+```
+
+Place the repository at `./workspace/my-service`, rerun `python scripts/bootstrap.py`,
+then trigger a full refresh if needed:
+
+```bash
+curl -X POST http://localhost:8765/sync -H "Content-Type: application/json" -d "{\"mode\":\"full\"}"
+curl -X POST http://localhost:8765/obsidian/export
+```
+
+See [docs/configuration.md](docs/configuration.md) for source type examples and path rules.
 
 ## CI and container publishing
 
@@ -86,7 +143,7 @@ The repository keeps validation and publishing in separate workflows.
 - `.github/workflows/ci.yml` runs ruff correctness lint, dependency checks, source compilation, pytest on Python 3.11 and 3.12, package build, Docker Compose validation, Docker image build, and image smoke tests.
 - `.github/workflows/release-version.yml` runs from trusted base-branch code, comments on PRs with valid release increments, and defaults to `patch` / `3` unless a maintainer comments with `minor`, `major`, `2`, or `1`.
 - `.github/workflows/container.yml` publishes only after CI passes on a push to `main`; it reads the merged PR release increment, bumps `pyproject.toml` and generated deployment tags on `main`, then builds the image.
-- Merged PRs publish one canonical image tag: `ghcr.io/esatt10/syncsage:<pyproject version>`. Direct pushes to `main` are not releaseable because there is no PR release-increment comment to read.
+- Merged PRs publish `ghcr.io/esatt10/syncsage:<pyproject version>` and update `ghcr.io/esatt10/syncsage:latest`. Direct pushes to `main` are not releaseable because there is no PR release-increment comment to read.
 - The workflow uses `GITHUB_TOKEN` with `packages: write`; no separate registry secret is required for this repository.
 
 After the first workflow run, set the package visibility in GitHub Packages if the image should be publicly pullable without authentication.
@@ -152,6 +209,7 @@ See [docs/deployment.md](docs/deployment.md).
 - [Graph model](docs/graph_model.md)
 - [MCP tools](docs/mcp_tools.md)
 - [MCP client setup](docs/mcp_client.md)
+- [CLI](docs/cli.md)
 - [Deployment](docs/deployment.md)
 - [Agentic workflows](docs/agentic_workflows.md)
 - [Obsidian integration](docs/obsidian_integration.md)

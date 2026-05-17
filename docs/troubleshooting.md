@@ -12,6 +12,17 @@
 - Check the GitHub Actions container publish workflow completed successfully.
 - If the package is private, authenticate Docker with a token that can read GitHub Packages or make the package public in GitHub Packages.
 
+## `syncsage` command is not recognized
+
+- Run `python scripts/bootstrap.py` to create `.venv` and install the local CLI.
+- Activate the virtual environment before using `syncsage` directly.
+- From a source checkout, `python -m syncsage --help` also works after dependencies are installed.
+
+## MCP server import fails locally
+
+- Install the MCP extra with `python -m pip install -e ".[mcp]"`, or rerun `python scripts/bootstrap.py`.
+- The default VS Code config uses `docker exec` into the running SyncSage container, which already includes the MCP runtime.
+
 ## Sources are not indexed
 
 - Verify source paths exist inside the container, not just on the host.
@@ -32,10 +43,10 @@ Disable chunk notes, keep file notes concise, and store large graph exports unde
 Run validation/repair commands when available:
 
 ```bash
-syncsage validate
-syncsage repair
-syncsage rebuild --source <source>
-syncsage rebuild --all
+syncsage validate syncsage.yaml --no-require-paths
+docker exec syncsage python -m syncsage repair --config /config/syncsage.yaml
+docker exec syncsage python -m syncsage sync --config /config/syncsage.yaml --all --mode full
+docker exec syncsage python -m syncsage sync --config /config/syncsage.yaml --source <source> --mode full
 ```
 
 ## Multiple instances conflict
