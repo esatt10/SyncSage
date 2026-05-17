@@ -2,6 +2,8 @@
 
 SyncSage reads YAML from `/config/syncsage.yaml` by default. Start from `syncsage.example.yaml` and mount it read-only into the container.
 
+The local `syncsage.yaml` copy is intentionally ignored by git because it contains host-specific mount assumptions. Commit changes to `syncsage.example.yaml` when you want to update the shared pattern. Commit `.env.example`, but not `.env`.
+
 ## Top-level sections
 
 | Section | Purpose |

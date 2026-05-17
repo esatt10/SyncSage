@@ -115,10 +115,10 @@ security:
   default_exclude_secrets: true
 
 sources:
-  - name: syncsage-codebase
+  - name: primary-repository
     type: repository
-    path: /workspace/syncsage
-    description: SyncSage project repository
+    path: /workspace/repository
+    description: Primary repository mounted into the SyncSage workspace
     enabled: true
     include:
       - "**/*.py"
@@ -160,10 +160,11 @@ sources:
       on_git_commit: true
       interval_seconds: 900
 
-  - name: architecture-vault
+  - name: existing-obsidian-vault
     type: obsidian_vault
-    path: /vault
-    enabled: true
+    path: /workspace/obsidian-vault
+    description: Optional existing Obsidian vault to index as a source
+    enabled: false
     include:
       - "**/*.md"
       - "**/*.canvas"

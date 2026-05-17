@@ -2,6 +2,40 @@
 
 MCP is the primary agent interface. Tool responses should be compact, ranked, and provenance-rich.
 
+## Server transports
+
+SyncSage exposes MCP through the official Python MCP SDK when the `mcp` extra is installed. The Docker image includes this runtime.
+
+```bash
+syncsage mcp --config /config/syncsage.yaml --transport stdio
+```
+
+For VS Code, keep SyncSage running with Docker Compose and let VS Code start the MCP protocol process inside that container:
+
+```bash
+docker compose up -d
+docker exec -i syncsage python -m syncsage mcp --config /config/syncsage.yaml --transport stdio
+```
+
+The command is intended to be owned by the MCP client, so it waits on stdio. Do not add Docker's `-d` detach flag to the MCP stdio command.
+
+## VS Code client config
+
+Create `.vscode/mcp.json` locally from the reusable template:
+
+```bash
+mkdir -p .vscode
+cp examples/vscode/mcp.json .vscode/mcp.json
+```
+
+Or generate it from the SyncSage CLI:
+
+```bash
+syncsage client-config vscode --output .vscode/mcp.json
+```
+
+The committed template contains no host-specific paths. `.vscode/mcp.json` is ignored because users often customize container names, images, volumes, or local environment values.
+
 ## Tools
 
 | Tool | Purpose |
