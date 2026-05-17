@@ -81,11 +81,12 @@ syncsage client-config vscode --mode docker-run --output .vscode/mcp.json
 
 ## CI and container publishing
 
-The repository validates pull requests and publishes the Docker image with `.github/workflows/container.yml`.
+The repository keeps validation and publishing in separate workflows.
 
-- Pull requests to `main` run ruff correctness lint, dependency checks, source compilation, pytest on Python 3.11 and 3.12, package build, Docker Compose validation, Docker image build, and image smoke tests.
-- Pull requests must set `pyproject.toml` to a stable semver version that is greater than the highest published GHCR semver tag and has not already been published as either `#.#.#` or `v#.#.#`.
-- Merged PRs and direct patches to `main` run the same checks, then publish `ghcr.io/esatt10/syncsage:<pyproject version>`, `ghcr.io/esatt10/syncsage:v<pyproject version>`, `latest`, and `sha-<commit>` tags.
+- `.github/workflows/ci.yml` runs ruff correctness lint, dependency checks, source compilation, pytest on Python 3.11 and 3.12, package build, Docker Compose validation, Docker image build, and image smoke tests.
+- `.github/workflows/release-version.yml` runs from trusted base-branch code, comments on PRs with valid release increments, and requires a maintainer comment such as `patch`, `minor`, `major`, `3`, `2`, or `1`.
+- `.github/workflows/container.yml` publishes only after CI passes on a push to `main`; it reads the merged PR release increment, bumps `pyproject.toml` and generated deployment tags on `main`, then builds the image.
+- Merged PRs publish one canonical image tag: `ghcr.io/esatt10/syncsage:<pyproject version>`. Direct pushes to `main` are not releaseable because there is no PR release-increment comment to read.
 - The workflow uses `GITHUB_TOKEN` with `packages: write`; no separate registry secret is required for this repository.
 
 After the first workflow run, set the package visibility in GitHub Packages if the image should be publicly pullable without authentication.
@@ -169,7 +170,7 @@ The v0.1 MVP is complete when SyncSage can load config, index at least one repos
 python scripts/sync_version.py --bump patch
 ```
 
-CI runs `python scripts/sync_version.py --check` and checks existing GHCR image tags before publishing. Helm, Kubernetes, Compose, and example image tags cannot drift from the version that will be published to GHCR.
+For PR releases, comment with the release increment instead of manually editing version files. The publish workflow applies the selected increment to `main` before building the release image. CI runs `python scripts/sync_version.py --check`, and the release-version workflow checks existing GHCR image tags.
 
 ## License
 

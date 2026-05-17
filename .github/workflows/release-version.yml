@@ -1,0 +1,54 @@
+name: Release Version Check
+
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+  issue_comment:
+    types:
+      - created
+      - edited
+
+permissions:
+  contents: read
+  issues: write
+  packages: read
+  statuses: write
+
+env:
+  IMAGE_NAME: syncsage
+
+jobs:
+  release-version:
+    name: Release version check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request_target' || github.event.issue.pull_request
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check version alignment
+        run: python scripts/sync_version.py --check
+
+      - name: Check release increment selection
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/release_version.py pr-gate \
+            --event-path "${GITHUB_EVENT_PATH}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --owner "${GITHUB_REPOSITORY_OWNER}" \
+            --package "${IMAGE_NAME}" \
+            --token "${GITHUB_TOKEN}"
