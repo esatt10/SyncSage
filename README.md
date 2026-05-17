@@ -35,6 +35,12 @@ the moving GHCR `latest` tag:
 python scripts/bootstrap.py --image ghcr.io/esatt10/syncsage:latest
 ```
 
+To run source changes before they are published to GHCR, build the local checkout:
+
+```bash
+python scripts/bootstrap.py --build --image syncsage:local
+```
+
 `syncsage.yaml`, `.syncsage/compose.env`, `.vscode/mcp.json`, local state, and local vault output are ignored by git. Commit `syncsage.example.yaml` and files under `examples/` or `docs/` when you want to share a generalized setup.
 
 ## Docker Compose

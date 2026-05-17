@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import platform
@@ -75,7 +76,10 @@ def install_dependencies(venv: Path, *, no_uv: bool) -> Path:
         except subprocess.CalledProcessError:
             log("uv install failed; falling back to stdlib venv and pip")
 
-    run([sys.executable, "-m", "venv", str(venv)])
+    if not venv_py.exists():
+        run([sys.executable, "-m", "venv", str(venv)])
+    else:
+        log(f"Using existing virtual environment: {venv}")
     run([str(venv_py), "-m", "pip", "install", "--upgrade", "pip"])
     run([str(venv_py), "-m", "pip", "install", "-e", ".[mcp]"])
     return venv_py
@@ -170,8 +174,12 @@ def ensure_docker() -> None:
     run(["docker", "compose", "version"])
 
 
-def compose(args: list[str], compose_env: Path) -> None:
-    run(["docker", "compose", "--env-file", str(compose_env), *args])
+def compose(args: list[str], compose_env: Path, *, check: bool = True) -> subprocess.CompletedProcess:
+    return run(["docker", "compose", "--env-file", str(compose_env), *args], check=check)
+
+
+def build_image(image: str) -> None:
+    run(["docker", "build", "-t", image, "."])
 
 
 def request_json(
@@ -201,7 +209,13 @@ def wait_for_api(api_base: str, timeout_seconds: int) -> None:
             request_json(f"{api_base}/health")
             request_json(f"{api_base}/ready")
             return
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            json.JSONDecodeError,
+            http.client.HTTPException,
+            OSError,
+        ) as exc:
             last_error = exc
             time.sleep(2)
     raise RuntimeError(f"SyncSage API did not become ready: {last_error}")
@@ -288,6 +302,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-up", action="store_true")
     parser.add_argument("--skip-sync", action="store_true")
     parser.add_argument("--skip-export", action="store_true")
+    parser.add_argument(
+        "--build",
+        action="store_true",
+        help="Build the local checkout as the selected image instead of pulling it.",
+    )
     return parser.parse_args()
 
 
@@ -311,6 +330,7 @@ def main() -> int:
     validate_config(venv_py, config)
 
     env = parse_env_file(compose_env)
+    configured_image = env.get("SYNCSAGE_IMAGE", "")
     if args.image:
         env["SYNCSAGE_IMAGE"] = args.image
         write_env_file(compose_env, env)
@@ -318,8 +338,29 @@ def main() -> int:
     if not (args.skip_pull and args.skip_up):
         ensure_docker()
 
-    if not args.skip_pull:
-        compose(["pull"], compose_env)
+    if args.build:
+        build_image(env["SYNCSAGE_IMAGE"])
+    elif not args.skip_pull:
+        pull = compose(["pull"], compose_env, check=False)
+        if pull.returncode != 0:
+            if args.image and args.image.endswith(":latest") and (ROOT / "Dockerfile").exists():
+                log(
+                    f"Image {args.image} is not available; "
+                    "building local checkout as syncsage:local"
+                )
+                env["SYNCSAGE_IMAGE"] = "syncsage:local"
+                write_env_file(compose_env, env)
+                build_image(env["SYNCSAGE_IMAGE"])
+            elif args.image and configured_image and configured_image != args.image:
+                log(
+                    f"Image {args.image or env['SYNCSAGE_IMAGE']} is not available; "
+                    f"falling back to configured image {configured_image}"
+                )
+                env["SYNCSAGE_IMAGE"] = configured_image
+                write_env_file(compose_env, env)
+                compose(["pull"], compose_env)
+            else:
+                raise SystemExit(pull.returncode)
     if not args.skip_up:
         compose(["up", "-d"], compose_env)
 

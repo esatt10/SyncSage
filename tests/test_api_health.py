@@ -30,8 +30,14 @@ def test_health_and_ready_endpoints_report_ok(loaded_config: object) -> None:
     client = TestClient(app)
     health = client.get("/health")
     ready = client.get("/ready")
+    sources = client.get("/sources")
+    sync = client.post("/sync", json={"mode": "incremental"})
 
     assert health.status_code == 200
     assert ready.status_code == 200
+    assert sources.status_code == 200
+    assert sync.status_code == 200
     assert health.json().get("status", "ok") in {"ok", "healthy", "pass"}
     assert ready.json().get("status", "ok") in {"ok", "ready", "pass"}
+    assert isinstance(sources.json(), list)
+    assert "results" in sync.json()

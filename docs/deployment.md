@@ -24,6 +24,7 @@ Useful variants:
 python scripts/bootstrap.py --skip-sync --skip-export
 python scripts/bootstrap.py --skip-install --skip-pull
 python scripts/bootstrap.py --image ghcr.io/esatt10/syncsage:latest
+python scripts/bootstrap.py --build --image syncsage:local
 python scripts/bootstrap.py --no-uv
 ```
 
