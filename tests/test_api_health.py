@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from types import ModuleType
 
 from tests.conftest import first_attr, import_any, require_attr
 
@@ -15,8 +16,12 @@ def test_health_and_ready_endpoints_report_ok(loaded_config: object) -> None:
 
     api_module = import_any(("syncsage.api", "syncsage.server", "syncsage.http"))
     app = first_attr(api_module, ("app", "application"))
-    if app is None:
-        factory: Callable[..., object] = require_attr(api_module, ("create_app", "build_app", "get_app"), "API app factory")
+    if app is None or isinstance(app, ModuleType):
+        factory: Callable[..., object] = require_attr(
+            api_module,
+            ("create_app", "build_app", "get_app"),
+            "API app factory",
+        )
         try:
             app = factory(config=loaded_config)
         except TypeError:

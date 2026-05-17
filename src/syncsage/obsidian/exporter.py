@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from syncsage.config.schema import SyncSageConfig
 from syncsage.obsidian.frontmatter import render_frontmatter
 from syncsage.persistence.state_store import StateStore

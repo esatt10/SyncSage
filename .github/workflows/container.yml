@@ -1,6 +1,9 @@
-name: Publish Container Image
+name: CI and Publish Container Image
 
 on:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
@@ -17,13 +20,79 @@ env:
   IMAGE_NAME: syncsage
 
 jobs:
-  build-and-push:
-    name: Build and push GHCR image
+  python-quality:
+    name: Python quality checks (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install project and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp]"
+
+      - name: Run ruff lint
+        run: python -m ruff check src tests yaml.py sitecustomize.py --select F,B --no-cache
+
+      - name: Compile Python sources
+        run: python -m compileall -q src tests
+
+      - name: Check installed dependencies
+        run: python -m pip check
+
+      - name: Run pytest suite
+        run: python -m pytest -q
+
+  package-build:
+    name: Build Python package
+    runs-on: ubuntu-latest
+    needs: python-quality
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+  container-build:
+    name: Container build and smoke tests
+    runs-on: ubuntu-latest
+    needs:
+      - python-quality
+      - package-build
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Resolve image name
         id: image
@@ -33,6 +102,7 @@ jobs:
           echo "ref=${REGISTRY}/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -49,7 +119,27 @@ jobs:
             type=sha,prefix=sha-
             type=ref,event=tag
 
-      - name: Build and push image
+      - name: Validate Docker Compose config
+        run: |
+          cp syncsage.example.yaml syncsage.yaml
+          docker compose config --quiet
+
+      - name: Build image for validation
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: syncsage:ci
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Smoke test built image
+        run: |
+          docker run --rm syncsage:ci python -m syncsage --help
+          docker run --rm syncsage:ci python -m syncsage validate /config/syncsage.yaml --no-require-paths
+          docker run --rm syncsage:ci python -c "from syncsage.api.app import create_app; print(create_app(config_path='/config/syncsage.yaml').title)"
+
+      - name: Push validated image
+        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
           context: .

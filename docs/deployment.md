@@ -42,12 +42,13 @@ helm install syncsage deploy/helm --namespace syncsage --create-namespace
 The plain Kubernetes manifests and Helm defaults both pull `ghcr.io/esatt10/syncsage:latest`.
 Override the Helm image with `--set image.repository=... --set image.tag=...` when installing from a fork or a pinned release.
 
-## Container registry
+## CI and container registry
 
-The GitHub Actions workflow at `.github/workflows/container.yml` builds the root `Dockerfile` and pushes to GitHub Container Registry.
+The GitHub Actions workflow at `.github/workflows/container.yml` validates pull requests, builds the root `Dockerfile`, and pushes passing builds to GitHub Container Registry.
 
-- Push to `main`: publishes `ghcr.io/esatt10/syncsage:latest` and `ghcr.io/esatt10/syncsage:sha-<commit>`.
-- Push a version tag such as `v0.1.0`: publishes `ghcr.io/esatt10/syncsage:v0.1.0`.
+- Pull request to `main`: runs ruff correctness lint, dependency checks, source compilation, pytest on Python 3.11 and 3.12, package build, Docker Compose validation, Docker image build, and image smoke tests.
+- Push to `main`: runs the same checks, then publishes `ghcr.io/esatt10/syncsage:latest` and `ghcr.io/esatt10/syncsage:sha-<commit>`.
+- Push a version tag such as `v0.1.0`: runs the same checks, then publishes `ghcr.io/esatt10/syncsage:v0.1.0`.
 - The workflow uses repository `GITHUB_TOKEN` permissions with `packages: write`.
 
 For public local installs, make the package public from the GitHub package settings after the first image is published.
