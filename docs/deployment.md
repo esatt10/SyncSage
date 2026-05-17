@@ -98,7 +98,7 @@ The plain Kubernetes manifests and Helm defaults pin the current `pyproject.toml
 Validation and publishing are intentionally split across workflows.
 
 - `.github/workflows/ci.yml`: runs ruff correctness lint, dependency checks, source compilation, pytest on Python 3.11 and 3.12, package build, Docker Compose validation, Docker image build, and image smoke tests.
-- `.github/workflows/release-version.yml`: comments on PRs with valid release increments and requires a maintainer comment such as `patch`, `minor`, `major`, `3`, `2`, or `1`.
+- `.github/workflows/release-version.yml`: runs from trusted base-branch code, comments on PRs with valid release increments, and requires a maintainer comment such as `patch`, `minor`, `major`, `3`, `2`, or `1`.
 - `.github/workflows/container.yml`: publishes after CI passes on a push to `main`; it reads the merged PR release increment, bumps `pyproject.toml` and generated deployment tags on `main`, then builds the image.
 - Merged PR to `main`: publishes `ghcr.io/esatt10/syncsage:<pyproject version>`. Direct pushes to `main` are not releaseable because there is no PR release-increment comment to read.
 - The workflow uses repository `GITHUB_TOKEN` permissions with `packages: write`.
