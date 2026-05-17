@@ -44,10 +44,10 @@ Override the Helm image with `--set image.repository=... --set image.tag=...` wh
 
 ## CI and container registry
 
-The GitHub Actions workflow at `.github/workflows/container.yml` validates pull requests, builds the root `Dockerfile`, and pushes passing builds to GitHub Container Registry.
+The GitHub Actions workflow at `.github/workflows/container.yml` validates pull requests, builds the root `Dockerfile`, and pushes passing builds to GitHub Container Registry. The separate `.github/workflows/release-tag.yml` workflow checks release labeling without rerunning container CI on label changes.
 
 - Pull request to `main`: runs ruff correctness lint, dependency checks, source compilation, pytest on Python 3.11 and 3.12, package build, Docker Compose validation, Docker image build, and image smoke tests.
-- Pull request release labeling: exactly one PR label must match `#.#.#`, such as `1.2.3`; labels like `v1.2.3` are rejected.
+- Pull request release labeling: exactly one PR label must match `#.#.#`, such as `1.2.3`; labels like `v1.2.3` are rejected. Adding or removing labels reruns only the release-label workflow.
 - Merged PR or direct patch to `main`: runs the same checks, then publishes `ghcr.io/esatt10/syncsage:latest` and `ghcr.io/esatt10/syncsage:sha-<commit>`.
 - The workflow uses repository `GITHUB_TOKEN` permissions with `packages: write`.
 

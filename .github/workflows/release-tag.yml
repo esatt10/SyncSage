@@ -1,0 +1,43 @@
+name: Release Tag Check
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
+      - unlabeled
+
+permissions:
+  contents: read
+
+jobs:
+  release-tag:
+    name: Release tag check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Require semver release label
+        env:
+          PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          labels = json.loads(os.environ.get("PR_LABELS", "[]"))
+          release_labels = [label for label in labels if re.fullmatch(r"\d+\.\d+\.\d+", label)]
+
+          if len(release_labels) != 1:
+              print("Pull request labels: " + (", ".join(labels) if labels else "(none)"))
+              print("Add exactly one release label matching #.#.#, for example 1.2.3.")
+              print("Do not prefix the label with v.")
+              sys.exit(1)
+
+          print(f"Release label accepted: {release_labels[0]}")
+          PY
