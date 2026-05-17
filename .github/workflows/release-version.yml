@@ -1,7 +1,5 @@
 name: Release Version Check
 
-# This workflow checks that the version in the codebase is aligned with the version in the pull request title and that the release increment selection is valid.
-
 on:
   pull_request_target:
     branches:
