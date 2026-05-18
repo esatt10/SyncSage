@@ -1,6 +1,6 @@
 # SyncSage
 
-SyncSage is a lightweight, Docker-first MCP knowledge graph server for indexing local repositories, Markdown notes, documents, and Obsidian vaults. It keeps graph/search state fresh with startup validation, debounced file watching, scheduled fallback sync, and explicit agent-triggered refreshes.
+SyncSage is a lightweight, Docker-first MCP knowledge graph server for indexing local repositories, Markdown notes, documents, and Obsidian vaults. It keeps graph/search state fresh with startup validation, debounced file watching, scheduled fallback sync, and explicit agent-triggered refreshes. This project is an active prototype with the potential for functionality to behave unexpectantly. If you experience this, please submit an issue to the backlog.
 
 ## What SyncSage provides
 
