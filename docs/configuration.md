@@ -254,6 +254,19 @@ Each source item supports:
 
 ---
 
+
+## Release/version alignment (important for merges)
+
+When a PR changes deployable server behavior and is merged, the release/version check expects a **new image version**. In practice:
+
+- `pyproject.toml` version and deployment image tags must remain aligned for a release.
+- `deployment.compose.image_tag` in `syncsage.example.yaml` is one of the generated references that should be incremented to the new server version during release prep.
+- Use `python scripts/sync_version.py --check` in CI/local validation to confirm all generated version references are synchronized.
+
+If this check fails on merge/release automation, bump the project version and re-run the sync script so config and deployment manifests match.
+
+---
+
 ## Deployment modality examples
 
 ### 1) Local developer workstation (Docker Compose)
