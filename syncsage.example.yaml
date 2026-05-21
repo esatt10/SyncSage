@@ -122,10 +122,10 @@ security:
   default_exclude_secrets: true
 
 sources:
-  - name: primary-repository
+  - name: syncsage-repo
     type: repository
-    path: /workspace/repository
-    description: Primary repository mounted into the SyncSage workspace
+    path: /workspace/SyncSage
+    description: SyncSage repository itself (use this repo as the example source)
     enabled: true
     include:
       - "**/*.py"
