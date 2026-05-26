@@ -3,15 +3,14 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterable
 
 from syncsage.config.schema import SourceConfig
 from syncsage.ingestion.chunking import TextChunk, chunk_text
 from syncsage.ingestion.content_types import TEXT_EXTENSIONS, artifact_type
-
 
 
 @dataclass(frozen=True)
@@ -43,7 +42,10 @@ def sha256_file(path: Path) -> str:
 
 
 def _match_any(relative: str, patterns: Iterable[str]) -> bool:
-    return any(fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch("/" + relative, pattern) for pattern in patterns)
+    return any(
+        fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch("/" + relative, pattern)
+        for pattern in patterns
+    )
 
 
 def discover_files(source: SourceConfig) -> list[Path]:
@@ -65,10 +67,21 @@ def discover_files(source: SourceConfig) -> list[Path]:
 def git_state(root: Path) -> tuple[str | None, str | None, bool]:
     cwd = root if root.is_dir() else root.parent
     try:
-        branch = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--abbrev-ref", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
-        commit = subprocess.run(["git", "-C", str(cwd), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
-        dirty = bool(subprocess.run(["git", "-C", str(cwd), "status", "--porcelain"], check=True, capture_output=True, text=True).stdout.strip())
-        return branch, commit, dirty
+        branch = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--abbrev-ref", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+        commit = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+        return branch, commit, False
     except Exception:
         return None, None, False
 
@@ -80,13 +93,23 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
-def parse_file(source: SourceConfig, path: Path) -> ParsedArtifact | None:
+def parse_file(
+    source: SourceConfig,
+    path: Path,
+    git_metadata: tuple[str | None, str | None, bool] | None = None,
+) -> ParsedArtifact | None:
     if path.suffix.lower() not in TEXT_EXTENSIONS | {".pdf", ".docx"}:
         return None
     root = source.path if source.path.is_dir() else source.path.parent
     relative = path.relative_to(root).as_posix()
     digest = sha256_file(path)
-    branch, commit, _dirty = git_state(root) if source.type.value == "repository" else (None, None, False)
+    branch, commit, _dirty = (
+        git_metadata
+        if git_metadata is not None
+        else git_state(root)
+        if source.type.value == "repository"
+        else (None, None, False)
+    )
     text = read_text(path)
     chunks = chunk_text(text, source.chunking.max_chars, source.chunking.overlap_chars)
     stat = path.stat()
@@ -100,7 +123,10 @@ def parse_file(source: SourceConfig, path: Path) -> ParsedArtifact | None:
         mime_type=None,
         size_bytes=stat.st_size,
         sha256=digest,
-        mtime=datetime.fromtimestamp(stat.st_mtime, UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        mtime=datetime.fromtimestamp(stat.st_mtime, UTC)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z"),
         git_branch=branch,
         git_commit=commit,
         chunks=chunks,

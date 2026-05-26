@@ -5,7 +5,7 @@ from typing import Literal
 
 from syncsage.config.schema import SourceConfig, SyncSageConfig
 from syncsage.graph.builder import GraphBuilder
-from syncsage.ingestion.pipeline import discover_files, parse_file, utc_now
+from syncsage.ingestion.pipeline import discover_files, git_state, parse_file, utc_now
 from syncsage.persistence.graph_store import GraphStore
 from syncsage.persistence.manifest import ManifestStore
 from syncsage.persistence.paths import StatePaths
@@ -27,7 +27,12 @@ class SyncResult:
 
 
 class SyncEngine:
-    def __init__(self, config: SyncSageConfig, paths: StatePaths | None = None, state: StateStore | None = None):
+    def __init__(
+        self,
+        config: SyncSageConfig,
+        paths: StatePaths | None = None,
+        state: StateStore | None = None,
+    ):
         self.config = config
         self.paths = paths or StatePaths.from_config(config)
         self.paths.ensure()
@@ -52,7 +57,11 @@ class SyncEngine:
         return results
 
     def sync_all(self, mode: SyncMode = "incremental") -> list[SyncResult]:
-        return [self.sync_source(source.name, mode) for source in self.config.sources if source.enabled]
+        return [
+            self.sync_source(source.name, mode)
+            for source in self.config.sources
+            if source.enabled
+        ]
 
     def sync_source(self, source_name: str, mode: SyncMode = "incremental") -> SyncResult:
         source = self._source(source_name)
@@ -61,8 +70,13 @@ class SyncEngine:
             artifacts = manifest.setdefault("artifacts", {})
             indexed = 0
             skipped = 0
+            git_metadata = (
+                git_state(source.path)
+                if source.type.value == "repository"
+                else None
+            )
             for path in discover_files(source):
-                parsed = parse_file(source, path)
+                parsed = parse_file(source, path, git_metadata)
                 if parsed is None:
                     continue
                 previous = artifacts.get(parsed.relative_path)
@@ -87,7 +101,10 @@ class SyncEngine:
                 }
                 chunk_rows = [
                     {
-                        "id": f"chunk:{source.name}:{parsed.relative_path}:sha256={chunk.text_hash}:chunk={chunk.index:04d}",
+                        "id": (
+                            f"chunk:{source.name}:{parsed.relative_path}:"
+                            f"sha256={chunk.text_hash}:chunk={chunk.index:04d}"
+                        ),
                         "artifact_id": parsed.id,
                         "source_id": source.name,
                         "chunk_index": chunk.index,
@@ -103,13 +120,25 @@ class SyncEngine:
                 ]
                 self.state.replace_artifact_chunks(artifact_row, chunk_rows)
                 self.graph_builder.add_artifact(source, parsed)
-                artifacts[parsed.relative_path] = {"sha256": parsed.sha256, "artifact_id": parsed.id, "last_indexed_at": now, "git_branch": parsed.git_branch, "git_commit": parsed.git_commit}
+                artifacts[parsed.relative_path] = {
+                    "sha256": parsed.sha256,
+                    "artifact_id": parsed.id,
+                    "last_indexed_at": now,
+                    "git_branch": parsed.git_branch,
+                    "git_commit": parsed.git_commit,
+                }
                 indexed += 1
             manifest["last_indexed_at"] = utc_now()
             self.manifests.save(source.name, manifest)
             self.graph_store.save(self.config.knowledge_base_id, self.graph_builder.graph)
             self.state.mark_source_indexed(source.name, utc_now())
-            return SyncResult(source.name, indexed, skipped, self.graph_builder.graph.number_of_nodes(), self.graph_builder.graph.number_of_edges())
+            return SyncResult(
+                source.name,
+                indexed,
+                skipped,
+                self.graph_builder.graph.number_of_nodes(),
+                self.graph_builder.graph.number_of_edges(),
+            )
 
     @property
     def stats(self) -> dict[str, int]:
@@ -124,7 +153,11 @@ class SyncEngine:
         from syncsage.search.hybrid import HybridSearch
         from syncsage.search.sqlite_store import SearchStore
 
-        return HybridSearch(SearchStore(self.state)).search_context(self.config.knowledge_base_id, query, max_results=max_results)
+        return HybridSearch(SearchStore(self.state)).search_context(
+            self.config.knowledge_base_id,
+            query,
+            max_results=max_results,
+        )
 
     def export_obsidian_notes(self, vault_path=None) -> dict:
         from syncsage.obsidian.exporter import ObsidianExporter
