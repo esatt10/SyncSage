@@ -2,7 +2,7 @@ deployment:
   compose:
     image_repository: ghcr.io/esatt10/syncsage
     image_tag: 0.1.6
-    workspace_path: ./workspace
+    workspace_path: .
     vault_path: ./vault
 
 syncsage:
@@ -51,11 +51,11 @@ search:
     enabled: true
     engine: sqlite_fts5
   embeddings:
-    enabled: false
+    enabled: true
     provider: local
     model: sentence-transformers/all-MiniLM-L6-v2
   vector_store:
-    enabled: false
+    enabled: true
     engine: chroma
     path: /state/vector
   ranking:
@@ -98,7 +98,7 @@ obsidian:
   create_index_notes: true
   create_source_notes: true
   create_file_notes: true
-  create_chunk_notes: false
+  create_chunk_notes: true
   create_canvas: true
   frontmatter:
     include_source_id: true
@@ -124,8 +124,8 @@ security:
 sources:
   - name: syncsage-repo
     type: repository
-    path: /workspace/SyncSage
-    description: SyncSage repository itself (use this repo as the example source)
+    path: /workspace
+    description: SyncSage repository mounted from the cloned repo root
     enabled: true
     include:
       - "**/*.py"
@@ -144,9 +144,15 @@ sources:
       - "**/*.key"
       - "**/__pycache__/**"
       - "**/.venv/**"
+      - "**/.syncsage/**"
       - "**/node_modules/**"
       - "**/dist/**"
       - "**/build/**"
+      - "docs/**"
+      - "exports/**"
+      - "state/**"
+      - "vault/**"
+      - "workspace/**"
     repo:
       branch_policy: current
       include_uncommitted: true
@@ -169,7 +175,7 @@ sources:
 
   - name: existing-obsidian-vault
     type: obsidian_vault
-    path: /workspace/obsidian-vault
+    path: /vault
     description: Optional existing Obsidian vault to index as a source
     enabled: false
     include:
@@ -182,9 +188,10 @@ sources:
       on_startup: true
       on_file_change: debounce
 
-  - name: documents
+  - name: syncsage-docs
     type: document_folder
-    path: /workspace/documents
+    path: /workspace/docs
+    description: SyncSage documentation folder from the cloned repo root
     enabled: true
     include:
       - "**/*.pdf"

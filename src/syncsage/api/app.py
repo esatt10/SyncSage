@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -17,6 +19,9 @@ from syncsage.search.hybrid import HybridSearch
 from syncsage.search.sqlite_store import SearchStore
 from syncsage.sync.engine import SyncEngine
 from syncsage.version import __version__
+
+
+logger = logging.getLogger(__name__)
 
 
 class SearchRequest(BaseModel):
@@ -43,7 +48,27 @@ def create_app(config: SyncSageConfig | None = None, config_path: str | Path | N
     SourceRegistry(config, state).initialize()
     engine = SyncEngine(config, paths, state)
     search = HybridSearch(SearchStore(state))
-    app = FastAPI(title="SyncSage", version=__version__)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        startup_sources = [
+            source.name for source in config.sources if source.enabled and source.sync.on_startup
+        ]
+        if startup_sources:
+            logger.info("Running startup sync for sources: %s", ", ".join(startup_sources))
+            results = engine.startup()
+            app.state.startup_sync_results = results
+            indexed = sum(result.indexed_artifacts for result in results)
+            skipped = sum(result.skipped_artifacts for result in results)
+            logger.info(
+                "Startup sync complete: sources=%s indexed=%s skipped=%s",
+                len(results),
+                indexed,
+                skipped,
+            )
+        yield
+
+    app = FastAPI(title="SyncSage", version=__version__, lifespan=lifespan)
     app.state.config = config
     app.state.state = state
     app.state.engine = engine
