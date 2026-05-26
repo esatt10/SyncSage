@@ -20,7 +20,6 @@ from syncsage.search.sqlite_store import SearchStore
 from syncsage.sync.engine import SyncEngine
 from syncsage.version import __version__
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -38,7 +37,10 @@ class SyncRequest(BaseModel):
     mode: str = "incremental"
 
 
-def create_app(config: SyncSageConfig | None = None, config_path: str | Path | None = None) -> FastAPI:
+def create_app(
+    config: SyncSageConfig | None = None,
+    config_path: str | Path | None = None,
+) -> FastAPI:
     if config is None:
         config = load_config(config_path or "/config/syncsage.yaml")
     paths = StatePaths.from_config(config)
@@ -114,11 +116,23 @@ def create_app(config: SyncSageConfig | None = None, config_path: str | Path | N
 
     @app.post("/search")
     def search_context(req: SearchRequest) -> dict:
-        return search.search_context(req.knowledge_base or config.knowledge_base_id, req.query, req.mode, req.max_results, req.source_name)
+        return search.search_context(
+            req.knowledge_base or config.knowledge_base_id,
+            req.query,
+            req.mode,
+            req.max_results,
+            req.source_name,
+        )
 
     @app.post("/relevant-files")
     def relevant_files(req: SearchRequest) -> dict:
-        payload = search.search_context(req.knowledge_base or config.knowledge_base_id, req.query, "hybrid", req.max_results, req.source_name)
+        payload = search.search_context(
+            req.knowledge_base or config.knowledge_base_id,
+            req.query,
+            "hybrid",
+            req.max_results,
+            req.source_name,
+        )
         seen = set()
         files = []
         for result in payload["results"]:
