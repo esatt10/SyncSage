@@ -91,6 +91,15 @@ CREATE TABLE IF NOT EXISTS sync_events (
   details_json TEXT,
   error_json TEXT
 );
+CREATE TABLE IF NOT EXISTS source_checkpoints (
+  source_id TEXT PRIMARY KEY,
+  connector_type TEXT NOT NULL,
+  cursor_json TEXT NOT NULL,
+  high_watermark_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  status TEXT NOT NULL,
+  FOREIGN KEY (source_id) REFERENCES sources(id)
+);
 """
 
 
@@ -155,7 +164,7 @@ class StateStore:
                 path=excluded.path,
                 enabled=excluded.enabled,
                 config_json=excluded.config_json,
-                last_status=excluded.last_status""",
+                last_status=COALESCE(sources.last_status, excluded.last_status)""",
             (
                 source_id,
                 kb_id,
@@ -234,6 +243,103 @@ class StateStore:
             (now, status, source_id),
         )
         self.conn.commit()
+
+    def mark_source_status(self, source_id: str, status: str) -> None:
+        self.conn.execute(
+            "UPDATE sources SET last_status=? WHERE id=?",
+            (status, source_id),
+        )
+        self.conn.commit()
+
+    def get_source_checkpoint(self, source_id: str) -> dict[str, Any] | None:
+        rows = self.rows(
+            """SELECT source_id, connector_type, cursor_json, high_watermark_json,
+                      updated_at, status
+               FROM source_checkpoints WHERE source_id=?""",
+            (source_id,),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "source_id": row["source_id"],
+            "connector_type": row["connector_type"],
+            "cursor": json.loads(row["cursor_json"] or "{}"),
+            "high_watermark": json.loads(row["high_watermark_json"] or "{}"),
+            "updated_at": row["updated_at"],
+            "status": row["status"],
+        }
+
+    def set_source_checkpoint(
+        self,
+        source_id: str,
+        connector_type: str,
+        cursor: dict[str, Any],
+        high_watermark: dict[str, Any],
+        updated_at: str,
+        status: str = "healthy",
+    ) -> None:
+        self.conn.execute(
+            """INSERT INTO source_checkpoints(
+                source_id,connector_type,cursor_json,high_watermark_json,updated_at,status
+            )
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(source_id) DO UPDATE SET
+                connector_type=excluded.connector_type,
+                cursor_json=excluded.cursor_json,
+                high_watermark_json=excluded.high_watermark_json,
+                updated_at=excluded.updated_at,
+                status=excluded.status""",
+            (
+                source_id,
+                connector_type,
+                json.dumps(cursor, default=str, sort_keys=True),
+                json.dumps(high_watermark, default=str, sort_keys=True),
+                updated_at,
+                status,
+            ),
+        )
+        self.conn.commit()
+
+    def list_source_checkpoints(self) -> list[dict[str, Any]]:
+        rows = self.rows(
+            """SELECT source_id, connector_type, cursor_json, high_watermark_json,
+                      updated_at, status
+               FROM source_checkpoints ORDER BY source_id"""
+        )
+        return [
+            {
+                "source_id": row["source_id"],
+                "connector_type": row["connector_type"],
+                "cursor": json.loads(row["cursor_json"] or "{}"),
+                "high_watermark": json.loads(row["high_watermark_json"] or "{}"),
+                "updated_at": row["updated_at"],
+                "status": row["status"],
+            }
+            for row in rows
+        ]
+
+    def delete_source_artifacts(self, source_id: str) -> int:
+        rows = self.rows("SELECT COUNT(*) AS c FROM artifacts WHERE source_id=?", (source_id,))
+        count = int(rows[0]["c"]) if rows else 0
+        with self.conn:
+            self.conn.execute("DELETE FROM chunks_fts WHERE source_id=?", (source_id,))
+            self.conn.execute("DELETE FROM chunks WHERE source_id=?", (source_id,))
+            self.conn.execute("DELETE FROM symbols WHERE source_id=?", (source_id,))
+            self.conn.execute("DELETE FROM artifacts WHERE source_id=?", (source_id,))
+        return count
+
+    def artifact_state(self, source_id: str, artifact_id: str) -> dict[str, Any] | None:
+        rows = self.rows(
+            """SELECT artifacts.id, artifacts.sha256, artifacts.status,
+                      COUNT(chunks.id) AS chunk_count
+               FROM artifacts
+               LEFT JOIN chunks ON chunks.artifact_id=artifacts.id
+               WHERE artifacts.source_id=? AND artifacts.id=?
+               GROUP BY artifacts.id""",
+            (source_id, artifact_id),
+        )
+        return dict(rows[0]) if rows else None
 
     def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         return list(self.conn.execute(sql, params))

@@ -112,7 +112,10 @@ def create_app(
 
     @app.get("/sync/status")
     def sync_status() -> dict:
-        return {"sources": SourceRegistry(config, state).list_sources()}
+        return {
+            "sources": SourceRegistry(config, state).list_sources(),
+            "checkpoints": state.list_source_checkpoints(),
+        }
 
     @app.post("/search")
     def search_context(req: SearchRequest) -> dict:

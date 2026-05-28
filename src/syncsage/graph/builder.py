@@ -60,3 +60,12 @@ class GraphBuilder:
                 {"source_id": source.name, "artifact_id": artifact.id, "start_line": chunk.start_line, "end_line": chunk.end_line, "text_hash": chunk.text_hash, "summary": chunk.text[:180], "token_estimate": chunk.token_estimate},
             )
             self.upsert_edge(artifact.id, chunk_id, "has_chunk", {"source_id": source.name})
+
+    def remove_source_content(self, source_name: str) -> None:
+        source_node = f"source:{self.kb_id}:{source_name}"
+        nodes = [
+            node_id
+            for node_id, attrs in self.graph.nodes(data=True)
+            if attrs.get("source_id") == source_name or node_id == source_node
+        ]
+        self.graph.remove_nodes_from(nodes)

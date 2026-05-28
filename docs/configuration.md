@@ -94,7 +94,7 @@ The local `syncsage.yaml` copy is intentionally ignored by git because it contai
 | `graph_snapshot_interval_seconds` | integer | `900` | Graph snapshot cadence. |
 | `sqlite_path` | absolute path | `/state/syncsage.db` | Main SQLite database file. |
 | `graph_path` | absolute path | `/state/graphs` | Directory for graph snapshots. |
-| `manifest_path` | absolute path | `/state/manifests` | Directory for source manifests/checkpoints. |
+| `manifest_path` | absolute path | `/state/manifests` | Directory for source manifests. Connector checkpoints are stored in SQLite. |
 | `max_state_size_gb` | integer | `10` | Soft state budget for cleanup/policy logic. |
 | `compression.enabled` | bool | `true` (example) | Optional compression toggle for persisted artifacts. |
 | `compression.algorithm` | string | `zstd` (example) | Compression codec name. |
@@ -172,6 +172,15 @@ The local `syncsage.yaml` copy is intentionally ignored by git because it contai
 | `concurrency.max_parallel_files` | integer | `8` | Per-source file concurrency cap. |
 | `concurrency.lock_timeout_seconds` | integer | `120` | Lock acquisition timeout. |
 
+### Manual sync modes
+
+| Mode | Behavior |
+|---|---|
+| `incremental` | Uses connector checkpoints and item/content hashes to skip unchanged artifacts. |
+| `full` | Rebuilds artifact, chunk, graph, manifest, and checkpoint state for the selected source. |
+| `validate_only` | Checks connector health and source readability without writing index artifacts or manifests. |
+| `repair` | Rebuilds only missing or invalid artifact/chunk state detected from manifests and database rows. |
+
 ---
 
 ## `obsidian` (output options)
@@ -215,7 +224,7 @@ Each source item supports:
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `name` | string | none | Unique source id/name. |
-| `type` | enum | `single_file` | One of `repository`, `markdown_folder`, `obsidian_vault`, `document_folder`, `web_collection`, `single_file`. |
+| `type` | enum | `single_file` | One of `repository`, `markdown_folder`, `obsidian_vault`, `document_folder`, `web_collection`, `single_file`, `s3`, `api`. |
 | `path` | absolute path | none | Filesystem path for source root (or file). |
 | `description` | string/null | null | Human-readable context for operators. |
 | `enabled` | bool | `true` | Disable without deleting config. |
@@ -224,6 +233,7 @@ Each source item supports:
 | `repo.*` | object | see below | Repository-specific behavior. |
 | `chunking.*` | object | see below | Chunking strategy/size overlap. |
 | `sync.*` | object | see below | Source-specific trigger policies. |
+| `connector.*` | object | see below | Connector feature flags and provider-specific options. |
 | `urls` | list[string] | `[]` | URL list (mainly for `web_collection`). |
 
 ### `sources[].repo`
@@ -251,6 +261,36 @@ Each source item supports:
 | `on_file_change` | bool/string | `debounce` | File-change trigger behavior. |
 | `on_git_commit` | bool | `true` | React to git commits for this source. |
 | `interval_seconds` | int/null | `null` | Source-specific scheduled sync interval. |
+
+### `sources[].connector`
+
+Experimental non-filesystem connectors are disabled until explicitly enabled per source.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `allow_experimental` | bool | `false` | Required for `web_collection`, `api`, and `s3` connector execution. |
+| `request_timeout_seconds` | integer | `10` | HTTP/API request timeout. |
+| `headers` | map[string,string] | `{}` | Optional HTTP headers for web/API requests. |
+| `api_endpoint` | string/null | `null` | JSON item listing endpoint for `api` sources. |
+| `api_items_field` | string | `items` | JSON field containing API item records. |
+| `api_content_field` | string | `content` | JSON field containing inline item content. |
+| `s3_bucket` | string/null | `null` | Bucket name for `s3` sources. |
+| `s3_prefix` | string | empty | Object prefix for `s3` sources. |
+
+Example `web_collection` source:
+
+```yaml
+sources:
+  - name: public-docs
+    type: web_collection
+    path: /workspace
+    urls:
+      - https://example.com/docs/overview.md
+    connector:
+      allow_experimental: true
+    include:
+      - "**/*.md"
+```
 
 ---
 

@@ -18,6 +18,8 @@ class SourceType(str, Enum):
     document_folder = "document_folder"
     web_collection = "web_collection"
     single_file = "single_file"
+    s3 = "s3"
+    api = "api"
 
 @dataclass
 class ModelMixin:
@@ -141,6 +143,17 @@ class SourceSyncSettings(ModelMixin):
     interval_seconds: int | None = None
 
 @dataclass
+class SourceConnectorSettings(ModelMixin):
+    allow_experimental: bool = False
+    request_timeout_seconds: int = 10
+    headers: dict[str, str] = field(default_factory=dict)
+    api_endpoint: str | None = None
+    api_items_field: str = "items"
+    api_content_field: str = "content"
+    s3_bucket: str | None = None
+    s3_prefix: str = ""
+
+@dataclass
 class SourceConfig(ModelMixin):
     name: str
     type: SourceType
@@ -152,6 +165,7 @@ class SourceConfig(ModelMixin):
     repo: RepoSettings = field(default_factory=RepoSettings)
     chunking: ChunkingSettings = field(default_factory=ChunkingSettings)
     sync: SourceSyncSettings = field(default_factory=SourceSyncSettings)
+    connector: SourceConnectorSettings = field(default_factory=SourceConnectorSettings)
     urls: list[str] = field(default_factory=list)
 
 @dataclass
@@ -192,7 +206,17 @@ class SyncSageConfig(ModelMixin):
             if "repo" in raw: raw["repo"] = build(RepoSettings, raw["repo"])
             if "chunking" in raw: raw["chunking"] = build(ChunkingSettings, raw["chunking"])
             if "sync" in raw: raw["sync"] = build(SourceSyncSettings, raw["sync"])
-            cfg.sources.append(SourceConfig(**{k: v for k, v in raw.items() if k in SourceConfig.__dataclass_fields__}))
+            if "connector" in raw:
+                raw["connector"] = build(SourceConnectorSettings, raw["connector"])
+            cfg.sources.append(
+                SourceConfig(
+                    **{
+                        k: v
+                        for k, v in raw.items()
+                        if k in SourceConfig.__dataclass_fields__
+                    }
+                )
+            )
         state = cfg.syncsage.state_path
         cfg.storage.sqlite_path = cfg.storage.sqlite_path or state / "syncsage.db"
         cfg.storage.graph_path = cfg.storage.graph_path or state / "graphs"

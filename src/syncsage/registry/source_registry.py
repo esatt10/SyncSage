@@ -31,4 +31,13 @@ class SourceRegistry:
         self.state.upsert_source(source.name, self.config.knowledge_base_id, source.name, source.type.value, str(source.path), source.enabled, source.model_dump(mode="json"))
 
     def list_sources(self) -> list[dict]:
-        return [dict(row) for row in self.state.rows("SELECT * FROM sources ORDER BY name")]
+        checkpoints = {
+            checkpoint["source_id"]: checkpoint
+            for checkpoint in self.state.list_source_checkpoints()
+        }
+        sources = []
+        for row in self.state.rows("SELECT * FROM sources ORDER BY name"):
+            source = dict(row)
+            source["checkpoint"] = checkpoints.get(source["id"])
+            sources.append(source)
+        return sources

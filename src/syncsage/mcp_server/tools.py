@@ -182,12 +182,8 @@ class SyncSageTools:
     def get_sync_status(self, knowledge_base: str) -> dict:
         self._require_knowledge_base(knowledge_base)
         return {
-            "sources": [
-                dict(row)
-                for row in self.state.rows(
-                    "SELECT name,last_status,last_indexed_at FROM sources ORDER BY name"
-                )
-            ]
+            "sources": SourceRegistry(self.config, self.state).list_sources(),
+            "checkpoints": self.state.list_source_checkpoints(),
         }
 
     def _require_knowledge_base(self, knowledge_base: str | None) -> None:
