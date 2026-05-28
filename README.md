@@ -260,6 +260,23 @@ Important endpoints:
 - `GET /graph/export/cytoscape-json`
 - `POST /obsidian/export`
 
+## Web UI
+
+A light React front end lives in [`ui/`](ui). It is a separate workload that
+talks to the SyncSage HTTP API, so the indexing container is unchanged. It
+provides a Cytoscape knowledge-graph workspace (drill into sub-networks, filter
+by edge type, inspect relationships and content), source management with
+add-a-local-directory registration, a full configuration editor (form + raw YAML
++ diff preview), and an Explain mode with a LaTeX-backed reference panel. The
+underlying HTTP routes are defined in `src/syncsage/api/app.py` and described in
+[docs/ui_recommendation.md](docs/ui_recommendation.md).
+
+```bash
+cd ui && npm install && npm run dev   # dev server on http://localhost:5173
+```
+
+See [ui/README.md](ui/README.md) for build and deployment options.
+
 ## Deployment
 
 Supported deployment paths:

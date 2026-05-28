@@ -84,7 +84,11 @@ def main(argv: list[str] | None = None) -> int:
             args.profile,
             parse_override_pairs(args.overrides),
         )
-        uvicorn.run(create_app(cfg), host=cfg.server.host, port=cfg.server.port)
+        uvicorn.run(
+            create_app(cfg, config_path=args.config),
+            host=cfg.server.host,
+            port=cfg.server.port,
+        )
         return 0
     if args.command == "validate":
         from syncsage.config.loader import load_config, validate_source_paths
@@ -177,7 +181,11 @@ def main(argv: list[str] | None = None) -> int:
         from syncsage.config.loader import load_config
 
         cfg = load_config(Path(args.config))
-        uvicorn.run(create_app(cfg), host=cfg.server.host, port=cfg.server.port)
+        uvicorn.run(
+            create_app(cfg, config_path=args.config),
+            host=cfg.server.host,
+            port=cfg.server.port,
+        )
         return 0
     if args.command == "mcp":
         from syncsage.config.loader import load_config

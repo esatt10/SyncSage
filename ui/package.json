@@ -1,0 +1,35 @@
+{
+  "name": "syncsage-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Light React front end for SyncSage: knowledge-graph navigation, source management, and configuration.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.51.1",
+    "cytoscape": "^3.30.0",
+    "js-yaml": "^4.1.0",
+    "katex": "^0.16.11",
+    "react": "^18.3.1",
+    "react-cytoscapejs": "^2.0.0",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^9.0.1",
+    "react-router-dom": "^6.25.1",
+    "rehype-katex": "^7.0.0",
+    "remark-math": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/cytoscape": "^3.21.5",
+    "@types/js-yaml": "^4.0.9",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.5.3",
+    "vite": "^5.3.4"
+  }
+}

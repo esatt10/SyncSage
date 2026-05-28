@@ -13,7 +13,11 @@ def main() -> None:
     config_path = os.environ.get("SYNCSAGE_CONFIG", "/config/syncsage.yaml")
     config = load_config(config_path)
     configure_logging(config.syncsage.log_level)
-    uvicorn.run(create_app(config), host=config.server.host, port=config.server.port)
+    uvicorn.run(
+        create_app(config, config_path=config_path),
+        host=config.server.host,
+        port=config.server.port,
+    )
 
 
 if __name__ == "__main__":

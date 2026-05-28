@@ -1,10 +1,11 @@
 # SyncSage Web UI — Design Recommendation
 
-> Status: proposal / design recommendation. No application code is introduced by
-> this document. It specifies a **light React front end** for SyncSage, grounded
-> in the existing FastAPI surface (`src/syncsage/api/app.py`), the configuration
-> schema (`src/syncsage/config/schema.py`), and the knowledge-graph model
-> (`docs/graph_model.md`).
+> Status: **implemented**. This document originated as a design recommendation
+> and has since been executed. The light React front end lives in [`ui/`](../ui)
+> and the supporting HTTP routes were added to `src/syncsage/api/app.py`. The
+> design below is retained as the rationale, grounded in the FastAPI surface, the
+> configuration schema (`src/syncsage/config/schema.py`), and the knowledge-graph
+> model (`docs/graph_model.md`). See §11 for the as-built route list.
 
 ## 1. Goals and constraints
 
@@ -53,20 +54,19 @@ them).
 | Obsidian export / preview | `POST /obsidian/export` | Exists |
 | Health / readiness / liveness badges | `GET /health`, `GET /ready`, `GET /metrics` | Exists |
 | Knowledge-base list | `GET /knowledge-bases` | Exists |
-| Expand a node's neighbors (sub-network) | `SyncSageTools.get_graph_neighbors`, `get_graph_slice` | **MCP-only today** — needs a thin HTTP route to be UI-reachable. |
-| Explain a node | `SyncSageTools.explain_node` | MCP-only today |
-| File summary / repo map | `get_file_summary`, `get_repo_map` | MCP-only today |
-| Register a source from a directory | `SyncSageTools.register_source` (+ `security.path_policy.resolve_under`) | MCP-only today |
-| Browse the local filesystem to pick a directory | — | **Gap** — needs a sandboxed `GET /fs/list` route restricted to `allow_workspace_roots`. |
-| Read/write effective config | `config/loader.py` (`effective_config_dict`, `load_layered_config`) | Exists as library calls; **needs** `GET/PUT /config` HTTP routes. |
-| Audit / sync history timeline | `get_sync_history`, `state.list_source_audit_events` | MCP-only today |
+| Expand a node's neighbors (sub-network) | `GET /graph/neighbors`, `GET /graph/slice` | **Added** — thin HTTP wrappers over the same traversal logic as the MCP tools. |
+| Explain a node | `GET /nodes/explain` | Added |
+| File summary / repo map | `GET /files/summary`, `GET /sources/{id}/repo-map` | Added |
+| Register a source from a directory | `POST /sources` (+ `security.path_policy.resolve_under`) | Added |
+| Browse the local filesystem to pick a directory | `GET /fs/list` (allowlist-scoped) | Added |
+| Read/write effective config | `GET /config`, `PUT /config` (validated) | Added |
+| Audit / sync history timeline | `GET /sources/{id}/history` | Added |
 
-**Design consequence:** the UI is mostly assembled from endpoints that already
-exist. The work to make it fully functional is concentrated in a small,
-well-bounded set of HTTP routes that re-expose already-implemented
-`SyncSageTools` methods (graph traversal, register, explain, history) plus two
-new ones (`/fs/list`, `/config`). Keeping that backend work minimal is exactly
-why the read-only graph + search experience can ship first.
+**Design consequence (as built):** the UI is mostly assembled from endpoints that
+already existed. The remaining work was a small, well-bounded set of HTTP routes
+that re-expose already-implemented traversal/register/explain/history logic plus
+two new ones (`/fs/list`, `/config`). All of these now exist in
+`src/syncsage/api/app.py` and are covered by `tests/test_api_ui_routes.py`.
 
 ## 3. Recommended technology
 
@@ -374,18 +374,21 @@ The UI inherits, and must not weaken, the existing controls:
 Each phase is independently shippable and leaves the SyncSage container as its
 own unchanged workload.
 
-## 11. Backend additions this design assumes (not implemented here)
+## 11. Backend routes (as built)
 
-For transparency, the only backend work this UI needs — all thin re-exposures of
-existing, tested logic except the two marked NEW:
+The following routes were added to `src/syncsage/api/app.py` to support the UI.
+All reuse existing security and validation primitives, keep the indexing
+container Python-only, and are covered by `tests/test_api_ui_routes.py`:
 
-- `GET /graph/neighbors`, `GET /graph/slice` → wrap `SyncSageTools.get_graph_neighbors` / `get_graph_slice`.
-- `GET /nodes/{id}/explain` → wrap `explain_node`.
-- `GET /files/summary`, `GET /sources/{name}/repo-map` → wrap `get_file_summary` / `get_repo_map`.
-- `POST /sources` (register), `POST /sources/{name}/promote` → wrap `register_source` / `promote_runtime_source_to_config`.
-- `GET /sources/{name}/history` → wrap `get_sync_history`.
-- `GET /fs/list` **(NEW)** → allowlist-scoped directory listing via `resolve_under`.
-- `GET /config`, `PUT /config` **(NEW)** → effective-config read + validated write via `config/loader.py`.
+- `GET /graph/neighbors`, `GET /graph/slice` → breadth-first traversal mirroring the MCP graph tools (depth clamped 1–10, optional `edge_types` filter).
+- `GET /nodes/explain` → node identity + provenance.
+- `GET /files/summary`, `GET /sources/{id}/repo-map` → indexed content / file listing.
+- `POST /sources` (register, allowlist-scoped, optional `sync_now`), `POST /sources/{id}/promote`, `POST /sources/{id}/disable`, `DELETE /sources/{id}`.
+- `GET /sources/{id}/history` → audit timeline.
+- `GET /fs/list` → allowlist-scoped directory listing via `resolve_under` (rejects paths outside `workspace_root` / `vault_path` / `exports_path` with HTTP 403).
+- `GET /config`, `PUT /config` → effective-config read + validated write (validation mirrors `syncsage doctor`; server-level changes require a restart).
+- CORS is enabled so the UI can run as a separate workload in development.
 
-These keep the indexing container Python-only and reuse the security and
-validation primitives already present in the codebase.
+The pre-built UI can optionally be served by SyncSage itself via
+`SYNCSAGE_UI_DIST`, gated behind `server.ui.enabled` (Option B in §8); by default
+nothing is mounted, so the container image is unchanged.
