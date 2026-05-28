@@ -188,21 +188,28 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        import asyncio
+
         startup_sources = [
             source.name for source in config.sources if source.enabled and source.sync.on_startup
         ]
         if startup_sources:
-            logger.info("Running startup sync for sources: %s", ", ".join(startup_sources))
-            results = engine.startup()
-            app.state.startup_sync_results = results
-            indexed = sum(result.indexed_artifacts for result in results)
-            skipped = sum(result.skipped_artifacts for result in results)
-            logger.info(
-                "Startup sync complete: sources=%s indexed=%s skipped=%s",
-                len(results),
-                indexed,
-                skipped,
-            )
+            loop = asyncio.get_running_loop()
+
+            def _run_startup() -> None:
+                logger.info("Running startup sync for sources: %s", ", ".join(startup_sources))
+                results = engine.startup()
+                app.state.startup_sync_results = results
+                indexed = sum(result.indexed_artifacts for result in results)
+                skipped = sum(result.skipped_artifacts for result in results)
+                logger.info(
+                    "Startup sync complete: sources=%s indexed=%s skipped=%s",
+                    len(results),
+                    indexed,
+                    skipped,
+                )
+
+            loop.run_in_executor(None, _run_startup)
         yield
 
     app = FastAPI(title="SyncSage", version=__version__, lifespan=lifespan)
