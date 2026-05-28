@@ -20,6 +20,20 @@ services:
       retries: 3
       start_period: 20s
 
+  # Optional web UI. A separate workload that serves the static React bundle and
+  # proxies /api/* to the syncsage service above. Bring it up with
+  # `docker compose up --build`; omit it to run SyncSage headless.
+  syncsage-ui:
+    build:
+      context: ./ui
+    image: ${SYNCSAGE_UI_IMAGE:-ghcr.io/esatt10/syncsage-ui:0.1.12}
+    container_name: syncsage-ui
+    restart: unless-stopped
+    ports:
+      - "${SYNCSAGE_UI_PORT:-8080}:80"
+    depends_on:
+      - syncsage
+
 volumes:
   syncsage-state:
   syncsage-exports:
