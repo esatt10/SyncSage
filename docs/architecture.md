@@ -18,14 +18,14 @@ SyncSage is a Docker-first MCP server with an admin API, source registry, sync e
 |---|---|
 | MCP server | Agent-facing tools, resources, and prompts. |
 | Admin API | Health, readiness, source, sync, search, graph, and Obsidian endpoints. |
-| Source registry | Configured and runtime-registered source metadata. |
+| Source registry | Configured and runtime-registered source metadata, lifecycle state, and audit history. |
 | Sync engine | Connector-backed startup validation, incremental sync, scheduled sync, manual sync, and repair orchestration. |
 | Watcher service | Debounced filesystem events for configured paths. |
 | Git monitor | Branch, commit, and working tree state detection without mutating repositories. |
 | Ingestion pipeline | Repository, Markdown, document, HTML/XML, and web artifact parsing. |
 | Graph builder | Stable node/edge upserts plus code, document, and similarity enrichment. |
 | Search indexer | SQLite FTS/path/hybrid indexing with graph-term expansion and optional embeddings later. |
-| Obsidian exporter | Markdown frontmatter, backlinks, source notes, repo maps, and optional canvas files. |
+| Obsidian exporter | Previewable Markdown projection with template profiles, source/concept/file/chunk notes, and optional canvas files. |
 
 ## Persistence split
 

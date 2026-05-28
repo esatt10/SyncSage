@@ -112,6 +112,16 @@ CREATE TABLE IF NOT EXISTS source_checkpoints (
   status TEXT NOT NULL,
   FOREIGN KEY (source_id) REFERENCES sources(id)
 );
+CREATE TABLE IF NOT EXISTS source_audit_events (
+  id TEXT PRIMARY KEY,
+  source_id TEXT,
+  action TEXT NOT NULL,
+  actor TEXT,
+  transport TEXT,
+  client_id TEXT,
+  created_at TEXT NOT NULL,
+  details_json TEXT NOT NULL
+);
 """
 
 
@@ -316,6 +326,26 @@ class StateStore:
         )
         self.conn.commit()
 
+    def set_source_enabled(self, source_id: str, enabled: bool, status: str | None = None) -> None:
+        if status is None:
+            self.conn.execute(
+                "UPDATE sources SET enabled=? WHERE id=?",
+                (int(enabled), source_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE sources SET enabled=?, last_status=? WHERE id=?",
+                (int(enabled), status, source_id),
+            )
+        self.conn.commit()
+
+    def get_source(self, source_id: str) -> dict[str, Any] | None:
+        rows = self.rows(
+            "SELECT * FROM sources WHERE id=? OR name=? LIMIT 1",
+            (source_id, source_id),
+        )
+        return dict(rows[0]) if rows else None
+
     def get_source_checkpoint(self, source_id: str) -> dict[str, Any] | None:
         rows = self.rows(
             """SELECT source_id, connector_type, cursor_json, high_watermark_json,
@@ -394,6 +424,71 @@ class StateStore:
             self.conn.execute("DELETE FROM artifact_terms WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM artifacts WHERE source_id=?", (source_id,))
         return count
+
+    def delete_source(self, source_id: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM chunks_fts WHERE source_id=?", (source_id,))
+            self.conn.execute("DELETE FROM chunks WHERE source_id=?", (source_id,))
+            self.conn.execute("DELETE FROM symbols WHERE source_id=?", (source_id,))
+            self.conn.execute("DELETE FROM artifact_terms WHERE source_id=?", (source_id,))
+            self.conn.execute("DELETE FROM artifacts WHERE source_id=?", (source_id,))
+            self.conn.execute("DELETE FROM source_checkpoints WHERE source_id=?", (source_id,))
+            self.conn.execute("DELETE FROM sources WHERE id=?", (source_id,))
+
+    def append_source_audit_event(
+        self,
+        event_id: str,
+        source_id: str | None,
+        action: str,
+        actor: str | None,
+        transport: str | None,
+        client_id: str | None,
+        created_at: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self.conn.execute(
+            """INSERT INTO source_audit_events(
+                id,source_id,action,actor,transport,client_id,created_at,details_json
+            )
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                event_id,
+                source_id,
+                action,
+                actor,
+                transport,
+                client_id,
+                created_at,
+                json.dumps(details or {}, default=str, sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def list_source_audit_events(
+        self,
+        source_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        where = ""
+        params: list[Any] = []
+        if source_id:
+            where = "WHERE source_id=?"
+            params.append(source_id)
+        params.extend([limit, offset])
+        rows = self.rows(
+            f"""SELECT * FROM source_audit_events
+                {where}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?""",
+            tuple(params),
+        )
+        events = []
+        for row in rows:
+            event = dict(row)
+            event["details"] = json.loads(event.pop("details_json") or "{}")
+            events.append(event)
+        return events
 
     def artifact_state(self, source_id: str, artifact_id: str) -> dict[str, Any] | None:
         rows = self.rows(

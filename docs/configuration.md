@@ -4,6 +4,18 @@ SyncSage reads YAML from `/config/syncsage.yaml` by default. Start from `syncsag
 
 The local `syncsage.yaml` copy is intentionally ignored by git because it contains host-specific mount assumptions. Commit changes to `syncsage.example.yaml` when you want to update the shared pattern. Docker Compose env files generated under `.syncsage/` are ignored.
 
+For a one-line local run, use a profile:
+
+```bash
+syncsage start --profile quickstart --config syncsage.yaml
+```
+
+Config is resolved as base defaults + profile + YAML + `--set` overrides. Inspect the result with:
+
+```bash
+syncsage config show --effective --profile dev --config syncsage.yaml
+```
+
 ## How to use this guide
 
 1. Copy `syncsage.example.yaml` to your runtime config path.
@@ -190,6 +202,7 @@ The local `syncsage.yaml` copy is intentionally ignored by git because it contai
 | `enabled` | bool | `true` | Master toggle for Obsidian exports. |
 | `write_mode` | string | `upsert` | Export strategy (`upsert`, etc.). |
 | `note_root` | string | `SyncSage` | Top-level folder/note namespace in the vault. |
+| `template_profile` | string | `engineering` | One of `engineering`, `research`, or `project-ops`. |
 | `create_index_notes` | bool | `true` | Generate index/navigation notes. |
 | `create_source_notes` | bool | `true` | Generate one note per source. |
 | `create_file_notes` | bool | `true` | Generate one note per file artifact. |
@@ -447,6 +460,8 @@ sources:
 ## Practical tuning checklist
 
 - Start with the example file defaults.
+- Use `syncsage init --profile <name>` to generate a focused starter config.
+- Use `syncsage doctor --profile <name> --config syncsage.yaml` before long-running syncs.
 - Confirm every `sources[].path` is under an allowed security root.
 - Trim `include` patterns first; then harden `exclude` patterns.
 - Keep `scheduler.interval_seconds` enabled as a safety net even when watcher is on.

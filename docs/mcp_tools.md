@@ -43,6 +43,10 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 |---|---|
 | `list_knowledge_bases` | Return registered knowledge bases and status. |
 | `register_source` | Add a source at runtime after path/include/exclude validation. |
+| `list_sources` | List sources with filters, status, and pagination. |
+| `disable_source` | Disable a source without deleting its indexed state. |
+| `remove_source` | Remove a source and its indexed state. |
+| `promote_runtime_source_to_config` | Return a deterministic YAML patch, or write one by policy, for runtime sources. |
 | `sync_source` | Trigger `incremental`, `full`, `validate_only`, or `repair` sync for one source. |
 | `sync_all` | Trigger sync for all enabled sources. |
 | `search_context` | Search graph/search state using keyword, path, graph, hybrid, semantic, or symbol modes. |
@@ -51,8 +55,9 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 | `get_file_summary` | Return a compact summary and provenance for a file. |
 | `get_repo_map` | Return repository structure, important modules, and dependencies. |
 | `explain_node` | Explain a graph node and why it matters. |
-| `export_obsidian_notes` | Write/update Obsidian notes for a knowledge base or source. |
+| `export_obsidian_notes` | Preview or write Obsidian notes for a knowledge base or source. |
 | `get_sync_status` | Return queue, lock, error, freshness, and connector checkpoint status. |
+| `get_sync_history` | Return runtime registration, sync, promotion, disable, and removal audit events. |
 
 ## Resources
 
@@ -62,6 +67,9 @@ syncsage://knowledge-bases/{kb_id}/sources
 syncsage://knowledge-bases/{kb_id}/graph
 syncsage://knowledge-bases/{kb_id}/sources/{source_id}/manifest
 syncsage://knowledge-bases/{kb_id}/sources/{source_id}/repo-map
+syncsage://knowledge-bases/{kb_id}/sources/{source_id}/history
+syncsage://knowledge-bases/{kb_id}/sync-history
+syncsage://knowledge-bases/{kb_id}/graph-slices/{node_id}
 syncsage://knowledge-bases/{kb_id}/nodes/{node_id}
 ```
 

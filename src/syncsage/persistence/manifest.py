@@ -25,3 +25,8 @@ class ManifestStore:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(path)
+
+    def delete(self, source_id: str) -> None:
+        path = self.path_for(source_id)
+        if path.exists():
+            path.unlink()

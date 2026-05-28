@@ -95,6 +95,7 @@ obsidian:
   enabled: true
   write_mode: upsert
   note_root: SyncSage
+  template_profile: engineering
   create_index_notes: true
   create_source_notes: true
   create_file_notes: true

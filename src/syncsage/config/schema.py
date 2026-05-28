@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any
 
 DEFAULT_EXCLUDES = [
-    "**/.git/**", "**/.env", "**/.env.*", "**/*id_rsa*", "**/*id_ed25519*", "**/*.pem", "**/*.key",
-    "**/node_modules/**", "**/__pycache__/**", "**/.venv/**", "**/venv/**", "**/dist/**", "**/build/**",
+    "**/.git/**", "**/.env", "**/.env.*", "**/*id_rsa*", "**/*id_ed25519*",
+    "**/*.pem", "**/*.key", "**/node_modules/**", "**/__pycache__/**",
+    "**/.venv/**", "**/venv/**", "**/dist/**", "**/build/**",
     "**/.mypy_cache/**", "**/.pytest_cache/**",
 ]
 
-class SourceType(str, Enum):
+class SourceType(StrEnum):
     repository = "repository"
     markdown_folder = "markdown_folder"
     obsidian_vault = "obsidian_vault"
@@ -52,7 +53,9 @@ class SyncSageSettings(ModelMixin):
 @dataclass
 class McpSettings(ModelMixin):
     enabled: bool = True
-    transports: dict[str, bool] = field(default_factory=lambda: {"stdio": True, "streamable_http": True, "sse": False})
+    transports: dict[str, bool] = field(
+        default_factory=lambda: {"stdio": True, "streamable_http": True, "sse": False}
+    )
 
 @dataclass
 class ApiSettings(ModelMixin):
@@ -116,6 +119,7 @@ class ObsidianSettings(ModelMixin):
     enabled: bool = True
     write_mode: str = "upsert"
     note_root: str = "SyncSage"
+    template_profile: str = "engineering"
     create_index_notes: bool = True
     create_source_notes: bool = True
     create_file_notes: bool = True
@@ -160,7 +164,17 @@ class SourceConfig(ModelMixin):
     path: Path
     description: str | None = None
     enabled: bool = True
-    include: list[str] = field(default_factory=lambda: ["**/*.py", "**/*.md", "**/*.txt", "**/*.yaml", "**/*.yml", "**/*.toml", "**/*.json"])
+    include: list[str] = field(
+        default_factory=lambda: [
+            "**/*.py",
+            "**/*.md",
+            "**/*.txt",
+            "**/*.yaml",
+            "**/*.yml",
+            "**/*.toml",
+            "**/*.json",
+        ]
+    )
     exclude: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDES))
     repo: RepoSettings = field(default_factory=RepoSettings)
     chunking: ChunkingSettings = field(default_factory=ChunkingSettings)
@@ -179,22 +193,38 @@ class SyncSageConfig(ModelMixin):
     sources: list[SourceConfig] = field(default_factory=list)
 
     @classmethod
-    def model_validate(cls, data: dict[str, Any]) -> "SyncSageConfig":
+    def model_validate(cls, data: dict[str, Any]) -> SyncSageConfig:
         def build(dc, raw):
             raw = raw or {}
             if dc is SyncSageSettings:
                 for key in ("state_path", "vault_path", "workspace_root", "exports_path"):
-                    if key in raw: raw[key] = Path(raw[key])
+                    if key in raw:
+                        raw[key] = Path(raw[key])
             if dc is StorageSettings:
                 for key in ("sqlite_path", "graph_path", "manifest_path"):
-                    if key in raw and raw[key] is not None: raw[key] = Path(raw[key])
+                    if key in raw and raw[key] is not None:
+                        raw[key] = Path(raw[key])
+            if dc is ServerSettings:
+                if "mcp" in raw and isinstance(raw["mcp"], dict):
+                    raw["mcp"] = build(McpSettings, raw["mcp"])
+                if "api" in raw and isinstance(raw["api"], dict):
+                    raw["api"] = build(ApiSettings, raw["api"])
+                if "ui" in raw and isinstance(raw["ui"], dict):
+                    raw["ui"] = build(UiSettings, raw["ui"])
+            if dc is SyncSettings:
+                if "watcher" in raw and isinstance(raw["watcher"], dict):
+                    raw["watcher"] = build(WatcherSettings, raw["watcher"])
+                if "git" in raw and isinstance(raw["git"], dict):
+                    raw["git"] = build(GitSettings, raw["git"])
+                if "scheduler" in raw and isinstance(raw["scheduler"], dict):
+                    raw["scheduler"] = build(SchedulerSettings, raw["scheduler"])
             return dc(**{k: v for k, v in raw.items() if k in dc.__dataclass_fields__})
         cfg = cls(
             syncsage=build(SyncSageSettings, data.get("syncsage")),
-            server=ServerSettings(**{**data.get("server", {})}),
+            server=build(ServerSettings, data.get("server")),
             storage=build(StorageSettings, data.get("storage")),
             search=build(SearchSettings, data.get("search")),
-            sync=SyncSettings(),
+            sync=build(SyncSettings, data.get("sync")),
             obsidian=build(ObsidianSettings, data.get("obsidian")),
             sources=[],
         )
@@ -203,9 +233,12 @@ class SyncSageConfig(ModelMixin):
             raw = dict(raw)
             raw["type"] = SourceType(raw.get("type", "single_file"))
             raw["path"] = Path(raw["path"])
-            if "repo" in raw: raw["repo"] = build(RepoSettings, raw["repo"])
-            if "chunking" in raw: raw["chunking"] = build(ChunkingSettings, raw["chunking"])
-            if "sync" in raw: raw["sync"] = build(SourceSyncSettings, raw["sync"])
+            if "repo" in raw:
+                raw["repo"] = build(RepoSettings, raw["repo"])
+            if "chunking" in raw:
+                raw["chunking"] = build(ChunkingSettings, raw["chunking"])
+            if "sync" in raw:
+                raw["sync"] = build(SourceSyncSettings, raw["sync"])
             if "connector" in raw:
                 raw["connector"] = build(SourceConnectorSettings, raw["connector"])
             cfg.sources.append(
