@@ -1,123 +1,187 @@
 # SyncSage
 
-SyncSage is a lightweight, Docker-first MCP knowledge graph server for indexing local repositories, Markdown notes, documents, and Obsidian vaults. It keeps graph/search state fresh with startup validation, debounced file watching, scheduled fallback sync, and explicit agent-triggered refreshes. This project is an active prototype with the potential for functionality to behave unexpectantly. If you experience this, please submit an issue to the backlog.
+SyncSage is a local-first MCP context server that turns project sources into a queryable knowledge graph for agents and humans. It syncs configured repositories, folders, files, Obsidian vaults, web collections, and experimental API/S3 sources; enriches them into graph relationships; exposes retrieval and lifecycle operations through MCP and HTTP; and can project the result into a navigable Obsidian vault.
 
-## What SyncSage provides
+The project is still an active prototype, but the current architecture is intentionally shaped around production concerns: connector boundaries, idempotent sync, persistent checkpoints, graph-derived search, runtime source lifecycle management, and inspectable configuration.
 
-- YAML-configured knowledge sources under allowlisted workspace roots.
-- Persistent graph state, manifests, and SQLite/FTS search state.
-- MCP tools/resources/prompts for low-token agentic retrieval.
-- Optional Obsidian-compatible Markdown exports with stable note names.
-- Local Docker, Docker Compose, Kubernetes, and Helm deployment examples.
+## What SyncSage Does
 
-## Quick start with Docker
+- Ingests local and connector-backed sources through a `SourceConnector` abstraction.
+- Maintains SQLite search state, source manifests, connector checkpoints, graph snapshots, and audit history under `/state`.
+- Builds an enriched graph with sources, artifacts, chunks, symbols, entities, concepts, external references, and cross-artifact relationships.
+- Serves MCP tools/resources for source registration, sync, search, graph traversal, source lifecycle operations, and Obsidian export.
+- Provides HTTP endpoints for health, readiness, source status, sync, search, graph export, and Obsidian export.
+- Generates previewable Obsidian notes using workflow profiles for engineering, research, and project operations.
+- Supports layered configuration: base defaults + profile + YAML + CLI overrides.
 
-1. Copy the example configuration:
+## Architecture at a Glance
 
-   ```bash
-   cp syncsage.example.yaml syncsage.yaml
-   ```
+```text
+YAML/profile config
+  -> source registry
+  -> connector-backed sync engine
+  -> parsing and chunking
+  -> graph enrichment
+  -> SQLite FTS + graph-term search
+  -> MCP tools/resources, HTTP API, Obsidian projection
+```
 
-2. Edit `syncsage.yaml` for your machine:
+Core components:
 
-   - `deployment.compose.workspace_path` is mounted read-only at `/workspace`.
-   - `deployment.compose.vault_path` is mounted read/write at `/vault` for generated Obsidian notes.
-   - Source paths in `syncsage.yaml` should use container paths such as `/workspace/repository`.
+| Component | Role |
+|---|---|
+| Source registry | Tracks configured and runtime-registered sources, status, and lifecycle audit events. |
+| Connectors | Normalize filesystem, web collection, API, and S3-style sources into list/read/checkpoint operations. |
+| Sync engine | Runs `incremental`, `full`, `validate_only`, and `repair` modes with stable manifests and checkpoints. |
+| Ingestion pipeline | Parses supported text/document artifacts into chunks with provenance. |
+| Graph builder | Creates stable graph nodes/edges and applies code, document, and similarity enrichment. |
+| Search store | Combines SQLite FTS/path search with graph-derived term expansion. |
+| MCP server | Provides the primary agent interface for retrieval, sync, graph navigation, and source lifecycle operations. |
+| Obsidian exporter | Creates previewable source, concept, file, and optional chunk notes with graph-driven links. |
 
-3. Render the Compose env file from that YAML and run the container:
+## Quick Start
 
-   ```bash
-   syncsage compose-env syncsage.yaml --output .syncsage/compose.env
-   docker compose --env-file .syncsage/compose.env up -d
-   ```
-
-4. Check health endpoints:
-
-   ```bash
-   curl http://localhost:8765/health
-   curl http://localhost:8765/ready
-   ```
-
-`syncsage.yaml`, `.syncsage/compose.env`, `.vscode/mcp.json`, local state, and local vault output are ignored by git. Commit `syncsage.example.yaml` and files under `examples/` or `docs/` when you want to share a generalized setup.
-
-## Docker Compose
+Generate a starter config:
 
 ```bash
-cp syncsage.example.yaml syncsage.yaml
+syncsage init --profile quickstart --output syncsage.yaml
+```
+
+Inspect the resolved config after profile/YAML/override layering:
+
+```bash
+syncsage config show --effective --profile quickstart --config syncsage.yaml
+```
+
+Validate paths and runtime readiness:
+
+```bash
+syncsage doctor --profile quickstart --config syncsage.yaml
+```
+
+Run locally:
+
+```bash
+syncsage start --profile quickstart --config syncsage.yaml
+```
+
+Or run through Docker Compose:
+
+```bash
 syncsage compose-env syncsage.yaml --output .syncsage/compose.env
 docker compose --env-file .syncsage/compose.env up -d
 ```
 
-The compose file gets its image and host mount values from the generated env file. Change those values under `deployment.compose` in the selected YAML.
-
-## VS Code MCP Client
-
-The primary client setup is VS Code connected to the MCP server running inside the SyncSage Docker container.
-
-1. Start the container:
-
-   ```bash
-   syncsage compose-env syncsage.yaml --output .syncsage/compose.env
-   docker compose --env-file .syncsage/compose.env up -d
-   ```
-
-2. Generate or copy the VS Code MCP config:
-
-   ```bash
-   syncsage client-config vscode --output .vscode/mcp.json
-   ```
-
-   If the local CLI is not installed, copy `examples/vscode/mcp.json` to `.vscode/mcp.json`.
-
-3. In VS Code, run `MCP: List Servers`, start `syncsage`, and enable the tools in Agent mode.
-
-The generated config uses `docker exec -i syncsage python -m syncsage mcp --config /config/syncsage.yaml --transport stdio`. Keep the compose container name as `syncsage`, or regenerate the config with `--container-name`.
-
-For a one-off foreground MCP server without the API container:
+Health checks:
 
 ```bash
-syncsage client-config vscode --mode docker-run --output .vscode/mcp.json
+curl http://localhost:8765/health
+curl http://localhost:8765/ready
 ```
 
-## CI and container publishing
+Local `syncsage.yaml`, `.syncsage/compose.env`, `.vscode/mcp.json`, state, and vault output are ignored by git.
 
-The repository keeps validation and publishing in separate workflows.
+## Configuration Model
 
-- `.github/workflows/ci.yml` runs ruff correctness lint, dependency checks, source compilation, pytest on Python 3.11 and 3.12, package build, Docker Compose validation, Docker image build, and image smoke tests.
-- `.github/workflows/release-version.yml` runs from trusted base-branch code, comments on PRs with valid release increments, and defaults to `patch` / `3` unless a maintainer comments with `minor`, `major`, `2`, or `1`.
-- `.github/workflows/container.yml` publishes only after CI passes on a push to `main`; it reads the merged PR release increment, bumps `pyproject.toml` and generated deployment tags on `main`, then builds the image.
-- Merged PRs publish one canonical image tag: `ghcr.io/esatt10/syncsage:<pyproject version>`. Direct pushes to `main` are not releaseable because there is no PR release-increment comment to read.
-- The workflow uses `GITHUB_TOKEN` with `packages: write`; no separate registry secret is required for this repository.
+SyncSage resolves config in this order:
 
-After the first workflow run, set the package visibility in GitHub Packages if the image should be publicly pullable without authentication.
+```text
+base defaults + profile + user YAML + CLI/env overrides
+```
 
-## Configuration overview
+Built-in profiles:
 
-SyncSage reads `/config/syncsage.yaml` by default. The example file includes these main sections:
+- `quickstart`: local defaults with API and MCP enabled.
+- `dev`: local developer defaults with debug logging and chunk-note export.
+- `team`: shared-service defaults with HTTP/SSE-oriented MCP settings.
+- `cloud-hybrid`: cloud/mounted-source defaults with research-style Obsidian output.
 
-- `syncsage`: instance name, environment, paths, and logging.
-- `server`: API/MCP/UI binding and transport settings.
-- `storage`: SQLite, graph, manifest, snapshot, and retention settings.
-- `search`: keyword, path, graph, hybrid, optional embeddings, and ranking settings.
-- `sync`: startup validation, watcher, git monitor, scheduler, idempotency, and concurrency settings.
-- `obsidian`: optional vault note and canvas export settings.
-- `deployment`: local deployment helper values used to render Docker Compose env files.
-- `sources`: repositories, Markdown folders, Obsidian vaults, document folders, web collections, or single files.
+Common commands:
 
-See [docs/configuration.md](docs/configuration.md) for details.
+```bash
+syncsage init --profile dev --output syncsage.yaml
+syncsage config show --effective --profile dev --config syncsage.yaml --set server.port=9001
+syncsage validate syncsage.yaml
+syncsage doctor --profile dev --config syncsage.yaml
+```
 
-## MCP interface
+See [docs/configuration.md](docs/configuration.md).
 
-The MCP server runs with:
+## Source Sync
+
+Configured sources are listed under `sources:` in YAML and can also be registered at runtime through MCP.
+
+Supported source types:
+
+- `repository`
+- `markdown_folder`
+- `obsidian_vault`
+- `document_folder`
+- `single_file`
+- `web_collection`
+- `api` experimental
+- `s3` experimental
+
+Sync modes:
+
+| Mode | Behavior |
+|---|---|
+| `incremental` | Uses connector checkpoints and hashes to skip unchanged artifacts. |
+| `full` | Rebuilds artifact, chunk, graph, manifest, and checkpoint state for a source. |
+| `validate_only` | Checks connector health and readability without writing index artifacts or manifests. |
+| `repair` | Rebuilds missing or invalid state based on manifests and database rows. |
+
+Run sync:
+
+```bash
+syncsage sync --config syncsage.yaml --source syncsage-repo --mode incremental
+syncsage sync --config syncsage.yaml --all --mode full
+```
+
+## Knowledge Graph and Search
+
+SyncSage stores a directed multi-graph. Core nodes include:
+
+- `knowledge_base`, `source`, `file`, `document`, `markdown_note`, `chunk`
+- `symbol`, `entity`, `concept`, `external_reference`
+
+Core edges include:
+
+- `contains`, `indexes`, `has_chunk`
+- `mentions`, `derived_from`, `references`, `imports`, `calls`, `similar_to`
+
+Enrichment passes extract:
+
+- Python imports, classes, functions, constants, and call targets.
+- Markdown/document headings, links, wiki links, URLs, citations, concepts, and named mentions.
+- Lightweight cross-artifact similarity based on shared concepts.
+
+Search combines SQLite full-text results with graph-derived term expansion, which helps surface related files even when no single chunk contains every query term. Graph traversal honors depth and optional edge filters.
+
+See [docs/graph_model.md](docs/graph_model.md).
+
+## MCP Interface
+
+Start MCP over stdio inside the running container:
 
 ```bash
 docker exec -i syncsage python -m syncsage mcp --config /config/syncsage.yaml --transport stdio
 ```
 
-The agent-facing tools are:
+Generate VS Code MCP config:
+
+```bash
+syncsage client-config vscode --output .vscode/mcp.json
+```
+
+Primary MCP tools:
 
 - `list_knowledge_bases`
 - `register_source`
+- `list_sources`
+- `disable_source`
+- `remove_source`
+- `promote_runtime_source_to_config`
 - `sync_source`
 - `sync_all`
 - `search_context`
@@ -128,22 +192,105 @@ The agent-facing tools are:
 - `explain_node`
 - `export_obsidian_notes`
 - `get_sync_status`
+- `get_sync_history`
 
-Every retrieval response should include provenance such as source ID, path, branch/commit when available, timestamps, and reason/confidence metadata. See [docs/mcp_tools.md](docs/mcp_tools.md).
+Runtime lifecycle flow:
 
-## Obsidian Workflow
+1. Register a source through MCP.
+2. Sync it.
+3. Query it through search or graph tools.
+4. Promote it to durable YAML config, or disable/remove it.
+5. Inspect audit history through MCP resources/tools.
 
-SyncSage writes generated Markdown into the mounted `/vault` path, under `SyncSage/` by default. Open the host folder from `deployment.compose.vault_path` as an Obsidian vault. After indexing, call the MCP tool `export_obsidian_notes` or the API endpoint `POST /obsidian/export` to update the managed notes.
+See [docs/mcp_tools.md](docs/mcp_tools.md) and [docs/mcp_client.md](docs/mcp_client.md).
 
-## Deployment paths
+## Obsidian Projection
 
-- **Local Docker:** fastest single-instance setup.
-- **Docker Compose:** repeatable local setup with named state volume.
-- **Docker Desktop Kubernetes:** local namespace/PVC simulation.
-- **Enterprise Kubernetes:** isolated namespace per team/project, PVC-backed state, service probes, and optional ingress/network policy.
-- **Helm:** skeleton chart under `deploy/helm` for parameterized Kubernetes installs.
+SyncSage can export a human-readable vault projection under `/vault/SyncSage` by default.
+
+Preview without writing:
+
+```bash
+curl -X POST http://localhost:8765/obsidian/export \
+  -H "content-type: application/json" \
+  -d '{"preview": true, "template_profile": "engineering"}'
+```
+
+Write notes:
+
+```bash
+curl -X POST http://localhost:8765/obsidian/export
+```
+
+Generated layout:
+
+```text
+SyncSage/
+  Index.md
+  Sources/
+  Concepts/
+  Files/
+  Chunks/        # optional
+```
+
+Template profiles:
+
+- `engineering`
+- `research`
+- `project-ops`
+
+The exporter creates source -> concept -> file -> chunk navigation when the indexed graph has enrichment terms and chunk notes are enabled.
+
+See [docs/obsidian_integration.md](docs/obsidian_integration.md).
+
+## HTTP API
+
+Important endpoints:
+
+- `GET /health`
+- `GET /ready`
+- `GET /sources`
+- `GET /sync/status`
+- `POST /sync`
+- `POST /sync/{source_id}`
+- `POST /search`
+- `POST /relevant-files`
+- `GET /graph`
+- `GET /graph/export/node-link-json`
+- `GET /graph/export/cytoscape-json`
+- `POST /obsidian/export`
+
+## Deployment
+
+Supported deployment paths:
+
+- Local CLI process
+- Docker
+- Docker Compose
+- Kubernetes manifests
+- Helm chart skeleton
 
 See [docs/deployment.md](docs/deployment.md).
+
+## Development and Verification
+
+Run tests:
+
+```bash
+python -m pytest
+```
+
+Run focused lint:
+
+```bash
+python -m ruff check src tests
+```
+
+Version references are synchronized from `pyproject.toml`:
+
+```bash
+python scripts/sync_version.py --check
+```
 
 ## Documentation
 
@@ -158,20 +305,6 @@ See [docs/deployment.md](docs/deployment.md).
 - [Security](docs/security.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
-## Development phases
-
-The v0.1 MVP is complete when SyncSage can load config, index at least one repository plus Markdown/document folders, persist graph/search state, expose MCP retrieval/sync tools, re-index idempotently, detect file/git changes, export useful Obsidian notes, and run through Docker/Kubernetes examples.
-
-## Versioning
-
-`pyproject.toml` is the canonical semver source. To bump it and refresh generated deployment defaults:
-
-```bash
-python scripts/sync_version.py --bump patch
-```
-
-For PR releases, `patch` is selected by default. Comment with a different release increment to override it; each new comment reruns the release-version check against the current valid options. The publish workflow applies the selected increment to `main` before building the release image.
-
 ## License
 
-License selection is pending. Apache-2.0 is recommended in the initial specification for permissive open-source distribution with an explicit patent grant.
+SyncSage is licensed under Apache-2.0. See [LICENSE](LICENSE).
