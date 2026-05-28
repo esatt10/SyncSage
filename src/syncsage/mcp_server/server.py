@@ -72,6 +72,47 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
         )
 
     @mcp.tool()
+    def list_sources(
+        knowledge_base: str,
+        enabled: bool | None = None,
+        status: str | None = None,
+        source_type: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict:
+        """List sources with optional filters and pagination."""
+
+        return tools.list_sources(knowledge_base, enabled, status, source_type, limit, offset)
+
+    @mcp.tool()
+    def disable_source(knowledge_base: str, source_name: str) -> dict:
+        """Disable a source without deleting its state."""
+
+        return tools.disable_source(knowledge_base, source_name)
+
+    @mcp.tool()
+    def remove_source(knowledge_base: str, source_name: str) -> dict:
+        """Remove a source and its indexed state."""
+
+        return tools.remove_source(knowledge_base, source_name)
+
+    @mcp.tool()
+    def promote_runtime_source_to_config(
+        knowledge_base: str,
+        source_name: str,
+        config_path: str | None = None,
+        write: bool = False,
+    ) -> dict:
+        """Return a deterministic YAML patch or write a source into durable config."""
+
+        return tools.promote_runtime_source_to_config(
+            knowledge_base,
+            source_name,
+            config_path,
+            write,
+        )
+
+    @mcp.tool()
     def sync_source(knowledge_base: str, source_name: str, mode: str = "incremental") -> dict:
         """Sync one configured source."""
 
@@ -152,16 +193,35 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
         knowledge_base: str,
         source_name: str | None = None,
         scope: str = "knowledge_base",
+        preview: bool = False,
+        template_profile: str | None = None,
     ) -> dict:
         """Write or update Obsidian-compatible Markdown notes."""
 
-        return tools.export_obsidian_notes(knowledge_base, source_name, scope)
+        return tools.export_obsidian_notes(
+            knowledge_base,
+            source_name,
+            scope,
+            preview,
+            template_profile,
+        )
 
     @mcp.tool()
     def get_sync_status(knowledge_base: str) -> dict:
         """Return source freshness and last sync status."""
 
         return tools.get_sync_status(knowledge_base)
+
+    @mcp.tool()
+    def get_sync_history(
+        knowledge_base: str,
+        source_name: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict:
+        """Return runtime source lifecycle history."""
+
+        return tools.get_sync_history(knowledge_base, source_name, limit, offset)
 
     @mcp.resource("syncsage://knowledge-bases")
     def knowledge_bases_resource() -> str:
@@ -186,8 +246,19 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
     def source_manifest_resource(kb_id: str, source_id: str) -> str:
         """Return the manifest for one source as JSON."""
 
-        tools._require_knowledge_base(kb_id)
-        return _json(tools.engine.manifests.load(source_id))
+        return _json(tools.get_source_manifest(kb_id, source_id))
+
+    @mcp.resource("syncsage://knowledge-bases/{kb_id}/sources/{source_id}/history")
+    def source_history_resource(kb_id: str, source_id: str) -> str:
+        """Return lifecycle history for one source as JSON."""
+
+        return _json(tools.get_sync_history(kb_id, source_id))
+
+    @mcp.resource("syncsage://knowledge-bases/{kb_id}/sync-history")
+    def sync_history_resource(kb_id: str) -> str:
+        """Return lifecycle history for a knowledge base as JSON."""
+
+        return _json(tools.get_sync_history(kb_id))
 
     @mcp.resource("syncsage://knowledge-bases/{kb_id}/sources/{source_id}/repo-map")
     def source_repo_map_resource(kb_id: str, source_id: str) -> str:
@@ -200,6 +271,12 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
         """Return an explanation for one graph node as JSON."""
 
         return _json(tools.explain_node(kb_id, node_id))
+
+    @mcp.resource("syncsage://knowledge-bases/{kb_id}/graph-slices/{node_id}")
+    def graph_slice_resource(kb_id: str, node_id: str) -> str:
+        """Return a small graph slice rooted at one node as JSON."""
+
+        return _json(tools.get_graph_slice(kb_id, node_id, depth=2))
 
     @mcp.prompt()
     def use_syncsage_for_coding_task(task: str = "") -> str:

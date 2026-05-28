@@ -37,6 +37,12 @@ class SyncRequest(BaseModel):
     mode: str = "incremental"
 
 
+class ObsidianExportRequest(BaseModel):
+    source_name: str | None = None
+    preview: bool = False
+    template_profile: str | None = None
+
+
 def create_app(
     config: SyncSageConfig | None = None,
     config_path: str | Path | None = None,
@@ -157,7 +163,11 @@ def create_app(
         return cytoscape(engine.graph_builder.graph)
 
     @app.post("/obsidian/export")
-    def obsidian_export(req: SyncRequest | None = None) -> dict:
-        return ObsidianExporter(config, state).export(req.source_name if req else None)
+    def obsidian_export(req: ObsidianExportRequest | None = None) -> dict:
+        return ObsidianExporter(config, state).export(
+            req.source_name if req else None,
+            preview=req.preview if req else False,
+            template_profile=req.template_profile if req else None,
+        )
 
     return app

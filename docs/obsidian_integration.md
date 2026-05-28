@@ -23,6 +23,14 @@ Obsidian is an optional human-readable projection layer. SyncSage does not requi
 
    Or call the MCP tool `export_obsidian_notes` from VS Code.
 
+   Preview planned changes without writing:
+
+   ```bash
+   curl -X POST http://localhost:8765/obsidian/export \
+     -H "content-type: application/json" \
+     -d '{"preview": true, "template_profile": "engineering"}'
+   ```
+
 SyncSage owns the generated `SyncSage/` folder inside the vault. User-authored notes can live outside that folder. If you also want SyncSage to index an existing Obsidian vault, mount that vault under `/workspace` and add it as an `obsidian_vault` source; do not point that source at the generated `/vault/SyncSage` output unless you intentionally want to index generated notes.
 
 ## Default vault layout
@@ -31,10 +39,9 @@ SyncSage owns the generated `SyncSage/` folder inside the vault. User-authored n
 /vault/SyncSage/
   Index.md
   Sources/
-  Repositories/
-  Documents/
-  Graphs/
-  Queries/
+  Concepts/
+  Files/
+  Chunks/
 ```
 
 ## Note types
@@ -48,6 +55,14 @@ SyncSage owns the generated `SyncSage/` folder inside the vault. User-authored n
 | Chunk note | No | Optional; can be noisy. |
 | Topic/query note | Optional | Saved searches and topical clusters. |
 | Canvas graph | Optional | Visual graph representation. |
+
+## Template profiles
+
+Obsidian export supports `engineering`, `research`, and `project-ops` templates through `obsidian.template_profile` or the MCP/API export request. Profiles keep the same graph-derived links but adjust section headings for the intended workflow.
+
+## Preview and links
+
+Preview mode returns `planned_count`, `changed_count`, and `changed_files` without creating notes. Written vaults include graph-driven navigation from source notes to concept notes, from concept notes to file notes, and from file notes to chunk notes when `create_chunk_notes` is enabled.
 
 ## Frontmatter
 

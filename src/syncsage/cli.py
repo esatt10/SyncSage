@@ -19,11 +19,33 @@ def _engine(config_path: Path):
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="syncsage", description="SyncSage knowledge graph indexing server")
+    parser = argparse.ArgumentParser(
+        prog="syncsage",
+        description="SyncSage knowledge graph indexing server",
+    )
     sub = parser.add_subparsers(dest="command")
+    start_p = sub.add_parser("start")
+    start_p.add_argument("--config", "-c", default="syncsage.yaml")
+    start_p.add_argument("--profile", default="quickstart")
+    start_p.add_argument("--set", dest="overrides", action="append", default=[])
     validate_p = sub.add_parser("validate")
     validate_p.add_argument("config", nargs="?", default="syncsage.example.yaml")
     validate_p.add_argument("--no-require-paths", action="store_true")
+    init_p = sub.add_parser("init")
+    init_p.add_argument("--profile", default="quickstart")
+    init_p.add_argument("--output", "-o", default="syncsage.yaml")
+    init_p.add_argument("--force", action="store_true")
+    config_p = sub.add_parser("config")
+    config_sub = config_p.add_subparsers(dest="config_command")
+    config_show_p = config_sub.add_parser("show")
+    config_show_p.add_argument("--effective", action="store_true")
+    config_show_p.add_argument("--config", "-c", default="syncsage.yaml")
+    config_show_p.add_argument("--profile", default="quickstart")
+    config_show_p.add_argument("--set", dest="overrides", action="append", default=[])
+    doctor_p = sub.add_parser("doctor")
+    doctor_p.add_argument("--config", "-c", default="syncsage.yaml")
+    doctor_p.add_argument("--profile", default="quickstart")
+    doctor_p.add_argument("--no-require-paths", action="store_true")
     sync_p = sub.add_parser("sync")
     sync_p.add_argument("--config", "-c", default="syncsage.example.yaml")
     sync_p.add_argument("--source", "-s")
@@ -49,16 +71,87 @@ def main(argv: list[str] | None = None) -> int:
     repair_p.add_argument("--config", "-c", default="syncsage.example.yaml")
     args = parser.parse_args(argv)
     if args.command in {None, "--help"}:
-        parser.print_help(); return 0
+        parser.print_help()
+        return 0
+    if args.command == "start":
+        import uvicorn
+
+        from syncsage.api.app import create_app
+        from syncsage.config.loader import load_layered_config, parse_override_pairs
+
+        cfg = load_layered_config(
+            Path(args.config),
+            args.profile,
+            parse_override_pairs(args.overrides),
+        )
+        uvicorn.run(create_app(cfg), host=cfg.server.host, port=cfg.server.port)
+        return 0
     if args.command == "validate":
         from syncsage.config.loader import load_config, validate_source_paths
 
         cfg = load_config(Path(args.config))
         errors = validate_source_paths(cfg, require_exists=not args.no_require_paths)
         if errors:
-            for e in errors: print(f"ERROR: {e}")
+            for error in errors:
+                print(f"ERROR: {error}")
             return 1
         print(f"Config valid: {args.config} ({len(cfg.sources)} sources)")
+        return 0
+    if args.command == "init":
+        from syncsage.config.loader import render_init_config
+
+        output = Path(args.output)
+        if output.exists() and not args.force:
+            print(f"ERROR: {output} already exists. Use --force to overwrite.")
+            return 1
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(render_init_config(args.profile), encoding="utf-8")
+        print(f"Wrote {output}")
+        return 0
+    if args.command == "config":
+        import yaml
+
+        from syncsage.config.loader import (
+            effective_config_dict,
+            parse_override_pairs,
+        )
+
+        if args.config_command != "show":
+            config_p.print_help()
+            return 1
+        payload = effective_config_dict(
+            Path(args.config),
+            args.profile,
+            parse_override_pairs(args.overrides),
+        )
+        print(yaml.safe_dump(payload, sort_keys=False), end="")
+        return 0
+    if args.command == "doctor":
+        from syncsage.config.loader import (
+            load_layered_config,
+            parse_override_pairs,
+            validate_source_paths,
+        )
+
+        cfg = load_layered_config(Path(args.config), args.profile, parse_override_pairs([]))
+        errors = validate_source_paths(cfg, require_exists=not args.no_require_paths)
+        for path in [
+            cfg.syncsage.state_path,
+            cfg.syncsage.vault_path,
+            cfg.syncsage.exports_path,
+        ]:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                errors.append(f"cannot create {path}: {exc}")
+        if errors:
+            for error in errors:
+                print(f"ERROR: {error}")
+            return 1
+        print(
+            f"Doctor ok: profile={args.profile} "
+            f"sources={len(cfg.sources)} transports={cfg.server.mcp.transports}"
+        )
         return 0
     if args.command == "sync":
         engine = _engine(Path(args.config))
@@ -78,9 +171,11 @@ def main(argv: list[str] | None = None) -> int:
         print("Repair complete")
         return 0
     if args.command == "serve":
+        import uvicorn
+
         from syncsage.api.app import create_app
         from syncsage.config.loader import load_config
-        import uvicorn
+
         cfg = load_config(Path(args.config))
         uvicorn.run(create_app(cfg), host=cfg.server.host, port=cfg.server.port)
         return 0
