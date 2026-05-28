@@ -1,6 +1,6 @@
 services:
   syncsage:
-    image: ${SYNCSAGE_IMAGE:-ghcr.io/esatt10/syncsage:0.1.13}
+    image: ${SYNCSAGE_IMAGE:-ghcr.io/esatt10/syncsage:0.2.0}
     container_name: syncsage
     restart: unless-stopped
     ports:
