@@ -47,7 +47,7 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 | `sync_all` | Trigger sync for all enabled sources. |
 | `search_context` | Search graph/search state using keyword, path, graph, hybrid, semantic, or symbol modes. |
 | `get_relevant_files` | Return files likely needed for a coding task. |
-| `get_graph_neighbors` | Traverse neighbors around a node by depth and edge type. |
+| `get_graph_neighbors` | Traverse graph neighbors with true depth-aware BFS and optional edge-type filters. |
 | `get_file_summary` | Return a compact summary and provenance for a file. |
 | `get_repo_map` | Return repository structure, important modules, and dependencies. |
 | `explain_node` | Explain a graph node and why it matters. |

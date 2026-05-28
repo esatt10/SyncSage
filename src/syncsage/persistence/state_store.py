@@ -81,6 +81,18 @@ CREATE TABLE IF NOT EXISTS symbols (
   docstring_summary TEXT,
   FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
 );
+CREATE TABLE IF NOT EXISTS artifact_terms (
+  id TEXT PRIMARY KEY,
+  artifact_id TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  node_id TEXT NOT NULL,
+  node_type TEXT NOT NULL,
+  term TEXT NOT NULL,
+  normalized_term TEXT NOT NULL,
+  weight REAL NOT NULL,
+  metadata_json TEXT NOT NULL,
+  FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
+);
 CREATE TABLE IF NOT EXISTS sync_events (
   id TEXT PRIMARY KEY,
   source_id TEXT,
@@ -209,6 +221,8 @@ class StateStore:
             )
             self.conn.execute("DELETE FROM chunks WHERE artifact_id=?", (artifact["id"],))
             self.conn.execute("DELETE FROM chunks_fts WHERE artifact_id=?", (artifact["id"],))
+            self.conn.execute("DELETE FROM symbols WHERE artifact_id=?", (artifact["id"],))
+            self.conn.execute("DELETE FROM artifact_terms WHERE artifact_id=?", (artifact["id"],))
             for chunk in chunks:
                 self.conn.execute(
                     """INSERT INTO chunks(
@@ -235,6 +249,57 @@ class StateStore:
                         chunk.get("heading_path") or "",
                         chunk["text"],
                     ),
+                )
+
+    def replace_artifact_enrichment(
+        self,
+        artifact_id: str,
+        source_id: str,
+        terms: list[dict[str, Any]],
+        symbols: list[dict[str, Any]],
+    ) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM symbols WHERE artifact_id=?", (artifact_id,))
+            self.conn.execute("DELETE FROM artifact_terms WHERE artifact_id=?", (artifact_id,))
+            seen_terms: set[tuple[str, str, str]] = set()
+            for index, term in enumerate(terms):
+                key = (
+                    term["node_id"],
+                    term["node_type"],
+                    term["normalized_term"],
+                )
+                if key in seen_terms:
+                    continue
+                seen_terms.add(key)
+                self.conn.execute(
+                    """INSERT INTO artifact_terms(
+                        id,artifact_id,source_id,node_id,node_type,term,
+                        normalized_term,weight,metadata_json
+                    )
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        f"{artifact_id}:term:{index:04d}",
+                        artifact_id,
+                        source_id,
+                        term["node_id"],
+                        term["node_type"],
+                        term["term"],
+                        term["normalized_term"],
+                        float(term.get("weight") or 1.0),
+                        json.dumps(term.get("metadata") or {}, default=str),
+                    ),
+                )
+            for symbol in symbols:
+                self.conn.execute(
+                    """INSERT INTO symbols(
+                        id,artifact_id,source_id,language,symbol_type,name,
+                        qualified_name,start_line,end_line,signature,docstring_summary
+                    )
+                    VALUES(
+                        :id,:artifact_id,:source_id,:language,:symbol_type,:name,
+                        :qualified_name,:start_line,:end_line,:signature,:docstring_summary
+                    )""",
+                    symbol,
                 )
 
     def mark_source_indexed(self, source_id: str, now: str, status: str = "healthy") -> None:
@@ -326,6 +391,7 @@ class StateStore:
             self.conn.execute("DELETE FROM chunks_fts WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM chunks WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM symbols WHERE source_id=?", (source_id,))
+            self.conn.execute("DELETE FROM artifact_terms WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM artifacts WHERE source_id=?", (source_id,))
         return count
 

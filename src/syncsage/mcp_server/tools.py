@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import deque
+
 from syncsage.config.schema import SourceConfig, SourceType, SyncSageConfig
 from syncsage.obsidian.exporter import ObsidianExporter
 from syncsage.persistence.paths import StatePaths
@@ -120,15 +122,39 @@ class SyncSageTools:
         graph = self.engine.graph_builder.graph
         if node_id not in graph:
             return {"node_id": node_id, "neighbors": []}
+        max_depth = max(1, min(int(depth or 1), 10))
+        allowed = set(edge_types or [])
+        queue = deque([(node_id, 0, [node_id])])
+        visited = {node_id}
         neighbors = []
-        for target in graph.neighbors(node_id):
-            edge_data = graph.get_edge_data(node_id, target, default={})
-            types = [data.get("type") for data in edge_data.values()]
-            if edge_types and not set(types).intersection(edge_types):
+        while queue:
+            current, current_depth, path = queue.popleft()
+            if current_depth >= max_depth:
                 continue
-            neighbors.append(
-                {"node_id": target, "edge_types": types, "node": dict(graph.nodes[target])}
-            )
+            for _source, target, edge_map in graph.out_edges(current):
+                matching_edges = [
+                    data
+                    for data in edge_map.values()
+                    if not allowed or data.get("type") in allowed
+                ]
+                if not matching_edges:
+                    continue
+                next_depth = current_depth + 1
+                edge_type_values = sorted(
+                    {data.get("type") for data in matching_edges if data.get("type")}
+                )
+                neighbors.append(
+                    {
+                        "node_id": target,
+                        "depth": next_depth,
+                        "edge_types": edge_type_values,
+                        "path": [*path, target],
+                        "node": dict(graph.nodes[target]),
+                    }
+                )
+                if target not in visited:
+                    visited.add(target)
+                    queue.append((target, next_depth, [*path, target]))
         return {"node_id": node_id, "depth": depth, "neighbors": neighbors}
 
     def get_file_summary(

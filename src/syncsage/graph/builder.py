@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from syncsage.config.schema import SourceConfig, SyncSageConfig
+from syncsage.graph.enrichment import (
+    ArtifactEnrichment,
+    CodeEnrichmentPass,
+    MarkdownDocumentEnrichmentPass,
+    SemanticSimilarityPass,
+)
 from syncsage.graph.simple import SimpleMultiDiGraph
-
-from syncsage.config.schema import SyncSageConfig, SourceConfig
 from syncsage.ingestion.pipeline import ParsedArtifact, utc_now
 
 
@@ -12,29 +17,74 @@ class GraphBuilder:
         self.graph = SimpleMultiDiGraph()
         self.kb_id = config.knowledge_base_id
         self.upsert_node(self.kb_id, "knowledge_base", self.kb_id, {})
+        self.enrichment_passes = [
+            CodeEnrichmentPass(),
+            MarkdownDocumentEnrichmentPass(),
+        ]
+        self.similarity_pass = SemanticSimilarityPass()
 
     def upsert_node(self, node_id: str, node_type: str, label: str, attrs: dict) -> None:
         now = utc_now()
-        existing_created = self.graph.nodes[node_id].get("created_at") if self.graph.has_node(node_id) else now
-        self.graph.add_node(node_id, id=node_id, type=node_type, label=label, created_at=existing_created, updated_at=now, knowledge_base_id=self.kb_id, **attrs)
+        existing_created = (
+            self.graph.nodes[node_id].get("created_at")
+            if self.graph.has_node(node_id)
+            else now
+        )
+        self.graph.add_node(
+            node_id,
+            id=node_id,
+            type=node_type,
+            label=label,
+            created_at=existing_created,
+            updated_at=now,
+            knowledge_base_id=self.kb_id,
+            **attrs,
+        )
 
-    def upsert_edge(self, source: str, target: str, edge_type: str, attrs: dict | None = None) -> None:
+    def upsert_edge(
+        self,
+        source: str,
+        target: str,
+        edge_type: str,
+        attrs: dict | None = None,
+    ) -> None:
         attrs = attrs or {}
         for _key, data in self.graph.get_edge_data(source, target, default={}).items():
             if data.get("type") == edge_type:
                 data.update(attrs)
                 data["updated_at"] = utc_now()
                 return
-        self.graph.add_edge(source, target, type=edge_type, created_at=utc_now(), confidence=attrs.pop("confidence", 1.0), **attrs)
+        self.graph.add_edge(
+            source,
+            target,
+            type=edge_type,
+            created_at=utc_now(),
+            confidence=attrs.pop("confidence", 1.0),
+            **attrs,
+        )
 
     def add_source(self, source: SourceConfig) -> str:
         node_id = f"source:{self.kb_id}:{source.name}"
-        self.upsert_node(node_id, "source", source.name, {"source_id": source.name, "source_type": source.type.value, "path": str(source.path)})
+        self.upsert_node(
+            node_id,
+            "source",
+            source.name,
+            {
+                "source_id": source.name,
+                "source_type": source.type.value,
+                "path": str(source.path),
+            },
+        )
         self.upsert_edge(self.kb_id, node_id, "contains", {"source_id": source.name})
         return node_id
 
-    def add_artifact(self, source: SourceConfig, artifact: ParsedArtifact) -> None:
+    def add_artifact(
+        self,
+        source: SourceConfig,
+        artifact: ParsedArtifact,
+    ) -> ArtifactEnrichment:
         source_node = self.add_source(source)
+        enrichment = self.enrich_artifact(source, artifact)
         self.upsert_node(
             artifact.id,
             artifact.type,
@@ -47,19 +97,65 @@ class GraphBuilder:
                 "size_bytes": artifact.size_bytes,
                 "git_branch": artifact.git_branch,
                 "git_commit": artifact.git_commit,
-                "provenance": {"path": str(artifact.path), "relative_path": artifact.relative_path, "git_branch": artifact.git_branch, "git_commit": artifact.git_commit},
+                "concept_terms": sorted(enrichment.concept_terms),
+                "provenance": {
+                    "path": str(artifact.path),
+                    "relative_path": artifact.relative_path,
+                    "git_branch": artifact.git_branch,
+                    "git_commit": artifact.git_commit,
+                },
             },
         )
         self.upsert_edge(source_node, artifact.id, "indexes", {"source_id": source.name})
         for chunk in artifact.chunks:
-            chunk_id = f"chunk:{source.name}:{artifact.relative_path}:sha256={chunk.text_hash}:chunk={chunk.index:04d}"
+            chunk_id = (
+                f"chunk:{source.name}:{artifact.relative_path}:"
+                f"sha256={chunk.text_hash}:chunk={chunk.index:04d}"
+            )
             self.upsert_node(
                 chunk_id,
                 "chunk",
                 f"{artifact.relative_path}#{chunk.index}",
-                {"source_id": source.name, "artifact_id": artifact.id, "start_line": chunk.start_line, "end_line": chunk.end_line, "text_hash": chunk.text_hash, "summary": chunk.text[:180], "token_estimate": chunk.token_estimate},
+                {
+                    "source_id": source.name,
+                    "artifact_id": artifact.id,
+                    "start_line": chunk.start_line,
+                    "end_line": chunk.end_line,
+                    "text_hash": chunk.text_hash,
+                    "summary": chunk.text[:180],
+                    "token_estimate": chunk.token_estimate,
+                },
             )
             self.upsert_edge(artifact.id, chunk_id, "has_chunk", {"source_id": source.name})
+        self.apply_enrichment(enrichment)
+        return enrichment
+
+    def enrich_artifact(
+        self,
+        source: SourceConfig,
+        artifact: ParsedArtifact,
+    ) -> ArtifactEnrichment:
+        enrichment = ArtifactEnrichment()
+        for enrichment_pass in self.enrichment_passes:
+            enrichment.extend(enrichment_pass.run(self.kb_id, source, artifact))
+        return enrichment
+
+    def apply_enrichment(self, enrichment: ArtifactEnrichment) -> None:
+        for node in enrichment.nodes:
+            self.upsert_node(node.id, node.type, node.label, node.attrs)
+        for edge in enrichment.edges:
+            self.upsert_edge(edge.source, edge.target, edge.type, edge.attrs)
+
+    def add_similarity_edges(self, source_name: str | None = None) -> None:
+        artifacts = []
+        for node_id, attrs in self.graph.nodes(data=True):
+            if attrs.get("type") not in {"file", "markdown_note", "document"}:
+                continue
+            if source_name and attrs.get("source_id") != source_name:
+                continue
+            artifacts.append((node_id, attrs))
+        for edge in self.similarity_pass.run(artifacts):
+            self.upsert_edge(edge.source, edge.target, edge.type, edge.attrs)
 
     def remove_source_content(self, source_name: str) -> None:
         source_node = f"source:{self.kb_id}:{source_name}"
