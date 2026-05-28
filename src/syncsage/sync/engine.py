@@ -163,7 +163,13 @@ class SyncEngine:
                     for chunk in parsed.chunks
                 ]
                 self.state.replace_artifact_chunks(artifact_row, chunk_rows)
-                self.graph_builder.add_artifact(source, parsed)
+                enrichment = self.graph_builder.add_artifact(source, parsed)
+                self.state.replace_artifact_enrichment(
+                    parsed.id,
+                    parsed.source_id,
+                    enrichment.terms,
+                    enrichment.symbols,
+                )
                 artifacts[parsed.relative_path] = {
                     "sha256": parsed.sha256,
                     "artifact_id": parsed.id,
@@ -172,6 +178,7 @@ class SyncEngine:
                     "git_commit": parsed.git_commit,
                 }
                 indexed += 1
+            self.graph_builder.add_similarity_edges(source.name)
             manifest["last_indexed_at"] = utc_now()
             manifest["connector"] = {"type": connector.connector_type}
             self.manifests.save(source.name, manifest)
