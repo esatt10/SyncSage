@@ -1,5 +1,7 @@
 services:
   syncsage:
+    build:
+      context: .
     image: ${SYNCSAGE_IMAGE:-ghcr.io/esatt10/syncsage:0.2.0}
     container_name: syncsage
     restart: unless-stopped
@@ -32,7 +34,8 @@ services:
     ports:
       - "${SYNCSAGE_UI_PORT:-8080}:80"
     depends_on:
-      - syncsage
+      syncsage:
+        condition: service_healthy
 
 volumes:
   syncsage-state:
