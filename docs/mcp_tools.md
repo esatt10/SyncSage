@@ -52,7 +52,7 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 | `get_repo_map` | Return repository structure, important modules, and dependencies. |
 | `explain_node` | Explain a graph node and why it matters. |
 | `export_obsidian_notes` | Write/update Obsidian notes for a knowledge base or source. |
-| `get_sync_status` | Return queue, lock, error, and freshness status. |
+| `get_sync_status` | Return queue, lock, error, freshness, and connector checkpoint status. |
 
 ## Resources
 

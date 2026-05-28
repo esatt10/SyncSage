@@ -74,7 +74,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
     if args.command == "repair":
-        _engine(Path(args.config)).sync_all("full"); print("Repair complete"); return 0
+        _engine(Path(args.config)).sync_all("repair")
+        print("Repair complete")
+        return 0
     if args.command == "serve":
         from syncsage.api.app import create_app
         from syncsage.config.loader import load_config

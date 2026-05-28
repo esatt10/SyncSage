@@ -7,17 +7,21 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from syncsage.config.schema import SourceConfig
 from syncsage.ingestion.chunking import TextChunk, chunk_text
 from syncsage.ingestion.content_types import TEXT_EXTENSIONS, artifact_type
+
+if TYPE_CHECKING:
+    from syncsage.sync.connectors import ConnectorItem, ConnectorPayload
 
 
 @dataclass(frozen=True)
 class ParsedArtifact:
     id: str
     source_id: str
-    path: Path
+    path: Path | str
     relative_path: str
     type: str
     mime_type: str | None
@@ -39,6 +43,10 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: fh.read(1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
 
 
 def _match_any(relative: str, patterns: Iterable[str]) -> bool:
@@ -93,6 +101,13 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
+def read_text_bytes(content: bytes, relative_path: str) -> str:
+    suffix = Path(relative_path).suffix.lower()
+    if suffix in {".pdf", ".docx"}:
+        return ""
+    return content.decode("utf-8", errors="ignore")
+
+
 def parse_file(
     source: SourceConfig,
     path: Path,
@@ -130,4 +145,50 @@ def parse_file(
         git_branch=branch,
         git_commit=commit,
         chunks=chunks,
+    )
+
+
+def parse_connector_payload(
+    source: SourceConfig,
+    item: ConnectorItem,
+    payload: ConnectorPayload,
+    git_metadata: tuple[str | None, str | None, bool] | None = None,
+) -> ParsedArtifact | None:
+    suffix = Path(item.relative_path).suffix.lower()
+    mime_type = payload.mime_type or item.mime_type
+    if suffix not in TEXT_EXTENSIONS | {".pdf", ".docx"} and not _is_text_like(mime_type):
+        return None
+    branch, commit, _dirty = (
+        git_metadata
+        if git_metadata is not None
+        else git_state(source.path)
+        if source.type.value == "repository"
+        else (None, None, False)
+    )
+    content_hash = payload.sha256 or item.sha256 or sha256_bytes(payload.content)
+    text = read_text_bytes(payload.content, item.relative_path)
+    chunks = chunk_text(text, source.chunking.max_chars, source.chunking.overlap_chars)
+    artifact_id = f"file:{source.name}:{item.relative_path}:branch={branch or 'none'}"
+    return ParsedArtifact(
+        id=artifact_id,
+        source_id=source.name,
+        path=payload.metadata.get("path") or item.uri,
+        relative_path=item.relative_path,
+        type=artifact_type(Path(item.relative_path)),
+        mime_type=mime_type,
+        size_bytes=payload.size_bytes or item.size_bytes or len(payload.content),
+        sha256=content_hash,
+        mtime=payload.mtime or item.mtime or utc_now(),
+        git_branch=branch,
+        git_commit=commit,
+        chunks=chunks,
+    )
+
+
+def _is_text_like(mime_type: str | None) -> bool:
+    if not mime_type:
+        return False
+    return (
+        mime_type.startswith("text/")
+        or mime_type in {"application/json", "application/xml", "application/x-yaml"}
     )

@@ -1,19 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from syncsage.config.schema import SourceConfig, SyncSageConfig
 from syncsage.graph.builder import GraphBuilder
-from syncsage.ingestion.pipeline import discover_files, git_state, parse_file, utc_now
+from syncsage.ingestion.pipeline import git_state, parse_connector_payload, utc_now
 from syncsage.persistence.graph_store import GraphStore
 from syncsage.persistence.manifest import ManifestStore
 from syncsage.persistence.paths import StatePaths
 from syncsage.persistence.state_store import StateStore
 from syncsage.registry.source_registry import SourceRegistry
+from syncsage.sync.connectors import ConnectorItem, connector_for_source
 from syncsage.sync.locks import source_lock
 
 SyncMode = Literal["incremental", "full", "validate_only", "repair"]
+SYNC_MODES = {"incremental", "full", "validate_only", "repair"}
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,7 @@ class SyncResult:
     graph_nodes: int
     graph_edges: int
     status: str = "healthy"
+    details: dict = field(default_factory=dict)
 
 
 class SyncEngine:
@@ -64,10 +67,38 @@ class SyncEngine:
         ]
 
     def sync_source(self, source_name: str, mode: SyncMode = "incremental") -> SyncResult:
+        if mode not in SYNC_MODES:
+            raise ValueError(f"Unsupported sync mode: {mode}")
         source = self._source(source_name)
         with source_lock(self.paths.locks, source.name):
+            connector = connector_for_source(source, self.state)
+            if mode == "validate_only":
+                health = connector.validate()
+                status = "validated" if health.ok else health.status
+                self.state.mark_source_status(source.name, status)
+                return SyncResult(
+                    source.name,
+                    0,
+                    0,
+                    self.graph_builder.graph.number_of_nodes(),
+                    self.graph_builder.graph.number_of_edges(),
+                    status,
+                    {
+                        "connector_type": connector.connector_type,
+                        "item_count": health.item_count,
+                        "checked_items": health.checked_items,
+                        "errors": health.errors,
+                        "checkpoint": health.checkpoint,
+                    },
+                )
             manifest = self.manifests.load(source.name)
             artifacts = manifest.setdefault("artifacts", {})
+            items = connector.list_items()
+            if mode == "full":
+                self.state.delete_source_artifacts(source.name)
+                self.graph_builder.remove_source_content(source.name)
+                manifest = {"source_id": source.name, "artifacts": {}}
+                artifacts = manifest["artifacts"]
             indexed = 0
             skipped = 0
             git_metadata = (
@@ -75,12 +106,25 @@ class SyncEngine:
                 if source.type.value == "repository"
                 else None
             )
-            for path in discover_files(source):
-                parsed = parse_file(source, path, git_metadata)
+            for item in items:
+                previous = artifacts.get(item.relative_path)
+                if self._can_skip_before_read(mode, previous, item):
+                    skipped += 1
+                    continue
+                payload = connector.read_item(item)
+                parsed = parse_connector_payload(source, item, payload, git_metadata)
                 if parsed is None:
                     continue
-                previous = artifacts.get(parsed.relative_path)
                 if mode == "incremental" and previous and previous.get("sha256") == parsed.sha256:
+                    skipped += 1
+                    continue
+                if mode == "repair" and not self._needs_repair(
+                    source.name,
+                    parsed.id,
+                    parsed.sha256,
+                    previous,
+                    len(parsed.chunks),
+                ):
                     skipped += 1
                     continue
                 now = utc_now()
@@ -129,15 +173,25 @@ class SyncEngine:
                 }
                 indexed += 1
             manifest["last_indexed_at"] = utc_now()
+            manifest["connector"] = {"type": connector.connector_type}
             self.manifests.save(source.name, manifest)
             self.graph_store.save(self.config.knowledge_base_id, self.graph_builder.graph)
-            self.state.mark_source_indexed(source.name, utc_now())
+            now = utc_now()
+            cursor, high_watermark = connector.checkpoint_from_items(items)
+            high_watermark.update({"indexed_artifacts": indexed, "skipped_artifacts": skipped})
+            connector.set_checkpoint(cursor, high_watermark, "healthy")
+            self.state.mark_source_indexed(source.name, now)
             return SyncResult(
                 source.name,
                 indexed,
                 skipped,
                 self.graph_builder.graph.number_of_nodes(),
                 self.graph_builder.graph.number_of_edges(),
+                "healthy",
+                {
+                    "connector_type": connector.connector_type,
+                    "checkpoint": self.state.get_source_checkpoint(source.name),
+                },
             )
 
     @property
@@ -171,3 +225,35 @@ class SyncEngine:
             if source.name == name:
                 return source
         raise KeyError(f"Unknown source: {name}")
+
+    def _can_skip_before_read(
+        self,
+        mode: SyncMode,
+        previous: dict | None,
+        item: ConnectorItem,
+    ) -> bool:
+        return (
+            mode == "incremental"
+            and previous is not None
+            and item.sha256 is not None
+            and previous.get("sha256") == item.sha256
+        )
+
+    def _needs_repair(
+        self,
+        source_id: str,
+        artifact_id: str,
+        sha256: str,
+        previous: dict | None,
+        expected_chunks: int,
+    ) -> bool:
+        if not previous or previous.get("sha256") != sha256:
+            return True
+        state = self.state.artifact_state(source_id, artifact_id)
+        if state is None:
+            return True
+        return (
+            state.get("sha256") != sha256
+            or state.get("status") != "indexed"
+            or int(state.get("chunk_count") or 0) < expected_chunks
+        )

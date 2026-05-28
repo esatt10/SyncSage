@@ -21,6 +21,11 @@ class SimpleMultiDiGraph:
     def add_node(self, node, **attrs): self._nodes[node] = {**self._nodes.get(node, {}), **attrs}
     def add_edge(self, source, target, **attrs):
         data=self._edges[(source,target)]; data[len(data)] = attrs
+    def remove_nodes_from(self, nodes):
+        remove = set(nodes)
+        for node in remove: self._nodes.pop(node, None)
+        for edge in list(self._edges):
+            if edge[0] in remove or edge[1] in remove: self._edges.pop(edge, None)
     def get_edge_data(self, source, target, default=None): return self._edges.get((source,target), default)
     def neighbors(self, node):
         for s,t in self._edges:
