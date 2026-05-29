@@ -25,6 +25,9 @@ export interface GraphLink {
 export interface NodeLinkGraph {
   nodes: GraphNode[];
   links: GraphLink[];
+  total_nodes?: number;
+  total_links?: number;
+  truncated?: boolean;
 }
 
 export interface GraphSlice {
@@ -63,10 +66,29 @@ export interface SourceRecord {
   type: string;
   path: string;
   enabled: number | boolean;
+  config_json?: string;
   last_status?: string;
   last_indexed_at?: string;
   checkpoint?: Record<string, unknown> | null;
   [key: string]: unknown;
+}
+
+export interface SourceWritePayload {
+  name?: string;
+  type?: string;
+  path?: string;
+  description?: string;
+  enabled?: boolean;
+  max_depth?: number | null;
+  include?: string[];
+  exclude?: string[];
+  repo?: Record<string, unknown>;
+  chunking?: Record<string, unknown>;
+  sync?: Record<string, unknown>;
+  connector?: Record<string, unknown>;
+  urls?: string[];
+  sync_now?: boolean;
+  sync_mode?: string;
 }
 
 export interface FsEntry {

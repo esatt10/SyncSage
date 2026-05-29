@@ -35,9 +35,31 @@ export const EDGE_COLORS: Record<string, string> = {
 };
 
 export const ALL_EDGE_TYPES = Object.keys(EDGE_COLORS);
+export const ALL_NODE_TYPES = Object.keys(NODE_COLORS);
+
+export type ShapeAlgorithm = "node_type" | "degree" | "uniform";
+
+export const NODE_TYPE_SHAPES: Record<string, string> = {
+  knowledge_base: "star",
+  source: "diamond",
+  repository: "diamond",
+  directory: "round-rectangle",
+  file: "rectangle",
+  document: "round-rectangle",
+  markdown_note: "round-rectangle",
+  chunk: "ellipse",
+  symbol: "triangle",
+  entity: "hexagon",
+  concept: "vee",
+  external_reference: "tag",
+};
 
 export function colorForNode(type?: string): string {
   return (type && NODE_COLORS[type]) || "#adb5bd";
+}
+
+export function shapeForNodeType(type?: string): string {
+  return (type && NODE_TYPE_SHAPES[type]) || "ellipse";
 }
 
 export interface CyElement {
@@ -46,9 +68,18 @@ export interface CyElement {
 }
 
 // Convert a node-link graph into Cytoscape elements, deduplicating ids.
-export function toElements(nodes: GraphNode[], links: GraphLink[]): CyElement[] {
+export function toElements(
+  nodes: GraphNode[],
+  links: GraphLink[],
+  shapeAlgorithm: ShapeAlgorithm = "node_type",
+): CyElement[] {
   const seen = new Set<string>();
   const elements: CyElement[] = [];
+  const degree = new Map<string, number>();
+  links.forEach((link) => {
+    degree.set(link.source, (degree.get(link.source) ?? 0) + 1);
+    degree.set(link.target, (degree.get(link.target) ?? 0) + 1);
+  });
   for (const node of nodes) {
     if (!node.id || seen.has(node.id)) continue;
     seen.add(node.id);
@@ -57,6 +88,7 @@ export function toElements(nodes: GraphNode[], links: GraphLink[]): CyElement[] 
         id: node.id,
         label: shorten(node.label ?? node.id),
         ntype: node.type ?? "unknown",
+        shape: shapeForNode(node.type, degree.get(node.id) ?? 0, shapeAlgorithm),
       },
     });
   }
@@ -69,6 +101,16 @@ export function toElements(nodes: GraphNode[], links: GraphLink[]): CyElement[] 
     });
   }
   return elements;
+}
+
+function shapeForNode(type: string | undefined, degree: number, algorithm: ShapeAlgorithm): string {
+  if (algorithm === "uniform") return "ellipse";
+  if (algorithm === "degree") {
+    if (degree >= 8) return "hexagon";
+    if (degree >= 3) return "diamond";
+    return "ellipse";
+  }
+  return shapeForNodeType(type);
 }
 
 function shorten(label: string): string {
@@ -90,6 +132,7 @@ export function buildStylesheet(): CyStylesheet[] {
       selector: "node",
       style: {
         "background-color": "#adb5bd",
+        shape: "data(shape)",
         "border-width": 2,
         "border-color": "#adb5bd",
         label: "data(label)",

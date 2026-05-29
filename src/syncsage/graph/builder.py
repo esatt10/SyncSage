@@ -78,12 +78,42 @@ class GraphBuilder:
         self.upsert_edge(self.kb_id, node_id, "contains", {"source_id": source.name})
         return node_id
 
+    def add_directory_chain(self, source: SourceConfig, relative_path: str, branch: str | None) -> str:
+        source_node = self.add_source(source)
+        parent = source_node
+        parts = [part for part in relative_path.replace("\\", "/").split("/")[:-1] if part]
+        prefix: list[str] = []
+        for depth, part in enumerate(parts, start=1):
+            prefix.append(part)
+            relative = "/".join(prefix)
+            node_id = f"directory:{source.name}:{relative}:branch={branch or 'none'}"
+            self.upsert_node(
+                node_id,
+                "directory",
+                part,
+                {
+                    "source_id": source.name,
+                    "relative_path": relative,
+                    "path": str(source.path / relative),
+                    "depth": depth,
+                    "provenance": {
+                        "path": str(source.path / relative),
+                        "relative_path": relative,
+                        "git_branch": branch,
+                    },
+                },
+            )
+            self.upsert_edge(parent, node_id, "contains", {"source_id": source.name})
+            parent = node_id
+        return parent
+
     def add_artifact(
         self,
         source: SourceConfig,
         artifact: ParsedArtifact,
     ) -> ArtifactEnrichment:
         source_node = self.add_source(source)
+        parent_node = self.add_directory_chain(source, artifact.relative_path, artifact.git_branch)
         enrichment = self.enrich_artifact(source, artifact)
         self.upsert_node(
             artifact.id,
@@ -107,6 +137,7 @@ class GraphBuilder:
             },
         )
         self.upsert_edge(source_node, artifact.id, "indexes", {"source_id": source.name})
+        self.upsert_edge(parent_node, artifact.id, "contains", {"source_id": source.name})
         for chunk in artifact.chunks:
             chunk_id = (
                 f"chunk:{source.name}:{artifact.relative_path}:"

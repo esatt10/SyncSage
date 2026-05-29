@@ -56,6 +56,13 @@ def _match_any(relative: str, patterns: Iterable[str]) -> bool:
     )
 
 
+def within_max_depth(relative: str, max_depth: int | None) -> bool:
+    if max_depth is None:
+        return True
+    depth = max(0, len(Path(relative).parts) - 1)
+    return depth <= max(0, max_depth)
+
+
 def discover_files(source: SourceConfig) -> list[Path]:
     root = source.path
     if not root.exists():
@@ -64,6 +71,8 @@ def discover_files(source: SourceConfig) -> list[Path]:
     files: list[Path] = []
     for path in candidates:
         rel = path.relative_to(root if root.is_dir() else root.parent).as_posix()
+        if not within_max_depth(rel, source.max_depth):
+            continue
         if _match_any(rel, source.exclude):
             continue
         if source.include and not _match_any(rel, source.include):
@@ -108,6 +117,22 @@ def read_text_bytes(content: bytes, relative_path: str) -> str:
     return content.decode("utf-8", errors="ignore")
 
 
+def chunks_for_source(source: SourceConfig, text: str) -> list[TextChunk]:
+    if not text:
+        return []
+    if not source.chunking.enabled:
+        lines = text.splitlines()
+        return [
+            TextChunk(
+                index=0,
+                text=text,
+                start_line=1,
+                end_line=len(lines) or 1,
+            )
+        ]
+    return chunk_text(text, source.chunking.max_chars, source.chunking.overlap_chars)
+
+
 def parse_file(
     source: SourceConfig,
     path: Path,
@@ -126,7 +151,7 @@ def parse_file(
         else (None, None, False)
     )
     text = read_text(path)
-    chunks = chunk_text(text, source.chunking.max_chars, source.chunking.overlap_chars)
+    chunks = chunks_for_source(source, text)
     stat = path.stat()
     artifact_id = f"file:{source.name}:{relative}:branch={branch or 'none'}"
     return ParsedArtifact(
@@ -167,7 +192,7 @@ def parse_connector_payload(
     )
     content_hash = payload.sha256 or item.sha256 or sha256_bytes(payload.content)
     text = read_text_bytes(payload.content, item.relative_path)
-    chunks = chunk_text(text, source.chunking.max_chars, source.chunking.overlap_chars)
+    chunks = chunks_for_source(source, text)
     artifact_id = f"file:{source.name}:{item.relative_path}:branch={branch or 'none'}"
     return ParsedArtifact(
         id=artifact_id,

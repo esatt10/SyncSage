@@ -18,11 +18,11 @@ export const explainRegistry: Record<string, string> = {
   "inspector.relationships":
     "Incoming and outgoing edges grouped by type. Click a neighbor to pivot the graph focus to it.",
   "inspector.content":
-    "Indexed content for this node: chunk text or a file summary for artifacts, drawn from the SQLite store.",
+    "Full indexed content for file-like nodes and exact chunk text for chunk nodes.",
   "sources.add":
-    "Register a new source by opening a local directory. Browsing is restricted server-side to allowlisted roots (workspace, vault, exports).",
+    "Register a new source from any directory visible inside the SyncSage container.",
   "sources.directory":
-    "Allowlist-scoped directory browser. You can only reach paths under SyncSage's configured roots; path traversal is rejected by the server.",
+    "Directory browser over container-visible paths. Host paths must be mounted into the container before SyncSage can index them.",
   "sources.syncMode":
     "Sync mode. incremental skips unchanged files via checkpoints/hashes; full rebuilds everything; validate_only checks health without writing; repair rebuilds only missing/invalid state.",
   "sources.promote":
@@ -30,11 +30,11 @@ export const explainRegistry: Record<string, string> = {
   "config.profile":
     "Built-in profile that seeds defaults (quickstart / dev / team / cloud-hybrid). The effective config is base + profile + your edits.",
   "config.diff":
-    "Preview the YAML difference before applying. This is the UI equivalent of `syncsage config show --effective`.",
+    "Preview the YAML difference before exporting an adjusted config file.",
   "config.rawYaml":
     "Edit the underlying YAML directly. The form and the YAML are two views of one source of truth — SyncSage never takes YAML away.",
   "config.apply":
-    "Validate and write the config to disk. Path/allowlist checks mirror `syncsage doctor`. Some changes require a SyncSage restart to take effect.",
+    "Export the adjusted YAML. Replace the mounted config and restart SyncSage to apply it.",
   "explain.toggle":
     "Explain mode. While on, hover any highlighted component for a description of what it does and which backend behavior it maps to.",
   "health.badge":

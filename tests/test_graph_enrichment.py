@@ -31,8 +31,20 @@ def test_full_sync_creates_enriched_graph_nodes_and_edges(
     node_types = {node["type"] for node in graph.to_node_link()["nodes"]}
     edge_types = {edge["type"] for edge in graph.to_node_link()["links"]}
 
-    assert {"symbol", "entity", "concept", "external_reference"} <= node_types
-    expected_edges = {"imports", "calls", "references", "derived_from", "mentions", "similar_to"}
+    assert {"directory", "symbol", "entity", "concept", "external_reference"} <= node_types
+    assert any(
+        node["type"] == "directory" and node.get("relative_path") == "syncsage"
+        for node in graph.to_node_link()["nodes"]
+    )
+    expected_edges = {
+        "contains",
+        "imports",
+        "calls",
+        "references",
+        "derived_from",
+        "mentions",
+        "similar_to",
+    }
     assert expected_edges <= edge_types
 
 

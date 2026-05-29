@@ -7,6 +7,7 @@ import type {
   NodeLinkGraph,
   SearchResponse,
   SourceRecord,
+  SourceWritePayload,
   SyncResult,
 } from "./types";
 
@@ -14,6 +15,14 @@ import type {
 // When the bundle is served by SyncSage itself, the API is same-origin (root).
 const API_BASE =
   import.meta.env.VITE_SYNCSAGE_API_BASE ?? (import.meta.env.DEV ? "/api" : "");
+
+function numericEnv(value: unknown, fallback: number): number {
+  const parsed = Number(value ?? fallback);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+const GRAPH_NODE_LIMIT = numericEnv(import.meta.env.VITE_SYNCSAGE_GRAPH_NODE_LIMIT, 1200);
+const GRAPH_LINK_LIMIT = numericEnv(import.meta.env.VITE_SYNCSAGE_GRAPH_LINK_LIMIT, 3600);
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -48,7 +57,10 @@ export const api = {
   health: () => request<{ status: string }>("/health"),
 
   // Graph
-  graph: () => request<NodeLinkGraph>("/graph"),
+  graph: () =>
+    request<NodeLinkGraph>(
+      `/graph${qs({ limit: GRAPH_NODE_LIMIT, link_limit: GRAPH_LINK_LIMIT })}`,
+    ),
   graphSlice: (nodeId: string, depth = 1, edgeTypes?: string[]) =>
     request<GraphSlice>(
       `/graph/slice${qs({ node_id: nodeId, depth, edge_types: edgeTypes?.join(",") })}`,
@@ -61,22 +73,20 @@ export const api = {
     request<ExplainResponse>(`/nodes/explain${qs({ node_id: nodeId })}`),
   fileSummary: (path: string, sourceName?: string) =>
     request<Record<string, unknown>>(`/files/summary${qs({ path, source_name: sourceName })}`),
+  nodeContent: (nodeId: string) =>
+    request<{ node_id: string; content: string | null }>(`/nodes/content${qs({ node_id: nodeId })}`),
 
   // Sources
   sources: () => request<SourceRecord[]>("/sources"),
-  registerSource: (body: {
-    name: string;
-    type: string;
-    path: string;
-    description?: string;
-    include?: string[];
-    exclude?: string[];
-    sync_now?: boolean;
-    sync_mode?: string;
-  }) => request<{ status: string; source: Record<string, unknown> }>("/sources", {
+  registerSource: (body: SourceWritePayload & { name: string; path: string }) => request<{ status: string; source: Record<string, unknown> }>("/sources", {
     method: "POST",
     body: JSON.stringify(body),
   }),
+  updateSource: (name: string, body: SourceWritePayload) =>
+    request<{ status: string; source: Record<string, unknown> }>(
+      `/sources/${encodeURIComponent(name)}`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
   disableSource: (name: string) =>
     request<{ status: string }>(`/sources/${encodeURIComponent(name)}/disable`, { method: "POST" }),
   removeSource: (name: string) =>

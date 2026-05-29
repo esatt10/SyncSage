@@ -13,7 +13,7 @@ from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
 from syncsage.config.schema import SourceConfig
-from syncsage.ingestion.pipeline import _match_any, sha256_file, utc_now
+from syncsage.ingestion.pipeline import _match_any, sha256_file, utc_now, within_max_depth
 from syncsage.persistence.state_store import StateStore
 
 
@@ -146,6 +146,8 @@ class SourceConnector(ABC):
             )
 
     def _allows_relative_path(self, relative_path: str) -> bool:
+        if not within_max_depth(relative_path, self.source.max_depth):
+            return False
         if _match_any(relative_path, self.source.exclude):
             return False
         return not self.source.include or _match_any(relative_path, self.source.include)

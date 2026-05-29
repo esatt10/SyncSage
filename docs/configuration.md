@@ -262,6 +262,7 @@ Each source item supports:
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
+| `enabled` | bool | `true` | When false, each artifact is indexed as one full-content chunk. |
 | `strategy` | string | `semantic` | Chunking algorithm (semantic/heading/page-oriented, etc.). |
 | `max_chars` | integer | `4000` | Maximum chunk size. |
 | `overlap_chars` | integer | `400` | Overlap between adjacent chunks. |
@@ -378,6 +379,8 @@ security:
   allow_workspace_roots:
     - /workspace
     - /vault
+    - /exports
+  allow_user_selected_source_paths: true
   read_only_sources: true
   deny_path_traversal: true
   default_exclude_secrets: true

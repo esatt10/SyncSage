@@ -31,6 +31,10 @@ SYNCSAGE_API_BASE=http://localhost:8765 npm run dev
 
 In dev, API calls go to `/api/*` and Vite proxies them to `SYNCSAGE_API_BASE`.
 Override the API base at build/runtime with `VITE_SYNCSAGE_API_BASE`.
+The production UI requests a bounded initial graph preview by default
+(`VITE_SYNCSAGE_GRAPH_NODE_LIMIT=1200`,
+`VITE_SYNCSAGE_GRAPH_LINK_LIMIT=3600`) so large indexes do not block the browser;
+node expansion still fetches focused graph slices.
 
 ## Build
 

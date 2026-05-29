@@ -118,6 +118,8 @@ security:
   allow_workspace_roots:
     - /workspace
     - /vault
+    - /exports
+  allow_user_selected_source_paths: true
   read_only_sources: true
   deny_path_traversal: true
   default_exclude_secrets: true
@@ -165,6 +167,7 @@ sources:
           javascript: false
           typescript: false
     chunking:
+      enabled: true
       strategy: semantic
       max_chars: 4000
       overlap_chars: 400
@@ -208,6 +211,7 @@ sources:
       - "**/*.pem"
       - "**/*.key"
     chunking:
+      enabled: true
       strategy: heading_or_page
       max_chars: 5000
       overlap_chars: 500

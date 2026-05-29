@@ -40,8 +40,31 @@ def test_graph_routes_have_stable_shape_when_empty(loaded_config) -> None:
     assert slice_resp.json()["links"] == []
 
 
+def test_graph_route_can_return_bounded_preview(loaded_config) -> None:
+    app = create_app(config=loaded_config)
+    graph = app.state.engine.graph_builder.graph
+    existing_nodes = graph.number_of_nodes()
+    existing_links = graph.number_of_edges()
+    graph.add_node("a", id="a", type="source", label="A")
+    graph.add_node("b", id="b", type="file", label="B")
+    graph.add_node("c", id="c", type="chunk", label="C")
+    graph.add_edge("a", "b", type="contains")
+    graph.add_edge("b", "c", type="has_chunk")
+
+    response = TestClient(app).get("/graph", params={"limit": 2, "link_limit": 1})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total_nodes"] == existing_nodes + 3
+    assert payload["total_links"] == existing_links + 2
+    assert payload["truncated"] is True
+    assert len(payload["nodes"]) == 2
+    assert len(payload["links"]) <= 1
+
+
 def test_fs_list_lists_roots_and_rejects_escapes(loaded_config, workspace_copy: Path) -> None:
     loaded_config.syncsage.workspace_root = workspace_copy
+    loaded_config.security.allow_user_selected_source_paths = False
     client = _client(loaded_config)
 
     roots = client.get("/fs/list")
@@ -54,6 +77,35 @@ def test_fs_list_lists_roots_and_rejects_escapes(loaded_config, workspace_copy: 
 
     escaped = client.get("/fs/list", params={"path": "/etc"})
     assert escaped.status_code == 403
+
+
+def test_fs_list_and_register_accept_user_selected_path(loaded_config, tmp_path: Path) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "note.md").write_text("# External\n", encoding="utf-8")
+    loaded_config.syncsage.workspace_root = tmp_path / "workspace"
+    loaded_config.security.allow_user_selected_source_paths = True
+    client = _client(loaded_config)
+
+    listing = client.get("/fs/list", params={"path": str(external)})
+    assert listing.status_code == 200
+    assert listing.json()["path"] == str(external.resolve())
+
+    response = client.post(
+        "/sources",
+        json={
+            "name": "external-notes",
+            "type": "markdown_folder",
+            "path": str(external),
+            "max_depth": 0,
+            "include": ["**/*.md"],
+            "sync": {"on_startup": False},
+        },
+    )
+    assert response.status_code == 200
+    source = response.json()["source"]
+    assert source["path"] == str(external.resolve())
+    assert source["max_depth"] == 0
 
 
 def test_register_source_appears_in_listing(loaded_config, workspace_copy: Path) -> None:
@@ -81,12 +133,52 @@ def test_register_source_appears_in_listing(loaded_config, workspace_copy: Path)
 
 def test_register_source_rejects_path_outside_roots(loaded_config, workspace_copy: Path) -> None:
     loaded_config.syncsage.workspace_root = workspace_copy
+    loaded_config.security.allow_user_selected_source_paths = False
     client = _client(loaded_config)
     response = client.post(
         "/sources",
         json={"name": "escape", "type": "markdown_folder", "path": "/etc"},
     )
     assert response.status_code == 400
+
+
+def test_update_source_persists_custom_runtime_config(loaded_config, workspace_copy: Path) -> None:
+    loaded_config.syncsage.workspace_root = workspace_copy
+    client = _client(loaded_config)
+    response = client.put(
+        "/sources/syncsage-repo",
+        json={
+            "path": str(workspace_copy / "syncsage-repo"),
+            "type": "repository",
+            "max_depth": 1,
+            "include": ["**/*.py"],
+            "exclude": ["**/.git/**"],
+            "chunking": {"strategy": "semantic", "max_chars": 1200, "overlap_chars": 120},
+            "sync": {"on_startup": False, "on_file_change": False, "on_git_commit": False},
+            "repo": {"branch_policy": "current", "include_uncommitted": False},
+        },
+    )
+
+    assert response.status_code == 200
+    source = response.json()["source"]
+    assert source["max_depth"] == 1
+    assert source["chunking"]["max_chars"] == 1200
+    assert source["repo"]["include_uncommitted"] is False
+
+
+def test_node_content_route_returns_full_indexed_text(loaded_config) -> None:
+    app = create_app(config=loaded_config)
+    app.state.engine.sync_source("architecture-notes", "full")
+    rows = app.state.state.rows(
+        "SELECT artifact_id, text FROM chunks WHERE source_id=? ORDER BY chunk_index",
+        ("architecture-notes",),
+    )
+    assert rows
+
+    response = TestClient(app).get("/nodes/content", params={"node_id": rows[0]["artifact_id"]})
+
+    assert response.status_code == 200
+    assert rows[0]["text"].replace("\r\n", "\n") in response.json()["content"].replace("\r\n", "\n")
 
 
 def test_promote_source_generates_patch(loaded_config, workspace_copy: Path) -> None:

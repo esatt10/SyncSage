@@ -21,7 +21,7 @@ from syncsage.config.profiles import profile_names
 from syncsage.config.schema import SourceConfig, SourceType, SyncSageConfig
 from syncsage.graph.exporter import cytoscape, node_link
 from syncsage.graph.simple import SimpleMultiDiGraph
-from syncsage.ingestion.pipeline import utc_now
+from syncsage.ingestion.pipeline import read_text, utc_now
 from syncsage.obsidian.exporter import ObsidianExporter
 from syncsage.persistence.paths import StatePaths
 from syncsage.persistence.state_store import StateStore
@@ -62,10 +62,31 @@ class RegisterSourceRequest(BaseModel):
     path: str
     description: str | None = None
     enabled: bool = True
+    max_depth: int | None = None
     include: list[str] | None = None
     exclude: list[str] | None = None
+    repo: dict | None = None
+    chunking: dict | None = None
+    sync: dict | None = None
+    connector: dict | None = None
+    urls: list[str] | None = None
     sync_now: bool = False
     sync_mode: str = "incremental"
+
+
+class UpdateSourceRequest(BaseModel):
+    type: str | None = None
+    path: str | None = None
+    description: str | None = None
+    enabled: bool | None = None
+    max_depth: int | None = None
+    include: list[str] | None = None
+    exclude: list[str] | None = None
+    repo: dict | None = None
+    chunking: dict | None = None
+    sync: dict | None = None
+    connector: dict | None = None
+    urls: list[str] | None = None
 
 
 class PromoteSourceRequest(BaseModel):
@@ -87,12 +108,45 @@ def _allowed_roots(config: SyncSageConfig) -> list[Path]:
         config.syncsage.workspace_root,
         config.syncsage.vault_path,
         config.syncsage.exports_path,
+        *config.security.allow_workspace_roots,
     ]
+    if config.security.allow_user_selected_source_paths:
+        roots.append(Path("/"))
     seen: list[Path] = []
     for root in roots:
-        if root not in seen:
-            seen.append(root)
+        resolved = root.expanduser().resolve()
+        if resolved not in seen and resolved.exists():
+            seen.append(resolved)
     return seen
+
+
+def _resolve_source_path(path: str, config: SyncSageConfig) -> Path:
+    if config.security.allow_user_selected_source_paths:
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.exists():
+            raise PathPolicyError(f"Path does not exist: {resolved}")
+        return resolved
+    return resolve_under(path, _allowed_roots(config))
+
+
+def _source_from_payload(payload: dict) -> SourceConfig:
+    return SyncSageConfig.model_validate({"sources": [payload]}).sources[0]
+
+
+def _source_payload(
+    req: RegisterSourceRequest | UpdateSourceRequest,
+    resolved_path: Path,
+    existing: SourceConfig | None = None,
+) -> dict:
+    payload = existing.model_dump(mode="json") if existing else {}
+    if isinstance(req, RegisterSourceRequest):
+        payload.update({"name": req.name, "type": req.type})
+        updates = req.model_dump(exclude={"sync_now", "sync_mode"}, exclude_none=True)
+    else:
+        updates = req.model_dump(exclude_unset=True)
+    updates["path"] = str(resolved_path)
+    payload.update(updates)
+    return payload
 
 
 def graph_neighbors(
@@ -276,24 +330,14 @@ def create_app(
     @app.post("/sources")
     def register_source(req: RegisterSourceRequest) -> dict:
         try:
-            resolved = resolve_under(req.path, _allowed_roots(config))
+            resolved = _resolve_source_path(req.path, config)
         except PathPolicyError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
-            source_type = SourceType(req.type)
+            SourceType(req.type)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"Unknown source type: {req.type}") from exc
-        source = SourceConfig(
-            name=req.name,
-            type=source_type,
-            path=resolved,
-            description=req.description,
-            enabled=req.enabled,
-        )
-        if req.include is not None:
-            source.include = req.include
-        if req.exclude is not None:
-            source.exclude = req.exclude
+        source = _source_from_payload(_source_payload(req, resolved))
         SourceRegistry(config, state).register_source(source)
         config.sources = [s for s in config.sources if s.name != source.name]
         config.sources.append(source)
@@ -309,6 +353,40 @@ def create_app(
             "knowledge_base": config.knowledge_base_id,
             "source": source.model_dump(mode="json"),
             "sync_result": result,
+            "config_update_required": True,
+        }
+
+    @app.put("/sources/{source_id}")
+    def update_source(source_id: str, req: UpdateSourceRequest) -> dict:
+        source = next((s for s in config.sources if s.name == source_id), None)
+        if source is None:
+            row = state.get_source(source_id)
+            if not row:
+                raise HTTPException(status_code=404, detail=f"Unknown source: {source_id}")
+            import json
+
+            source = _source_from_payload(json.loads(row["config_json"]))
+        try:
+            resolved = _resolve_source_path(req.path, config) if req.path else source.path
+        except PathPolicyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if req.type is not None:
+            try:
+                SourceType(req.type)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f"Unknown source type: {req.type}") from exc
+        updated = _source_from_payload(_source_payload(req, resolved, existing=source))
+        engine.graph_builder.remove_source_content(source_id)
+        engine.manifests.delete(source_id)
+        state.delete_source_artifacts(source_id)
+        SourceRegistry(config, state).register_source(updated)
+        config.sources = [s for s in config.sources if s.name != source_id]
+        config.sources.append(updated)
+        engine.graph_store.save(config.knowledge_base_id, engine.graph_builder.graph)
+        audit(source_id, "update_source", {"source": updated.model_dump(mode="json")})
+        return {
+            "status": "updated",
+            "source": updated.model_dump(mode="json"),
             "config_update_required": True,
         }
 
@@ -438,7 +516,8 @@ def create_app(
     @app.get("/files/summary")
     def file_summary(path: str, source_name: str | None = None) -> dict:
         rows = state.rows(
-            """SELECT artifacts.*, GROUP_CONCAT(chunks.summary, '\n') AS summary FROM artifacts
+            """SELECT artifacts.*, GROUP_CONCAT(chunks.summary, '\n') AS summary,
+            GROUP_CONCAT(chunks.text, '\n\n') AS content FROM artifacts
             LEFT JOIN chunks ON chunks.artifact_id=artifacts.id
             WHERE artifacts.relative_path=? AND (? IS NULL OR artifacts.source_id=?)
             GROUP BY artifacts.id LIMIT 1""",
@@ -446,9 +525,36 @@ def create_app(
         )
         return dict(rows[0]) if rows else {"path": path, "summary": None}
 
+    @app.get("/nodes/content")
+    def node_content(node_id: str) -> dict:
+        graph = engine.graph_builder.graph
+        if node_id not in graph:
+            raise HTTPException(status_code=404, detail=f"Unknown node: {node_id}")
+        node = dict(graph.nodes[node_id])
+        if node.get("type") == "chunk":
+            rows = state.rows(
+                "SELECT text FROM chunks WHERE id=? LIMIT 1",
+                (node_id,),
+            )
+            return {"node_id": node_id, "content": rows[0]["text"] if rows else None}
+        artifact_rows = state.rows("SELECT path FROM artifacts WHERE id=? LIMIT 1", (node_id,))
+        if artifact_rows:
+            path = Path(artifact_rows[0]["path"])
+            if path.exists() and path.is_file():
+                content = read_text(path)
+                if content:
+                    return {"node_id": node_id, "content": content}
+        rows = state.rows(
+            "SELECT GROUP_CONCAT(text, '\n\n') AS content FROM chunks WHERE artifact_id=? "
+            "ORDER BY chunk_index",
+            (node_id,),
+        )
+        content = rows[0]["content"] if rows else None
+        return {"node_id": node_id, "content": content}
+
     @app.get("/graph")
-    def graph() -> dict:
-        return node_link(engine.graph_builder.graph)
+    def graph(limit: int | None = None, link_limit: int | None = None) -> dict:
+        return node_link(engine.graph_builder.graph, node_limit=limit, link_limit=link_limit)
 
     @app.get("/graph/export/node-link-json")
     def graph_node_link() -> dict:
@@ -506,7 +612,7 @@ def create_app(
                 ],
             }
         try:
-            resolved = resolve_under(path, roots)
+            resolved = _resolve_source_path(path, config)
         except PathPolicyError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         if not resolved.exists() or not resolved.is_dir():
@@ -519,7 +625,10 @@ def create_app(
                 {"name": child.name, "path": str(child), "is_dir": child.is_dir()}
             )
         parent = resolved.parent
-        parent_allowed = any(parent == r or r in parent.parents or parent == r for r in roots)
+        parent_allowed = (
+            config.security.allow_user_selected_source_paths
+            or any(parent == r or r in parent.parents or parent == r for r in roots)
+        )
         return {
             "path": str(resolved),
             "parent": str(parent) if parent_allowed and parent != resolved else None,
