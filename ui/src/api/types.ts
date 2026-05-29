@@ -25,6 +25,9 @@ export interface GraphLink {
 export interface NodeLinkGraph {
   nodes: GraphNode[];
   links: GraphLink[];
+  total_nodes?: number;
+  total_links?: number;
+  truncated?: boolean;
 }
 
 export interface GraphSlice {

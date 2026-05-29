@@ -32,6 +32,8 @@ export function GraphWorkspace() {
     [...base.links, ...extra.links].forEach((l) => linkMap.set(linkKey(l), l));
     return { nodes: [...nodeMap.values()], links: [...linkMap.values()] };
   }, [base, extra]);
+  const totalNodes = graphQuery.data?.total_nodes ?? merged.nodes.length;
+  const totalLinks = graphQuery.data?.total_links ?? merged.links.length;
 
   const visibleLinks = useMemo(
     () => merged.links.filter((l) => !l.type || enabledEdges.has(l.type)),
@@ -135,9 +137,16 @@ export function GraphWorkspace() {
         <div className="canvas-toolbar">
           <Breadcrumbs trail={trail} onJump={(i) => select(trail[i].id)} />
           <span className="muted small">
-            {merged.nodes.length} nodes · {visibleLinks.length} edges
+            {merged.nodes.length}
+            {graphQuery.data?.truncated ? ` of ${totalNodes}` : ""} nodes · {visibleLinks.length}
+            {graphQuery.data?.truncated ? ` of ${totalLinks}` : ""} edges
           </span>
         </div>
+        {graphQuery.data?.truncated ? (
+          <div className="graph-limit-banner">
+            Showing a bounded graph preview. Search or expand nodes to inspect focused neighborhoods.
+          </div>
+        ) : null}
         <Explainable id="graph.canvas" className="canvas-host">
           {graphQuery.isLoading ? (
             <div className="centered muted">Loading graph…</div>

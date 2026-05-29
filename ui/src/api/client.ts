@@ -15,6 +15,14 @@ import type {
 const API_BASE =
   import.meta.env.VITE_SYNCSAGE_API_BASE ?? (import.meta.env.DEV ? "/api" : "");
 
+function numericEnv(value: unknown, fallback: number): number {
+  const parsed = Number(value ?? fallback);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+const GRAPH_NODE_LIMIT = numericEnv(import.meta.env.VITE_SYNCSAGE_GRAPH_NODE_LIMIT, 1200);
+const GRAPH_LINK_LIMIT = numericEnv(import.meta.env.VITE_SYNCSAGE_GRAPH_LINK_LIMIT, 3600);
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
@@ -48,7 +56,10 @@ export const api = {
   health: () => request<{ status: string }>("/health"),
 
   // Graph
-  graph: () => request<NodeLinkGraph>("/graph"),
+  graph: () =>
+    request<NodeLinkGraph>(
+      `/graph${qs({ limit: GRAPH_NODE_LIMIT, link_limit: GRAPH_LINK_LIMIT })}`,
+    ),
   graphSlice: (nodeId: string, depth = 1, edgeTypes?: string[]) =>
     request<GraphSlice>(
       `/graph/slice${qs({ node_id: nodeId, depth, edge_types: edgeTypes?.join(",") })}`,

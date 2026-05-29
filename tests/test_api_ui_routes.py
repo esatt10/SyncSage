@@ -40,6 +40,28 @@ def test_graph_routes_have_stable_shape_when_empty(loaded_config) -> None:
     assert slice_resp.json()["links"] == []
 
 
+def test_graph_route_can_return_bounded_preview(loaded_config) -> None:
+    app = create_app(config=loaded_config)
+    graph = app.state.engine.graph_builder.graph
+    existing_nodes = graph.number_of_nodes()
+    existing_links = graph.number_of_edges()
+    graph.add_node("a", id="a", type="source", label="A")
+    graph.add_node("b", id="b", type="file", label="B")
+    graph.add_node("c", id="c", type="chunk", label="C")
+    graph.add_edge("a", "b", type="contains")
+    graph.add_edge("b", "c", type="has_chunk")
+
+    response = TestClient(app).get("/graph", params={"limit": 2, "link_limit": 1})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total_nodes"] == existing_nodes + 3
+    assert payload["total_links"] == existing_links + 2
+    assert payload["truncated"] is True
+    assert len(payload["nodes"]) == 2
+    assert len(payload["links"]) <= 1
+
+
 def test_fs_list_lists_roots_and_rejects_escapes(loaded_config, workspace_copy: Path) -> None:
     loaded_config.syncsage.workspace_root = workspace_copy
     client = _client(loaded_config)

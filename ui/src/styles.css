@@ -231,6 +231,14 @@ body {
   min-height: 0;
   background: radial-gradient(circle at 50% 40%, #11161f, #0d1117);
 }
+.graph-limit-banner {
+  border-bottom: 1px solid var(--border);
+  background: #161b22;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 8px 12px;
+}
 
 /* Breadcrumbs */
 .breadcrumbs {

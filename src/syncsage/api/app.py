@@ -447,8 +447,8 @@ def create_app(
         return dict(rows[0]) if rows else {"path": path, "summary": None}
 
     @app.get("/graph")
-    def graph() -> dict:
-        return node_link(engine.graph_builder.graph)
+    def graph(limit: int | None = None, link_limit: int | None = None) -> dict:
+        return node_link(engine.graph_builder.graph, node_limit=limit, link_limit=link_limit)
 
     @app.get("/graph/export/node-link-json")
     def graph_node_link() -> dict:
