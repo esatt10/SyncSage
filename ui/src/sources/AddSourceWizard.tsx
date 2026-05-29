@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
+import type { SourceRecord, SourceWritePayload } from "../api/types";
 import { DirectoryBrowser } from "./DirectoryBrowser";
 import { Explainable } from "../explain/Explainable";
 
@@ -11,113 +12,328 @@ const SOURCE_TYPES = [
   "document_folder",
   "single_file",
   "web_collection",
+  "api",
+  "s3",
 ];
 
+const SYNC_MODES = ["incremental", "full", "validate_only", "repair"];
+
 interface AddSourceWizardProps {
+  source?: SourceRecord | null;
   onClose: () => void;
 }
 
-// Open a local directory and register it as a source; optionally sync immediately
-// so it appears on the knowledge graph.
-export function AddSourceWizard({ onClose }: AddSourceWizardProps) {
+export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
   const queryClient = useQueryClient();
+  const editing = Boolean(source);
+  const initial = useMemo(() => sourceConfig(source), [source]);
   const [browsePath, setBrowsePath] = useState<string | null>(null);
-  const [chosen, setChosen] = useState<string | null>(null);
-  const [name, setName] = useState("");
-  const [type, setType] = useState("document_folder");
-  const [description, setDescription] = useState("");
-  const [syncNow, setSyncNow] = useState(true);
+  const [chosen, setChosen] = useState<string | null>((initial.path as string | undefined) ?? null);
+  const [name, setName] = useState(String(initial.name ?? ""));
+  const [type, setType] = useState(String(initial.type ?? "document_folder"));
+  const [description, setDescription] = useState(String(initial.description ?? ""));
+  const [enabled, setEnabled] = useState(Boolean(initial.enabled ?? true));
+  const [maxDepth, setMaxDepth] = useState(
+    initial.max_depth === null || initial.max_depth === undefined ? "" : String(initial.max_depth),
+  );
+  const [includeText, setIncludeText] = useState(lines(initial.include));
+  const [excludeText, setExcludeText] = useState(lines(initial.exclude));
+  const chunking = (initial.chunking ?? {}) as Record<string, unknown>;
+  const repo = (initial.repo ?? {}) as Record<string, unknown>;
+  const sync = (initial.sync ?? {}) as Record<string, unknown>;
+  const connector = (initial.connector ?? {}) as Record<string, unknown>;
+  const [chunkStrategy, setChunkStrategy] = useState(String(chunking.strategy ?? "semantic"));
+  const [chunkMax, setChunkMax] = useState(String(chunking.max_chars ?? 4000));
+  const [chunkOverlap, setChunkOverlap] = useState(String(chunking.overlap_chars ?? 400));
+  const [repoBranchPolicy, setRepoBranchPolicy] = useState(String(repo.branch_policy ?? "current"));
+  const [repoIncludeUncommitted, setRepoIncludeUncommitted] = useState(
+    Boolean(repo.include_uncommitted ?? true),
+  );
+  const [repoCommitTrigger, setRepoCommitTrigger] = useState(Boolean(repo.commit_trigger ?? true));
+  const [syncOnStartup, setSyncOnStartup] = useState(Boolean(sync.on_startup ?? true));
+  const [syncOnFileChange, setSyncOnFileChange] = useState(String(sync.on_file_change ?? "debounce"));
+  const [syncOnGitCommit, setSyncOnGitCommit] = useState(Boolean(sync.on_git_commit ?? true));
+  const [syncInterval, setSyncInterval] = useState(
+    sync.interval_seconds === null || sync.interval_seconds === undefined
+      ? ""
+      : String(sync.interval_seconds),
+  );
+  const [urlsText, setUrlsText] = useState(lines(initial.urls));
+  const [connectorText, setConnectorText] = useState(JSON.stringify(connector, null, 2));
+  const [syncNow, setSyncNow] = useState(!editing);
+  const [syncMode, setSyncMode] = useState("incremental");
+  const [error, setError] = useState<string | null>(null);
 
-  const register = useMutation({
-    mutationFn: () =>
-      api.registerSource({
-        name,
-        type,
-        path: chosen as string,
-        description: description || undefined,
-        sync_now: syncNow,
-      }),
+  const mutation = useMutation({
+    mutationFn: () => {
+      const payload = buildPayload();
+      return editing
+        ? api.updateSource(source!.name, payload)
+        : api.registerSource(payload as SourceWritePayload & { name: string; path: string });
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sources"] });
       queryClient.invalidateQueries({ queryKey: ["graph"] });
       onClose();
     },
+    onError: (err) => setError((err as Error).message),
   });
 
   const choose = (path: string) => {
     setChosen(path);
     if (!name) {
-      const leaf = path.split("/").filter(Boolean).pop() ?? "source";
+      const leaf = path.split(/[\\/]/).filter(Boolean).pop() ?? "source";
       setName(leaf.replace(/[^a-zA-Z0-9-_]/g, "-").toLowerCase());
     }
   };
 
+  const buildPayload = (): SourceWritePayload & { name?: string; path?: string } => {
+    setError(null);
+    let connectorPayload: Record<string, unknown>;
+    try {
+      connectorPayload = JSON.parse(connectorText || "{}");
+    } catch {
+      throw new Error("Connector settings must be valid JSON.");
+    }
+    const payload: SourceWritePayload = {
+      type,
+      path: chosen ?? undefined,
+      description: description || undefined,
+      enabled,
+      max_depth: maxDepth.trim() ? Number(maxDepth) : null,
+      include: patterns(includeText),
+      exclude: patterns(excludeText),
+      chunking: {
+        strategy: chunkStrategy,
+        max_chars: Number(chunkMax),
+        overlap_chars: Number(chunkOverlap),
+      },
+      repo: {
+        branch_policy: repoBranchPolicy,
+        include_uncommitted: repoIncludeUncommitted,
+        commit_trigger: repoCommitTrigger,
+      },
+      sync: {
+        on_startup: syncOnStartup,
+        on_file_change: syncOnFileChange,
+        on_git_commit: syncOnGitCommit,
+        interval_seconds: syncInterval.trim() ? Number(syncInterval) : null,
+      },
+      connector: connectorPayload,
+      urls: patterns(urlsText),
+    };
+    if (!editing) {
+      payload.name = name;
+      payload.sync_now = syncNow;
+      payload.sync_mode = syncMode;
+    }
+    return payload;
+  };
+
   return (
     <div className="modal-scrim" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal modal--wide" onClick={(e) => e.stopPropagation()}>
         <header className="modal__header">
-          <h2>Add a source</h2>
+          <h2>{editing ? "Edit source" : "Add a source"}</h2>
           <button className="btn btn--ghost" onClick={onClose}>
-            ✕
+            close
           </button>
         </header>
 
         <div className="wizard">
           <div className="wizard__col">
-            <h4>1 · Open a directory</h4>
+            <h4>Directory</h4>
             <DirectoryBrowser path={browsePath} onNavigate={setBrowsePath} onChoose={choose} />
           </div>
 
-          <div className="wizard__col">
-            <h4>2 · Configure</h4>
-            <label className="field">
-              <span>Chosen path</span>
-              <input className="text-input" value={chosen ?? ""} readOnly placeholder="select a directory →" />
-            </label>
-            <label className="field">
-              <span>Name</span>
-              <input className="text-input" value={name} onChange={(e) => setName(e.target.value)} />
-            </label>
-            <label className="field">
-              <span>Type</span>
-              <select className="text-input" value={type} onChange={(e) => setType(e.target.value)}>
-                {SOURCE_TYPES.map((t) => (
-                  <option key={t} value={t}>
-                    {t}
-                  </option>
-                ))}
-              </select>
-            </label>
+          <div className="wizard__col wizard__col--form">
+            <h4>Source settings</h4>
+            <div className="form-grid">
+              <label className="field">
+                <span>Chosen path</span>
+                <input
+                  className="text-input"
+                  value={chosen ?? ""}
+                  onChange={(event) => setChosen(event.target.value)}
+                  placeholder="Container-visible path"
+                />
+              </label>
+              <label className="field">
+                <span>Name</span>
+                <input
+                  className="text-input"
+                  value={name}
+                  disabled={editing}
+                  onChange={(event) => setName(event.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span>Type</span>
+                <select className="text-input" value={type} onChange={(e) => setType(e.target.value)}>
+                  {SOURCE_TYPES.map((t) => (
+                    <option key={t} value={t}>
+                      {t}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>Folder depth</span>
+                <input
+                  className="text-input"
+                  type="number"
+                  min="0"
+                  value={maxDepth}
+                  onChange={(event) => setMaxDepth(event.target.value)}
+                  placeholder="unlimited"
+                />
+              </label>
+            </div>
+
             <label className="field">
               <span>Description</span>
               <input
                 className="text-input"
                 value={description}
-                onChange={(e) => setDescription(e.target.value)}
+                onChange={(event) => setDescription(event.target.value)}
               />
             </label>
-            <Explainable id="sources.syncMode" as="span">
-              <label className="checkbox">
-                <input type="checkbox" checked={syncNow} onChange={(e) => setSyncNow(e.target.checked)} />
-                Sync now (renders on the graph immediately)
-              </label>
-            </Explainable>
 
-            {register.isError && <p className="error">{(register.error as Error).message}</p>}
+            <div className="form-grid">
+              <label className="field">
+                <span>Include patterns</span>
+                <textarea className="text-area" value={includeText} onChange={(e) => setIncludeText(e.target.value)} />
+              </label>
+              <label className="field">
+                <span>Exclude patterns</span>
+                <textarea className="text-area" value={excludeText} onChange={(e) => setExcludeText(e.target.value)} />
+              </label>
+            </div>
+
+            <details className="settings-group" open>
+              <summary>Indexing</summary>
+              <div className="form-grid">
+                <label className="field">
+                  <span>Chunk strategy</span>
+                  <input className="text-input" value={chunkStrategy} onChange={(e) => setChunkStrategy(e.target.value)} />
+                </label>
+                <label className="field">
+                  <span>Max chars</span>
+                  <input className="text-input" type="number" value={chunkMax} onChange={(e) => setChunkMax(e.target.value)} />
+                </label>
+                <label className="field">
+                  <span>Overlap chars</span>
+                  <input className="text-input" type="number" value={chunkOverlap} onChange={(e) => setChunkOverlap(e.target.value)} />
+                </label>
+              </div>
+            </details>
+
+            <details className="settings-group">
+              <summary>Sync and connectors</summary>
+              <div className="form-grid">
+                <label className="checkbox">
+                  <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+                  Enabled
+                </label>
+                <label className="checkbox">
+                  <input type="checkbox" checked={syncOnStartup} onChange={(e) => setSyncOnStartup(e.target.checked)} />
+                  Sync on startup
+                </label>
+                <label className="checkbox">
+                  <input type="checkbox" checked={syncOnGitCommit} onChange={(e) => setSyncOnGitCommit(e.target.checked)} />
+                  Sync on git commit
+                </label>
+                <label className="field">
+                  <span>File changes</span>
+                  <input className="text-input" value={syncOnFileChange} onChange={(e) => setSyncOnFileChange(e.target.value)} />
+                </label>
+                <label className="field">
+                  <span>Interval seconds</span>
+                  <input className="text-input" type="number" value={syncInterval} onChange={(e) => setSyncInterval(e.target.value)} />
+                </label>
+              </div>
+              <label className="field">
+                <span>URLs</span>
+                <textarea className="text-area" value={urlsText} onChange={(e) => setUrlsText(e.target.value)} />
+              </label>
+              <label className="field">
+                <span>Connector JSON</span>
+                <textarea className="text-area text-area--code" value={connectorText} onChange={(e) => setConnectorText(e.target.value)} />
+              </label>
+            </details>
+
+            <details className="settings-group">
+              <summary>Repository</summary>
+              <div className="form-grid">
+                <label className="field">
+                  <span>Branch policy</span>
+                  <input className="text-input" value={repoBranchPolicy} onChange={(e) => setRepoBranchPolicy(e.target.value)} />
+                </label>
+                <label className="checkbox">
+                  <input type="checkbox" checked={repoIncludeUncommitted} onChange={(e) => setRepoIncludeUncommitted(e.target.checked)} />
+                  Include uncommitted
+                </label>
+                <label className="checkbox">
+                  <input type="checkbox" checked={repoCommitTrigger} onChange={(e) => setRepoCommitTrigger(e.target.checked)} />
+                  Commit trigger
+                </label>
+              </div>
+            </details>
+
+            {!editing && (
+              <Explainable id="sources.syncMode" as="span" className="form-grid">
+                <label className="checkbox">
+                  <input type="checkbox" checked={syncNow} onChange={(e) => setSyncNow(e.target.checked)} />
+                  Sync now
+                </label>
+                <label className="field">
+                  <span>Sync mode</span>
+                  <select className="text-input" value={syncMode} onChange={(e) => setSyncMode(e.target.value)}>
+                    {SYNC_MODES.map((mode) => (
+                      <option key={mode} value={mode}>
+                        {mode}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </Explainable>
+            )}
+
+            {(error || mutation.isError) && <p className="error">{error ?? (mutation.error as Error).message}</p>}
 
             <button
               className="btn btn--primary"
-              disabled={!chosen || !name || register.isPending}
-              onClick={() => register.mutate()}
+              disabled={!chosen || !name || mutation.isPending}
+              onClick={() => mutation.mutate()}
             >
-              {register.isPending ? "Registering…" : "Register source"}
+              {mutation.isPending ? "Saving..." : editing ? "Save source" : "Register source"}
             </button>
-            <p className="muted small">
-              Registered at runtime. Use “Promote to YAML” afterwards to persist it.
-            </p>
           </div>
         </div>
       </div>
     </div>
   );
+}
+
+function sourceConfig(source?: SourceRecord | null): Record<string, unknown> {
+  if (!source) return {};
+  if (source.config_json) {
+    try {
+      return JSON.parse(source.config_json);
+    } catch {
+      return source;
+    }
+  }
+  return source;
+}
+
+function patterns(value: string): string[] {
+  return value
+    .split(/\r?\n|,/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function lines(value: unknown): string {
+  return Array.isArray(value) ? value.join("\n") : "";
 }

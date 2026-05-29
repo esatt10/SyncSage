@@ -118,6 +118,8 @@ security:
   allow_workspace_roots:
     - /workspace
     - /vault
+    - /exports
+  allow_user_selected_source_paths: true
   read_only_sources: true
   deny_path_traversal: true
   default_exclude_secrets: true

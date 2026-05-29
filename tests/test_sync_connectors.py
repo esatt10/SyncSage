@@ -67,6 +67,39 @@ def test_validate_only_does_not_write_index_state(tmp_path: Path, workspace_copy
     assert not engine.manifests.path_for("sample-repo").exists()
 
 
+def test_filesystem_source_respects_max_depth(tmp_path: Path) -> None:
+    root = tmp_path / "docs"
+    nested = root / "section" / "deep"
+    nested.mkdir(parents=True)
+    (root / "root.md").write_text("# Root\n", encoding="utf-8")
+    (root / "section" / "child.md").write_text("# Child\n", encoding="utf-8")
+    (nested / "deep.md").write_text("# Deep\n", encoding="utf-8")
+    config = _config(
+        tmp_path,
+        SourceConfig(
+            name="depth-limited",
+            type=SourceType.document_folder,
+            path=root,
+            include=["**/*.md"],
+            max_depth=1,
+            sync=SourceSyncSettings(on_startup=False),
+        ),
+    )
+    engine = SyncEngine(config)
+
+    result = engine.sync_source("depth-limited", "full")
+
+    assert result.indexed_artifacts == 2
+    paths = {
+        row["relative_path"]
+        for row in engine.state.rows(
+            "SELECT relative_path FROM artifacts WHERE source_id=?",
+            ("depth-limited",),
+        )
+    }
+    assert paths == {"root.md", "section/child.md"}
+
+
 def test_web_collection_connector_syncs_and_exposes_checkpoint(
     tmp_path: Path,
     web_server: str,

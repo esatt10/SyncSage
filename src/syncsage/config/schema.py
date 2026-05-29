@@ -126,6 +126,18 @@ class ObsidianSettings(ModelMixin):
     create_chunk_notes: bool = False
     create_canvas: bool = True
 
+
+@dataclass
+class SecuritySettings(ModelMixin):
+    allow_workspace_roots: list[Path] = field(
+        default_factory=lambda: [Path("/workspace"), Path("/vault"), Path("/exports")]
+    )
+    allow_user_selected_source_paths: bool = True
+    read_only_sources: bool = True
+    deny_path_traversal: bool = True
+    default_exclude_secrets: bool = True
+
+
 @dataclass
 class RepoSettings(ModelMixin):
     branch_policy: str = "current"
@@ -164,6 +176,7 @@ class SourceConfig(ModelMixin):
     path: Path
     description: str | None = None
     enabled: bool = True
+    max_depth: int | None = None
     include: list[str] = field(
         default_factory=lambda: [
             "**/*.py",
@@ -190,6 +203,7 @@ class SyncSageConfig(ModelMixin):
     search: SearchSettings = field(default_factory=SearchSettings)
     sync: SyncSettings = field(default_factory=SyncSettings)
     obsidian: ObsidianSettings = field(default_factory=ObsidianSettings)
+    security: SecuritySettings = field(default_factory=SecuritySettings)
     sources: list[SourceConfig] = field(default_factory=list)
 
     @classmethod
@@ -204,6 +218,11 @@ class SyncSageConfig(ModelMixin):
                 for key in ("sqlite_path", "graph_path", "manifest_path"):
                     if key in raw and raw[key] is not None:
                         raw[key] = Path(raw[key])
+            if dc is SecuritySettings:
+                if "allow_workspace_roots" in raw:
+                    raw["allow_workspace_roots"] = [
+                        Path(item) for item in raw["allow_workspace_roots"] or []
+                    ]
             if dc is ServerSettings:
                 if "mcp" in raw and isinstance(raw["mcp"], dict):
                     raw["mcp"] = build(McpSettings, raw["mcp"])
@@ -226,6 +245,7 @@ class SyncSageConfig(ModelMixin):
             search=build(SearchSettings, data.get("search")),
             sync=build(SyncSettings, data.get("sync")),
             obsidian=build(ObsidianSettings, data.get("obsidian")),
+            security=build(SecuritySettings, data.get("security")),
             sources=[],
         )
         cfg.sources = []

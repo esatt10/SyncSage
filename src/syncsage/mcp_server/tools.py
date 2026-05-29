@@ -48,13 +48,24 @@ class SyncSageTools:
         client_id: str | None = None,
     ) -> dict:
         self._require_knowledge_base(knowledge_base)
+        if self.config.security.allow_user_selected_source_paths:
+            resolved_path = Path(path).expanduser().resolve()
+            if not resolved_path.exists():
+                raise ValueError(f"Path does not exist: {resolved_path}")
+        else:
+            resolved_path = resolve_under(
+                path,
+                [
+                    self.config.syncsage.workspace_root,
+                    self.config.syncsage.vault_path,
+                    self.config.syncsage.exports_path,
+                    *self.config.security.allow_workspace_roots,
+                ],
+            )
         source = SourceConfig(
             name=name,
             type=SourceType(source_type),
-            path=resolve_under(
-                path,
-                [self.config.syncsage.workspace_root, self.config.syncsage.vault_path],
-            ),
+            path=resolved_path,
             description=description,
             enabled=enabled,
         )

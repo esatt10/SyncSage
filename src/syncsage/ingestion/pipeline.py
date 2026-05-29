@@ -56,6 +56,13 @@ def _match_any(relative: str, patterns: Iterable[str]) -> bool:
     )
 
 
+def within_max_depth(relative: str, max_depth: int | None) -> bool:
+    if max_depth is None:
+        return True
+    depth = max(0, len(Path(relative).parts) - 1)
+    return depth <= max(0, max_depth)
+
+
 def discover_files(source: SourceConfig) -> list[Path]:
     root = source.path
     if not root.exists():
@@ -64,6 +71,8 @@ def discover_files(source: SourceConfig) -> list[Path]:
     files: list[Path] = []
     for path in candidates:
         rel = path.relative_to(root if root.is_dir() else root.parent).as_posix()
+        if not within_max_depth(rel, source.max_depth):
+            continue
         if _match_any(rel, source.exclude):
             continue
         if source.include and not _match_any(rel, source.include):

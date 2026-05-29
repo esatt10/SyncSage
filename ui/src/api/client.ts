@@ -7,6 +7,7 @@ import type {
   NodeLinkGraph,
   SearchResponse,
   SourceRecord,
+  SourceWritePayload,
   SyncResult,
 } from "./types";
 
@@ -75,19 +76,15 @@ export const api = {
 
   // Sources
   sources: () => request<SourceRecord[]>("/sources"),
-  registerSource: (body: {
-    name: string;
-    type: string;
-    path: string;
-    description?: string;
-    include?: string[];
-    exclude?: string[];
-    sync_now?: boolean;
-    sync_mode?: string;
-  }) => request<{ status: string; source: Record<string, unknown> }>("/sources", {
+  registerSource: (body: SourceWritePayload & { name: string; path: string }) => request<{ status: string; source: Record<string, unknown> }>("/sources", {
     method: "POST",
     body: JSON.stringify(body),
   }),
+  updateSource: (name: string, body: SourceWritePayload) =>
+    request<{ status: string; source: Record<string, unknown> }>(
+      `/sources/${encodeURIComponent(name)}`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
   disableSource: (name: string) =>
     request<{ status: string }>(`/sources/${encodeURIComponent(name)}/disable`, { method: "POST" }),
   removeSource: (name: string) =>

@@ -129,6 +129,20 @@ body {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 12px;
 }
+.text-area {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 8px;
+  border-radius: 6px;
+  width: 100%;
+  min-height: 84px;
+  resize: vertical;
+}
+.text-area--code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+}
 
 .muted {
   color: var(--muted);
@@ -448,6 +462,9 @@ body {
 .modal--narrow {
   width: min(560px, 92vw);
 }
+.modal--wide {
+  width: min(1180px, 96vw);
+}
 .modal__header {
   display: flex;
   justify-content: space-between;
@@ -462,6 +479,15 @@ body {
 .wizard__col h4 {
   margin: 0 0 8px;
 }
+.wizard__col--form {
+  min-width: 0;
+}
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  align-items: start;
+}
 .field {
   display: flex;
   flex-direction: column;
@@ -473,6 +499,22 @@ body {
   flex-direction: row;
   align-items: center;
   justify-content: space-between;
+}
+.field--compact {
+  margin-bottom: 8px;
+}
+.settings-group {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  margin-bottom: 10px;
+}
+.settings-group summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--muted);
 }
 .checkbox {
   display: flex;
@@ -491,6 +533,12 @@ body {
   display: flex;
   gap: 8px;
   align-items: center;
+  margin-bottom: 8px;
+}
+.dir-browser__open {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
   margin-bottom: 8px;
 }
 .dir-list {

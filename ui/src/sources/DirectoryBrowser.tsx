@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { Explainable } from "../explain/Explainable";
@@ -8,9 +9,9 @@ interface DirectoryBrowserProps {
   onChoose: (path: string) => void;
 }
 
-// Allowlist-scoped directory browser. The server only ever returns paths under
-// SyncSage's configured roots, so the UI cannot reach anything outside them.
+// Server-side validation decides which container-visible paths may be opened.
 export function DirectoryBrowser({ path, onNavigate, onChoose }: DirectoryBrowserProps) {
+  const [manualPath, setManualPath] = useState("");
   const listing = useQuery({
     queryKey: ["fs", path],
     queryFn: () => api.fsList(path ?? undefined),
@@ -31,6 +32,23 @@ export function DirectoryBrowser({ path, onNavigate, onChoose }: DirectoryBrowse
           </button>
         )}
       </div>
+      <form
+        className="dir-browser__open"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (manualPath.trim()) onNavigate(manualPath.trim());
+        }}
+      >
+        <input
+          className="text-input"
+          value={manualPath}
+          onChange={(event) => setManualPath(event.target.value)}
+          placeholder="Open a container-visible path, e.g. /workspace or /vault"
+        />
+        <button className="btn btn--small" type="submit">
+          open
+        </button>
+      </form>
       {listing.isError && <p className="error">{(listing.error as Error).message}</p>}
       <ul className="dir-list">
         {listing.data?.entries.map((entry) => (

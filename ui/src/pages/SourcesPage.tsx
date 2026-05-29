@@ -11,6 +11,7 @@ export function SourcesPage() {
   const queryClient = useQueryClient();
   const sources = useQuery({ queryKey: ["sources"], queryFn: api.sources });
   const [showWizard, setShowWizard] = useState(false);
+  const [editingSource, setEditingSource] = useState<SourceRecord | null>(null);
   const [patch, setPatch] = useState<string | null>(null);
 
   const invalidate = () => {
@@ -72,6 +73,9 @@ export function SourcesPage() {
               <td>{source.last_status ?? "—"}</td>
               <td className="actions-cell">
                 <SyncControl onSync={(mode) => sync.mutate({ name: source.name, mode })} />
+                <button className="btn btn--small" onClick={() => setEditingSource(source)}>
+                  edit
+                </button>
                 <button className="btn btn--small" onClick={() => promote.mutate(source.name)}>
                   promote
                 </button>
@@ -88,6 +92,9 @@ export function SourcesPage() {
       </table>
 
       {showWizard && <AddSourceWizard onClose={() => setShowWizard(false)} />}
+      {editingSource && (
+        <AddSourceWizard source={editingSource} onClose={() => setEditingSource(null)} />
+      )}
 
       {patch && (
         <div className="modal-scrim" onClick={() => setPatch(null)}>

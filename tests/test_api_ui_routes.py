@@ -64,6 +64,7 @@ def test_graph_route_can_return_bounded_preview(loaded_config) -> None:
 
 def test_fs_list_lists_roots_and_rejects_escapes(loaded_config, workspace_copy: Path) -> None:
     loaded_config.syncsage.workspace_root = workspace_copy
+    loaded_config.security.allow_user_selected_source_paths = False
     client = _client(loaded_config)
 
     roots = client.get("/fs/list")
@@ -76,6 +77,35 @@ def test_fs_list_lists_roots_and_rejects_escapes(loaded_config, workspace_copy: 
 
     escaped = client.get("/fs/list", params={"path": "/etc"})
     assert escaped.status_code == 403
+
+
+def test_fs_list_and_register_accept_user_selected_path(loaded_config, tmp_path: Path) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "note.md").write_text("# External\n", encoding="utf-8")
+    loaded_config.syncsage.workspace_root = tmp_path / "workspace"
+    loaded_config.security.allow_user_selected_source_paths = True
+    client = _client(loaded_config)
+
+    listing = client.get("/fs/list", params={"path": str(external)})
+    assert listing.status_code == 200
+    assert listing.json()["path"] == str(external.resolve())
+
+    response = client.post(
+        "/sources",
+        json={
+            "name": "external-notes",
+            "type": "markdown_folder",
+            "path": str(external),
+            "max_depth": 0,
+            "include": ["**/*.md"],
+            "sync": {"on_startup": False},
+        },
+    )
+    assert response.status_code == 200
+    source = response.json()["source"]
+    assert source["path"] == str(external.resolve())
+    assert source["max_depth"] == 0
 
 
 def test_register_source_appears_in_listing(loaded_config, workspace_copy: Path) -> None:
@@ -103,12 +133,37 @@ def test_register_source_appears_in_listing(loaded_config, workspace_copy: Path)
 
 def test_register_source_rejects_path_outside_roots(loaded_config, workspace_copy: Path) -> None:
     loaded_config.syncsage.workspace_root = workspace_copy
+    loaded_config.security.allow_user_selected_source_paths = False
     client = _client(loaded_config)
     response = client.post(
         "/sources",
         json={"name": "escape", "type": "markdown_folder", "path": "/etc"},
     )
     assert response.status_code == 400
+
+
+def test_update_source_persists_custom_runtime_config(loaded_config, workspace_copy: Path) -> None:
+    loaded_config.syncsage.workspace_root = workspace_copy
+    client = _client(loaded_config)
+    response = client.put(
+        "/sources/syncsage-repo",
+        json={
+            "path": str(workspace_copy / "syncsage-repo"),
+            "type": "repository",
+            "max_depth": 1,
+            "include": ["**/*.py"],
+            "exclude": ["**/.git/**"],
+            "chunking": {"strategy": "semantic", "max_chars": 1200, "overlap_chars": 120},
+            "sync": {"on_startup": False, "on_file_change": False, "on_git_commit": False},
+            "repo": {"branch_policy": "current", "include_uncommitted": False},
+        },
+    )
+
+    assert response.status_code == 200
+    source = response.json()["source"]
+    assert source["max_depth"] == 1
+    assert source["chunking"]["max_chars"] == 1200
+    assert source["repo"]["include_uncommitted"] is False
 
 
 def test_promote_source_generates_patch(loaded_config, workspace_copy: Path) -> None:

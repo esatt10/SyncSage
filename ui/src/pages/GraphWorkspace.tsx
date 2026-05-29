@@ -5,7 +5,13 @@ import type { GraphLink, GraphNode } from "../api/types";
 import { GraphCanvas } from "../graph/GraphCanvas";
 import { NodeInspector } from "../graph/NodeInspector";
 import { Breadcrumbs } from "../graph/Breadcrumbs";
-import { ALL_EDGE_TYPES, EDGE_COLORS, NODE_COLORS } from "../graph/graphStyles";
+import {
+  ALL_EDGE_TYPES,
+  ALL_NODE_TYPES,
+  EDGE_COLORS,
+  NODE_COLORS,
+  type ShapeAlgorithm,
+} from "../graph/graphStyles";
 import { Explainable } from "../explain/Explainable";
 
 export function GraphWorkspace() {
@@ -18,6 +24,10 @@ export function GraphWorkspace() {
   const [focusIds, setFocusIds] = useState<string[]>([]);
   const [expandDepth, setExpandDepth] = useState(1);
   const [enabledEdges, setEnabledEdges] = useState<Set<string>>(new Set(ALL_EDGE_TYPES));
+  const [enabledNodeTypes, setEnabledNodeTypes] = useState<Set<string>>(new Set(ALL_NODE_TYPES));
+  const [layoutName, setLayoutName] = useState("auto");
+  const [shapeAlgorithm, setShapeAlgorithm] = useState<ShapeAlgorithm>("node_type");
+  const [spacing, setSpacing] = useState(1);
   const [trail, setTrail] = useState<{ id: string; label: string }[]>([]);
   const [query, setQuery] = useState("");
 
@@ -35,9 +45,23 @@ export function GraphWorkspace() {
   const totalNodes = graphQuery.data?.total_nodes ?? merged.nodes.length;
   const totalLinks = graphQuery.data?.total_links ?? merged.links.length;
 
+  const visibleNodes = useMemo(
+    () =>
+      merged.nodes.filter(
+        (node) => !node.type || !ALL_NODE_TYPES.includes(node.type) || enabledNodeTypes.has(node.type),
+      ),
+    [merged.nodes, enabledNodeTypes],
+  );
+  const visibleNodeIds = useMemo(() => new Set(visibleNodes.map((node) => node.id)), [visibleNodes]);
   const visibleLinks = useMemo(
-    () => merged.links.filter((l) => !l.type || enabledEdges.has(l.type)),
-    [merged.links, enabledEdges],
+    () =>
+      merged.links.filter(
+        (link) =>
+          (!link.type || enabledEdges.has(link.type)) &&
+          visibleNodeIds.has(link.source) &&
+          visibleNodeIds.has(link.target),
+      ),
+    [merged.links, enabledEdges, visibleNodeIds],
   );
 
   const nodeById = useMemo(() => new Map(merged.nodes.map((n) => [n.id, n])), [merged.nodes]);
@@ -70,6 +94,15 @@ export function GraphWorkspace() {
 
   const toggleEdge = (type: string) => {
     setEnabledEdges((prev) => {
+      const next = new Set(prev);
+      if (next.has(type)) next.delete(type);
+      else next.add(type);
+      return next;
+    });
+  };
+
+  const toggleNodeType = (type: string) => {
+    setEnabledNodeTypes((prev) => {
       const next = new Set(prev);
       if (next.has(type)) next.delete(type);
       else next.add(type);
@@ -111,6 +144,44 @@ export function GraphWorkspace() {
           </div>
         </Explainable>
 
+        <div className="legend-block">
+          <h3>Graph layout</h3>
+          <label className="field field--compact">
+            <span>Algorithm</span>
+            <select className="text-input text-input--small" value={layoutName} onChange={(event) => setLayoutName(event.target.value)}>
+              <option value="auto">auto</option>
+              <option value="cose">force</option>
+              <option value="grid">grid</option>
+              <option value="circle">circle</option>
+              <option value="concentric">concentric</option>
+              <option value="breadthfirst">breadthfirst</option>
+            </select>
+          </label>
+          <label className="field field--compact">
+            <span>Shape algorithm</span>
+            <select
+              className="text-input text-input--small"
+              value={shapeAlgorithm}
+              onChange={(event) => setShapeAlgorithm(event.target.value as ShapeAlgorithm)}
+            >
+              <option value="node_type">node type</option>
+              <option value="degree">relationship degree</option>
+              <option value="uniform">uniform</option>
+            </select>
+          </label>
+          <label className="field field--compact">
+            <span>Spacing</span>
+            <input
+              type="range"
+              min="0.6"
+              max="1.8"
+              step="0.1"
+              value={spacing}
+              onChange={(event) => setSpacing(Number(event.target.value))}
+            />
+          </label>
+        </div>
+
         <Explainable id="graph.legend" className="legend-block">
           <h3>Edge lens</h3>
           {ALL_EDGE_TYPES.map((type) => (
@@ -125,10 +196,11 @@ export function GraphWorkspace() {
         <div className="legend-block">
           <h3>Node types</h3>
           {Object.entries(NODE_COLORS).map(([type, color]) => (
-            <div key={type} className="legend-row">
+            <label key={type} className="legend-row">
+              <input type="checkbox" checked={enabledNodeTypes.has(type)} onChange={() => toggleNodeType(type)} />
               <span className="legend-dot" style={{ background: color }} />
               {type}
-            </div>
+            </label>
           ))}
         </div>
       </aside>
@@ -137,7 +209,7 @@ export function GraphWorkspace() {
         <div className="canvas-toolbar">
           <Breadcrumbs trail={trail} onJump={(i) => select(trail[i].id)} />
           <span className="muted small">
-            {merged.nodes.length}
+            {visibleNodes.length}
             {graphQuery.data?.truncated ? ` of ${totalNodes}` : ""} nodes · {visibleLinks.length}
             {graphQuery.data?.truncated ? ` of ${totalLinks}` : ""} edges
           </span>
@@ -150,16 +222,19 @@ export function GraphWorkspace() {
         <Explainable id="graph.canvas" className="canvas-host">
           {graphQuery.isLoading ? (
             <div className="centered muted">Loading graph…</div>
-          ) : merged.nodes.length === 0 ? (
+          ) : visibleNodes.length === 0 ? (
             <div className="centered muted">
               No graph yet. Add a source and sync it to populate the knowledge graph.
             </div>
           ) : (
             <GraphCanvas
-              nodes={merged.nodes}
+              nodes={visibleNodes}
               links={visibleLinks}
               selectedId={selectedId}
               focusIds={focusIds}
+              layoutName={layoutName}
+              spacing={spacing}
+              shapeAlgorithm={shapeAlgorithm}
               onSelect={select}
             />
           )}
