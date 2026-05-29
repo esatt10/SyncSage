@@ -166,6 +166,21 @@ def test_update_source_persists_custom_runtime_config(loaded_config, workspace_c
     assert source["repo"]["include_uncommitted"] is False
 
 
+def test_node_content_route_returns_full_indexed_text(loaded_config) -> None:
+    app = create_app(config=loaded_config)
+    app.state.engine.sync_source("architecture-notes", "full")
+    rows = app.state.state.rows(
+        "SELECT artifact_id, text FROM chunks WHERE source_id=? ORDER BY chunk_index",
+        ("architecture-notes",),
+    )
+    assert rows
+
+    response = TestClient(app).get("/nodes/content", params={"node_id": rows[0]["artifact_id"]})
+
+    assert response.status_code == 200
+    assert rows[0]["text"].replace("\r\n", "\n") in response.json()["content"].replace("\r\n", "\n")
+
+
 def test_promote_source_generates_patch(loaded_config, workspace_copy: Path) -> None:
     loaded_config.syncsage.workspace_root = workspace_copy
     client = _client(loaded_config)

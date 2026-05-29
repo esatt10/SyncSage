@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import yaml from "js-yaml";
 import { api } from "../api/client";
 import { ObjectEditor } from "../config/ObjectEditor";
@@ -9,12 +9,13 @@ import { Explainable } from "../explain/Explainable";
 type Mode = "form" | "yaml";
 
 export function ConfigPage() {
-  const queryClient = useQueryClient();
   const configQuery = useQuery({ queryKey: ["config"], queryFn: api.getConfig });
   const [mode, setMode] = useState<Mode>("form");
   const [working, setWorking] = useState<Record<string, unknown>>({});
   const [yamlText, setYamlText] = useState("");
   const [showDiff, setShowDiff] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [exported, setExported] = useState(false);
 
   useEffect(() => {
     if (configQuery.data) {
@@ -23,7 +24,6 @@ export function ConfigPage() {
     }
   }, [configQuery.data]);
 
-  // The proposed YAML always reflects whichever editor the user is using.
   const proposedYaml = useMemo(() => {
     if (mode === "yaml") return yamlText;
     try {
@@ -37,17 +37,43 @@ export function ConfigPage() {
   const diff = useMemo(() => lineDiff(original, proposedYaml), [original, proposedYaml]);
   const changedCount = diff.filter((d) => d.kind !== "same").length;
 
-  const apply = useMutation({
-    mutationFn: () =>
-      mode === "yaml"
-        ? api.putConfig({ yaml_text: yamlText })
-        : api.putConfig({ config: working }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["config"] }),
-  });
+  const exportYaml = () => {
+    setExportError(null);
+    setExported(false);
+    try {
+      const parsed = yaml.load(proposedYaml);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Config YAML must be a mapping at the root.");
+      }
+      const blob = new Blob([proposedYaml], { type: "application/yaml" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "syncsage.adjusted.yaml";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setExported(true);
+    } catch (err) {
+      setExportError((err as Error).message);
+    }
+  };
 
-  if (configQuery.isLoading) return <div className="page"><p className="muted">Loading config…</p></div>;
-  if (configQuery.isError)
-    return <div className="page"><p className="error">{(configQuery.error as Error).message}</p></div>;
+  if (configQuery.isLoading) {
+    return (
+      <div className="page">
+        <p className="muted">Loading config...</p>
+      </div>
+    );
+  }
+  if (configQuery.isError) {
+    return (
+      <div className="page">
+        <p className="error">{(configQuery.error as Error).message}</p>
+      </div>
+    );
+  }
 
   return (
     <div className="page">
@@ -74,16 +100,16 @@ export function ConfigPage() {
           </button>
         </Explainable>
         <Explainable id="config.apply" as="span">
-          <button className="btn btn--primary" disabled={apply.isPending} onClick={() => apply.mutate()}>
-            {apply.isPending ? "Applying…" : "Validate & apply"}
+          <button className="btn btn--primary" onClick={exportYaml}>
+            Export adjusted YAML
           </button>
         </Explainable>
       </div>
 
-      {apply.isError && <p className="error">{(apply.error as Error).message}</p>}
-      {apply.isSuccess && (
+      {exportError && <p className="error">{exportError}</p>}
+      {exported && (
         <p className="notice">
-          Written to disk. {apply.data?.restart_required ? "Restart SyncSage for server-level changes to take effect." : ""}
+          Adjusted YAML exported. Replace your mounted config and restart SyncSage to apply it.
         </p>
       )}
 

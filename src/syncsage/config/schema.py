@@ -147,6 +147,7 @@ class RepoSettings(ModelMixin):
 
 @dataclass
 class ChunkingSettings(ModelMixin):
+    enabled: bool = True
     strategy: str = "semantic"
     max_chars: int = 4000
     overlap_chars: int = 400

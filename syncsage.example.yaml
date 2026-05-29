@@ -167,6 +167,7 @@ sources:
           javascript: false
           typescript: false
     chunking:
+      enabled: true
       strategy: semantic
       max_chars: 4000
       overlap_chars: 400
@@ -210,6 +211,7 @@ sources:
       - "**/*.pem"
       - "**/*.key"
     chunking:
+      enabled: true
       strategy: heading_or_page
       max_chars: 5000
       overlap_chars: 500

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { GraphLink, GraphNode } from "../api/types";
@@ -10,26 +10,37 @@ import {
   ALL_NODE_TYPES,
   EDGE_COLORS,
   NODE_COLORS,
+  shapeForNodeType,
   type ShapeAlgorithm,
 } from "../graph/graphStyles";
 import { Explainable } from "../explain/Explainable";
 
 export function GraphWorkspace() {
   const graphQuery = useQuery({ queryKey: ["graph"], queryFn: api.graph });
+  const persisted = useMemo(readGraphWorkspaceState, []);
   const [extra, setExtra] = useState<{ nodes: GraphNode[]; links: GraphLink[] }>({
-    nodes: [],
-    links: [],
+    nodes: persisted.extra?.nodes ?? [],
+    links: persisted.extra?.links ?? [],
   });
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [focusIds, setFocusIds] = useState<string[]>([]);
-  const [expandDepth, setExpandDepth] = useState(1);
-  const [enabledEdges, setEnabledEdges] = useState<Set<string>>(new Set(ALL_EDGE_TYPES));
-  const [enabledNodeTypes, setEnabledNodeTypes] = useState<Set<string>>(new Set(ALL_NODE_TYPES));
-  const [layoutName, setLayoutName] = useState("auto");
-  const [shapeAlgorithm, setShapeAlgorithm] = useState<ShapeAlgorithm>("node_type");
-  const [spacing, setSpacing] = useState(1);
-  const [trail, setTrail] = useState<{ id: string; label: string }[]>([]);
-  const [query, setQuery] = useState("");
+  const [selectedId, setSelectedId] = useState<string | null>(persisted.selectedId ?? null);
+  const [focusIds, setFocusIds] = useState<string[]>(persisted.focusIds ?? []);
+  const [expandDepth, setExpandDepth] = useState(persisted.expandDepth ?? 1);
+  const [enabledEdges, setEnabledEdges] = useState<Set<string>>(
+    new Set(persisted.enabledEdges ?? ALL_EDGE_TYPES),
+  );
+  const [enabledNodeTypes, setEnabledNodeTypes] = useState<Set<string>>(
+    new Set(persisted.enabledNodeTypes ?? ALL_NODE_TYPES),
+  );
+  const [layoutName, setLayoutName] = useState(persisted.layoutName ?? "auto");
+  const [shapeAlgorithm, setShapeAlgorithm] = useState<ShapeAlgorithm>(
+    persisted.shapeAlgorithm ?? "node_type",
+  );
+  const [spacing, setSpacing] = useState(persisted.spacing ?? 1);
+  const debouncedSpacing = useDebouncedValue(spacing, 160);
+  const [showTrail, setShowTrail] = useState(persisted.showTrail ?? true);
+  const [trail, setTrail] = useState<{ id: string; label: string }[]>(persisted.trail ?? []);
+  const [query, setQuery] = useState(persisted.query ?? "");
+  const [expandingNode, setExpandingNode] = useState<string | null>(null);
 
   const base = graphQuery.data ?? { nodes: [], links: [] };
 
@@ -66,15 +77,50 @@ export function GraphWorkspace() {
 
   const nodeById = useMemo(() => new Map(merged.nodes.map((n) => [n.id, n])), [merged.nodes]);
 
+  useEffect(() => {
+    writeGraphWorkspaceState({
+      extra,
+      selectedId,
+      focusIds,
+      expandDepth,
+      enabledEdges: [...enabledEdges],
+      enabledNodeTypes: [...enabledNodeTypes],
+      layoutName,
+      shapeAlgorithm,
+      spacing,
+      showTrail,
+      trail,
+      query,
+    });
+  }, [
+    extra,
+    selectedId,
+    focusIds,
+    expandDepth,
+    enabledEdges,
+    enabledNodeTypes,
+    layoutName,
+    shapeAlgorithm,
+    spacing,
+    showTrail,
+    trail,
+    query,
+  ]);
+
   const expand = useCallback(
     async (nodeId: string) => {
-      const edgeTypes = enabledEdges.size === ALL_EDGE_TYPES.length ? undefined : [...enabledEdges];
-      const slice = await api.graphSlice(nodeId, expandDepth, edgeTypes);
-      setExtra((prev) => ({
-        nodes: [...prev.nodes, ...slice.nodes],
-        links: [...prev.links, ...slice.links],
-      }));
-      setFocusIds([nodeId, ...slice.nodes.map((n) => n.id)]);
+      setExpandingNode(nodeId);
+      try {
+        const edgeTypes = enabledEdges.size === ALL_EDGE_TYPES.length ? undefined : [...enabledEdges];
+        const slice = await api.graphSlice(nodeId, expandDepth, edgeTypes);
+        setExtra((prev) => ({
+          nodes: [...prev.nodes, ...slice.nodes],
+          links: [...prev.links, ...slice.links],
+        }));
+        setFocusIds([nodeId, ...slice.nodes.map((n) => n.id)]);
+      } finally {
+        setExpandingNode(null);
+      }
     },
     [enabledEdges, expandDepth],
   );
@@ -198,7 +244,11 @@ export function GraphWorkspace() {
           {Object.entries(NODE_COLORS).map(([type, color]) => (
             <label key={type} className="legend-row">
               <input type="checkbox" checked={enabledNodeTypes.has(type)} onChange={() => toggleNodeType(type)} />
-              <span className="legend-dot" style={{ background: color }} />
+              <span
+                className={`legend-shape legend-shape--${legendShape(shapeForNodeType(type))}`}
+                style={{ background: color }}
+                title={`${type} shape: ${shapeForNodeType(type)}`}
+              />
               {type}
             </label>
           ))}
@@ -207,7 +257,22 @@ export function GraphWorkspace() {
 
       <section className="canvas-area">
         <div className="canvas-toolbar">
-          <Breadcrumbs trail={trail} onJump={(i) => select(trail[i].id)} />
+          <div className="canvas-toolbar__left">
+            {showTrail ? <Breadcrumbs trail={trail} onJump={(i) => select(trail[i].id)} /> : null}
+            <label className="checkbox checkbox--inline">
+              <input
+                type="checkbox"
+                checked={showTrail}
+                onChange={(event) => setShowTrail(event.target.checked)}
+              />
+              Traversal path
+            </label>
+            {trail.length > 0 ? (
+              <button className="btn btn--small" onClick={() => setTrail([])}>
+                clear path
+              </button>
+            ) : null}
+          </div>
           <span className="muted small">
             {visibleNodes.length}
             {graphQuery.data?.truncated ? ` of ${totalNodes}` : ""} nodes · {visibleLinks.length}
@@ -218,6 +283,9 @@ export function GraphWorkspace() {
           <div className="graph-limit-banner">
             Showing a bounded graph preview. Search or expand nodes to inspect focused neighborhoods.
           </div>
+        ) : null}
+        {expandingNode ? (
+          <div className="graph-limit-banner">Loading neighborhood for {nodeById.get(expandingNode)?.label ?? expandingNode}...</div>
         ) : null}
         <Explainable id="graph.canvas" className="canvas-host">
           {graphQuery.isLoading ? (
@@ -233,7 +301,7 @@ export function GraphWorkspace() {
               selectedId={selectedId}
               focusIds={focusIds}
               layoutName={layoutName}
-              spacing={spacing}
+              spacing={debouncedSpacing}
               shapeAlgorithm={shapeAlgorithm}
               onSelect={select}
             />
@@ -254,4 +322,51 @@ export function GraphWorkspace() {
       </aside>
     </div>
   );
+}
+
+function legendShape(shape: string): string {
+  return shape.replace(/[^a-z0-9_-]/gi, "-").toLowerCase();
+}
+
+interface PersistedGraphWorkspace {
+  extra?: { nodes: GraphNode[]; links: GraphLink[] };
+  selectedId?: string | null;
+  focusIds?: string[];
+  expandDepth?: number;
+  enabledEdges?: string[];
+  enabledNodeTypes?: string[];
+  layoutName?: string;
+  shapeAlgorithm?: ShapeAlgorithm;
+  spacing?: number;
+  showTrail?: boolean;
+  trail?: { id: string; label: string }[];
+  query?: string;
+}
+
+const GRAPH_STATE_KEY = "syncsage.graph.workspace.v2";
+
+function readGraphWorkspaceState(): PersistedGraphWorkspace {
+  try {
+    const raw = sessionStorage.getItem(GRAPH_STATE_KEY);
+    return raw ? (JSON.parse(raw) as PersistedGraphWorkspace) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeGraphWorkspaceState(state: PersistedGraphWorkspace): void {
+  try {
+    sessionStorage.setItem(GRAPH_STATE_KEY, JSON.stringify(state));
+  } catch {
+    /* session storage may be unavailable or full */
+  }
+}
+
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const handle = window.setTimeout(() => setDebounced(value), delayMs);
+    return () => window.clearTimeout(handle);
+  }, [value, delayMs]);
+  return debounced;
 }

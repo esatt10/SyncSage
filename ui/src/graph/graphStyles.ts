@@ -39,7 +39,7 @@ export const ALL_NODE_TYPES = Object.keys(NODE_COLORS);
 
 export type ShapeAlgorithm = "node_type" | "degree" | "uniform";
 
-const NODE_TYPE_SHAPES: Record<string, string> = {
+export const NODE_TYPE_SHAPES: Record<string, string> = {
   knowledge_base: "star",
   source: "diamond",
   repository: "diamond",
@@ -56,6 +56,10 @@ const NODE_TYPE_SHAPES: Record<string, string> = {
 
 export function colorForNode(type?: string): string {
   return (type && NODE_COLORS[type]) || "#adb5bd";
+}
+
+export function shapeForNodeType(type?: string): string {
+  return (type && NODE_TYPE_SHAPES[type]) || "ellipse";
 }
 
 export interface CyElement {
@@ -106,7 +110,7 @@ function shapeForNode(type: string | undefined, degree: number, algorithm: Shape
     if (degree >= 3) return "diamond";
     return "ellipse";
   }
-  return (type && NODE_TYPE_SHAPES[type]) || "ellipse";
+  return shapeForNodeType(type);
 }
 
 function shorten(label: string): string {

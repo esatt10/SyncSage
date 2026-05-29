@@ -73,6 +73,8 @@ export const api = {
     request<ExplainResponse>(`/nodes/explain${qs({ node_id: nodeId })}`),
   fileSummary: (path: string, sourceName?: string) =>
     request<Record<string, unknown>>(`/files/summary${qs({ path, source_name: sourceName })}`),
+  nodeContent: (nodeId: string) =>
+    request<{ node_id: string; content: string | null }>(`/nodes/content${qs({ node_id: nodeId })}`),
 
   // Sources
   sources: () => request<SourceRecord[]>("/sources"),

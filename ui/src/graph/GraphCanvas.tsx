@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import CytoscapeComponent from "react-cytoscapejs";
 import type { Core } from "cytoscape";
 import type { GraphLink, GraphNode } from "../api/types";
@@ -28,26 +28,48 @@ export function GraphCanvas({
   onSelect,
 }: GraphCanvasProps) {
   const cyRef = useRef<Core | null>(null);
+  const onSelectRef = useRef(onSelect);
+  const listenerBoundRef = useRef(false);
+  const selectedRef = useRef<string | null>(null);
   const elements = useMemo(() => toElements(nodes, links, shapeAlgorithm), [nodes, links, shapeAlgorithm]);
   const stylesheet = useMemo(() => buildStylesheet(), []);
   const layout = useMemo(
     () => layoutOptions(layoutName, spacing, elements.length),
     [layoutName, spacing, elements.length],
   );
+  const [layouting, setLayouting] = useState(false);
+
+  useEffect(() => {
+    onSelectRef.current = onSelect;
+  }, [onSelect]);
 
   // Re-run layout whenever the element set changes (e.g. a sub-network is added).
   useEffect(() => {
     const cy = cyRef.current;
     if (!cy) return;
-    cy.layout(layout as never).run();
+    setLayouting(true);
+    const handle = window.setTimeout(() => {
+      const nextLayout = cy.layout(layout as never);
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        setLayouting(false);
+      };
+      cy.one("layoutstop", finish);
+      nextLayout.run();
+      window.setTimeout(finish, 1200);
+    }, 40);
+    return () => window.clearTimeout(handle);
   }, [elements.length, layout]);
 
-  // Apply selection + focus/fade highlighting on top of the rendered graph.
+  // Apply focus/fade highlighting only when the focus set changes. Selection is
+  // handled separately so a node click does not restyle the entire graph.
   useEffect(() => {
     const cy = cyRef.current;
     if (!cy) return;
     cy.batch(() => {
-      cy.elements().removeClass("selected focus faded");
+      cy.elements().removeClass("focus faded");
       if (focusIds.length > 0) {
         const focus = cy.collection();
         focusIds.forEach((id) => focus.merge(cy.getElementById(id)));
@@ -55,25 +77,37 @@ export function GraphCanvas({
         cy.elements().difference(neighborhood).addClass("faded");
         focus.addClass("focus");
       }
-      if (selectedId) cy.getElementById(selectedId).addClass("selected");
     });
-  }, [selectedId, focusIds, elements.length]);
+  }, [focusIds, elements.length]);
+
+  useEffect(() => {
+    const cy = cyRef.current;
+    if (!cy) return;
+    const previous = selectedRef.current;
+    if (previous) cy.getElementById(previous).removeClass("selected");
+    if (selectedId) cy.getElementById(selectedId).addClass("selected");
+    selectedRef.current = selectedId;
+  }, [selectedId, elements.length]);
 
   return (
-    <CytoscapeComponent
-      elements={elements as never}
-      stylesheet={stylesheet}
-      layout={layout as never}
-      style={{ width: "100%", height: "100%" }}
-      minZoom={0.1}
-      maxZoom={3}
-      wheelSensitivity={0.2}
-      cy={(cy: Core) => {
-        cyRef.current = cy;
-        cy.removeAllListeners();
-        cy.on("tap", "node", (event) => onSelect(event.target.id()));
-      }}
-    />
+    <div className="graph-canvas-shell">
+      {layouting ? <div className="graph-busy">Arranging graph...</div> : null}
+      <CytoscapeComponent
+        elements={elements as never}
+        stylesheet={stylesheet}
+        layout={layout as never}
+        style={{ width: "100%", height: "100%" }}
+        minZoom={0.1}
+        maxZoom={3}
+        wheelSensitivity={0.2}
+        cy={(cy: Core) => {
+          cyRef.current = cy;
+          if (listenerBoundRef.current) return;
+          listenerBoundRef.current = true;
+          cy.on("tap", "node", (event) => onSelectRef.current(event.target.id()));
+        }}
+      />
+    </div>
   );
 }
 

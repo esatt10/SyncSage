@@ -17,7 +17,7 @@ interface NodeInspectorProps {
 
 type Tab = "overview" | "relationships" | "content";
 
-const FILE_TYPES = new Set(["file", "document", "markdown_note", "chunk"]);
+const CONTENT_TYPES = new Set(["file", "document", "markdown_note", "chunk"]);
 
 export function NodeInspector({
   selectedId,
@@ -38,11 +38,10 @@ export function NodeInspector({
     enabled: Boolean(selectedId),
   });
 
-  const summaryQuery = useQuery({
-    queryKey: ["summary", selectedId],
-    queryFn: () =>
-      api.fileSummary(String(node?.relative_path), node?.source_id ? String(node.source_id) : undefined),
-    enabled: Boolean(selectedId && node?.relative_path && FILE_TYPES.has(node?.type ?? "")),
+  const contentQuery = useQuery({
+    queryKey: ["node-content", selectedId],
+    queryFn: () => api.nodeContent(selectedId as string),
+    enabled: Boolean(tab === "content" && selectedId && CONTENT_TYPES.has(node?.type ?? "")),
   });
 
   const relationships = useMemo(() => {
@@ -151,12 +150,12 @@ export function NodeInspector({
 
       {tab === "content" && (
         <div className="content-tab">
-          {node.summary ? (
+          {contentQuery.isLoading ? (
+            <p className="muted">Loading full content...</p>
+          ) : contentQuery.data?.content ? (
+            <pre className="content-block">{contentQuery.data.content}</pre>
+          ) : node.summary ? (
             <pre className="content-block">{String(node.summary)}</pre>
-          ) : summaryQuery.isLoading ? (
-            <p className="muted">Loading content…</p>
-          ) : summaryQuery.data?.summary ? (
-            <pre className="content-block">{String(summaryQuery.data.summary)}</pre>
           ) : (
             <p className="muted">No indexed content for this node type.</p>
           )}
@@ -197,7 +196,7 @@ function RelGroup({
 }
 
 function renderValue(value: unknown): string {
-  if (value === null || value === undefined) return "—";
+  if (value === null || value === undefined) return "-";
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
 }

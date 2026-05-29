@@ -204,6 +204,41 @@ body {
   border-radius: 50%;
   display: inline-block;
 }
+.legend-shape {
+  width: 12px;
+  height: 12px;
+  display: inline-block;
+  flex: 0 0 auto;
+  border: 1px solid rgba(255, 255, 255, 0.32);
+}
+.legend-shape--ellipse {
+  border-radius: 50%;
+}
+.legend-shape--rectangle {
+  border-radius: 2px;
+}
+.legend-shape--round-rectangle {
+  border-radius: 4px;
+}
+.legend-shape--diamond {
+  transform: rotate(45deg) scale(0.85);
+  border-radius: 2px;
+}
+.legend-shape--triangle {
+  clip-path: polygon(50% 0, 100% 100%, 0 100%);
+}
+.legend-shape--hexagon {
+  clip-path: polygon(25% 0, 75% 0, 100% 50%, 75% 100%, 25% 100%, 0 50%);
+}
+.legend-shape--vee {
+  clip-path: polygon(0 0, 50% 100%, 100% 0, 78% 0, 50% 58%, 22% 0);
+}
+.legend-shape--tag {
+  clip-path: polygon(0 0, 82% 0, 100% 50%, 82% 100%, 0 100%);
+}
+.legend-shape--star {
+  clip-path: polygon(50% 0, 61% 35%, 98% 35%, 68% 56%, 79% 91%, 50% 70%, 21% 91%, 32% 56%, 2% 35%, 39% 35%);
+}
 .legend-swatch {
   border-radius: 2px;
   width: 14px;
@@ -239,11 +274,36 @@ body {
   justify-content: space-between;
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
+  gap: 12px;
+}
+.canvas-toolbar__left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 .canvas-host {
   flex: 1;
   min-height: 0;
   background: radial-gradient(circle at 50% 40%, #11161f, #0d1117);
+}
+.graph-canvas-shell {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+.graph-busy {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 4;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(22, 27, 34, 0.92);
+  color: var(--text);
+  font-size: 12px;
+  padding: 6px 10px;
 }
 .graph-limit-banner {
   border-bottom: 1px solid var(--border);
@@ -521,6 +581,10 @@ body {
   gap: 6px;
   align-items: center;
   margin-bottom: 10px;
+}
+.checkbox--inline {
+  margin-bottom: 0;
+  white-space: nowrap;
 }
 
 /* Directory browser */

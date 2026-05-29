@@ -21,7 +21,7 @@ from syncsage.config.profiles import profile_names
 from syncsage.config.schema import SourceConfig, SourceType, SyncSageConfig
 from syncsage.graph.exporter import cytoscape, node_link
 from syncsage.graph.simple import SimpleMultiDiGraph
-from syncsage.ingestion.pipeline import utc_now
+from syncsage.ingestion.pipeline import read_text, utc_now
 from syncsage.obsidian.exporter import ObsidianExporter
 from syncsage.persistence.paths import StatePaths
 from syncsage.persistence.state_store import StateStore
@@ -516,13 +516,41 @@ def create_app(
     @app.get("/files/summary")
     def file_summary(path: str, source_name: str | None = None) -> dict:
         rows = state.rows(
-            """SELECT artifacts.*, GROUP_CONCAT(chunks.summary, '\n') AS summary FROM artifacts
+            """SELECT artifacts.*, GROUP_CONCAT(chunks.summary, '\n') AS summary,
+            GROUP_CONCAT(chunks.text, '\n\n') AS content FROM artifacts
             LEFT JOIN chunks ON chunks.artifact_id=artifacts.id
             WHERE artifacts.relative_path=? AND (? IS NULL OR artifacts.source_id=?)
             GROUP BY artifacts.id LIMIT 1""",
             (path, source_name, source_name),
         )
         return dict(rows[0]) if rows else {"path": path, "summary": None}
+
+    @app.get("/nodes/content")
+    def node_content(node_id: str) -> dict:
+        graph = engine.graph_builder.graph
+        if node_id not in graph:
+            raise HTTPException(status_code=404, detail=f"Unknown node: {node_id}")
+        node = dict(graph.nodes[node_id])
+        if node.get("type") == "chunk":
+            rows = state.rows(
+                "SELECT text FROM chunks WHERE id=? LIMIT 1",
+                (node_id,),
+            )
+            return {"node_id": node_id, "content": rows[0]["text"] if rows else None}
+        artifact_rows = state.rows("SELECT path FROM artifacts WHERE id=? LIMIT 1", (node_id,))
+        if artifact_rows:
+            path = Path(artifact_rows[0]["path"])
+            if path.exists() and path.is_file():
+                content = read_text(path)
+                if content:
+                    return {"node_id": node_id, "content": content}
+        rows = state.rows(
+            "SELECT GROUP_CONCAT(text, '\n\n') AS content FROM chunks WHERE artifact_id=? "
+            "ORDER BY chunk_index",
+            (node_id,),
+        )
+        content = rows[0]["content"] if rows else None
+        return {"node_id": node_id, "content": content}
 
     @app.get("/graph")
     def graph(limit: int | None = None, link_limit: int | None = None) -> dict:

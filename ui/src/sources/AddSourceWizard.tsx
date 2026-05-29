@@ -42,6 +42,7 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
   const repo = (initial.repo ?? {}) as Record<string, unknown>;
   const sync = (initial.sync ?? {}) as Record<string, unknown>;
   const connector = (initial.connector ?? {}) as Record<string, unknown>;
+  const [chunkingEnabled, setChunkingEnabled] = useState(Boolean(chunking.enabled ?? true));
   const [chunkStrategy, setChunkStrategy] = useState(String(chunking.strategy ?? "semantic"));
   const [chunkMax, setChunkMax] = useState(String(chunking.max_chars ?? 4000));
   const [chunkOverlap, setChunkOverlap] = useState(String(chunking.overlap_chars ?? 400));
@@ -104,6 +105,7 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
       include: patterns(includeText),
       exclude: patterns(excludeText),
       chunking: {
+        enabled: chunkingEnabled,
         strategy: chunkStrategy,
         max_chars: Number(chunkMax),
         overlap_chars: Number(chunkOverlap),
@@ -212,6 +214,14 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
 
             <details className="settings-group" open>
               <summary>Indexing</summary>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={chunkingEnabled}
+                  onChange={(e) => setChunkingEnabled(e.target.checked)}
+                />
+                Chunk content for retrieval
+              </label>
               <div className="form-grid">
                 <label className="field">
                   <span>Chunk strategy</span>
