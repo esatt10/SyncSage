@@ -13,6 +13,7 @@ interface GraphCanvasProps {
   spacing: number;
   shapeAlgorithm: ShapeAlgorithm;
   onSelect: (nodeId: string) => void;
+  onClearSelection: () => void;
 }
 
 const FORCE_LAYOUT_ELEMENT_LIMIT = 1000;
@@ -26,9 +27,11 @@ export function GraphCanvas({
   spacing,
   shapeAlgorithm,
   onSelect,
+  onClearSelection,
 }: GraphCanvasProps) {
   const cyRef = useRef<Core | null>(null);
   const onSelectRef = useRef(onSelect);
+  const onClearSelectionRef = useRef(onClearSelection);
   const listenerBoundRef = useRef(false);
   const selectedRef = useRef<string | null>(null);
   const elements = useMemo(() => toElements(nodes, links, shapeAlgorithm), [nodes, links, shapeAlgorithm]);
@@ -42,6 +45,10 @@ export function GraphCanvas({
   useEffect(() => {
     onSelectRef.current = onSelect;
   }, [onSelect]);
+
+  useEffect(() => {
+    onClearSelectionRef.current = onClearSelection;
+  }, [onClearSelection]);
 
   // Re-run layout whenever the element set changes (e.g. a sub-network is added).
   useEffect(() => {
@@ -105,6 +112,9 @@ export function GraphCanvas({
           if (listenerBoundRef.current) return;
           listenerBoundRef.current = true;
           cy.on("tap", "node", (event) => onSelectRef.current(event.target.id()));
+          cy.on("tap", (event) => {
+            if (event.target === cy) onClearSelectionRef.current();
+          });
         }}
       />
     </div>

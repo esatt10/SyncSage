@@ -137,13 +137,13 @@ export function buildStylesheet(): CyStylesheet[] {
         "border-color": "#adb5bd",
         label: "data(label)",
         color: "#e9ecef",
-        "font-size": 9,
+        "font-size": 8,
         "text-valign": "bottom",
-        "text-margin-y": 4,
+        "text-margin-y": 3,
         "text-wrap": "ellipsis",
         "text-max-width": "120px",
-        width: 22,
-        height: 22,
+        width: 19,
+        height: 19,
       },
     },
     {
@@ -162,7 +162,7 @@ export function buildStylesheet(): CyStylesheet[] {
     ...edgeColorRules,
     {
       selector: "node.selected",
-      style: { "border-width": 4, "border-color": "#ffd43b", width: 30, height: 30 },
+      style: { "border-width": 3, "border-color": "#ffd43b", width: 25, height: 25 },
     },
     { selector: ".faded", style: { opacity: 0.12 } },
     {

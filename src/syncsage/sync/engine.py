@@ -108,14 +108,19 @@ class SyncEngine:
             )
             for item in items:
                 previous = artifacts.get(item.relative_path)
-                if self._can_skip_before_read(mode, previous, item):
+                if self._can_skip_before_read(mode, source.name, previous, item):
                     skipped += 1
                     continue
                 payload = connector.read_item(item)
                 parsed = parse_connector_payload(source, item, payload, git_metadata)
                 if parsed is None:
                     continue
-                if mode == "incremental" and previous and previous.get("sha256") == parsed.sha256:
+                if (
+                    mode == "incremental"
+                    and previous
+                    and previous.get("sha256") == parsed.sha256
+                    and self._graph_has_indexed_artifact(source.name, previous)
+                ):
                     skipped += 1
                     continue
                 if mode == "repair" and not self._needs_repair(
@@ -244,15 +249,29 @@ class SyncEngine:
     def _can_skip_before_read(
         self,
         mode: SyncMode,
+        source_name: str,
         previous: dict | None,
         item: ConnectorItem,
     ) -> bool:
-        return (
-            mode == "incremental"
-            and previous is not None
-            and item.sha256 is not None
-            and previous.get("sha256") == item.sha256
-        )
+        if (
+            mode != "incremental"
+            or previous is None
+            or item.sha256 is None
+            or previous.get("sha256") != item.sha256
+        ):
+            return False
+        return self._graph_has_indexed_artifact(source_name, previous)
+
+    def _graph_has_indexed_artifact(self, source_name: str, previous: dict) -> bool:
+        artifact_id = previous.get("artifact_id")
+        if not artifact_id:
+            return False
+        graph = self.graph_builder.graph
+        source_node = f"source:{self.config.knowledge_base_id}:{source_name}"
+        if not graph.has_node(source_node) or not graph.has_node(artifact_id):
+            return False
+        edge_map = graph.get_edge_data(source_node, artifact_id, default={})
+        return any(data.get("type") == "indexes" for data in edge_map.values())
 
     def _needs_repair(
         self,

@@ -138,6 +138,18 @@ export function GraphWorkspace() {
     [nodeById],
   );
 
+  const clearSelection = useCallback(() => {
+    setSelectedId(null);
+    setFocusIds([]);
+    setTrail([]);
+  }, []);
+
+  const showFullGraph = useCallback(() => {
+    clearSelection();
+    setEnabledEdges(new Set(ALL_EDGE_TYPES));
+    setEnabledNodeTypes(new Set(ALL_NODE_TYPES));
+  }, [clearSelection]);
+
   const toggleEdge = (type: string) => {
     setEnabledEdges((prev) => {
       const next = new Set(prev);
@@ -169,6 +181,11 @@ export function GraphWorkspace() {
       setFocusIds([match.id]);
     }
   };
+
+  const hasSelection = Boolean(selectedId) || focusIds.length > 0;
+  const hasFilters =
+    enabledEdges.size !== ALL_EDGE_TYPES.length ||
+    enabledNodeTypes.size !== ALL_NODE_TYPES.length;
 
   return (
     <div className="workspace">
@@ -272,6 +289,16 @@ export function GraphWorkspace() {
                 clear path
               </button>
             ) : null}
+            {hasSelection ? (
+              <button className="btn btn--small" onClick={clearSelection}>
+                clear selection
+              </button>
+            ) : null}
+            {hasSelection || hasFilters ? (
+              <button className="btn btn--small" onClick={showFullGraph}>
+                show full graph
+              </button>
+            ) : null}
           </div>
           <span className="muted small">
             {visibleNodes.length}
@@ -304,6 +331,7 @@ export function GraphWorkspace() {
               spacing={debouncedSpacing}
               shapeAlgorithm={shapeAlgorithm}
               onSelect={select}
+              onClearSelection={clearSelection}
             />
           )}
         </Explainable>
@@ -343,7 +371,7 @@ interface PersistedGraphWorkspace {
   query?: string;
 }
 
-const GRAPH_STATE_KEY = "syncsage.graph.workspace.v2";
+const GRAPH_STATE_KEY = "syncsage.graph.workspace.v3";
 
 function readGraphWorkspaceState(): PersistedGraphWorkspace {
   try {

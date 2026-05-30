@@ -16,3 +16,22 @@ def test_full_sync_is_idempotent_for_sample_repository(sync_engine: object) -> N
 
     assert second_counts == first_counts
     assert all(value > 0 for value in second_counts.values())
+
+
+def test_incremental_sync_repairs_missing_graph_snapshot(
+    loaded_config: object,
+    sync_engine: object,
+) -> None:
+    """Unchanged-file skips should not preserve a graph reduced to only the root."""
+
+    run_sync(sync_engine, source_name="syncsage-repo", mode="full")
+    sync_engine.graph_builder.remove_source_content("syncsage-repo")
+    assert sync_engine.graph_builder.graph.number_of_nodes() == 1
+
+    result = run_sync(sync_engine, source_name="syncsage-repo", mode="incremental")
+    graph = sync_engine.graph_builder.graph
+    source_node = f"source:{loaded_config.knowledge_base_id}:syncsage-repo"
+
+    assert result.indexed_artifacts > 0
+    assert graph.has_node(source_node)
+    assert graph.number_of_nodes() > 1
