@@ -244,6 +244,18 @@ body {
   width: 14px;
   height: 4px;
 }
+.search-controls {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  margin-top: 8px;
+}
+.search-controls .field {
+  margin-bottom: 0;
+}
+.search-controls input[type="number"] {
+  width: 64px;
+}
 .search-results {
   margin-top: 8px;
   display: flex;
@@ -251,16 +263,43 @@ body {
   gap: 2px;
 }
 .search-hit {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
   text-align: left;
   background: none;
   border: none;
   color: var(--accent);
   cursor: pointer;
   font-size: 11px;
-  padding: 2px 0;
+  padding: 3px 0;
+  width: 100%;
+}
+.search-hit:hover {
+  color: var(--text);
+}
+.search-hit__main {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.search-hit__meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.search-hit__type {
+  color: var(--muted);
+  background: var(--bg-3);
+  border-radius: 8px;
+  padding: 0 6px;
+  font-size: 10px;
+}
+.search-hit__score {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
 }
 
 .canvas-area {

@@ -40,5 +40,5 @@ export const explainRegistry: Record<string, string> = {
   "health.badge":
     "Live service health from /health and /ready, including the active knowledge base.",
   "search.box":
-    "Hybrid retrieval over indexed content: SQLite full-text combined with graph-derived term expansion and ranking boosts.",
+    "Search across nodes, relationships and their attributes. Mode tunes retrieval: text = SQLite full-text over chunk content, graph = node/edge/attribute matches, hybrid = both merged and ranked. Results sets how many hits to return. Click a hit to focus it, pulling it in from the wider graph if needed.",
 };

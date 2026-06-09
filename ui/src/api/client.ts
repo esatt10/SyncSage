@@ -5,6 +5,7 @@ import type {
   GraphSlice,
   NeighborsResponse,
   NodeLinkGraph,
+  SearchMode,
   SearchResponse,
   SourceRecord,
   SourceWritePayload,
@@ -111,7 +112,7 @@ export const api = {
   fsList: (path?: string) => request<FsListing>(`/fs/list${qs({ path })}`),
 
   // Search
-  search: (query: string, mode = "hybrid", maxResults = 10) =>
+  search: (query: string, mode: SearchMode = "hybrid", maxResults = 10) =>
     request<SearchResponse>("/search", {
       method: "POST",
       body: JSON.stringify({ query, mode, max_results: maxResults }),
