@@ -22,7 +22,7 @@ YAML/profile config
   -> connector-backed sync engine
   -> parsing and chunking
   -> graph enrichment
-  -> SQLite FTS + graph-term search
+  -> text / graph / hybrid search
   -> MCP tools/resources, HTTP API, Obsidian projection
 ```
 
@@ -35,7 +35,7 @@ Core components:
 | Sync engine | Runs `incremental`, `full`, `validate_only`, and `repair` modes with stable manifests and checkpoints. |
 | Ingestion pipeline | Parses supported text/document artifacts into chunks with provenance. |
 | Graph builder | Creates stable graph nodes/edges and applies code, document, and similarity enrichment. |
-| Search store | Combines SQLite FTS/path search with graph-derived term expansion. |
+| Search store | Combines SQLite FTS/path search, graph-derived term expansion, and graph search over node/relationship attributes via `text`/`graph`/`hybrid` modes. |
 | MCP server | Provides the primary agent interface for retrieval, sync, graph navigation, and source lifecycle operations. |
 | Obsidian exporter | Creates previewable source, concept, file, and optional chunk notes with graph-driven links. |
 
@@ -156,7 +156,7 @@ Enrichment passes extract:
 - Markdown/document headings, links, wiki links, URLs, citations, concepts, and named mentions.
 - Lightweight cross-artifact similarity based on shared concepts.
 
-Search combines SQLite full-text results with graph-derived term expansion, which helps surface related files even when no single chunk contains every query term. Graph traversal honors depth and optional edge filters.
+Search spans the whole knowledge graph. Three modes are available: `text` (SQLite full-text over chunk content and paths), `graph` (matches node labels, types and attribute values plus relationship types/endpoints), and `hybrid` (the default — merges and re-ranks both, de-duplicating by node). This surfaces concepts, symbols, entities and references that never appear verbatim in chunk text, and helps relate files even when no single chunk contains every query term. Both the retrieval mode and the result count are adjustable. Graph traversal honors depth and optional edge filters.
 
 See [docs/graph_model.md](docs/graph_model.md).
 
@@ -265,7 +265,9 @@ Important endpoints:
 A light React front end lives in [`ui/`](ui). It is a separate workload that
 talks to the SyncSage HTTP API, so the indexing container is unchanged. It
 provides a Cytoscape knowledge-graph workspace (drill into sub-networks, filter
-by edge type, inspect relationships and content), source management with
+by edge type, inspect relationships and content, and search across nodes,
+relationships and attributes with adjustable mode and result count), source
+management with
 add-a-local-directory registration, a full configuration editor (form + raw YAML
 + diff preview), and an Explain mode with a LaTeX-backed reference panel. The
 underlying HTTP routes are defined in `src/syncsage/api/app.py` and described in
