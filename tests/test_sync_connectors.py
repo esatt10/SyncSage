@@ -65,7 +65,7 @@ def test_validate_only_does_not_write_index_state(tmp_path: Path, workspace_copy
     assert result.status == "validated"
     assert engine.stats["artifact_count"] == 0
     assert engine.stats["chunk_count"] == 0
-    assert not engine.manifests.path_for("sample-repo").exists()
+    assert not engine.manifests.exists("sample-repo")
 
 
 def test_filesystem_source_respects_max_depth(tmp_path: Path) -> None:

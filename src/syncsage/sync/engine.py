@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -12,7 +15,7 @@ from syncsage.persistence.paths import StatePaths
 from syncsage.persistence.state_store import StateStore
 from syncsage.registry.source_registry import SourceRegistry
 from syncsage.sync.connectors import ConnectorItem, connector_for_source
-from syncsage.sync.locks import source_lock
+from syncsage.sync.locks import EngineLease, source_lock
 
 SyncMode = Literal["incremental", "full", "validate_only", "repair"]
 SYNC_MODES = {"incremental", "full", "validate_only", "repair"}
@@ -35,19 +38,33 @@ class SyncEngine:
         config: SyncSageConfig,
         paths: StatePaths | None = None,
         state: StateStore | None = None,
+        lease: EngineLease | None = None,
     ):
         self.config = config
         self.paths = paths or StatePaths.from_config(config)
         self.paths.ensure()
         self.state = state or StateStore(self.paths.sqlite)
         self.state.migrate()
+        # Single-writer lease (Synapse 21.2): acquired lazily on the first
+        # sync so read-only engines (e.g. docker-exec MCP stdio beside a
+        # running server) keep working against a served state directory.
+        self.lease = lease or EngineLease(self.paths.state)
+        # In-process serialization across all writers (watcher, scheduler,
+        # API startup executor, HTTP /sync): SyncEngine is not safe for
+        # concurrent syncs within a process.
+        self._sync_mutex = threading.RLock()
         SourceRegistry(self.config, self.state).initialize()
-        self.manifests = ManifestStore(self.paths.manifests)
+        self.manifests = ManifestStore(self.paths.manifests, self.state)
         self.graph_store = GraphStore(self.paths.graphs)
         self.graph_builder = GraphBuilder(config)
         existing = self.graph_store.load(config.knowledge_base_id)
         if len(existing):
             self.graph_builder.graph = existing
+
+    def close(self) -> None:
+        """Release the writer lease and close the state store."""
+        self.lease.release()
+        self.state.close()
 
     def startup(self) -> list[SyncResult]:
         self.paths.ensure()
@@ -61,16 +78,18 @@ class SyncEngine:
 
     def sync_all(self, mode: SyncMode = "incremental") -> list[SyncResult]:
         return [
-            self.sync_source(source.name, mode)
-            for source in self.config.sources
-            if source.enabled
+            self.sync_source(source.name, mode) for source in self.config.sources if source.enabled
         ]
 
     def sync_source(self, source_name: str, mode: SyncMode = "incremental") -> SyncResult:
         if mode not in SYNC_MODES:
             raise ValueError(f"Unsupported sync mode: {mode}")
         source = self._source(source_name)
-        with source_lock(self.paths.locks, source.name):
+        self.lease.acquire()
+        # Test-only hook (Synapse 21.2 crash-safety tests): widens the window
+        # between per-artifact writes so a kill -9 can land mid-sync.
+        slow_sync_s = float(os.environ.get("SYNCSAGE_TEST_SLOW_SYNC_MS", "0") or 0) / 1000.0
+        with self._sync_mutex, source_lock(self.paths.locks, source.name):
             connector = connector_for_source(source, self.state)
             if mode == "validate_only":
                 health = connector.validate()
@@ -101,11 +120,7 @@ class SyncEngine:
                 artifacts = manifest["artifacts"]
             indexed = 0
             skipped = 0
-            git_metadata = (
-                git_state(source.path)
-                if source.type.value == "repository"
-                else None
-            )
+            git_metadata = git_state(source.path) if source.type.value == "repository" else None
             for item in items:
                 previous = artifacts.get(item.relative_path)
                 if self._can_skip_before_read(mode, previous, item):
@@ -178,6 +193,8 @@ class SyncEngine:
                     "git_commit": parsed.git_commit,
                 }
                 indexed += 1
+                if slow_sync_s:
+                    time.sleep(slow_sync_s)
             self.graph_builder.add_similarity_edges(source.name)
             manifest["last_indexed_at"] = utc_now()
             manifest["connector"] = {"type": connector.connector_type}

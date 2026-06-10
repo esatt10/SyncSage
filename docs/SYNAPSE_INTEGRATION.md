@@ -99,6 +99,16 @@ migrates exactly once (second startup is a no-op).
 **Files:** `persistence/state_store.py`, `persistence/manifest.py`,
 `sync/engine.py`, `sync/locks.py`, `tests/test_crash_safety.py`.
 
+**Implementation note (2026-06-10, landed):** the lease is acquired on the
+first *sync* rather than at engine construction — acquiring at construction
+would break the documented docker-exec MCP-stdio workflow (a second,
+read-mostly engine process against the state dir of a running server). Any
+writer (one-shot `syncsage sync`, startup sync, watcher, scheduler, HTTP
+`/sync`) acquires the lease and holds it (heartbeating) until `close()`;
+all 21.2 acceptance criteria hold unchanged. In-process writers are
+additionally serialized by an engine-internal lock, closing the 21.1
+startup-executor gap.
+
 ### Step 21.3 — True incremental web / API / S3 connectors
 
 **Gap:** `sync/connectors.py` creates checkpoints but never consults

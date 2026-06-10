@@ -72,8 +72,8 @@ def test_watcher_reindexes_only_the_touched_artifact(
             else:
                 assert entry == before[relative], f"untouched artifact re-indexed: {relative}"
         # Untouched sources were never synced by the watcher.
-        assert not engine.manifests.path_for("architecture-notes").exists()
-        assert not engine.manifests.path_for("product-documents").exists()
+        assert not engine.manifests.exists("architecture-notes")
+        assert not engine.manifests.exists("product-documents")
     finally:
         watcher.stop()
     assert not watcher.running

@@ -122,6 +122,11 @@ CREATE TABLE IF NOT EXISTS source_audit_events (
   created_at TEXT NOT NULL,
   details_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS manifests (
+  source_name TEXT PRIMARY KEY,
+  payload_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 
@@ -136,6 +141,12 @@ class StateStore:
         if self._conn is None:
             self._conn = sqlite3.connect(self.path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
+            # Crash/concurrency safety (Synapse step 21.2): WAL survives
+            # kill -9 mid-write, busy_timeout rides out concurrent readers,
+            # synchronous=NORMAL is the sanctioned WAL durability level.
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
         return self._conn
 
     def migrate(self) -> None:
@@ -489,6 +500,37 @@ class StateStore:
             event["details"] = json.loads(event.pop("details_json") or "{}")
             events.append(event)
         return events
+
+    def get_manifest(self, source_name: str) -> dict[str, Any] | None:
+        rows = self.rows(
+            "SELECT payload_json FROM manifests WHERE source_name=?",
+            (source_name,),
+        )
+        if not rows:
+            return None
+        return json.loads(rows[0]["payload_json"])
+
+    def set_manifest(self, source_name: str, payload: dict[str, Any], updated_at: str) -> None:
+        self.conn.execute(
+            """INSERT INTO manifests(source_name,payload_json,updated_at)
+            VALUES(?,?,?)
+            ON CONFLICT(source_name) DO UPDATE SET
+                payload_json=excluded.payload_json,
+                updated_at=excluded.updated_at""",
+            (source_name, json.dumps(payload, sort_keys=True, default=str), updated_at),
+        )
+        self.conn.commit()
+
+    def manifest_exists(self, source_name: str) -> bool:
+        rows = self.rows(
+            "SELECT 1 FROM manifests WHERE source_name=? LIMIT 1",
+            (source_name,),
+        )
+        return bool(rows)
+
+    def delete_manifest(self, source_name: str) -> None:
+        self.conn.execute("DELETE FROM manifests WHERE source_name=?", (source_name,))
+        self.conn.commit()
 
     def artifact_state(self, source_id: str, artifact_id: str) -> dict[str, Any] | None:
         rows = self.rows(

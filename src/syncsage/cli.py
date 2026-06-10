@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 
@@ -36,6 +37,7 @@ def _serve_app(cfg, config_path: str) -> None:
     finally:
         scheduler.stop()
         watcher.stop()
+        app_obj.state.engine.close()
 
 
 def _engine(config_path: Path):
@@ -185,12 +187,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "sync":
+        from syncsage.sync.locks import EngineLeaseError
+
         engine = _engine(Path(args.config))
-        results = (
-            engine.sync_all(args.mode)
-            if args.all or not args.source
-            else [engine.sync_source(args.source, args.mode)]
-        )
+        try:
+            results = (
+                engine.sync_all(args.mode)
+                if args.all or not args.source
+                else [engine.sync_source(args.source, args.mode)]
+            )
+        except EngineLeaseError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            engine.close()
         for r in results:
             print(
                 f"{r.source_id}: indexed={r.indexed_artifacts} "
@@ -198,7 +208,16 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
     if args.command == "repair":
-        _engine(Path(args.config)).sync_all("repair")
+        from syncsage.sync.locks import EngineLeaseError
+
+        engine = _engine(Path(args.config))
+        try:
+            engine.sync_all("repair")
+        except EngineLeaseError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            engine.close()
         print("Repair complete")
         return 0
     if args.command == "serve":
@@ -210,6 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "mcp":
         from syncsage.config.loader import load_config
         from syncsage.mcp_server.server import run_mcp_server
+
         cfg = load_config(Path(args.config))
         run_mcp_server(cfg, args.transport)
         return 0
@@ -219,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             docker_run_stdio_config,
             render_vscode_mcp_json,
         )
+
         if args.client != "vscode":
             client_p.print_help()
             return 1
