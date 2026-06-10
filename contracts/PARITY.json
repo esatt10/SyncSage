@@ -1,0 +1,5 @@
+{
+  "comment": "Cross-repo parity manifest (Synapse Step 20.1). Regenerate ONLY via the contract-author skill in subjective-retrieval; both repos must carry identical copies.",
+  "fixtures/demo-region.v1.contract.json": "68e81ed507be4ca5eaa422fb4f336a407d2402701c329d283555c6e779c42213",
+  "semantic_contract.v1.schema.json": "3a7a8a069a6fe35900abd24f7b1721578a36549b93706f093eef2584d07d8c9b"
+}
