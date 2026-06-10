@@ -75,7 +75,7 @@ def _relationship_hits(
     for (source, target), edge_map in graph._edges.items():
         source_label = str(graph._nodes.get(source, {}).get("label") or source)
         target_label = str(graph._nodes.get(target, {}).get("label") or target)
-        for key, data in edge_map.items():
+        for _key, data in edge_map.items():
             if source_name and data.get("source_id") != source_name:
                 continue
             etype = str(data.get("type") or "related")
