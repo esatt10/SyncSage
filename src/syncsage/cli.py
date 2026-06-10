@@ -4,6 +4,40 @@ import argparse
 from pathlib import Path
 
 
+def _sync_services(engine, cfg):
+    """Build the watcher + scheduler pair sharing one sync serialization lock.
+
+    SyncEngine is not safe for concurrent syncs within a process, so both
+    background services funnel their sync calls through the same lock.
+    """
+    import threading
+
+    from syncsage.sync.scheduler import SchedulerService
+    from syncsage.sync.watcher import WatcherService
+
+    sync_lock = threading.Lock()
+    return (
+        WatcherService(engine, cfg, sync_lock=sync_lock),
+        SchedulerService(engine, cfg, sync_lock=sync_lock),
+    )
+
+
+def _serve_app(cfg, config_path: str) -> None:
+    import uvicorn
+
+    from syncsage.api.app import create_app
+
+    app_obj = create_app(cfg, config_path=config_path)
+    watcher, scheduler = _sync_services(app_obj.state.engine, cfg)
+    watcher.start()
+    scheduler.start()
+    try:
+        uvicorn.run(app_obj, host=cfg.server.host, port=cfg.server.port)
+    finally:
+        scheduler.stop()
+        watcher.stop()
+
+
 def _engine(config_path: Path):
     from syncsage.config.loader import load_config
     from syncsage.persistence.paths import StatePaths
@@ -74,9 +108,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 0
     if args.command == "start":
-        import uvicorn
-
-        from syncsage.api.app import create_app
         from syncsage.config.loader import load_layered_config, parse_override_pairs
 
         cfg = load_layered_config(
@@ -84,11 +115,7 @@ def main(argv: list[str] | None = None) -> int:
             args.profile,
             parse_override_pairs(args.overrides),
         )
-        uvicorn.run(
-            create_app(cfg, config_path=args.config),
-            host=cfg.server.host,
-            port=cfg.server.port,
-        )
+        _serve_app(cfg, args.config)
         return 0
     if args.command == "validate":
         from syncsage.config.loader import load_config, validate_source_paths
@@ -175,17 +202,10 @@ def main(argv: list[str] | None = None) -> int:
         print("Repair complete")
         return 0
     if args.command == "serve":
-        import uvicorn
-
-        from syncsage.api.app import create_app
         from syncsage.config.loader import load_config
 
         cfg = load_config(Path(args.config))
-        uvicorn.run(
-            create_app(cfg, config_path=args.config),
-            host=cfg.server.host,
-            port=cfg.server.port,
-        )
+        _serve_app(cfg, args.config)
         return 0
     if args.command == "mcp":
         from syncsage.config.loader import load_config
