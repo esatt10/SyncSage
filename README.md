@@ -4,6 +4,8 @@ SyncSage is a local-first MCP context server that turns project sources into a q
 
 The project is still an active prototype, but the current architecture is intentionally shaped around production concerns: connector boundaries, idempotent sync, persistent checkpoints, graph-derived search, runtime source lifecycle management, and inspectable configuration.
 
+> **Synapse (federated layer, in build):** SyncSage is also the *region* component of **Synapse** — a hyperfast federated knowledge-base system in which each SyncSage container is a self-searching "brain region" that publishes a **semantic contract**, and the [subjective-retrieval](https://github.com/esatt10/subjective-retrieval) router (the "nervous system") routes global queries across regions. Region-side spec: `docs/SYNAPSE_INTEGRATION.md`; system design lives in the subjective-retrieval repo (`docs/SYNAPSE_ARCHITECTURE.md`).
+
 ## What SyncSage Does
 
 - Ingests local and connector-backed sources through a `SourceConnector` abstraction.
