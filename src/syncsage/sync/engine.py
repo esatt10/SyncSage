@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -14,7 +15,7 @@ from syncsage.persistence.manifest import ManifestStore
 from syncsage.persistence.paths import StatePaths
 from syncsage.persistence.state_store import StateStore
 from syncsage.registry.source_registry import SourceRegistry
-from syncsage.sync.connectors import ConnectorItem, connector_for_source
+from syncsage.sync.connectors import ConnectorItem, ItemNotModified, connector_for_source
 from syncsage.sync.locks import EngineLease, source_lock
 
 SyncMode = Literal["incremental", "full", "validate_only", "repair"]
@@ -110,8 +111,12 @@ class SyncEngine:
                         "checkpoint": health.checkpoint,
                     },
                 )
+            started_at = utc_now()
             manifest = self.manifests.load(source.name)
             artifacts = manifest.setdefault("artifacts", {})
+            # Synapse 21.3: thread the previous checkpoint into the connector
+            # so non-filesystem sources can skip unchanged remote items.
+            connector.begin_sync(mode)
             items = connector.list_items()
             if mode == "full":
                 self.state.delete_source_artifacts(source.name)
@@ -120,13 +125,22 @@ class SyncEngine:
                 artifacts = manifest["artifacts"]
             indexed = 0
             skipped = 0
+            fetched = 0
+            transfer_skipped = 0
             git_metadata = git_state(source.path) if source.type.value == "repository" else None
             for item in items:
                 previous = artifacts.get(item.relative_path)
                 if self._can_skip_before_read(mode, previous, item):
                     skipped += 1
+                    transfer_skipped += 1
                     continue
-                payload = connector.read_item(item)
+                try:
+                    payload = connector.read_item(item)
+                except ItemNotModified:
+                    skipped += 1
+                    transfer_skipped += 1
+                    continue
+                fetched += 1
                 parsed = parse_connector_payload(source, item, payload, git_metadata)
                 if parsed is None:
                     continue
@@ -205,6 +219,23 @@ class SyncEngine:
             high_watermark.update({"indexed_artifacts": indexed, "skipped_artifacts": skipped})
             connector.set_checkpoint(cursor, high_watermark, "healthy")
             self.state.mark_source_indexed(source.name, now)
+            # Synapse 21.3: record skipped-vs-fetched transfer counts per sync.
+            self.state.append_sync_event(
+                uuid.uuid4().hex,
+                source.name,
+                "sync.completed",
+                "healthy",
+                started_at,
+                now,
+                {
+                    "mode": mode,
+                    "connector_type": connector.connector_type,
+                    "fetched": fetched,
+                    "skipped": transfer_skipped,
+                    "indexed_artifacts": indexed,
+                    "skipped_artifacts": skipped,
+                },
+            )
             return SyncResult(
                 source.name,
                 indexed,
@@ -214,6 +245,8 @@ class SyncEngine:
                 "healthy",
                 {
                     "connector_type": connector.connector_type,
+                    "fetched": fetched,
+                    "skipped": transfer_skipped,
                     "checkpoint": self.state.get_source_checkpoint(source.name),
                 },
             )

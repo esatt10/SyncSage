@@ -5,10 +5,11 @@ import json
 import mimetypes
 import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
@@ -19,6 +20,14 @@ from syncsage.persistence.state_store import StateStore
 
 class ConnectorUnavailable(RuntimeError):
     """Raised when a connector is configured but cannot run in this environment."""
+
+
+class ItemNotModified(RuntimeError):
+    """Raised by ``read_item`` when validators report an unchanged remote item.
+
+    The sync engine treats this as a skip: no body was transferred, the
+    persisted artifact stays untouched (Synapse step 21.3).
+    """
 
 
 @dataclass(frozen=True)
@@ -62,6 +71,27 @@ class SourceConnector(ABC):
     def __init__(self, source: SourceConfig, state: StateStore):
         self.source = source
         self.state = state
+        self.sync_mode: str | None = None
+        self._previous_cursor: dict[str, Any] | None = None
+        self._previous_watermark: dict[str, Any] | None = None
+
+    def begin_sync(self, mode: str = "incremental") -> None:
+        """Prepare one sync pass: load the previous checkpoint (Synapse 21.3).
+
+        Connectors only consult their checkpoint in ``incremental`` mode —
+        ``full`` and ``repair`` always re-fetch. Checkpoints written before
+        21.3 simply lack the newer cursor fields and degrade gracefully to
+        "no validator cached", i.e. a normal fetch.
+        """
+        self.sync_mode = mode
+        self._previous_cursor = None
+        self._previous_watermark = None
+        if mode != "incremental":
+            return
+        checkpoint = self.get_checkpoint()
+        if checkpoint:
+            self._previous_cursor = checkpoint.get("cursor") or {}
+            self._previous_watermark = checkpoint.get("high_watermark") or {}
 
     @abstractmethod
     def list_items(self) -> list[ConnectorItem]:
@@ -212,6 +242,14 @@ class WebCollectionConnector(SourceConnector):
     connector_type = "web_collection"
     experimental = True
 
+    def __init__(self, source: SourceConfig, state: StateStore):
+        super().__init__(source, state)
+        self._seen_validators: dict[str, dict[str, Any]] = {}
+
+    def begin_sync(self, mode: str = "incremental") -> None:
+        super().begin_sync(mode)
+        self._seen_validators = {}
+
     def list_items(self) -> list[ConnectorItem]:
         self._require_experimental_enabled()
         items: list[ConnectorItem] = []
@@ -232,11 +270,24 @@ class WebCollectionConnector(SourceConnector):
 
     def read_item(self, item: ConnectorItem) -> ConnectorPayload:
         self._require_experimental_enabled()
+        cached = self._cached_validators(item.uri)
         response = _urlopen(
             item.uri,
             headers=self.source.connector.headers,
             timeout=self.source.connector.request_timeout_seconds,
+            etag=cached.get("etag"),
+            last_modified=cached.get("last_modified"),
         )
+        if response.get("not_modified"):
+            # Carry validators forward so the next sync stays conditional.
+            self._seen_validators[item.uri] = cached
+            raise ItemNotModified(f"not modified (HTTP 304): {item.uri}")
+        validators = {
+            "etag": response.get("etag"),
+            "last_modified": response["last_modified"],
+        }
+        if validators["etag"] or validators["last_modified"]:
+            self._seen_validators[item.uri] = validators
         content = response["content"]
         return ConnectorPayload(
             item=item,
@@ -253,15 +304,38 @@ class WebCollectionConnector(SourceConnector):
         items: list[ConnectorItem],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         urls = [item.uri for item in items]
+        previous = (self._previous_cursor or {}).get("validators") or {}
+        validators: dict[str, dict[str, Any]] = {}
+        for item in items:
+            entry = self._seen_validators.get(item.uri) or previous.get(item.uri)
+            if entry:
+                validators[item.uri] = entry
         return (
-            {"item_count": len(items), "last_url": urls[-1] if urls else None},
+            {
+                "item_count": len(items),
+                "last_url": urls[-1] if urls else None,
+                "validators": validators,
+            },
             {"item_count": len(items), "urls": urls, "listed_at": utc_now()},
         )
+
+    def _cached_validators(self, url: str) -> dict[str, Any]:
+        validators = (self._previous_cursor or {}).get("validators") or {}
+        cached = validators.get(url)
+        return cached if isinstance(cached, dict) else {}
 
 
 class APIConnector(SourceConnector):
     connector_type = "api"
     experimental = True
+
+    def __init__(self, source: SourceConfig, state: StateStore):
+        super().__init__(source, state)
+        self._read_hashes: dict[str, str] = {}
+
+    def begin_sync(self, mode: str = "incremental") -> None:
+        super().begin_sync(mode)
+        self._read_hashes = {}
 
     def list_items(self) -> list[ConnectorItem]:
         self._require_experimental_enabled()
@@ -295,30 +369,65 @@ class APIConnector(SourceConnector):
             if not self._allows_relative_path(relative):
                 continue
             uri = str(item_url or f"api://{self.source.name}/{item_id}")
+            identity = f"api:{self.source.name}:{item_id}"
+            mtime = raw.get("updated_at") or raw.get("mtime")
+            sha256 = raw.get("sha256")
+            content_value = raw.get(self.source.connector.api_content_field)
+            if sha256 is None and content_value is not None:
+                # Inline content already arrived with the listing — hashing it
+                # here is free and lets the engine skip before "reading".
+                sha256 = hashlib.sha256(str(content_value).encode("utf-8")).hexdigest()
+            if sha256 is None:
+                sha256 = self._cached_sha256(identity, mtime)
             items.append(
                 ConnectorItem(
-                    identity=f"api:{self.source.name}:{item_id}",
+                    identity=identity,
                     relative_path=relative,
                     uri=uri,
                     mime_type=raw.get("mime_type"),
-                    sha256=raw.get("sha256"),
-                    mtime=raw.get("updated_at") or raw.get("mtime"),
+                    sha256=sha256,
+                    mtime=mtime,
                     metadata=raw,
                 )
             )
         return items
+
+    def _cached_sha256(self, identity: str, mtime: str | None) -> str | None:
+        """Reuse the content hash from the checkpoint cursor when the item's
+        last-modified marker is unchanged (Synapse 21.3 cursor consultation)."""
+        if not mtime:
+            return None
+        cached = ((self._previous_cursor or {}).get("items") or {}).get(identity)
+        if isinstance(cached, dict) and cached.get("mtime") == mtime:
+            return cached.get("sha256")
+        return None
+
+    def checkpoint_from_items(
+        self,
+        items: list[ConnectorItem],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        cursor, high_watermark = super().checkpoint_from_items(items)
+        item_state: dict[str, dict[str, Any]] = {}
+        for item in items:
+            sha256 = item.sha256 or self._read_hashes.get(item.identity)
+            if sha256:
+                item_state[item.identity] = {"sha256": sha256, "mtime": item.mtime}
+        cursor["items"] = item_state
+        return cursor, high_watermark
 
     def read_item(self, item: ConnectorItem) -> ConnectorPayload:
         self._require_experimental_enabled()
         content_value = item.metadata.get(self.source.connector.api_content_field)
         if content_value is not None:
             content = str(content_value).encode("utf-8")
+            digest = hashlib.sha256(content).hexdigest()
+            self._read_hashes[item.identity] = digest
             return ConnectorPayload(
                 item=item,
                 content=content,
                 mime_type=item.mime_type or "text/plain",
                 size_bytes=len(content),
-                sha256=hashlib.sha256(content).hexdigest(),
+                sha256=digest,
                 mtime=item.mtime,
                 metadata=item.metadata,
             )
@@ -332,12 +441,14 @@ class APIConnector(SourceConnector):
             timeout=self.source.connector.request_timeout_seconds,
         )
         content = response["content"]
+        digest = hashlib.sha256(content).hexdigest()
+        self._read_hashes[item.identity] = digest
         return ConnectorPayload(
             item=item,
             content=content,
             mime_type=response["mime_type"] or item.mime_type,
             size_bytes=len(content),
-            sha256=hashlib.sha256(content).hexdigest(),
+            sha256=digest,
             mtime=response["last_modified"] or item.mtime,
             metadata=item.metadata,
         )
@@ -346,6 +457,14 @@ class APIConnector(SourceConnector):
 class S3Connector(SourceConnector):
     connector_type = "s3"
     experimental = True
+
+    def __init__(self, source: SourceConfig, state: StateStore):
+        super().__init__(source, state)
+        self._read_hashes: dict[str, str] = {}
+
+    def begin_sync(self, mode: str = "incremental") -> None:
+        super().begin_sync(mode)
+        self._read_hashes = {}
 
     def list_items(self) -> list[ConnectorItem]:
         self._require_experimental_enabled()
@@ -367,43 +486,79 @@ class S3Connector(SourceConnector):
                 key = obj["Key"]
                 if key.endswith("/"):
                     continue
-                relative = key[len(prefix):].lstrip("/") if key.startswith(prefix) else key
+                relative = key[len(prefix) :].lstrip("/") if key.startswith(prefix) else key
                 if _match_any(relative, self.source.exclude):
                     continue
                 if self.source.include and not _match_any(relative, self.source.include):
                     continue
                 last_modified = obj.get("LastModified")
-                items.append(
-                    ConnectorItem(
-                        identity=f"s3:{bucket}:{key}",
-                        relative_path=relative,
-                        uri=f"s3://{bucket}/{key}",
-                        mime_type=mimetypes.guess_type(key)[0],
-                        size_bytes=obj.get("Size"),
-                        sha256=None,
-                        mtime=last_modified.isoformat().replace("+00:00", "Z")
-                        if last_modified
-                        else None,
-                        etag=(obj.get("ETag") or "").strip('"') or None,
-                        metadata={"bucket": bucket, "key": key},
-                    )
+                item = ConnectorItem(
+                    identity=f"s3:{bucket}:{key}",
+                    relative_path=relative,
+                    uri=f"s3://{bucket}/{key}",
+                    mime_type=mimetypes.guess_type(key)[0],
+                    size_bytes=obj.get("Size"),
+                    sha256=None,
+                    mtime=last_modified.isoformat().replace("+00:00", "Z")
+                    if last_modified
+                    else None,
+                    etag=(obj.get("ETag") or "").strip('"') or None,
+                    metadata={"bucket": bucket, "key": key},
                 )
+                cached_sha256 = self._cached_object_sha256(item)
+                if cached_sha256:
+                    item = replace(item, sha256=cached_sha256)
+                items.append(item)
             if not response.get("IsTruncated"):
                 break
             continuation = response.get("NextContinuationToken")
         return items
+
+    def _cached_object_sha256(self, item: ConnectorItem) -> str | None:
+        """Objects at-or-before the checkpoint high-watermark (LastModified)
+        with unchanged ETag/size reuse the cached content hash, letting the
+        engine skip them without ``get_object`` (Synapse 21.3)."""
+        watermark = (self._previous_watermark or {}).get("max_mtime")
+        if not watermark or not item.mtime or item.mtime > watermark:
+            return None
+        cached = ((self._previous_cursor or {}).get("objects") or {}).get(item.identity)
+        if not isinstance(cached, dict):
+            return None
+        if cached.get("etag") != item.etag or cached.get("size_bytes") != item.size_bytes:
+            return None
+        return cached.get("sha256")
+
+    def checkpoint_from_items(
+        self,
+        items: list[ConnectorItem],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        cursor, high_watermark = super().checkpoint_from_items(items)
+        objects: dict[str, dict[str, Any]] = {}
+        for item in items:
+            sha256 = item.sha256 or self._read_hashes.get(item.identity)
+            if sha256:
+                objects[item.identity] = {
+                    "etag": item.etag,
+                    "size_bytes": item.size_bytes,
+                    "mtime": item.mtime,
+                    "sha256": sha256,
+                }
+        cursor["objects"] = objects
+        return cursor, high_watermark
 
     def read_item(self, item: ConnectorItem) -> ConnectorPayload:
         self._require_experimental_enabled()
         client = _boto3_client()
         response = client.get_object(Bucket=item.metadata["bucket"], Key=item.metadata["key"])
         content = response["Body"].read()
+        digest = hashlib.sha256(content).hexdigest()
+        self._read_hashes[item.identity] = digest
         return ConnectorPayload(
             item=item,
             content=content,
             mime_type=response.get("ContentType") or item.mime_type,
             size_bytes=len(content),
-            sha256=hashlib.sha256(content).hexdigest(),
+            sha256=digest,
             mtime=item.mtime,
             metadata=item.metadata,
         )
@@ -443,19 +598,45 @@ def _path_uri(path: Path) -> str:
         return str(path)
 
 
-def _urlopen(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any]:
+def _urlopen(
+    url: str,
+    headers: dict[str, str],
+    timeout: int,
+    etag: str | None = None,
+    last_modified: str | None = None,
+) -> dict[str, Any]:
     request_headers = {"User-Agent": "SyncSage/0.1"}
     request_headers.update(headers)
+    if etag:
+        request_headers["If-None-Match"] = etag
+    if last_modified:
+        request_headers["If-Modified-Since"] = last_modified
     request = Request(url, headers=request_headers)
-    with urlopen(request, timeout=timeout) as response:
-        content = response.read()
-        info = response.info()
-        return {
-            "content": content,
-            "mime_type": info.get_content_type() if hasattr(info, "get_content_type") else None,
-            "last_modified": info.get("Last-Modified"),
-            "headers": dict(info.items()),
-        }
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            content = response.read()
+            info = response.info()
+            mime_type = info.get_content_type() if hasattr(info, "get_content_type") else None
+            return {
+                "not_modified": False,
+                "content": content,
+                "mime_type": mime_type,
+                "etag": info.get("ETag"),
+                "last_modified": info.get("Last-Modified"),
+                "headers": dict(info.items()),
+            }
+    except HTTPError as exc:
+        if exc.code == 304 and (etag or last_modified):
+            exc.close()
+            return {
+                "not_modified": True,
+                "content": b"",
+                "mime_type": None,
+                "etag": etag,
+                "last_modified": last_modified,
+                "headers": {},
+            }
+        raise
 
 
 def _relative_url_path(url: str, index: int) -> str:

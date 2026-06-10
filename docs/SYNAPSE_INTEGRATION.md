@@ -126,6 +126,25 @@ but reads 0 objects; sync_events rows show `{"fetched": 0, "skipped": N}`.
 
 **Files:** `sync/connectors.py`, `tests/test_sync_connectors.py`.
 
+**Implementation note (2026-06-10, landed):** the previous checkpoint is
+threaded via a new `SourceConnector.begin_sync(mode)` hook the engine calls
+before `list_items()`; connectors consult it only in `incremental` mode
+(`full`/`repair` always re-fetch), and pre-21.3 checkpoints degrade
+gracefully to "no validator cached". Web 304s surface as an
+`ItemNotModified` exception from `read_item` which the engine counts as a
+skip. The API connector has no pagination in its current design, so
+"consults `cursor_json`" is implemented as the minimal honest version that
+design supports: a per-item `{identity: {sha256, mtime}}` map in the cursor
+(unchanged `updated_at`/`mtime` reuses the cached content hash and skips the
+item fetch) plus free hashing of listing-inline content. S3 caches
+`{etag, size_bytes, mtime, sha256}` per object and skips `get_object` for
+objects at-or-before the high-watermark with unchanged ETag/size.
+`sync_events` counters: `fetched` = bodies actually transferred, `skipped` =
+items skipped without a transfer — a no-validator web server therefore
+counts re-downloads as fetched even when the post-fetch hash comparison
+skips re-indexing (`indexed_artifacts`/`skipped_artifacts` are also
+recorded).
+
 ### Step 21.4 — Per-region vector index + embedding provider **[x-repo]**
 
 **Gap:** `search.embeddings` / `search.vector_store` config exists with

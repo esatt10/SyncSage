@@ -446,6 +446,64 @@ class StateStore:
             self.conn.execute("DELETE FROM source_checkpoints WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM sources WHERE id=?", (source_id,))
 
+    def append_sync_event(
+        self,
+        event_id: str,
+        source_id: str | None,
+        event_type: str,
+        status: str,
+        started_at: str | None,
+        finished_at: str | None,
+        details: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> None:
+        self.conn.execute(
+            """INSERT INTO sync_events(
+                id,source_id,event_type,status,started_at,finished_at,details_json,error_json
+            )
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                event_id,
+                source_id,
+                event_type,
+                status,
+                started_at,
+                finished_at,
+                json.dumps(details or {}, default=str, sort_keys=True),
+                json.dumps(error, default=str, sort_keys=True) if error else None,
+            ),
+        )
+        self.conn.commit()
+
+    def list_sync_events(
+        self,
+        source_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Most-recent-first sync events (rowid order is insertion order)."""
+        where = ""
+        params: list[Any] = []
+        if source_id:
+            where = "WHERE source_id=?"
+            params.append(source_id)
+        params.extend([limit, offset])
+        rows = self.rows(
+            f"""SELECT * FROM sync_events
+                {where}
+                ORDER BY rowid DESC
+                LIMIT ? OFFSET ?""",
+            tuple(params),
+        )
+        events = []
+        for row in rows:
+            event = dict(row)
+            event["details"] = json.loads(event.pop("details_json") or "{}")
+            error_json = event.pop("error_json")
+            event["error"] = json.loads(error_json) if error_json else None
+            events.append(event)
+        return events
+
     def append_source_audit_event(
         self,
         event_id: str,
