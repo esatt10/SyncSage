@@ -11,6 +11,11 @@ HTTP API, so the indexing container is unchanged (see
   `knowledge_base → source → file → chunk/symbol/concept`, expand a node's
   sub-network (depth-bounded), filter by edge type (the "edge lens"), and pivot
   across relationships. Adding + syncing a source animates new nodes in.
+- **Search** — query across nodes, relationships and their attributes. A **mode**
+  control tunes retrieval (`hybrid` / `text` / `graph`) and a **results** control
+  sets the hit count. Each hit shows its node type and relevance score; clicking
+  one focuses the node, pulling it in from the bounded preview (and re-enabling a
+  filtered node type) if it is not already on the canvas.
 - **Sources** — list/sync/disable/remove, **add a source by opening a local
   directory** (allowlist-scoped browser), and **promote** runtime sources to
   YAML.

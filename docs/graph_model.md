@@ -61,3 +61,5 @@ SyncSage runs deterministic enrichment during sync:
 - Semantic similarity pass: links artifacts with `similar_to` when their normalized concept sets overlap.
 
 Graph-derived terms are also written to SQLite so hybrid search can surface multiple relevant files for a cross-file query, even when no single chunk contains every query term.
+
+Search runs in three modes. `text` queries the SQLite full-text index over chunk content and paths. `graph` matches directly against the live graph — node labels, types and attribute values, plus relationship types and endpoint labels — so enrichment outputs (symbols, concepts, entities, external references) and the relationships between them are first-class search targets, not just the chunk text they were derived from. `hybrid` (the default) runs both and merges the results, de-duplicating by node and re-ranking by score. The retrieval mode and the maximum result count are both caller-adjustable.

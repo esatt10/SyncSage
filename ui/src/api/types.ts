@@ -111,16 +111,31 @@ export interface ConfigResponse {
   profiles: string[];
 }
 
+export type SearchMode = "hybrid" | "text" | "graph";
+
 export interface SearchResultItem {
-  relative_path: string;
+  node_id?: string;
+  kind?: "node" | "relationship" | "chunk";
+  type?: string;
+  title?: string;
+  label?: string;
+  relative_path?: string;
   source_id?: string;
   summary?: string;
   score?: number;
+  match?: string;
+  edge_type?: string;
+  source?: string;
+  target?: string;
+  source_label?: string;
+  target_label?: string;
   [key: string]: unknown;
 }
 
 export interface SearchResponse {
   results: SearchResultItem[];
+  mode?: SearchMode;
+  counts?: { text?: number; graph?: number; returned?: number };
   [key: string]: unknown;
 }
 

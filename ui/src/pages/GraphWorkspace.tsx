@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
-import type { GraphLink, GraphNode } from "../api/types";
+import type { GraphLink, GraphNode, SearchMode, SearchResultItem } from "../api/types";
 import { GraphCanvas } from "../graph/GraphCanvas";
 import { NodeInspector } from "../graph/NodeInspector";
 import { Breadcrumbs } from "../graph/Breadcrumbs";
@@ -40,7 +40,10 @@ export function GraphWorkspace() {
   const [showTrail, setShowTrail] = useState(persisted.showTrail ?? true);
   const [trail, setTrail] = useState<{ id: string; label: string }[]>(persisted.trail ?? []);
   const [query, setQuery] = useState(persisted.query ?? "");
+  const [searchMode, setSearchMode] = useState<SearchMode>(persisted.searchMode ?? "hybrid");
+  const [searchLimit, setSearchLimit] = useState(persisted.searchLimit ?? 10);
   const [expandingNode, setExpandingNode] = useState<string | null>(null);
+  const [locating, setLocating] = useState(false);
 
   const base = graphQuery.data ?? { nodes: [], links: [] };
 
@@ -91,6 +94,8 @@ export function GraphWorkspace() {
       showTrail,
       trail,
       query,
+      searchMode,
+      searchLimit,
     });
   }, [
     extra,
@@ -105,6 +110,8 @@ export function GraphWorkspace() {
     showTrail,
     trail,
     query,
+    searchMode,
+    searchLimit,
   ]);
 
   const expand = useCallback(
@@ -157,18 +164,59 @@ export function GraphWorkspace() {
   };
 
   const searchQuery = useQuery({
-    queryKey: ["search", query],
-    queryFn: () => api.search(query, "hybrid", 10),
-    enabled: query.trim().length > 2,
+    queryKey: ["search", query, searchMode, searchLimit],
+    queryFn: () => api.search(query, searchMode, searchLimit),
+    enabled: query.trim().length > 1,
   });
 
-  const locateResult = (relativePath: string) => {
-    const match = merged.nodes.find((n) => n.relative_path === relativePath);
-    if (match) {
-      select(match.id);
-      setFocusIds([match.id]);
-    }
-  };
+  // Re-enable a node type that is currently filtered out so a located node is
+  // actually visible on the canvas instead of silently hidden.
+  const ensureTypeVisible = useCallback((type?: string) => {
+    if (!type || !ALL_NODE_TYPES.includes(type)) return;
+    setEnabledNodeTypes((prev) => (prev.has(type) ? prev : new Set(prev).add(type)));
+  }, []);
+
+  // Navigate to a search hit by its node id. When the node is part of a
+  // truncated graph preview it may not be loaded yet, so we pull in its
+  // neighborhood slice before focusing it; relative_path is a fallback for
+  // legacy text hits that don't carry a node id.
+  const locateNode = useCallback(
+    async (result: SearchResultItem) => {
+      const id = result.node_id;
+      if (id && nodeById.has(id)) {
+        ensureTypeVisible(nodeById.get(id)?.type);
+        select(id);
+        setFocusIds([id]);
+        return;
+      }
+      if (result.relative_path) {
+        const match = merged.nodes.find((n) => n.relative_path === result.relative_path);
+        if (match) {
+          ensureTypeVisible(match.type);
+          select(match.id);
+          setFocusIds([match.id]);
+          return;
+        }
+      }
+      if (!id) return;
+      setLocating(true);
+      try {
+        const slice = await api.graphSlice(id, 1);
+        if (slice.nodes.length > 0) {
+          setExtra((prev) => ({
+            nodes: [...prev.nodes, ...slice.nodes],
+            links: [...prev.links, ...slice.links],
+          }));
+          slice.nodes.forEach((n) => ensureTypeVisible(n.type));
+          select(id);
+          setFocusIds([id, ...slice.nodes.map((n) => n.id)]);
+        }
+      } finally {
+        setLocating(false);
+      }
+    },
+    [nodeById, merged.nodes, select, ensureTypeVisible],
+  );
 
   return (
     <div className="workspace">
@@ -177,14 +225,59 @@ export function GraphWorkspace() {
           <h3>Search</h3>
           <input
             className="text-input"
-            placeholder="Hybrid search…"
+            placeholder="Search nodes, edges, attributes…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
+          <div className="search-controls">
+            <label className="field field--compact">
+              <span>Mode</span>
+              <select
+                className="text-input text-input--small"
+                value={searchMode}
+                onChange={(e) => setSearchMode(e.target.value as SearchMode)}
+              >
+                <option value="hybrid">hybrid</option>
+                <option value="text">text</option>
+                <option value="graph">graph</option>
+              </select>
+            </label>
+            <label className="field field--compact">
+              <span>Results</span>
+              <input
+                className="text-input text-input--small"
+                type="number"
+                min={1}
+                max={100}
+                value={searchLimit}
+                onChange={(e) =>
+                  setSearchLimit(Math.max(1, Math.min(100, Number(e.target.value) || 1)))
+                }
+              />
+            </label>
+          </div>
           <div className="search-results">
-            {searchQuery.data?.results?.slice(0, 8).map((r, i) => (
-              <button key={`${r.relative_path}-${i}`} className="search-hit" onClick={() => locateResult(r.relative_path)}>
-                {r.relative_path}
+            {searchQuery.isFetching ? <span className="muted small">Searching…</span> : null}
+            {locating ? <span className="muted small">Loading node…</span> : null}
+            {!searchQuery.isFetching &&
+            query.trim().length > 1 &&
+            (searchQuery.data?.results?.length ?? 0) === 0 ? (
+              <span className="muted small">No matches.</span>
+            ) : null}
+            {searchQuery.data?.results?.map((r, i) => (
+              <button
+                key={`${r.node_id ?? r.relative_path ?? "hit"}-${i}`}
+                className="search-hit"
+                onClick={() => locateNode(r)}
+                title={searchHitTitle(r)}
+              >
+                <span className="search-hit__main">{searchHitLabel(r)}</span>
+                <span className="search-hit__meta">
+                  {r.type ? <span className="search-hit__type">{r.type}</span> : null}
+                  {typeof r.score === "number" ? (
+                    <span className="search-hit__score">{r.score.toFixed(2)}</span>
+                  ) : null}
+                </span>
               </button>
             ))}
           </div>
@@ -328,6 +421,20 @@ function legendShape(shape: string): string {
   return shape.replace(/[^a-z0-9_-]/gi, "-").toLowerCase();
 }
 
+function searchHitLabel(result: SearchResultItem): string {
+  if (result.kind === "relationship") {
+    return `${result.source_label ?? result.source ?? ""} → ${result.target_label ?? result.target ?? ""}`;
+  }
+  return String(result.title ?? result.label ?? result.relative_path ?? result.node_id ?? "");
+}
+
+function searchHitTitle(result: SearchResultItem): string {
+  const parts = [searchHitLabel(result)];
+  if (result.kind === "relationship" && result.edge_type) parts.push(`(${result.edge_type})`);
+  if (result.match) parts.push(`matched: ${result.match}`);
+  return parts.join(" ");
+}
+
 interface PersistedGraphWorkspace {
   extra?: { nodes: GraphNode[]; links: GraphLink[] };
   selectedId?: string | null;
@@ -341,6 +448,8 @@ interface PersistedGraphWorkspace {
   showTrail?: boolean;
   trail?: { id: string; label: string }[];
   query?: string;
+  searchMode?: SearchMode;
+  searchLimit?: number;
 }
 
 const GRAPH_STATE_KEY = "syncsage.graph.workspace.v2";

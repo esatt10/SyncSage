@@ -494,6 +494,7 @@ def create_app(
             req.mode,
             req.max_results,
             req.source_name,
+            graph=engine.graph_builder.graph,
         )
 
     @app.post("/relevant-files")
@@ -508,8 +509,9 @@ def create_app(
         seen = set()
         files = []
         for result in payload["results"]:
-            if result["relative_path"] not in seen:
-                seen.add(result["relative_path"])
+            relative_path = result.get("relative_path")
+            if relative_path and relative_path not in seen:
+                seen.add(relative_path)
                 files.append(result)
         return {"files": files}
 

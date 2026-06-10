@@ -49,7 +49,7 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 | `promote_runtime_source_to_config` | Return a deterministic YAML patch, or write one by policy, for runtime sources. |
 | `sync_source` | Trigger `incremental`, `full`, `validate_only`, or `repair` sync for one source. |
 | `sync_all` | Trigger sync for all enabled sources. |
-| `search_context` | Search graph/search state using keyword, path, graph, hybrid, semantic, or symbol modes. |
+| `search_context` | Search graph/search state in `text` (SQLite full-text over chunk content and paths), `graph` (node/relationship labels, types and attribute values), or `hybrid` (merged and re-ranked) mode. |
 | `get_relevant_files` | Return files likely needed for a coding task. |
 | `get_graph_neighbors` | Traverse graph neighbors with true depth-aware BFS and optional edge-type filters. |
 | `get_file_summary` | Return a compact summary and provenance for a file. |

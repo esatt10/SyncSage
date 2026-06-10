@@ -234,6 +234,7 @@ class SyncSageTools:
             query,
             mode,
             max_results,
+            graph=self.engine.graph_builder.graph,
         )
 
     def get_relevant_files(
