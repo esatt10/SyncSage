@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from tests.conftest import run_sync, sync_result_counts
+from pathlib import Path
+
+from tests.conftest import make_vector_engine, run_sync, sync_result_counts
 
 
 def test_full_sync_is_idempotent_for_sample_repository(sync_engine: object) -> None:
@@ -16,3 +18,25 @@ def test_full_sync_is_idempotent_for_sample_repository(sync_engine: object) -> N
 
     assert second_counts == first_counts
     assert all(value > 0 for value in second_counts.values())
+
+
+def test_resync_of_unchanged_content_performs_zero_embedder_calls(tmp_path: Path) -> None:
+    """Synapse 21.4: embed-on-sync is keyed on text_hash via content-addressed
+    chunk ids, so re-syncing unchanged content never re-embeds — in full or
+    incremental mode."""
+
+    engine = make_vector_engine(tmp_path)
+    run_sync(engine, source_name="notes", mode="full")
+    embedder = engine.vectors.embedder
+    store = engine.vectors.store
+    assert embedder.texts_embedded > 0
+    baseline_calls = embedder.calls
+    baseline_count = store.count()
+
+    run_sync(engine, source_name="notes", mode="full")
+    assert embedder.calls == baseline_calls
+    assert store.count() == baseline_count
+
+    run_sync(engine, source_name="notes", mode="incremental")
+    assert embedder.calls == baseline_calls
+    assert store.count() == baseline_count

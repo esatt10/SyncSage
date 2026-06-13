@@ -85,9 +85,43 @@ class StorageSettings(ModelMixin):
     max_state_size_gb: int = 10
 
 @dataclass
+class EmbeddingsSettings(ModelMixin):
+    """Optional embed-on-sync provider (Synapse 21.4). Off by default.
+
+    ``provider`` is ``openai-spec`` (POST {base_url}/embeddings, the same
+    wire format the subjective-retrieval router uses) or ``stub``
+    (deterministic, offline). The API key is read from the environment
+    variable named by ``api_key_env`` and never stored in config/state.
+    """
+
+    enabled: bool = False
+    provider: str = "openai-spec"
+    model: str = "text-embedding-3-small"
+    base_url: str = "https://api.openai.com/v1"
+    api_key_env: str = "OPENAI_API_KEY"
+    dimensions: int = 256
+    batch_size: int = 64
+
+
+@dataclass
+class VectorStoreSettings(ModelMixin):
+    """Vector index backend; vectors live under ``<path>/<kb_id>/``.
+
+    ``provider`` is ``lancedb`` (default; optional ``[vector]`` extra) or
+    ``numpy`` (always available flat file). ``path`` defaults to
+    ``<state>/vectors``.
+    """
+
+    provider: str = "lancedb"
+    path: Path | None = None
+
+
+@dataclass
 class SearchSettings(ModelMixin):
     default_mode: str = "hybrid"
     max_results_default: int = 10
+    embeddings: EmbeddingsSettings = field(default_factory=EmbeddingsSettings)
+    vector_store: VectorStoreSettings = field(default_factory=VectorStoreSettings)
 
 @dataclass
 class WatcherSettings(ModelMixin):
@@ -231,6 +265,14 @@ class SyncSageConfig(ModelMixin):
                     raw["api"] = build(ApiSettings, raw["api"])
                 if "ui" in raw and isinstance(raw["ui"], dict):
                     raw["ui"] = build(UiSettings, raw["ui"])
+            if dc is VectorStoreSettings:
+                if raw.get("path") is not None:
+                    raw["path"] = Path(raw["path"])
+            if dc is SearchSettings:
+                if "embeddings" in raw and isinstance(raw["embeddings"], dict):
+                    raw["embeddings"] = build(EmbeddingsSettings, raw["embeddings"])
+                if "vector_store" in raw and isinstance(raw["vector_store"], dict):
+                    raw["vector_store"] = build(VectorStoreSettings, raw["vector_store"])
             if dc is SyncSettings:
                 if "watcher" in raw and isinstance(raw["watcher"], dict):
                     raw["watcher"] = build(WatcherSettings, raw["watcher"])

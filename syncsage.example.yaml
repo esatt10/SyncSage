@@ -50,14 +50,21 @@ search:
   keyword:
     enabled: true
     engine: sqlite_fts5
+  # Optional semantic self-search (Synapse 21.4). Disabled by default; when
+  # enabled, chunks are embedded at sync time through an OpenAI-spec HTTP
+  # endpoint (the only sanctioned network call in the indexing path) and
+  # search gains mode=vector plus vector candidates inside mode=hybrid.
   embeddings:
-    enabled: true
-    provider: local
-    model: sentence-transformers/all-MiniLM-L6-v2
+    enabled: false
+    provider: openai-spec        # "openai-spec" | "stub" (deterministic, offline)
+    model: text-embedding-3-small
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY  # env var NAME; the key itself never lands in config
+    dimensions: 256
+    batch_size: 64
   vector_store:
-    enabled: true
-    engine: chroma
-    path: /state/vector
+    provider: lancedb            # "lancedb" (pip install 'syncsage[vector]') | "numpy"
+    path: /state/vectors         # vectors live under <path>/<kb_id>/
   ranking:
     prefer_exact_path_matches: true
     prefer_recent_commits: true

@@ -15,6 +15,10 @@ from syncsage.persistence.manifest import ManifestStore
 from syncsage.persistence.paths import StatePaths
 from syncsage.persistence.state_store import StateStore
 from syncsage.registry.source_registry import SourceRegistry
+from syncsage.search.vector_store import (
+    VectorSearcher,
+    vector_indexer_from_config,
+)
 from syncsage.sync.connectors import ConnectorItem, ItemNotModified, connector_for_source
 from syncsage.sync.locks import EngineLease, source_lock
 
@@ -61,6 +65,10 @@ class SyncEngine:
         existing = self.graph_store.load(config.knowledge_base_id)
         if len(existing):
             self.graph_builder.graph = existing
+        # Optional embed-on-sync (Synapse 21.4): None when
+        # search.embeddings.enabled is false, leaving sync byte-identical
+        # to pre-21.4 behavior (no vector dir, no embedder calls).
+        self.vectors = vector_indexer_from_config(config)
 
     def close(self) -> None:
         """Release the writer lease and close the state store."""
@@ -112,6 +120,7 @@ class SyncEngine:
                     },
                 )
             started_at = utc_now()
+            details_extra: dict = {}
             manifest = self.manifests.load(source.name)
             artifacts = manifest.setdefault("artifacts", {})
             # Synapse 21.3: thread the previous checkpoint into the connector
@@ -127,6 +136,7 @@ class SyncEngine:
             skipped = 0
             fetched = 0
             transfer_skipped = 0
+            embedded_chunks = 0
             git_metadata = git_state(source.path) if source.type.value == "repository" else None
             for item in items:
                 previous = artifacts.get(item.relative_path)
@@ -192,6 +202,12 @@ class SyncEngine:
                     for chunk in parsed.chunks
                 ]
                 self.state.replace_artifact_chunks(artifact_row, chunk_rows)
+                if self.vectors is not None:
+                    # Chunk ids are content-addressed (text_hash in the id),
+                    # so only new/changed chunk text reaches the embedder.
+                    embedded_chunks += self.vectors.index_artifact(
+                        source.name, parsed.id, chunk_rows
+                    )
                 enrichment = self.graph_builder.add_artifact(source, parsed)
                 self.state.replace_artifact_enrichment(
                     parsed.id,
@@ -209,6 +225,17 @@ class SyncEngine:
                 indexed += 1
                 if slow_sync_s:
                     time.sleep(slow_sync_s)
+            pruned_vectors = 0
+            if self.vectors is not None:
+                # Drop vectors whose chunks left the chunks table (removed
+                # artifacts, re-chunked text, full-mode deletions).
+                live_chunk_ids = {
+                    str(row["id"])
+                    for row in self.state.rows(
+                        "SELECT id FROM chunks WHERE source_id=?", (source.name,)
+                    )
+                }
+                pruned_vectors = self.vectors.prune_source(source.name, live_chunk_ids)
             self.graph_builder.add_similarity_edges(source.name)
             manifest["last_indexed_at"] = utc_now()
             manifest["connector"] = {"type": connector.connector_type}
@@ -219,6 +246,13 @@ class SyncEngine:
             high_watermark.update({"indexed_artifacts": indexed, "skipped_artifacts": skipped})
             connector.set_checkpoint(cursor, high_watermark, "healthy")
             self.state.mark_source_indexed(source.name, now)
+            if self.vectors is not None:
+                # Synapse 21.4: additive keys, present only when embeddings
+                # are enabled so default sync_events stay byte-identical.
+                details_extra = {
+                    "embedded_chunks": embedded_chunks,
+                    "pruned_vectors": pruned_vectors,
+                }
             # Synapse 21.3: record skipped-vs-fetched transfer counts per sync.
             self.state.append_sync_event(
                 uuid.uuid4().hex,
@@ -234,6 +268,7 @@ class SyncEngine:
                     "skipped": transfer_skipped,
                     "indexed_artifacts": indexed,
                     "skipped_artifacts": skipped,
+                    **details_extra,
                 },
             )
             return SyncResult(
@@ -248,6 +283,7 @@ class SyncEngine:
                     "fetched": fetched,
                     "skipped": transfer_skipped,
                     "checkpoint": self.state.get_source_checkpoint(source.name),
+                    **details_extra,
                 },
             )
 
@@ -260,11 +296,18 @@ class SyncEngine:
             "chunk_count": int(self.state.rows("SELECT COUNT(*) AS c FROM chunks")[0]["c"]),
         }
 
+    def vector_searcher(self) -> VectorSearcher | None:
+        """Query-time vector searcher sharing this engine's embedder/store."""
+
+        if self.vectors is None:
+            return None
+        return VectorSearcher(self.vectors.embedder, self.vectors.store, self.state)
+
     def search_context(self, query: str, max_results: int = 10) -> dict:
         from syncsage.search.hybrid import HybridSearch
         from syncsage.search.sqlite_store import SearchStore
 
-        return HybridSearch(SearchStore(self.state)).search_context(
+        return HybridSearch(SearchStore(self.state), vector=self.vector_searcher()).search_context(
             self.config.knowledge_base_id,
             query,
             max_results=max_results,

@@ -188,6 +188,47 @@ def sync_engine(loaded_config: Any, config_path: Path) -> Any:
         return engine_factory(config_path=config_path)
 
 
+def make_vector_engine(tmp_path: Path, vector_provider: str = "numpy") -> Any:
+    """SyncEngine over a tiny workspace with stub embeddings enabled.
+
+    The stub embedder maps planted synonyms onto shared directions
+    (``automobile -> car``), so ``vehicles.md`` is retrievable for the
+    query "car" through vector search while FTS misses it. Used by the
+    vector-search acceptance tests and the idempotency spine.
+    """
+
+    sync_module = import_any(("syncsage.sync.engine",))
+    schema_module = import_any(("syncsage.config.schema",))
+
+    notes = tmp_path / "vector-workspace" / "notes"
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "vehicles.md").write_text(
+        "# Fleet\n\nThe automobile fleet needs quarterly inspection and battery checks.\n",
+        encoding="utf-8",
+    )
+    (notes / "kitchen.md").write_text(
+        "# Kitchen\n\nWash dishes nightly and restock pantry shelves.\n",
+        encoding="utf-8",
+    )
+    config = schema_module.SyncSageConfig.model_validate(
+        {
+            "syncsage": {
+                "name": "vector-acceptance",
+                "state_path": str(tmp_path / "vector-state"),
+                "vault_path": str(tmp_path / "vector-vault"),
+                "workspace_root": str(tmp_path / "vector-workspace"),
+                "exports_path": str(tmp_path / "vector-exports"),
+            },
+            "search": {
+                "embeddings": {"enabled": True, "provider": "stub", "dimensions": 64},
+                "vector_store": {"provider": vector_provider},
+            },
+            "sources": [{"name": "notes", "type": "markdown_folder", "path": str(notes)}],
+        }
+    )
+    return sync_module.SyncEngine(config)
+
+
 def run_sync(engine: Any, source_name: str = "syncsage-repo", mode: str = "full") -> Any:
     """Run a source sync using common public method names."""
 

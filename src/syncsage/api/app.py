@@ -238,7 +238,7 @@ def create_app(
     state.migrate()
     SourceRegistry(config, state).initialize()
     engine = SyncEngine(config, paths, state)
-    search = HybridSearch(SearchStore(state))
+    search = HybridSearch(SearchStore(state), vector=engine.vector_searcher())
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

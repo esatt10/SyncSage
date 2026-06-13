@@ -170,6 +170,24 @@ re-embed, keyed on `text_hash`); test suite stays fully offline.
 `sync/engine.py` (embed-on-sync), `config/schema.py` (activate keys),
 `pyproject.toml` (`[vector]` extra), `tests/test_vector_search.py`.
 
+**Implementation note (2026-06-13, landed):** two `VectorStore` backends —
+`NumpyVectorStore` (always available; flat fsync'd `index.json` of
+base64-float32 vectors under `<state>/vectors/<kb_id>/`; the offline test
+backend) and `LanceDBVectorStore` (production default, lazy import with a
+`pip install 'syncsage[vector]'` hint). Idempotency bookkeeping is
+content-addressed: chunk ids embed the chunk `text_hash`, so "already
+embedded?" is exactly store membership — `VectorIndexer` embeds only
+missing ids and prunes ids absent from the `chunks` table at sync end
+(re-syncing unchanged content performs zero embedder calls, asserted in
+`tests/test_sync_idempotency.py`). `StubEmbedder` hashes tokens (blake2b)
+to fixed unit directions with a small synonym canonicalization table so
+hybrid-vs-text acceptance runs offline. The **[x-repo]** obligation was
+satisfied by wire conformance, not code: `OpenAISpecEmbedder` speaks the
+standard OpenAI embeddings HTTP shape the subjective-retrieval provider
+layer uses, so a fleet pins one model for both repos; no sibling-repo
+change was needed. `numpy` was promoted to a core dependency (the numpy
+backend + stub must work without `[vector]`).
+
 ### Step 21.5 — Contract publisher + sync event stream **[x-repo]**
 
 **Gap:** no sync-completion signal (`sync_events` is write-only); no
