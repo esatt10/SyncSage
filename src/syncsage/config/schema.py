@@ -162,6 +162,29 @@ class ObsidianSettings(ModelMixin):
 
 
 @dataclass
+class SynapseSettings(ModelMixin):
+    """Synapse federation (Synapse 21.5). Standalone-safe: all router-facing
+    behavior no-ops when ``router_url`` is unset and ``publish`` is false.
+
+    - ``publish`` gates contract publication + the NDJSON event stream from the
+      sync engine. Default off → a router-less SyncSage behaves exactly as
+      before. The local ``GET /contract`` serving path still works once a
+      contract has been published.
+    - ``router_url`` is the Synapse router base URL; when set, the engine POSTs
+      the ``sync.completed`` event (with the inline contract) to
+      ``<router_url>/v1/synapse/events`` (fail-soft).
+    - ``fleet_id`` / ``endpoint`` are stamped into the contract so the router
+      can pin the fleet embedding space and pull/route to this region.
+    """
+
+    publish: bool = False
+    router_url: str | None = None
+    fleet_id: str | None = None
+    endpoint: str | None = None
+    webhook_timeout_seconds: float = 5.0
+
+
+@dataclass
 class SecuritySettings(ModelMixin):
     allow_workspace_roots: list[Path] = field(
         default_factory=lambda: [Path("/workspace"), Path("/vault"), Path("/exports")]
@@ -239,6 +262,7 @@ class SyncSageConfig(ModelMixin):
     sync: SyncSettings = field(default_factory=SyncSettings)
     obsidian: ObsidianSettings = field(default_factory=ObsidianSettings)
     security: SecuritySettings = field(default_factory=SecuritySettings)
+    synapse: SynapseSettings = field(default_factory=SynapseSettings)
     sources: list[SourceConfig] = field(default_factory=list)
 
     @classmethod
@@ -289,6 +313,7 @@ class SyncSageConfig(ModelMixin):
             sync=build(SyncSettings, data.get("sync")),
             obsidian=build(ObsidianSettings, data.get("obsidian")),
             security=build(SecuritySettings, data.get("security")),
+            synapse=build(SynapseSettings, data.get("synapse")),
             sources=[],
         )
         cfg.sources = []

@@ -366,6 +366,21 @@ class SyncSageTools:
         self._require_source(source_name)
         return self.engine.manifests.load(source_name)
 
+    def get_contract(self, knowledge_base: str) -> dict:
+        """Return this region's published semantic contract (Synapse 21.5).
+
+        ``{"status": "unpublished"}`` until a contract has been published.
+        """
+        self._require_knowledge_base(knowledge_base)
+        import json as _json
+
+        from syncsage.synapse.publisher import load_contract_text
+
+        text = load_contract_text(self.config.syncsage.state_path)
+        if text is None:
+            return {"status": "unpublished", "knowledge_base": self.config.knowledge_base_id}
+        return _json.loads(text)
+
     def get_sync_history(
         self,
         knowledge_base: str,

@@ -350,6 +350,14 @@ class NumpyVectorStore:
             if item.get("payload", {}).get("source_id") == source_id
         }
 
+    def all_vectors(self) -> list[tuple[str, list[float]]]:
+        """Bulk (chunk_id, vector) reader used by the contract publisher."""
+
+        return [
+            (chunk_id, list(self._decode(item["v"])))
+            for chunk_id, item in self._items().items()
+        ]
+
 
 class LanceDBVectorStore:
     """LanceDB-backed store (optional ``[vector]`` extra)."""
@@ -466,6 +474,14 @@ class LanceDBVectorStore:
             for row in self._rows(["chunk_id", "source_id"])
             if row["source_id"] == source_id
         }
+
+    def all_vectors(self) -> list[tuple[str, list[float]]]:
+        """Bulk (chunk_id, vector) reader used by the contract publisher."""
+
+        return [
+            (row["chunk_id"], [float(value) for value in row["vector"]])
+            for row in self._rows(["chunk_id", "vector"])
+        ]
 
 
 class VectorIndexer:

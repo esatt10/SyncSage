@@ -213,6 +213,12 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
         return tools.get_sync_status(knowledge_base)
 
     @mcp.tool()
+    def get_contract(knowledge_base: str) -> dict:
+        """Return this region's published Synapse semantic contract."""
+
+        return tools.get_contract(knowledge_base)
+
+    @mcp.tool()
     def get_sync_history(
         knowledge_base: str,
         source_name: str | None = None,
@@ -277,6 +283,12 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
         """Return a small graph slice rooted at one node as JSON."""
 
         return _json(tools.get_graph_slice(kb_id, node_id, depth=2))
+
+    @mcp.resource("syncsage://knowledge-bases/{kb_id}/contract")
+    def contract_resource(kb_id: str) -> str:
+        """Return this region's published Synapse semantic contract as JSON."""
+
+        return _json(tools.get_contract(kb_id))
 
     @mcp.prompt()
     def use_syncsage_for_coding_task(task: str = "") -> str:

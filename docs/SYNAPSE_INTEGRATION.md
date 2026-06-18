@@ -220,6 +220,58 @@ except the local contract file + `GET /contract`.
 `synapse.publish: bool`), `tests/test_contract_publisher.py`,
 `tests/test_contract_parity.py`.
 
+**Implementation note (2026-06-14, landed):** new `src/syncsage/synapse/`
+package (region-side; not the sibling's `synapse/`). The contract is built **by
+hand** to the vendored `contracts/semantic_contract.v1.schema.json` — no import
+of subjective-retrieval. Verified byte-for-byte against the sibling's canonical
+model: the fp16-base64 vector codec, the u64-base64 + blake2b MinHash, the
+`sha256:`-prefixed canonical-JSON `integrity.content_hash`
+(`sort_keys`/compact-separators/`integrity`-excluded), and the file
+serialization (`indent=2, sort_keys, ensure_ascii=False` + trailing newline)
+all produce output that feeds back into the sibling's `SemanticContract.seal()`
+/ `to_json_text()` identically and passes `verify_content_hash()`.
+
+- **MinHash scheme: MATCHES the sibling exactly.** `_minhash_signature`
+  reimplements the documented 128-perm scheme — permutation `i` hashes term `t`
+  as the low 64 bits (big-endian) of `blake2b(f"{i}:{t}", digest_size=8)`, min
+  across the term set, encoded as base64 of a uint64 array. A standalone parity
+  check confirms `numpy.array_equal` with the sibling's `minhash_signature` for
+  populated and empty term sets, so cross-repo white-matter overlap (Step 23.1)
+  can compare region MinHashes directly.
+- **Signature:** centroid = mean, `covariance_diag` = population variance, and
+  ≤32 cluster centroids from a deterministic seeded Lloyd's k-means (pure numpy,
+  no sklearn — works without the `[vector]` extra), `m = min(32, ⌊√n⌋, n)`,
+  strided ≤16,384-row sample, clusters canonically ordered by
+  `(-weight, fp16_payload)` for byte-stable output. Vectors are read from the
+  21.4 vector store via an additive `all_vectors()` bulk reader added to both
+  `NumpyVectorStore` and `LanceDBVectorStore`.
+- **No-vector fallback (decision: option b — degenerate signature, NOT a
+  no-op):** when `search.embeddings.enabled` is false there are no chunk
+  vectors, so the publisher emits a schema-valid contract with a *degenerate
+  zero signature* (zero centroid/covariance, no clusters, `sample_count=0`) and
+  `embedding_space` from the configured embed model/dim, while still carrying
+  the real vocabulary + watermark. Capabilities truthfully drop `"vector"` from
+  `search_modes` and set `returns_vectors=false`. This keeps the region
+  routable on vocabulary/freshness even without embeddings.
+- **Watermark digest:** `source_checkpoints_digest` = sha256 over each source's
+  ordered `(source_id, relative_path, sha256)` content fingerprint from the
+  artifacts table — deliberately **not** the connector checkpoints, whose
+  `high_watermark` carries transient per-sync `indexed`/`skipped` counters that
+  would make two no-change syncs disagree. Two syncs with unchanged content
+  produce the identical digest (acceptance-gated, byte-identical with a pinned
+  `generated_at`).
+- **Publish default + gating:** `synapse.publish` defaults **off**. The entire
+  21.5 hook (`contract.latest.json` write + NDJSON `sync.completed` event +
+  router webhook) is gated by it, so a router-less standalone region is
+  byte-for-byte unchanged. `GET /contract` (FastAPI) and the MCP resource
+  `syncsage://knowledge-bases/{kb_id}/contract` (+ `get_contract` tool) serve
+  the on-disk contract (404 / `{"status":"unpublished"}` before first publish).
+- **Webhook:** when `synapse.router_url` is set, the engine POSTs the
+  `sync.completed` event with the inline `contract` to
+  `<router>/v1/synapse/events` (the sibling's 20.3 endpoint shape) via stdlib
+  `urllib` (no new dependency), 5 s timeout; failures are logged, never raised,
+  so a router-down fleet still syncs.
+
 ### Step 21.6 — Snapshots, compression, retention, backup + cross-source edges
 
 **Gap:** `graph.latest.json` is overwritten with no history; `storage.

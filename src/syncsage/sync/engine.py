@@ -19,6 +19,8 @@ from syncsage.search.vector_store import (
     VectorSearcher,
     vector_indexer_from_config,
 )
+from syncsage.synapse.events import EventStream, RouterWebhook
+from syncsage.synapse.publisher import ContractPublisher
 from syncsage.sync.connectors import ConnectorItem, ItemNotModified, connector_for_source
 from syncsage.sync.locks import EngineLease, source_lock
 
@@ -69,6 +71,15 @@ class SyncEngine:
         # search.embeddings.enabled is false, leaving sync byte-identical
         # to pre-21.4 behavior (no vector dir, no embedder calls).
         self.vectors = vector_indexer_from_config(config)
+        # Synapse 21.5: contract publisher + NDJSON event stream. The event
+        # log is always written (local, useful standalone); contract
+        # publication + the router webhook are gated by synapse.publish /
+        # synapse.router_url so a router-less region is unchanged.
+        self.events = EventStream(self.paths.state)
+        self.router_webhook = RouterWebhook(
+            config.synapse.router_url,
+            timeout=config.synapse.webhook_timeout_seconds,
+        )
 
     def close(self) -> None:
         """Release the writer lease and close the state store."""
@@ -271,6 +282,10 @@ class SyncEngine:
                     **details_extra,
                 },
             )
+            # Synapse 21.5: (re)publish the contract + emit/POST sync.completed.
+            # Still inside the writer lock + per-source lock; fail-soft so a
+            # publish/webhook hiccup never fails the sync.
+            self._publish_after_sync(source.name, mode, started_at, now, indexed, skipped)
             return SyncResult(
                 source.name,
                 indexed,
@@ -326,6 +341,72 @@ class SyncEngine:
         return ObsidianExporter(self.config, self.state).export(
             preview=preview,
             template_profile=template_profile,
+        )
+
+    def _publish_after_sync(
+        self,
+        source_name: str,
+        mode: str,
+        started_at: str,
+        finished_at: str,
+        indexed: int,
+        skipped: int,
+    ) -> None:
+        """Publish the contract + emit/POST the sync.completed event.
+
+        Entirely gated by ``synapse.publish`` (default off) so a router-less
+        standalone region is byte-for-byte unchanged. When on, (re)derives +
+        writes ``<state>/contract.latest.json``, appends the local NDJSON
+        ``sync.completed`` event, and — when ``synapse.router_url`` is set —
+        POSTs the event (with the inline contract) to the router. Every step is
+        fail-soft: a publish/webhook hiccup never fails the sync.
+        """
+
+        if not self.config.synapse.publish:
+            return
+        contract: dict | None = None
+        try:
+            store = self.vectors.store if self.vectors is not None else None
+            contract = ContractPublisher(
+                self.config, self.state, vector_store=store
+            ).publish(generated_at=finished_at)
+        except Exception as exc:  # noqa: BLE001 - publication must not fail sync
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Synapse contract publication failed for %s: %s", source_name, exc
+            )
+        event: dict = {
+            "type": "sync.completed",
+            "kb_id": self.config.knowledge_base_id,
+            "source_id": source_name,
+            "mode": mode,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "indexed_artifacts": indexed,
+            "skipped_artifacts": skipped,
+        }
+        if self.config.synapse.fleet_id:
+            event["fleet_id"] = self.config.synapse.fleet_id
+        if self.config.synapse.endpoint:
+            event["endpoint"] = self.config.synapse.endpoint
+        self.events.append(event, now=finished_at)
+        if self.router_webhook.enabled:
+            payload = dict(event)
+            if contract is not None:
+                payload["contract"] = contract
+            self.router_webhook.post_event(payload)
+
+    def _emit_source_changed(self, source_name: str, now: str | None = None) -> None:
+        """Emit a local ``source.changed`` event (used by the watcher)."""
+
+        self.events.append(
+            {
+                "type": "source.changed",
+                "kb_id": self.config.knowledge_base_id,
+                "source_id": source_name,
+            },
+            now=now,
         )
 
     def _source(self, name: str) -> SourceConfig:
