@@ -41,6 +41,48 @@ STOPWORDS = {
     "your",
 }
 
+# Synapse 21.6B: concept normalization. A small, deterministic stoplist of
+# words whose trailing "s"/"es"/"ies" must NOT be singularized — either
+# because the singular changes meaning (status -> statu) or the word is not a
+# plural at all (its, this, analysis, basis, ...). No NLP dependency is used;
+# the rules below are pure-python and reproducible so concept ids stay stable.
+SINGULARIZE_STOPLIST = frozenset(
+    {
+        "analysis",
+        "axis",
+        "basis",
+        "bias",
+        "bus",
+        "canvas",
+        "class",
+        "css",
+        "data",
+        "dns",
+        "focus",
+        "gas",
+        "https",
+        "ies",
+        "index",
+        "ios",
+        "is",
+        "its",
+        "less",
+        "lens",
+        "news",
+        "os",
+        "pass",
+        "process",
+        "series",
+        "species",
+        "status",
+        "this",
+        "thus",
+        "tls",
+        "ux",
+        "yes",
+    }
+)
+
 
 @dataclass(frozen=True)
 class EnrichmentNode:
@@ -233,6 +275,164 @@ class SemanticSimilarityPass:
         return edges
 
 
+ARTIFACT_NODE_TYPES = {"file", "markdown_note", "document"}
+
+
+@dataclass(frozen=True)
+class _ArtifactRef:
+    node_id: str
+    source_id: str
+    relative_path: str
+
+
+def resolve_cross_source_edges(
+    nodes: list[tuple[str, dict[str, Any]]],
+    edges: list[tuple[str, str, str, str | None]],
+) -> list[EnrichmentEdge]:
+    """Resolve references whose targets live in a *different* source.
+
+    Synapse 21.6B cross-source pass. Deterministic and rule-based (no LLM,
+    rule 1). Runs over the *whole* graph after every source's enrichment has
+    been applied — references can only resolve once both the referencing and
+    the target source are present, so this is a global post-pass (mirroring
+    the post-hoc :class:`SemanticSimilarityPass`).
+
+    ``nodes`` is ``(node_id, attrs)`` for every node; ``edges`` is
+    ``(source, target, edge_type, reference_type)`` for the artifact ->
+    external_reference edges that carry a resolvable target. For each such
+    edge whose ``reference`` resolves to an artifact in a *different* source,
+    an ``imports`` (python imports) or ``references`` (links) edge is emitted
+    from the referencing artifact to the resolved artifact. Edges are upserted
+    by the caller, so re-running is idempotent.
+    """
+
+    by_path: dict[str, list[_ArtifactRef]] = {}
+    for node_id, attrs in nodes:
+        if attrs.get("type") not in ARTIFACT_NODE_TYPES:
+            continue
+        rel = attrs.get("relative_path")
+        src = attrs.get("source_id")
+        if not rel or not src:
+            continue
+        by_path.setdefault(_norm_rel(rel), []).append(_ArtifactRef(node_id, src, rel))
+
+    ext_nodes = {
+        node_id: attrs for node_id, attrs in nodes if attrs.get("type") == "external_reference"
+    }
+    out: list[EnrichmentEdge] = []
+    seen: set[tuple[str, str, str]] = set()
+    for artifact_id, ext_id, edge_type, reference_type in edges:
+        ext = ext_nodes.get(ext_id)
+        if ext is None:
+            continue
+        source_id = ext.get("source_id")
+        reference = ext.get("reference")
+        if not reference or not source_id:
+            continue
+        targets = _resolve_reference(reference, reference_type, by_path)
+        for target in targets:
+            if target.node_id == artifact_id:
+                continue
+            if target.source_id == source_id:
+                # Same source: existing intra-source enrichment already covers
+                # it; cross-source resolution intentionally only links across.
+                continue
+            key = (artifact_id, target.node_id, edge_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                EnrichmentEdge(
+                    artifact_id,
+                    target.node_id,
+                    edge_type,
+                    {
+                        "source_id": source_id,
+                        "target_source_id": target.source_id,
+                        "reference": reference,
+                        "reference_type": reference_type,
+                        "cross_source": True,
+                        "enrichment_pass": "cross_source_resolution",
+                    },
+                )
+            )
+    # Deterministic ordering so re-runs / snapshots are byte-stable.
+    out.sort(key=lambda e: (e.source, e.target, e.type))
+    return out
+
+
+def _resolve_reference(
+    reference: str,
+    reference_type: str | None,
+    by_path: dict[str, list[_ArtifactRef]],
+) -> list[_ArtifactRef]:
+    if reference_type == "python_import":
+        return _resolve_python_import(reference, by_path)
+    if reference_type in {"document_link", "url"}:
+        return _resolve_document_link(reference, by_path)
+    return []
+
+
+def _resolve_python_import(
+    module: str,
+    by_path: dict[str, list[_ArtifactRef]],
+) -> list[_ArtifactRef]:
+    parts = [part for part in module.replace("\\", "/").split(".") if part]
+    if not parts:
+        return []
+    base = "/".join(parts)
+    candidates = (f"{base}.py", f"{base}/__init__.py")
+    for candidate in candidates:
+        matches = _match_suffix(candidate, by_path)
+        if matches:
+            return matches
+    return []
+
+
+def _resolve_document_link(
+    target: str,
+    by_path: dict[str, list[_ArtifactRef]],
+) -> list[_ArtifactRef]:
+    if target.startswith(("http://", "https://", "mailto:")):
+        return []
+    cleaned = target.split("#", 1)[0].split("?", 1)[0].strip()
+    if not cleaned:
+        return []
+    cleaned = cleaned.lstrip("./")
+    norm = _norm_rel(cleaned)
+    direct = by_path.get(norm)
+    if direct:
+        return direct
+    # Obsidian-style wiki link without extension -> try common doc suffixes.
+    if "." not in Path(norm).name:
+        for suffix in (".md", ".txt"):
+            matches = by_path.get(norm + suffix)
+            if matches:
+                return matches
+    return _match_suffix(norm, by_path)
+
+
+def _match_suffix(
+    candidate: str,
+    by_path: dict[str, list[_ArtifactRef]],
+) -> list[_ArtifactRef]:
+    candidate = _norm_rel(candidate)
+    direct = by_path.get(candidate)
+    if direct:
+        return direct
+    matches: list[_ArtifactRef] = []
+    needle = "/" + candidate
+    for path, refs in by_path.items():
+        if path == candidate or path.endswith(needle):
+            matches.extend(refs)
+    matches.sort(key=lambda ref: (ref.source_id, ref.relative_path, ref.node_id))
+    return matches
+
+
+def _norm_rel(value: str) -> str:
+    return value.replace("\\", "/").strip("/").lower()
+
+
 def artifact_text(artifact: ParsedArtifact) -> str:
     return "\n\n".join(chunk.text for chunk in artifact.chunks)
 
@@ -372,7 +572,7 @@ def _add_concept(
     concept: str,
     weight: float,
 ) -> None:
-    normalized = _normalize_term(concept)
+    normalized = _normalize_concept(concept)
     if not normalized:
         return
     node_id = _node_id("concept", kb_id, source.name, normalized)
@@ -419,10 +619,13 @@ def _add_entity(
 
 
 def _concept_candidates(text: str, relative_path: str) -> set[str]:
-    tokens = [_normalize_term(token) for token in _split_identifier(Path(relative_path).stem)]
+    # Synapse 21.6B: normalize + singularize candidates up front so plural and
+    # singular surface forms count toward the same concept (e.g. "systems" and
+    # "system" both increment one bucket) and collapse to one node.
+    tokens = [_normalize_concept(token) for token in _split_identifier(Path(relative_path).stem)]
     normalized_tokens = [token for token in tokens if token and token not in STOPWORDS]
     words = [
-        _normalize_term(match)
+        _normalize_concept(match)
         for match in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text)
     ]
     words = [word for word in words if word and word not in STOPWORDS]
@@ -516,6 +719,44 @@ def _clean_inline(value: str) -> str:
 def _normalize_term(value: str) -> str:
     parts = [_slug_part(part) for part in _split_identifier(value)]
     return " ".join(part for part in parts if part)
+
+
+def _singularize_word(word: str) -> str:
+    """Lemma-light singularization of a single lowercased word.
+
+    Deterministic, pure-python, no NLP dependency (rule 1 / "no new deps").
+    Rules, applied to words length >= 4 not in ``SINGULARIZE_STOPLIST``:
+    ``…ies`` -> ``…y`` (libraries -> library), ``…(s|x|z|ch|sh)es`` -> drop
+    ``es`` (boxes -> box, classes is stoplisted), other ``…s`` -> drop ``s``
+    (systems -> system). Words ending in ``ss`` are left untouched. The
+    transform is idempotent: singularizing an already-singular word is a
+    no-op, so a concept's stable id derivation stays consistent across syncs.
+    """
+
+    if len(word) < 4 or word in SINGULARIZE_STOPLIST or word.endswith("ss"):
+        return word
+    if word.endswith("ies"):
+        return word[:-3] + "y"
+    if word.endswith("es") and word[:-2].endswith(("s", "x", "z", "ch", "sh")):
+        return word[:-2]
+    if word.endswith("s"):
+        return word[:-1]
+    return word
+
+
+def _normalize_concept(value: str) -> str:
+    """Normalize a concept surface term before node creation (Synapse 21.6B).
+
+    Lowercase + slug via ``_normalize_term`` (existing behavior), then
+    singularize each token so "Systems"/"system"/"systems" collapse to a
+    single ``concept`` node. Because ``_node_id`` derives the concept id from
+    this normalized term, the id stays deterministic for a given input.
+    """
+
+    normalized = _normalize_term(value)
+    if not normalized:
+        return ""
+    return " ".join(_singularize_word(token) for token in normalized.split(" "))
 
 
 def _reference_label(value: str) -> str:

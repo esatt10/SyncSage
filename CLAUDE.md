@@ -162,6 +162,10 @@ docker compose up                          # container + optional UI sidecar
 
 ## 5. Current Synapse work queue (Phase 21 — region hardening)
 
+**Phase 21 region hardening is complete (2026-06-18).** Remaining Synapse work
+lives in the sibling subjective-retrieval repo (Phase 22 finish — Step 22.5 —
+plus Phases 23–26).
+
 Full step contracts with acceptance criteria: `docs/SYNAPSE_INTEGRATION.md` §2.
 
 | Step | What | Fixes | Status |
@@ -171,7 +175,7 @@ Full step contracts with acceptance criteria: `docs/SYNAPSE_INTEGRATION.md` §2.
 | 21.3 | True incremental web/API/S3 (ETag/cursor/watermark) | connectors ignore their checkpoints | done (2026-06-10) |
 | 21.4 | Per-region vector index (lancedb, `[vector]` extra) + OpenAI-spec embedder, `mode="vector"` in hybrid search **[x-repo]** | dead `search.embeddings`/`vector_store` config | done (2026-06-13) |
 | 21.5 | Semantic-contract publisher + NDJSON event stream + router webhook **[x-repo]** | no sync-completion signal; no contract | done (2026-06-14) |
-| 21.6 | Graph snapshots (zstd) + retention + backup/restore; cross-source edges + concept normalization | dead storage config; no backup; no cross-source links | session A done (2026-06-18); session B (cross-source edges + concept normalization) pending |
+| 21.6 | Graph snapshots (zstd) + retention + backup/restore; cross-source edges + concept normalization | dead storage config; no backup; no cross-source links | done (session A 2026-06-18; session B 2026-06-18) — Phase 21 complete |
 
 ---
 

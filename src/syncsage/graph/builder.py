@@ -6,6 +6,7 @@ from syncsage.graph.enrichment import (
     CodeEnrichmentPass,
     MarkdownDocumentEnrichmentPass,
     SemanticSimilarityPass,
+    resolve_cross_source_edges,
 )
 from syncsage.graph.simple import SimpleMultiDiGraph
 from syncsage.ingestion.pipeline import ParsedArtifact, utc_now
@@ -187,6 +188,33 @@ class GraphBuilder:
             artifacts.append((node_id, attrs))
         for edge in self.similarity_pass.run(artifacts):
             self.upsert_edge(edge.source, edge.target, edge.type, edge.attrs)
+
+    def add_cross_source_edges(self) -> int:
+        """Resolve references whose targets resolve into a *different* source.
+
+        Synapse 21.6B. A global post-pass over the whole graph (sources sync
+        independently, so a reference can only resolve once both the
+        referencing and the target source are indexed). Python imports resolve
+        ``imports`` edges; markdown/document links resolve ``references`` edges.
+        Edges are upserted, so re-running is idempotent and deterministic.
+        Returns the number of cross-source edges resolved this pass.
+        """
+
+        nodes = list(self.graph.nodes(data=True))
+        ref_edges: list[tuple[str, str, str, str | None]] = []
+        for (source, target), edge_map in self.graph._edges.items():
+            for data in edge_map.values():
+                edge_type = data.get("type")
+                if edge_type not in {"imports", "references"}:
+                    continue
+                target_attrs = self.graph.nodes[target] if self.graph.has_node(target) else {}
+                if target_attrs.get("type") != "external_reference":
+                    continue
+                ref_edges.append((source, target, edge_type, data.get("reference_type")))
+        resolved = resolve_cross_source_edges(nodes, ref_edges)
+        for edge in resolved:
+            self.upsert_edge(edge.source, edge.target, edge.type, dict(edge.attrs))
+        return len(resolved)
 
     def remove_source_content(self, source_name: str) -> None:
         source_node = f"source:{self.kb_id}:{source_name}"

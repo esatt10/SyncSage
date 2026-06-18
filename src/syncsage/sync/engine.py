@@ -264,6 +264,12 @@ class SyncEngine:
                 }
                 pruned_vectors = self.vectors.prune_source(source.name, live_chunk_ids)
             self.graph_builder.add_similarity_edges(source.name)
+            # Synapse 21.6B: global cross-source edge pass. Resolves python
+            # imports / document links whose targets land in a *different*
+            # source into imports/references edges. Runs over the whole
+            # accumulated graph (sources sync independently) and is idempotent
+            # via edge upsert, so re-sync produces an identical graph.
+            self.graph_builder.add_cross_source_edges()
             manifest["last_indexed_at"] = utc_now()
             manifest["connector"] = {"type": connector.connector_type}
             self.manifests.save(source.name, manifest)

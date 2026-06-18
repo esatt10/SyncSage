@@ -350,6 +350,60 @@ not modified.
   (snapshots/backup must work without any extra). It is the only new dep for
   this step.
 
+**Implementation note (2026-06-18, session B landed — closes Step 21.6 and
+Phase 21):** this session implemented **only the graph half** (cross-source
+edges + concept normalization). The persistence half (session A) was untouched:
+no snapshot/backup/retention code (`persistence/graph_store.py` snapshot logic,
+`persistence/backup.py`, `backup`/`restore` CLI) was modified. Touched:
+`graph/enrichment.py`, `graph/builder.py`, `sync/engine.py`, new
+`tests/test_cross_source_edges.py`. No new dependencies; no stable-ID grammar
+change (rule 3) — only new edges between existing IDs and concept surface-term
+normalization that keeps id derivation deterministic.
+
+- **Cross-source resolution timing.** A new global post-pass,
+  `GraphBuilder.add_cross_source_edges()`, runs in `SyncEngine.sync_source`
+  *after* the per-source `add_similarity_edges` and *before* the graph save (it
+  mirrors the post-hoc `SemanticSimilarityPass`). It must run after each
+  source's enrichment is applied because references can only resolve once both
+  the referencing and the target source are present in the accumulated graph
+  (sources sync independently). The pass walks the whole graph each time;
+  edges are **upserted** so a re-sync produces an identical graph (idempotent).
+- **Resolution rules (deterministic, rule-based, no LLM).** The pass inspects
+  every `artifact → external_reference` edge of type `imports` or `references`:
+  - `reference_type == "python_import"`: the dotted module is mapped to
+    candidate relative paths `pkg/mod.py` then `pkg/mod/__init__.py`; the first
+    that matches an artifact (exact relative-path, else `/`-suffix match)
+    yields an **`imports`** edge.
+  - `reference_type in {"document_link","url"}`: the link target (fragment/query
+    stripped, leading `./` trimmed, `http(s)`/`mailto` skipped) is matched by
+    exact relative path, then — for extension-less wiki links — `.md`/`.txt`,
+    then `/`-suffix match; a hit yields a **`references`** edge.
+  Only matches whose target lives in a **different** source produce an edge
+  (intra-source resolution is already covered by existing enrichment and is
+  intentionally skipped here). Cross-source edges carry
+  `{cross_source: true, target_source_id, reference, reference_type,
+  enrichment_pass: "cross_source_resolution"}`. Unresolvable references keep the
+  existing `external_reference` node + edge unchanged (no regression). Output is
+  sorted `(source, target, type)` for byte-stable snapshots.
+- **Concept normalization rule set.** Before a `concept` node is created,
+  `_normalize_concept` applies the existing `_normalize_term` (lowercase + slug)
+  and then a lemma-light per-token singularizer `_singularize_word` (pure
+  python, no NLP dep): for tokens length ≥ 4 not in a `SINGULARIZE_STOPLIST`
+  and not ending in `ss` — `…ies → …y` (libraries → library),
+  `…(s|x|z|ch|sh)es → drop es` (boxes → box), other `…s → drop s`
+  (systems → system). The transform is idempotent so an already-singular term
+  is a no-op, keeping the concept's stable id derivation consistent across
+  syncs. Candidates are singularized up front in `_concept_candidates` so
+  plural/singular surface forms count toward one frequency bucket and collapse
+  to a single node. `STOPWORDS`/`SINGULARIZE_STOPLIST` guard non-plural words
+  (status, analysis, css, …). Concept ids stay `concept:<kb>:<source>:<term>`;
+  only the `<term>` is now the normalized/singular surface (rule 3 honored).
+- **Fixtures.** Cross-source acceptance uses self-contained workspaces built in
+  `tests/test_cross_source_edges.py` (a code source importing a module + linking
+  a doc that live in a second source); no shared-fixture edit was needed.
+- **Standalone unchanged.** The pass is fully local, additive, and
+  router-independent; idempotency (`tests/test_sync_idempotency.py`) stays green.
+
 **Phase 21 exit criterion:** a single SyncSage container survives
 kill-mid-sync, live-watches its sources, answers vector+hybrid
 self-search offline-testably, publishes a schema-valid contract on every
