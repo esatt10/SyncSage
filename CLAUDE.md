@@ -51,7 +51,8 @@ SyncSage must keep working unchanged.
 SyncSage/
 ├── CLAUDE.md                  ← you are here
 ├── README.md
-├── pyproject.toml             ← extras: [mcp], [dev]; (Phase 21.4 adds [vector])
+├── pyproject.toml             ← extras: [mcp], [dev]; (Phase 21.4 adds [vector]);
+│                                core deps include numpy + zstandard (21.6A snapshots/backup)
 ├── syncsage.example.yaml      ← reference config (all sections)
 ├── Dockerfile                 ← python:3.12-slim, port 8765, /config/syncsage.yaml
 ├── docker-compose.yml         ← syncsage + optional syncsage-ui sidecar
@@ -170,7 +171,7 @@ Full step contracts with acceptance criteria: `docs/SYNAPSE_INTEGRATION.md` §2.
 | 21.3 | True incremental web/API/S3 (ETag/cursor/watermark) | connectors ignore their checkpoints | done (2026-06-10) |
 | 21.4 | Per-region vector index (lancedb, `[vector]` extra) + OpenAI-spec embedder, `mode="vector"` in hybrid search **[x-repo]** | dead `search.embeddings`/`vector_store` config | done (2026-06-13) |
 | 21.5 | Semantic-contract publisher + NDJSON event stream + router webhook **[x-repo]** | no sync-completion signal; no contract | done (2026-06-14) |
-| 21.6 | Graph snapshots (zstd) + retention + backup/restore; cross-source edges + concept normalization | dead storage config; no backup; no cross-source links | pending (2 sessions) |
+| 21.6 | Graph snapshots (zstd) + retention + backup/restore; cross-source edges + concept normalization | dead storage config; no backup; no cross-source links | session A done (2026-06-18); session B (cross-source edges + concept normalization) pending |
 
 ---
 

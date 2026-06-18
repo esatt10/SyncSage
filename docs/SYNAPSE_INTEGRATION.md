@@ -300,6 +300,56 @@ tests.
 `cli.py` (backup/restore), `graph/{builder,enrichment}.py`,
 `pyproject.toml` (`zstandard`), tests.
 
+**Implementation note (2026-06-18, session A landed; session B pending):**
+this session implemented **only the persistence half** (snapshots + retention +
+backup/restore). The graph half (cross-source edges + concept normalization) is
+untouched and remains for **session B** — `graph/{builder,enrichment}.py` were
+not modified.
+
+- **Snapshot layout.** After a successful sync, `GraphStore.write_snapshot`
+  writes `graphs/<kb_id>/graph.<utc-ts>.json.zst` — the same node-link JSON
+  payload as `graph.latest.json` (`indent=2, sort_keys=True`), zstd-compressed
+  (level 10). The `<utc-ts>` is the ISO-8601 `utc_now()` with `:` → `-` so the
+  filename stays filesystem-safe **and** lexically sortable (chronological).
+  `graph.latest.json` stays **uncompressed** for fast hot-path load; snapshots
+  are additive history. Both snapshot and latest writes are durable
+  (tmp + fsync + `os.replace` + best-effort dir fsync), reusing the 21.2
+  pattern.
+- **Interval throttling.** `SyncEngine._snapshot_after_sync` writes at most one
+  snapshot per `storage.graph_snapshot_interval_seconds`: it parses the newest
+  existing snapshot's embedded timestamp and skips writing when the elapsed time
+  is below the interval (two syncs within the window → one snapshot; a sync after
+  it → a second). Snapshotting + retention are fail-soft (a hiccup is logged,
+  never fails the sync).
+- **Retention policy.** `GraphStore.enforce_retention(kb_id, max_bytes)` deletes
+  **oldest snapshots first** until the total `.zst` byte size for the KB is at or
+  under `max_state_size_gb` (× 1024³). It **never** deletes `graph.latest.json`,
+  the SQLite db, or `contract.latest.json`, and always keeps at least the newest
+  snapshot even if it alone exceeds the cap. `max_state_size_gb` is now typed
+  `float` so small-cap tests can use sub-GB values.
+- **Backup format.** `syncsage backup <out.tar.zst>` (new
+  `persistence/backup.py`) writes a zstd-compressed tar of the durable state:
+  `syncsage.db` taken via **`VACUUM INTO` a temp file** (a consistent snapshot
+  under WAL — never a raw copy of the live db; manifests live in the db since
+  21.2 so they ride along), plus `graphs/`, `events/`, `vectors/`, any legacy
+  `manifests/` dir, and `contract.latest.json` when present. The live state dir
+  is read-only during backup.
+- **Restore safety.** `syncsage restore <in.tar.zst>` decompresses + extracts
+  into a sibling temp dir (with path-traversal/absolute-member guards), runs
+  `PRAGMA integrity_check` on the restored db, and only then swaps it in. It
+  **refuses a non-empty target** (non-zero exit, clear message) unless `--force`;
+  on `--force` the existing dir is renamed aside to `<name>.replaced-<ts>`
+  (preserved, never deleted) before the staged tree is moved into place — so a
+  failure never partially destroys the user's state.
+- **Config defaults.** `storage.graph_snapshots` (new, default **on**),
+  `storage.compression` (new, `"zstd"`), and the previously-dead
+  `graph_snapshot_interval_seconds` (900 s) / `max_state_size_gb` (10) are now
+  live. Standalone behavior stays sane: snapshots are additive, bounded, and
+  fully local — no Synapse/router involvement.
+- **New dependency.** `zstandard>=0.22` promoted to a **core** dependency
+  (snapshots/backup must work without any extra). It is the only new dep for
+  this step.
+
 **Phase 21 exit criterion:** a single SyncSage container survives
 kill-mid-sync, live-watches its sources, answers vector+hybrid
 self-search offline-testably, publishes a schema-valid contract on every

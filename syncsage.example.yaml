@@ -33,16 +33,17 @@ server:
 
 storage:
   graph_format: node_link_json
+  # Synapse 21.6A: zstd-compressed timestamped graph snapshots written after a
+  # successful sync (graphs/<kb_id>/graph.<utc-ts>.json.zst), beside the
+  # uncompressed graph.latest.json. Throttled by the interval; bounded by the
+  # retention cap (oldest evicted first; latest.json/db/contract never evicted).
+  graph_snapshots: true
   graph_snapshot_interval_seconds: 900
+  compression: zstd
   sqlite_path: /state/syncsage.db
   graph_path: /state/graphs
   manifest_path: /state/manifests
   max_state_size_gb: 10
-  compression:
-    enabled: true
-    algorithm: zstd
-  retention:
-    keep_snapshots: 10
     keep_event_days: 30
 
 search:

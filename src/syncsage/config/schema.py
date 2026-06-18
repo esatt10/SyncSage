@@ -6,11 +6,23 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_EXCLUDES = [
-    "**/.git/**", "**/.env", "**/.env.*", "**/*id_rsa*", "**/*id_ed25519*",
-    "**/*.pem", "**/*.key", "**/node_modules/**", "**/__pycache__/**",
-    "**/.venv/**", "**/venv/**", "**/dist/**", "**/build/**",
-    "**/.mypy_cache/**", "**/.pytest_cache/**",
+    "**/.git/**",
+    "**/.env",
+    "**/.env.*",
+    "**/*id_rsa*",
+    "**/*id_ed25519*",
+    "**/*.pem",
+    "**/*.key",
+    "**/node_modules/**",
+    "**/__pycache__/**",
+    "**/.venv/**",
+    "**/venv/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/.mypy_cache/**",
+    "**/.pytest_cache/**",
 ]
+
 
 class SourceType(StrEnum):
     repository = "repository"
@@ -21,6 +33,7 @@ class SourceType(StrEnum):
     single_file = "single_file"
     s3 = "s3"
     api = "api"
+
 
 @dataclass
 class ModelMixin:
@@ -37,7 +50,9 @@ class ModelMixin:
             if isinstance(v, dict):
                 return {k: conv(val) for k, val in v.items()}
             return v
+
         return {k: conv(v) for k, v in asdict(self).items()}
+
 
 @dataclass
 class SyncSageSettings(ModelMixin):
@@ -50,6 +65,7 @@ class SyncSageSettings(ModelMixin):
     workspace_root: Path = Path("/workspace")
     exports_path: Path = Path("/exports")
 
+
 @dataclass
 class McpSettings(ModelMixin):
     enabled: bool = True
@@ -57,15 +73,18 @@ class McpSettings(ModelMixin):
         default_factory=lambda: {"stdio": True, "streamable_http": True, "sse": False}
     )
 
+
 @dataclass
 class ApiSettings(ModelMixin):
     enabled: bool = True
     openapi: bool = True
 
+
 @dataclass
 class UiSettings(ModelMixin):
     enabled: bool = True
     graph_visualization: bool = True
+
 
 @dataclass
 class ServerSettings(ModelMixin):
@@ -75,14 +94,32 @@ class ServerSettings(ModelMixin):
     api: ApiSettings = field(default_factory=ApiSettings)
     ui: UiSettings = field(default_factory=UiSettings)
 
+
 @dataclass
 class StorageSettings(ModelMixin):
+    """On-disk state layout + graph snapshot/retention policy (Synapse 21.6A).
+
+    - ``graph_snapshots`` toggles zstd-compressed timestamped graph snapshots
+      written after a successful sync. Defaults **on** — a snapshot is additive
+      history beside the (unchanged) ``graph.latest.json`` and is bounded by the
+      retention cap below, so standalone behavior stays sane.
+    - ``graph_snapshot_interval_seconds`` is the minimum spacing between
+      snapshots; syncs closer together than this reuse the most recent snapshot.
+    - ``compression`` selects the snapshot codec (``zstd`` only, for now).
+    - ``max_state_size_gb`` caps total snapshot bytes per KB; oldest snapshots
+      are evicted first when exceeded. ``graph.latest.json``, the SQLite db, and
+      the contract are never evicted.
+    """
+
     graph_format: str = "node_link_json"
+    graph_snapshots: bool = True
     graph_snapshot_interval_seconds: int = 900
+    compression: str = "zstd"
     sqlite_path: Path | None = None
     graph_path: Path | None = None
     manifest_path: Path | None = None
-    max_state_size_gb: int = 10
+    max_state_size_gb: float = 10
+
 
 @dataclass
 class EmbeddingsSettings(ModelMixin):
@@ -123,12 +160,14 @@ class SearchSettings(ModelMixin):
     embeddings: EmbeddingsSettings = field(default_factory=EmbeddingsSettings)
     vector_store: VectorStoreSettings = field(default_factory=VectorStoreSettings)
 
+
 @dataclass
 class WatcherSettings(ModelMixin):
     enabled: bool = True
     max_watch_paths: int = 100
     debounce_ms: int = 1500
     batch_window_ms: int = 5000
+
 
 @dataclass
 class GitSettings(ModelMixin):
@@ -137,16 +176,19 @@ class GitSettings(ModelMixin):
     detect_branch_switch: bool = True
     reindex_on_commit: bool = True
 
+
 @dataclass
 class SchedulerSettings(ModelMixin):
     enabled: bool = True
     interval_seconds: int = 900
+
 
 @dataclass
 class SyncSettings(ModelMixin):
     watcher: WatcherSettings = field(default_factory=WatcherSettings)
     git: GitSettings = field(default_factory=GitSettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
+
 
 @dataclass
 class ObsidianSettings(ModelMixin):
@@ -202,6 +244,7 @@ class RepoSettings(ModelMixin):
     commit_trigger: bool = True
     dependency_graph: dict[str, Any] = field(default_factory=dict)
 
+
 @dataclass
 class ChunkingSettings(ModelMixin):
     enabled: bool = True
@@ -209,12 +252,14 @@ class ChunkingSettings(ModelMixin):
     max_chars: int = 4000
     overlap_chars: int = 400
 
+
 @dataclass
 class SourceSyncSettings(ModelMixin):
     on_startup: bool = True
     on_file_change: str | bool = "debounce"
     on_git_commit: bool = True
     interval_seconds: int | None = None
+
 
 @dataclass
 class SourceConnectorSettings(ModelMixin):
@@ -226,6 +271,7 @@ class SourceConnectorSettings(ModelMixin):
     api_content_field: str = "content"
     s3_bucket: str | None = None
     s3_prefix: str = ""
+
 
 @dataclass
 class SourceConfig(ModelMixin):
@@ -252,6 +298,7 @@ class SourceConfig(ModelMixin):
     sync: SourceSyncSettings = field(default_factory=SourceSyncSettings)
     connector: SourceConnectorSettings = field(default_factory=SourceConnectorSettings)
     urls: list[str] = field(default_factory=list)
+
 
 @dataclass
 class SyncSageConfig(ModelMixin):
@@ -305,6 +352,7 @@ class SyncSageConfig(ModelMixin):
                 if "scheduler" in raw and isinstance(raw["scheduler"], dict):
                     raw["scheduler"] = build(SchedulerSettings, raw["scheduler"])
             return dc(**{k: v for k, v in raw.items() if k in dc.__dataclass_fields__})
+
         cfg = cls(
             syncsage=build(SyncSageSettings, data.get("syncsage")),
             server=build(ServerSettings, data.get("server")),
@@ -331,11 +379,7 @@ class SyncSageConfig(ModelMixin):
                 raw["connector"] = build(SourceConnectorSettings, raw["connector"])
             cfg.sources.append(
                 SourceConfig(
-                    **{
-                        k: v
-                        for k, v in raw.items()
-                        if k in SourceConfig.__dataclass_fields__
-                    }
+                    **{k: v for k, v in raw.items() if k in SourceConfig.__dataclass_fields__}
                 )
             )
         state = cfg.syncsage.state_path
@@ -345,8 +389,13 @@ class SyncSageConfig(ModelMixin):
         return cfg
 
     @property
-    def knowledge_base_id(self) -> str: return self.syncsage.name
+    def knowledge_base_id(self) -> str:
+        return self.syncsage.name
+
     @property
-    def state_path(self) -> Path: return self.syncsage.state_path
+    def state_path(self) -> Path:
+        return self.syncsage.state_path
+
     @property
-    def vault_path(self) -> Path: return self.syncsage.vault_path
+    def vault_path(self) -> Path:
+        return self.syncsage.vault_path

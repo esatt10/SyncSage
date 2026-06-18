@@ -105,6 +105,13 @@ def main(argv: list[str] | None = None) -> int:
     compose_env_p.add_argument("--output", "-o")
     repair_p = sub.add_parser("repair")
     repair_p.add_argument("--config", "-c", default="syncsage.example.yaml")
+    backup_p = sub.add_parser("backup")
+    backup_p.add_argument("output")
+    backup_p.add_argument("--config", "-c", default="syncsage.example.yaml")
+    restore_p = sub.add_parser("restore")
+    restore_p.add_argument("input")
+    restore_p.add_argument("--config", "-c", default="syncsage.example.yaml")
+    restore_p.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
     if args.command in {None, "--help"}:
         parser.print_help()
@@ -219,6 +226,34 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             engine.close()
         print("Repair complete")
+        return 0
+    if args.command == "backup":
+        from syncsage.config.loader import load_config
+        from syncsage.persistence.backup import create_backup
+        from syncsage.persistence.paths import StatePaths
+
+        cfg = load_config(Path(args.config))
+        paths = StatePaths.from_config(cfg)
+        out = create_backup(paths.state, Path(args.output), sqlite_path=paths.sqlite)
+        size = out.stat().st_size
+        print(f"Backup written: {out} ({size} bytes)")
+        return 0
+    if args.command == "restore":
+        from syncsage.config.loader import load_config
+        from syncsage.persistence.backup import restore_backup
+        from syncsage.persistence.paths import StatePaths
+
+        cfg = load_config(Path(args.config))
+        paths = StatePaths.from_config(cfg)
+        try:
+            target = restore_backup(Path(args.input), paths.state, force=args.force)
+        except FileExistsError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(f"Restored state into: {target}")
         return 0
     if args.command == "serve":
         from syncsage.config.loader import load_config
