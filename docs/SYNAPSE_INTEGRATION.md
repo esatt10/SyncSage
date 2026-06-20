@@ -469,9 +469,22 @@ A region remains the existing container (`Dockerfile`, port 8765, PVC on
   file-backed registry fills over HTTP (no shared volume). Standalone SyncSage
   is unchanged — drop `synapse.publish`/`router_url` and the region is
   router-less again. See `subjective-retrieval/docs/DEPLOY.md` §11.
-- **Kubernetes** (Step 25.2): one StatefulSet + PVC + headless Service
-  per region, rendered from the router repo's Helm chart `regions:`
-  values; this repo's `deploy/kubernetes/` manifests are the pod-spec
-  baseline.
+- **Kubernetes** (Synapse Step 25.2, **landed 2026-06-20** in the router
+  repo): the router repo's sibling Helm chart
+  `subjective-retrieval/deploy/helm/synapse/` renders the whole fleet — one
+  router (`Deployment` + HPA + `Service`) plus a values-driven `regions:`
+  list where **each entry becomes one `StatefulSet` + a `/state` PVC
+  (`volumeClaimTemplate`, so each region owns its own volume — independent
+  scale-up) + a headless `Service` + a `ConfigMap`**. **No SyncSage code
+  change** was needed: the region pod spec in the chart **mirrors this
+  repo's `deploy/kubernetes/` manifests** (port 8765, `/health`+`/ready`
+  probes, `/state`+`/config`+`/vault`+`/workspace`+`/exports` mounts,
+  non-root 10001, read-only rootfs) — those manifests remain the pod-spec
+  baseline; the chart vendors that shape on the router side (chart values),
+  the same boundary as the 25.1 compose configs. Regions publish their
+  contract to the router webhook (21.5) over the headless Service DNS name;
+  standalone SyncSage is unchanged. The live `helm template | kubeconform`
+  + kind smoke is a runbook in `subjective-retrieval/docs/DEPLOY.md` §12
+  (the router-repo build env had no helm binary).
 - Auth: regions accept a bearer token (`security` settings) minted by the
   router's tenancy layer; local/demo fleets may run open.
