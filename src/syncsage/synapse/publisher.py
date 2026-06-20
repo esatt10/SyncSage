@@ -275,7 +275,10 @@ class ContractPublisher:
             "vocabulary": self._vocabulary(),
             "axiom_projections": {},
         }
-        body["integrity"] = {"content_hash": _content_hash(body), "signature": None}
+        body["integrity"] = {
+            "content_hash": _content_hash(body),
+            "signature": self._signature_b64(body),
+        }
         return body
 
     def publish(self, *, generated_at: str | None = None) -> dict[str, Any]:
@@ -300,6 +303,22 @@ class ContractPublisher:
         return contract
 
     # -- contract blocks ---------------------------------------------
+
+    def _signature_b64(self, body: dict[str, Any]) -> str | None:
+        """Ed25519-sign the canonical body when ``synapse.signing_key_ref`` is set.
+
+        Returns ``None`` (unsigned) when no key ref is configured — the
+        long-standing standalone path. The signature covers the same bytes as
+        ``_content_hash`` so the router's ``verify_signature`` accepts it (the
+        cross-repo crypto parity guaranteed by the parity test).
+        """
+        ref = getattr(self.config.synapse, "signing_key_ref", None) or None
+        if ref is None:
+            return None
+        from syncsage.synapse.signing import resolve_signing_key_ref, sign_body
+
+        seed = resolve_signing_key_ref(ref)
+        return sign_body(body, seed)
 
     def _fleet_id(self) -> str | None:
         return getattr(self.config.synapse, "fleet_id", None) or None

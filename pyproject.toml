@@ -29,6 +29,10 @@ dependencies = [
 [project.optional-dependencies]
 mcp = ["mcp>=1.27,<2"]
 vector = ["lancedb>=0.6"]
+# Synapse 24.4: optional Ed25519 contract signing. Gated so a region that
+# never sets synapse.signing_key_ref needs no crypto dep and the offline
+# suite passes without it.
+a2a = ["cryptography>=42.0"]
 dev = ["pytest>=8.2", "pytest-asyncio>=0.23", "httpx>=0.27", "ruff>=0.5"]
 
 [project.scripts]

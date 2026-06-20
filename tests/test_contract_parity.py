@@ -20,6 +20,7 @@ REPO = Path(__file__).resolve().parents[1]
 CONTRACTS = REPO / "contracts"
 SCHEMA = CONTRACTS / "semantic_contract.v1.schema.json"
 FIXTURE = CONTRACTS / "fixtures" / "demo-region.v1.contract.json"
+SIGNED_FIXTURE = CONTRACTS / "fixtures" / "signed-demo-region.v1.contract.json"
 PARITY = CONTRACTS / "PARITY.json"
 
 
@@ -30,6 +31,7 @@ def _sha256(path: Path) -> str:
 def test_vendored_files_exist() -> None:
     assert SCHEMA.is_file()
     assert FIXTURE.is_file()
+    assert SIGNED_FIXTURE.is_file()
     assert PARITY.is_file()
 
 
@@ -37,6 +39,7 @@ def test_vendored_hashes_match_parity_manifest() -> None:
     parity = json.loads(PARITY.read_text(encoding="utf-8"))
     assert _sha256(SCHEMA) == parity["semantic_contract.v1.schema.json"]
     assert _sha256(FIXTURE) == parity["fixtures/demo-region.v1.contract.json"]
+    assert _sha256(SIGNED_FIXTURE) == parity["fixtures/signed-demo-region.v1.contract.json"]
 
 
 def test_schema_shape() -> None:
@@ -82,4 +85,7 @@ def test_parity_with_sibling_subjective_retrieval_when_present() -> None:
     assert (
         sibling / "tests/fixtures/contracts/demo-region.v1.contract.json"
     ).read_bytes() == FIXTURE.read_bytes()
+    assert (
+        sibling / "tests/fixtures/contracts/signed-demo-region.v1.contract.json"
+    ).read_bytes() == SIGNED_FIXTURE.read_bytes()
     assert (sibling / "contracts/PARITY.json").read_bytes() == PARITY.read_bytes()

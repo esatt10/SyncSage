@@ -422,6 +422,34 @@ sync, can be backed up and restored byte-faithfully — with the standalone
 | Serving | `GET /contract` + MCP resource |
 | Push | `POST <router>/v1/synapse/events` on `sync.completed` |
 | Embedding-space pin | `search.embeddings.model` must equal the fleet pin or the router rejects the contract (HTTP 409) |
+| Signing (optional, Step 24.4) | `synapse.signing_key_ref` → `src/syncsage/synapse/signing.py` Ed25519-signs `integrity.signature`; router rejects (HTTP 403) under `require_signed` |
+
+### Step 24.4 — Ed25519-signed contracts + A2A (2026-06-20, [x-repo])
+
+A region can **optionally sign** its semantic contract so the router can verify
+authenticity/integrity beyond the `content_hash`:
+
+- **Config:** set `synapse.signing_key_ref` to a secret *reference*
+  (`env://NAME` or a bare env-var name). The referenced value is the base64 of a
+  32-byte raw Ed25519 private seed — the plaintext key never lands in YAML or on
+  disk. **Unset (default) → unsigned** (`integrity.signature: null`); a
+  **standalone, router-less SyncSage is entirely unchanged**.
+- **What gets signed:** the *exact same canonical body bytes* the
+  `integrity.content_hash` covers (body with `integrity` excluded,
+  `sort_keys=True`, compact separators, `ensure_ascii=False`). The signature
+  lives outside the hashed body, so signing never perturbs the content hash.
+  `src/syncsage/synapse/signing.py` (`sign_body`/`signing_bytes`) is the
+  region-side codec; it is byte-compatible with the router's
+  `SemanticContract.verify_signature`, guarded by the cross-repo signing-parity
+  fixture `contracts/fixtures/signed-demo-region.v1.contract.json` (+ PARITY).
+- **Out-of-band public key (decision):** the router holds the kb_id→public-key
+  trust store in *its own* config (`synapse.trust.keys`) and enforces
+  `synapse.require_signed`. The public key is **not** added to the contract, so
+  the **contract wire format / vendored JSON Schema are unchanged** — no
+  schema-version bump, no re-vendor.
+- **Optional dependency:** the `cryptography` import is gated behind the new
+  `[a2a]` extra (`pip install 'syncsage[a2a]'`). A region without
+  `signing_key_ref` needs no crypto dep; the offline suite passes without it.
 
 ## 4. Deployment notes
 

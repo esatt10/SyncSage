@@ -224,6 +224,14 @@ class SynapseSettings(ModelMixin):
     fleet_id: str | None = None
     endpoint: str | None = None
     webhook_timeout_seconds: float = 5.0
+    # Synapse 24.4: optional Ed25519 contract signing. ``signing_key_ref`` is a
+    # secret *reference* (``env://NAME`` or a bare env-var name) resolving to a
+    # base64 32-byte Ed25519 private seed — the plaintext key never lands in the
+    # config or on disk. When unset (default) the contract's
+    # ``integrity.signature`` stays ``null`` and a standalone SyncSage is
+    # unchanged. The router verifies the signature against an out-of-band public
+    # key when its fleet sets ``require_signed: true``.
+    signing_key_ref: str | None = None
 
 
 @dataclass

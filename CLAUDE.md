@@ -166,6 +166,26 @@ docker compose up                          # container + optional UI sidecar
 lives in the sibling subjective-retrieval repo (Phase 22 finish — Step 22.5 —
 plus Phases 23–26).
 
+**Step 24.4 (A2A + Ed25519-signed contracts) landed here 2026-06-20 [x-repo].**
+The publisher now **optionally signs** the contract's `integrity.signature`
+(Ed25519) when `synapse.signing_key_ref` is set (a secret *reference* —
+`env://NAME` or a bare env var name — resolving to a base64 32-byte Ed25519
+seed; the plaintext key never lands in config or on disk). Unset → unsigned,
+`integrity.signature: null`, and a **standalone SyncSage is unchanged**. New
+`src/syncsage/synapse/signing.py` (`sign_body`/`signing_bytes`/`content_hash`/
+`resolve_signing_key_ref`/`public_key_b64`); the `cryptography` import is gated
+behind the new optional **`[a2a]` extra** (a region without `signing_key_ref`
+needs no crypto dep; offline tests `importorskip("cryptography")`). The
+signature covers byte-identical canonical body bytes to `_content_hash`, so the
+router's `SemanticContract.verify_signature` accepts it — **out-of-band public
+key** decision: the router carries the kb_id→pubkey trust store in *its* config,
+so the contract wire format / vendored schema are **unchanged** (no re-vendor;
+schema export asserted byte-identical in SR). A new vendored
+`contracts/fixtures/signed-demo-region.v1.contract.json` (+ PARITY.json sha256
+both repos) is the cross-repo signing-parity guard
+(`tests/test_contract_signing.py` + `tests/test_contract_parity.py`). Suite:
+**128 passed** (+7).
+
 Full step contracts with acceptance criteria: `docs/SYNAPSE_INTEGRATION.md` §2.
 
 | Step | What | Fixes | Status |
