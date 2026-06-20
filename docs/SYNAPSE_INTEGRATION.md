@@ -456,8 +456,19 @@ authenticity/integrity beyond the `content_hash`:
 A region remains the existing container (`Dockerfile`, port 8765, PVC on
 `/state`). In a Synapse fleet:
 
-- **Compose** (Synapse Step 25.1, other repo): N syncsage services + 1
-  router; each region gets `synapse.router_url` pointing at the router.
+- **Compose** (Synapse Step 25.1, **landed 2026-06-20** in the router repo):
+  the `docker compose --profile synapse` topology runs 1 router + 3 demo
+  syncsage regions, each with `synapse.publish: true` +
+  `synapse.router_url` → the router. **No SyncSage code change** was needed:
+  the region image is built unmodified from this repo's `Dockerfile` (sibling
+  build context `../SyncSage`, or `SYNCSAGE_IMAGE` pinned tag), and the three
+  fleet-demo region configs + fixture workspaces are **vendored on the router
+  side** (`subjective-retrieval/deploy/synapse-demo/`) and mounted into the
+  container at `/config/syncsage.yaml` + `/workspace`. Regions sync on startup
+  (21.1) and publish their contract over the 21.5 webhook; the router's
+  file-backed registry fills over HTTP (no shared volume). Standalone SyncSage
+  is unchanged — drop `synapse.publish`/`router_url` and the region is
+  router-less again. See `subjective-retrieval/docs/DEPLOY.md` §11.
 - **Kubernetes** (Step 25.2): one StatefulSet + PVC + headless Service
   per region, rendered from the router repo's Helm chart `regions:`
   values; this repo's `deploy/kubernetes/` manifests are the pod-spec
