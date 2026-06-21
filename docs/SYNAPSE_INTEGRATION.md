@@ -1,4 +1,26 @@
-# Synapse Integration — SyncSage as a Brain Region
+# SyncSage as a Synapse region
+
+!!! abstract "For consumers — start here"
+    SyncSage can act as a **region** in a **Synapse** fleet: it publishes a
+    bounded **semantic contract** describing what it knows, and a Synapse
+    router uses that contract to route global, cross-region queries to it.
+
+    - **Want to attach your KB to a fleet?** Read the task-focused guide:
+      [Attach to a Synapse fleet](how-to/attach-to-synapse.md). That's all most
+      consumers need.
+    - **Standalone is the default.** Every Synapse setting is off unless you opt
+      in via the `synapse:` config block; a router-less SyncSage is unchanged.
+    - **The global search experience** (routing, fan-out, merge, cross-region
+      "white matter") lives on the router —
+      [subjective-retrieval](https://github.com/esatt10/subjective-retrieval).
+
+    Everything **below this box is the internal, contributor-facing spec**: the
+    region-side contract obligations and the Phase-21 region-hardening step
+    contracts. Consumers can safely stop here.
+
+---
+
+## Internal spec — SyncSage as a Brain Region
 
 **Status:** authoritative SyncSage-side spec (2026-06-10). The system-wide
 design lives in the **subjective-retrieval** repository:
