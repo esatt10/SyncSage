@@ -8,6 +8,10 @@ DOCUMENT_EXTENSIONS = {".pdf", ".docx"}
 # (see syncsage.ingestion.captioner). The caption flows through the normal
 # chunk -> embed -> graph path; the artifact type is "image".
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+# Synapse 25.4 (session B): audio is ingested by transcribing it into text
+# (see syncsage.ingestion.transcriber). The transcript flows through the normal
+# chunk -> embed -> graph path; the artifact type is "audio".
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
 
 
 def artifact_type(path: Path) -> str:
@@ -17,4 +21,6 @@ def artifact_type(path: Path) -> str:
         return "document"
     if path.suffix.lower() in IMAGE_EXTENSIONS:
         return "image"
+    if path.suffix.lower() in AUDIO_EXTENSIONS:
+        return "audio"
     return "file"

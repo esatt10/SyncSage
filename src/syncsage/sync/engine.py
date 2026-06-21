@@ -11,6 +11,7 @@ from syncsage.config.schema import SourceConfig, SyncSageConfig
 from syncsage.graph.builder import GraphBuilder
 from syncsage.ingestion.captioner import captioner_from_config
 from syncsage.ingestion.pipeline import git_state, parse_connector_payload, utc_now
+from syncsage.ingestion.transcriber import transcriber_from_config
 from syncsage.persistence.graph_store import GraphStore
 from syncsage.persistence.manifest import ManifestStore
 from syncsage.persistence.paths import StatePaths
@@ -94,6 +95,10 @@ class SyncEngine:
         # captioning network call possible). Default provider is the offline
         # deterministic stub.
         self.captioner = captioner_from_config(config)
+        # Multi-modal audio ingestion (Synapse 25.4 session B): None unless a
+        # source's include globs admit audio extensions — same opt-in,
+        # zero-network-when-absent contract as the image captioner above.
+        self.transcriber = transcriber_from_config(config)
         # Synapse 21.5: contract publisher + NDJSON event stream. The event
         # log is always written (local, useful standalone); contract
         # publication + the router webhook are gated by synapse.publish /
@@ -186,7 +191,12 @@ class SyncEngine:
                     continue
                 fetched += 1
                 parsed = parse_connector_payload(
-                    source, item, payload, git_metadata, captioner=self.captioner
+                    source,
+                    item,
+                    payload,
+                    git_metadata,
+                    captioner=self.captioner,
+                    transcriber=self.transcriber,
                 )
                 if parsed is None:
                     continue

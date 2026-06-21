@@ -38,13 +38,15 @@ embedder gets (21.4).
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from urllib.request import Request, urlopen
+
+from syncsage.ingestion._modal import sidecar_text as _sidecar_text
+from syncsage.ingestion._modal import stub_fingerprint
 
 if TYPE_CHECKING:
     from syncsage.config.schema import CaptionerSettings
@@ -75,13 +77,6 @@ class Captioner(Protocol):
     def caption(self, content: bytes, relative_path: str) -> str: ...
 
 
-def _sidecar_text(relative_path: str, sidecar: bytes | None) -> str | None:
-    if sidecar is None:
-        return None
-    text = sidecar.decode("utf-8", errors="ignore").strip()
-    return text or None
-
-
 class StubCaptioner:
     """Deterministic, offline captioner for tests and demos.
 
@@ -98,11 +93,11 @@ class StubCaptioner:
 
     def caption(self, content: bytes, relative_path: str, sidecar: bytes | None = None) -> str:
         self.calls += 1
-        authored = _sidecar_text(relative_path, sidecar)
+        authored = _sidecar_text(sidecar)
         if authored is not None:
             return authored
         name = Path(relative_path).stem.replace("_", " ").replace("-", " ").strip()
-        digest = hashlib.blake2b(content, digest_size=6).hexdigest()
+        digest = stub_fingerprint(content)
         return f"Image {name} (visual content, fingerprint {digest})."
 
 
@@ -134,7 +129,7 @@ class OpenAISpecVisionCaptioner:
         self.calls = 0
 
     def caption(self, content: bytes, relative_path: str, sidecar: bytes | None = None) -> str:
-        authored = _sidecar_text(relative_path, sidecar)
+        authored = _sidecar_text(sidecar)
         if authored is not None:
             return authored
         mime = _IMAGE_MIME.get(Path(relative_path).suffix.lower(), "image/png")

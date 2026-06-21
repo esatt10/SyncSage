@@ -494,6 +494,54 @@ is session B.**
   no captioner; contract advertises `image`). Router-filter test on the SR side
   (`tests/synapse/test_router.py::test_modality_image_routes_only_to_image_capable_regions`).
 
+### Step 25.4 session B — multi-modal: audio ingest (2026-06-21, [x-repo]) — COMPLETES Step 25.4 + Phase 25
+
+A region can ingest **audio** (`.wav`/`.mp3`/`.m4a`/`.flac`/`.ogg`) by
+**transcribing** it into indexable text — the audio twin of session A's image
+captioning, same architecture §8 principle (project into the *one* fleet-pinned
+text embedding space; modality-native audio vectors stay region-local, out of
+scope). The transcript becomes the artifact's text and flows through the normal
+chunk → embed → graph path. The transcriber and captioner share a tiny additive
+helper `src/syncsage/ingestion/_modal.py` (`sidecar_text` + `stub_fingerprint`)
+so they stay in lock-step; session A's observable behavior is unchanged.
+
+- **Transcriber abstraction:** `src/syncsage/ingestion/transcriber.py`.
+  `StubTranscriber` is the **default + offline** path (deterministic transcript
+  from the file name + a blake2b digest of the audio bytes — same file always
+  transcribes identically, different audio differs; tests use it, **no network /
+  no audio decoder / no ASR model / no audio library**). `OpenAISpecTranscriber`
+  is the gated production path — OpenAI-spec `POST {base_url}/audio/transcriptions`
+  as a stdlib-urllib multipart upload (`model` + raw `file` bytes), transcript
+  read from the response `text` field. An authored sidecar
+  `<audio>.transcript.txt` always wins (offline real transcripts for
+  fixtures/demos). Transcription is a sanctioned indexing-path network call
+  alongside the 21.4 embedder and the 25.4A captioner, and like them keeps the
+  stub path so the suite is network-free.
+- **Config:** `ingestion.transcriber.{provider,model,base_url,api_key_env}` —
+  `provider: stub` (default; `model: whisper-1`) or `openai-spec`. The API key is
+  read from the named env var at call time, never stored. The transcriber is
+  **only built when a source's `include` globs admit an audio extension** (e.g.
+  `**/*.wav`), so a text-only / standalone region is byte-identical to pre-25.4
+  (no transcriber, no possible network call). The `stub` default needs **no
+  extra dependency**.
+- **Idempotency:** the engine's pre-read sha256 skip (`_can_skip_before_read`)
+  compares the audio's content hash *before* reading bytes, so an unchanged audio
+  file in an incremental sync is **never re-transcribed** — the same zero-work
+  guarantee the embedder (21.4) and image captioner (25.4A) get.
+- **Modalities wiring (contract):** the 21.5 publisher's `_capabilities()`
+  appends `"audio"` to `capabilities.modalities` when an audio source is
+  configured. The router (subjective-retrieval) already filters by
+  `--modality audio` *before* scoring (22.1), so an audio query routes only to
+  audio-capable regions. **`modalities` is existing contract data — the wire
+  format / vendored JSON Schema are UNCHANGED** (no schema bump, no re-vendor,
+  parity test green).
+- **Tests:** `tests/test_audio_ingestion.py` (transcript searchable; artifact
+  typed `audio`; zero re-transcribe on unchanged re-sync; text-only region builds
+  no transcriber; contract advertises `audio`); fixture
+  `tests/fixtures/sample_workspace/audio/briefing.wav` + `.transcript.txt`
+  sidecar (a few bytes, no real decoder). Router-filter test on the SR side
+  (`tests/synapse/test_router.py::test_modality_audio_routes_only_to_audio_capable_regions`).
+
 ## 4. Deployment notes
 
 A region remains the existing container (`Dockerfile`, port 8765, PVC on

@@ -349,10 +349,16 @@ class ContractPublisher:
         # carry no modality-native contract vector — they are projected into
         # the one text embedding space (architecture §8).
         from syncsage.ingestion.captioner import config_has_image_source
+        from syncsage.ingestion.transcriber import config_has_audio_source
 
         modalities = ["text", "code"]
         if config_has_image_source(self.config):
             modalities.append("image")
+        # Synapse 25.4 (session B): advertise "audio" when a source is
+        # configured to ingest audio (transcribed into the same text space), so
+        # the router's `--modality audio` filter selects this region.
+        if config_has_audio_source(self.config):
+            modalities.append("audio")
         return {
             "search_modes": search_modes,
             "granularities": ["summaries", "chunks", "graph"],

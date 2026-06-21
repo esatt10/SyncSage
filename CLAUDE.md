@@ -208,8 +208,33 @@ when an image source is configured, so the router's `--modality image` filter
 data → wire format / vendored schema UNCHANGED** (no schema bump, no re-vendor,
 parity test green). Tiny PNG fixture +
 `tests/fixtures/sample_workspace/images/diagram.png.caption.txt`;
-`tests/test_image_ingestion.py`. Suite: **135 passed** (+7). **Session B (audio,
-transcribe-then-index) is pending.**
+`tests/test_image_ingestion.py`. Suite: **135 passed** (+7).
+
+**Step 25.4 session B (multi-modal: AUDIO ingest) landed here 2026-06-21 [x-repo] —
+COMPLETES Step 25.4 and Phase 25.** A region ingests audio
+(`.wav/.mp3/.m4a/.flac/.ogg`) by **transcribing** it into indexable text that
+flows through the normal chunk→embed→graph path — the audio twin of session A's
+image captioning (architecture §8: project into the *one* fleet-pinned text
+space). New `src/syncsage/ingestion/transcriber.py`: `StubTranscriber`
+(deterministic, offline, **default** — transcript = template over file name +
+blake2b digest of bytes; an authored `<audio>.transcript.txt` sidecar wins;
+**no network / no audio decoder / no ASR model / no audio library**) +
+`OpenAISpecTranscriber` (gated — OpenAI-spec `POST {base_url}/audio/transcriptions`
+stdlib-urllib multipart upload, transcript from response `text`). A tiny additive
+helper `src/syncsage/ingestion/_modal.py` (`sidecar_text` + `stub_fingerprint`)
+now backs both the captioner and the transcriber (session A behavior unchanged).
+Config `ingestion.transcriber.{provider,model,base_url,api_key_env}`
+(`stub`|`openai-spec`, default `whisper-1`); the transcriber is **only built
+when a source's `include` globs admit an audio extension**, so a text-only /
+standalone region is byte-identical to pre-25.4. **Idempotent:** the engine's
+pre-read sha256 skip never re-transcribes an unchanged audio file (zero-work,
+like 21.4's zero re-embed). The 21.5 publisher's `_capabilities()` appends
+`"audio"` to `capabilities.modalities` when an audio source is configured, so the
+router's `--modality audio` filter (22.1) routes only to audio-capable regions.
+**`modalities` is existing contract data → wire format / vendored schema
+UNCHANGED** (no schema bump, no re-vendor, parity test green). Tiny WAV fixture +
+`tests/fixtures/sample_workspace/audio/briefing.wav.transcript.txt`;
+`tests/test_audio_ingestion.py`. Suite: **142 passed** (+7). **Phase 25 complete.**
 
 Full step contracts with acceptance criteria: `docs/SYNAPSE_INTEGRATION.md` §2.
 

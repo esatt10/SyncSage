@@ -183,15 +183,37 @@ class CaptionerSettings(ModelMixin):
 
 
 @dataclass
+class TranscriberSettings(ModelMixin):
+    """Audio transcriber for multi-modal ingestion (Synapse 25.4 session B).
+
+    When an audio source is configured, audio files are transcribed into text
+    that flows through the normal chunk -> embed -> graph path (architecture
+    §8). ``provider`` is ``stub`` (default; deterministic + offline, the only
+    path used by tests — no audio library required) or ``openai-spec`` (POST
+    {base_url}/audio/transcriptions, a multipart upload to a speech-to-text
+    model). The API key is read from the environment variable named by
+    ``api_key_env`` and never stored. A sidecar ``<audio>.transcript.txt``
+    always wins, providing an authored transcript with no model or network.
+    """
+
+    provider: str = "stub"
+    model: str = "whisper-1"
+    base_url: str = "https://api.openai.com/v1"
+    api_key_env: str = "OPENAI_API_KEY"
+
+
+@dataclass
 class IngestionSettings(ModelMixin):
     """Ingestion-path enrichment knobs. Standalone-safe defaults.
 
-    ``captioner`` only takes effect for sources that include image files; a
-    text-only region never builds it (and the default ``stub`` provider needs
-    no extra dependency anyway).
+    ``captioner`` only takes effect for sources that include image files and
+    ``transcriber`` only for sources that include audio files; a text-only
+    region never builds either (and the default ``stub`` providers need no
+    extra dependency anyway).
     """
 
     captioner: CaptionerSettings = field(default_factory=CaptionerSettings)
+    transcriber: TranscriberSettings = field(default_factory=TranscriberSettings)
 
 
 @dataclass
@@ -389,6 +411,8 @@ class SyncSageConfig(ModelMixin):
             if dc is IngestionSettings:
                 if "captioner" in raw and isinstance(raw["captioner"], dict):
                     raw["captioner"] = build(CaptionerSettings, raw["captioner"])
+                if "transcriber" in raw and isinstance(raw["transcriber"], dict):
+                    raw["transcriber"] = build(TranscriberSettings, raw["transcriber"])
             if dc is SyncSettings:
                 if "watcher" in raw and isinstance(raw["watcher"], dict):
                     raw["watcher"] = build(WatcherSettings, raw["watcher"])
