@@ -186,6 +186,31 @@ both repos) is the cross-repo signing-parity guard
 (`tests/test_contract_signing.py` + `tests/test_contract_parity.py`). Suite:
 **128 passed** (+7).
 
+**Step 25.4 session A (multi-modal: IMAGE ingest) landed here 2026-06-21 [x-repo].**
+A region ingests images (`.png/.jpg/.jpeg/.webp/.gif`) by **captioning** them
+into indexable text that flows through the normal chunk→embed→graph path
+(architecture §8: project into the *one* fleet-pinned text space; CLIP-style
+modality-native vectors stay region-local, out of scope). New
+`src/syncsage/ingestion/captioner.py`: `StubCaptioner` (deterministic, offline,
+**default** — caption = template over file name + blake2b digest of bytes; an
+authored `<image>.caption.txt` sidecar wins) + `OpenAISpecVisionCaptioner`
+(gated — OpenAI-spec `chat/completions` with an `image_url` part). Captioning is
+the only sanctioned indexing-path network call besides the 21.4 embedder and
+keeps the stub path (tests network-free). Config
+`ingestion.captioner.{provider,model,base_url,api_key_env,prompt}`
+(`stub`|`openai-spec`); the captioner is **only built when a source's `include`
+globs admit an image extension**, so a text-only / standalone region is
+byte-identical to pre-25.4. **Idempotent:** the engine's pre-read sha256 skip
+never re-captions an unchanged image (zero-work, like 21.4's zero re-embed). The
+21.5 publisher's `_capabilities()` appends `"image"` to `capabilities.modalities`
+when an image source is configured, so the router's `--modality image` filter
+(22.1) routes only to image-capable regions. **`modalities` is existing contract
+data → wire format / vendored schema UNCHANGED** (no schema bump, no re-vendor,
+parity test green). Tiny PNG fixture +
+`tests/fixtures/sample_workspace/images/diagram.png.caption.txt`;
+`tests/test_image_ingestion.py`. Suite: **135 passed** (+7). **Session B (audio,
+transcribe-then-index) is pending.**
+
 Full step contracts with acceptance criteria: `docs/SYNAPSE_INTEGRATION.md` §2.
 
 | Step | What | Fixes | Status |

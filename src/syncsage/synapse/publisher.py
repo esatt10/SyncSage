@@ -343,10 +343,20 @@ class ContractPublisher:
         search_modes = ["text", "graph", "hybrid"]
         if vector_on:
             search_modes.append("vector")
+        # Synapse 25.4 (session A): advertise "image" when a source is
+        # configured to ingest images (captioned into the same text space), so
+        # the router's `--modality image` filter selects this region. Images
+        # carry no modality-native contract vector — they are projected into
+        # the one text embedding space (architecture §8).
+        from syncsage.ingestion.captioner import config_has_image_source
+
+        modalities = ["text", "code"]
+        if config_has_image_source(self.config):
+            modalities.append("image")
         return {
             "search_modes": search_modes,
             "granularities": ["summaries", "chunks", "graph"],
-            "modalities": ["text", "code"],
+            "modalities": modalities,
             "returns_vectors": bool(vector_on),
             "auth": "none",
             "api_version": "v1",

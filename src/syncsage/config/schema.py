@@ -162,6 +162,39 @@ class SearchSettings(ModelMixin):
 
 
 @dataclass
+class CaptionerSettings(ModelMixin):
+    """Image captioner for multi-modal ingestion (Synapse 25.4 session A).
+
+    When an image source is configured, image files are captioned into text
+    that flows through the normal chunk -> embed -> graph path (architecture
+    §8). ``provider`` is ``stub`` (default; deterministic + offline, the only
+    path used by tests) or ``openai-spec`` (POST {base_url}/chat/completions
+    with an ``image_url`` content part — a vision-capable chat model). The API
+    key is read from the environment variable named by ``api_key_env`` and
+    never stored. A sidecar ``<image>.caption.txt`` always wins, providing an
+    authored caption with no model or network.
+    """
+
+    provider: str = "stub"
+    model: str = "gpt-4o-mini"
+    base_url: str = "https://api.openai.com/v1"
+    api_key_env: str = "OPENAI_API_KEY"
+    prompt: str = "Describe this image in one concise sentence for search indexing."
+
+
+@dataclass
+class IngestionSettings(ModelMixin):
+    """Ingestion-path enrichment knobs. Standalone-safe defaults.
+
+    ``captioner`` only takes effect for sources that include image files; a
+    text-only region never builds it (and the default ``stub`` provider needs
+    no extra dependency anyway).
+    """
+
+    captioner: CaptionerSettings = field(default_factory=CaptionerSettings)
+
+
+@dataclass
 class WatcherSettings(ModelMixin):
     enabled: bool = True
     max_watch_paths: int = 100
@@ -314,6 +347,7 @@ class SyncSageConfig(ModelMixin):
     server: ServerSettings = field(default_factory=ServerSettings)
     storage: StorageSettings = field(default_factory=StorageSettings)
     search: SearchSettings = field(default_factory=SearchSettings)
+    ingestion: IngestionSettings = field(default_factory=IngestionSettings)
     sync: SyncSettings = field(default_factory=SyncSettings)
     obsidian: ObsidianSettings = field(default_factory=ObsidianSettings)
     security: SecuritySettings = field(default_factory=SecuritySettings)
@@ -352,6 +386,9 @@ class SyncSageConfig(ModelMixin):
                     raw["embeddings"] = build(EmbeddingsSettings, raw["embeddings"])
                 if "vector_store" in raw and isinstance(raw["vector_store"], dict):
                     raw["vector_store"] = build(VectorStoreSettings, raw["vector_store"])
+            if dc is IngestionSettings:
+                if "captioner" in raw and isinstance(raw["captioner"], dict):
+                    raw["captioner"] = build(CaptionerSettings, raw["captioner"])
             if dc is SyncSettings:
                 if "watcher" in raw and isinstance(raw["watcher"], dict):
                     raw["watcher"] = build(WatcherSettings, raw["watcher"])
@@ -366,6 +403,7 @@ class SyncSageConfig(ModelMixin):
             server=build(ServerSettings, data.get("server")),
             storage=build(StorageSettings, data.get("storage")),
             search=build(SearchSettings, data.get("search")),
+            ingestion=build(IngestionSettings, data.get("ingestion")),
             sync=build(SyncSettings, data.get("sync")),
             obsidian=build(ObsidianSettings, data.get("obsidian")),
             security=build(SecuritySettings, data.get("security")),

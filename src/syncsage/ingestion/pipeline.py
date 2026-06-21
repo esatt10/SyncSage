@@ -11,10 +11,13 @@ from typing import TYPE_CHECKING
 
 from syncsage.config.schema import SourceConfig
 from syncsage.ingestion.chunking import TextChunk, chunk_text
-from syncsage.ingestion.content_types import TEXT_EXTENSIONS, artifact_type
+from syncsage.ingestion.content_types import IMAGE_EXTENSIONS, TEXT_EXTENSIONS, artifact_type
 
 if TYPE_CHECKING:
+    from syncsage.ingestion.captioner import Captioner
     from syncsage.sync.connectors import ConnectorItem, ConnectorPayload
+
+CAPTION_SIDECAR_SUFFIX = ".caption.txt"
 
 
 @dataclass(frozen=True)
@@ -133,12 +136,45 @@ def chunks_for_source(source: SourceConfig, text: str) -> list[TextChunk]:
     return chunk_text(text, source.chunking.max_chars, source.chunking.overlap_chars)
 
 
+def _sidecar_for_path(path: Path) -> bytes | None:
+    sidecar = path.with_name(path.name + CAPTION_SIDECAR_SUFFIX)
+    try:
+        return sidecar.read_bytes()
+    except OSError:
+        return None
+
+
+def caption_to_text(
+    captioner: Captioner | None,
+    content: bytes,
+    relative_path: str,
+    sidecar: bytes | None,
+) -> str:
+    """Caption image bytes into indexable text (architecture §8).
+
+    With no captioner configured we fall back to the file name so an
+    image-bearing source still produces *some* deterministic indexable text
+    rather than an empty (skipped) artifact.
+    """
+
+    if captioner is None:
+        stem = Path(relative_path).stem.replace("_", " ").replace("-", " ").strip()
+        return f"Image {stem}." if stem else "Image."
+    try:
+        return captioner.caption(content, relative_path, sidecar=sidecar)  # type: ignore[call-arg]
+    except TypeError:
+        # A captioner without the optional ``sidecar`` kwarg (duck-typed).
+        return captioner.caption(content, relative_path)
+
+
 def parse_file(
     source: SourceConfig,
     path: Path,
     git_metadata: tuple[str | None, str | None, bool] | None = None,
+    captioner: Captioner | None = None,
 ) -> ParsedArtifact | None:
-    if path.suffix.lower() not in TEXT_EXTENSIONS | {".pdf", ".docx"}:
+    suffix = path.suffix.lower()
+    if suffix not in TEXT_EXTENSIONS | {".pdf", ".docx"} | IMAGE_EXTENSIONS:
         return None
     root = source.path if source.path.is_dir() else source.path.parent
     relative = path.relative_to(root).as_posix()
@@ -150,7 +186,10 @@ def parse_file(
         if source.type.value == "repository"
         else (None, None, False)
     )
-    text = read_text(path)
+    if suffix in IMAGE_EXTENSIONS:
+        text = caption_to_text(captioner, path.read_bytes(), relative, _sidecar_for_path(path))
+    else:
+        text = read_text(path)
     chunks = chunks_for_source(source, text)
     stat = path.stat()
     artifact_id = f"file:{source.name}:{relative}:branch={branch or 'none'}"
@@ -178,10 +217,16 @@ def parse_connector_payload(
     item: ConnectorItem,
     payload: ConnectorPayload,
     git_metadata: tuple[str | None, str | None, bool] | None = None,
+    captioner: Captioner | None = None,
 ) -> ParsedArtifact | None:
     suffix = Path(item.relative_path).suffix.lower()
     mime_type = payload.mime_type or item.mime_type
-    if suffix not in TEXT_EXTENSIONS | {".pdf", ".docx"} and not _is_text_like(mime_type):
+    is_image = suffix in IMAGE_EXTENSIONS
+    if (
+        suffix not in TEXT_EXTENSIONS | {".pdf", ".docx"}
+        and not is_image
+        and not _is_text_like(mime_type)
+    ):
         return None
     branch, commit, _dirty = (
         git_metadata
@@ -191,7 +236,15 @@ def parse_connector_payload(
         else (None, None, False)
     )
     content_hash = payload.sha256 or item.sha256 or sha256_bytes(payload.content)
-    text = read_text_bytes(payload.content, item.relative_path)
+    if is_image:
+        text = caption_to_text(
+            captioner,
+            payload.content,
+            item.relative_path,
+            _sidecar_for_payload(payload),
+        )
+    else:
+        text = read_text_bytes(payload.content, item.relative_path)
     chunks = chunks_for_source(source, text)
     artifact_id = f"file:{source.name}:{item.relative_path}:branch={branch or 'none'}"
     return ParsedArtifact(
@@ -208,6 +261,15 @@ def parse_connector_payload(
         git_commit=commit,
         chunks=chunks,
     )
+
+
+def _sidecar_for_payload(payload: ConnectorPayload) -> bytes | None:
+    """Read an authored ``<image>.caption.txt`` sidecar for a filesystem payload."""
+
+    path = payload.metadata.get("path")
+    if not path:
+        return None
+    return _sidecar_for_path(Path(path))
 
 
 def _is_text_like(mime_type: str | None) -> bool:

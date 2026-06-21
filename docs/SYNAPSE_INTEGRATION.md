@@ -451,6 +451,49 @@ authenticity/integrity beyond the `content_hash`:
   `[a2a]` extra (`pip install 'syncsage[a2a]'`). A region without
   `signing_key_ref` needs no crypto dep; the offline suite passes without it.
 
+### Step 25.4 session A — multi-modal: image ingest (2026-06-21, [x-repo])
+
+A region can ingest **images** (`.png`/`.jpg`/`.jpeg`/`.webp`/`.gif`) by
+**captioning** them into indexable text (architecture §8: project everything
+into the *one* fleet-pinned text embedding space; modality-native vectors like
+CLIP would stay region-local and are out of scope). The caption becomes the
+artifact's text and flows through the normal chunk → embed → graph path like
+any other document. **Image only this session — audio (transcribe-then-index)
+is session B.**
+
+- **Captioner abstraction:** `src/syncsage/ingestion/captioner.py`.
+  `StubCaptioner` is the **default + offline** path (deterministic caption from
+  the file name + a blake2b digest of the image bytes, so the same image always
+  captions identically and different images differ; tests use it, no network /
+  no decoder / no model). `OpenAISpecVisionCaptioner` is the gated production
+  path — OpenAI-spec `POST {base_url}/chat/completions` with an `image_url`
+  content part (data-URI base64), caption read from
+  `choices[0].message.content`. An authored sidecar `<image>.caption.txt`
+  always wins (offline real captions for fixtures/demos). Captioning is the
+  **only** sanctioned indexing-path network call besides the 21.4 embedder, and
+  like it must keep the stub path.
+- **Config:** `ingestion.captioner.{provider,model,base_url,api_key_env,prompt}`
+  — `provider: stub` (default) or `openai-spec`. The API key is read from the
+  named env var at call time, never stored. The captioner is **only built when
+  a source's `include` globs admit an image extension** (e.g. `**/*.png`), so a
+  text-only region is byte-identical to pre-25.4 (no captioner, no possible
+  network call). The `stub` default needs no extra dependency.
+- **Idempotency:** the engine's pre-read sha256 skip
+  (`_can_skip_before_read`) compares the image's content hash *before* reading
+  bytes, so an unchanged image in an incremental sync is **never re-captioned**
+  — the same zero-work guarantee the embedder gets (21.4).
+- **Modalities wiring (contract):** the 21.5 publisher's `_capabilities()`
+  appends `"image"` to `capabilities.modalities` when an image source is
+  configured. The router (subjective-retrieval) already filters by
+  `--modality image` *before* scoring (22.1), so an image query routes only to
+  image-capable regions. **`modalities` is existing contract data — the wire
+  format / vendored JSON Schema are UNCHANGED** (no schema bump, no re-vendor,
+  parity test green).
+- **Tests:** `tests/test_image_ingestion.py` (caption searchable; artifact
+  typed `image`; zero re-caption on unchanged re-sync; text-only region builds
+  no captioner; contract advertises `image`). Router-filter test on the SR side
+  (`tests/synapse/test_router.py::test_modality_image_routes_only_to_image_capable_regions`).
+
 ## 4. Deployment notes
 
 A region remains the existing container (`Dockerfile`, port 8765, PVC on

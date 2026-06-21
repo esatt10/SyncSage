@@ -4,6 +4,10 @@ from pathlib import Path
 
 TEXT_EXTENSIONS = {".py", ".md", ".txt", ".yaml", ".yml", ".toml", ".json", ".html", ".xml", ".css", ".js", ".ts"}
 DOCUMENT_EXTENSIONS = {".pdf", ".docx"}
+# Synapse 25.4 (session A): images are ingested by captioning them into text
+# (see syncsage.ingestion.captioner). The caption flows through the normal
+# chunk -> embed -> graph path; the artifact type is "image".
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 
 def artifact_type(path: Path) -> str:
@@ -11,4 +15,6 @@ def artifact_type(path: Path) -> str:
         return "markdown_note"
     if path.suffix.lower() in DOCUMENT_EXTENSIONS:
         return "document"
+    if path.suffix.lower() in IMAGE_EXTENSIONS:
+        return "image"
     return "file"
