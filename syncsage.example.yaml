@@ -44,7 +44,6 @@ storage:
   graph_path: /state/graphs
   manifest_path: /state/manifests
   max_state_size_gb: 10
-    keep_event_days: 30
 
 search:
   default_mode: hybrid
