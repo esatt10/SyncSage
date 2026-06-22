@@ -5,6 +5,14 @@ sources — git repositories, folders, single files, Obsidian vaults, web
 collections, and experimental API/S3 sources — into a queryable **knowledge
 graph** with hybrid self-search, for both agents and humans.
 
+!!! tip "Part of the Synapse Suite"
+    SyncSage is the **region** component of **Synapse**, a federated
+    knowledge-base platform. New here, or want the whole-system view? Start at
+    the suite front door:
+    **[The Synapse Suite →](https://esatt10.github.io/subjective-retrieval/)**
+    (the [subjective-retrieval](https://github.com/esatt10/subjective-retrieval)
+    router site). This site is the region/KB half.
+
 It runs perfectly well **standalone**: point it at some sources, sync, and query
 over MCP or HTTP. It also has a **second role**: each SyncSage container can act
 as a federated **"brain region"** inside a **Synapse** fleet.
