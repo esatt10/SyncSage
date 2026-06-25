@@ -125,12 +125,15 @@ syncsage config show --effective --profile dev --config syncsage.yaml
 | `default_mode` | string | `hybrid` | Typical modes: keyword, path, graph, hybrid (implementation-dependent). |
 | `keyword.enabled` | bool | `true` (example) | Enables keyword index/query path. |
 | `keyword.engine` | string | `sqlite_fts5` (example) | Keyword backend engine. |
-| `embeddings.enabled` | bool | `false` (example) | Enables vector embedding generation/use. |
-| `embeddings.provider` | string | `local` (example) | Embedding provider identifier. |
-| `embeddings.model` | string | `sentence-transformers/all-MiniLM-L6-v2` (example) | Embedding model name. |
-| `vector_store.enabled` | bool | `false` (example) | Enables vector store. |
-| `vector_store.engine` | string | `chroma` (example) | Vector storage backend. |
-| `vector_store.path` | absolute path | `/state/vector` (example) | Vector index persistence path. |
+| `embeddings.enabled` | bool | `false` | Enables embed-on-sync + `mode=vector` self-search (Synapse 21.4). |
+| `embeddings.provider` | string | `openai-spec` | `openai-spec` (OpenAI-compatible HTTP endpoint) or `stub` (deterministic, offline). |
+| `embeddings.model` | string | `text-embedding-3-small` | Embedding model name (must match the Synapse fleet pin when federated). |
+| `embeddings.base_url` | string | `https://api.openai.com/v1` | OpenAI-spec endpoint base; `POST {base_url}/embeddings`. |
+| `embeddings.api_key_env` | string | `OPENAI_API_KEY` | Name of the env var holding the API key (key never lands in config/state). |
+| `embeddings.dimensions` | integer | `256` | Requested embedding dimensionality (sent as `dimensions` when set). |
+| `embeddings.batch_size` | integer | `64` | Texts per embedding HTTP request. |
+| `vector_store.provider` | string | `lancedb` | `lancedb` (optional `[vector]` extra) or `numpy` (always-available flat file). |
+| `vector_store.path` | absolute path | `<state>/vectors` | Vector index root; vectors live under `<path>/<kb_id>/`. Created only when embeddings are enabled. |
 | `ranking.prefer_exact_path_matches` | bool | `true` (example) | Boost exact path matches. |
 | `ranking.prefer_recent_commits` | bool | `true` (example) | Boost content tied to recent commits. |
 | `ranking.graph_neighbor_boost` | bool | `true` (example) | Boost graph-adjacent matches. |

@@ -238,7 +238,7 @@ def create_app(
     state.migrate()
     SourceRegistry(config, state).initialize()
     engine = SyncEngine(config, paths, state)
-    search = HybridSearch(SearchStore(state))
+    search = HybridSearch(SearchStore(state), vector=engine.vector_searcher())
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -318,6 +318,23 @@ def create_app(
     @app.get("/metrics")
     def metrics() -> str:
         return "syncsage_up 1\n"
+
+    @app.get("/contract")
+    def contract() -> dict:
+        """Return this region's published semantic contract (Synapse 21.5).
+
+        404 until a contract has been published (a sync with
+        ``synapse.publish`` on). Standalone regions that never enable
+        publishing simply always 404 here.
+        """
+        from syncsage.synapse.publisher import load_contract_text
+
+        text = load_contract_text(config.syncsage.state_path)
+        if text is None:
+            raise HTTPException(status_code=404, detail="No contract published yet")
+        import json as _json
+
+        return _json.loads(text)
 
     @app.get("/knowledge-bases")
     def knowledge_bases() -> dict:

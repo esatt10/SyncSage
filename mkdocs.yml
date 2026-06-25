@@ -1,0 +1,91 @@
+site_name: SyncSage
+site_description: >-
+  A Docker-first, local-first MCP context server that turns your sources into a
+  queryable knowledge graph — and attaches to a Synapse fleet as a federated region.
+site_url: https://esatt10.github.io/SyncSage/
+repo_url: https://github.com/esatt10/SyncSage
+repo_name: esatt10/SyncSage
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - navigation.footer
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Tutorials:
+      - 10-minute quickstart: tutorials/quickstart.md
+      - Multi-modal ingest (image + audio): tutorials/multimodal.md
+  - How-to guides:
+      - Configure sources: how-to/sources.md
+      - Multi-modal ingest: how-to/multimodal-ingest.md
+      - Vector self-search: how-to/vector-search.md
+      - Attach to a Synapse fleet: how-to/attach-to-synapse.md
+      - Backup & restore: how-to/backup-restore.md
+      - Obsidian integration: obsidian_integration.md
+      - MCP for agents: mcp_client.md
+  - Reference:
+      - Configuration: configuration.md
+      - Interface matrix: reference/interfaces.md
+      - HTTP API: reference/http-api.md
+      - MCP tools & resources: mcp_tools.md
+      - Graph model: graph_model.md
+      - Security: security.md
+      - Deployment: deployment.md
+  - Explanation:
+      - Architecture: architecture.md
+      - Troubleshooting: troubleshooting.md
+  - Contributor / internal:
+      - SyncSage as a Synapse region (internal spec): SYNAPSE_INTEGRATION.md
+      - Agentic workflows: agentic_workflows.md
+      - UI recommendation: ui_recommendation.md
+      - Gap analysis & plan: development_patches/gap_analysis_and_plan.md

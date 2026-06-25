@@ -231,3 +231,5 @@ __marimo__/
 
 # Obsidian
 .obsidian/
+# Synapse run summaries (framework convention: runs/ is local-only)
+runs/

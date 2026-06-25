@@ -4,6 +4,12 @@ SyncSage is a local-first MCP context server that turns project sources into a q
 
 The project is still an active prototype, but the current architecture is intentionally shaped around production concerns: connector boundaries, idempotent sync, persistent checkpoints, graph-derived search, runtime source lifecycle management, and inspectable configuration.
 
+> **Part of the [Synapse Suite](https://esatt10.github.io/subjective-retrieval/):** SyncSage is the *region* component of **Synapse** — a hyperfast federated knowledge-base system in which each SyncSage container is a self-searching "brain region" that publishes a **semantic contract**, and the [subjective-retrieval](https://github.com/esatt10/subjective-retrieval) router (the "nervous system") routes global queries across regions. The **suite front door** (whole-system view) is the [Synapse Suite site](https://esatt10.github.io/subjective-retrieval/); this repo is the region/KB half. Attaching to a fleet is opt-in and standalone-safe — see the consumer guide [Attach to a Synapse fleet](docs/how-to/attach-to-synapse.md). Region-side spec: `docs/SYNAPSE_INTEGRATION.md`; system design lives in the subjective-retrieval repo (`docs/SYNAPSE_ARCHITECTURE.md`).
+
+> **📖 Documentation site:** Full consumer docs (tutorials, how-to guides, reference, explanation) are published as a [MkDocs Material](https://www.mkdocs.org/) site — see the [Documentation](#documentation) section below. Build locally with `pip install -e ".[docs]" && mkdocs build --strict`.
+
+> **Multi-modal ingest:** SyncSage indexes **images** (`.png/.jpg/.jpeg/.webp/.gif`, captioned) and **audio** (`.wav/.mp3/.m4a/.flac/.ogg`, transcribed) alongside text. Both ship with a deterministic **offline stub** by default (no API keys, no model downloads) and support authored `.caption.txt`/`.transcript.txt` sidecars. See [Multi-modal ingest](docs/how-to/multimodal-ingest.md).
+
 ## What SyncSage Does
 
 - Ingests local and connector-backed sources through a `SourceConnector` abstraction.
@@ -313,8 +319,30 @@ python scripts/sync_version.py --check
 
 ## Documentation
 
+The full documentation is a [MkDocs Material](https://squidfunk.github.io/mkdocs-material/)
+site under [`docs/`](docs), organized Diátaxis-style (tutorials / how-to /
+reference / explanation). Build and serve it locally:
+
+```bash
+pip install -e ".[docs]"
+mkdocs serve          # live preview at http://localhost:8000
+mkdocs build --strict # produce ./site
+```
+
+It is published to GitHub Pages by `.github/workflows/docs.yml` on pushes to `main`.
+
+**Start here**
+
+- [Documentation home](docs/index.md)
+- Tutorials: [10-minute quickstart](docs/tutorials/quickstart.md) · [Multi-modal ingest](docs/tutorials/multimodal.md)
+- How-to: [Configure sources](docs/how-to/sources.md) · [Vector self-search](docs/how-to/vector-search.md) · [Attach to a Synapse fleet](docs/how-to/attach-to-synapse.md) · [Backup & restore](docs/how-to/backup-restore.md)
+
+**Reference & explanation**
+
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
+- [Interface matrix](docs/reference/interfaces.md)
+- [HTTP API](docs/reference/http-api.md)
 - [Graph model](docs/graph_model.md)
 - [MCP tools](docs/mcp_tools.md)
 - [MCP client setup](docs/mcp_client.md)
@@ -323,6 +351,7 @@ python scripts/sync_version.py --check
 - [Obsidian integration](docs/obsidian_integration.md)
 - [Security](docs/security.md)
 - [Troubleshooting](docs/troubleshooting.md)
+- [SyncSage as a Synapse region](docs/SYNAPSE_INTEGRATION.md)
 
 ## License
 

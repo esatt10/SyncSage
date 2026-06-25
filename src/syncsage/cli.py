@@ -1,7 +1,43 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+
+def _sync_services(engine, cfg):
+    """Build the watcher + scheduler pair sharing one sync serialization lock.
+
+    SyncEngine is not safe for concurrent syncs within a process, so both
+    background services funnel their sync calls through the same lock.
+    """
+    import threading
+
+    from syncsage.sync.scheduler import SchedulerService
+    from syncsage.sync.watcher import WatcherService
+
+    sync_lock = threading.Lock()
+    return (
+        WatcherService(engine, cfg, sync_lock=sync_lock),
+        SchedulerService(engine, cfg, sync_lock=sync_lock),
+    )
+
+
+def _serve_app(cfg, config_path: str) -> None:
+    import uvicorn
+
+    from syncsage.api.app import create_app
+
+    app_obj = create_app(cfg, config_path=config_path)
+    watcher, scheduler = _sync_services(app_obj.state.engine, cfg)
+    watcher.start()
+    scheduler.start()
+    try:
+        uvicorn.run(app_obj, host=cfg.server.host, port=cfg.server.port)
+    finally:
+        scheduler.stop()
+        watcher.stop()
+        app_obj.state.engine.close()
 
 
 def _engine(config_path: Path):
@@ -69,14 +105,18 @@ def main(argv: list[str] | None = None) -> int:
     compose_env_p.add_argument("--output", "-o")
     repair_p = sub.add_parser("repair")
     repair_p.add_argument("--config", "-c", default="syncsage.example.yaml")
+    backup_p = sub.add_parser("backup")
+    backup_p.add_argument("output")
+    backup_p.add_argument("--config", "-c", default="syncsage.example.yaml")
+    restore_p = sub.add_parser("restore")
+    restore_p.add_argument("input")
+    restore_p.add_argument("--config", "-c", default="syncsage.example.yaml")
+    restore_p.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
     if args.command in {None, "--help"}:
         parser.print_help()
         return 0
     if args.command == "start":
-        import uvicorn
-
-        from syncsage.api.app import create_app
         from syncsage.config.loader import load_layered_config, parse_override_pairs
 
         cfg = load_layered_config(
@@ -84,11 +124,7 @@ def main(argv: list[str] | None = None) -> int:
             args.profile,
             parse_override_pairs(args.overrides),
         )
-        uvicorn.run(
-            create_app(cfg, config_path=args.config),
-            host=cfg.server.host,
-            port=cfg.server.port,
-        )
+        _serve_app(cfg, args.config)
         return 0
     if args.command == "validate":
         from syncsage.config.loader import load_config, validate_source_paths
@@ -158,12 +194,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "sync":
+        from syncsage.sync.locks import EngineLeaseError
+
         engine = _engine(Path(args.config))
-        results = (
-            engine.sync_all(args.mode)
-            if args.all or not args.source
-            else [engine.sync_source(args.source, args.mode)]
-        )
+        try:
+            results = (
+                engine.sync_all(args.mode)
+                if args.all or not args.source
+                else [engine.sync_source(args.source, args.mode)]
+            )
+        except EngineLeaseError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            engine.close()
         for r in results:
             print(
                 f"{r.source_id}: indexed={r.indexed_artifacts} "
@@ -171,25 +215,56 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
     if args.command == "repair":
-        _engine(Path(args.config)).sync_all("repair")
+        from syncsage.sync.locks import EngineLeaseError
+
+        engine = _engine(Path(args.config))
+        try:
+            engine.sync_all("repair")
+        except EngineLeaseError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            engine.close()
         print("Repair complete")
         return 0
-    if args.command == "serve":
-        import uvicorn
+    if args.command == "backup":
+        from syncsage.config.loader import load_config
+        from syncsage.persistence.backup import create_backup
+        from syncsage.persistence.paths import StatePaths
 
-        from syncsage.api.app import create_app
+        cfg = load_config(Path(args.config))
+        paths = StatePaths.from_config(cfg)
+        out = create_backup(paths.state, Path(args.output), sqlite_path=paths.sqlite)
+        size = out.stat().st_size
+        print(f"Backup written: {out} ({size} bytes)")
+        return 0
+    if args.command == "restore":
+        from syncsage.config.loader import load_config
+        from syncsage.persistence.backup import restore_backup
+        from syncsage.persistence.paths import StatePaths
+
+        cfg = load_config(Path(args.config))
+        paths = StatePaths.from_config(cfg)
+        try:
+            target = restore_backup(Path(args.input), paths.state, force=args.force)
+        except FileExistsError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(f"Restored state into: {target}")
+        return 0
+    if args.command == "serve":
         from syncsage.config.loader import load_config
 
         cfg = load_config(Path(args.config))
-        uvicorn.run(
-            create_app(cfg, config_path=args.config),
-            host=cfg.server.host,
-            port=cfg.server.port,
-        )
+        _serve_app(cfg, args.config)
         return 0
     if args.command == "mcp":
         from syncsage.config.loader import load_config
         from syncsage.mcp_server.server import run_mcp_server
+
         cfg = load_config(Path(args.config))
         run_mcp_server(cfg, args.transport)
         return 0
@@ -199,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
             docker_run_stdio_config,
             render_vscode_mcp_json,
         )
+
         if args.client != "vscode":
             client_p.print_help()
             return 1

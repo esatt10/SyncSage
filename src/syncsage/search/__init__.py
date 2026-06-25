@@ -5,6 +5,7 @@ from syncsage.persistence.paths import StatePaths
 from syncsage.persistence.state_store import StateStore
 from syncsage.search.hybrid import HybridSearch
 from syncsage.search.sqlite_store import SearchStore
+from syncsage.search.vector_store import vector_searcher_from_config
 
 
 class SearchEngine(HybridSearch):
@@ -12,7 +13,7 @@ class SearchEngine(HybridSearch):
         paths = StatePaths.from_config(config)
         state = StateStore(paths.sqlite)
         state.migrate()
-        super().__init__(SearchStore(state))
+        super().__init__(SearchStore(state), vector=vector_searcher_from_config(config, state))
         self.config = config
 
     def search(self, query: str) -> dict:

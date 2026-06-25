@@ -33,31 +33,38 @@ server:
 
 storage:
   graph_format: node_link_json
+  # Synapse 21.6A: zstd-compressed timestamped graph snapshots written after a
+  # successful sync (graphs/<kb_id>/graph.<utc-ts>.json.zst), beside the
+  # uncompressed graph.latest.json. Throttled by the interval; bounded by the
+  # retention cap (oldest evicted first; latest.json/db/contract never evicted).
+  graph_snapshots: true
   graph_snapshot_interval_seconds: 900
+  compression: zstd
   sqlite_path: /state/syncsage.db
   graph_path: /state/graphs
   manifest_path: /state/manifests
   max_state_size_gb: 10
-  compression:
-    enabled: true
-    algorithm: zstd
-  retention:
-    keep_snapshots: 10
-    keep_event_days: 30
 
 search:
   default_mode: hybrid
   keyword:
     enabled: true
     engine: sqlite_fts5
+  # Optional semantic self-search (Synapse 21.4). Disabled by default; when
+  # enabled, chunks are embedded at sync time through an OpenAI-spec HTTP
+  # endpoint (the only sanctioned network call in the indexing path) and
+  # search gains mode=vector plus vector candidates inside mode=hybrid.
   embeddings:
-    enabled: true
-    provider: local
-    model: sentence-transformers/all-MiniLM-L6-v2
+    enabled: false
+    provider: openai-spec        # "openai-spec" | "stub" (deterministic, offline)
+    model: text-embedding-3-small
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY  # env var NAME; the key itself never lands in config
+    dimensions: 256
+    batch_size: 64
   vector_store:
-    enabled: true
-    engine: chroma
-    path: /state/vector
+    provider: lancedb            # "lancedb" (pip install 'syncsage[vector]') | "numpy"
+    path: /state/vectors         # vectors live under <path>/<kb_id>/
   ranking:
     prefer_exact_path_matches: true
     prefer_recent_commits: true
@@ -123,6 +130,25 @@ security:
   read_only_sources: true
   deny_path_traversal: true
   default_exclude_secrets: true
+
+# Synapse federation (Synapse 21.5). Standalone-safe: every router-facing
+# behavior is a no-op unless you opt in here. With the defaults below the
+# region behaves exactly like a router-less SyncSage.
+#
+# synapse:
+#   publish: false               # gate contract publication + sync event stream
+#   router_url: null             # e.g. http://synapse-router:8000 (POST sync.completed)
+#   fleet_id: null               # fleet label stamped into the contract
+#   endpoint: null               # this region's reachable base URL, e.g.
+#                                # http://my-region:8765 (router pulls GET /contract)
+#   webhook_timeout_seconds: 5.0
+#
+# When synapse.publish is true, each successful indexing sync (re)writes
+# <state>/contract.latest.json (served at GET /contract and the MCP resource
+# syncsage://knowledge-bases/{kb_id}/contract) and appends a sync.completed
+# record to <state>/events/YYYY-MM-DD.ndjson. When router_url is also set, the
+# event (with the inline contract) is POSTed to <router_url>/v1/synapse/events;
+# webhook failures are logged, never raised.
 
 sources:
   - name: syncsage-repo

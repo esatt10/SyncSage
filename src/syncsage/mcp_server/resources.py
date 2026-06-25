@@ -7,4 +7,5 @@ RESOURCES = [
     "syncsage://knowledge-bases/{kb_id}/sync-history",
     "syncsage://knowledge-bases/{kb_id}/graph-slices/{node_id}",
     "syncsage://knowledge-bases/{kb_id}/nodes/{node_id}",
+    "syncsage://knowledge-bases/{kb_id}/contract",
 ]

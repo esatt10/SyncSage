@@ -122,6 +122,11 @@ CREATE TABLE IF NOT EXISTS source_audit_events (
   created_at TEXT NOT NULL,
   details_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS manifests (
+  source_name TEXT PRIMARY KEY,
+  payload_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 
@@ -136,6 +141,12 @@ class StateStore:
         if self._conn is None:
             self._conn = sqlite3.connect(self.path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
+            # Crash/concurrency safety (Synapse step 21.2): WAL survives
+            # kill -9 mid-write, busy_timeout rides out concurrent readers,
+            # synchronous=NORMAL is the sanctioned WAL durability level.
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
         return self._conn
 
     def migrate(self) -> None:
@@ -435,6 +446,64 @@ class StateStore:
             self.conn.execute("DELETE FROM source_checkpoints WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM sources WHERE id=?", (source_id,))
 
+    def append_sync_event(
+        self,
+        event_id: str,
+        source_id: str | None,
+        event_type: str,
+        status: str,
+        started_at: str | None,
+        finished_at: str | None,
+        details: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> None:
+        self.conn.execute(
+            """INSERT INTO sync_events(
+                id,source_id,event_type,status,started_at,finished_at,details_json,error_json
+            )
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                event_id,
+                source_id,
+                event_type,
+                status,
+                started_at,
+                finished_at,
+                json.dumps(details or {}, default=str, sort_keys=True),
+                json.dumps(error, default=str, sort_keys=True) if error else None,
+            ),
+        )
+        self.conn.commit()
+
+    def list_sync_events(
+        self,
+        source_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Most-recent-first sync events (rowid order is insertion order)."""
+        where = ""
+        params: list[Any] = []
+        if source_id:
+            where = "WHERE source_id=?"
+            params.append(source_id)
+        params.extend([limit, offset])
+        rows = self.rows(
+            f"""SELECT * FROM sync_events
+                {where}
+                ORDER BY rowid DESC
+                LIMIT ? OFFSET ?""",
+            tuple(params),
+        )
+        events = []
+        for row in rows:
+            event = dict(row)
+            event["details"] = json.loads(event.pop("details_json") or "{}")
+            error_json = event.pop("error_json")
+            event["error"] = json.loads(error_json) if error_json else None
+            events.append(event)
+        return events
+
     def append_source_audit_event(
         self,
         event_id: str,
@@ -489,6 +558,37 @@ class StateStore:
             event["details"] = json.loads(event.pop("details_json") or "{}")
             events.append(event)
         return events
+
+    def get_manifest(self, source_name: str) -> dict[str, Any] | None:
+        rows = self.rows(
+            "SELECT payload_json FROM manifests WHERE source_name=?",
+            (source_name,),
+        )
+        if not rows:
+            return None
+        return json.loads(rows[0]["payload_json"])
+
+    def set_manifest(self, source_name: str, payload: dict[str, Any], updated_at: str) -> None:
+        self.conn.execute(
+            """INSERT INTO manifests(source_name,payload_json,updated_at)
+            VALUES(?,?,?)
+            ON CONFLICT(source_name) DO UPDATE SET
+                payload_json=excluded.payload_json,
+                updated_at=excluded.updated_at""",
+            (source_name, json.dumps(payload, sort_keys=True, default=str), updated_at),
+        )
+        self.conn.commit()
+
+    def manifest_exists(self, source_name: str) -> bool:
+        rows = self.rows(
+            "SELECT 1 FROM manifests WHERE source_name=? LIMIT 1",
+            (source_name,),
+        )
+        return bool(rows)
+
+    def delete_manifest(self, source_name: str) -> None:
+        self.conn.execute("DELETE FROM manifests WHERE source_name=?", (source_name,))
+        self.conn.commit()
 
     def artifact_state(self, source_id: str, artifact_id: str) -> dict[str, Any] | None:
         rows = self.rows(

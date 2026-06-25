@@ -29,14 +29,69 @@ Disable chunk notes, keep file notes concise, and store large graph exports unde
 
 ## State appears stale or inconsistent
 
-Run validation/repair commands when available:
+Validate, then repair or re-sync. There is no `rebuild` command — use `repair`
+(rebuilds missing/invalid state from manifests + DB) or a `full` sync (rebuilds
+everything for a source):
 
 ```bash
-syncsage validate
-syncsage repair
-syncsage rebuild --source <source>
-syncsage rebuild --all
+syncsage validate syncsage.yaml
+syncsage repair --config syncsage.yaml
+syncsage sync --config syncsage.yaml --source <source> --mode repair
+syncsage sync --config syncsage.yaml --source <source> --mode full
+syncsage sync --config syncsage.yaml --all --mode full
 ```
+
+`validate_only` mode checks readability without writing anything, which is handy
+for diagnosing a source before a heavier rebuild:
+
+```bash
+syncsage sync --config syncsage.yaml --source <source> --mode validate_only
+```
+
+## Images are not indexed
+
+- The captioner is only built when a source's `include` globs admit an image
+  extension (`.png` `.jpg` `.jpeg` `.webp` `.gif`). Add the glob, e.g.
+  `"**/*.png"`, then re-sync.
+- An unchanged image is skipped by content `sha256` on incremental sync — that
+  is expected (it was already captioned). Use `--mode full` to force.
+- See [Multi-modal ingest](how-to/multimodal-ingest.md).
+
+## Audio is not transcribed
+
+- The transcriber is only built when a source's `include` globs admit an audio
+  extension (`.wav` `.mp3` `.m4a` `.flac` `.ogg`). Add the glob, then re-sync.
+- An unchanged audio file is skipped by `sha256` on incremental sync — expected.
+  Use `--mode full` to force re-transcription.
+- The default `stub` transcriber needs no model; to use a real one, set
+  `ingestion.transcriber.provider: openai-spec`. See
+  [Multi-modal ingest](how-to/multimodal-ingest.md).
+
+## Embedding requests fail
+
+- Vector search is off unless `search.embeddings.enabled: true`. With it off,
+  text/graph search still works.
+- For `provider: openai-spec`, confirm the env var named by `api_key_env`
+  (default `OPENAI_API_KEY`) is set in the container/process, and that
+  `base_url` is reachable.
+- For air-gapped or test runs, set `provider: stub` (deterministic, offline).
+- If `vector_store.provider: lancedb` errors, install the extra
+  (`pip install 'syncsage[vector]'`) or switch to `provider: numpy`.
+- See [Vector self-search](how-to/vector-search.md).
+
+## Router connection or contract publish fails
+
+- Synapse features are off unless `synapse.publish: true`. A standalone region
+  is unaffected by router problems.
+- Webhook failures are **logged, never raised** — a sync never fails because the
+  router is unreachable. Confirm `synapse.router_url` is correct and the router's
+  `POST /v1/synapse/events` is reachable from the region.
+- Confirm the region's contract is being written: `GET /contract` should return
+  JSON, and `<state>/contract.latest.json` should be fresh after a sync.
+- If the router rejects the region, check the embedding space matches the fleet
+  (same `model`/`dimensions`) and, if signing, that the router's trust store has
+  this region's public key.
+- See [Attach to a Synapse fleet](how-to/attach-to-synapse.md).
 
 ## Multiple instances conflict
 

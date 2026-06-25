@@ -1,0 +1,113 @@
+# How to ingest images and audio
+
+SyncSage indexes images by **captioning** them and audio by **transcribing**
+it into text that flows through the normal chunk → embed → graph path. For a
+hands-on walkthrough, see the [multi-modal tutorial](../tutorials/multimodal.md);
+this page is the configuration reference.
+
+## Turn it on
+
+Captioning/transcription is **opt-in by file extension**. The captioner is only
+built when a source's `include` globs admit an image extension; the transcriber
+only when they admit an audio extension. A text-only config builds neither and
+is byte-identical to a SyncSage without multi-modal.
+
+| Modality | Extensions | Built when `include` admits | Producer |
+|---|---|---|---|
+| Image | `.png` `.jpg` `.jpeg` `.webp` `.gif` | any image extension | captioner |
+| Audio | `.wav` `.mp3` `.m4a` `.flac` `.ogg` | any audio extension | transcriber |
+
+```yaml
+sources:
+  - name: assets
+    type: repository
+    path: /workspace
+    include:
+      - "**/*.png"     # builds the captioner
+      - "**/*.wav"     # builds the transcriber
+```
+
+## Three sources of text (in priority order)
+
+For each media file, SyncSage picks the caption/transcript text like this:
+
+1. **Sidecar file** — if `<file>.caption.txt` (image) or
+   `<file>.transcript.txt` (audio) exists next to the media file, its contents
+   are used **verbatim**. The sidecar always wins, even over a network provider.
+2. **Configured provider** — otherwise the configured `provider` runs.
+3. **Stub fallback** — the `stub` provider (the default) produces a
+   deterministic placeholder from the file name + a stable content fingerprint.
+
+Sidecars are the offline way to get accurate text — author them by hand or
+generate them out-of-band.
+
+## Providers
+
+Configure providers under `ingestion.captioner` and `ingestion.transcriber`.
+Both default to `stub` (offline, deterministic, network-free).
+
+### Image captioner — `ingestion.captioner`
+
+```yaml
+ingestion:
+  captioner:
+    provider: stub                 # "stub" | "openai-spec"
+    model: gpt-4o-mini             # used by openai-spec
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY    # env var NAME; key never lands in config
+    prompt: "Describe this image in one concise sentence for search indexing."
+```
+
+- `stub` — `StubCaptioner`. Default. No network. Caption =
+  `Image <name> (visual content, fingerprint <digest>).`
+- `openai-spec` — `OpenAISpecVisionCaptioner`. Calls
+  `POST {base_url}/chat/completions` with an `image_url` content part and reads
+  `choices[0].message.content`. Works against any OpenAI-spec vision endpoint,
+  including self-hosted (set `base_url`).
+
+### Audio transcriber — `ingestion.transcriber`
+
+```yaml
+ingestion:
+  transcriber:
+    provider: stub                 # "stub" | "openai-spec"
+    model: whisper-1               # used by openai-spec
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY    # env var NAME; key never lands in config
+```
+
+- `stub` — `StubTranscriber`. Default. No network, **no audio decoder, no ASR
+  model, no audio library**. Transcript =
+  `Audio <name> (spoken content, fingerprint <digest>).`
+- `openai-spec` — `OpenAISpecTranscriber`. Uploads the raw bytes via
+  `POST {base_url}/audio/transcriptions` (multipart) and reads the response
+  `text`. Works against any OpenAI-spec transcription endpoint.
+
+!!! warning "Network calls in the indexing path"
+    Captioning/transcription with `openai-spec` is one of the few sanctioned
+    network calls at sync time (the others are the optional embedder). Keep the
+    `stub` provider for tests and air-gapped runs — it is the default precisely
+    so the offline path stays network-free.
+
+## When to use which
+
+| Situation | Use |
+|---|---|
+| Tests, CI, offline / air-gapped, "just make it discoverable" | `stub` (default) |
+| You have exact text already (alt text, meeting notes) | author a **sidecar** |
+| You want real captions/transcripts at scale | `openai-spec` + a hosted or self-hosted endpoint |
+
+## Idempotency
+
+An unchanged image or audio file is skipped by content `sha256` **before it is
+read**, so it is never re-captioned or re-transcribed on an incremental sync.
+Change the media file (or its sidecar) to force reprocessing.
+
+## How the fleet sees it
+
+When an image source is configured, this region's published Synapse contract
+adds `"image"` to `capabilities.modalities`; an audio source adds `"audio"`.
+A Synapse router can then route modality-filtered queries
+(`--modality image` / `--modality audio`) only to regions that advertise them.
+This is existing contract data — no schema change. See
+[Attach to a Synapse fleet](attach-to-synapse.md).

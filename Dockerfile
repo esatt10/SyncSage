@@ -16,22 +16,14 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir \
-    "fastapi>=0.111" \
-    "uvicorn[standard]>=0.30" \
-    "pydantic>=2.7" \
-    "PyYAML>=6.0" \
-    "networkx>=3.3" \
-    "typer>=0.12" \
-    "watchdog>=4.0" \
-    "markdown-it-py>=3.0" \
-    "beautifulsoup4>=4.12" \
-    "python-docx>=1.1" \
-    "pymupdf>=1.24" \
-    "mcp>=1.27,<2"
-
+# Install from pyproject so the image's dependencies never drift from the
+# package's declared deps (a hand-maintained list previously omitted core deps
+# added later — numpy (21.4) and zstandard (21.6a) — breaking the smoke test).
+# ".[mcp]" = core deps + the MCP server extra the container serves.
 COPY pyproject.toml README.md LICENSE /app/
 COPY src /app/src
+RUN pip install --no-cache-dir ".[mcp]"
+
 COPY syncsage.example.yaml /config/syncsage.yaml
 
 EXPOSE 8765
