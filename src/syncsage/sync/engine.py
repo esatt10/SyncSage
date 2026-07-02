@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Literal
 
-from syncsage.config.schema import SourceConfig, SyncSageConfig
+from syncsage.config.schema import FILESYSTEM_SOURCE_TYPES, SourceConfig, SyncSageConfig
 from syncsage.graph.builder import GraphBuilder
 from syncsage.ingestion.captioner import captioner_from_config
 from syncsage.ingestion.pipeline import git_state, parse_connector_payload, utc_now
@@ -165,6 +165,29 @@ class SyncEngine:
             # Synapse 21.3: thread the previous checkpoint into the connector
             # so non-filesystem sources can skip unchanged remote items.
             connector.begin_sync(mode)
+            # A filesystem source whose root is absent (typically: the path is
+            # not mounted into this container) would otherwise index 0 files
+            # silently and report success. Surface it as a first-class status so
+            # the operator sees *why* nothing was indexed instead of a clean
+            # zero. (validate() only runs in validate_only mode.)
+            if source.type in FILESYSTEM_SOURCE_TYPES and not source.path.exists():
+                self.state.mark_source_status(source.name, "path_missing")
+                return SyncResult(
+                    source.name,
+                    0,
+                    0,
+                    self.graph_builder.graph.number_of_nodes(),
+                    self.graph_builder.graph.number_of_edges(),
+                    "path_missing",
+                    {
+                        "connector_type": connector.connector_type,
+                        "error": (
+                            f"source path does not exist in this environment: "
+                            f"{source.path}. If SyncSage runs in a container, "
+                            f"ensure this path is mounted into the container."
+                        ),
+                    },
+                )
             items = connector.list_items()
             if mode == "full":
                 self.state.delete_source_artifacts(source.name)

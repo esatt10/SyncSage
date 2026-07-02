@@ -15,4 +15,9 @@ def resolve_under(path: str | Path, allowed_roots: list[str | Path]) -> Path:
     for root in roots:
         if candidate == root or root in candidate.parents:
             return candidate
-    raise PathPolicyError(f"Path {candidate} is outside allowed roots: {', '.join(map(str, roots))}")
+    raise PathPolicyError(
+        f"Path {candidate} is outside allowed roots: {', '.join(map(str, roots))}. "
+        f"Mount it under one of those roots, or add its container path to "
+        f"security.allow_workspace_roots (or set "
+        f"security.allow_user_selected_source_paths: true)."
+    )

@@ -145,7 +145,12 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
         <div className="wizard">
           <div className="wizard__col">
             <h4>Directory</h4>
-            <DirectoryBrowser path={browsePath} onNavigate={setBrowsePath} onChoose={choose} />
+            <DirectoryBrowser
+              path={browsePath}
+              onNavigate={setBrowsePath}
+              onChoose={choose}
+              allowFiles={type === "single_file"}
+            />
           </div>
 
           <div className="wizard__col wizard__col--form">

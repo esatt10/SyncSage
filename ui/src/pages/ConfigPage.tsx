@@ -33,8 +33,22 @@ export function ConfigPage() {
     }
   }, [mode, yamlText, working]);
 
-  const original = configQuery.data?.raw_yaml ?? "";
-  const diff = useMemo(() => lineDiff(original, proposedYaml), [original, proposedYaml]);
+  // Diff baseline must be rendered the same way as `proposedYaml`, else an
+  // unedited page shows spurious changes. In Raw YAML mode the editor is seeded
+  // from the user's sparse `raw_yaml`, so diff against that. In Form mode the
+  // editor holds the fully-resolved `effective` config, so diff against the
+  // effective config dumped the same way (not the sparse file).
+  const baseline = useMemo(() => {
+    const data = configQuery.data;
+    if (!data) return "";
+    if (mode === "yaml") return data.raw_yaml ?? yaml.dump(data.effective, { sortKeys: false });
+    try {
+      return yaml.dump(data.effective, { sortKeys: false });
+    } catch {
+      return data.raw_yaml ?? "";
+    }
+  }, [mode, configQuery.data]);
+  const diff = useMemo(() => lineDiff(baseline, proposedYaml), [baseline, proposedYaml]);
   const changedCount = diff.filter((d) => d.kind !== "same").length;
 
   const exportYaml = () => {

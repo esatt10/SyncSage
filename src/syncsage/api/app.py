@@ -120,6 +120,31 @@ def _allowed_roots(config: SyncSageConfig) -> list[Path]:
     return seen
 
 
+def _configured_roots(config: SyncSageConfig) -> list[Path]:
+    """Browse roots for the UI, *including* configured-but-unmounted ones.
+
+    Unlike ``_allowed_roots`` (which drops non-existent roots because they can
+    never contain a selectable path), this preserves every configured root so
+    the browser can render a root the operator added to
+    ``security.allow_workspace_roots`` but forgot to mount — flagged
+    ``mounted: false`` — instead of silently hiding it.
+    """
+    roots = [
+        config.syncsage.workspace_root,
+        config.syncsage.vault_path,
+        config.syncsage.exports_path,
+        *config.security.allow_workspace_roots,
+    ]
+    if config.security.allow_user_selected_source_paths:
+        roots.append(Path("/"))
+    seen: list[Path] = []
+    for root in roots:
+        resolved = root.expanduser().resolve()
+        if resolved not in seen:
+            seen.append(resolved)
+    return seen
+
+
 def _resolve_source_path(path: str, config: SyncSageConfig) -> Path:
     if config.security.allow_user_selected_source_paths:
         resolved = Path(path).expanduser().resolve()
@@ -391,7 +416,9 @@ def create_app(
             try:
                 SourceType(req.type)
             except ValueError as exc:
-                raise HTTPException(status_code=400, detail=f"Unknown source type: {req.type}") from exc
+                raise HTTPException(
+                    status_code=400, detail=f"Unknown source type: {req.type}"
+                ) from exc
         updated = _source_from_payload(_source_payload(req, resolved, existing=source))
         engine.graph_builder.remove_source_content(source_id)
         engine.manifests.delete(source_id)
@@ -621,13 +648,19 @@ def create_app(
     def fs_list(path: str | None = None) -> dict:
         roots = _allowed_roots(config)
         if not path:
+            browse_roots = _configured_roots(config)
             return {
                 "path": None,
                 "parent": None,
-                "roots": [str(root) for root in roots],
+                "roots": [str(root) for root in browse_roots],
                 "entries": [
-                    {"name": root.name or str(root), "path": str(root), "is_dir": True}
-                    for root in roots
+                    {
+                        "name": root.name or str(root),
+                        "path": str(root),
+                        "is_dir": True,
+                        "mounted": root.exists(),
+                    }
+                    for root in browse_roots
                 ],
             }
         try:
@@ -640,13 +673,10 @@ def create_app(
         for child in sorted(resolved.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
             if child.name.startswith("."):
                 continue
-            entries.append(
-                {"name": child.name, "path": str(child), "is_dir": child.is_dir()}
-            )
+            entries.append({"name": child.name, "path": str(child), "is_dir": child.is_dir()})
         parent = resolved.parent
-        parent_allowed = (
-            config.security.allow_user_selected_source_paths
-            or any(parent == r or r in parent.parents or parent == r for r in roots)
+        parent_allowed = config.security.allow_user_selected_source_paths or any(
+            parent == r or r in parent.parents or parent == r for r in roots
         )
         return {
             "path": str(resolved),
@@ -690,8 +720,8 @@ def create_app(
             raise HTTPException(status_code=400, detail="; ".join(errors))
         path = Path(app.state.config_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        rendered = req.yaml_text if req.yaml_text is not None else yaml.safe_dump(
-            data, sort_keys=False
+        rendered = (
+            req.yaml_text if req.yaml_text is not None else yaml.safe_dump(data, sort_keys=False)
         )
         path.write_text(rendered, encoding="utf-8")
         audit(None, "write_config", {"path": str(path)})

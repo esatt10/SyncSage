@@ -7,10 +7,12 @@ interface DirectoryBrowserProps {
   path: string | null;
   onNavigate: (path: string | null) => void;
   onChoose: (path: string) => void;
+  // When true (single_file sources), files are selectable too, not just dirs.
+  allowFiles?: boolean;
 }
 
 // Server-side validation decides which container-visible paths may be opened.
-export function DirectoryBrowser({ path, onNavigate, onChoose }: DirectoryBrowserProps) {
+export function DirectoryBrowser({ path, onNavigate, onChoose, allowFiles = false }: DirectoryBrowserProps) {
   const [manualPath, setManualPath] = useState("");
   const listing = useQuery({
     queryKey: ["fs", path],
@@ -59,8 +61,9 @@ export function DirectoryBrowser({ path, onNavigate, onChoose }: DirectoryBrowse
               onClick={() => entry.is_dir && onNavigate(entry.path)}
             >
               {entry.is_dir ? "📁" : "📄"} {entry.name}
+              {entry.mounted === false && <span className="muted small"> (not mounted)</span>}
             </button>
-            {entry.is_dir && (
+            {(entry.is_dir || allowFiles) && (
               <button className="btn btn--small" onClick={() => onChoose(entry.path)}>
                 choose
               </button>
