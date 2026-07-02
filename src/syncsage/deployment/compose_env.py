@@ -14,6 +14,7 @@ ENV_ORDER = (
     "SYNCSAGE_CONFIG_PATH",
     "SYNCSAGE_WORKSPACE_PATH",
     "SYNCSAGE_VAULT_PATH",
+    "SYNCSAGE_DATA_PATH",
 )
 
 
@@ -62,9 +63,10 @@ def load_compose_environment(config_path: str | Path) -> dict[str, str]:
         "SYNCSAGE_WORKSPACE_PATH": _compose_host_path(
             _string(compose.get("workspace_path"), "./workspace")
         ),
-        "SYNCSAGE_VAULT_PATH": _compose_host_path(
-            _string(compose.get("vault_path"), "./vault")
-        ),
+        "SYNCSAGE_VAULT_PATH": _compose_host_path(_string(compose.get("vault_path"), "./vault")),
+        # Extra read-only bind mount for local files that live OUTSIDE the
+        # workspace, surfaced in the container at /data (an allowed source root).
+        "SYNCSAGE_DATA_PATH": _compose_host_path(_string(compose.get("data_path"), "./data")),
     }
 
 

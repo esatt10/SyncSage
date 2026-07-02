@@ -12,6 +12,12 @@ services:
     volumes:
       - ${SYNCSAGE_CONFIG_PATH:-./syncsage.example.yaml}:/config/syncsage.yaml:ro
       - ${SYNCSAGE_WORKSPACE_PATH:-./workspace}:/workspace:ro
+      # Local files that live OUTSIDE ./workspace: point SYNCSAGE_DATA_PATH at
+      # any host directory and it appears in the container at /data (an allowed
+      # source root). This is how you index files that aren't a subdirectory of
+      # the workspace. Add more mounts here (or in docker-compose.override.yml)
+      # the same way, then add each container path to security.allow_workspace_roots.
+      - ${SYNCSAGE_DATA_PATH:-./data}:/data:ro
       - ${SYNCSAGE_VAULT_PATH:-./vault}:/vault
       - syncsage-state:/state
       - syncsage-exports:/exports

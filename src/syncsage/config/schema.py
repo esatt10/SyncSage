@@ -35,6 +35,20 @@ class SourceType(StrEnum):
     api = "api"
 
 
+# Source types whose ``path`` is a real local directory/file (as opposed to
+# the URL/connector-backed web/api/s3 types). A relative ``path`` on one of
+# these is anchored to ``syncsage.workspace_root`` at config-load time.
+FILESYSTEM_SOURCE_TYPES = frozenset(
+    {
+        SourceType.repository,
+        SourceType.markdown_folder,
+        SourceType.obsidian_vault,
+        SourceType.document_folder,
+        SourceType.single_file,
+    }
+)
+
+
 @dataclass
 class ModelMixin:
     def model_dump(self, mode: str = "python") -> dict[str, Any]:
@@ -438,7 +452,14 @@ class SyncSageConfig(ModelMixin):
         for raw in data.get("sources", []) or []:
             raw = dict(raw)
             raw["type"] = SourceType(raw.get("type", "single_file"))
-            raw["path"] = Path(raw["path"])
+            src_path = Path(raw["path"])
+            # Anchor a relative filesystem source path to workspace_root so a
+            # config written as `path: docs` means "<workspace_root>/docs", not
+            # "<cwd>/docs" — the container CWD is /app, which would silently
+            # resolve off the mounted workspace and index nothing.
+            if not src_path.is_absolute() and raw["type"] in FILESYSTEM_SOURCE_TYPES:
+                src_path = cfg.syncsage.workspace_root / src_path
+            raw["path"] = src_path
             if "repo" in raw:
                 raw["repo"] = build(RepoSettings, raw["repo"])
             if "chunking" in raw:

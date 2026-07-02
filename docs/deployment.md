@@ -37,9 +37,43 @@ docker compose --env-file .syncsage/compose.env up -d
 |---|---|---|
 | selected config path | `/config/syncsage.yaml` | Runtime config, read-only. |
 | `deployment.compose.workspace_path` | `/workspace` | Indexed repositories and documents, read-only. |
+| `deployment.compose.data_path` | `/data` | Extra local files that live **outside** the workspace, read-only. |
 | `deployment.compose.vault_path` | `/vault` | Generated Obsidian notes, read/write. |
 | `syncsage-state` volume | `/state` | SQLite, manifests, graph snapshots. |
 | `syncsage-exports` volume | `/exports` | JSON/canvas exports. |
+
+### Connecting local files that aren't in the workspace
+
+A source can only index a path the container can actually see. **A host directory
+that is not a subdirectory of the mounted workspace does not exist inside the
+container** — registering a source for it fails with `path_missing` (the sync
+result names the absent path and reminds you to mount it).
+
+To index files that live somewhere else on the host, mount that directory in.
+The compose file ships a ready-made second mount for exactly this:
+
+```bash
+# Index ~/research (outside ./workspace) — it appears in the container at /data:
+SYNCSAGE_DATA_PATH="$HOME/research" docker compose up -d
+# then register a source with path /data (already in security.allow_workspace_roots)
+```
+
+Need more than one extra directory? Add mounts in a `docker-compose.override.yml`
+and add each *container* path to `security.allow_workspace_roots`:
+
+```yaml
+# docker-compose.override.yml
+services:
+  syncsage:
+    volumes:
+      - /abs/host/notes:/notes:ro
+      - /abs/host/archive:/archive:ro
+```
+
+A relative source `path` (e.g. `path: docs`) is anchored to `workspace_root`, so
+it means `/workspace/docs` — not a path relative to the container's working
+directory. Use absolute container paths (`/data/...`, `/notes/...`) for anything
+outside the workspace.
 
 Check the API container:
 

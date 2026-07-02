@@ -95,6 +95,8 @@ export interface FsEntry {
   name: string;
   path: string;
   is_dir: boolean;
+  // Root entries only: false when a configured allowlist root isn't mounted.
+  mounted?: boolean;
 }
 
 export interface FsListing {

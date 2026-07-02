@@ -126,6 +126,10 @@ security:
     - /workspace
     - /vault
     - /exports
+    # Extra mount for local files that live outside ./workspace. Point the
+    # SYNCSAGE_DATA_PATH env var (docker-compose.yml) at any host directory and
+    # it shows up here at /data — then register a source under /data.
+    - /data
   allow_user_selected_source_paths: true
   read_only_sources: true
   deny_path_traversal: true
