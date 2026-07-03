@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import yaml from "js-yaml";
 import { api } from "../api/client";
 import { ObjectEditor } from "../config/ObjectEditor";
@@ -9,6 +9,7 @@ import { Explainable } from "../explain/Explainable";
 type Mode = "form" | "yaml";
 
 export function ConfigPage() {
+  const queryClient = useQueryClient();
   const configQuery = useQuery({ queryKey: ["config"], queryFn: api.getConfig });
   const [mode, setMode] = useState<Mode>("form");
   const [working, setWorking] = useState<Record<string, unknown>>({});
@@ -16,6 +17,30 @@ export function ConfigPage() {
   const [showDiff, setShowDiff] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [exported, setExported] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  const save = useMutation({
+    mutationFn: (body: { config?: Record<string, unknown>; yaml_text?: string }) =>
+      api.putConfig(body),
+    onSuccess: () => {
+      setSaved(true);
+      queryClient.invalidateQueries({ queryKey: ["config"] });
+    },
+    onError: (err) => setSaveError((err as Error).message),
+  });
+
+  const saveToServer = () => {
+    setSaveError(null);
+    setSaved(false);
+    // Raw YAML mode saves the user's exact text (preserving comments); form
+    // mode saves the edited config object and lets the server render it.
+    if (mode === "yaml") {
+      save.mutate({ yaml_text: yamlText });
+    } else {
+      save.mutate({ config: working });
+    }
+  };
 
   useEffect(() => {
     if (configQuery.data) {
@@ -113,17 +138,26 @@ export function ConfigPage() {
             {showDiff ? "Hide diff" : `Preview diff (${changedCount})`}
           </button>
         </Explainable>
+        <button className="btn" onClick={exportYaml}>
+          Export adjusted YAML
+        </button>
         <Explainable id="config.apply" as="span">
-          <button className="btn btn--primary" onClick={exportYaml}>
-            Export adjusted YAML
+          <button className="btn btn--primary" onClick={saveToServer} disabled={save.isPending}>
+            {save.isPending ? "Saving…" : "Save to SyncSage"}
           </button>
         </Explainable>
       </div>
 
       {exportError && <p className="error">{exportError}</p>}
+      {saveError && <p className="error">{saveError}</p>}
       {exported && (
         <p className="notice">
           Adjusted YAML exported. Replace your mounted config and restart SyncSage to apply it.
+        </p>
+      )}
+      {saved && (
+        <p className="notice">
+          Config written to the server. Restart SyncSage to apply the new configuration.
         </p>
       )}
 

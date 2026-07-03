@@ -113,7 +113,7 @@ export interface ConfigResponse {
   profiles: string[];
 }
 
-export type SearchMode = "hybrid" | "text" | "graph";
+export type SearchMode = "hybrid" | "text" | "graph" | "vector";
 
 export interface SearchResultItem {
   node_id?: string;
@@ -137,7 +137,7 @@ export interface SearchResultItem {
 export interface SearchResponse {
   results: SearchResultItem[];
   mode?: SearchMode;
-  counts?: { text?: number; graph?: number; returned?: number };
+  counts?: { text?: number; graph?: number; vector?: number; returned?: number };
   [key: string]: unknown;
 }
 

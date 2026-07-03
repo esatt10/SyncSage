@@ -66,11 +66,24 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
   const [error, setError] = useState<string | null>(null);
 
   const mutation = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       const payload = buildPayload();
-      return editing
-        ? api.updateSource(source!.name, payload)
-        : api.registerSource(payload as SourceWritePayload & { name: string; path: string });
+      if (!editing) {
+        return api.registerSource(payload as SourceWritePayload & { name: string; path: string });
+      }
+      const result = await api.updateSource(source!.name, payload);
+      // Updating a source clears its indexed artifacts server-side, so kick
+      // off an incremental re-sync; otherwise the graph stays empty until the
+      // user remembers to sync manually. Failures surface on the sources page
+      // via last_status rather than blocking the save.
+      api
+        .syncSource(source!.name, "incremental")
+        .catch(() => undefined)
+        .finally(() => {
+          queryClient.invalidateQueries({ queryKey: ["sources"] });
+          queryClient.invalidateQueries({ queryKey: ["graph"] });
+        });
+      return result;
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sources"] });
@@ -102,8 +115,13 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
       description: description || undefined,
       enabled,
       max_depth: maxDepth.trim() ? Number(maxDepth) : null,
-      include: patterns(includeText),
-      exclude: patterns(excludeText),
+      // On create, omit empty pattern lists so the server's defaults apply
+      // (curated text-file includes, .git/node_modules excludes). Sending []
+      // would override those defaults and index everything. On edit the
+      // fields are prefilled from the existing config, so send them as-is —
+      // clearing them there is an explicit choice.
+      include: editing ? patterns(includeText) : orUndefined(patterns(includeText)),
+      exclude: editing ? patterns(excludeText) : orUndefined(patterns(excludeText)),
       chunking: {
         enabled: chunkingEnabled,
         strategy: chunkStrategy,
@@ -209,11 +227,21 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
             <div className="form-grid">
               <label className="field">
                 <span>Include patterns</span>
-                <textarea className="text-area" value={includeText} onChange={(e) => setIncludeText(e.target.value)} />
+                <textarea
+                  className="text-area"
+                  value={includeText}
+                  onChange={(e) => setIncludeText(e.target.value)}
+                  placeholder={editing ? undefined : "empty = server defaults (**/*.py, **/*.md, …)"}
+                />
               </label>
               <label className="field">
                 <span>Exclude patterns</span>
-                <textarea className="text-area" value={excludeText} onChange={(e) => setExcludeText(e.target.value)} />
+                <textarea
+                  className="text-area"
+                  value={excludeText}
+                  onChange={(e) => setExcludeText(e.target.value)}
+                  placeholder={editing ? undefined : "empty = server defaults (.git, node_modules, …)"}
+                />
               </label>
             </div>
 
@@ -340,6 +368,10 @@ function sourceConfig(source?: SourceRecord | null): Record<string, unknown> {
     }
   }
   return source;
+}
+
+function orUndefined(value: string[]): string[] | undefined {
+  return value.length > 0 ? value : undefined;
 }
 
 function patterns(value: string): string[] {
