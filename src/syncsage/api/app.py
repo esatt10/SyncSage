@@ -379,7 +379,10 @@ def create_app(
             SourceType(req.type)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"Unknown source type: {req.type}") from exc
-        source = _source_from_payload(_source_payload(req, resolved))
+        try:
+            source = _source_from_payload(_source_payload(req, resolved))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid source: {exc}") from exc
         SourceRegistry(config, state).register_source(source)
         config.sources = [s for s in config.sources if s.name != source.name]
         config.sources.append(source)
@@ -419,7 +422,10 @@ def create_app(
                 raise HTTPException(
                     status_code=400, detail=f"Unknown source type: {req.type}"
                 ) from exc
-        updated = _source_from_payload(_source_payload(req, resolved, existing=source))
+        try:
+            updated = _source_from_payload(_source_payload(req, resolved, existing=source))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid source: {exc}") from exc
         engine.graph_builder.remove_source_content(source_id)
         engine.manifests.delete(source_id)
         state.delete_source_artifacts(source_id)
@@ -510,10 +516,15 @@ def create_app(
 
     @app.post("/sync")
     def sync_all(req: SyncRequest) -> dict:
-        if req.source_name:
-            result = engine.sync_source(req.source_name, req.mode)  # type: ignore[arg-type]
-            return {"results": [result.__dict__]}
-        return {"results": [r.__dict__ for r in engine.sync_all(req.mode)]}  # type: ignore[arg-type]
+        try:
+            if req.source_name:
+                result = engine.sync_source(req.source_name, req.mode)  # type: ignore[arg-type]
+                return {"results": [result.__dict__]}
+            return {"results": [r.__dict__ for r in engine.sync_all(req.mode)]}  # type: ignore[arg-type]
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/sync/{source_id}")
     def sync_source(source_id: str, req: SyncRequest | None = None) -> dict:
@@ -522,6 +533,8 @@ def create_app(
             return engine.sync_source(source_id, mode).__dict__  # type: ignore[arg-type]
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/sync/status")
     def sync_status() -> dict:
@@ -561,12 +574,20 @@ def create_app(
 
     @app.get("/files/summary")
     def file_summary(path: str, source_name: str | None = None) -> dict:
+        # GROUP_CONCAT order is arbitrary unless the input rows are ordered,
+        # so concatenate over ordered scalar subqueries to keep summaries and
+        # content in chunk order.
         rows = state.rows(
-            """SELECT artifacts.*, GROUP_CONCAT(chunks.summary, '\n') AS summary,
-            GROUP_CONCAT(chunks.text, '\n\n') AS content FROM artifacts
-            LEFT JOIN chunks ON chunks.artifact_id=artifacts.id
+            """SELECT artifacts.*,
+            (SELECT GROUP_CONCAT(summary, '\n') FROM
+                (SELECT summary FROM chunks WHERE artifact_id=artifacts.id
+                 ORDER BY chunk_index)) AS summary,
+            (SELECT GROUP_CONCAT(text, '\n\n') FROM
+                (SELECT text FROM chunks WHERE artifact_id=artifacts.id
+                 ORDER BY chunk_index)) AS content
+            FROM artifacts
             WHERE artifacts.relative_path=? AND (? IS NULL OR artifacts.source_id=?)
-            GROUP BY artifacts.id LIMIT 1""",
+            LIMIT 1""",
             (path, source_name, source_name),
         )
         return dict(rows[0]) if rows else {"path": path, "summary": None}
@@ -590,9 +611,11 @@ def create_app(
                 content = read_text(path)
                 if content:
                     return {"node_id": node_id, "content": content}
+        # GROUP_CONCAT ignores a trailing ORDER BY, so order the rows in a
+        # subquery to keep the reassembled file content in chunk order.
         rows = state.rows(
-            "SELECT GROUP_CONCAT(text, '\n\n') AS content FROM chunks WHERE artifact_id=? "
-            "ORDER BY chunk_index",
+            "SELECT GROUP_CONCAT(text, '\n\n') AS content FROM "
+            "(SELECT text FROM chunks WHERE artifact_id=? ORDER BY chunk_index)",
             (node_id,),
         )
         content = rows[0]["content"] if rows else None

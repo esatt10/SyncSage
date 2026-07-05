@@ -233,3 +233,82 @@ def test_pure_graph_helpers_traverse_typed_edges() -> None:
     sliced = graph_slice(graph, "a", depth=2)
     assert {node["id"] for node in sliced["nodes"]} == {"a", "b", "c"}
     assert len(sliced["links"]) == 2
+
+
+def test_node_content_concatenates_chunks_in_index_order(loaded_config) -> None:
+    """GROUP_CONCAT must respect chunk_index even when rows were written out of order."""
+    app = create_app(config=loaded_config)
+    state = app.state.state
+    artifact = {
+        "id": "file:test:ordered.md:branch=main",
+        "source_id": "test",
+        "type": "document",
+        "path": "/nonexistent/ordered.md",  # forces the chunk-concat fallback
+        "relative_path": "ordered.md",
+        "mime_type": "text/markdown",
+        "size_bytes": 10,
+        "sha256": "0" * 64,
+        "mtime": None,
+        "git_branch": None,
+        "git_commit": None,
+        "last_indexed_at": None,
+        "status": "healthy",
+    }
+    chunks = [
+        {
+            "id": f"chunk:test:ordered.md:sha256=h{i}:chunk={i:04d}",
+            "artifact_id": artifact["id"],
+            "source_id": "test",
+            "chunk_index": i,
+            "heading_path": None,
+            "start_line": 1,
+            "end_line": 2,
+            "text": f"part-{i}",
+            "text_hash": f"h{i}",
+            "summary": f"part-{i}",
+            "token_estimate": 2,
+        }
+        # Insert in reverse so raw rowid order disagrees with chunk order.
+        for i in (2, 1, 0)
+    ]
+    state.replace_artifact_chunks(artifact, chunks)
+    graph = app.state.engine.graph_builder.graph
+    graph.add_node(artifact["id"], id=artifact["id"], type="document", label="ordered.md")
+
+    response = TestClient(app).get("/nodes/content", params={"node_id": artifact["id"]})
+
+    assert response.status_code == 200
+    assert response.json()["content"] == "part-0\n\npart-1\n\npart-2"
+
+    summary = TestClient(app).get(
+        "/files/summary", params={"path": "ordered.md", "source_name": "test"}
+    )
+    assert summary.status_code == 200
+    assert summary.json()["content"] == "part-0\n\npart-1\n\npart-2"
+
+
+def test_register_source_invalid_payload_returns_400(loaded_config, workspace_copy: Path) -> None:
+    loaded_config.syncsage.workspace_root = workspace_copy
+    client = _client(loaded_config)
+    response = client.post(
+        "/sources",
+        json={
+            "name": "broken",
+            "type": "markdown_folder",
+            "path": str(workspace_copy / "notes"),
+            "chunking": {"max_chars": "not-a-number"},
+        },
+    )
+    assert response.status_code == 400
+    assert "Invalid source" in response.json()["detail"]
+
+
+def test_sync_routes_map_domain_errors_to_4xx(loaded_config) -> None:
+    client = _client(loaded_config)
+
+    bad_mode = client.post("/sync/architecture-notes", json={"mode": "definitely-not-a-mode"})
+    assert bad_mode.status_code == 400
+    assert "Unsupported sync mode" in bad_mode.json()["detail"]
+
+    unknown = client.post("/sync", json={"source_name": "no-such-source"})
+    assert unknown.status_code == 404

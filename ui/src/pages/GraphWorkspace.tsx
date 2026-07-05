@@ -240,6 +240,9 @@ export function GraphWorkspace() {
                 <option value="hybrid">hybrid</option>
                 <option value="text">text</option>
                 <option value="graph">graph</option>
+                <option value="vector" title="Semantic search; needs search.embeddings enabled">
+                  vector
+                </option>
               </select>
             </label>
             <label className="field field--compact">

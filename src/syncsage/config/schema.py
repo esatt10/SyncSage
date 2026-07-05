@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from dataclasses import fields as dataclass_fields
 from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,42 @@ FILESYSTEM_SOURCE_TYPES = frozenset(
         SourceType.single_file,
     }
 )
+
+
+_TRUTHY = {"true", "yes", "on", "1"}
+_FALSY = {"false", "no", "off", "0"}
+
+
+def _coerce_scalar_fields(dc: type, raw: dict[str, Any]) -> None:
+    """Coerce int/float/bool fields in-place; raise ValueError on garbage.
+
+    The dataclass constructors accept whatever they are given, so without
+    this a config (or a UI payload) carrying e.g. ``max_chars: "oops"``
+    validates "successfully" and only blows up mid-sync. Coercion keeps the
+    friendly behaviours (``"8765"`` → 8765, ``"true"`` → True) while turning
+    unusable values into an immediate, catchable error.
+    """
+    for f in dataclass_fields(dc):
+        if f.name not in raw or raw[f.name] is None:
+            continue
+        annotation = f.type if isinstance(f.type, str) else getattr(f.type, "__name__", "")
+        base = annotation.replace(" ", "").removesuffix("|None")
+        value = raw[f.name]
+        try:
+            if base == "int" and not isinstance(value, bool) and not isinstance(value, int):
+                raw[f.name] = int(value)
+            elif base == "float" and not isinstance(value, (int, float)):
+                raw[f.name] = float(value)
+            elif base == "bool" and not isinstance(value, bool):
+                text = str(value).strip().lower()
+                if text in _TRUTHY:
+                    raw[f.name] = True
+                elif text in _FALSY:
+                    raw[f.name] = False
+                else:
+                    raise ValueError(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{dc.__name__}.{f.name} expects {base}, got {value!r}") from exc
 
 
 @dataclass
@@ -394,6 +431,7 @@ class SyncSageConfig(ModelMixin):
     def model_validate(cls, data: dict[str, Any]) -> SyncSageConfig:
         def build(dc, raw):
             raw = raw or {}
+            _coerce_scalar_fields(dc, raw)
             if dc is SyncSageSettings:
                 for key in ("state_path", "vault_path", "workspace_root", "exports_path"):
                     if key in raw:
@@ -468,6 +506,7 @@ class SyncSageConfig(ModelMixin):
                 raw["sync"] = build(SourceSyncSettings, raw["sync"])
             if "connector" in raw:
                 raw["connector"] = build(SourceConnectorSettings, raw["connector"])
+            _coerce_scalar_fields(SourceConfig, raw)
             cfg.sources.append(
                 SourceConfig(
                     **{k: v for k, v in raw.items() if k in SourceConfig.__dataclass_fields__}
