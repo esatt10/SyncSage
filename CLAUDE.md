@@ -236,6 +236,18 @@ UNCHANGED** (no schema bump, no re-vendor, parity test green). Tiny WAV fixture 
 `tests/fixtures/sample_workspace/audio/briefing.wav.transcript.txt`;
 `tests/test_audio_ingestion.py`. Suite: **142 passed** (+7). **Phase 25 complete.**
 
+**Heterogeneous embedding spaces (2026-07-11) [x-repo] — docs-only here.**
+The Synapse router (subjective-retrieval, ADR 2026-07-11) now routes
+**mixed-embedding-space fleets** by partitioning contracts per
+`embedding_space (model_id, dim, normalized)` and scoring each partition with
+a query vector in that space (`synapse.spaces` per-space query embedders /
+`query_vecs`); unresolvable spaces are excluded per query with
+`embedding_space_unresolved`. **No SyncSage code change** — a region already
+embeds with its own `search.embeddings` model and publishes its own
+`embedding_space`; wire format unchanged (no schema bump, no re-vendor,
+parity green). See `docs/SYNAPSE_INTEGRATION.md` §3 note. Suite: **152
+passed / 2 skipped** (unchanged).
+
 Full step contracts with acceptance criteria: `docs/SYNAPSE_INTEGRATION.md` §2.
 
 | Step | What | Fixes | Status |
