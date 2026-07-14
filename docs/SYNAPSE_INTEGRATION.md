@@ -443,8 +443,29 @@ sync, can be backed up and restored byte-faithfully — with the standalone
 | Publisher | `src/syncsage/synapse/publisher.py` (Step 21.5) |
 | Serving | `GET /contract` + MCP resource |
 | Push | `POST <router>/v1/synapse/events` on `sync.completed` |
-| Embedding-space pin | `search.embeddings.model` must equal the fleet pin or the router rejects the contract (HTTP 409) |
+| Embedding space | The region publishes its own `embedding_space` (model/dim) in the contract; since 2026-07-11 the router routes **heterogeneous fleets** by partitioning per space, so regions with different models/dims coexist. Only when the router opts into the `synapse.embedding_space` pin must `search.embeddings.model` equal it (HTTP 409 otherwise) |
 | Signing (optional, Step 24.4) | `synapse.signing_key_ref` → `src/syncsage/synapse/signing.py` Ed25519-signs `integrity.signature`; router rejects (HTTP 403) under `require_signed` |
+
+### Heterogeneous embedding spaces (2026-07-11, [x-repo] — router-side; SyncSage docs-only)
+
+The fleet no longer requires all regions to share one embedding model/dim.
+The router (subjective-retrieval, ADR 2026-07-11 in its `docs/DECISIONS.md`)
+now **partitions** registered contracts by `embedding_space
+(model_id, dim, normalized)` and scores each partition with a query vector in
+that space (per-space query embedders under its `synapse.spaces` config, or
+explicit per-space `query_vecs`); regions whose space cannot be resolved for a
+query are excluded with `embedding_space_unresolved` in the routing report.
+Cross-space math remains forbidden — white-matter edges are confirmed within
+one space only.
+
+**Region-side impact: none.** SyncSage already embeds with its own configured
+model (`search.embeddings`) and publishes its own `embedding_space` in the
+contract; the **wire format is unchanged** (no schema bump, no re-vendor,
+`tests/test_contract_parity.py` green). Operators may now mix regions on
+local, OpenAI-spec, or Gemini(-compatible) embedding models in one fleet —
+just make sure the router config carries a `synapse.spaces` entry (or a
+matching default provider) for each `model_id` the fleet's regions report, so
+text queries can be embedded into every space.
 
 ### Step 24.4 — Ed25519-signed contracts + A2A (2026-06-20, [x-repo])
 
