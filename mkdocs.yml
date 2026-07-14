@@ -86,6 +86,7 @@ nav:
       - Troubleshooting: troubleshooting.md
   - Contributor / internal:
       - SyncSage as a Synapse region (internal spec): SYNAPSE_INTEGRATION.md
+      - Roadmap — context & knowledge management (region side): ROADMAP_CONTEXT_KNOWLEDGE_MGMT.md
       - Agentic workflows: agentic_workflows.md
       - UI recommendation: ui_recommendation.md
       - Gap analysis & plan: development_patches/gap_analysis_and_plan.md
