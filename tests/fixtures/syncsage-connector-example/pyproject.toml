@@ -1,0 +1,18 @@
+# Canonical third-party connector package shape (Product Step 31.1).
+# The entry-point NAME is the `sources[].type` users write in syncsage.yaml.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "syncsage-connector-example"
+version = "0.1.0"
+description = "Example SyncSage connector plugin: indexes .txt files from a static directory."
+requires-python = ">=3.11"
+dependencies = ["syncsage>=0.3"]
+
+[project.entry-points."syncsage.connectors"]
+staticdir = "syncsage_connector_example:StaticDirConnector"
+
+[tool.setuptools.packages.find]
+include = ["syncsage_connector_example*"]

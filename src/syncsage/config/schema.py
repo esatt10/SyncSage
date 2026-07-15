@@ -36,6 +36,21 @@ class SourceType(StrEnum):
     api = "api"
 
 
+class PluginSourceType(str):
+    """A connector-plugin source type outside the built-in enum (Step 31.1).
+
+    Behaves as its plain string everywhere, plus a ``.value`` property so
+    every existing ``source.type.value`` call site works unchanged. Whether
+    a connector actually exists for the name is checked at dispatch time
+    (``connector_for_source``), not at config load — config stays loadable
+    on a machine that hasn't installed the plugin yet.
+    """
+
+    @property
+    def value(self) -> str:
+        return str(self)
+
+
 # Source types whose ``path`` is a real local directory/file (as opposed to
 # the URL/connector-backed web/api/s3 types). A relative ``path`` on one of
 # these is anchored to ``syncsage.workspace_root`` at config-load time.
@@ -390,7 +405,7 @@ class SourceConnectorSettings(ModelMixin):
 @dataclass
 class SourceConfig(ModelMixin):
     name: str
-    type: SourceType
+    type: SourceType | PluginSourceType
     path: Path
     description: str | None = None
     enabled: bool = True
@@ -489,7 +504,10 @@ class SyncSageConfig(ModelMixin):
         cfg.sources = []
         for raw in data.get("sources", []) or []:
             raw = dict(raw)
-            raw["type"] = SourceType(raw.get("type", "single_file"))
+            try:
+                raw["type"] = SourceType(raw.get("type", "single_file"))
+            except ValueError:
+                raw["type"] = PluginSourceType(str(raw.get("type")))
             src_path = Path(raw["path"])
             # Anchor a relative filesystem source path to workspace_root so a
             # config written as `path: docs` means "<workspace_root>/docs", not

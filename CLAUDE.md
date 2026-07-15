@@ -242,6 +242,24 @@ UNCHANGED** (no schema bump, no re-vendor, parity test green). Tiny WAV fixture 
 `tests/fixtures/sample_workspace/audio/briefing.wav.transcript.txt`;
 `tests/test_audio_ingestion.py`. Suite: **142 passed** (+7). **Phase 25 complete.**
 
+**Step 31.1 (Connector SDK) landed here 2026-07-15.** Third-party connector
+plugins resolve by `sources[].type` name via `importlib.metadata` entry
+points (group `syncsage.connectors`, `sync/connector_registry.py`) or
+programmatic `register_connector_class`; unknown config type strings load
+as `PluginSourceType` (a `str` with a `.value` property — existing
+`source.type.value` call sites untouched, no workspace anchoring) and
+resolve at dispatch (`connector_for_source` falls through to the registry
+after the hardcoded built-ins, so the zero-plugin path is byte-identical;
+missing plugin → error naming type + installed plugins). Public quality
+bar: `syncsage.testing.ConnectorConformance` (subclass + one
+`make_connector` factory) — FilesystemConnector passes the same harness.
+Canonical third-party shape: `tests/fixtures/syncsage-connector-example/`
+(`StaticDirConnector`), engine-e2e + idempotent second sync in
+`tests/test_connector_sdk.py`. Docs: `docs/reference/connector-sdk.md`.
+Suite: **183 passed** (+19). Steps 31.2–31.6 (Notion/GDrive/Slack/
+Confluence/IMAP) build on this, one per session; contracts in the SR
+repo's `docs/PRODUCT_FRAMEWORK.md` §3.
+
 Full step contracts with acceptance criteria: `docs/SYNAPSE_INTEGRATION.md` §2.
 
 | Step | What | Fixes | Status |

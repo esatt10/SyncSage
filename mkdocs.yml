@@ -76,6 +76,7 @@ nav:
       - MCP for agents: mcp_client.md
   - Reference:
       - Configuration: configuration.md
+      - Connector SDK: reference/connector-sdk.md
       - Interface matrix: reference/interfaces.md
       - HTTP API: reference/http-api.md
       - MCP tools & resources: mcp_tools.md

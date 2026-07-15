@@ -90,6 +90,35 @@ listings deferred (release-channel work, tracked in the SR framework doc).
 
 **Phase 30 is complete (2026-07-15).**
 
+## 2c. Phase 31 — region-side step contracts (execution started 2026-07-15)
+
+Canonical contracts: `subjective-retrieval/docs/PRODUCT_FRAMEWORK.md` §3.
+
+### Step 31.1 — Connector SDK — **landed 2026-07-15**
+
+Third parties add a source type without forking: connector classes resolve
+by `sources[].type` name through `importlib.metadata` entry points (group
+`syncsage.connectors`, new `sync/connector_registry.py`) or programmatic
+`register_connector_class`; loaded objects must subclass
+`SourceConnector`. Config accepts unknown type strings as
+`PluginSourceType` (a `str` with a `.value` property — every existing
+`source.type.value` call site untouched; no workspace-root anchoring for
+plugin types); resolution happens at dispatch, and a missing plugin fails
+the sync naming the type + installed plugins. Built-ins stay hardcoded in
+`connector_for_source` — the zero-plugin path is byte-identical. The
+public quality bar is `syncsage.testing.ConnectorConformance` (declared
+type, healthy validate, deterministic unique identities, stable payloads
+or `ItemNotModified`, JSON-serializable checkpoint round-trip, full-mode
+bypass) — **FilesystemConnector passes the same harness**. Canonical
+third-party shape: `tests/fixtures/syncsage-connector-example/`
+(`StaticDirConnector`), driven end-to-end through `SyncEngine` with an
+idempotent second sync in `tests/test_connector_sdk.py`; conformance for
+both connectors in `tests/test_connector_conformance.py`. Docs:
+`docs/reference/connector-sdk.md`. Steps 31.2–31.6 (Notion, Google Drive,
+Slack, Confluence/Jira, IMAP) build on this SDK, one per session, each
+with recorded-fixture offline tests + ACL-capture fields reserved for
+Phase 32; 31.7 publishes the conformance suite as the public bar.
+
 ## 3. Sequencing note for this repo
 
 The enterprise track runs **30 → 31 → 32 → 36** and is region-heavy; the
