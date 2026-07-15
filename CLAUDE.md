@@ -122,6 +122,9 @@ syncsage validate && syncsage doctor       # config + environment checks
 syncsage start                             # HTTP API + MCP on :8765
 syncsage sync --source <name> --mode incremental|full|validate_only|repair
 syncsage mcp --transport stdio             # standalone MCP server
+syncsage client-config claude-code|cursor|vscode   # emit MCP client config
+                                           #   (agents: --mode local|docker-exec|
+                                           #    docker-run; Step 30.5)
 syncsage config show                       # resolved config after profile+YAML+--set
 docker compose up                          # container + optional UI sidecar
 ```

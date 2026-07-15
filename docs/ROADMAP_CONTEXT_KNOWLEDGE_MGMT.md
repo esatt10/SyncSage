@@ -68,8 +68,27 @@ byte-stable config + zero re-index (idempotency spine); detection tests
 for all three types; fully offline; no synapse config emitted (standalone
 mode untouched).
 
-Steps 30.3 (published images) and 30.5 (KB-MCP wedge packaging) also land
-partly here — contracted in the SR framework doc when scheduled.
+### Step 30.3 — published images — **landed 2026-07-15 (defaults alignment)**
+
+This repo's half pre-existed: `.github/workflows/container.yml` publishes
+`ghcr.io/<owner>/syncsage:<semver>` on every merged release. The SR side
+aligned its Helm/compose/docs defaults to the published-image path (its
+`docs/PRODUCT_FRAMEWORK.md` §2 has the full contract). No change here.
+
+### Step 30.5 — KB-MCP wedge — **landed 2026-07-15**
+
+`syncsage client-config claude-code|cursor [--mode local|docker-exec|
+docker-run]`: new `src/syncsage/mcp_client/agents.py` emits the shared
+`mcpServers` config shape (project `.mcp.json` / `.cursor/mcp.json`).
+`local` mode runs the pip-installed binary over stdio — the zero-docker
+path that pairs with `syncsage up` (whose ready-message now prints the
+attach command); docker modes reuse the VS Code arg vectors. Guide:
+`docs/how-to/attach-to-coding-agent.md`. MCP tool surface unchanged
+(additive-only rule respected). Acceptance: agent-config cases in
+`tests/test_mcp_client_config.py`. External MCP registry/directory
+listings deferred (release-channel work, tracked in the SR framework doc).
+
+**Phase 30 is complete (2026-07-15).**
 
 ## 3. Sequencing note for this repo
 

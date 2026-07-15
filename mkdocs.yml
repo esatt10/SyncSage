@@ -66,6 +66,7 @@ nav:
       - 10-minute quickstart: tutorials/quickstart.md
       - Multi-modal ingest (image + audio): tutorials/multimodal.md
   - How-to guides:
+      - Attach to a coding agent (MCP): how-to/attach-to-coding-agent.md
       - Configure sources: how-to/sources.md
       - Multi-modal ingest: how-to/multimodal-ingest.md
       - Vector self-search: how-to/vector-search.md

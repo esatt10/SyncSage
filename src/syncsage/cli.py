@@ -115,6 +115,18 @@ def main(argv: list[str] | None = None) -> int:
     vscode_p.add_argument("--container-name", default="syncsage")
     vscode_p.add_argument("--image")
     vscode_p.add_argument("--output", "-o")
+    for agent_name in ("claude-code", "cursor"):
+        agent_p = client_sub.add_parser(
+            agent_name, help=f"emit an mcpServers config for {agent_name}"
+        )
+        agent_p.add_argument(
+            "--mode", choices=("local", "docker-exec", "docker-run"), default="local"
+        )
+        agent_p.add_argument("--server-name", default="syncsage")
+        agent_p.add_argument("--config", "-c", default="syncsage.yaml")
+        agent_p.add_argument("--container-name", default="syncsage")
+        agent_p.add_argument("--image")
+        agent_p.add_argument("--output", "-o")
     compose_env_p = sub.add_parser("compose-env")
     compose_env_p.add_argument("config", nargs="?", default="syncsage.yaml")
     compose_env_p.add_argument("--output", "-o")
@@ -162,6 +174,10 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.no_serve:
             print(f"Ready. Start the server with: syncsage start -c {config_path}")
+            print(
+                "Attach to a coding agent: "
+                f"syncsage client-config claude-code -c {config_path} -o .mcp.json"
+            )
             return 0
         from syncsage.config.loader import load_config
 
@@ -328,6 +344,32 @@ def main(argv: list[str] | None = None) -> int:
             render_vscode_mcp_json,
         )
 
+        if args.client in ("claude-code", "cursor"):
+            from syncsage.mcp_client.agents import (
+                AGENT_CONFIG_FILES,
+                agent_mcp_config,
+                render_agent_mcp_json,
+            )
+
+            payload = agent_mcp_config(
+                args.mode,
+                server_name=args.server_name,
+                config_path=args.config,
+                container_name=args.container_name,
+                image=args.image,
+            )
+            rendered = render_agent_mcp_json(payload)
+            if args.output:
+                output_path = Path(args.output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(rendered, encoding="utf-8")
+            else:
+                print(rendered, end="")
+                print(
+                    f"# save as {AGENT_CONFIG_FILES[args.client]} in your project root",
+                    file=sys.stderr,
+                )
+            return 0
         if args.client != "vscode":
             client_p.print_help()
             return 1
