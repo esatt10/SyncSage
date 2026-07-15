@@ -60,6 +60,21 @@ def main(argv: list[str] | None = None) -> int:
         description="SyncSage knowledge graph indexing server",
     )
     sub = parser.add_subparsers(dest="command")
+    up_p = sub.add_parser(
+        "up",
+        help="zero-config quickstart: detect, generate config, index, serve",
+    )
+    up_p.add_argument("path", nargs="?", default=".")
+    up_p.add_argument("--config", "-c", default="syncsage.yaml")
+    up_p.add_argument("--name", help="knowledge-base name [default: slug of the directory]")
+    up_p.add_argument("--port", type=int, default=8765)
+    up_p.add_argument("--profile", default="quickstart")
+    up_p.add_argument("--mode", default="incremental")
+    up_p.add_argument(
+        "--no-serve",
+        action="store_true",
+        help="generate + index only; do not start the server",
+    )
     start_p = sub.add_parser("start")
     start_p.add_argument("--config", "-c", default="syncsage.yaml")
     start_p.add_argument("--profile", default="quickstart")
@@ -115,6 +130,44 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command in {None, "--help"}:
         parser.print_help()
+        return 0
+    if args.command == "up":
+        from syncsage.quickstart import ensure_up_config
+        from syncsage.sync.locks import EngineLeaseError
+
+        target = Path(args.path).resolve()
+        if not target.is_dir():
+            print(f"ERROR: not a directory: {target}", file=sys.stderr)
+            return 1
+        config_path = Path(args.config)
+        created = ensure_up_config(
+            target, config_path, name=args.name, port=args.port, profile=args.profile
+        )
+        if created:
+            print(f"Wrote {config_path}")
+        else:
+            print(f"Reusing existing {config_path} (never overwritten)")
+        engine = _engine(config_path)
+        try:
+            results = engine.sync_all(args.mode)
+        except EngineLeaseError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            engine.close()
+        for r in results:
+            print(
+                f"{r.source_id}: indexed={r.indexed_artifacts} "
+                f"skipped={r.skipped_artifacts} nodes={r.graph_nodes} edges={r.graph_edges}"
+            )
+        if args.no_serve:
+            print(f"Ready. Start the server with: syncsage start -c {config_path}")
+            return 0
+        from syncsage.config.loader import load_config
+
+        cfg = load_config(config_path)
+        print(f"Serving API + MCP on http://{cfg.server.host}:{cfg.server.port}")
+        _serve_app(cfg, str(config_path))
         return 0
     if args.command == "start":
         from syncsage.config.loader import load_layered_config, parse_override_pairs

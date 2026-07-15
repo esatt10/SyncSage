@@ -114,6 +114,9 @@ pip install -e ".[dev,mcp]"
 pytest -q                                  # full suite, offline by design
 ruff check src tests && ruff format --check src tests
 
+syncsage up [PATH] [--no-serve]            # zero-config quickstart: detect
+                                           #   (.obsidian/.git/folder) → generate
+                                           #   config → index → serve (Step 30.1)
 syncsage init --profile quickstart         # generate starter syncsage.yaml
 syncsage validate && syncsage doctor       # config + environment checks
 syncsage start                             # HTTP API + MCP on :8765

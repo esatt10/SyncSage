@@ -45,6 +45,32 @@ limitations. They stay inviolate through every phase below.
 | **35 — Open contract spec + adapters** [x-repo] | Schema re-vendor **only if** SR bumps the wire format (bilateral law + PARITY.json); A2A alignment if the region grows its own card | Never hand-edit `contracts/`; vendored-fixture parity |
 | **36 — Enterprise ops** | Fleet observability hooks (region health/sync metrics), backup/restore drill participation (21.6 snapshots already ship) | `/state` is user data — migrations preserve originals |
 
+## 2b. Phase 30 — region-side step contracts (execution started 2026-07-15)
+
+Canonical contracts live in
+`subjective-retrieval/docs/PRODUCT_FRAMEWORK.md` §2; this section mirrors
+only the steps that land **here**.
+
+### Step 30.1 — `syncsage up` personal quickstart — **landed 2026-07-15**
+
+One command takes a directory (default `.`) from nothing to an indexed,
+queryable knowledge base: **detect** (`.obsidian/` → `obsidian_vault`,
+`.git/` → `repository`, else `document_folder`) → **generate** a
+laptop-shaped config if absent (quickstart profile, one source with the
+detected type + absolute path, name slugged from the dir, state anchored
+under `./.syncsage/{state,vault,exports}`, `workspace_root` = target;
+an existing config is **reused unchanged**, never overwritten) →
+**index** via the normal `SyncEngine.sync_all("incremental")` →
+**serve** as `syncsage start` does (`--no-serve` stops after sync,
+`--port` sets the generated port). Acceptance: fixture-workspace run
+indexes > 0 artifacts with state under `./.syncsage/state`; second run is
+byte-stable config + zero re-index (idempotency spine); detection tests
+for all three types; fully offline; no synapse config emitted (standalone
+mode untouched).
+
+Steps 30.3 (published images) and 30.5 (KB-MCP wedge packaging) also land
+partly here — contracted in the SR framework doc when scheduled.
+
 ## 3. Sequencing note for this repo
 
 The enterprise track runs **30 → 31 → 32 → 36** and is region-heavy; the
