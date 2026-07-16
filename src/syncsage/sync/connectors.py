@@ -571,6 +571,7 @@ def connector_for_source(source: SourceConfig, state: StateStore) -> SourceConne
         "obsidian_vault",
         "document_folder",
         "single_file",
+        "memory",
     }:
         return FilesystemConnector(source, state)
     if source.type.value == "web_collection":

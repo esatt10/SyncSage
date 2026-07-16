@@ -34,6 +34,7 @@ class SourceType(StrEnum):
     single_file = "single_file"
     s3 = "s3"
     api = "api"
+    memory = "memory"
 
 
 class PluginSourceType(str):
@@ -61,6 +62,7 @@ FILESYSTEM_SOURCE_TYPES = frozenset(
         SourceType.obsidian_vault,
         SourceType.document_folder,
         SourceType.single_file,
+        SourceType.memory,
     }
 )
 

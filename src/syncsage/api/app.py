@@ -44,6 +44,15 @@ class SearchRequest(BaseModel):
     source_name: str | None = None
 
 
+class MemoryWriteRequest(BaseModel):
+    text: str
+    scope: str = "user"
+    subject: str | None = None
+    supersedes: str | None = None
+    tags: list[str] = []
+    sync: bool = True
+
+
 class SyncRequest(BaseModel):
     knowledge_base: str | None = None
     source_name: str | None = None
@@ -535,6 +544,53 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/memory")
+    def memory_write(req: MemoryWriteRequest) -> dict:
+        from syncsage.memory.store import MemoryStore, memory_source
+
+        source = memory_source(config)
+        if source is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "no enabled memory source configured; add a `type: memory` "
+                    "source to syncsage.yaml"
+                ),
+            )
+        try:
+            record, created = MemoryStore(source.path).append(
+                req.text,
+                scope=req.scope,
+                subject=req.subject,
+                supersedes=req.supersedes,
+                tags=req.tags,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        payload: dict = {"record": record.as_dict(), "created": created, "source": source.name}
+        if req.sync and created:
+            payload["sync"] = engine.sync_source(source.name, "incremental").__dict__
+        return payload
+
+    @app.get("/memory")
+    def memory_list(scope: str | None = None) -> dict:
+        from syncsage.memory.store import MemoryStore, memory_source
+
+        source = memory_source(config)
+        if source is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "no enabled memory source configured; add a `type: memory` "
+                    "source to syncsage.yaml"
+                ),
+            )
+        try:
+            records = MemoryStore(source.path).list_records(scope)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"source": source.name, "records": [r.as_dict() for r in records]}
 
     @app.get("/sync/status")
     def sync_status() -> dict:

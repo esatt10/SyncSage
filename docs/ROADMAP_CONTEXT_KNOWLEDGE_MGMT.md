@@ -119,6 +119,32 @@ Slack, Confluence/Jira, IMAP) build on this SDK, one per session, each
 with recorded-fixture offline tests + ACL-capture fields reserved for
 Phase 32; 31.7 publishes the conformance suite as the public bar.
 
+## 2d. Phase 33 — region-side step contracts (execution started 2026-07-16)
+
+Canonical contracts: `subjective-retrieval/docs/PRODUCT_FRAMEWORK.md` §3c.
+
+### Step 33.1 — Memory region type + write path — **landed 2026-07-16**
+
+**Memory records are source content** — the write path only creates files;
+indexing stays the ordinary deterministic pipeline. New
+`src/syncsage/memory/store.py`: append-only `MemoryStore` (one Markdown
+file per record under `<memory-source>/<scope>/<record_id>.md`,
+frontmatter with `schema_version: 1` / scope / subject / `asserted_at` /
+optional `supersedes` + `tags`; deterministic id
+`mem-<instant>-<blake2b8(scope|subject|text)>`; identical write →
+`created: false`, nothing ever overwritten). `SourceType.memory` is a
+built-in filesystem source type (watcher/scheduler/globs/anchoring as any
+folder). Write surfaces (additive): MCP `memory_write` on `SyncSageTools`
++ `POST /memory` / `GET /memory` on the API — `sync=true` default gives
+read-your-writes via ordinary `search_context`; no memory source →
+actionable error. The contract publisher advertises `"memory"` in
+`capabilities.modalities` (25.4 image/audio precedent — existing wire
+data, no schema bump, parity green). Acceptance:
+`tests/test_memory_region.py` (store determinism/round-trip/validation,
+MCP write→search e2e + zero-work re-write, HTTP round-trip + 400s,
+publisher capability). Steps 33.2 (temporal validity + consolidation)
+lands here next; 33.3/33.4 (routing + benchmark) land in SR.
+
 ## 3. Sequencing note for this repo
 
 The enterprise track runs **30 → 31 → 32 → 36** and is region-heavy; the

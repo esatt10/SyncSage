@@ -219,6 +219,52 @@ class SyncSageTools:
             self._audit(result["source_id"], "sync_source", "mcp", "mcp", None, utc_now(), result)
         return {"results": results}
 
+    def memory_write(
+        self,
+        knowledge_base: str,
+        text: str,
+        scope: str = "user",
+        subject: str | None = None,
+        supersedes: str | None = None,
+        tags: list[str] | None = None,
+        sync: bool = True,
+    ) -> dict:
+        """Append one memory record and (by default) index it immediately.
+
+        The record lands as a Markdown file in the configured ``type: memory``
+        source; ``sync=True`` runs an incremental sync of that source so the
+        memory is retrievable via ``search_context`` in the same session
+        (read-your-writes). Recall is ordinary search — no separate path.
+        """
+        from syncsage.memory.store import MemoryStore, memory_source
+
+        self._require_knowledge_base(knowledge_base)
+        source = memory_source(self.config)
+        if source is None:
+            raise ValueError(
+                "no enabled memory source configured. Add one to syncsage.yaml:\n"
+                "  sources:\n"
+                "    - name: agent-memory\n"
+                "      type: memory\n"
+                "      path: memory"
+            )
+        record, created = MemoryStore(source.path).append(
+            text, scope=scope, subject=subject, supersedes=supersedes, tags=tags or ()
+        )
+        result: dict = {"record": record.as_dict(), "created": created, "source": source.name}
+        if sync and created:
+            result["sync"] = self.engine.sync_source(source.name, "incremental").__dict__
+        self._audit(
+            source.name,
+            "memory_write",
+            "mcp",
+            "mcp",
+            None,
+            utc_now(),
+            {"record_id": record.record_id, "scope": record.scope, "created": created},
+        )
+        return result
+
     def search_context(
         self,
         knowledge_base: str,

@@ -242,6 +242,21 @@ UNCHANGED** (no schema bump, no re-vendor, parity test green). Tiny WAV fixture 
 `tests/fixtures/sample_workspace/audio/briefing.wav.transcript.txt`;
 `tests/test_audio_ingestion.py`. Suite: **142 passed** (+7). **Phase 25 complete.**
 
+**Step 33.1 (agent memory as a region) landed here 2026-07-16.** Memory
+records are **source content**: `memory/store.py` appends one frontmatter
+Markdown file per record (`schema_version: 1`, deterministic
+`mem-<instant>-<blake2b8>` ids, append-only, `<scope>/` dirs) into a new
+built-in `SourceType.memory` filesystem source; indexing is the normal
+deterministic pipeline (no second path, no LLM). Write surfaces
+(additive): MCP `memory_write` (`SyncSageTools` + server tool) and
+`POST/GET /memory` — `sync=true` default → read-your-writes via ordinary
+`search_context`; recall IS search. Publisher advertises `"memory"` in
+`capabilities.modalities` (25.4 precedent — wire format unchanged, parity
+green). Acceptance: `tests/test_memory_region.py` (9). Suite: **192
+passed** (+9). Next region-side: 33.2 (supersedes/validity +
+consolidation); 33.3/33.4 live in SR. Docs:
+`docs/how-to/agent-memory.md`, contracts in SR `PRODUCT_FRAMEWORK.md` §3c.
+
 **Step 31.1 (Connector SDK) landed here 2026-07-15.** Third-party connector
 plugins resolve by `sources[].type` name via `importlib.metadata` entry
 points (group `syncsage.connectors`, `sync/connector_registry.py`) or

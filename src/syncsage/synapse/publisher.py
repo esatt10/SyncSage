@@ -359,6 +359,14 @@ class ContractPublisher:
         # the router's `--modality audio` filter selects this region.
         if config_has_audio_source(self.config):
             modalities.append("audio")
+        # Product 33.1: advertise "memory" when a `type: memory` source is
+        # configured, so the router's `--modality memory` filter routes
+        # remember/recall traffic to memory-capable regions. Existing wire
+        # data — no schema bump (the 25.4 image/audio precedent).
+        from syncsage.memory.store import memory_source
+
+        if memory_source(self.config) is not None:
+            modalities.append("memory")
         return {
             "search_modes": search_modes,
             "granularities": ["summaries", "chunks", "graph"],
