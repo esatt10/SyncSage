@@ -265,6 +265,29 @@ class SyncSageTools:
         )
         return result
 
+    def memory_consolidate(self, knowledge_base: str) -> dict:
+        """Run one memory-consolidation pass now (Step 33.2).
+
+        Archives superseded and TTL-expired records (files renamed, never
+        deleted) and re-syncs the memory source so they leave the index. The
+        scheduler runs this automatically; this tool is the on-demand edge.
+        """
+        from syncsage.memory.maintenance import run_memory_maintenance
+
+        self._require_knowledge_base(knowledge_base)
+        result = run_memory_maintenance(self.engine)
+        if result is None:
+            return {
+                "skipped": (
+                    "memory consolidation is disabled or no `type: memory` "
+                    "source is configured"
+                )
+            }
+        self._audit(
+            result["source"], "memory_consolidate", "mcp", "mcp", None, utc_now(), result["report"]
+        )
+        return result
+
     def search_context(
         self,
         knowledge_base: str,

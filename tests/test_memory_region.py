@@ -247,3 +247,152 @@ def test_publisher_advertises_memory_modality(tmp_path: Path) -> None:
     plain_dir.mkdir()
     without = load_config(_write_config(plain_dir, include_memory=False))
     assert "memory" not in ContractPublisher(without, state)._capabilities()["modalities"]
+
+
+# ---------------------------------------------------------------------------
+# Step 33.2 — validity chains + consolidation
+# ---------------------------------------------------------------------------
+
+
+def test_supersedes_chain_filters_current_records(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    old, _ = store.append("Staging lives in us-west-1.", scope="org", now=PINNED_NOW)
+    newer, _ = store.append(
+        "Staging lives in us-east-2.",
+        scope="org",
+        supersedes=old.record_id,
+        now=PINNED_NOW.replace(hour=13),
+    )
+    assert {r.record_id for r in store.list_records()} == {old.record_id, newer.record_id}
+    current = store.list_records(current_only=True)
+    assert [r.record_id for r in current] == [newer.record_id]
+
+
+def test_consolidate_archives_superseded_and_expired_deterministically(
+    tmp_path: Path,
+) -> None:
+    from datetime import timedelta
+
+    store = MemoryStore(tmp_path / "memory")
+    old, _ = store.append("Old fact.", scope="org", now=PINNED_NOW)
+    newer, _ = store.append(
+        "New fact.", scope="org", supersedes=old.record_id, now=PINNED_NOW.replace(hour=13)
+    )
+    stale_session, _ = store.append(
+        "Scratch thought.", scope="session", now=PINNED_NOW - timedelta(days=30)
+    )
+    fresh_user, _ = store.append("Durable preference.", scope="user", now=PINNED_NOW)
+
+    report = store.consolidate(now=PINNED_NOW.replace(hour=14), session_ttl_days=7)
+    assert report.archived_superseded == (old.record_id,)
+    assert report.archived_expired == (stale_session.record_id,)
+    assert report.kept == 2
+    assert not old.path.exists()
+    assert (old.path.parent / (old.path.name + ".archived")).exists()  # bytes preserved
+    assert newer.path.exists() and fresh_user.path.exists()
+
+    # Idempotent: a second pass over unchanged content archives nothing.
+    second = store.consolidate(now=PINNED_NOW.replace(hour=14), session_ttl_days=7)
+    assert second.archived == 0
+    assert second.kept == 2
+
+
+def test_ttl_none_means_scope_never_expires(tmp_path: Path) -> None:
+    from datetime import timedelta
+
+    store = MemoryStore(tmp_path / "memory")
+    store.append("Ancient but precious.", scope="user", now=PINNED_NOW - timedelta(days=3650))
+    report = store.consolidate(now=PINNED_NOW)
+    assert report.archived == 0
+    assert report.kept == 1
+
+
+def test_maintenance_reindexes_so_search_forgets_archived_records(tmp_path: Path) -> None:
+    from syncsage.memory.maintenance import run_memory_maintenance
+
+    config = load_config(_write_config(tmp_path))
+    tools = SyncSageTools(config)
+    try:
+        first = tools.memory_write("memory-test", "The rollout password is BANANAS.", scope="org")
+        old_id = first["record"]["record_id"]
+        tools.memory_write(
+            "memory-test",
+            "The rollout password is GRAPES.",
+            scope="org",
+            supersedes=old_id,
+        )
+        assert (
+            "bananas"
+            in str(tools.search_context("memory-test", "rollout password", mode="text")).lower()
+        )
+
+        result = run_memory_maintenance(tools.engine)
+        assert result is not None
+        assert result["report"]["archived"] == 1
+        assert result["sync"]["indexed_artifacts"] >= 1
+
+        flattened = str(
+            tools.search_context("memory-test", "rollout password", mode="text")
+        ).lower()
+        assert "grapes" in flattened
+        assert "bananas" not in flattened
+
+        # Second pass: nothing to archive, no re-sync.
+        again = run_memory_maintenance(tools.engine)
+        assert again is not None
+        assert again["report"]["archived"] == 0
+        assert "sync" not in again
+    finally:
+        tools.engine.close()
+
+
+def test_maintenance_respects_disable_and_missing_source(tmp_path: Path) -> None:
+    from syncsage.memory.maintenance import run_memory_maintenance
+
+    no_source = load_config(_write_config(tmp_path, include_memory=False))
+    tools = SyncSageTools(no_source)
+    try:
+        assert run_memory_maintenance(tools.engine) is None
+        assert "skipped" in tools.memory_consolidate("memory-test")
+    finally:
+        tools.engine.close()
+
+    disabled_dir = tmp_path / "disabled"
+    disabled_dir.mkdir()
+    config_path = _write_config(disabled_dir)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "memory:\n  consolidation_enabled: false\n",
+        encoding="utf-8",
+    )
+    tools2 = SyncSageTools(load_config(config_path))
+    try:
+        assert run_memory_maintenance(tools2.engine) is None
+    finally:
+        tools2.engine.close()
+
+
+def test_http_consolidate_endpoint(tmp_path: Path) -> None:
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from syncsage.api.app import create_app
+
+    config_path = _write_config(tmp_path)
+    app = create_app(load_config(config_path), config_path=str(config_path))
+    client = fastapi_testclient.TestClient(app)
+    try:
+        first = client.post("/memory", json={"text": "v1 of the fact", "scope": "org"}).json()
+        client.post(
+            "/memory",
+            json={
+                "text": "v2 of the fact",
+                "scope": "org",
+                "supersedes": first["record"]["record_id"],
+            },
+        )
+        resp = client.post("/memory/consolidate")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["report"]["archived"] == 1
+
+        current = client.get("/memory", params={"current_only": True}).json()["records"]
+        assert [r["text"] for r in current] == ["v2 of the fact"]
+    finally:
+        app.state.engine.close()

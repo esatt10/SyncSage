@@ -137,6 +137,12 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
         return tools.memory_write(knowledge_base, text, scope, subject, supersedes, tags, sync)
 
     @mcp.tool()
+    def memory_consolidate(knowledge_base: str) -> dict:
+        """Archive superseded/expired memory records and re-index the memory source."""
+
+        return tools.memory_consolidate(knowledge_base)
+
+    @mcp.tool()
     def sync_all(knowledge_base: str, mode: str = "incremental") -> dict:
         """Sync all enabled configured sources."""
 

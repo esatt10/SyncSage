@@ -70,13 +70,35 @@ The staging cluster lives in us-east-2.
 
 Writing the identical fact again is a no-op (`created: false`, no
 re-index). Re-asserting a fact later creates a new record — recency is
-signal. The optional `supersedes: <record_id>` field marks corrections;
-validity-window handling and consolidation land in Step 33.2.
+signal.
+
+## Corrections, decay, and consolidation
+
+Pass `supersedes: <record_id>` when a memory corrects an earlier one. The
+old record is then no longer *current* — `GET /memory?current_only=true`
+filters it immediately — and the next **consolidation pass** archives it:
+the file is renamed `<id>.md.archived` in place (bytes preserved forever,
+nothing deleted) and a full re-sync of the memory source drops it from the
+index, so search stops surfacing the stale fact while the audit trail
+remains on disk.
+
+Consolidation runs automatically on the scheduler beat, or on demand via
+the `memory_consolidate` MCP tool / `POST /memory/consolidate`. Per-scope
+decay is opt-in:
+
+```yaml
+memory:
+  consolidation_enabled: true   # default — supersedes chains get archived
+  session_ttl_days: 14          # opt-in: scratch session memories decay
+  user_ttl_days: null           # null = the scope never expires (default)
+  org_ttl_days: null
+```
 
 ## Fleet routing
 
 A region with a memory source advertises `memory` in its contract's
-`capabilities.modalities`, so a Synapse router can direct remember/recall
-traffic to memory-capable regions with the existing `--modality memory`
-filter — no wire-format change. The router-side `synapse_remember` tool is
-Step 33.3.
+`capabilities.modalities`, so a Synapse router directs remember/recall
+traffic with the existing `--modality memory` filter — no wire-format
+change. Router-side, the `synapse_remember` MCP tool (Step 33.3) routes a
+write to the fleet's memory-capable region and recall stays ordinary
+`synapse_search`.

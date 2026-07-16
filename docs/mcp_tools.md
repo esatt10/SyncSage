@@ -50,6 +50,7 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 | `sync_source` | Trigger `incremental`, `full`, `validate_only`, or `repair` sync for one source. |
 | `sync_all` | Trigger sync for all enabled sources. |
 | `memory_write` | Append one agent-memory record (`session`/`user`/`org` scope, optional `subject`/`supersedes`/`tags`) to the configured `type: memory` source and, by default, index it immediately — the memory is retrievable via `search_context` in the same session. Recall is ordinary search; there is no separate read path. |
+| `memory_consolidate` | Run one consolidation pass now: archive superseded and TTL-expired memory records (files renamed `.md.archived`, never deleted) and re-sync the memory source so they leave the index. The scheduler runs this automatically; this is the on-demand edge. |
 | `search_context` | Search graph/search state in `text` (SQLite full-text over chunk content and paths), `graph` (node/relationship labels, types and attribute values), `vector` (embedding similarity; requires `search.embeddings.enabled`, otherwise contributes nothing), or `hybrid` (merged and re-ranked) mode. |
 | `get_relevant_files` | Return files likely needed for a coding task. |
 | `get_graph_neighbors` | Traverse graph neighbors with true depth-aware BFS and optional edge-type filters. |

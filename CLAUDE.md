@@ -252,10 +252,24 @@ deterministic pipeline (no second path, no LLM). Write surfaces
 `POST/GET /memory` — `sync=true` default → read-your-writes via ordinary
 `search_context`; recall IS search. Publisher advertises `"memory"` in
 `capabilities.modalities` (25.4 precedent — wire format unchanged, parity
-green). Acceptance: `tests/test_memory_region.py` (9). Suite: **192
-passed** (+9). Next region-side: 33.2 (supersedes/validity +
-consolidation); 33.3/33.4 live in SR. Docs:
+green). Acceptance: `tests/test_memory_region.py`. Docs:
 `docs/how-to/agent-memory.md`, contracts in SR `PRODUCT_FRAMEWORK.md` §3c.
+
+**Step 33.2 (memory validity + consolidation) landed here 2026-07-16.**
+Supersedes chains resolve across scopes (`list_records(current_only=True)`
+/ `GET /memory?current_only=true` filter live). Consolidation is a pure
+content operation: superseded + per-scope-TTL-expired records are archived
+(`<id>.md.archived` rename in place — bytes preserved, never deleted — so
+the `**/*.md` include glob stops matching), then a **full** re-sync of the
+small memory source prunes them from index/graph/vectors through the
+ordinary pipeline (incremental never prunes). Runs on the 21.1 scheduler
+beat (`memory/maintenance.run_memory_maintenance`) + on demand
+(`memory_consolidate` MCP tool, `POST /memory/consolidate`). New config
+block `memory.{consolidation_enabled, session_ttl_days, user_ttl_days,
+org_ttl_days}` (TTLs opt-in `None`, consolidation on by default).
+Deterministic in `now`, idempotent second pass.
+`tests/test_memory_region.py` (15 total). Suite: **198 passed** (+6).
+33.4 (benchmark) remains in SR.
 
 **Step 31.1 (Connector SDK) landed here 2026-07-15.** Third-party connector
 plugins resolve by `sources[].type` name via `importlib.metadata` entry

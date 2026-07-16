@@ -142,8 +142,27 @@ actionable error. The contract publisher advertises `"memory"` in
 data, no schema bump, parity green). Acceptance:
 `tests/test_memory_region.py` (store determinism/round-trip/validation,
 MCP write→search e2e + zero-work re-write, HTTP round-trip + 400s,
-publisher capability). Steps 33.2 (temporal validity + consolidation)
-lands here next; 33.3/33.4 (routing + benchmark) land in SR.
+publisher capability). 33.3/33.4 (routing + benchmark) land in SR.
+
+### Step 33.2 — Temporal validity + consolidation — **landed 2026-07-16**
+
+A record is **superseded** once any record names it in `supersedes`
+(chains resolved across scopes); `list_records(current_only=True)` /
+`GET /memory?current_only=true` filter live. **Consolidation** is a pure
+content operation: superseded + per-scope-TTL-expired records are archived
+(file renamed `<id>.md.archived` in place — bytes preserved, never
+deleted — so it stops matching the `**/*.md` include glob), then a
+**full** re-sync of the small memory source drops them from
+index/graph/vectors through the ordinary pipeline (incremental never
+prunes). Runs on the 21.1 scheduler beat
+(`memory/maintenance.run_memory_maintenance`) and on demand
+(`memory_consolidate` MCP tool, `POST /memory/consolidate`). Config
+`memory.{consolidation_enabled, session_ttl_days, user_ttl_days,
+org_ttl_days}` — TTLs opt-in, consolidation on by default. Deterministic
+in `now`, idempotent second pass. Acceptance: +6 cases in
+`tests/test_memory_region.py` (chain filtering, deterministic+idempotent
+archive, search-forgets-after-maintenance, TTL-None, disabled/no-source
+no-ops, HTTP round-trip).
 
 ## 3. Sequencing note for this repo
 

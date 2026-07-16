@@ -574,7 +574,7 @@ def create_app(
         return payload
 
     @app.get("/memory")
-    def memory_list(scope: str | None = None) -> dict:
+    def memory_list(scope: str | None = None, current_only: bool = False) -> dict:
         from syncsage.memory.store import MemoryStore, memory_source
 
         source = memory_source(config)
@@ -587,10 +587,25 @@ def create_app(
                 ),
             )
         try:
-            records = MemoryStore(source.path).list_records(scope)
+            records = MemoryStore(source.path).list_records(scope, current_only=current_only)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"source": source.name, "records": [r.as_dict() for r in records]}
+
+    @app.post("/memory/consolidate")
+    def memory_consolidate() -> dict:
+        from syncsage.memory.maintenance import run_memory_maintenance
+
+        result = run_memory_maintenance(engine)
+        if result is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "memory consolidation is disabled or no `type: memory` "
+                    "source is configured"
+                ),
+            )
+        return result
 
     @app.get("/sync/status")
     def sync_status() -> dict:

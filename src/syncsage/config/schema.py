@@ -358,6 +358,22 @@ class SynapseSettings(ModelMixin):
 
 
 @dataclass
+class MemorySettings(ModelMixin):
+    """Agent-memory consolidation policy (Step 33.2).
+
+    Consolidation archives superseded records (an explicit correction is the
+    only default trigger); per-scope TTL decay is opt-in — ``None`` means the
+    scope never expires. Archived record files are renamed in place
+    (``.md.archived``) and never deleted.
+    """
+
+    consolidation_enabled: bool = True
+    session_ttl_days: int | None = None
+    user_ttl_days: int | None = None
+    org_ttl_days: int | None = None
+
+
+@dataclass
 class SecuritySettings(ModelMixin):
     allow_workspace_roots: list[Path] = field(
         default_factory=lambda: [Path("/workspace"), Path("/vault"), Path("/exports")]
@@ -442,6 +458,7 @@ class SyncSageConfig(ModelMixin):
     obsidian: ObsidianSettings = field(default_factory=ObsidianSettings)
     security: SecuritySettings = field(default_factory=SecuritySettings)
     synapse: SynapseSettings = field(default_factory=SynapseSettings)
+    memory: MemorySettings = field(default_factory=MemorySettings)
     sources: list[SourceConfig] = field(default_factory=list)
 
     @classmethod
@@ -501,6 +518,7 @@ class SyncSageConfig(ModelMixin):
             obsidian=build(ObsidianSettings, data.get("obsidian")),
             security=build(SecuritySettings, data.get("security")),
             synapse=build(SynapseSettings, data.get("synapse")),
+            memory=build(MemorySettings, data.get("memory")),
             sources=[],
         )
         cfg.sources = []

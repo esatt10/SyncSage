@@ -78,7 +78,19 @@ class SchedulerService:
             try:
                 with self._sync_lock:
                     results = self.engine.sync_all("incremental")
+                    # Step 33.2: memory consolidation rides the same beat —
+                    # archive superseded/expired records, then a full re-sync
+                    # of the (small) memory source drops them from the index.
+                    # No-ops fast when no memory source is configured.
+                    from syncsage.memory.maintenance import run_memory_maintenance
+
+                    maintenance = run_memory_maintenance(self.engine)
             except Exception:
                 logger.exception("Scheduled incremental sync failed")
                 continue
+            if maintenance and maintenance["report"]["archived"]:
+                logger.info(
+                    "Memory consolidation archived %s record(s)",
+                    maintenance["report"]["archived"],
+                )
             logger.debug("Scheduled sync completed for %s source(s)", len(results))
