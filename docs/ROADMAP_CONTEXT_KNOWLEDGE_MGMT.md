@@ -114,10 +114,32 @@ third-party shape: `tests/fixtures/syncsage-connector-example/`
 (`StaticDirConnector`), driven end-to-end through `SyncEngine` with an
 idempotent second sync in `tests/test_connector_sdk.py`; conformance for
 both connectors in `tests/test_connector_conformance.py`. Docs:
-`docs/reference/connector-sdk.md`. Steps 31.2–31.6 (Notion, Google Drive,
-Slack, Confluence/Jira, IMAP) build on this SDK, one per session, each
-with recorded-fixture offline tests + ACL-capture fields reserved for
-Phase 32; 31.7 publishes the conformance suite as the public bar.
+`docs/reference/connector-sdk.md`.
+
+### Step 31.2 — Notion connector — **landed 2026-07-16**
+
+The first SaaS connector, built as a **first-party SDK plugin**
+(dogfooding 31.1: `src/syncsage/connectors/notion.py`, declared under the
+`syncsage.connectors` entry-point group in this repo's `pyproject.toml`,
+config `type: notion`). Pages via paginated `POST /v1/search`; content =
+each page's block tree rendered to **deterministic Markdown** (headings /
+paragraphs / lists / to-dos / quotes / callouts / code / dividers, nested
+children to depth 3, no LLM). Pillars: `item.sha256` =
+`(page_id, last_edited_time)` version proxy → engine pre-read skip before
+any block fetch; checkpoint cursor stores per-page edit times →
+`read_item` raises `ItemNotModified` on incremental for unchanged pages;
+`full` ignores the checkpoint; token from
+`sources[].connector.api_key_env` (new generic field, default
+`NOTION_TOKEN`) — never stored. **ACL capture reserved for Phase 32**:
+`metadata["acl"]` carries `created_by`/`last_edited_by` principal ids.
+Acceptance: `tests/test_notion_connector.py` (12) against recorded
+fixtures — pagination, deterministic rendering, actionable token error,
+incremental skip, engine e2e (idempotent second sync with zero block
+fetches; edit-time-only bump refetches without re-index; real content
+edit re-indexes exactly one page), conformance pass, entry-point guard.
+
+Steps 31.3–31.6 (Google Drive, Slack, Confluence/Jira, IMAP) follow the
+same pattern one per session; 31.7 publishes the conformance bar.
 
 ## 2d. Phase 33 — region-side step contracts (execution started 2026-07-16)
 

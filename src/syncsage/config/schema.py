@@ -413,6 +413,9 @@ class SourceConnectorSettings(ModelMixin):
     allow_experimental: bool = False
     request_timeout_seconds: int = 10
     headers: dict[str, str] = field(default_factory=dict)
+    # Name of the environment variable holding the connector's API token
+    # (Step 31.2+ SaaS connectors). The secret itself never lands in config.
+    api_key_env: str | None = None
     api_endpoint: str | None = None
     api_items_field: str = "items"
     api_content_field: str = "content"

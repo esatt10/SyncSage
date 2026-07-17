@@ -283,6 +283,20 @@ BM25; (2) `1/(1+|bm25|)` inverted relevance in hybrid merges → monotone
 mapping (LIKE-fallback rows keep 1.0). Gate:
 `tests/test_memory_benchmark.py`. Suite: **202 passed** (+4).
 
+**Step 31.2 (Notion connector) landed here 2026-07-16.** First-party SDK
+plugin dogfooding 31.1: `src/syncsage/connectors/notion.py` under the
+`syncsage.connectors` entry-point group in this repo's own `pyproject.toml`
+(config `type: notion`, zero new dispatch code). Paginated `POST /v1/search`
+listing; block tree → deterministic Markdown (nested to depth 3, no LLM);
+`item.sha256` = `(page_id, last_edited_time)` proxy → pre-read skip;
+per-page edit-time cursor → `read_item` `ItemNotModified` on incremental;
+token via new generic `sources[].connector.api_key_env` (default
+`NOTION_TOKEN`); `metadata["acl"]` carries created_by/last_edited_by
+(Phase 32 reserved). Offline recorded fixtures `tests/fixtures/notion/`;
+`tests/test_notion_connector.py` (12) incl. engine-e2e idempotent +
+incremental (zero block fetches on unchanged) + conformance + entry-point
+guard. Suite: **214 passed** (+12).
+
 **Step 31.1 (Connector SDK) landed here 2026-07-15.** Third-party connector
 plugins resolve by `sources[].type` name via `importlib.metadata` entry
 points (group `syncsage.connectors`, `sync/connector_registry.py`) or
