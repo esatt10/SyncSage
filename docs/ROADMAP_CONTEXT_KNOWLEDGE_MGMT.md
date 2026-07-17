@@ -164,6 +164,23 @@ in `now`, idempotent second pass. Acceptance: +6 cases in
 archive, search-forgets-after-maintenance, TTL-None, disabled/no-source
 no-ops, HTTP round-trip).
 
+### Step 33.4 — Memory-recall benchmark — **landed 2026-07-16 (Phase 33 complete)**
+
+`memory/benchmark.py` (`python -m syncsage.memory.benchmark`):
+LongMemEval-style, deterministic, offline — seeded cases through the
+**real** `memory_write` → batch index → `search_context` (hybrid) path;
+categories: single-hop recall, multi-session interference, knowledge
+updates (supersedes + consolidation), abstention. Recorded (30 facts /
+120 distractors / 10 updates / 10 abstain, k=5): **recall@5 1.000,
+update_accuracy 1.000, stale_leak 0.000, abstention 1.000** — canonical
+numbers + methodology in SR `docs/RESULTS.md` §9d. **The bench exposed
+and drove two real self-search fixes** (`search/sqlite_store.py`): NL
+questions no longer zero out on FTS5 implicit-AND (MATCH is now an OR of
+sanitized tokens ranked by BM25), and the bm25→relevance mapping is now
+monotone (the old `1/(1+|bm25|)` inverted hybrid-merge ordering). Gate:
+`tests/test_memory_benchmark.py` (thresholds ≥0.9/≥0.9/0.0/≥0.9 +
+NL-question ranking regression + generator determinism).
+
 ## 3. Sequencing note for this repo
 
 The enterprise track runs **30 → 31 → 32 → 36** and is region-heavy; the

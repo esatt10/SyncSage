@@ -15,7 +15,14 @@ class SearchStore:
         source_name: str | None = None,
         max_results: int = 10,
     ) -> list[dict]:
-        params: list[object] = [query]
+        # Natural-language queries ("where does the X service run") must not
+        # fall to FTS5's implicit-AND — a single unmatched stopword would
+        # zero out the whole query (found by the Step-33.4 memory benchmark).
+        # OR the sanitized tokens instead and let BM25 rank by token rarity;
+        # quoting each token also neutralizes FTS5 query-syntax characters.
+        tokens = _query_tokens(query)
+        match_expr = " OR ".join(f'"{token}"' for token in tokens) if tokens else query
+        params: list[object] = [match_expr]
         where = "chunks_fts MATCH ?"
         if source_name:
             where += " AND source_id = ?"
@@ -48,14 +55,14 @@ class SearchStore:
         seen_artifacts: set[str] = set()
         for i, row in enumerate(rows, start=1):
             seen_artifacts.add(row["artifact_id"])
-            results.append(
-                _row_result(
-                    row,
-                    i,
-                    float(1.0 / (1.0 + abs(row["rank_score"] or 0.0))),
-                    "SQLite FTS/path match",
-                )
-            )
+            # FTS5 bm25() is a cost: more negative = better. Map it to a
+            # monotone [0, 1) relevance so downstream merges (hybrid mode)
+            # keep FTS's own ordering — the old 1/(1+|bm25|) *inverted* it
+            # (found by the Step-33.4 memory benchmark). The LIKE-fallback
+            # rows carry rank_score 0.0 and keep their historical 1.0.
+            raw_rank = float(row["rank_score"] or 0.0)
+            score = (-raw_rank / (1.0 - raw_rank)) if raw_rank < 0 else 1.0
+            results.append(_row_result(row, i, score, "SQLite FTS/path match"))
         remaining = max(0, max_results - len(results))
         if remaining:
             for row in self._term_augmented_rows(query, source_name, remaining, seen_artifacts):

@@ -268,8 +268,20 @@ beat (`memory/maintenance.run_memory_maintenance`) + on demand
 block `memory.{consolidation_enabled, session_ttl_days, user_ttl_days,
 org_ttl_days}` (TTLs opt-in `None`, consolidation on by default).
 Deterministic in `now`, idempotent second pass.
-`tests/test_memory_region.py` (15 total). Suite: **198 passed** (+6).
-33.4 (benchmark) remains in SR.
+`tests/test_memory_region.py` (15 total).
+
+**Step 33.4 (memory-recall benchmark) landed here 2026-07-16 — Phase 33
+complete.** `memory/benchmark.py` (`python -m syncsage.memory.benchmark`):
+LongMemEval-style, deterministic, offline, through the real
+`memory_write`→index→`search_context` path. Recorded: recall@5 **1.000**,
+update_accuracy **1.000**, stale_leak **0.000**, abstention **1.000**
+(30/120/10/10, k=5; canonical numbers in SR `docs/RESULTS.md` §9d). The
+bench exposed + drove **two self-search fixes** in
+`search/sqlite_store.py`: (1) NL questions zeroed out on FTS5
+implicit-AND → MATCH is now an OR of sanitized `_query_tokens` ranked by
+BM25; (2) `1/(1+|bm25|)` inverted relevance in hybrid merges → monotone
+mapping (LIKE-fallback rows keep 1.0). Gate:
+`tests/test_memory_benchmark.py`. Suite: **202 passed** (+4).
 
 **Step 31.1 (Connector SDK) landed here 2026-07-15.** Third-party connector
 plugins resolve by `sources[].type` name via `importlib.metadata` entry
