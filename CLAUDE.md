@@ -283,6 +283,18 @@ BM25; (2) `1/(1+|bm25|)` inverted relevance in hybrid merges → monotone
 mapping (LIKE-fallback rows keep 1.0). Gate:
 `tests/test_memory_benchmark.py`. Suite: **202 passed** (+4).
 
+**Steps 31.3–31.7 (GDrive/Slack/Confluence/IMAP + certification) landed
+here 2026-07-16 — Phase 31 complete.** Four more first-party SDK plugins in
+`src/syncsage/connectors/` (entry points in pyproject; zero new deps —
+stdlib urllib/imaplib, bs4 already core): version-proxy sha256 pre-read
+skips, per-item incremental cursors (imap = exact UID high-watermark, a
+second sync lists nothing), deterministic rendering, `connector.api_key_env`
+secrets, Phase-32 ACL capture. 31.7: certified-connectors table + recipe in
+`docs/reference/connector-sdk.md`; the example package now ships the
+certification test (`tests/fixtures/syncsage-connector-example/tests/`),
+fixture suites excluded via pytest `norecursedirs`.
+`tests/test_saas_connectors.py` (34). Suite: **248 passed** (+34).
+
 **Step 31.2 (Notion connector) landed here 2026-07-16.** First-party SDK
 plugin dogfooding 31.1: `src/syncsage/connectors/notion.py` under the
 `syncsage.connectors` entry-point group in this repo's own `pyproject.toml`

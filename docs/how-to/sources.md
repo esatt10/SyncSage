@@ -17,6 +17,10 @@ Sources are the inputs SyncSage indexes. They live under `sources:` in your
 | `web_collection` | A set of web URLs |
 | `memory` | Agent-memory records (see [Agent memory](agent-memory.md)) |
 | `notion` | A Notion workspace, via an integration token (below) |
+| `gdrive` | Google Drive docs + text files (`connector.api_key_env`, default `GDRIVE_TOKEN`) |
+| `slack` | Slack channel transcripts (`SLACK_TOKEN`; ids rendered as-is) |
+| `confluence` | Confluence pages (`CONFLUENCE_TOKEN` + `connector.api_endpoint` site URL) |
+| `imap` | An email mailbox (`IMAP_CREDENTIALS` as `user:password`; `path` = mailbox) |
 | `api` | Experimental — an HTTP API source |
 | `s3` | Experimental — an S3-style object store |
 

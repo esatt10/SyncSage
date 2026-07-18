@@ -138,8 +138,27 @@ incremental skip, engine e2e (idempotent second sync with zero block
 fetches; edit-time-only bump refetches without re-index; real content
 edit re-indexes exactly one page), conformance pass, entry-point guard.
 
-Steps 31.3–31.6 (Google Drive, Slack, Confluence/Jira, IMAP) follow the
-same pattern one per session; 31.7 publishes the conformance bar.
+### Steps 31.3–31.7 — GDrive, Slack, Confluence, IMAP + certification — **landed 2026-07-16 (Phase 31 complete)**
+
+All four ride the 31.2 pattern (full contracts: SR `PRODUCT_FRAMEWORK.md`
+§3): entry-point SDK plugins in `src/syncsage/connectors/`, one
+monkeypatch-friendly network touchpoint each (stdlib urllib / imaplib —
+zero new deps), deterministic rendering, version-proxy `item.sha256`,
+per-item incremental cursors (`ItemNotModified`), secrets via
+`connector.api_key_env`, Phase-32 ACL capture in `metadata["acl"]`.
+Highlights: gdrive exports Google-native docs as text and filters
+non-text mimes; slack renders ts-ordered channel transcripts (subtypes
+filtered, user ids as-is) with a `(channel, latest_ts)` proxy; confluence
+expands storage bodies into the listing (network-free reads) and reduces
+XHTML via BeautifulSoup; imap exploits message immutability for an exact
+UID high-watermark (a second sync lists *nothing*). 31.7 publishes the
+bar: certified-connectors table + recipe in
+`docs/reference/connector-sdk.md`, certification test shipped inside the
+canonical example package (fixture suites excluded from the host run via
+`norecursedirs`); standalone PyPI/cookiecutter template = release-channel
+work. Acceptance: `tests/test_saas_connectors.py` (34, fully offline)
+incl. per-connector conformance + engine e2e + the five-entry-point
+guard. Suite: **248 passed**.
 
 ## 2d. Phase 33 — region-side step contracts (execution started 2026-07-16)
 
