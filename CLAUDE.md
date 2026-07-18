@@ -283,6 +283,26 @@ BM25; (2) `1/(1+|bm25|)` inverted relevance in hybrid merges → monotone
 mapping (LIKE-fallback rows keep 1.0). Gate:
 `tests/test_memory_benchmark.py`. Suite: **202 passed** (+4).
 
+**Steps 32.1+32.2+32.6 (ACL persistence, principal filtering, leak gate)
+landed here 2026-07-17 [x-repo] — Phase 32 core.** Artifacts gain an `acl`
+column (one-shot idempotent additive migration in `StateStore.migrate`;
+NULL = pre-32 semantics). `security/acl.py`: per-connector `normalize_acl`
+→ canonical `{"allow": ["user:…","group:…"], "public": bool}` (notion
+creators, gdrive owners, slack privacy, confluence space+creator, imap
+from/to/cc, canonical passthrough otherwise; unreadable ACLs fail closed);
+the engine stores it on every indexed artifact. `search_context` accepts
+`principal`/`principal_groups` and, under `security.acl_enforced: true`
+(**default false — pre-32 byte-identical**), over-fetches candidates and
+filters against artifact ACLs BEFORE merge/return (graph nodes without an
+artifact row conservatively denied; un-ACL'd artifacts follow
+`security.default_visibility`, `groups:` config maps principals→groups —
+IdP sync loop = 32.4). Threaded through MCP `search_context` + HTTP
+`/search` (router forwards the principal; the region enforces). Leak gate:
+`tests/test_acl_enforcement.py` (adversarial cross-user, anonymous
+public-only, group via param + config, enforcement-off parity,
+normalization rules, fail-closed). Suite: **253 passed** (+5). Router-side
+32.3 + deferred 32.4/32.5 live in SR (`PRODUCT_FRAMEWORK.md` §3d).
+
 **Steps 31.3–31.7 (GDrive/Slack/Confluence/IMAP + certification) landed
 here 2026-07-16 — Phase 31 complete.** Four more first-party SDK plugins in
 `src/syncsage/connectors/` (entry points in pyproject; zero new deps —

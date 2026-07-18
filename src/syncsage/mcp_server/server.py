@@ -149,15 +149,21 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
         return tools.sync_all(knowledge_base, mode)
 
     @mcp.tool()
-    def search_context(
+    def search_context(  # noqa: PLR0913 - additive principal params (32.2)
         knowledge_base: str,
         query: str,
         mode: str = "hybrid",
         max_results: int = 10,
         include_chunks: bool = True,
         include_graph_neighbors: bool = True,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
     ) -> dict:
-        """Search indexed context and return compact results with provenance."""
+        """Search indexed context and return compact results with provenance.
+
+        principal/principal_groups scope results to what that caller may see
+        when security.acl_enforced is on (Step 32.2); ignored otherwise.
+        """
 
         return tools.search_context(
             knowledge_base,
@@ -166,6 +172,8 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
             max_results,
             include_chunks,
             include_graph_neighbors,
+            principal=principal,
+            principal_groups=principal_groups,
         )
 
     @mcp.tool()

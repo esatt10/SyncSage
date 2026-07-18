@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -236,7 +237,11 @@ class SyncEngine:
                     skipped += 1
                     continue
                 now = utc_now()
+                from syncsage.security.acl import normalize_acl
+
+                acl_doc = normalize_acl(connector.connector_type, (item.metadata or {}).get("acl"))
                 artifact_row = {
+                    "acl": json.dumps(acl_doc, sort_keys=True) if acl_doc else None,
                     "id": parsed.id,
                     "source_id": parsed.source_id,
                     "type": parsed.type,

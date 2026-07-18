@@ -182,9 +182,7 @@ class SyncSageTools:
             data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
             data = data or {}
             existing = [
-                item
-                for item in data.get("sources", []) or []
-                if item.get("name") != source.name
+                item for item in data.get("sources", []) or [] if item.get("name") != source.name
             ]
             data["sources"] = [*existing, source_payload]
             path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
@@ -279,8 +277,7 @@ class SyncSageTools:
         if result is None:
             return {
                 "skipped": (
-                    "memory consolidation is disabled or no `type: memory` "
-                    "source is configured"
+                    "memory consolidation is disabled or no `type: memory` source is configured"
                 )
             }
         self._audit(
@@ -296,6 +293,8 @@ class SyncSageTools:
         max_results: int = 10,
         include_chunks: bool = True,
         include_graph_neighbors: bool = True,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
     ) -> dict:
         self._require_knowledge_base(knowledge_base)
         return self.searcher.search_context(
@@ -304,6 +303,9 @@ class SyncSageTools:
             mode,
             max_results,
             graph=self.engine.graph_builder.graph,
+            principal=principal,
+            principal_groups=principal_groups,
+            security=self.config.security,
         )
 
     def get_relevant_files(
@@ -345,9 +347,7 @@ class SyncSageTools:
                 continue
             for _source, target, edge_map in graph.out_edges(current):
                 matching_edges = [
-                    data
-                    for data in edge_map.values()
-                    if not allowed or data.get("type") in allowed
+                    data for data in edge_map.values() if not allowed or data.get("type") in allowed
                 ]
                 if not matching_edges:
                     continue

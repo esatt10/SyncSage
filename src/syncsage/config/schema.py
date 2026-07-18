@@ -378,6 +378,14 @@ class SecuritySettings(ModelMixin):
     allow_workspace_roots: list[Path] = field(
         default_factory=lambda: [Path("/workspace"), Path("/vault"), Path("/exports")]
     )
+    # Step 32.2 — principal-aware retrieval. Off by default: a standalone /
+    # single-user region behaves byte-identically to pre-32. When enforced,
+    # un-ACL'd artifacts follow default_visibility ("public" keeps local
+    # sources searchable; "private" requires an authenticated principal),
+    # and `groups` maps principal ids to group identities (IdP sync = 32.4).
+    acl_enforced: bool = False
+    default_visibility: str = "public"
+    groups: dict[str, list[str]] = field(default_factory=dict)
     allow_user_selected_source_paths: bool = True
     read_only_sources: bool = True
     deny_path_traversal: bool = True

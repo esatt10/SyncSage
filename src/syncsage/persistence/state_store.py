@@ -151,7 +151,23 @@ class StateStore:
 
     def migrate(self) -> None:
         self.conn.executescript(SCHEMA)
+        # Step 32.1 — one-shot idempotent column add (additive; existing rows
+        # keep acl NULL = "source expressed no ACL", the pre-32 semantics).
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(artifacts)")}
+        if "acl" not in columns:
+            self.conn.execute("ALTER TABLE artifacts ADD COLUMN acl TEXT")
         self.conn.commit()
+
+    def artifact_acls(self, artifact_ids: list[str]) -> dict[str, str | None]:
+        """The stored ACL JSON (or None) for each artifact id (Step 32.2)."""
+        if not artifact_ids:
+            return {}
+        placeholders = ",".join("?" for _ in artifact_ids)
+        rows = self.conn.execute(
+            f"SELECT id, acl FROM artifacts WHERE id IN ({placeholders})",
+            tuple(artifact_ids),
+        )
+        return {row[0]: row[1] for row in rows}
 
     def upsert_knowledge_base(
         self,
@@ -220,11 +236,11 @@ class StateStore:
             self.conn.execute(
                 """INSERT INTO artifacts(
                     id,source_id,type,path,relative_path,mime_type,size_bytes,
-                    sha256,mtime,git_branch,git_commit,last_indexed_at,status
+                    sha256,mtime,git_branch,git_commit,last_indexed_at,status,acl
                 )
                 VALUES(
                     :id,:source_id,:type,:path,:relative_path,:mime_type,:size_bytes,
-                    :sha256,:mtime,:git_branch,:git_commit,:last_indexed_at,:status
+                    :sha256,:mtime,:git_branch,:git_commit,:last_indexed_at,:status,:acl
                 )
                 ON CONFLICT(id) DO UPDATE SET
                     type=excluded.type,
@@ -237,8 +253,9 @@ class StateStore:
                     git_branch=excluded.git_branch,
                     git_commit=excluded.git_commit,
                     last_indexed_at=excluded.last_indexed_at,
-                    status=excluded.status""",
-                artifact,
+                    status=excluded.status,
+                    acl=excluded.acl""",
+                {"acl": None, **artifact},
             )
             self.conn.execute("DELETE FROM chunks WHERE artifact_id=?", (artifact["id"],))
             self.conn.execute("DELETE FROM chunks_fts WHERE artifact_id=?", (artifact["id"],))

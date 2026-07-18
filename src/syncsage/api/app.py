@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 
 
 class SearchRequest(BaseModel):
+    # Step 32.2 — optional caller identity; enforced only when
+    # security.acl_enforced is on. The caller (router / deployment
+    # perimeter) authenticates; the region enforces visibility.
+    principal: str | None = None
+    principal_groups: list[str] = []
     knowledge_base: str | None = None
     query: str
     mode: str = "hybrid"
@@ -601,8 +606,7 @@ def create_app(
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "memory consolidation is disabled or no `type: memory` "
-                    "source is configured"
+                    "memory consolidation is disabled or no `type: memory` source is configured"
                 ),
             )
         return result
@@ -623,6 +627,9 @@ def create_app(
             req.max_results,
             req.source_name,
             graph=engine.graph_builder.graph,
+            principal=req.principal,
+            principal_groups=req.principal_groups,
+            security=config.security,
         )
 
     @app.post("/relevant-files")
