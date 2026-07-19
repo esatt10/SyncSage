@@ -374,6 +374,27 @@ class MemorySettings(ModelMixin):
 
 
 @dataclass
+class IdPSettings(ModelMixin):
+    """External identity-provider group sync (Step 32.4).
+
+    Disabled by default — the 32.2 config-mapped ``security.groups`` stays
+    the deterministic core. When enabled, the region pulls a SCIM 2.0
+    ``/Groups`` listing every ``sync_interval_minutes`` (scheduler beat, or
+    ``POST /security/idp/sync``) into SQLite; the bearer token is read from
+    the environment variable named by ``api_key_env`` and never stored.
+    ``staleness_max_minutes`` is the SLA: a mapping older than this grants
+    nothing (fail closed) until the next successful sync.
+    """
+
+    enabled: bool = False
+    provider: str = "scim"
+    base_url: str = ""
+    api_key_env: str = "IDP_TOKEN"
+    sync_interval_minutes: int = 60
+    staleness_max_minutes: int = 1440
+
+
+@dataclass
 class SecuritySettings(ModelMixin):
     allow_workspace_roots: list[Path] = field(
         default_factory=lambda: [Path("/workspace"), Path("/vault"), Path("/exports")]
@@ -386,6 +407,7 @@ class SecuritySettings(ModelMixin):
     acl_enforced: bool = False
     default_visibility: str = "public"
     groups: dict[str, list[str]] = field(default_factory=dict)
+    idp: IdPSettings = field(default_factory=IdPSettings)
     allow_user_selected_source_paths: bool = True
     read_only_sources: bool = True
     deny_path_traversal: bool = True
@@ -490,6 +512,8 @@ class SyncSageConfig(ModelMixin):
                     raw["allow_workspace_roots"] = [
                         Path(item) for item in raw["allow_workspace_roots"] or []
                     ]
+                if "idp" in raw and isinstance(raw["idp"], dict):
+                    raw["idp"] = build(IdPSettings, raw["idp"])
             if dc is ServerSettings:
                 if "mcp" in raw and isinstance(raw["mcp"], dict):
                     raw["mcp"] = build(McpSettings, raw["mcp"])

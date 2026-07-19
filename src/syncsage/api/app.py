@@ -611,6 +611,21 @@ def create_app(
             )
         return result
 
+    @app.post("/security/idp/sync")
+    def idp_sync() -> dict:
+        from syncsage.security.idp import run_idp_sync
+
+        try:
+            return run_idp_sync(config, state)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/security/idp/status")
+    def idp_sync_status() -> dict:
+        from syncsage.security.idp import idp_status
+
+        return idp_status(config, state)
+
     @app.get("/sync/status")
     def sync_status() -> dict:
         return {

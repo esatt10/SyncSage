@@ -303,6 +303,33 @@ public-only, group via param + config, enforcement-off parity,
 normalization rules, fail-closed). Suite: **253 passed** (+5). Router-side
 32.3 + deferred 32.4/32.5 live in SR (`PRODUCT_FRAMEWORK.md` §3d).
 
+**Step 32.4 (external-IdP group sync + staleness SLA) landed here 2026-07-18
+[x-repo] — completes the SyncSage side of Phase 32.** The 32.2 config-mapped
+`security.groups` stays the deterministic core; `security/idp.py` adds a
+*synced* principal→groups mapping from a SCIM 2.0 `/Groups` directory
+(`fetch_scim_groups` — paginated ListResponse, token from
+`security.idp.api_key_env`, one monkeypatch-friendly module-level HTTP fn,
+stdlib urllib, zero new deps). Persistence is SQLite: additive `idp_groups` +
+`idp_sync_meta` tables in `StateStore.migrate` (CREATE IF NOT EXISTS —
+idempotent, user data preserved); `replace_idp_groups` is transactional and
+row-stable on an unchanged directory while `synced_at` bumps every successful
+pass (the heartbeat IS the SLA clock). Enforcement: the `search_context` ACL
+path unions **fresh** IdP groups into the identity set; the **staleness SLA
+fails closed** — a mapping older than `security.idp.staleness_max_minutes`
+(default 1440) grants NOTHING until the next successful sync (config +
+param groups unaffected). Refresh rides the 21.1 scheduler beat
+(`run_idp_maintenance` — due-interval check, fetch failures reported never
+raised, so the beat survives and the mapping just ages toward the SLA) +
+on-demand `POST /security/idp/sync` and `GET /security/idp/status`. Config
+`security.idp.{enabled=false, provider=scim, base_url, api_key_env,
+sync_interval_minutes=60, staleness_max_minutes=1440}` — **disabled by
+default: byte-identical 32.2 behavior**. Docs: `docs/security.md`.
+Acceptance: `tests/test_idp_sync.py` (7 — paginated fetch, idempotent
+re-sync + heartbeat, fresh-grant vs stale-fail-closed e2e, maintenance due
+logic + error resilience, HTTP round-trip, disabled no-ops). Suite:
+**260 passed / 2 skipped** (+7). Router-side 32.5 (OIDC bearer→principal +
+audit) lands in SR the same day — **Phase 32 complete**.
+
 **Steps 31.3–31.7 (GDrive/Slack/Confluence/IMAP + certification) landed
 here 2026-07-16 — Phase 31 complete.** Four more first-party SDK plugins in
 `src/syncsage/connectors/` (entry points in pyproject; zero new deps —

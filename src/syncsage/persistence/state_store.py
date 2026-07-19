@@ -127,6 +127,15 @@ CREATE TABLE IF NOT EXISTS manifests (
   payload_json TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS idp_groups (
+  principal TEXT NOT NULL,
+  group_name TEXT NOT NULL,
+  PRIMARY KEY (principal, group_name)
+);
+CREATE TABLE IF NOT EXISTS idp_sync_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 """
 
 
@@ -157,6 +166,55 @@ class StateStore:
         if "acl" not in columns:
             self.conn.execute("ALTER TABLE artifacts ADD COLUMN acl TEXT")
         self.conn.commit()
+
+    def replace_idp_groups(self, mapping: dict[str, list[str]], synced_at: str) -> bool:
+        """Persist one IdP sync pass (Step 32.4). Returns True when rows changed.
+
+        The mapping replace is transactional; ``synced_at`` bumps on every
+        call (an unchanged directory still counts as a fresh heartbeat —
+        that heartbeat is the staleness-SLA clock).
+        """
+        desired = {
+            (principal, group) for principal, groups in mapping.items() for group in groups
+        }
+        current = {
+            (row[0], row[1])
+            for row in self.conn.execute("SELECT principal, group_name FROM idp_groups")
+        }
+        changed = desired != current
+        with self.conn:
+            if changed:
+                self.conn.execute("DELETE FROM idp_groups")
+                self.conn.executemany(
+                    "INSERT INTO idp_groups(principal, group_name) VALUES(?,?)",
+                    sorted(desired),
+                )
+            self.conn.execute(
+                """INSERT INTO idp_sync_meta(key, value) VALUES('synced_at', ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (synced_at,),
+            )
+        return changed
+
+    def idp_groups_for(self, principals: set[str]) -> set[str]:
+        """Group names the IdP mapping grants any of these principal spellings."""
+        if not principals:
+            return set()
+        ordered = sorted(principals)
+        placeholders = ",".join("?" for _ in ordered)
+        rows = self.conn.execute(
+            f"SELECT group_name FROM idp_groups WHERE principal IN ({placeholders})",
+            tuple(ordered),
+        )
+        return {row[0] for row in rows}
+
+    def idp_synced_at(self) -> str | None:
+        rows = self.rows("SELECT value FROM idp_sync_meta WHERE key='synced_at'")
+        return str(rows[0]["value"]) if rows else None
+
+    def idp_principal_count(self) -> int:
+        rows = self.rows("SELECT COUNT(DISTINCT principal) AS c FROM idp_groups")
+        return int(rows[0]["c"]) if rows else 0
 
     def artifact_acls(self, artifact_ids: list[str]) -> dict[str, str | None]:
         """The stored ACL JSON (or None) for each artifact id (Step 32.2)."""

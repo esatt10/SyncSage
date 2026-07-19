@@ -58,6 +58,14 @@ class HybridSearch:
             identities = expand_principal(
                 principal, principal_groups, getattr(security, "groups", None)
             )
+            # Step 32.4 — union in IdP-synced groups, but only while the
+            # mapping honors the staleness SLA (stale grants fail closed).
+            if identities is not None and principal:
+                from syncsage.security.idp import fresh_idp_groups
+
+                identities |= fresh_idp_groups(
+                    self.store.state, principal, getattr(security, "idp", None)
+                )
             default_public = getattr(security, "default_visibility", "public") != "private"
             candidate_ids = [
                 str(item.get("node_id"))
