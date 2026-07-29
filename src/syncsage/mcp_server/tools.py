@@ -182,9 +182,7 @@ class SyncSageTools:
             data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
             data = data or {}
             existing = [
-                item
-                for item in data.get("sources", []) or []
-                if item.get("name") != source.name
+                item for item in data.get("sources", []) or [] if item.get("name") != source.name
             ]
             data["sources"] = [*existing, source_payload]
             path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
@@ -219,6 +217,74 @@ class SyncSageTools:
             self._audit(result["source_id"], "sync_source", "mcp", "mcp", None, utc_now(), result)
         return {"results": results}
 
+    def memory_write(
+        self,
+        knowledge_base: str,
+        text: str,
+        scope: str = "user",
+        subject: str | None = None,
+        supersedes: str | None = None,
+        tags: list[str] | None = None,
+        sync: bool = True,
+    ) -> dict:
+        """Append one memory record and (by default) index it immediately.
+
+        The record lands as a Markdown file in the configured ``type: memory``
+        source; ``sync=True`` runs an incremental sync of that source so the
+        memory is retrievable via ``search_context`` in the same session
+        (read-your-writes). Recall is ordinary search — no separate path.
+        """
+        from syncsage.memory.store import MemoryStore, memory_source
+
+        self._require_knowledge_base(knowledge_base)
+        source = memory_source(self.config)
+        if source is None:
+            raise ValueError(
+                "no enabled memory source configured. Add one to syncsage.yaml:\n"
+                "  sources:\n"
+                "    - name: agent-memory\n"
+                "      type: memory\n"
+                "      path: memory"
+            )
+        record, created = MemoryStore(source.path).append(
+            text, scope=scope, subject=subject, supersedes=supersedes, tags=tags or ()
+        )
+        result: dict = {"record": record.as_dict(), "created": created, "source": source.name}
+        if sync and created:
+            result["sync"] = self.engine.sync_source(source.name, "incremental").__dict__
+        self._audit(
+            source.name,
+            "memory_write",
+            "mcp",
+            "mcp",
+            None,
+            utc_now(),
+            {"record_id": record.record_id, "scope": record.scope, "created": created},
+        )
+        return result
+
+    def memory_consolidate(self, knowledge_base: str) -> dict:
+        """Run one memory-consolidation pass now (Step 33.2).
+
+        Archives superseded and TTL-expired records (files renamed, never
+        deleted) and re-syncs the memory source so they leave the index. The
+        scheduler runs this automatically; this tool is the on-demand edge.
+        """
+        from syncsage.memory.maintenance import run_memory_maintenance
+
+        self._require_knowledge_base(knowledge_base)
+        result = run_memory_maintenance(self.engine)
+        if result is None:
+            return {
+                "skipped": (
+                    "memory consolidation is disabled or no `type: memory` source is configured"
+                )
+            }
+        self._audit(
+            result["source"], "memory_consolidate", "mcp", "mcp", None, utc_now(), result["report"]
+        )
+        return result
+
     def search_context(
         self,
         knowledge_base: str,
@@ -227,6 +293,8 @@ class SyncSageTools:
         max_results: int = 10,
         include_chunks: bool = True,
         include_graph_neighbors: bool = True,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
     ) -> dict:
         self._require_knowledge_base(knowledge_base)
         return self.searcher.search_context(
@@ -235,6 +303,9 @@ class SyncSageTools:
             mode,
             max_results,
             graph=self.engine.graph_builder.graph,
+            principal=principal,
+            principal_groups=principal_groups,
+            security=self.config.security,
         )
 
     def get_relevant_files(
@@ -276,9 +347,7 @@ class SyncSageTools:
                 continue
             for _source, target, edge_map in graph.out_edges(current):
                 matching_edges = [
-                    data
-                    for data in edge_map.values()
-                    if not allowed or data.get("type") in allowed
+                    data for data in edge_map.values() if not allowed or data.get("type") in allowed
                 ]
                 if not matching_edges:
                     continue

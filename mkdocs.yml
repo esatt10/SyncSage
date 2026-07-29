@@ -66,6 +66,8 @@ nav:
       - 10-minute quickstart: tutorials/quickstart.md
       - Multi-modal ingest (image + audio): tutorials/multimodal.md
   - How-to guides:
+      - Attach to a coding agent (MCP): how-to/attach-to-coding-agent.md
+      - Agent memory: how-to/agent-memory.md
       - Configure sources: how-to/sources.md
       - Multi-modal ingest: how-to/multimodal-ingest.md
       - Vector self-search: how-to/vector-search.md
@@ -75,6 +77,7 @@ nav:
       - MCP for agents: mcp_client.md
   - Reference:
       - Configuration: configuration.md
+      - Connector SDK: reference/connector-sdk.md
       - Interface matrix: reference/interfaces.md
       - HTTP API: reference/http-api.md
       - MCP tools & resources: mcp_tools.md

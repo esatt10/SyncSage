@@ -114,11 +114,17 @@ pip install -e ".[dev,mcp]"
 pytest -q                                  # full suite, offline by design
 ruff check src tests && ruff format --check src tests
 
+syncsage up [PATH] [--no-serve]            # zero-config quickstart: detect
+                                           #   (.obsidian/.git/folder) → generate
+                                           #   config → index → serve (Step 30.1)
 syncsage init --profile quickstart         # generate starter syncsage.yaml
 syncsage validate && syncsage doctor       # config + environment checks
 syncsage start                             # HTTP API + MCP on :8765
 syncsage sync --source <name> --mode incremental|full|validate_only|repair
 syncsage mcp --transport stdio             # standalone MCP server
+syncsage client-config claude-code|cursor|vscode   # emit MCP client config
+                                           #   (agents: --mode local|docker-exec|
+                                           #    docker-run; Step 30.5)
 syncsage config show                       # resolved config after profile+YAML+--set
 docker compose up                          # container + optional UI sidecar
 ```
@@ -236,17 +242,137 @@ UNCHANGED** (no schema bump, no re-vendor, parity test green). Tiny WAV fixture 
 `tests/fixtures/sample_workspace/audio/briefing.wav.transcript.txt`;
 `tests/test_audio_ingestion.py`. Suite: **142 passed** (+7). **Phase 25 complete.**
 
-**Heterogeneous embedding spaces (2026-07-11) [x-repo] — docs-only here.**
-The Synapse router (subjective-retrieval, ADR 2026-07-11) now routes
-**mixed-embedding-space fleets** by partitioning contracts per
-`embedding_space (model_id, dim, normalized)` and scoring each partition with
-a query vector in that space (`synapse.spaces` per-space query embedders /
-`query_vecs`); unresolvable spaces are excluded per query with
-`embedding_space_unresolved`. **No SyncSage code change** — a region already
-embeds with its own `search.embeddings` model and publishes its own
-`embedding_space`; wire format unchanged (no schema bump, no re-vendor,
-parity green). See `docs/SYNAPSE_INTEGRATION.md` §3 note. Suite: **152
-passed / 2 skipped** (unchanged).
+**Step 33.1 (agent memory as a region) landed here 2026-07-16.** Memory
+records are **source content**: `memory/store.py` appends one frontmatter
+Markdown file per record (`schema_version: 1`, deterministic
+`mem-<instant>-<blake2b8>` ids, append-only, `<scope>/` dirs) into a new
+built-in `SourceType.memory` filesystem source; indexing is the normal
+deterministic pipeline (no second path, no LLM). Write surfaces
+(additive): MCP `memory_write` (`SyncSageTools` + server tool) and
+`POST/GET /memory` — `sync=true` default → read-your-writes via ordinary
+`search_context`; recall IS search. Publisher advertises `"memory"` in
+`capabilities.modalities` (25.4 precedent — wire format unchanged, parity
+green). Acceptance: `tests/test_memory_region.py`. Docs:
+`docs/how-to/agent-memory.md`, contracts in SR `PRODUCT_FRAMEWORK.md` §3c.
+
+**Step 33.2 (memory validity + consolidation) landed here 2026-07-16.**
+Supersedes chains resolve across scopes (`list_records(current_only=True)`
+/ `GET /memory?current_only=true` filter live). Consolidation is a pure
+content operation: superseded + per-scope-TTL-expired records are archived
+(`<id>.md.archived` rename in place — bytes preserved, never deleted — so
+the `**/*.md` include glob stops matching), then a **full** re-sync of the
+small memory source prunes them from index/graph/vectors through the
+ordinary pipeline (incremental never prunes). Runs on the 21.1 scheduler
+beat (`memory/maintenance.run_memory_maintenance`) + on demand
+(`memory_consolidate` MCP tool, `POST /memory/consolidate`). New config
+block `memory.{consolidation_enabled, session_ttl_days, user_ttl_days,
+org_ttl_days}` (TTLs opt-in `None`, consolidation on by default).
+Deterministic in `now`, idempotent second pass.
+`tests/test_memory_region.py` (15 total).
+
+**Step 33.4 (memory-recall benchmark) landed here 2026-07-16 — Phase 33
+complete.** `memory/benchmark.py` (`python -m syncsage.memory.benchmark`):
+LongMemEval-style, deterministic, offline, through the real
+`memory_write`→index→`search_context` path. Recorded: recall@5 **1.000**,
+update_accuracy **1.000**, stale_leak **0.000**, abstention **1.000**
+(30/120/10/10, k=5; canonical numbers in SR `docs/RESULTS.md` §9d). The
+bench exposed + drove **two self-search fixes** in
+`search/sqlite_store.py`: (1) NL questions zeroed out on FTS5
+implicit-AND → MATCH is now an OR of sanitized `_query_tokens` ranked by
+BM25; (2) `1/(1+|bm25|)` inverted relevance in hybrid merges → monotone
+mapping (LIKE-fallback rows keep 1.0). Gate:
+`tests/test_memory_benchmark.py`. Suite: **202 passed** (+4).
+
+**Steps 32.1+32.2+32.6 (ACL persistence, principal filtering, leak gate)
+landed here 2026-07-17 [x-repo] — Phase 32 core.** Artifacts gain an `acl`
+column (one-shot idempotent additive migration in `StateStore.migrate`;
+NULL = pre-32 semantics). `security/acl.py`: per-connector `normalize_acl`
+→ canonical `{"allow": ["user:…","group:…"], "public": bool}` (notion
+creators, gdrive owners, slack privacy, confluence space+creator, imap
+from/to/cc, canonical passthrough otherwise; unreadable ACLs fail closed);
+the engine stores it on every indexed artifact. `search_context` accepts
+`principal`/`principal_groups` and, under `security.acl_enforced: true`
+(**default false — pre-32 byte-identical**), over-fetches candidates and
+filters against artifact ACLs BEFORE merge/return (graph nodes without an
+artifact row conservatively denied; un-ACL'd artifacts follow
+`security.default_visibility`, `groups:` config maps principals→groups —
+IdP sync loop = 32.4). Threaded through MCP `search_context` + HTTP
+`/search` (router forwards the principal; the region enforces). Leak gate:
+`tests/test_acl_enforcement.py` (adversarial cross-user, anonymous
+public-only, group via param + config, enforcement-off parity,
+normalization rules, fail-closed). Suite: **253 passed** (+5). Router-side
+32.3 + deferred 32.4/32.5 live in SR (`PRODUCT_FRAMEWORK.md` §3d).
+
+**Step 32.4 (external-IdP group sync + staleness SLA) landed here 2026-07-18
+[x-repo] — completes the SyncSage side of Phase 32.** The 32.2 config-mapped
+`security.groups` stays the deterministic core; `security/idp.py` adds a
+*synced* principal→groups mapping from a SCIM 2.0 `/Groups` directory
+(`fetch_scim_groups` — paginated ListResponse, token from
+`security.idp.api_key_env`, one monkeypatch-friendly module-level HTTP fn,
+stdlib urllib, zero new deps). Persistence is SQLite: additive `idp_groups` +
+`idp_sync_meta` tables in `StateStore.migrate` (CREATE IF NOT EXISTS —
+idempotent, user data preserved); `replace_idp_groups` is transactional and
+row-stable on an unchanged directory while `synced_at` bumps every successful
+pass (the heartbeat IS the SLA clock). Enforcement: the `search_context` ACL
+path unions **fresh** IdP groups into the identity set; the **staleness SLA
+fails closed** — a mapping older than `security.idp.staleness_max_minutes`
+(default 1440) grants NOTHING until the next successful sync (config +
+param groups unaffected). Refresh rides the 21.1 scheduler beat
+(`run_idp_maintenance` — due-interval check, fetch failures reported never
+raised, so the beat survives and the mapping just ages toward the SLA) +
+on-demand `POST /security/idp/sync` and `GET /security/idp/status`. Config
+`security.idp.{enabled=false, provider=scim, base_url, api_key_env,
+sync_interval_minutes=60, staleness_max_minutes=1440}` — **disabled by
+default: byte-identical 32.2 behavior**. Docs: `docs/security.md`.
+Acceptance: `tests/test_idp_sync.py` (7 — paginated fetch, idempotent
+re-sync + heartbeat, fresh-grant vs stale-fail-closed e2e, maintenance due
+logic + error resilience, HTTP round-trip, disabled no-ops). Suite:
+**260 passed / 2 skipped** (+7). Router-side 32.5 (OIDC bearer→principal +
+audit) lands in SR the same day — **Phase 32 complete**.
+
+**Steps 31.3–31.7 (GDrive/Slack/Confluence/IMAP + certification) landed
+here 2026-07-16 — Phase 31 complete.** Four more first-party SDK plugins in
+`src/syncsage/connectors/` (entry points in pyproject; zero new deps —
+stdlib urllib/imaplib, bs4 already core): version-proxy sha256 pre-read
+skips, per-item incremental cursors (imap = exact UID high-watermark, a
+second sync lists nothing), deterministic rendering, `connector.api_key_env`
+secrets, Phase-32 ACL capture. 31.7: certified-connectors table + recipe in
+`docs/reference/connector-sdk.md`; the example package now ships the
+certification test (`tests/fixtures/syncsage-connector-example/tests/`),
+fixture suites excluded via pytest `norecursedirs`.
+`tests/test_saas_connectors.py` (34). Suite: **248 passed** (+34).
+
+**Step 31.2 (Notion connector) landed here 2026-07-16.** First-party SDK
+plugin dogfooding 31.1: `src/syncsage/connectors/notion.py` under the
+`syncsage.connectors` entry-point group in this repo's own `pyproject.toml`
+(config `type: notion`, zero new dispatch code). Paginated `POST /v1/search`
+listing; block tree → deterministic Markdown (nested to depth 3, no LLM);
+`item.sha256` = `(page_id, last_edited_time)` proxy → pre-read skip;
+per-page edit-time cursor → `read_item` `ItemNotModified` on incremental;
+token via new generic `sources[].connector.api_key_env` (default
+`NOTION_TOKEN`); `metadata["acl"]` carries created_by/last_edited_by
+(Phase 32 reserved). Offline recorded fixtures `tests/fixtures/notion/`;
+`tests/test_notion_connector.py` (12) incl. engine-e2e idempotent +
+incremental (zero block fetches on unchanged) + conformance + entry-point
+guard. Suite: **214 passed** (+12).
+
+**Step 31.1 (Connector SDK) landed here 2026-07-15.** Third-party connector
+plugins resolve by `sources[].type` name via `importlib.metadata` entry
+points (group `syncsage.connectors`, `sync/connector_registry.py`) or
+programmatic `register_connector_class`; unknown config type strings load
+as `PluginSourceType` (a `str` with a `.value` property — existing
+`source.type.value` call sites untouched, no workspace anchoring) and
+resolve at dispatch (`connector_for_source` falls through to the registry
+after the hardcoded built-ins, so the zero-plugin path is byte-identical;
+missing plugin → error naming type + installed plugins). Public quality
+bar: `syncsage.testing.ConnectorConformance` (subclass + one
+`make_connector` factory) — FilesystemConnector passes the same harness.
+Canonical third-party shape: `tests/fixtures/syncsage-connector-example/`
+(`StaticDirConnector`), engine-e2e + idempotent second sync in
+`tests/test_connector_sdk.py`. Docs: `docs/reference/connector-sdk.md`.
+Suite: **183 passed** (+19). Steps 31.2–31.6 (Notion/GDrive/Slack/
+Confluence/IMAP) build on this, one per session; contracts in the SR
+repo's `docs/PRODUCT_FRAMEWORK.md` §3.
 
 Full step contracts with acceptance criteria: `docs/SYNAPSE_INTEGRATION.md` §2.
 

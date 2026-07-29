@@ -15,8 +15,40 @@ Sources are the inputs SyncSage indexes. They live under `sources:` in your
 | `document_folder` | PDFs, DOCX, TXT, HTML, XML |
 | `single_file` | One file |
 | `web_collection` | A set of web URLs |
+| `memory` | Agent-memory records (see [Agent memory](agent-memory.md)) |
+| `notion` | A Notion workspace, via an integration token (below) |
+| `gdrive` | Google Drive docs + text files (`connector.api_key_env`, default `GDRIVE_TOKEN`) |
+| `slack` | Slack channel transcripts (`SLACK_TOKEN`; ids rendered as-is) |
+| `confluence` | Confluence pages (`CONFLUENCE_TOKEN` + `connector.api_endpoint` site URL) |
+| `imap` | An email mailbox (`IMAP_CREDENTIALS` as `user:password`; `path` = mailbox) |
 | `api` | Experimental — an HTTP API source |
 | `s3` | Experimental — an S3-style object store |
+
+Third-party connector plugins add further types by name — see the
+[Connector SDK](../reference/connector-sdk.md).
+
+## Notion
+
+Create an internal integration at `notion.so/my-integrations`, share the
+pages with it, and export the token in the environment — it never lands in
+config:
+
+```yaml
+sources:
+  - name: team-notion
+    type: notion
+    path: /unused            # required by the schema; Notion ignores it
+    include: []
+    connector:
+      api_key_env: NOTION_TOKEN   # default; name of the env var
+```
+
+Pages are listed through Notion's search API and rendered to deterministic
+Markdown (headings, lists, to-dos, quotes, code, nested blocks). Sync is
+incremental: unchanged pages (by `last_edited_time`) are skipped before
+any block is fetched, so a large workspace re-syncs in seconds. Page
+`created_by` / `last_edited_by` ids are captured for the upcoming
+permission-aware retrieval work.
 
 ## A minimal source
 

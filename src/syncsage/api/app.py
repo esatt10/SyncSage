@@ -37,11 +37,25 @@ logger = logging.getLogger(__name__)
 
 
 class SearchRequest(BaseModel):
+    # Step 32.2 — optional caller identity; enforced only when
+    # security.acl_enforced is on. The caller (router / deployment
+    # perimeter) authenticates; the region enforces visibility.
+    principal: str | None = None
+    principal_groups: list[str] = []
     knowledge_base: str | None = None
     query: str
     mode: str = "hybrid"
     max_results: int = 10
     source_name: str | None = None
+
+
+class MemoryWriteRequest(BaseModel):
+    text: str
+    scope: str = "user"
+    subject: str | None = None
+    supersedes: str | None = None
+    tags: list[str] = []
+    sync: bool = True
 
 
 class SyncRequest(BaseModel):
@@ -536,6 +550,82 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/memory")
+    def memory_write(req: MemoryWriteRequest) -> dict:
+        from syncsage.memory.store import MemoryStore, memory_source
+
+        source = memory_source(config)
+        if source is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "no enabled memory source configured; add a `type: memory` "
+                    "source to syncsage.yaml"
+                ),
+            )
+        try:
+            record, created = MemoryStore(source.path).append(
+                req.text,
+                scope=req.scope,
+                subject=req.subject,
+                supersedes=req.supersedes,
+                tags=req.tags,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        payload: dict = {"record": record.as_dict(), "created": created, "source": source.name}
+        if req.sync and created:
+            payload["sync"] = engine.sync_source(source.name, "incremental").__dict__
+        return payload
+
+    @app.get("/memory")
+    def memory_list(scope: str | None = None, current_only: bool = False) -> dict:
+        from syncsage.memory.store import MemoryStore, memory_source
+
+        source = memory_source(config)
+        if source is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "no enabled memory source configured; add a `type: memory` "
+                    "source to syncsage.yaml"
+                ),
+            )
+        try:
+            records = MemoryStore(source.path).list_records(scope, current_only=current_only)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"source": source.name, "records": [r.as_dict() for r in records]}
+
+    @app.post("/memory/consolidate")
+    def memory_consolidate() -> dict:
+        from syncsage.memory.maintenance import run_memory_maintenance
+
+        result = run_memory_maintenance(engine)
+        if result is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "memory consolidation is disabled or no `type: memory` source is configured"
+                ),
+            )
+        return result
+
+    @app.post("/security/idp/sync")
+    def idp_sync() -> dict:
+        from syncsage.security.idp import run_idp_sync
+
+        try:
+            return run_idp_sync(config, state)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/security/idp/status")
+    def idp_sync_status() -> dict:
+        from syncsage.security.idp import idp_status
+
+        return idp_status(config, state)
+
     @app.get("/sync/status")
     def sync_status() -> dict:
         return {
@@ -552,6 +642,9 @@ def create_app(
             req.max_results,
             req.source_name,
             graph=engine.graph_builder.graph,
+            principal=req.principal,
+            principal_groups=req.principal_groups,
+            security=config.security,
         )
 
     @app.post("/relevant-files")

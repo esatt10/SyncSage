@@ -78,7 +78,28 @@ class SchedulerService:
             try:
                 with self._sync_lock:
                     results = self.engine.sync_all("incremental")
+                    # Step 33.2: memory consolidation rides the same beat —
+                    # archive superseded/expired records, then a full re-sync
+                    # of the (small) memory source drops them from the index.
+                    # No-ops fast when no memory source is configured.
+                    from syncsage.memory.maintenance import run_memory_maintenance
+
+                    maintenance = run_memory_maintenance(self.engine)
+                    # Step 32.4: the IdP group-sync refresh rides the same
+                    # beat. No-ops when disabled or not yet due; a fetch
+                    # failure is reported (never raised) so the beat
+                    # survives and the mapping just ages toward the SLA.
+                    from syncsage.security.idp import run_idp_maintenance
+
+                    idp = run_idp_maintenance(self.engine.config, self.engine.state)
             except Exception:
                 logger.exception("Scheduled incremental sync failed")
                 continue
+            if idp and not idp.get("error"):
+                logger.debug("IdP group sync refreshed (%s principal(s))", idp["principals"])
+            if maintenance and maintenance["report"]["archived"]:
+                logger.info(
+                    "Memory consolidation archived %s record(s)",
+                    maintenance["report"]["archived"],
+                )
             logger.debug("Scheduled sync completed for %s source(s)", len(results))

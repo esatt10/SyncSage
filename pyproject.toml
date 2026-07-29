@@ -37,6 +37,13 @@ a2a = ["cryptography>=42.0"]
 docs = ["mkdocs-material>=9.5"]
 dev = ["pytest>=8.2", "pytest-asyncio>=0.23", "httpx>=0.27", "ruff>=0.5"]
 
+[project.entry-points."syncsage.connectors"]
+notion = "syncsage.connectors.notion:NotionConnector"
+gdrive = "syncsage.connectors.gdrive:GDriveConnector"
+slack = "syncsage.connectors.slack:SlackConnector"
+confluence = "syncsage.connectors.confluence:ConfluenceConnector"
+imap = "syncsage.connectors.imap:ImapConnector"
+
 [project.scripts]
 syncsage = "syncsage.cli:app"
 
@@ -46,6 +53,9 @@ packages = ["src/syncsage"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# Fixture packages carry their own test suites (the canonical third-party
+# connector shape); they run in *their* package context, not ours.
+norecursedirs = ["tests/fixtures"]
 
 [tool.ruff]
 line-length = 100

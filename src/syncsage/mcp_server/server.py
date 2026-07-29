@@ -119,21 +119,51 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
         return tools.sync_source(knowledge_base, source_name, mode)
 
     @mcp.tool()
+    def memory_write(
+        knowledge_base: str,
+        text: str,
+        scope: str = "user",
+        subject: str | None = None,
+        supersedes: str | None = None,
+        tags: list[str] | None = None,
+        sync: bool = True,
+    ) -> dict:
+        """Persist one agent-memory record (session/user/org scope) and index it.
+
+        The memory becomes retrievable via search_context immediately when
+        sync=true (read-your-writes). Requires a `type: memory` source.
+        """
+
+        return tools.memory_write(knowledge_base, text, scope, subject, supersedes, tags, sync)
+
+    @mcp.tool()
+    def memory_consolidate(knowledge_base: str) -> dict:
+        """Archive superseded/expired memory records and re-index the memory source."""
+
+        return tools.memory_consolidate(knowledge_base)
+
+    @mcp.tool()
     def sync_all(knowledge_base: str, mode: str = "incremental") -> dict:
         """Sync all enabled configured sources."""
 
         return tools.sync_all(knowledge_base, mode)
 
     @mcp.tool()
-    def search_context(
+    def search_context(  # noqa: PLR0913 - additive principal params (32.2)
         knowledge_base: str,
         query: str,
         mode: str = "hybrid",
         max_results: int = 10,
         include_chunks: bool = True,
         include_graph_neighbors: bool = True,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
     ) -> dict:
-        """Search indexed context and return compact results with provenance."""
+        """Search indexed context and return compact results with provenance.
+
+        principal/principal_groups scope results to what that caller may see
+        when security.acl_enforced is on (Step 32.2); ignored otherwise.
+        """
 
         return tools.search_context(
             knowledge_base,
@@ -142,6 +172,8 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
             max_results,
             include_chunks,
             include_graph_neighbors,
+            principal=principal,
+            principal_groups=principal_groups,
         )
 
     @mcp.tool()

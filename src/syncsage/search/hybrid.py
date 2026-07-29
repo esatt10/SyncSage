@@ -26,28 +26,66 @@ class HybridSearch:
         max_results: int = 10,
         source_name: str | None = None,
         graph: SimpleMultiDiGraph | None = None,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
+        security: Any = None,
     ) -> dict:
         mode = mode if mode in VALID_MODES else "hybrid"
         max_results = max(1, int(max_results or 10))
+
+        # Step 32.2 — principal-aware retrieval, opt-in via
+        # security.acl_enforced. Candidates are over-fetched, filtered
+        # against artifact ACLs *before* the merge/return, then truncated.
+        enforced = bool(security is not None and getattr(security, "acl_enforced", False))
+        fetch_n = max_results * 3 if enforced else max_results
 
         text_results: list[dict[str, Any]] = []
         graph_results: list[dict[str, Any]] = []
         vector_results: list[dict[str, Any]] = []
 
         if mode in {"hybrid", "text"}:
-            text_results = self.store.search(
-                query, source_name=source_name, max_results=max_results
-            )
+            text_results = self.store.search(query, source_name=source_name, max_results=fetch_n)
         # Graph search needs the live graph; callers that don't supply one
         # (e.g. CLI/MCP search_context) transparently fall back to text search.
         if mode in {"hybrid", "graph"} and graph is not None:
-            graph_results = search_graph(
-                graph, query, max_results=max_results, source_name=source_name
-            )
+            graph_results = search_graph(graph, query, max_results=fetch_n, source_name=source_name)
         if mode in {"hybrid", "vector"} and self.vector is not None:
-            vector_results = self.vector.search(
-                query, source_name=source_name, max_results=max_results
+            vector_results = self.vector.search(query, source_name=source_name, max_results=fetch_n)
+
+        if enforced:
+            from syncsage.security.acl import expand_principal, is_allowed
+
+            identities = expand_principal(
+                principal, principal_groups, getattr(security, "groups", None)
             )
+            # Step 32.4 — union in IdP-synced groups, but only while the
+            # mapping honors the staleness SLA (stale grants fail closed).
+            if identities is not None and principal:
+                from syncsage.security.idp import fresh_idp_groups
+
+                identities |= fresh_idp_groups(
+                    self.store.state, principal, getattr(security, "idp", None)
+                )
+            default_public = getattr(security, "default_visibility", "public") != "private"
+            candidate_ids = [
+                str(item.get("node_id"))
+                for group in (text_results, vector_results, graph_results)
+                for item in group
+                if item.get("node_id")
+            ]
+            acls = self.store.state.artifact_acls(candidate_ids)
+
+            def visible(item: dict[str, Any]) -> bool:
+                node_id = str(item.get("node_id") or "")
+                if node_id not in acls:
+                    # Not resolvable to an artifact row (concept/symbol graph
+                    # nodes): conservative deny under enforcement.
+                    return False
+                return is_allowed(acls[node_id], identities, default_public=default_public)
+
+            text_results = [r for r in text_results if visible(r)]
+            vector_results = [r for r in vector_results if visible(r)]
+            graph_results = [r for r in graph_results if visible(r)]
 
         chunk_candidates = text_results + vector_results
         if text_results and vector_results:

@@ -571,6 +571,7 @@ def connector_for_source(source: SourceConfig, state: StateStore) -> SourceConne
         "obsidian_vault",
         "document_folder",
         "single_file",
+        "memory",
     }:
         return FilesystemConnector(source, state)
     if source.type.value == "web_collection":
@@ -579,7 +580,16 @@ def connector_for_source(source: SourceConfig, state: StateStore) -> SourceConne
         return APIConnector(source, state)
     if source.type.value == "s3":
         return S3Connector(source, state)
-    raise ConnectorUnavailable(f"No connector registered for source type: {source.type.value}")
+    from syncsage.sync.connector_registry import get_connector_class, list_connector_types
+
+    plugin_class = get_connector_class(source.type.value)
+    if plugin_class is not None:
+        return plugin_class(source, state)
+    installed = ", ".join(list_connector_types()) or "none"
+    raise ConnectorUnavailable(
+        f"No connector registered for source type: {source.type.value} "
+        f"(installed connector plugins: {installed})"
+    )
 
 
 def _timestamp(timestamp: float) -> str:

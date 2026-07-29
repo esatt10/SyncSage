@@ -34,6 +34,22 @@ class SourceType(StrEnum):
     single_file = "single_file"
     s3 = "s3"
     api = "api"
+    memory = "memory"
+
+
+class PluginSourceType(str):
+    """A connector-plugin source type outside the built-in enum (Step 31.1).
+
+    Behaves as its plain string everywhere, plus a ``.value`` property so
+    every existing ``source.type.value`` call site works unchanged. Whether
+    a connector actually exists for the name is checked at dispatch time
+    (``connector_for_source``), not at config load — config stays loadable
+    on a machine that hasn't installed the plugin yet.
+    """
+
+    @property
+    def value(self) -> str:
+        return str(self)
 
 
 # Source types whose ``path`` is a real local directory/file (as opposed to
@@ -46,6 +62,7 @@ FILESYSTEM_SOURCE_TYPES = frozenset(
         SourceType.obsidian_vault,
         SourceType.document_folder,
         SourceType.single_file,
+        SourceType.memory,
     }
 )
 
@@ -341,10 +358,56 @@ class SynapseSettings(ModelMixin):
 
 
 @dataclass
+class MemorySettings(ModelMixin):
+    """Agent-memory consolidation policy (Step 33.2).
+
+    Consolidation archives superseded records (an explicit correction is the
+    only default trigger); per-scope TTL decay is opt-in — ``None`` means the
+    scope never expires. Archived record files are renamed in place
+    (``.md.archived``) and never deleted.
+    """
+
+    consolidation_enabled: bool = True
+    session_ttl_days: int | None = None
+    user_ttl_days: int | None = None
+    org_ttl_days: int | None = None
+
+
+@dataclass
+class IdPSettings(ModelMixin):
+    """External identity-provider group sync (Step 32.4).
+
+    Disabled by default — the 32.2 config-mapped ``security.groups`` stays
+    the deterministic core. When enabled, the region pulls a SCIM 2.0
+    ``/Groups`` listing every ``sync_interval_minutes`` (scheduler beat, or
+    ``POST /security/idp/sync``) into SQLite; the bearer token is read from
+    the environment variable named by ``api_key_env`` and never stored.
+    ``staleness_max_minutes`` is the SLA: a mapping older than this grants
+    nothing (fail closed) until the next successful sync.
+    """
+
+    enabled: bool = False
+    provider: str = "scim"
+    base_url: str = ""
+    api_key_env: str = "IDP_TOKEN"
+    sync_interval_minutes: int = 60
+    staleness_max_minutes: int = 1440
+
+
+@dataclass
 class SecuritySettings(ModelMixin):
     allow_workspace_roots: list[Path] = field(
         default_factory=lambda: [Path("/workspace"), Path("/vault"), Path("/exports")]
     )
+    # Step 32.2 — principal-aware retrieval. Off by default: a standalone /
+    # single-user region behaves byte-identically to pre-32. When enforced,
+    # un-ACL'd artifacts follow default_visibility ("public" keeps local
+    # sources searchable; "private" requires an authenticated principal),
+    # and `groups` maps principal ids to group identities (IdP sync = 32.4).
+    acl_enforced: bool = False
+    default_visibility: str = "public"
+    groups: dict[str, list[str]] = field(default_factory=dict)
+    idp: IdPSettings = field(default_factory=IdPSettings)
     allow_user_selected_source_paths: bool = True
     read_only_sources: bool = True
     deny_path_traversal: bool = True
@@ -380,6 +443,9 @@ class SourceConnectorSettings(ModelMixin):
     allow_experimental: bool = False
     request_timeout_seconds: int = 10
     headers: dict[str, str] = field(default_factory=dict)
+    # Name of the environment variable holding the connector's API token
+    # (Step 31.2+ SaaS connectors). The secret itself never lands in config.
+    api_key_env: str | None = None
     api_endpoint: str | None = None
     api_items_field: str = "items"
     api_content_field: str = "content"
@@ -390,7 +456,7 @@ class SourceConnectorSettings(ModelMixin):
 @dataclass
 class SourceConfig(ModelMixin):
     name: str
-    type: SourceType
+    type: SourceType | PluginSourceType
     path: Path
     description: str | None = None
     enabled: bool = True
@@ -425,6 +491,7 @@ class SyncSageConfig(ModelMixin):
     obsidian: ObsidianSettings = field(default_factory=ObsidianSettings)
     security: SecuritySettings = field(default_factory=SecuritySettings)
     synapse: SynapseSettings = field(default_factory=SynapseSettings)
+    memory: MemorySettings = field(default_factory=MemorySettings)
     sources: list[SourceConfig] = field(default_factory=list)
 
     @classmethod
@@ -445,6 +512,8 @@ class SyncSageConfig(ModelMixin):
                     raw["allow_workspace_roots"] = [
                         Path(item) for item in raw["allow_workspace_roots"] or []
                     ]
+                if "idp" in raw and isinstance(raw["idp"], dict):
+                    raw["idp"] = build(IdPSettings, raw["idp"])
             if dc is ServerSettings:
                 if "mcp" in raw and isinstance(raw["mcp"], dict):
                     raw["mcp"] = build(McpSettings, raw["mcp"])
@@ -484,12 +553,16 @@ class SyncSageConfig(ModelMixin):
             obsidian=build(ObsidianSettings, data.get("obsidian")),
             security=build(SecuritySettings, data.get("security")),
             synapse=build(SynapseSettings, data.get("synapse")),
+            memory=build(MemorySettings, data.get("memory")),
             sources=[],
         )
         cfg.sources = []
         for raw in data.get("sources", []) or []:
             raw = dict(raw)
-            raw["type"] = SourceType(raw.get("type", "single_file"))
+            try:
+                raw["type"] = SourceType(raw.get("type", "single_file"))
+            except ValueError:
+                raw["type"] = PluginSourceType(str(raw.get("type")))
             src_path = Path(raw["path"])
             # Anchor a relative filesystem source path to workspace_root so a
             # config written as `path: docs` means "<workspace_root>/docs", not
