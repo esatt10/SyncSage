@@ -1,0 +1,392 @@
+"""One-line setup over arbitrary targets, and one-line container hosting.
+
+Acceptance:
+
+1. Any target shape resolves to a source: folder, file, markdown notes,
+   obsidian vault, git repo (local + remote URL), web URL, s3://,
+   connector plugin name.
+2. A glob or ``--split`` over a folder-of-folders yields one source per
+   child directory, with de-duplicated names.
+3. ``syncsage up a b c`` writes one config with all three sources, indexes
+   them, and re-running it re-indexes nothing (idempotency spine).
+4. ``syncsage host`` generates a compose file plus a container-view config
+   whose paths are remapped into the image — without needing Docker.
+5. The UI's ``/sources/quick-add`` is the same resolution path over HTTP.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import shutil
+from pathlib import Path
+
+import pytest
+import yaml
+from fastapi.testclient import TestClient
+
+from syncsage.api.app import create_app
+from syncsage.cli import main
+from syncsage.config.loader import load_config
+from syncsage.deployment.host import render_compose
+from syncsage.targets import (
+    ResolvedTarget,
+    TargetError,
+    expand_specs,
+    is_git_url,
+    resolve_target,
+    resolve_targets,
+)
+
+SAMPLE_WORKSPACE = Path(__file__).resolve().parent / "fixtures" / "sample_workspace"
+
+
+@pytest.fixture()
+def roots(tmp_path: Path) -> tuple[Path, Path]:
+    return tmp_path / ".syncsage" / "sources", tmp_path / ".syncsage" / "external"
+
+
+def _sync_counts(output: str) -> list[tuple[int, int]]:
+    return [(int(a), int(b)) for a, b in re.findall(r"indexed=(\d+) skipped=(\d+)", output)]
+
+
+# --------------------------------------------------------------------- detection
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/anthropics/claude-code",
+        "git@github.com:owner/repo.git",
+        "https://gitlab.com/group/project",
+        "https://example.com/thing.git",
+        "ssh://git@host/repo",
+    ],
+)
+def test_git_urls_are_recognised(url: str) -> None:
+    assert is_git_url(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://docs.example.com/guide",
+        "https://github.com/owner/repo/blob/main/README.md",  # a page, not a clone
+        "https://example.com",
+    ],
+)
+def test_non_git_urls_are_not_clones(url: str) -> None:
+    assert is_git_url(url) is False
+
+
+def test_local_shapes_are_classified(tmp_path: Path, roots) -> None:
+    clone_root, workspace = roots
+    vault = tmp_path / "vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "a.md").write_text("# a", encoding="utf-8")
+    mixed = tmp_path / "mixed"
+    mixed.mkdir()
+    (mixed / "a.pdf").write_bytes(b"%PDF-")
+    (mixed / "b.csv").write_text("x", encoding="utf-8")
+    single = tmp_path / "one.md"
+    single.write_text("# one", encoding="utf-8")
+
+    def kind(path: Path) -> str:
+        return resolve_target(str(path), clone_root=clone_root, workspace=workspace).type
+
+    assert kind(vault) == "obsidian_vault"
+    assert kind(repo) == "repository"
+    assert kind(notes) == "markdown_folder"
+    assert kind(mixed) == "document_folder"
+    assert kind(single) == "single_file"
+
+
+def test_remote_and_connector_targets_resolve_without_touching_disk(roots) -> None:
+    clone_root, workspace = roots
+
+    repo = resolve_target(
+        "https://github.com/owner/proj", clone_root=clone_root, workspace=workspace
+    )
+    assert repo.type == "repository"
+    assert repo.clone_url == "https://github.com/owner/proj"
+    assert repo.name == "proj"
+    assert repo.path.endswith("proj")
+
+    web = resolve_target(
+        "https://docs.example.com/guide", clone_root=clone_root, workspace=workspace
+    )
+    assert web.type == "web_collection"
+    assert web.urls == ["https://docs.example.com/guide"]
+    assert web.local is False
+
+    bucket = resolve_target("s3://my-bucket/prefix", clone_root=clone_root, workspace=workspace)
+    assert bucket.type == "s3"
+    assert bucket.local is False
+
+    # Step 31.1 plugin types pass through by name and resolve at dispatch.
+    notion = resolve_target("notion:my-workspace", clone_root=clone_root, workspace=workspace)
+    assert notion.type == "notion"
+    assert notion.local is False
+
+
+def test_explicit_type_prefix_overrides_detection(tmp_path: Path, roots) -> None:
+    clone_root, workspace = roots
+    folder = tmp_path / "stuff"
+    folder.mkdir()
+    (folder / "a.md").write_text("# a", encoding="utf-8")
+
+    target = resolve_target(f"docs:{folder}", clone_root=clone_root, workspace=workspace)
+    assert target.type == "document_folder"  # not the auto-detected markdown_folder
+
+
+def test_missing_local_path_is_an_error(tmp_path: Path, roots) -> None:
+    clone_root, workspace = roots
+    with pytest.raises(TargetError):
+        resolve_target(str(tmp_path / "nope"), clone_root=clone_root, workspace=workspace)
+
+
+# ------------------------------------------------------------------- collections
+
+
+def test_glob_and_split_expand_a_folder_of_folders(tmp_path: Path, monkeypatch) -> None:
+    parent = tmp_path / "clients"
+    for name in ("acme", "globex", "initech"):
+        (parent / name).mkdir(parents=True)
+        (parent / name / "brief.md").write_text("# brief", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    globbed = expand_specs(["clients/*"])
+    assert len(globbed) == 3
+
+    split = expand_specs([str(parent)], split=True)
+    assert sorted(Path(p).name for p in split) == ["acme", "globex", "initech"]
+
+
+def test_duplicate_names_are_disambiguated(tmp_path: Path, roots) -> None:
+    clone_root, workspace = roots
+    for parent in ("a", "b"):
+        (tmp_path / parent / "docs").mkdir(parents=True)
+        (tmp_path / parent / "docs" / "x.md").write_text("# x", encoding="utf-8")
+
+    targets = resolve_targets(
+        [str(tmp_path / "a" / "docs"), str(tmp_path / "b" / "docs")],
+        clone_root=clone_root,
+        workspace=workspace,
+    )
+    assert [t.name for t in targets] == ["docs", "docs-2"]
+
+
+# --------------------------------------------------------------------- `up` e2e
+
+
+def test_up_indexes_multiple_targets_and_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    notes = tmp_path / "notes"
+    shutil.copytree(SAMPLE_WORKSPACE, notes)
+    clients = tmp_path / "clients"
+    for name in ("acme", "globex"):
+        (clients / name).mkdir(parents=True)
+        (clients / name / "brief.md").write_text(f"# {name} brief\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["up", str(notes), str(clients / "*"), "--no-serve"]) == 0
+    output = capsys.readouterr().out
+
+    config_path = tmp_path / "syncsage.yaml"
+    cfg = load_config(config_path)
+    assert [s.name for s in cfg.sources] == ["notes", "acme", "globex"]
+    assert cfg.sources[1].type.value == "markdown_folder"
+    # Every local target is reachable under the security allowlist.
+    roots = {str(p) for p in cfg.security.allow_workspace_roots}
+    assert str(clients / "acme") in roots
+
+    counts = _sync_counts(output)
+    assert len(counts) == 3
+    assert all(indexed > 0 for indexed, _ in counts)
+
+    first_bytes = config_path.read_bytes()
+    assert main(["up", str(notes), str(clients / "*"), "--no-serve"]) == 0
+    second = capsys.readouterr().out
+    assert config_path.read_bytes() == first_bytes, "config is never rewritten"
+    assert all(indexed == 0 and skipped > 0 for indexed, skipped in _sync_counts(second))
+
+
+def test_up_splits_a_parent_directory_into_one_source_each(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    parent = tmp_path / "projects"
+    for name in ("alpha", "beta"):
+        (parent / name).mkdir(parents=True)
+        (parent / name / "readme.md").write_text(f"# {name}\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["up", str(parent), "--split", "--no-serve"]) == 0
+    capsys.readouterr()
+    cfg = load_config(tmp_path / "syncsage.yaml")
+    assert [s.name for s in cfg.sources] == ["alpha", "beta"]
+
+
+def test_up_rejects_a_target_that_does_not_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert main(["up", str(tmp_path / "missing"), "--no-serve"]) == 1
+
+
+def test_generated_multi_source_config_round_trips_through_yaml(tmp_path: Path, roots) -> None:
+    """Globs and URLs in a generated config must survive the YAML round trip."""
+    from syncsage.quickstart import render_up_config
+
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "a.md").write_text("# a", encoding="utf-8")
+    clone_root, workspace = roots
+    targets = resolve_targets(
+        [str(notes), "https://docs.example.com/guide"],
+        clone_root=clone_root,
+        workspace=workspace,
+    )
+    config_path = tmp_path / "syncsage.yaml"
+
+    text = render_up_config(targets, config_path)
+    assert text == render_up_config(targets, config_path), "rendering is deterministic"
+
+    raw = yaml.safe_load(text)
+    assert [s["name"] for s in raw["sources"]] == ["notes", "docs-example-com"]
+    assert raw["sources"][0]["include"] == ["**/*.md", "**/*.markdown"]
+    assert raw["sources"][1]["urls"] == ["https://docs.example.com/guide"]
+
+
+# --------------------------------------------------------------------- `host`
+
+
+def test_host_generates_compose_and_container_config_without_docker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "a.md").write_text("# a\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    args = argparse.Namespace(
+        path=[str(notes)],
+        config="syncsage.yaml",
+        name=None,
+        port=9100,
+        ui_port=9200,
+        profile="quickstart",
+        split=False,
+        output="docker-compose.syncsage.yml",
+        image=None,
+        ui_image=None,
+        no_ui=False,
+        print_only=True,
+    )
+    from syncsage.deployment.host import host_stack
+
+    assert host_stack(args) == 0
+    capsys.readouterr()
+
+    compose = yaml.safe_load((tmp_path / "docker-compose.syncsage.yml").read_text(encoding="utf-8"))
+    services = compose["services"]
+    assert services["syncsage"]["ports"] == ["9100:8765"]
+    assert services["syncsage-ui"]["ports"] == ["9200:80"]
+    # The local source is mounted read-only at a stable container path.
+    assert any(v.endswith("/sources/notes:ro") for v in services["syncsage"]["volumes"])
+    # State survives `docker compose down`.
+    assert any(v.endswith(":/state") for v in services["syncsage"]["volumes"])
+
+    container_config = yaml.safe_load(
+        (tmp_path / "syncsage.container.yaml").read_text(encoding="utf-8")
+    )
+    assert container_config["sources"][0]["path"] == "/sources/notes"
+    assert container_config["syncsage"]["state_path"] == "/state"
+    assert "/sources/notes" in container_config["security"]["allow_workspace_roots"]
+
+
+def test_host_can_omit_the_ui_sidecar(tmp_path: Path) -> None:
+    target = ResolvedTarget(
+        name="notes", type="markdown_folder", path=str(tmp_path / "notes"), description="d"
+    )
+    compose = yaml.safe_load(
+        render_compose(
+            [target],
+            config_path=tmp_path / "c.yaml",
+            state_dir=tmp_path / ".syncsage",
+            port=8765,
+            ui_port=8080,
+            include_ui=False,
+        )
+    )
+    assert set(compose["services"]) == {"syncsage"}
+
+
+# --------------------------------------------------------------------- HTTP
+
+
+def test_quick_add_registers_and_syncs_a_pasted_path(loaded_config, tmp_path: Path) -> None:
+    external = tmp_path / "pasted-notes"
+    external.mkdir()
+    (external / "note.md").write_text("# Pasted\nSome content.\n", encoding="utf-8")
+    loaded_config.security.allow_user_selected_source_paths = True
+    client = TestClient(create_app(config=loaded_config))
+
+    response = client.post("/sources/quick-add", json={"target": str(external)})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["sources"][0]["name"] == "pasted-notes"
+    assert body["sources"][0]["type"] == "markdown_folder"
+    assert body["sync_results"][0]["indexed_artifacts"] == 1
+    assert any(s["name"] == "pasted-notes" for s in client.get("/sources").json())
+
+
+def test_quick_add_rejects_a_bad_target(loaded_config, tmp_path: Path) -> None:
+    client = TestClient(create_app(config=loaded_config))
+    response = client.post("/sources/quick-add", json={"target": str(tmp_path / "nowhere")})
+    assert response.status_code == 400
+
+
+def test_overview_reports_whether_there_is_a_graph_to_show(loaded_config) -> None:
+    """The lone-star-node case: a fresh KB must report has_content False."""
+    app = create_app(config=loaded_config)
+    client = TestClient(app)
+
+    empty = client.get("/overview").json()
+    assert empty["has_content"] is False
+    assert empty["indexed_artifacts"] == 0
+
+    app.state.engine.sync_source("architecture-notes", "full")
+    filled = client.get("/overview").json()
+    assert filled["has_content"] is True
+    assert filled["indexed_artifacts"] > 0
+    assert filled["node_counts"]["knowledge_base"] == 1
+
+
+def test_graph_route_filters_noisy_node_types(loaded_config) -> None:
+    app = create_app(config=loaded_config)
+    app.state.engine.sync_source("architecture-notes", "full")
+    client = TestClient(app)
+
+    everything = client.get("/graph").json()
+    trimmed = client.get("/graph", params={"exclude_types": "concept,chunk"}).json()
+
+    assert len(trimmed["nodes"]) < len(everything["nodes"])
+    assert not any(n.get("type") in ("concept", "chunk") for n in trimmed["nodes"])
+    # Totals still describe the whole graph, so the UI can say "x of y".
+    assert trimmed["total_nodes"] == everything["total_nodes"]
+    assert trimmed["filtered"] is True
+
+
+def test_mcp_info_exposes_the_tool_surface(loaded_config) -> None:
+    client = TestClient(create_app(config=loaded_config))
+    info = client.get("/mcp/info").json()
+
+    names = {tool["name"] for tool in info["tools"]}
+    assert {"search_context", "sync_source", "get_graph_neighbors"} <= names
+    assert info["stdio_command"][:2] == ["syncsage", "mcp"]

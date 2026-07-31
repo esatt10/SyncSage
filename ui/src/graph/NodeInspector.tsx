@@ -2,16 +2,13 @@ import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { GraphLink, GraphNode } from "../api/types";
-import { Explainable } from "../explain/Explainable";
 import { colorForNode } from "./graphStyles";
 
 interface NodeInspectorProps {
   selectedId: string | null;
   nodes: GraphNode[];
   links: GraphLink[];
-  expandDepth: number;
-  onDepthChange: (depth: number) => void;
-  onExpand: (nodeId: string) => void;
+  onExpand: (nodeId: string, depth?: number) => void;
   onPivot: (nodeId: string) => void;
 }
 
@@ -19,12 +16,13 @@ type Tab = "overview" | "relationships" | "content";
 
 const CONTENT_TYPES = new Set(["file", "document", "markdown_note", "chunk"]);
 
+// Internal bookkeeping the user never needs to see.
+const HIDDEN_KEYS = new Set(["label", "type", "id", "knowledge_base_id"]);
+
 export function NodeInspector({
   selectedId,
   nodes,
   links,
-  expandDepth,
-  onDepthChange,
   onExpand,
   onPivot,
 }: NodeInspectorProps) {
@@ -58,8 +56,10 @@ export function NodeInspector({
   if (!selectedId || !node) {
     return (
       <div className="inspector inspector--empty">
-        <p>Select a node to inspect its identity, relationships and content.</p>
-        <p className="muted">Tip: turn on Explain mode in the top bar to learn the controls.</p>
+        <p style={{ margin: 0 }}>
+          Select a node on the graph, or click a citation in an answer, to inspect its
+          identity, relationships and indexed content.
+        </p>
       </div>
     );
   }
@@ -68,63 +68,45 @@ export function NodeInspector({
     <div className="inspector">
       <div className="inspector__title">
         <span className="dot" style={{ background: colorForNode(node.type) }} />
-        <div>
+        <div style={{ minWidth: 0 }}>
           <div className="inspector__label">{node.label ?? node.id}</div>
           <div className="muted small">{node.type}</div>
         </div>
       </div>
 
-      <div className="inspector__expand">
-        <Explainable id="graph.depth" as="span">
-          <label className="small muted">
-            depth
-            <input
-              type="number"
-              min={1}
-              max={10}
-              value={expandDepth}
-              onChange={(e) => onDepthChange(Number(e.target.value))}
-            />
-          </label>
-        </Explainable>
-        <Explainable id="graph.expand" as="span">
-          <button className="btn btn--primary" onClick={() => onExpand(selectedId)}>
-            Expand sub-network
-          </button>
-        </Explainable>
-      </div>
+      <button className="btn btn--small" onClick={() => onExpand(selectedId)}>
+        Expand neighbourhood
+      </button>
 
       <div className="tabs">
-        <Explainable id="inspector.overview" as="span">
-          <button className={tab === "overview" ? "tab active" : "tab"} onClick={() => setTab("overview")}>
-            Overview
-          </button>
-        </Explainable>
-        <Explainable id="inspector.relationships" as="span">
-          <button
-            className={tab === "relationships" ? "tab active" : "tab"}
-            onClick={() => setTab("relationships")}
-          >
-            Relationships
-          </button>
-        </Explainable>
-        <Explainable id="inspector.content" as="span">
-          <button className={tab === "content" ? "tab active" : "tab"} onClick={() => setTab("content")}>
-            Content
-          </button>
-        </Explainable>
+        <button
+          className={tab === "overview" ? "tab active" : "tab"}
+          onClick={() => setTab("overview")}
+        >
+          Overview
+        </button>
+        <button
+          className={tab === "relationships" ? "tab active" : "tab"}
+          onClick={() => setTab("relationships")}
+        >
+          Links
+        </button>
+        <button
+          className={tab === "content" ? "tab active" : "tab"}
+          onClick={() => setTab("content")}
+        >
+          Content
+        </button>
       </div>
 
       {tab === "overview" && (
         <div className="kv">
-          {Object.entries(node)
-            .filter(([key]) => !["label", "type"].includes(key))
-            .map(([key, value]) => (
-              <div className="kv__row" key={key}>
-                <span className="kv__key">{key}</span>
-                <span className="kv__value">{renderValue(value)}</span>
-              </div>
-            ))}
+          {flattenAttributes(node).map(([key, value]) => (
+            <div className="kv__row" key={key}>
+              <span className="kv__key">{key.replace(/_/g, " ")}</span>
+              <span className="kv__value">{value}</span>
+            </div>
+          ))}
           {explainQuery.data?.explanation && (
             <p className="explanation">{explainQuery.data.explanation}</p>
           )}
@@ -132,7 +114,7 @@ export function NodeInspector({
       )}
 
       {tab === "relationships" && (
-        <div className="relationships">
+        <div>
           <RelGroup
             title="Outgoing"
             items={relationships.outgoing}
@@ -149,15 +131,17 @@ export function NodeInspector({
       )}
 
       {tab === "content" && (
-        <div className="content-tab">
+        <div>
           {contentQuery.isLoading ? (
-            <p className="muted">Loading full content...</p>
+            <p className="muted small">
+              <span className="spinner" /> Loading content…
+            </p>
           ) : contentQuery.data?.content ? (
             <pre className="content-block">{contentQuery.data.content}</pre>
           ) : node.summary ? (
             <pre className="content-block">{String(node.summary)}</pre>
           ) : (
-            <p className="muted">No indexed content for this node type.</p>
+            <p className="muted small">No indexed content for this node type.</p>
           )}
         </div>
       )}
@@ -176,10 +160,19 @@ function RelGroup({
   nodeById: Map<string, GraphNode>;
   onPivot: (id: string) => void;
 }) {
-  if (items.length === 0) return <div className="rel-group muted small">{title}: none</div>;
+  if (items.length === 0) {
+    return (
+      <div className="rel-group">
+        <div className="rel-group__title">{title}</div>
+        <span className="muted small">none</span>
+      </div>
+    );
+  }
   return (
     <div className="rel-group">
-      <div className="rel-group__title">{title}</div>
+      <div className="rel-group__title">
+        {title} · {items.length}
+      </div>
       {items.map((item, index) => (
         <button
           key={`${item.type}-${item.other}-${index}`}
@@ -195,8 +188,41 @@ function RelGroup({
   );
 }
 
-function renderValue(value: unknown): string {
-  if (value === null || value === undefined) return "-";
-  if (typeof value === "object") return JSON.stringify(value);
-  return String(value);
+/**
+ * Node attributes as flat, readable rows.
+ *
+ * Enrichment attaches nested objects (`provenance`) and arrays (`concept
+ * terms`); dumping raw JSON into the panel makes the useful fields — path,
+ * hash, branch — hard to find. Nested objects are flattened one level and
+ * arrays are joined, with keys that duplicate an already-shown row dropped.
+ */
+function flattenAttributes(node: GraphNode): [string, string][] {
+  const rows: [string, string][] = [];
+  const emitted = new Set<string>();
+
+  const push = (key: string, value: unknown) => {
+    if (value === null || value === undefined || value === "") return;
+    if (HIDDEN_KEYS.has(key) || emitted.has(key)) return;
+    if (Array.isArray(value)) {
+      if (value.length === 0) return;
+      emitted.add(key);
+      rows.push([key, value.map((item) => String(item)).join(", ")]);
+      return;
+    }
+    if (typeof value === "object") return; // handled by the nested pass below
+    emitted.add(key);
+    rows.push([key, String(value)]);
+  };
+
+  for (const [key, value] of Object.entries(node)) push(key, value);
+  for (const [key, value] of Object.entries(node)) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+    for (const [subKey, subValue] of Object.entries(value as Record<string, unknown>)) {
+      // `provenance.path` and `path` are the same string — show it once.
+      if (emitted.has(subKey)) continue;
+      push(subKey, subValue);
+    }
+    void key;
+  }
+  return rows;
 }

@@ -1,63 +1,121 @@
 # SyncSage Web UI
 
-A light React + Vite front end for SyncSage. It is a **separate workload**: it
-builds to a static bundle and talks to the SyncSage container purely over its
-HTTP API, so the indexing container is unchanged (see
+A React + Vite front end for SyncSage: a three-pane research workspace over
+your indexed knowledge base. It is a **separate workload** — it builds to a
+static bundle and talks to the SyncSage container purely over its HTTP API, so
+the indexing container is unchanged (see
 [`docs/ui_recommendation.md`](../docs/ui_recommendation.md)).
+
+```
+┌──────────┬──────────────────────────┬──────────────────────┐
+│ Sources  │ Chat                     │ Graph / Facts / Node │
+│  scope   │  question → grounded     │  cited nodes lit up  │
+│  + add   │  answer with [1] chips   │  surfaced triples    │
+└──────────┴──────────────────────────┴──────────────────────┘
+```
 
 ## Features
 
-- **Graph workspace** — the knowledge graph rendered with Cytoscape. Drill from
-  `knowledge_base → source → file → chunk/symbol/concept`, expand a node's
-  sub-network (depth-bounded), filter by edge type (the "edge lens"), and pivot
-  across relationships. Adding + syncing a source animates new nodes in.
-- **Search** — query across nodes, relationships and their attributes. A **mode**
-  control tunes retrieval (`hybrid` / `text` / `graph`) and a **results** control
-  sets the hit count. Each hit shows its node type and relevance score; clicking
-  one focuses the node, pulling it in from the bounded preview (and re-enabling a
-  filtered node type) if it is not already on the canvas.
-- **Sources** — list/sync/disable/remove, **add a source by opening a local
-  directory** (allowlist-scoped browser), and **promote** runtime sources to
-  YAML.
-- **Config** — edit every config section via a form, drop to **raw YAML**, and
-  **preview a diff** before validating and writing.
-- **Explain mode** — a toggle that outlines explainable components and shows
-  hover tooltips, plus a **"How it works"** Markdown panel with the numerical
-  behavior in LaTeX (KaTeX).
+- **Chat** — ask in prose; answers are grounded in your own index and cite the
+  passages they came from. Clicking a `[1]` chip focuses that node on the graph
+  and opens it in the inspector. Works with **Anthropic**, **OpenAI** or
+  **Gemini**, and works *without* any of them (extractive answers). Full
+  behavior: [Ask your knowledge base](../docs/how-to/chat-and-ui.md).
+- **Facts** — subject–predicate–object triples read straight off the graph one
+  hop from each cited passage, collected round-robin so one hub document cannot
+  crowd out the rest. Both endpoints of a fact are clickable.
+- **Graph** — Cytoscape canvas with a small shape vocabulary and a legend that
+  doubles as the type filter. `concept` and `chunk` are hidden by default (they
+  routinely make up most of a real index). Expand a node's sub-network, pivot
+  across relationships, inspect identity/links/content.
+- **Workflow** — pick the agent that answers questions. With the `[agent]`
+  extra and a model connected, the default is a LangGraph agent that plans
+  sub-queries, searches every mode, walks the graph, grades its own evidence
+  and retries when it is thin, then verifies its citations — with the trace
+  shown under the answer. Custom workflows registered under the
+  `syncsage.agent_workflows` entry-point group appear here too:
+  [Customize the answering workflow](../docs/how-to/agent-workflows.md).
+- **Sources** — one field takes a path, URL, glob or connector name and
+  SyncSage detects the rest; selecting a source scopes both chat and graph to
+  it. **Advanced…** exposes the whole source schema — include/exclude globs,
+  depth, chunking, branch policy, sync triggers, connector settings — with the
+  type list read from the server, so installed connector plugins (Notion,
+  Slack, Confluence, Drive, IMAP, or your own) are offered alongside the
+  built-ins. Service-backed types skip the directory browser entirely.
+- **Semantic search** — turn embeddings on, pick a provider and a vector
+  backend (only ones installed here are offered), see what fraction of the
+  index actually has vectors, and embed already-indexed content without
+  re-reading a single source file.
+- **Onboarding** — when nothing is indexed you get an actionable empty state
+  (add a source, or the one-line command), not an empty canvas.
+- **Connect agent** — MCP transports, a ready-to-paste `.mcp.json`, and the
+  tool list an attached coding agent gets.
+- **Settings** — edit every config section via a form, drop to raw YAML, and
+  preview a diff before validating and writing.
+
+## Design notes
+
+- **Light by default.** This is a reading tool; dark is opt-in via the theme
+  toggle and persists in `localStorage`. Both themes come from the CSS custom
+  properties at the top of `styles.css` — change a token, not a rule.
+- **Small shape vocabulary.** Four shapes, not twelve: rounded rectangles for
+  containers, rectangles for documents, circles for ideas, diamonds for code
+  symbols. Colour carries the finer distinction; size grows with connectivity.
+- **Nothing secret is stored here.** A chat API key the user pastes goes to the
+  server, which holds it in memory behind an opaque token; the browser keeps
+  only that token, in `sessionStorage`. Connector credentials are never typed
+  in at all — a source stores the *name* of an environment variable.
+- **Parity with the API.** Every control is a call the server already exposes;
+  the UI adds no capability of its own. If something is configurable in
+  `syncsage.yaml` it should be reachable here, and what a deployment can offer
+  (source types, vector backends, workflows) is read from the server rather
+  than hardcoded in this bundle — an installed plugin shows up without a
+  rebuild.
 
 ## Develop
 
 ```bash
 cd ui
 npm install
-# Point at a running SyncSage (defaults to http://localhost:8765):
-SYNCSAGE_API_BASE=http://localhost:8765 npm run dev
+npm run dev        # http://localhost:5173, proxying /api -> :8765
 ```
 
-In dev, API calls go to `/api/*` and Vite proxies them to `SYNCSAGE_API_BASE`.
-Override the API base at build/runtime with `VITE_SYNCSAGE_API_BASE`.
-The production UI requests a bounded initial graph preview by default
-(`VITE_SYNCSAGE_GRAPH_NODE_LIMIT=1200`,
-`VITE_SYNCSAGE_GRAPH_LINK_LIMIT=3600`) so large indexes do not block the browser;
-node expansion still fetches focused graph slices.
+Point the proxy elsewhere with `SYNCSAGE_API_BASE`:
+
+```bash
+SYNCSAGE_API_BASE=http://localhost:9000 npm run dev
+```
 
 ## Build
 
 ```bash
+npm run typecheck
 npm run build      # outputs ui/dist
 npm run preview    # serve the production build locally
 ```
 
+| Build variable | Default | Purpose |
+|---|---|---|
+| `VITE_SYNCSAGE_API_BASE` | `/api` in dev, same-origin in prod | Where the API lives. |
+| `VITE_SYNCSAGE_GRAPH_NODE_LIMIT` | `1200` | Node budget per graph request. |
+| `VITE_SYNCSAGE_GRAPH_LINK_LIMIT` | `3600` | Link budget per graph request. |
+
+The bounded preview keeps large indexes from blocking the browser; node
+expansion still fetches focused graph slices on demand.
+
 ## Deploy
 
-- **Sidecar (recommended):** serve `ui/dist` from any static web server / nginx
-  image next to SyncSage; set `VITE_SYNCSAGE_API_BASE` to the SyncSage URL.
-- **Served by SyncSage (optional):** point SyncSage at the bundle with
-  `SYNCSAGE_UI_DIST=/path/to/ui/dist`; it is mounted only when
+- **Sidecar (default):** `docker compose up` — or `syncsage host <target>` —
+  builds this image and serves it behind nginx, proxying `/api/*` to the
+  SyncSage container.
+- **Served by SyncSage:** build to `dist/` and the API mounts it automatically,
+  or point `SYNCSAGE_UI_DIST` at a bundle elsewhere. Mounted only when
   `server.ui.enabled` is true and the directory exists.
 
 ## Backend routes used
 
-`/graph`, `/graph/slice`, `/graph/neighbors`, `/nodes/explain`, `/files/summary`,
-`/sources` (GET/POST), `/sources/{name}/disable|promote` , `DELETE /sources/{name}`,
-`/sync/{name}`, `/fs/list`, `/search`, `/config` (GET/PUT), `/health`.
+`/overview`, `/graph`, `/graph/slice`, `/graph/neighbors`, `/nodes/explain`,
+`/nodes/content`, `/files/summary`, `/sources` (GET/POST),
+`/sources/quick-add`, `/sources/{name}/disable|promote`,
+`DELETE /sources/{name}`, `/sync/{name}`, `/fs/list`, `/search`,
+`/assistant/status|key|chat`, `/mcp/info`, `/config` (GET/PUT), `/health`.

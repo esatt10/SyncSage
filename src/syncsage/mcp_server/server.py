@@ -177,6 +177,37 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
         )
 
     @mcp.tool()
+    def ask_knowledge_base(  # noqa: PLR0913 - mirrors the HTTP surface
+        knowledge_base: str,
+        question: str,
+        workflow: str | None = None,
+        mode: str = "hybrid",
+        max_results: int = 8,
+        source_name: str | None = None,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
+        options: dict | None = None,
+    ) -> dict:
+        """Answer a question from the knowledge base, with citations and graph facts.
+
+        Runs the configured agent workflow over SyncSage's own search. Use
+        this for a synthesized, cited answer; use search_context when you
+        want the raw passages to reason over yourself.
+        """
+
+        return tools.ask_knowledge_base(
+            knowledge_base,
+            question,
+            workflow=workflow,
+            mode=mode,
+            max_results=max_results,
+            source_name=source_name,
+            principal=principal,
+            principal_groups=principal_groups,
+            options=options,
+        )
+
+    @mcp.tool()
     def get_relevant_files(
         knowledge_base: str,
         task: str,

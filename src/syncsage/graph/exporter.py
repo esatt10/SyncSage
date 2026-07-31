@@ -7,8 +7,30 @@ def node_link(
     graph: SimpleMultiDiGraph,
     node_limit: int | None = None,
     link_limit: int | None = None,
+    node_types: set[str] | None = None,
+    exclude_node_types: set[str] | None = None,
+    source_id: str | None = None,
 ) -> dict:
-    if node_limit is None and link_limit is None:
+    """Node-link JSON, optionally bounded and filtered.
+
+    Filtering happens *before* the limit is applied, so asking for a
+    concept-free overview returns a full budget of structural nodes rather
+    than a budget's worth of nodes that then mostly get dropped.
+    ``total_nodes``/``total_links`` always report the unfiltered graph, so
+    the caller can tell "filtered out" from "truncated away".
+    """
+    filtering = bool(node_types or exclude_node_types or source_id)
+
+    def keep(node: dict) -> bool:
+        if node_types and node.get("type") not in node_types:
+            return False
+        if exclude_node_types and node.get("type") in exclude_node_types:
+            return False
+        if source_id and node.get("source_id") not in (source_id, None):
+            return False
+        return True
+
+    if node_limit is None and link_limit is None and not filtering:
         payload = graph.to_node_link()
         payload.update(
             {
@@ -26,10 +48,14 @@ def node_link(
 
     nodes = []
     selected_ids: set[str] = set()
+    eligible = 0
     for node_id in graph.nodes:
-        if len(nodes) >= max_nodes:
-            break
         node = dict(graph.nodes[node_id])
+        if not keep(node):
+            continue
+        eligible += 1
+        if len(nodes) >= max_nodes:
+            continue
         nodes.append(node)
         selected_ids.add(node_id)
 
@@ -52,7 +78,9 @@ def node_link(
         "links": links,
         "total_nodes": total_nodes,
         "total_links": total_links,
-        "truncated": len(nodes) < total_nodes or len(links) < total_links,
+        "matched_nodes": eligible,
+        "filtered": filtering,
+        "truncated": len(nodes) < eligible,
     }
 
 

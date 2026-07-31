@@ -50,7 +50,31 @@ search:
 | `lancedb` | Faster at scale. Requires the `[vector]` extra: `pip install 'syncsage[vector]'`. |
 
 If you select `lancedb` without installing the extra, fall back to `numpy` or
-install it.
+install it. `PUT /search/embeddings` refuses a backend whose dependency is
+missing rather than accepting the change and failing later, and
+`GET /search/embeddings` reports `store_providers[].available` so the UI only
+offers backends that work here.
+
+## From the UI
+
+Everything above is also in **Settings → Semantic search**, which adds two
+things the YAML cannot express:
+
+- **Coverage.** Enabling embeddings only affects *future* syncs — content
+  indexed beforehand has no vector. The coverage bar shows the gap, and
+  **Build missing vectors** (`POST /search/embeddings/reindex`) closes it by
+  embedding what SQLite already holds, without re-reading a single source
+  file. Vectors are keyed by content-addressed chunk id, so a second run
+  embeds nothing.
+- **Invalidation.** Changing `model` or `dimensions` puts existing vectors in
+  a different space, where similarity is meaningless. The response flags
+  `vectors_invalidated`, and **Rebuild from scratch**
+  (`?drop_existing=true`) discards the old space instead of quietly mixing
+  two.
+
+Saving with **persist** writes only the `search.embeddings` and
+`search.vector_store` keys back into your config file; the rest of the file,
+`sources` included, is preserved.
 
 ## 3. Self-hosted OpenAI-spec endpoint
 

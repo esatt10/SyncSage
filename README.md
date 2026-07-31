@@ -47,6 +47,36 @@ Core components:
 
 ## Quick Start
 
+**One line, any target.** `syncsage up` detects what you point it at — a folder,
+an Obsidian vault, a git repo (local or a URL it clones), a docs site, an S3
+bucket, or a connector — writes a config, indexes it, and serves the API + MCP:
+
+```bash
+syncsage up ~/notes                                   # a folder
+syncsage up https://github.com/you/project            # cloned, then indexed
+syncsage up ~/notes https://docs.example.com/guide    # several at once
+syncsage up '~/clients/*'                             # one source per subfolder
+syncsage up ~/projects --split                        # same, without the glob
+```
+
+An existing `syncsage.yaml` is never overwritten, and re-running re-indexes
+nothing that has not changed.
+
+**One line to host it.** `syncsage host` does the same detection, then writes a
+compose file (mounting each local source read-only at `/sources/<name>`) and
+brings the stack up:
+
+```bash
+syncsage host ~/notes                    # config + compose + docker compose up -d
+syncsage host ~/notes --print-only       # write the compose file, run it yourself
+syncsage host ~/notes --no-ui --port 9000
+```
+
+Open <http://localhost:8080> for the web UI, or <http://localhost:8765> for the
+API and MCP endpoint.
+
+### The longer way
+
 Generate a starter config:
 
 ```bash
@@ -162,7 +192,9 @@ Enrichment passes extract:
 - Markdown/document headings, links, wiki links, URLs, citations, concepts, and named mentions.
 - Lightweight cross-artifact similarity based on shared concepts.
 
-Search spans the whole knowledge graph. Three modes are available: `text` (SQLite full-text over chunk content and paths), `graph` (matches node labels, types and attribute values plus relationship types/endpoints), and `hybrid` (the default — merges and re-ranks both, de-duplicating by node). This surfaces concepts, symbols, entities and references that never appear verbatim in chunk text, and helps relate files even when no single chunk contains every query term. Both the retrieval mode and the result count are adjustable. Graph traversal honors depth and optional edge filters.
+Search spans the whole knowledge graph. Four modes are available: `text` (SQLite full-text over chunk content and paths), `graph` (matches node labels, types and attribute values plus relationship types/endpoints), `vector` (embedding similarity — opt-in, see [Vector self-search](docs/how-to/vector-search.md)), and `hybrid` (the default — merges and re-ranks every available signal, de-duplicating by node). This surfaces concepts, symbols, entities and references that never appear verbatim in chunk text, and helps relate files even when no single chunk contains every query term. Both the retrieval mode and the result count are adjustable. Graph traversal honors depth and optional edge filters.
+
+**Asking, not just searching.** `POST /assistant/chat`, the MCP tool `ask_knowledge_base`, and the UI's chat pane all run the same *agent workflow* over that search surface: retrieve, cite the passages, surface graph facts around them, then have a model write the answer from those passages alone. The default workflow (with `pip install 'syncsage[agent]'`) is a LangGraph state graph that plans sub-queries, fans out across modes, walks the graph for material lexical search missed, grades its own evidence and loops when it is thin, then verifies its citations. It is fully customizable, and third-party workflows register under the `syncsage.agent_workflows` entry-point group — see [Customize the answering workflow](docs/how-to/agent-workflows.md). **No LLM ever runs during indexing**; with no provider reachable, answers degrade to extractive (top passages, citations and facts intact) rather than failing.
 
 See [docs/graph_model.md](docs/graph_model.md).
 
@@ -253,31 +285,35 @@ See [docs/obsidian_integration.md](docs/obsidian_integration.md).
 
 Important endpoints:
 
-- `GET /health`
-- `GET /ready`
-- `GET /sources`
-- `GET /sync/status`
-- `POST /sync`
-- `POST /sync/{source_id}`
-- `POST /search`
-- `POST /relevant-files`
-- `GET /graph`
-- `GET /graph/export/node-link-json`
-- `GET /graph/export/cytoscape-json`
+- `GET /health`, `GET /ready`, `GET /overview`
+- `GET /sources`, `GET /sources/types`, `POST /sources`, `POST /sources/quick-add`
+- `GET /sync/status`, `POST /sync`, `POST /sync/{source_id}`
+- `POST /search`, `POST /relevant-files`
+- `POST /assistant/chat`, `GET /assistant/workflows`, `POST /assistant/key`
+- `GET /search/embeddings`, `PUT /search/embeddings`, `POST /search/embeddings/reindex`
+- `GET /graph`, `GET /graph/export/node-link-json`, `GET /graph/export/cytoscape-json`
+- `GET /mcp/info`
 - `POST /obsidian/export`
+
+Full list: [docs/reference/http-api.md](docs/reference/http-api.md).
 
 ## Web UI
 
 A light React front end lives in [`ui/`](ui). It is a separate workload that
-talks to the SyncSage HTTP API, so the indexing container is unchanged. It
-provides a Cytoscape knowledge-graph workspace (drill into sub-networks, filter
-by edge type, inspect relationships and content, and search across nodes,
-relationships and attributes with adjustable mode and result count), source
-management with
-add-a-local-directory registration, a full configuration editor (form + raw YAML
-+ diff preview), and an Explain mode with a LaTeX-backed reference panel. The
-underlying HTTP routes are defined in `src/syncsage/api/app.py` and described in
-[docs/ui_recommendation.md](docs/ui_recommendation.md).
+talks to the SyncSage HTTP API, so the indexing container is unchanged: a
+three-pane workspace with sources on the left, chat in the middle, and the
+knowledge graph on the right. Asking a question outlines the cited nodes on the
+canvas and lists the graph facts behind the answer, so the reasoning and the
+structure stay side by side.
+
+The UI is meant to reach everything the API does, for low-code users and
+developers alike: quick source setup from a single field *and* a form covering
+the whole source schema (including installed connector plugins), the agent
+workflow picker with its tuning options, semantic-search configuration with
+coverage and a rebuild that never re-reads a source file, an MCP connection
+panel, and a configuration editor (form + raw YAML + diff preview). What a
+given deployment can offer is read from the server rather than baked into the
+bundle. Routes are defined in `src/syncsage/api/app.py`.
 
 ```bash
 cd ui && npm install && npm run dev   # dev server on http://localhost:5173
@@ -335,7 +371,7 @@ It is published to GitHub Pages by `.github/workflows/docs.yml` on pushes to `ma
 
 - [Documentation home](docs/index.md)
 - Tutorials: [10-minute quickstart](docs/tutorials/quickstart.md) · [Multi-modal ingest](docs/tutorials/multimodal.md)
-- How-to: [Configure sources](docs/how-to/sources.md) · [Vector self-search](docs/how-to/vector-search.md) · [Attach to a Synapse fleet](docs/how-to/attach-to-synapse.md) · [Backup & restore](docs/how-to/backup-restore.md)
+- How-to: [Ask your knowledge base](docs/how-to/chat-and-ui.md) · [Customize the answering workflow](docs/how-to/agent-workflows.md) · [Configure sources](docs/how-to/sources.md) · [Vector self-search](docs/how-to/vector-search.md) · [Attach to a Synapse fleet](docs/how-to/attach-to-synapse.md) · [Backup & restore](docs/how-to/backup-restore.md)
 
 **Reference & explanation**
 

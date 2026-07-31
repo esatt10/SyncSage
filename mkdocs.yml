@@ -66,6 +66,8 @@ nav:
       - 10-minute quickstart: tutorials/quickstart.md
       - Multi-modal ingest (image + audio): tutorials/multimodal.md
   - How-to guides:
+      - Ask your knowledge base (web UI): how-to/chat-and-ui.md
+      - Customize the answering workflow: how-to/agent-workflows.md
       - Attach to a coding agent (MCP): how-to/attach-to-coding-agent.md
       - Agent memory: how-to/agent-memory.md
       - Configure sources: how-to/sources.md

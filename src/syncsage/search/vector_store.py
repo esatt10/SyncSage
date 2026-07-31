@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -354,8 +355,7 @@ class NumpyVectorStore:
         """Bulk (chunk_id, vector) reader used by the contract publisher."""
 
         return [
-            (chunk_id, list(self._decode(item["v"])))
-            for chunk_id, item in self._items().items()
+            (chunk_id, list(self._decode(item["v"]))) for chunk_id, item in self._items().items()
         ]
 
 
@@ -612,6 +612,35 @@ def build_vector_store(config: SyncSageConfig) -> VectorStore:
         f"Unsupported search.vector_store.provider {settings.provider!r}; "
         "expected 'lancedb' or 'numpy'"
     )
+
+
+#: Backends ``build_vector_store`` knows how to construct, with the label and
+#: install hint the UI shows. ``numpy`` needs nothing beyond the core deps.
+VECTOR_STORE_PROVIDERS: tuple[tuple[str, str, str | None], ...] = (
+    ("numpy", "Flat file (numpy)", None),
+    ("lancedb", "LanceDB", "pip install 'syncsage[vector]'"),
+)
+
+
+def vector_store_available(provider: str) -> bool:
+    """Can this backend actually run in this process?
+
+    Backends import lazily so that a region configured for LanceDB but never
+    used doesn't pay the import, which also means "constructed" is not
+    "usable". Callers that need to know *before* touching the store — the
+    config UI offering a choice, the API refusing to claim embeddings are
+    active — ask here.
+    """
+
+    name = (provider or "").lower()
+    if name == "numpy":
+        return True
+    if name == "lancedb":
+        try:
+            return importlib.util.find_spec("lancedb") is not None
+        except (ImportError, ValueError):  # namespace shadowing, broken install
+            return False
+    return False
 
 
 def vector_indexer_from_config(config: SyncSageConfig) -> VectorIndexer | None:

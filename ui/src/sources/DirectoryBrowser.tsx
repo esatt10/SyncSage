@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
-import { Explainable } from "../explain/Explainable";
 
 interface DirectoryBrowserProps {
   path: string | null;
@@ -20,7 +19,7 @@ export function DirectoryBrowser({ path, onNavigate, onChoose, allowFiles = fals
   });
 
   return (
-    <Explainable id="sources.directory" className="dir-browser">
+    <div className="dir-browser">
       <div className="dir-browser__bar">
         <span className="muted small">{listing.data?.path ?? "Allowlisted roots"}</span>
         {listing.data?.parent && (
@@ -76,6 +75,6 @@ export function DirectoryBrowser({ path, onNavigate, onChoose, allowFiles = fals
           Use this directory
         </button>
       )}
-    </Explainable>
+    </div>
   );
 }

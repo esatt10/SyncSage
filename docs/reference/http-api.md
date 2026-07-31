@@ -28,8 +28,11 @@ See [Attach to a Synapse fleet](../how-to/attach-to-synapse.md).
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/knowledge-bases` | List knowledge bases. |
+| GET | `/overview` | One call for a UI cold start: knowledge base, sources, node counts, whether anything is indexed. |
 | GET | `/sources` | List configured + runtime sources. |
-| POST | `/sources` | Register a runtime source. |
+| GET | `/sources/types` | Registerable source types — built-ins plus installed connector plugins — each with a `path_role` of `required` or `unused`. |
+| POST | `/sources/quick-add` | One-field setup: a path, URL, glob or connector name is detected, named, registered and (by default) synced. Same inference as `syncsage up`. |
+| POST | `/sources` | Register a runtime source (full schema). Accepts plugin types; a plugin source needs no local path. |
 | PUT | `/sources/{source_id}` | Update a source. |
 | POST | `/sources/{source_id}/disable` | Disable a source. |
 | DELETE | `/sources/{source_id}` | Remove a source. |
@@ -55,11 +58,40 @@ See [Attach to a Synapse fleet](../how-to/attach-to-synapse.md).
 | GET | `/nodes/content` | Fetch a node's content. |
 | GET | `/nodes/explain` | Explain why a node matched / its provenance. |
 
+## Assistant (grounded chat)
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/assistant/status` | Whether a model is reachable, from where (config env var or session key), and the resolved provider/model. |
+| POST | `/assistant/key` | Hand the server an API key for this session only. Held in process memory behind an opaque token; never written to config, `/state`, or logs. |
+| DELETE | `/assistant/key` | Revoke a session key immediately. |
+| GET | `/assistant/workflows` | Available answering workflows, which one `auto` currently resolves to, whether the `[agent]` extra is installed, and each workflow's option defaults. |
+| POST | `/assistant/chat` | Ask a question. Returns the answer, numbered citations, graph facts, the nodes to focus, and the workflow's step trace. Accepts `workflow` and `options` overrides. |
+
+See [Ask your knowledge base](../how-to/chat-and-ui.md) and
+[Customize the answering workflow](../how-to/agent-workflows.md).
+
+## Semantic search (embeddings)
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/search/embeddings` | Embeddings settings, vector coverage, and which vector backends are installed here. |
+| PUT | `/search/embeddings` | Enable/configure embeddings in the live process; `persist: true` also writes the `search.embeddings` / `search.vector_store` keys back to the config file. Refuses a backend whose optional extra is missing. |
+| POST | `/search/embeddings/reindex` | Embed already-indexed content without re-reading sources. Idempotent; `?drop_existing=true` discards vectors left in a stale embedding space. |
+
+See [Vector self-search](../how-to/vector-search.md).
+
+## MCP
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/mcp/info` | Transports, a ready-to-paste client config, and the tool list an attached agent gets. |
+
 ## Graph
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/graph` | Full graph. |
+| GET | `/graph` | Full graph. Filter with `types` / `exclude_types` / `source` before the node limit applies. |
 | GET | `/graph/slice` | Subgraph around a node. |
 | GET | `/graph/neighbors` | Neighbors of a node (depth + edge filters). |
 | GET | `/graph/export/node-link-json` | Export graph as node-link JSON. |

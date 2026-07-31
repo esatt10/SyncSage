@@ -64,16 +64,49 @@ def main(argv: list[str] | None = None) -> int:
         "up",
         help="zero-config quickstart: detect, generate config, index, serve",
     )
-    up_p.add_argument("path", nargs="?", default=".")
+    up_p.add_argument(
+        "path",
+        nargs="*",
+        default=["."],
+        help=(
+            "one or more targets: a folder, file, glob (~/clients/*), git URL, "
+            "web URL, s3:// bucket, or connector (notion:workspace)"
+        ),
+    )
     up_p.add_argument("--config", "-c", default="syncsage.yaml")
     up_p.add_argument("--name", help="knowledge-base name [default: slug of the directory]")
     up_p.add_argument("--port", type=int, default=8765)
     up_p.add_argument("--profile", default="quickstart")
     up_p.add_argument("--mode", default="incremental")
     up_p.add_argument(
+        "--split",
+        action="store_true",
+        help="index each immediate subdirectory of a target as its own source",
+    )
+    up_p.add_argument(
         "--no-serve",
         action="store_true",
         help="generate + index only; do not start the server",
+    )
+    host_p = sub.add_parser(
+        "host",
+        help="one-line container hosting: generate config + compose file, then run it",
+    )
+    host_p.add_argument("path", nargs="*", default=["."])
+    host_p.add_argument("--config", "-c", default="syncsage.yaml")
+    host_p.add_argument("--name")
+    host_p.add_argument("--port", type=int, default=8765)
+    host_p.add_argument("--ui-port", type=int, default=8080)
+    host_p.add_argument("--profile", default="quickstart")
+    host_p.add_argument("--split", action="store_true")
+    host_p.add_argument("--output", "-o", default="docker-compose.syncsage.yml")
+    host_p.add_argument("--image")
+    host_p.add_argument("--ui-image")
+    host_p.add_argument("--no-ui", action="store_true", help="omit the web UI sidecar")
+    host_p.add_argument(
+        "--print-only",
+        action="store_true",
+        help="write the compose file but do not run docker compose",
     )
     start_p = sub.add_parser("start")
     start_p.add_argument("--config", "-c", default="syncsage.yaml")
@@ -144,19 +177,37 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 0
     if args.command == "up":
-        from syncsage.quickstart import ensure_up_config
+        from syncsage.quickstart import ensure_up_config, state_root
         from syncsage.sync.locks import EngineLeaseError
+        from syncsage.targets import TargetError, fetch_target, resolve_targets
 
-        target = Path(args.path).resolve()
-        if not target.is_dir():
-            print(f"ERROR: not a directory: {target}", file=sys.stderr)
-            return 1
         config_path = Path(args.config)
+        specs = args.path if isinstance(args.path, list) else [args.path]
+        if not specs:
+            specs = ["."]
+        local_state = state_root(config_path)
+        try:
+            targets = resolve_targets(
+                specs,
+                clone_root=local_state / "sources",
+                workspace=local_state / "external",
+                split=args.split,
+                name=args.name,
+            )
+            for target in targets:
+                status = fetch_target(target)
+                if status:
+                    print(status)
+        except TargetError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
         created = ensure_up_config(
-            target, config_path, name=args.name, port=args.port, profile=args.profile
+            targets, config_path, name=args.name, port=args.port, profile=args.profile
         )
         if created:
             print(f"Wrote {config_path}")
+            for target in targets:
+                print(f"  + {target.name} ({target.type}) <- {target.path}")
         else:
             print(f"Reusing existing {config_path} (never overwritten)")
         engine = _engine(config_path)
@@ -185,6 +236,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Serving API + MCP on http://{cfg.server.host}:{cfg.server.port}")
         _serve_app(cfg, str(config_path))
         return 0
+    if args.command == "host":
+        from syncsage.deployment.host import host_stack
+        from syncsage.targets import TargetError
+
+        try:
+            return host_stack(args)
+        except TargetError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
     if args.command == "start":
         from syncsage.config.loader import load_layered_config, parse_override_pairs
 

@@ -1,22 +1,21 @@
 import { useMemo, useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import type { SourceRecord, SourceWritePayload } from "../api/types";
+import type { SourceRecord, SourceTypeInfo, SourceWritePayload } from "../api/types";
 import { DirectoryBrowser } from "./DirectoryBrowser";
-import { Explainable } from "../explain/Explainable";
-
-const SOURCE_TYPES = [
-  "repository",
-  "markdown_folder",
-  "obsidian_vault",
-  "document_folder",
-  "single_file",
-  "web_collection",
-  "api",
-  "s3",
-];
 
 const SYNC_MODES = ["incremental", "full", "validate_only", "repair"];
+
+// Shown when the type catalog hasn't loaded yet, so the form is never empty.
+const FALLBACK_TYPES: SourceTypeInfo[] = [
+  {
+    id: "document_folder",
+    label: "Folder of documents",
+    description: "",
+    path_role: "required",
+    builtin: true,
+  },
+];
 
 interface AddSourceWizardProps {
   source?: SourceRecord | null;
@@ -61,9 +60,26 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
   );
   const [urlsText, setUrlsText] = useState(lines(initial.urls));
   const [connectorText, setConnectorText] = useState(JSON.stringify(connector, null, 2));
+  // The one connector setting nearly every service-backed source needs. It
+  // holds an environment variable *name*, never a token, so promoting it out
+  // of the raw JSON costs nothing in safety and saves hand-writing JSON.
+  const [apiKeyEnv, setApiKeyEnv] = useState(String(connector.api_key_env ?? ""));
   const [syncNow, setSyncNow] = useState(!editing);
   const [syncMode, setSyncMode] = useState("incremental");
   const [error, setError] = useState<string | null>(null);
+
+  // The set of types is a property of the deployment, not of this bundle:
+  // an installed connector plugin adds one, and the form has to offer
+  // exactly what YAML would accept.
+  const catalog = useQuery({ queryKey: ["source-types"], queryFn: api.sourceTypes });
+  const sourceTypes = catalog.data?.types ?? FALLBACK_TYPES;
+  const placeholderPath = catalog.data?.placeholder_path ?? "/unused";
+  const typeInfo = sourceTypes.find((entry) => entry.id === type);
+  // Service-backed types (web, S3, connector plugins) still carry the
+  // schema's mandatory path; it is a placeholder nothing ever opens, so
+  // don't make anyone browse for a directory that has no meaning.
+  const needsPath = (typeInfo?.path_role ?? "required") === "required";
+  const effectivePath = needsPath ? chosen : (chosen ?? placeholderPath);
 
   const mutation = useMutation({
     mutationFn: async () => {
@@ -109,9 +125,12 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
     } catch {
       throw new Error("Connector settings must be valid JSON.");
     }
+    // The dedicated field wins over whatever the JSON says, so editing the
+    // obvious control cannot be silently undone by a stale JSON blob.
+    if (apiKeyEnv.trim()) connectorPayload.api_key_env = apiKeyEnv.trim();
     const payload: SourceWritePayload = {
       type,
-      path: chosen ?? undefined,
+      path: effectivePath ?? undefined,
       description: description || undefined,
       enabled,
       max_depth: maxDepth.trim() ? Number(maxDepth) : null,
@@ -162,25 +181,44 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
 
         <div className="wizard">
           <div className="wizard__col">
-            <h4>Directory</h4>
-            <DirectoryBrowser
-              path={browsePath}
-              onNavigate={setBrowsePath}
-              onChoose={choose}
-              allowFiles={type === "single_file"}
-            />
+            <h4>{needsPath ? "Directory" : "Connection"}</h4>
+            {needsPath ? (
+              <DirectoryBrowser
+                path={browsePath}
+                onNavigate={setBrowsePath}
+                onChoose={choose}
+                allowFiles={type === "single_file"}
+              />
+            ) : (
+              <div className="muted small">
+                <p>
+                  <strong>{typeInfo?.label ?? type}</strong> pulls from its own service, so
+                  there is no folder to pick.
+                </p>
+                <p>{typeInfo?.description}</p>
+                <p>
+                  {type === "web_collection"
+                    ? "List the pages under URLs, in Sync and connectors."
+                    : "Point it at your account with Connector JSON, in Sync and connectors — " +
+                      "typically an api_key_env naming the environment variable that holds " +
+                      "the token. The token itself is read from the container environment and " +
+                      "never stored in your config."}
+                </p>
+              </div>
+            )}
           </div>
 
           <div className="wizard__col wizard__col--form">
             <h4>Source settings</h4>
             <div className="form-grid">
               <label className="field">
-                <span>Chosen path</span>
+                <span>{needsPath ? "Chosen path" : "Path (unused)"}</span>
                 <input
                   className="text-input"
                   value={chosen ?? ""}
+                  disabled={!needsPath}
                   onChange={(event) => setChosen(event.target.value)}
-                  placeholder="Container-visible path"
+                  placeholder={needsPath ? "Container-visible path" : placeholderPath}
                 />
               </label>
               <label className="field">
@@ -195,24 +233,44 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
               <label className="field">
                 <span>Type</span>
                 <select className="text-input" value={type} onChange={(e) => setType(e.target.value)}>
-                  {SOURCE_TYPES.map((t) => (
-                    <option key={t} value={t}>
-                      {t}
+                  {sourceTypes.map((entry) => (
+                    <option key={entry.id} value={entry.id}>
+                      {entry.label}
+                      {entry.builtin ? "" : " · plugin"}
                     </option>
                   ))}
+                  {/* An existing source may use a type whose plugin is no
+                      longer installed — keep it visible instead of silently
+                      rewriting the source to something else on save. */}
+                  {sourceTypes.some((entry) => entry.id === type) ? null : (
+                    <option value={type}>{type} (not installed)</option>
+                  )}
                 </select>
+                {typeInfo ? <span className="muted small">{typeInfo.description}</span> : null}
               </label>
-              <label className="field">
-                <span>Folder depth</span>
-                <input
-                  className="text-input"
-                  type="number"
-                  min="0"
-                  value={maxDepth}
-                  onChange={(event) => setMaxDepth(event.target.value)}
-                  placeholder="unlimited"
-                />
-              </label>
+              {needsPath ? (
+                <label className="field">
+                  <span>Folder depth</span>
+                  <input
+                    className="text-input"
+                    type="number"
+                    min="0"
+                    value={maxDepth}
+                    onChange={(event) => setMaxDepth(event.target.value)}
+                    placeholder="unlimited"
+                  />
+                </label>
+              ) : (
+                <label className="field">
+                  <span>API key environment variable</span>
+                  <input
+                    className="text-input"
+                    value={apiKeyEnv}
+                    onChange={(event) => setApiKeyEnv(event.target.value)}
+                    placeholder="e.g. NOTION_TOKEN — the variable name, not the token"
+                  />
+                </label>
+              )}
             </div>
 
             <label className="field">
@@ -324,7 +382,7 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
             </details>
 
             {!editing && (
-              <Explainable id="sources.syncMode" as="span" className="form-grid">
+              <div className="form-grid">
                 <label className="checkbox">
                   <input type="checkbox" checked={syncNow} onChange={(e) => setSyncNow(e.target.checked)} />
                   Sync now
@@ -339,14 +397,14 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
                     ))}
                   </select>
                 </label>
-              </Explainable>
+              </div>
             )}
 
             {(error || mutation.isError) && <p className="error">{error ?? (mutation.error as Error).message}</p>}
 
             <button
               className="btn btn--primary"
-              disabled={!chosen || !name || mutation.isPending}
+              disabled={(needsPath && !chosen) || !name || mutation.isPending}
               onClick={() => mutation.mutate()}
             >
               {mutation.isPending ? "Saving..." : editing ? "Save source" : "Register source"}
