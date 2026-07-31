@@ -1,8 +1,45 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
+
+
+def _print_scan(report: dict) -> None:
+    """Human-readable pre-flight for one source.
+
+    The point of the depth table is that a depth cap should be picked from
+    evidence — "depth 2 gets me 900 files, depth 3 gets me 40,000" — rather
+    than guessed and then discovered by an OOM.
+    """
+    name = report.get("source_id")
+    if not report.get("scannable"):
+        print(f"{name}: not scannable — {report.get('reason')}")
+        return
+    print(f"{name} ({report.get('path')})")
+    print(
+        f"  would index {report['file_count']} files, {report['total_mb']} MB "
+        f"(scanned {report['entries_scanned']} entries, "
+        f"pruned {report['directories_pruned']} directories)"
+    )
+    subtree = report.get("bytes_by_subtree") or {}
+    if subtree:
+        top = ", ".join(
+            f"{key} ({value // (1024 * 1024)} MB)" for key, value in list(subtree.items())[:5]
+        )
+        print(f"  largest subtrees: {top}")
+    options = report.get("depth_options") or []
+    if len(options) > 1:
+        table = "  ".join(f"depth {o['max_depth']}={o['files']}" for o in options[:8])
+        print(f"  files by depth cap: {table}")
+    if report.get("oversized_count"):
+        print(f"  {report['oversized_count']} file(s) skipped as oversized")
+    if report.get("would_exceed"):
+        print(f"  WOULD BE REFUSED: exceeds {', '.join(report['would_exceed'])}")
+        print("  narrow with --depth / include / exclude, raise sync.limits, or use --full-scan")
+    else:
+        print("  within configured limits — sync would proceed")
 
 
 def _sync_services(engine, cfg):
@@ -135,6 +172,26 @@ def main(argv: list[str] | None = None) -> int:
     sync_p.add_argument("--source", "-s")
     sync_p.add_argument("--all", action="store_true")
     sync_p.add_argument("--mode", default="incremental")
+    sync_p.add_argument(
+        "--depth",
+        type=int,
+        default=None,
+        help="cap directory depth for this run (0 = only files directly in the source root)",
+    )
+    sync_p.add_argument(
+        "--full-scan",
+        action="store_true",
+        help="index everything: no depth cap and no size budget (sync.limits is ignored)",
+    )
+    scan_p = sub.add_parser(
+        "scan",
+        help="estimate what a source would index — file count, size, depth options — "
+        "without indexing anything",
+    )
+    scan_p.add_argument("--config", "-c", default="syncsage.yaml")
+    scan_p.add_argument("--source", "-s", help="source to scan (default: every enabled source)")
+    scan_p.add_argument("--depth", type=int, default=None, help="cap directory depth for the scan")
+    scan_p.add_argument("--json", action="store_true", help="emit the raw report as JSON")
     serve_p = sub.add_parser("serve")
     serve_p.add_argument("--config", "-c", default="/config/syncsage.yaml")
     mcp_p = sub.add_parser("mcp")
@@ -328,20 +385,55 @@ def main(argv: list[str] | None = None) -> int:
         engine = _engine(Path(args.config))
         try:
             results = (
-                engine.sync_all(args.mode)
+                engine.sync_all(args.mode, max_depth=args.depth, full_scan=args.full_scan)
                 if args.all or not args.source
-                else [engine.sync_source(args.source, args.mode)]
+                else [
+                    engine.sync_source(
+                        args.source,
+                        args.mode,
+                        max_depth=args.depth,
+                        full_scan=args.full_scan,
+                    )
+                ]
             )
         except EngineLeaseError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
         finally:
             engine.close()
+        exit_code = 0
         for r in results:
+            if r.status == "limit_exceeded":
+                # A refused sync is a failure the caller must see — both in the
+                # message and in the exit code, so a scripted sync does not
+                # sail past it reporting "0 indexed" as if that were success.
+                print(f"ERROR: {r.details.get('error', 'sync limit exceeded')}", file=sys.stderr)
+                exit_code = 1
+                continue
             print(
                 f"{r.source_id}: indexed={r.indexed_artifacts} "
                 f"skipped={r.skipped_artifacts} nodes={r.graph_nodes} edges={r.graph_edges}"
             )
+        return exit_code
+    if args.command == "scan":
+        engine = _engine(Path(args.config))
+        try:
+            names = (
+                [args.source]
+                if args.source
+                else [s.name for s in engine.config.sources if s.enabled]
+            )
+            reports = [engine.scan_source(name, max_depth=args.depth) for name in names]
+        except KeyError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            engine.close()
+        if args.json:
+            print(json.dumps(reports, indent=2))
+            return 0
+        for report in reports:
+            _print_scan(report)
         return 0
     if args.command == "repair":
         from syncsage.sync.locks import EngineLeaseError

@@ -47,6 +47,23 @@ server:
     enabled: true
     graph_visualization: true
 
+sync:
+  # Guardrails on how much one filesystem source may pull in. A source may
+  # point at any readable path, so "I accidentally indexed my home directory"
+  # is a realistic mistake — these turn it into a refusal with an actionable
+  # message instead of a process that eats memory until it dies. Checked
+  # during traversal, before any file is read.
+  #
+  # Run `syncsage scan` to see what a source would index before syncing it.
+  # A source over budget indexes NOTHING (a partial index would be
+  # non-deterministic); narrow it with max_depth / include / exclude, raise
+  # these numbers, or sync once with --full-scan.
+  limits:
+    max_files: 50000        # matching files, after include/exclude
+    max_file_size_mb: 25    # skip any single file larger than this
+    max_total_mb: 4096      # total matched content
+    follow_symlinks: false  # home dirs are full of links that escape or loop
+
 storage:
   graph_format: node_link_json
   # Synapse 21.6A: zstd-compressed timestamped graph snapshots written after a

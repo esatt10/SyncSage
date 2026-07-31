@@ -113,6 +113,10 @@ class SyncRequest(BaseModel):
     knowledge_base: str | None = None
     source_name: str | None = None
     mode: str = "incremental"
+    # Per-run traversal controls. `depth` caps directory depth for this run;
+    # `full_scan` lifts both the depth cap and sync.limits. Neither persists.
+    depth: int | None = None
+    full_scan: bool = False
 
 
 class ObsidianExportRequest(BaseModel):
@@ -752,9 +756,19 @@ def create_app(
     def sync_all(req: SyncRequest) -> dict:
         try:
             if req.source_name:
-                result = engine.sync_source(req.source_name, req.mode)  # type: ignore[arg-type]
+                result = engine.sync_source(
+                    req.source_name,
+                    req.mode,  # type: ignore[arg-type]
+                    max_depth=req.depth,
+                    full_scan=req.full_scan,
+                )
                 return {"results": [result.__dict__]}
-            return {"results": [r.__dict__ for r in engine.sync_all(req.mode)]}  # type: ignore[arg-type]
+            results = engine.sync_all(
+                req.mode,  # type: ignore[arg-type]
+                max_depth=req.depth,
+                full_scan=req.full_scan,
+            )
+            return {"results": [r.__dict__ for r in results]}
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -764,11 +778,29 @@ def create_app(
     def sync_source(source_id: str, req: SyncRequest | None = None) -> dict:
         mode = req.mode if req else "incremental"
         try:
-            return engine.sync_source(source_id, mode).__dict__  # type: ignore[arg-type]
+            return engine.sync_source(
+                source_id,
+                mode,  # type: ignore[arg-type]
+                max_depth=req.depth if req else None,
+                full_scan=req.full_scan if req else False,
+            ).__dict__
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/sources/{source_id}/scan")
+    def scan_source(source_id: str, depth: int | None = None) -> dict:
+        """Estimate what a source would index, without indexing it.
+
+        The pre-flight for the "point it at anything" workflow: file count,
+        size, where the weight sits, how many files each depth cap admits,
+        and whether the configured limits would refuse the sync.
+        """
+        try:
+            return engine.scan_source(source_id, max_depth=depth)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/memory")
     def memory_write(req: MemoryWriteRequest) -> dict:

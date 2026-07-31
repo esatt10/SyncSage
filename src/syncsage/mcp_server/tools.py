@@ -218,15 +218,57 @@ class SyncSageTools:
             "config_path": config_path,
         }
 
-    def sync_source(self, knowledge_base: str, source_name: str, mode: str = "incremental") -> dict:
+    def scan_source(
+        self,
+        knowledge_base: str,
+        source_name: str,
+        max_depth: int | None = None,
+    ) -> dict:
+        """Estimate what a source would index, without indexing anything.
+
+        Call this before syncing a source that points at something large or
+        unfamiliar (a home directory, a whole drive). Reports the file count,
+        total size, the largest subtrees, how many files each depth cap would
+        admit, and whether the configured limits would refuse the sync.
+        Reads no file content and writes nothing.
+        """
         self._require_knowledge_base(knowledge_base)
-        result = self.engine.sync_source(source_name, mode).__dict__  # type: ignore[arg-type]
+        return self.engine.scan_source(source_name, max_depth=max_depth)
+
+    def sync_source(
+        self,
+        knowledge_base: str,
+        source_name: str,
+        mode: str = "incremental",
+        max_depth: int | None = None,
+        full_scan: bool = False,
+    ) -> dict:
+        self._require_knowledge_base(knowledge_base)
+        result = self.engine.sync_source(
+            source_name,
+            mode,  # type: ignore[arg-type]
+            max_depth=max_depth,
+            full_scan=full_scan,
+        ).__dict__
         self._audit(source_name, "sync_source", "mcp", "mcp", None, utc_now(), result)
         return result
 
-    def sync_all(self, knowledge_base: str, mode: str = "incremental") -> dict:
+    def sync_all(
+        self,
+        knowledge_base: str,
+        mode: str = "incremental",
+        max_depth: int | None = None,
+        full_scan: bool = False,
+    ) -> dict:
         self._require_knowledge_base(knowledge_base)
-        results = [r.__dict__ for r in self.engine.sync_all(mode)]  # type: ignore[arg-type]
+        results = [
+            r.__dict__
+            for r in self.engine.sync_all(
+                mode,  # type: ignore[arg-type]
+                max_depth=max_depth,
+                full_scan=full_scan,
+            )
+        ]
         for result in results:
             self._audit(result["source_id"], "sync_source", "mcp", "mcp", None, utc_now(), result)
         return {"results": results}

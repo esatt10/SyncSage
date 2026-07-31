@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 
 from syncsage.config.schema import SourceConfig
 from syncsage.ingestion.pipeline import _match_any, sha256_file, utc_now, within_max_depth
+from syncsage.ingestion.walk import walk_source
 from syncsage.persistence.state_store import StateStore
 
 logger = logging.getLogger(__name__)
@@ -193,12 +194,26 @@ class FilesystemConnector(SourceConnector):
         root = self.source.path
         if not root.exists():
             return []
-        candidates = [root] if root.is_file() else [p for p in root.rglob("*") if p.is_file()]
+        # Pruning, budgeted walk (see ingestion/walk.py). The previous
+        # `rglob("*")` materialized the whole tree before applying excludes,
+        # so excluding node_modules cost more than not excluding it — and a
+        # source pointed at a home directory had no upper bound at all.
+        from syncsage.ingestion.walk import SyncBudgetExceeded, WalkBudget, budget_message
+
+        budget = WalkBudget.from_settings(self.source.limits)
+        report = walk_source(
+            root,
+            include=self.source.include,
+            exclude=self.source.exclude,
+            max_depth=self.source.max_depth,
+            budget=budget,
+            follow_symlinks=bool(getattr(self.source.limits, "follow_symlinks", False)),
+        )
+        if report.limit_hit:
+            raise SyncBudgetExceeded(budget_message(self.source.name, report, budget), report)
         items: list[ConnectorItem] = []
-        for path in sorted(candidates):
+        for path in report.files:
             relative = path.relative_to(root if root.is_dir() else root.parent).as_posix()
-            if not self._allows_relative_path(relative):
-                continue
             stat = path.stat()
             digest = sha256_file(path)
             items.append(

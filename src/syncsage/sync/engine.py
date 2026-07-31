@@ -13,6 +13,12 @@ from syncsage.graph.builder import GraphBuilder
 from syncsage.ingestion.captioner import captioner_from_config
 from syncsage.ingestion.pipeline import git_state, parse_connector_payload, utc_now
 from syncsage.ingestion.transcriber import transcriber_from_config
+from syncsage.ingestion.walk import (
+    SyncBudgetExceeded,
+    WalkBudget,
+    aggregate_depth_counts,
+    walk_source,
+)
 from syncsage.persistence.graph_store import GraphStore
 from syncsage.persistence.manifest import ManifestStore
 from syncsage.persistence.paths import StatePaths
@@ -125,15 +131,40 @@ class SyncEngine:
                 results.append(self.sync_source(source.name, "incremental"))
         return results
 
-    def sync_all(self, mode: SyncMode = "incremental") -> list[SyncResult]:
+    def sync_all(
+        self,
+        mode: SyncMode = "incremental",
+        *,
+        max_depth: int | None = None,
+        full_scan: bool = False,
+    ) -> list[SyncResult]:
         return [
-            self.sync_source(source.name, mode) for source in self.config.sources if source.enabled
+            self.sync_source(source.name, mode, max_depth=max_depth, full_scan=full_scan)
+            for source in self.config.sources
+            if source.enabled
         ]
 
-    def sync_source(self, source_name: str, mode: SyncMode = "incremental") -> SyncResult:
+    def sync_source(
+        self,
+        source_name: str,
+        mode: SyncMode = "incremental",
+        *,
+        max_depth: int | None = None,
+        full_scan: bool = False,
+    ) -> SyncResult:
+        """Sync one source.
+
+        ``max_depth`` caps directory depth for this run only, and
+        ``full_scan`` lifts both the depth cap and the size budget — the
+        explicit "yes, index all of it" switch. Neither is persisted to the
+        source config, so a one-off wide sync cannot silently become the
+        standing behavior of a scheduled one.
+        """
         if mode not in SYNC_MODES:
             raise ValueError(f"Unsupported sync mode: {mode}")
-        source = self._source(source_name)
+        source = self.config.effective_source(
+            self._source(source_name), max_depth=max_depth, full_scan=full_scan
+        )
         self.lease.acquire()
         # Test-only hook (Synapse 21.2 crash-safety tests): widens the window
         # between per-artifact writes so a kill -9 can land mid-sync.
@@ -189,7 +220,27 @@ class SyncEngine:
                         ),
                     },
                 )
-            items = connector.list_items()
+            try:
+                items = connector.list_items()
+            except SyncBudgetExceeded as exc:
+                # The source is bigger than its budget. Refuse the whole sync
+                # rather than indexing a prefix of it: a partial index is
+                # non-deterministic, and the operator needs to make a choice
+                # (narrow it, or ask for it explicitly with full_scan).
+                self.state.mark_source_status(source.name, "limit_exceeded")
+                return SyncResult(
+                    source.name,
+                    0,
+                    0,
+                    self.graph_builder.graph.number_of_nodes(),
+                    self.graph_builder.graph.number_of_edges(),
+                    "limit_exceeded",
+                    {
+                        "connector_type": connector.connector_type,
+                        "error": str(exc),
+                        "scan": exc.report.as_dict(),
+                    },
+                )
             if mode == "full":
                 self.state.delete_source_artifacts(source.name)
                 self.graph_builder.remove_source_content(source.name)
@@ -536,6 +587,92 @@ class SyncEngine:
             },
             now=now,
         )
+
+    def scan_source(
+        self,
+        source_name: str,
+        *,
+        max_depth: int | None = None,
+        full_scan: bool = False,
+    ) -> dict:
+        """Estimate what a source would index, without indexing anything.
+
+        The pre-flight for pointing a source at something large: it reports
+        the file count, total size, where the weight actually sits, and — via
+        ``depth_options`` — how many files each depth cap would admit, so a
+        depth can be chosen from evidence instead of guessed. Reads no file
+        content and writes nothing.
+
+        Runs with the budget *disabled* on purpose: the whole point is to
+        learn the real size, including when it is over the limit. The
+        absolute entry ceiling in the walker still applies.
+        """
+        source = self.config.effective_source(
+            self._source(source_name), max_depth=max_depth, full_scan=full_scan
+        )
+        configured = WalkBudget.from_settings(source.limits)
+        if source.type not in FILESYSTEM_SOURCE_TYPES:
+            return {
+                "source_id": source.name,
+                "type": source.type.value,
+                "scannable": False,
+                "reason": "scan estimates filesystem sources; this source pulls from a service.",
+            }
+        if not source.path.exists():
+            return {
+                "source_id": source.name,
+                "type": source.type.value,
+                "scannable": False,
+                "reason": f"source path does not exist in this environment: {source.path}",
+            }
+        report = walk_source(
+            source.path,
+            include=source.include,
+            exclude=source.exclude,
+            max_depth=source.max_depth,
+            # Size the *real* tree, then report which limits it would trip.
+            budget=WalkBudget(
+                max_files=None,
+                max_file_size_bytes=configured.max_file_size_bytes,
+                max_total_bytes=None,
+            ),
+            follow_symlinks=bool(getattr(source.limits, "follow_symlinks", False)),
+        )
+        would_exceed = []
+        if configured.max_files is not None and report.file_count > configured.max_files:
+            would_exceed.append(f"max_files ({report.file_count} > {configured.max_files})")
+        over_total = (
+            configured.max_total_bytes is not None
+            and report.total_bytes > configured.max_total_bytes
+        )
+        if over_total:
+            would_exceed.append(
+                f"max_total_mb ({report.total_bytes // (1024 * 1024)} > "
+                f"{configured.max_total_bytes // (1024 * 1024)})"
+            )
+        return {
+            "source_id": source.name,
+            "type": source.type.value,
+            "path": str(source.path),
+            "scannable": True,
+            **report.as_dict(),
+            "depth_options": aggregate_depth_counts(report),
+            "limits": {
+                "max_files": configured.max_files,
+                "max_file_size_mb": (
+                    configured.max_file_size_bytes // (1024 * 1024)
+                    if configured.max_file_size_bytes
+                    else None
+                ),
+                "max_total_mb": (
+                    configured.max_total_bytes // (1024 * 1024)
+                    if configured.max_total_bytes
+                    else None
+                ),
+            },
+            "would_exceed": would_exceed,
+            "would_sync": not would_exceed,
+        }
 
     def _source(self, name: str) -> SourceConfig:
         for source in self.config.sources:

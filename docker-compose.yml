@@ -6,7 +6,13 @@ services:
     container_name: syncsage
     restart: unless-stopped
     ports:
-      - "8765:8765"
+      # Published to loopback only. The API is unauthenticated and can be
+      # pointed at any path mounted into the container, so a bare "8765:8765"
+      # would expose it to every host on the network — and Docker's own
+      # iptables rules bypass most host firewalls, so this is not something
+      # the machine's firewall would have caught. Set SYNCSAGE_BIND=0.0.0.0
+      # only behind an authenticating ingress.
+      - "${SYNCSAGE_BIND:-127.0.0.1}:8765:8765"
     environment:
       SYNCSAGE_CONFIG: /config/syncsage.yaml
     volumes:
@@ -42,7 +48,8 @@ services:
     container_name: syncsage-ui
     restart: unless-stopped
     ports:
-      - "${SYNCSAGE_UI_PORT:-8080}:80"
+      # Loopback by default, for the same reason as the API above.
+      - "${SYNCSAGE_BIND:-127.0.0.1}:${SYNCSAGE_UI_PORT:-8080}:80"
     depends_on:
       syncsage:
         condition: service_healthy
