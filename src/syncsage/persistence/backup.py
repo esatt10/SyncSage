@@ -99,13 +99,26 @@ def _is_within(base: Path, target: Path) -> bool:
 
 
 def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
-    """Extract guarding against path traversal / absolute members."""
+    """Extract guarding against path traversal / absolute members.
+
+    The name check alone is not sufficient: a member named ``a`` that is a
+    *symlink* to ``/etc`` passes it (``dest/a`` is lexically inside ``dest``),
+    and a later member ``a/b`` then writes through the link. Reject link
+    members whose target escapes, and hand extraction the stdlib ``data``
+    filter, which additionally strips absolute/traversing links, device nodes
+    and setuid bits. (``data`` is the default from Python 3.14; asking for it
+    explicitly makes the behavior the same on 3.11–3.13.)
+    """
 
     for member in tar.getmembers():
         member_path = dest / member.name
         if member.name.startswith("/") or not _is_within(dest, member_path):
             raise ValueError(f"Unsafe path in backup archive: {member.name}")
-    tar.extractall(dest)  # noqa: S202 - members validated above
+        if (member.issym() or member.islnk()) and not _is_within(
+            dest, member_path.parent / member.linkname
+        ):
+            raise ValueError(f"Unsafe link in backup archive: {member.name} -> {member.linkname}")
+    tar.extractall(dest, filter="data")  # noqa: S202 - members validated above
 
 
 def restore_backup(

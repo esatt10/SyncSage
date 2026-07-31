@@ -21,3 +21,44 @@ def resolve_under(path: str | Path, allowed_roots: list[str | Path]) -> Path:
         f"security.allow_workspace_roots (or set "
         f"security.allow_user_selected_source_paths: true)."
     )
+
+
+def resolve_config_write_target(
+    requested: str | Path | None,
+    *,
+    server_config_path: str | Path,
+    allowed_roots: list[str | Path] | None = None,
+) -> Path:
+    """Where a "promote this source into YAML" write is allowed to land.
+
+    ``config_path`` on the promote surfaces (HTTP ``POST
+    /sources/{id}/promote``, MCP ``promote_runtime_source_to_config``) used
+    to be written verbatim, which turned a source-management call into an
+    arbitrary file write anywhere the process could reach. Promotion only
+    ever *means* "write my config", so the target is constrained to the
+    config file this server was started with, or — for the multi-config
+    workflows the CLI supports — a path under an allowed root.
+
+    ``allowed_roots`` is opt-in; with none supplied the server's own config
+    path is the single permitted target.
+    """
+    server_path = Path(server_config_path).expanduser().resolve()
+    if requested is None or str(requested).strip() == "":
+        return server_path
+    candidate = Path(requested).expanduser().resolve()
+    if candidate == server_path:
+        return candidate
+    if allowed_roots:
+        try:
+            return resolve_under(candidate, list(allowed_roots))
+        except PathPolicyError:
+            pass
+    raise PathPolicyError(
+        f"Refusing to write config to {candidate}: promotion may only write this "
+        f"server's config file ({server_path})"
+        + (
+            f" or a path under {', '.join(str(Path(r)) for r in allowed_roots)}."
+            if allowed_roots
+            else "."
+        )
+    )

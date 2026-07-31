@@ -26,6 +26,17 @@ RUN pip install --no-cache-dir ".[mcp]"
 
 COPY syncsage.example.yaml /config/syncsage.yaml
 
+# Run as an unprivileged user. The indexer reads whatever paths it is pointed
+# at, so running it as root means a misconfigured source — or a bug in the
+# path handling — reads the container's entire filesystem, /proc/self/environ
+# (which holds any API keys passed through `environment:`) included. The state
+# and export volumes are chowned so the non-root user can still write them;
+# source mounts stay read-only and only need read access.
+RUN useradd --create-home --uid 10001 syncsage \
+    && mkdir -p /state /vault /exports /workspace \
+    && chown -R syncsage:syncsage /state /vault /exports /app /config
+USER syncsage
+
 EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8765/health || exit 1

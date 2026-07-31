@@ -74,21 +74,24 @@ def within_max_depth(relative: str, max_depth: int | None) -> bool:
 
 
 def discover_files(source: SourceConfig) -> list[Path]:
-    root = source.path
-    if not root.exists():
-        return []
-    candidates = [root] if root.is_file() else [p for p in root.rglob("*") if p.is_file()]
-    files: list[Path] = []
-    for path in candidates:
-        rel = path.relative_to(root if root.is_dir() else root.parent).as_posix()
-        if not within_max_depth(rel, source.max_depth):
-            continue
-        if _match_any(rel, source.exclude):
-            continue
-        if source.include and not _match_any(rel, source.include):
-            continue
-        files.append(path)
-    return sorted(files)
+    """Files a source would index, via the shared pruning walk.
+
+    Delegates to :func:`syncsage.ingestion.walk.walk_source` so there is one
+    traversal implementation rather than two that drift — this used to
+    ``rglob("*")`` the whole tree and filter afterwards, which meant exclude
+    patterns never pruned the walk.
+    """
+    from syncsage.ingestion.walk import WalkBudget, walk_source
+
+    report = walk_source(
+        source.path,
+        include=source.include,
+        exclude=source.exclude,
+        max_depth=source.max_depth,
+        budget=WalkBudget.from_settings(source.limits),
+        follow_symlinks=bool(getattr(source.limits, "follow_symlinks", False)),
+    )
+    return report.files
 
 
 def git_state(root: Path) -> tuple[str | None, str | None, bool]:
@@ -325,7 +328,8 @@ def _sidecar_for_payload(
 def _is_text_like(mime_type: str | None) -> bool:
     if not mime_type:
         return False
-    return (
-        mime_type.startswith("text/")
-        or mime_type in {"application/json", "application/xml", "application/x-yaml"}
-    )
+    return mime_type.startswith("text/") or mime_type in {
+        "application/json",
+        "application/xml",
+        "application/x-yaml",
+    }

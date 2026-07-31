@@ -193,6 +193,13 @@ def render_up_config(
         }
     )
     data["server"]["port"] = port
+    # A laptop install answers on loopback only. The API is unauthenticated
+    # and can be pointed at any readable path, so the default 0.0.0.0 would
+    # hand the whole index — and the filesystem behind it — to anyone on the
+    # same network. Containers still bind 0.0.0.0 (see the Dockerfile:
+    # binding loopback inside a container makes it unreachable from the
+    # host); it is compose that publishes them to 127.0.0.1.
+    data["server"]["host"] = "127.0.0.1"
     roots = [str(workspace)]
     for candidate in [*(str(p) for p in local_paths), str(local / "vault"), str(local / "exports")]:
         if candidate not in roots:

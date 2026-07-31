@@ -113,10 +113,34 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
         )
 
     @mcp.tool()
-    def sync_source(knowledge_base: str, source_name: str, mode: str = "incremental") -> dict:
-        """Sync one configured source."""
+    def sync_source(
+        knowledge_base: str,
+        source_name: str,
+        mode: str = "incremental",
+        max_depth: int | None = None,
+        full_scan: bool = False,
+    ) -> dict:
+        """Sync one configured source.
 
-        return tools.sync_source(knowledge_base, source_name, mode)
+        A source that would exceed its configured size limits returns
+        ``status: "limit_exceeded"`` and indexes nothing — call
+        ``scan_source`` first to see the shape, then either narrow it with
+        ``max_depth`` or re-run with ``full_scan=True``.
+        """
+
+        return tools.sync_source(
+            knowledge_base, source_name, mode, max_depth=max_depth, full_scan=full_scan
+        )
+
+    @mcp.tool()
+    def scan_source(
+        knowledge_base: str,
+        source_name: str,
+        max_depth: int | None = None,
+    ) -> dict:
+        """Estimate what a source would index, without indexing anything."""
+
+        return tools.scan_source(knowledge_base, source_name, max_depth=max_depth)
 
     @mcp.tool()
     def memory_write(
@@ -143,10 +167,15 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
         return tools.memory_consolidate(knowledge_base)
 
     @mcp.tool()
-    def sync_all(knowledge_base: str, mode: str = "incremental") -> dict:
+    def sync_all(
+        knowledge_base: str,
+        mode: str = "incremental",
+        max_depth: int | None = None,
+        full_scan: bool = False,
+    ) -> dict:
         """Sync all enabled configured sources."""
 
-        return tools.sync_all(knowledge_base, mode)
+        return tools.sync_all(knowledge_base, mode, max_depth=max_depth, full_scan=full_scan)
 
     @mcp.tool()
     def search_context(  # noqa: PLR0913 - additive principal params (32.2)
@@ -213,10 +242,19 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
         task: str,
         source_name: str | None = None,
         max_files: int = 8,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
     ) -> dict:
         """Return files likely needed for a coding or research task."""
 
-        return tools.get_relevant_files(knowledge_base, task, source_name, max_files)
+        return tools.get_relevant_files(
+            knowledge_base,
+            task,
+            source_name,
+            max_files,
+            principal=principal,
+            principal_groups=principal_groups,
+        )
 
     @mcp.tool()
     def get_graph_neighbors(

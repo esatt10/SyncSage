@@ -6,23 +6,80 @@ from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any
 
-DEFAULT_EXCLUDES = [
-    "**/.git/**",
+#: Patterns that keep credentials out of the index. Unlike the rest of
+#: ``DEFAULT_EXCLUDES``, these are **not** merely a default a caller can
+#: replace: ``security.default_exclude_secrets`` (on by default) unions them
+#: into every filesystem source's effective exclude list. That distinction
+#: matters because SyncSage supports indexing any readable path — pointing a
+#: source at ``$HOME`` with ``include: ["**/*.json", "**/*.yaml"]`` otherwise
+#: sweeps up ``~/.docker/config.json``, ``~/.config/gh/hosts.yml`` and
+#: friends, and a caller that supplies its own ``exclude`` list used to drop
+#: every one of these patterns silently.
+SECRET_EXCLUDES = [
+    # Environment and dotenv files
     "**/.env",
     "**/.env.*",
+    "**/*.envrc",
+    # Private keys and certificates
     "**/*id_rsa*",
+    "**/*id_dsa*",
+    "**/*id_ecdsa*",
     "**/*id_ed25519*",
     "**/*.pem",
     "**/*.key",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/*.jks",
+    "**/*.keystore",
+    "**/*.asc",
+    "**/*.gpg",
+    # Credential stores people keep in a home directory
+    "**/.ssh/**",
+    "**/.gnupg/**",
+    "**/.aws/**",
+    "**/.azure/**",
+    "**/.kube/**",
+    "**/.docker/config.json",
+    "**/.config/gh/**",
+    "**/.config/gcloud/**",
+    "**/.netrc",
+    "**/.npmrc",
+    "**/.pypirc",
+    "**/.git-credentials",
+    "**/credentials",
+    "**/credentials.json",
+    "**/secrets.yaml",
+    "**/secrets.yml",
+    "**/*.kdbx",
+    # Local keychains / browser profiles
+    "**/Library/Keychains/**",
+    "**/.mozilla/**",
+    "**/.password-store/**",
+]
+
+#: Directories that are large, generated, and never worth indexing. Kept
+#: separate from the secret list because these are about *cost*, not
+#: disclosure, and an operator may legitimately want to drop them.
+NOISE_EXCLUDES = [
+    "**/.git/**",
     "**/node_modules/**",
     "**/__pycache__/**",
     "**/.venv/**",
     "**/venv/**",
     "**/dist/**",
     "**/build/**",
+    "**/target/**",
+    "**/.next/**",
+    "**/.cache/**",
+    "**/.tox/**",
+    "**/.gradle/**",
+    "**/.terraform/**",
     "**/.mypy_cache/**",
     "**/.pytest_cache/**",
+    "**/.ruff_cache/**",
 ]
+
+DEFAULT_EXCLUDES = [*NOISE_EXCLUDES, *SECRET_EXCLUDES]
 
 
 class SourceType(StrEnum):
@@ -146,6 +203,28 @@ class McpSettings(ModelMixin):
 class ApiSettings(ModelMixin):
     enabled: bool = True
     openapi: bool = True
+    # Browser origins allowed to call this API. The API is unauthenticated by
+    # design (a local-first tool behind the operator's own perimeter), which
+    # is exactly why the origin list must not be "*": with a wildcard, any
+    # page the user happens to visit can script the whole surface — read the
+    # index, rewrite the config, point the embedder at an attacker's host and
+    # ship a server-side API key with it. The defaults cover the UI sidecar
+    # and local dev; add explicit origins for anything else.
+    cors_origins: list[str] = field(
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:8765",
+            "http://127.0.0.1:8765",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ]
+    )
+    # Escape hatch for deployments that genuinely front this with their own
+    # authenticating ingress and need `*` back. Opt-in, never the default.
+    cors_allow_all_origins: bool = False
 
 
 @dataclass
@@ -307,10 +386,40 @@ class SchedulerSettings(ModelMixin):
 
 
 @dataclass
+class SyncLimitsSettings(ModelMixin):
+    """Guardrails on how much one filesystem source may pull in.
+
+    SyncSage lets a source point at any readable path, which makes
+    "accidentally indexed my home directory" a realistic mistake rather than
+    a hypothetical one. These limits turn that mistake into a refusal with an
+    actionable message instead of a process that consumes memory until it
+    dies. They are checked *during* traversal, before any file is read.
+
+    Any field set to ``None`` disables that particular limit. A sync that
+    trips a limit indexes nothing — a partial index would be
+    non-deterministic, and silently indexing the first N files of a home
+    directory is a worse outcome than a clear stop. Pass ``full_scan`` on the
+    sync surfaces (or raise the limits here) to index it anyway.
+    """
+
+    #: Matching files, after include/exclude. A large monorepo is ~100k.
+    max_files: int | None = 50_000
+    #: Skip any single file bigger than this — a 2 GB model checkpoint or
+    #: database dump has no business in a text index and would be read whole.
+    max_file_size_mb: int | None = 25
+    #: Total matched content. Chunking and embedding both scale off this.
+    max_total_mb: int | None = 4096
+    #: Symlinks are not followed by default: a home directory routinely
+    #: contains links that escape the source root or form loops.
+    follow_symlinks: bool = False
+
+
+@dataclass
 class SyncSettings(ModelMixin):
     watcher: WatcherSettings = field(default_factory=WatcherSettings)
     git: GitSettings = field(default_factory=GitSettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
+    limits: SyncLimitsSettings = field(default_factory=SyncLimitsSettings)
 
 
 @dataclass
@@ -517,6 +626,9 @@ class SourceConfig(ModelMixin):
     sync: SourceSyncSettings = field(default_factory=SourceSyncSettings)
     connector: SourceConnectorSettings = field(default_factory=SourceConnectorSettings)
     urls: list[str] = field(default_factory=list)
+    #: Per-source override of ``sync.limits``. ``None`` inherits the global
+    #: block; set it to widen or tighten one source without touching others.
+    limits: SyncLimitsSettings | None = None
 
 
 @dataclass
@@ -581,6 +693,8 @@ class SyncSageConfig(ModelMixin):
                     raw["git"] = build(GitSettings, raw["git"])
                 if "scheduler" in raw and isinstance(raw["scheduler"], dict):
                     raw["scheduler"] = build(SchedulerSettings, raw["scheduler"])
+                if "limits" in raw and isinstance(raw["limits"], dict):
+                    raw["limits"] = build(SyncLimitsSettings, raw["limits"])
             return dc(**{k: v for k, v in raw.items() if k in dc.__dataclass_fields__})
 
         cfg = cls(
@@ -620,6 +734,8 @@ class SyncSageConfig(ModelMixin):
                 raw["sync"] = build(SourceSyncSettings, raw["sync"])
             if "connector" in raw:
                 raw["connector"] = build(SourceConnectorSettings, raw["connector"])
+            if raw.get("limits") is not None:
+                raw["limits"] = build(SyncLimitsSettings, raw["limits"])
             _coerce_scalar_fields(SourceConfig, raw)
             cfg.sources.append(
                 SourceConfig(
@@ -631,6 +747,55 @@ class SyncSageConfig(ModelMixin):
         cfg.storage.graph_path = cfg.storage.graph_path or state / "graphs"
         cfg.storage.manifest_path = cfg.storage.manifest_path or state / "manifests"
         return cfg
+
+    def effective_source(
+        self,
+        source: SourceConfig,
+        *,
+        max_depth: int | None = None,
+        full_scan: bool = False,
+    ) -> SourceConfig:
+        """The source as the sync path should actually see it.
+
+        Two deployment-wide policies are folded in here rather than at every
+        call site, because the connector API takes only ``(source, state)``
+        and third-party plugins must keep working unchanged:
+
+        * ``security.default_exclude_secrets`` unions :data:`SECRET_EXCLUDES`
+          into the exclude list. This has to happen *after* any caller-
+          supplied ``exclude``, because supplying one replaces the field
+          wholesale — which used to drop every credential pattern silently.
+        * ``sync.limits`` fills in a per-source budget when the source does
+          not carry its own.
+
+        ``max_depth`` overrides the source's own depth for this call, and
+        ``full_scan`` means "I know what I am asking for": no depth cap and
+        no budget. Both are per-invocation, never persisted.
+        """
+        import copy
+
+        resolved = copy.deepcopy(source)
+        if self.security.default_exclude_secrets:
+            existing = list(resolved.exclude or [])
+            for pattern in SECRET_EXCLUDES:
+                if pattern not in existing:
+                    existing.append(pattern)
+            resolved.exclude = existing
+        if full_scan:
+            inherited = resolved.limits or self.sync.limits
+            resolved.max_depth = None
+            resolved.limits = SyncLimitsSettings(
+                max_files=None,
+                max_file_size_mb=None,
+                max_total_mb=None,
+                follow_symlinks=bool(getattr(inherited, "follow_symlinks", False)),
+            )
+            return resolved
+        if max_depth is not None:
+            resolved.max_depth = max_depth
+        if resolved.limits is None:
+            resolved.limits = self.sync.limits
+        return resolved
 
     @property
     def knowledge_base_id(self) -> str:

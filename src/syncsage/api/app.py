@@ -30,7 +30,11 @@ from syncsage.registry.knowledge_base_registry import KnowledgeBaseRegistry
 from syncsage.registry.source_registry import SourceRegistry
 from syncsage.search.hybrid import HybridSearch
 from syncsage.search.sqlite_store import SearchStore
-from syncsage.security.path_policy import PathPolicyError, resolve_under
+from syncsage.security.path_policy import (
+    PathPolicyError,
+    resolve_config_write_target,
+    resolve_under,
+)
 from syncsage.sync.engine import SyncEngine
 from syncsage.version import __version__
 
@@ -109,6 +113,10 @@ class SyncRequest(BaseModel):
     knowledge_base: str | None = None
     source_name: str | None = None
     mode: str = "incremental"
+    # Per-run traversal controls. `depth` caps directory depth for this run;
+    # `full_scan` lifts both the depth cap and sync.limits. Neither persists.
+    depth: int | None = None
+    full_scan: bool = False
 
 
 class ObsidianExportRequest(BaseModel):
@@ -248,6 +256,30 @@ def _configured_roots(config: SyncSageConfig) -> list[Path]:
     ]
     if config.security.allow_user_selected_source_paths:
         roots.append(Path("/"))
+    seen: list[Path] = []
+    for root in roots:
+        resolved = root.expanduser().resolve()
+        if resolved not in seen:
+            seen.append(resolved)
+    return seen
+
+
+def _config_write_roots(config: SyncSageConfig) -> list[Path]:
+    """Roots a *config file* may be written into.
+
+    Deliberately not ``_allowed_roots``: that one honors
+    ``security.allow_user_selected_source_paths``, which widens the list to
+    ``/`` so a user can index any folder they like. Choosing what content to
+    index is not the same permission as choosing where the server writes
+    YAML, and conflating them turns source promotion into an arbitrary file
+    write. Only the explicitly configured roots count here.
+    """
+    roots = [
+        config.syncsage.workspace_root,
+        config.syncsage.vault_path,
+        config.syncsage.exports_path,
+        *config.security.allow_workspace_roots,
+    ]
     seen: list[Path] = []
     for root in roots:
         resolved = root.expanduser().resolve()
@@ -438,11 +470,19 @@ def create_app(
     app.state.session_keys = SessionKeyStore(config.assistant.session_key_ttl_minutes)
 
     # The web UI is a separate workload that talks to this API over HTTP, so the
-    # browser origin differs in development. CORS is intentionally permissive for
-    # a local-first tool; production deployments should front this with ingress.
+    # browser origin differs in development — but this API is unauthenticated,
+    # so a wildcard here means any page in the user's browser can drive every
+    # route on it (read the whole index, rewrite the config, register a source
+    # over a sensitive directory). Allow the UI's origins, not the web.
+    cors_settings = config.server.api
+    if cors_settings.cors_allow_all_origins:
+        logger.warning(
+            "server.api.cors_allow_all_origins is on: every browser origin may call this "
+            "unauthenticated API. Only do this behind an authenticating ingress."
+        )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=["*"] if cors_settings.cors_allow_all_origins else cors_settings.cors_origins,
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -662,11 +702,25 @@ def create_app(
         source_payload = source.model_dump(mode="json")
         yaml_patch = yaml.safe_dump({"sources": [source_payload]}, sort_keys=False)
         wrote = False
-        target = req.config_path or app.state.config_path
+        # `config_path` is caller-supplied: constrain it to this server's own
+        # config (or an allowed root) so promotion cannot be used to write a
+        # YAML file anywhere the process can reach.
+        try:
+            path = resolve_config_write_target(
+                req.config_path,
+                server_config_path=app.state.config_path,
+                allowed_roots=_config_write_roots(config),
+            )
+        except PathPolicyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        target = str(path)
         if req.write:
-            path = Path(target)
             data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
-            data = data or {}
+            if not isinstance(data, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Refusing to overwrite {path}: it is not a SyncSage config mapping",
+                )
             existing = [
                 item for item in data.get("sources", []) or [] if item.get("name") != source.name
             ]
@@ -702,9 +756,19 @@ def create_app(
     def sync_all(req: SyncRequest) -> dict:
         try:
             if req.source_name:
-                result = engine.sync_source(req.source_name, req.mode)  # type: ignore[arg-type]
+                result = engine.sync_source(
+                    req.source_name,
+                    req.mode,  # type: ignore[arg-type]
+                    max_depth=req.depth,
+                    full_scan=req.full_scan,
+                )
                 return {"results": [result.__dict__]}
-            return {"results": [r.__dict__ for r in engine.sync_all(req.mode)]}  # type: ignore[arg-type]
+            results = engine.sync_all(
+                req.mode,  # type: ignore[arg-type]
+                max_depth=req.depth,
+                full_scan=req.full_scan,
+            )
+            return {"results": [r.__dict__ for r in results]}
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -714,11 +778,29 @@ def create_app(
     def sync_source(source_id: str, req: SyncRequest | None = None) -> dict:
         mode = req.mode if req else "incremental"
         try:
-            return engine.sync_source(source_id, mode).__dict__  # type: ignore[arg-type]
+            return engine.sync_source(
+                source_id,
+                mode,  # type: ignore[arg-type]
+                max_depth=req.depth if req else None,
+                full_scan=req.full_scan if req else False,
+            ).__dict__
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/sources/{source_id}/scan")
+    def scan_source(source_id: str, depth: int | None = None) -> dict:
+        """Estimate what a source would index, without indexing it.
+
+        The pre-flight for the "point it at anything" workflow: file count,
+        size, where the weight sits, how many files each depth cap admits,
+        and whether the configured limits would refuse the sync.
+        """
+        try:
+            return engine.scan_source(source_id, max_depth=depth)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/memory")
     def memory_write(req: MemoryWriteRequest) -> dict:
@@ -819,12 +901,21 @@ def create_app(
 
     @app.post("/relevant-files")
     def relevant_files(req: SearchRequest) -> dict:
+        # Same retrieval as /search, so it must run under the same ACL
+        # enforcement: dropping `security`/`principal` here silently returned
+        # unfiltered results for every caller whenever acl_enforced was on.
+        # No `graph=` on purpose — this route projects to *files*, and graph
+        # nodes (concepts, symbols) carry no relative_path, so admitting them
+        # would crowd file hits out of the merge and return an empty list.
         payload = search.search_context(
             req.knowledge_base or config.knowledge_base_id,
             req.query,
             "hybrid",
             req.max_results,
             req.source_name,
+            principal=req.principal,
+            principal_groups=req.principal_groups,
+            security=config.security,
         )
         seen = set()
         files = []
@@ -835,8 +926,43 @@ def create_app(
                 files.append(result)
         return {"files": files}
 
+    def _acl_guard(
+        artifact_id: str | None,
+        principal: str | None,
+        principal_groups: list[str] | None = None,
+    ) -> None:
+        """403 unless ``principal`` may read ``artifact_id`` (Step 32.2).
+
+        The content endpoints hand back whole artifact bodies by id or path,
+        which bypasses the filtering ``search_context`` does — an ACL-enforcing
+        region that filters search results but serves the same bytes from
+        /files/summary or /nodes/content has not enforced anything. No-op when
+        ``security.acl_enforced`` is off, so pre-32 behavior is unchanged.
+        """
+        if not config.security.acl_enforced:
+            return
+        from syncsage.security.acl import expand_principal, is_allowed
+
+        identities = expand_principal(principal, principal_groups, config.security.groups)
+        if identities is not None and principal:
+            from syncsage.security.idp import fresh_idp_groups
+
+            identities |= fresh_idp_groups(state, principal, config.security.idp)
+        default_public = config.security.default_visibility != "private"
+        acls = state.artifact_acls([artifact_id]) if artifact_id else {}
+        if artifact_id not in acls:
+            # Not resolvable to an artifact row: deny, matching the
+            # conservative rule the search path applies to bare graph nodes.
+            raise HTTPException(status_code=403, detail="Not permitted")
+        if not is_allowed(acls[artifact_id], identities, default_public=default_public):
+            raise HTTPException(status_code=403, detail="Not permitted")
+
     @app.get("/files/summary")
-    def file_summary(path: str, source_name: str | None = None) -> dict:
+    def file_summary(
+        path: str,
+        source_name: str | None = None,
+        principal: str | None = None,
+    ) -> dict:
         # GROUP_CONCAT order is arbitrary unless the input rows are ordered,
         # so concatenate over ordered scalar subqueries to keep summaries and
         # content in chunk order.
@@ -853,20 +979,26 @@ def create_app(
             LIMIT 1""",
             (path, source_name, source_name),
         )
-        return dict(rows[0]) if rows else {"path": path, "summary": None}
+        if not rows:
+            return {"path": path, "summary": None}
+        _acl_guard(str(rows[0]["id"]), principal)
+        return dict(rows[0])
 
     @app.get("/nodes/content")
-    def node_content(node_id: str) -> dict:
+    def node_content(node_id: str, principal: str | None = None) -> dict:
         graph = engine.graph_builder.graph
         if node_id not in graph:
             raise HTTPException(status_code=404, detail=f"Unknown node: {node_id}")
         node = dict(graph.nodes[node_id])
         if node.get("type") == "chunk":
             rows = state.rows(
-                "SELECT text FROM chunks WHERE id=? LIMIT 1",
+                "SELECT artifact_id, text FROM chunks WHERE id=? LIMIT 1",
                 (node_id,),
             )
+            if rows:
+                _acl_guard(str(rows[0]["artifact_id"]), principal)
             return {"node_id": node_id, "content": rows[0]["text"] if rows else None}
+        _acl_guard(node_id, principal)
         artifact_rows = state.rows("SELECT path FROM artifacts WHERE id=? LIMIT 1", (node_id,))
         if artifact_rows:
             path = Path(artifact_rows[0]["path"])

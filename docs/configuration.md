@@ -76,8 +76,11 @@ syncsage config show --effective --profile dev --config syncsage.yaml
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `host` | string | `0.0.0.0` | Bind address; set `127.0.0.1` for local-only exposure. |
+| `host` | string | `0.0.0.0` | Bind address. `syncsage up` generates `127.0.0.1`; containers keep `0.0.0.0` (loopback inside a container is unreachable from the host) and compose publishes them to `127.0.0.1` instead. |
 | `port` | integer | `8765` | Primary service port. |
+
+The API is unauthenticated, so the bind address is a security control, not
+just a networking detail — see [security.md](security.md#trust-model-for-the-http-api).
 
 ### MCP options (`server.mcp`)
 
@@ -94,6 +97,8 @@ syncsage config show --effective --profile dev --config syncsage.yaml
 |---|---|---|---|
 | `api.enabled` | bool | `true` | Enables REST API endpoints. |
 | `api.openapi` | bool | `true` | Exposes OpenAPI schema/docs endpoints. |
+| `api.cors_origins` | list[str] | localhost dev/UI origins | Browser origins allowed to call the API. The shipped UI proxies `/api/*` same-origin and needs no entry here. |
+| `api.cors_allow_all_origins` | bool | `false` | Restores `Access-Control-Allow-Origin: *`. The API is unauthenticated — only enable behind an authenticating ingress. |
 | `ui.enabled` | bool | `true` | Enables web UI routes (if packaged). |
 | `ui.graph_visualization` | bool | `true` | Enables graph visualization features in UI. |
 
@@ -177,6 +182,58 @@ syncsage config show --effective --profile dev --config syncsage.yaml
 | `enabled` | bool | `true` | Enable periodic fallback sync job. |
 | `interval_seconds` | integer | `900` | Scheduler interval. |
 
+### Size guardrails (`sync.limits`)
+
+A source may point at any readable path, which makes "I accidentally indexed
+my home directory" a realistic mistake. These limits are checked **during**
+traversal, before any file is read, so an oversized source is refused rather
+than consuming memory until the process dies. Set any field to `null` to
+disable that limit.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `max_files` | integer\|null | `50000` | Matching files, after include/exclude. |
+| `max_file_size_mb` | integer\|null | `25` | Skip any single file larger than this. Skipped files are reported, not fatal. |
+| `max_total_mb` | integer\|null | `4096` | Total matched content. |
+| `follow_symlinks` | bool | `false` | Home directories routinely contain links that escape the root or loop. |
+
+A source can override the whole block with `sources[].limits`.
+
+**A source over budget indexes nothing.** A partial index would be
+non-deterministic, and silently indexing the first N files of a home
+directory is worse than a clear stop. The sync returns
+`status: "limit_exceeded"` with a message naming the limit and the largest
+subtrees. Your options are: narrow it (`max_depth`, tighter `include`, more
+`exclude`), raise the limits, or sync once with `--full-scan`.
+
+### Knowing the size first (`syncsage scan`)
+
+```bash
+syncsage scan -c syncsage.yaml            # every enabled source
+syncsage scan -s notes --depth 2 --json   # one source, machine-readable
+```
+
+`scan` walks without reading or indexing anything and reports the file
+count, total size, largest subtrees, oversized files, and a **files-by-depth
+table** so a depth cap can be chosen from evidence rather than guessed. It
+also reports whether the configured limits would refuse the sync. Also
+available as `POST /sources/{id}/scan` and the `scan_source` MCP tool.
+
+### Per-run traversal toggles
+
+`--depth N` and `--full-scan` apply to one invocation and are never written
+back to the source config, so a one-off wide sync cannot silently become the
+standing behavior of a scheduled one.
+
+| Surface | Depth cap | Full scan |
+|---|---|---|
+| CLI | `syncsage sync --depth N` | `syncsage sync --full-scan` |
+| HTTP | `{"depth": N}` on `/sync`, `/sync/{id}` | `{"full_scan": true}` |
+| MCP | `max_depth=N` on `sync_source`/`sync_all` | `full_scan=true` |
+
+`--full-scan` lifts both the depth cap and the size budget — the explicit
+"yes, index all of it" switch.
+
 ### Idempotency + concurrency
 
 | Key | Type | Example | Notes |
@@ -230,7 +287,8 @@ syncsage config show --effective --profile dev --config syncsage.yaml
 | `allow_workspace_roots` | list[path] | `[/workspace, /vault]` | Allowed root prefixes for registered source paths. |
 | `read_only_sources` | bool | `true` | Prevent source mutation operations. |
 | `deny_path_traversal` | bool | `true` | Block `..` traversal and unsafe resolution. |
-| `default_exclude_secrets` | bool | `true` | Apply secret-oriented default excludes. |
+| `allow_user_selected_source_paths` | bool | `true` | Let a source name any readable path, not just one under `allow_workspace_roots`. This is what makes "point it at anything" work; see the security notes on what compensates for it. |
+| `default_exclude_secrets` | bool | `true` | **Always** union `SECRET_EXCLUDES` into every filesystem source's excludes. Unlike the rest of `DEFAULT_EXCLUDES`, supplying your own `exclude` list does not drop these. |
 
 ---
 

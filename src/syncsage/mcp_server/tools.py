@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections import deque
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from syncsage.registry.knowledge_base_registry import KnowledgeBaseRegistry
 from syncsage.registry.source_registry import SourceRegistry
 from syncsage.search.hybrid import HybridSearch
 from syncsage.search.sqlite_store import SearchStore
-from syncsage.security.path_policy import resolve_under
+from syncsage.security.path_policy import resolve_config_write_target, resolve_under
 from syncsage.sync.engine import SyncEngine
 
 
@@ -178,9 +179,22 @@ class SyncSageTools:
         if write:
             if not config_path:
                 raise ValueError("config_path is required when write=True")
-            path = Path(config_path)
+            # An agent-supplied path must not become an arbitrary file write:
+            # promotion may only touch this region's own config, or a path
+            # under an allowed workspace root.
+            path = resolve_config_write_target(
+                config_path,
+                server_config_path=os.environ.get("SYNCSAGE_CONFIG", "/config/syncsage.yaml"),
+                allowed_roots=[
+                    self.config.syncsage.workspace_root,
+                    *self.config.security.allow_workspace_roots,
+                ],
+            )
             data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
-            data = data or {}
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"Refusing to overwrite {path}: it is not a SyncSage config mapping"
+                )
             existing = [
                 item for item in data.get("sources", []) or [] if item.get("name") != source.name
             ]
@@ -204,15 +218,57 @@ class SyncSageTools:
             "config_path": config_path,
         }
 
-    def sync_source(self, knowledge_base: str, source_name: str, mode: str = "incremental") -> dict:
+    def scan_source(
+        self,
+        knowledge_base: str,
+        source_name: str,
+        max_depth: int | None = None,
+    ) -> dict:
+        """Estimate what a source would index, without indexing anything.
+
+        Call this before syncing a source that points at something large or
+        unfamiliar (a home directory, a whole drive). Reports the file count,
+        total size, the largest subtrees, how many files each depth cap would
+        admit, and whether the configured limits would refuse the sync.
+        Reads no file content and writes nothing.
+        """
         self._require_knowledge_base(knowledge_base)
-        result = self.engine.sync_source(source_name, mode).__dict__  # type: ignore[arg-type]
+        return self.engine.scan_source(source_name, max_depth=max_depth)
+
+    def sync_source(
+        self,
+        knowledge_base: str,
+        source_name: str,
+        mode: str = "incremental",
+        max_depth: int | None = None,
+        full_scan: bool = False,
+    ) -> dict:
+        self._require_knowledge_base(knowledge_base)
+        result = self.engine.sync_source(
+            source_name,
+            mode,  # type: ignore[arg-type]
+            max_depth=max_depth,
+            full_scan=full_scan,
+        ).__dict__
         self._audit(source_name, "sync_source", "mcp", "mcp", None, utc_now(), result)
         return result
 
-    def sync_all(self, knowledge_base: str, mode: str = "incremental") -> dict:
+    def sync_all(
+        self,
+        knowledge_base: str,
+        mode: str = "incremental",
+        max_depth: int | None = None,
+        full_scan: bool = False,
+    ) -> dict:
         self._require_knowledge_base(knowledge_base)
-        results = [r.__dict__ for r in self.engine.sync_all(mode)]  # type: ignore[arg-type]
+        results = [
+            r.__dict__
+            for r in self.engine.sync_all(
+                mode,  # type: ignore[arg-type]
+                max_depth=max_depth,
+                full_scan=full_scan,
+            )
+        ]
         for result in results:
             self._audit(result["source_id"], "sync_source", "mcp", "mcp", None, utc_now(), result)
         return {"results": results}
@@ -357,14 +413,24 @@ class SyncSageTools:
         task: str,
         source_name: str | None = None,
         max_files: int = 8,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
     ) -> dict:
         self._require_knowledge_base(knowledge_base)
+        # This is `search_context` with a different projection, so it runs
+        # under the same ACL enforcement — without `security` it returned
+        # unfiltered hits to every caller whenever acl_enforced was on.
+        # No `graph=`: this route answers with files, and graph nodes carry
+        # no path, so admitting them would crowd the file hits out.
         payload = self.searcher.search_context(
             knowledge_base or self.config.knowledge_base_id,
             task,
             "hybrid",
             max_files,
             source_name,
+            principal=principal,
+            principal_groups=principal_groups,
+            security=self.config.security,
         )
         return {"files": payload["results"]}
 
