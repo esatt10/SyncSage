@@ -3,13 +3,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { SourceRecord } from "../api/types";
 import { AddSourceWizard } from "../sources/AddSourceWizard";
-import { Explainable } from "../explain/Explainable";
+import { QuickAdd } from "../components/QuickAdd";
 
 const SYNC_MODES = ["incremental", "full", "validate_only", "repair"];
 
 export function SourcesPage() {
   const queryClient = useQueryClient();
   const sources = useQuery({ queryKey: ["sources"], queryFn: api.sources });
+  const [quickAdd, setQuickAdd] = useState(false);
   const [showWizard, setShowWizard] = useState(false);
   const [editingSource, setEditingSource] = useState<SourceRecord | null>(null);
   const [patch, setPatch] = useState<string | null>(null);
@@ -17,6 +18,7 @@ export function SourcesPage() {
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ["sources"] });
     queryClient.invalidateQueries({ queryKey: ["graph"] });
+    queryClient.invalidateQueries({ queryKey: ["overview"] });
   };
 
   const sync = useMutation({
@@ -37,27 +39,32 @@ export function SourcesPage() {
   });
 
   return (
-    <div className="page">
+    <div className="page page--wide">
       <div className="page__header">
         <h1>Sources</h1>
-        <Explainable id="sources.add" as="span">
-          <button className="btn btn--primary" onClick={() => setShowWizard(true)}>
-            + Add source
-          </button>
-        </Explainable>
+        <button className="btn btn--primary" onClick={() => setQuickAdd(true)}>
+          + Add source
+        </button>
       </div>
 
-      {sources.isLoading && <p className="muted">Loading sources…</p>}
-      {sources.isError && <p className="error">{(sources.error as Error).message}</p>}
+      {sources.isLoading && (
+        <p className="muted">
+          <span className="spinner" /> Loading sources…
+        </p>
+      )}
+      {sources.isError && (
+        <div className="banner banner--error">{(sources.error as Error).message}</div>
+      )}
 
-      <table className="data-table">
+      <div className="table-scroll">
+        <table className="data-table">
         <thead>
           <tr>
             <th>Name</th>
             <th>Type</th>
             <th>Path</th>
             <th>Status</th>
-            <th>Actions</th>
+            <th style={{ textAlign: "right" }}>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -70,7 +77,7 @@ export function SourcesPage() {
               <td className="path-cell" title={source.path}>
                 {source.path}
               </td>
-              <td>{source.last_status ?? "—"}</td>
+              <td className="muted small">{source.last_status ?? "—"}</td>
               <td className="actions-cell">
                 <SyncControl onSync={(mode) => sync.mutate({ name: source.name, mode })} />
                 <button className="btn btn--small" onClick={() => setEditingSource(source)}>
@@ -82,15 +89,42 @@ export function SourcesPage() {
                 <button className="btn btn--small" onClick={() => disable.mutate(source.name)}>
                   disable
                 </button>
-                <button className="btn btn--small btn--danger" onClick={() => remove.mutate(source.name)}>
+                <button
+                  className="btn btn--small btn--danger"
+                  onClick={() => remove.mutate(source.name)}
+                >
                   remove
                 </button>
               </td>
             </tr>
           ))}
+          {sources.data?.length === 0 ? (
+            <tr>
+              <td colSpan={5} className="muted small" style={{ textAlign: "center" }}>
+                No sources yet.
+              </td>
+            </tr>
+          ) : null}
         </tbody>
-      </table>
+        </table>
+      </div>
 
+      <p className="muted small" style={{ marginTop: 14 }}>
+        Need every option (include globs, chunking, branch policy)?{" "}
+        <button className="btn btn--small btn--ghost" onClick={() => setShowWizard(true)}>
+          Open the advanced form
+        </button>
+      </p>
+
+      {quickAdd ? (
+        <QuickAdd
+          onClose={() => setQuickAdd(false)}
+          onAdded={() => {
+            setQuickAdd(false);
+            invalidate();
+          }}
+        />
+      ) : null}
       {showWizard && <AddSourceWizard onClose={() => setShowWizard(false)} />}
       {editingSource && (
         <AddSourceWizard source={editingSource} onClose={() => setEditingSource(null)} />
@@ -99,16 +133,16 @@ export function SourcesPage() {
       {patch && (
         <div className="modal-scrim" onClick={() => setPatch(null)}>
           <div className="modal modal--narrow" onClick={(e) => e.stopPropagation()}>
-            <Explainable id="sources.promote">
-              <header className="modal__header">
-                <h2>YAML patch</h2>
-                <button className="btn btn--ghost" onClick={() => setPatch(null)}>
-                  ✕
-                </button>
-              </header>
-              <p className="muted small">Add this to your syncsage.yaml to make the source durable.</p>
-              <pre className="content-block">{patch}</pre>
-            </Explainable>
+            <header className="modal__header">
+              <h2>YAML patch</h2>
+              <button className="btn btn--ghost btn--icon" onClick={() => setPatch(null)}>
+                ✕
+              </button>
+            </header>
+            <p className="muted small">
+              Add this to your syncsage.yaml to make the source durable across restarts.
+            </p>
+            <pre className="content-block">{patch}</pre>
           </div>
         </div>
       )}
@@ -119,8 +153,13 @@ export function SourcesPage() {
 function SyncControl({ onSync }: { onSync: (mode: string) => void }) {
   const [mode, setMode] = useState("incremental");
   return (
-    <Explainable id="sources.syncMode" as="span" className="sync-control">
-      <select className="text-input text-input--small" value={mode} onChange={(e) => setMode(e.target.value)}>
+    <span className="sync-control">
+      <select
+        className="text-input text-input--small"
+        value={mode}
+        onChange={(e) => setMode(e.target.value)}
+        style={{ width: "auto" }}
+      >
         {SYNC_MODES.map((m) => (
           <option key={m} value={m}>
             {m}
@@ -130,6 +169,6 @@ function SyncControl({ onSync }: { onSync: (mode: string) => void }) {
       <button className="btn btn--small btn--primary" onClick={() => onSync(mode)}>
         sync
       </button>
-    </Explainable>
+    </span>
   );
 }

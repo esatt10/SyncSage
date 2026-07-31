@@ -3,7 +3,6 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { SourceRecord, SourceWritePayload } from "../api/types";
 import { DirectoryBrowser } from "./DirectoryBrowser";
-import { Explainable } from "../explain/Explainable";
 
 const SOURCE_TYPES = [
   "repository",
@@ -324,7 +323,7 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
             </details>
 
             {!editing && (
-              <Explainable id="sources.syncMode" as="span" className="form-grid">
+              <div className="form-grid">
                 <label className="checkbox">
                   <input type="checkbox" checked={syncNow} onChange={(e) => setSyncNow(e.target.checked)} />
                   Sync now
@@ -339,7 +338,7 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
                     ))}
                   </select>
                 </label>
-              </Explainable>
+              </div>
             )}
 
             {(error || mutation.isError) && <p className="error">{error ?? (mutation.error as Error).message}</p>}

@@ -1,10 +1,15 @@
 import type {
+  AssistantStatus,
+  ChatAnswer,
   ConfigResponse,
   ExplainResponse,
   FsListing,
   GraphSlice,
+  McpInfo,
   NeighborsResponse,
   NodeLinkGraph,
+  Overview,
+  QuickAddResponse,
   SearchMode,
   SearchResponse,
   SourceRecord,
@@ -43,7 +48,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
-function qs(params: Record<string, string | number | string[] | undefined>): string {
+function qs(
+  params: Record<string, string | number | boolean | string[] | undefined>,
+): string {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined) continue;
@@ -54,13 +61,26 @@ function qs(params: Record<string, string | number | string[] | undefined>): str
   return text ? `?${text}` : "";
 }
 
+export interface GraphQueryOptions {
+  excludeTypes?: string[];
+  types?: string[];
+  source?: string;
+}
+
 export const api = {
   health: () => request<{ status: string }>("/health"),
+  overview: () => request<Overview>("/overview"),
 
   // Graph
-  graph: () =>
+  graph: (options: GraphQueryOptions = {}) =>
     request<NodeLinkGraph>(
-      `/graph${qs({ limit: GRAPH_NODE_LIMIT, link_limit: GRAPH_LINK_LIMIT })}`,
+      `/graph${qs({
+        limit: GRAPH_NODE_LIMIT,
+        link_limit: GRAPH_LINK_LIMIT,
+        exclude_types: options.excludeTypes?.length ? options.excludeTypes.join(",") : undefined,
+        types: options.types?.length ? options.types.join(",") : undefined,
+        source: options.source,
+      })}`,
     ),
   graphSlice: (nodeId: string, depth = 1, edgeTypes?: string[]) =>
     request<GraphSlice>(
@@ -79,10 +99,17 @@ export const api = {
 
   // Sources
   sources: () => request<SourceRecord[]>("/sources"),
-  registerSource: (body: SourceWritePayload & { name: string; path: string }) => request<{ status: string; source: Record<string, unknown> }>("/sources", {
-    method: "POST",
-    body: JSON.stringify(body),
-  }),
+  /** One-field source creation: a path, URL, glob or connector name. */
+  quickAdd: (body: { target: string; name?: string; split?: boolean; sync_now?: boolean }) =>
+    request<QuickAddResponse>("/sources/quick-add", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  registerSource: (body: SourceWritePayload & { name: string; path: string }) =>
+    request<{ status: string; source: Record<string, unknown> }>("/sources", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   updateSource: (name: string, body: SourceWritePayload) =>
     request<{ status: string; source: Record<string, unknown> }>(
       `/sources/${encodeURIComponent(name)}`,
@@ -117,6 +144,39 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ query, mode, max_results: maxResults }),
     }),
+
+  // Assistant (grounded chat)
+  assistantStatus: (sessionId?: string | null) =>
+    request<AssistantStatus>(`/assistant/status${qs({ session_id: sessionId ?? undefined })}`),
+  /** Hand a key to the server for this session only — it is never persisted. */
+  assistantKey: (body: {
+    provider: string;
+    api_key: string;
+    model?: string;
+    base_url?: string;
+  }) =>
+    request<{ session_id: string; session: { provider: string; expires_at: string } }>(
+      "/assistant/key",
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  assistantRevoke: (sessionId: string) =>
+    request<{ revoked: boolean }>(`/assistant/key${qs({ session_id: sessionId })}`, {
+      method: "DELETE",
+    }),
+  chat: (body: {
+    question: string;
+    session_id?: string | null;
+    mode?: string;
+    max_results?: number;
+    source_name?: string | null;
+  }) =>
+    request<ChatAnswer>("/assistant/chat", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  // MCP
+  mcpInfo: () => request<McpInfo>("/mcp/info"),
 
   // Config
   getConfig: () => request<ConfigResponse>("/config"),

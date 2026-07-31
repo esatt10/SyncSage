@@ -47,6 +47,36 @@ Core components:
 
 ## Quick Start
 
+**One line, any target.** `syncsage up` detects what you point it at — a folder,
+an Obsidian vault, a git repo (local or a URL it clones), a docs site, an S3
+bucket, or a connector — writes a config, indexes it, and serves the API + MCP:
+
+```bash
+syncsage up ~/notes                                   # a folder
+syncsage up https://github.com/you/project            # cloned, then indexed
+syncsage up ~/notes https://docs.example.com/guide    # several at once
+syncsage up '~/clients/*'                             # one source per subfolder
+syncsage up ~/projects --split                        # same, without the glob
+```
+
+An existing `syncsage.yaml` is never overwritten, and re-running re-indexes
+nothing that has not changed.
+
+**One line to host it.** `syncsage host` does the same detection, then writes a
+compose file (mounting each local source read-only at `/sources/<name>`) and
+brings the stack up:
+
+```bash
+syncsage host ~/notes                    # config + compose + docker compose up -d
+syncsage host ~/notes --print-only       # write the compose file, run it yourself
+syncsage host ~/notes --no-ui --port 9000
+```
+
+Open <http://localhost:8080> for the web UI, or <http://localhost:8765> for the
+API and MCP endpoint.
+
+### The longer way
+
 Generate a starter config:
 
 ```bash

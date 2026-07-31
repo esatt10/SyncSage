@@ -4,7 +4,6 @@ import yaml from "js-yaml";
 import { api } from "../api/client";
 import { ObjectEditor } from "../config/ObjectEditor";
 import { lineDiff } from "../util/diff";
-import { Explainable } from "../explain/Explainable";
 
 type Mode = "form" | "yaml";
 
@@ -126,26 +125,26 @@ export function ConfigPage() {
           <button className={mode === "form" ? "tab active" : "tab"} onClick={() => setMode("form")}>
             Form
           </button>
-          <Explainable id="config.rawYaml" as="span">
+          <span>
             <button className={mode === "yaml" ? "tab active" : "tab"} onClick={() => setMode("yaml")}>
               Raw YAML
             </button>
-          </Explainable>
+          </span>
         </div>
         <div className="spacer" />
-        <Explainable id="config.diff" as="span">
+        <span>
           <button className="btn" onClick={() => setShowDiff((v) => !v)}>
             {showDiff ? "Hide diff" : `Preview diff (${changedCount})`}
           </button>
-        </Explainable>
+        </span>
         <button className="btn" onClick={exportYaml}>
           Export adjusted YAML
         </button>
-        <Explainable id="config.apply" as="span">
+        <span>
           <button className="btn btn--primary" onClick={saveToServer} disabled={save.isPending}>
             {save.isPending ? "Saving…" : "Save to SyncSage"}
           </button>
-        </Explainable>
+        </span>
       </div>
 
       {exportError && <p className="error">{exportError}</p>}

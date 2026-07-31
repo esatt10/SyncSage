@@ -358,6 +358,37 @@ class SynapseSettings(ModelMixin):
 
 
 @dataclass
+class AssistantSettings(ModelMixin):
+    """Grounded chat over the knowledge graph (query-time only).
+
+    The assistant is a **retrieval-time** surface: it runs the ordinary
+    hybrid self-search, assembles the hits into a grounded prompt, and asks
+    a chat model to answer with citations. It is never part of the indexing
+    path, so determinism there is untouched — and with no provider
+    configured it falls back to a deterministic extractive answer, which is
+    what the offline test suite exercises.
+
+    ``provider: "auto"`` picks the first provider whose ``api_key_env`` is
+    populated in the server environment (Anthropic, then OpenAI, then
+    Gemini). ``allow_session_keys`` lets a UI user paste a key for the
+    lifetime of a browser session: it is held in process memory only, keyed
+    by an opaque token, and is never written to config, state, or logs.
+    """
+
+    enabled: bool = True
+    provider: str = "auto"  # auto | anthropic | openai | gemini | none
+    model: str | None = None
+    base_url: str | None = None
+    api_key_env: str | None = None
+    allow_session_keys: bool = True
+    session_key_ttl_minutes: int = 720
+    max_context_chunks: int = 8
+    max_output_tokens: int = 4096
+    request_timeout_seconds: float = 90.0
+    max_facts: int = 12
+
+
+@dataclass
 class MemorySettings(ModelMixin):
     """Agent-memory consolidation policy (Step 33.2).
 
@@ -492,6 +523,7 @@ class SyncSageConfig(ModelMixin):
     security: SecuritySettings = field(default_factory=SecuritySettings)
     synapse: SynapseSettings = field(default_factory=SynapseSettings)
     memory: MemorySettings = field(default_factory=MemorySettings)
+    assistant: AssistantSettings = field(default_factory=AssistantSettings)
     sources: list[SourceConfig] = field(default_factory=list)
 
     @classmethod
@@ -554,6 +586,7 @@ class SyncSageConfig(ModelMixin):
             security=build(SecuritySettings, data.get("security")),
             synapse=build(SynapseSettings, data.get("synapse")),
             memory=build(MemorySettings, data.get("memory")),
+            assistant=build(AssistantSettings, data.get("assistant")),
             sources=[],
         )
         cfg.sources = []

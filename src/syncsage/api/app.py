@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from syncsage.assistant.credentials import SessionKeyStore
 from syncsage.config.loader import (
     ConfigError,
     effective_config_dict,
@@ -111,6 +112,34 @@ class PromoteSourceRequest(BaseModel):
 class ConfigWriteRequest(BaseModel):
     config: dict | None = None
     yaml_text: str | None = None
+
+
+class ChatRequest(BaseModel):
+    question: str
+    # Opaque handle for a key the user pasted this session. Never the key.
+    session_id: str | None = None
+    mode: str = "hybrid"
+    max_results: int | None = None
+    source_name: str | None = None
+    principal: str | None = None
+    principal_groups: list[str] = []
+
+
+class AssistantKeyRequest(BaseModel):
+    provider: str
+    api_key: str
+    model: str | None = None
+    base_url: str | None = None
+
+
+class QuickAddRequest(BaseModel):
+    """One-field source creation: paste a path or URL and go."""
+
+    target: str
+    name: str | None = None
+    split: bool = False
+    sync_now: bool = True
+    sync_mode: str = "incremental"
 
 
 def _allowed_roots(config: SyncSageConfig) -> list[Path]:
@@ -310,6 +339,9 @@ def create_app(
     app.state.state = state
     app.state.engine = engine
     app.state.config_path = resolved_config_path
+    # Chat API keys a user pastes in the browser live here and nowhere else:
+    # process memory, TTL'd, gone on restart.
+    app.state.session_keys = SessionKeyStore(config.assistant.session_key_ttl_minutes)
 
     # The web UI is a separate workload that talks to this API over HTTP, so the
     # browser origin differs in development. CORS is intentionally permissive for
@@ -715,8 +747,25 @@ def create_app(
         return {"node_id": node_id, "content": content}
 
     @app.get("/graph")
-    def graph(limit: int | None = None, link_limit: int | None = None) -> dict:
-        return node_link(engine.graph_builder.graph, node_limit=limit, link_limit=link_limit)
+    def graph(
+        limit: int | None = None,
+        link_limit: int | None = None,
+        types: str | None = None,
+        exclude_types: str | None = None,
+        source: str | None = None,
+    ) -> dict:
+        def _set(value: str | None) -> set[str] | None:
+            items = {t.strip() for t in (value or "").split(",") if t.strip()}
+            return items or None
+
+        return node_link(
+            engine.graph_builder.graph,
+            node_limit=limit,
+            link_limit=link_limit,
+            node_types=_set(types),
+            exclude_node_types=_set(exclude_types),
+            source_id=source,
+        )
 
     @app.get("/graph/export/node-link-json")
     def graph_node_link() -> dict:
@@ -863,8 +912,244 @@ def create_app(
             template_profile=req.template_profile if req else None,
         )
 
+    # ------------------------------------------------------------------
+    # Overview — one call that tells the UI whether there is anything to
+    # show yet, and what shape it is. Drives the onboarding empty state.
+    # ------------------------------------------------------------------
+    @app.get("/overview")
+    def overview() -> dict:
+        graph_obj = engine.graph_builder.graph
+        counts: dict[str, int] = {}
+        for node_id in graph_obj.nodes:
+            node_type = str(graph_obj.nodes[node_id].get("type") or "unknown")
+            counts[node_type] = counts.get(node_type, 0) + 1
+        registered = SourceRegistry(config, state).list_sources()
+        artifacts = state.rows("SELECT COUNT(*) AS n FROM artifacts")
+        chunks = state.rows("SELECT COUNT(*) AS n FROM chunks")
+        indexed = int(artifacts[0]["n"]) if artifacts else 0
+        # "Content" excludes the knowledge-base root and its source nodes:
+        # a freshly-created KB has those and nothing else, and showing a
+        # lone star node as if it were a graph is exactly the confusion
+        # this field exists to prevent.
+        structural = counts.get("knowledge_base", 0) + counts.get("source", 0)
+        return {
+            "knowledge_base": config.knowledge_base_id,
+            "name": config.syncsage.name,
+            "description": config.syncsage.description,
+            "version": __version__,
+            "sources": registered,
+            "source_count": len(registered),
+            "indexed_artifacts": indexed,
+            "chunk_count": int(chunks[0]["n"]) if chunks else 0,
+            "node_counts": counts,
+            "total_nodes": graph_obj.number_of_nodes(),
+            "total_links": graph_obj.number_of_edges(),
+            "has_content": graph_obj.number_of_nodes() > structural and indexed > 0,
+            "config_path": str(app.state.config_path),
+        }
+
+    # ------------------------------------------------------------------
+    # Assistant — grounded chat over the index. Never in the sync path.
+    # ------------------------------------------------------------------
+    @app.get("/assistant/status")
+    def assistant_status(session_id: str | None = None) -> dict:
+        from syncsage.assistant.providers import PROVIDERS, resolve_auto_provider
+
+        settings = config.assistant
+        providers = [
+            {
+                "id": spec.id,
+                "label": spec.label,
+                "default_model": spec.default_model,
+                "api_key_env": spec.api_key_env,
+                "key_hint": spec.key_hint,
+                # Whether the *server* already holds a key for this provider.
+                "env_key_present": bool(os.environ.get(spec.api_key_env)),
+            }
+            for spec in PROVIDERS.values()
+        ]
+        from syncsage.assistant.chat import resolve_provider
+
+        credential = app.state.session_keys.get(session_id)
+        configured = settings.provider
+        if configured == "auto":
+            configured = resolve_auto_provider(dict(os.environ))
+        # `ready` must mean "a credential actually resolves", not "a provider
+        # name is configured" — otherwise a config naming a provider whose key
+        # env var is unset reports "model connected" while every answer comes
+        # back extractive. Resolve exactly the way /assistant/chat does.
+        selected = resolve_provider(config, credential, dict(os.environ))
+        return {
+            "enabled": settings.enabled,
+            "providers": providers,
+            "configured_provider": configured,
+            "configured_model": settings.model,
+            "allow_session_keys": settings.allow_session_keys,
+            "session": credential.redacted() if credential else None,
+            # False means answers will be extractive rather than synthesized.
+            "ready": selected is not None,
+            "credential_source": selected.get("source") if selected else None,
+        }
+
+    @app.post("/assistant/key")
+    def assistant_key(req: AssistantKeyRequest) -> dict:
+        """Hold a user-supplied key in memory for this session only.
+
+        The key never leaves this process: not to disk, not to the config,
+        not into any response body. The caller gets an opaque session id.
+        """
+        from syncsage.assistant.providers import PROVIDERS
+
+        if not config.assistant.allow_session_keys:
+            raise HTTPException(
+                status_code=403,
+                detail="Session-supplied API keys are disabled (assistant.allow_session_keys)",
+            )
+        if req.provider not in PROVIDERS:
+            raise HTTPException(status_code=400, detail=f"Unknown provider: {req.provider}")
+        if not req.api_key.strip():
+            raise HTTPException(status_code=400, detail="API key must not be empty")
+        token, credential = app.state.session_keys.put(
+            req.provider,
+            req.api_key.strip(),
+            model=req.model,
+            base_url=req.base_url,
+        )
+        return {"session_id": token, "session": credential.redacted()}
+
+    @app.delete("/assistant/key")
+    def assistant_key_revoke(session_id: str | None = None) -> dict:
+        return {"revoked": app.state.session_keys.revoke(session_id)}
+
+    @app.post("/assistant/chat")
+    def assistant_chat(req: ChatRequest) -> dict:
+        from syncsage.assistant.chat import answer_question
+
+        if not config.assistant.enabled:
+            raise HTTPException(status_code=403, detail="The assistant is disabled")
+        if not req.question.strip():
+            raise HTTPException(status_code=400, detail="question must not be empty")
+        return answer_question(
+            req.question,
+            search=search,
+            knowledge_base=config.knowledge_base_id,
+            config=config,
+            graph=engine.graph_builder.graph,
+            credential=app.state.session_keys.get(req.session_id),
+            env=dict(os.environ),
+            mode=req.mode,
+            max_results=req.max_results,
+            source_name=req.source_name,
+            principal=req.principal,
+            principal_groups=req.principal_groups,
+        )
+
+    # ------------------------------------------------------------------
+    # MCP connection details, so the UI can hand an agent a working config.
+    # ------------------------------------------------------------------
+    @app.get("/mcp/info")
+    def mcp_info() -> dict:
+        from syncsage.mcp_client.agents import agent_mcp_config, render_agent_mcp_json
+
+        transports = dict(config.server.mcp.transports)
+        base = f"http://{config.server.host}:{config.server.port}"
+        clients = {}
+        for client_name in ("claude-code", "cursor"):
+            try:
+                clients[client_name] = render_agent_mcp_json(
+                    agent_mcp_config("local", config_path=str(app.state.config_path))
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("could not render %s mcp config: %s", client_name, exc)
+        return {
+            "enabled": config.server.mcp.enabled,
+            "transports": transports,
+            "streamable_http_url": f"{base}/mcp" if transports.get("streamable_http") else None,
+            "stdio_command": ["syncsage", "mcp", "--transport", "stdio"],
+            "config_path": str(app.state.config_path),
+            "tools": _mcp_tool_summaries(),
+            "client_configs": clients,
+        }
+
+    # ------------------------------------------------------------------
+    # Quick add — the UI counterpart to `syncsage up <anything>`.
+    # ------------------------------------------------------------------
+    @app.post("/sources/quick-add")
+    def quick_add(req: QuickAddRequest) -> dict:
+        from syncsage.targets import TargetError, fetch_target, resolve_targets
+
+        state_dir = Path(config.syncsage.state_path)
+        try:
+            targets = resolve_targets(
+                [req.target],
+                clone_root=state_dir / "sources",
+                workspace=state_dir / "external",
+                split=req.split,
+                name=req.name,
+            )
+            for target in targets:
+                fetch_target(target)
+        except TargetError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        registry = SourceRegistry(config, state)
+        created: list[dict] = []
+        for target in targets:
+            payload = target.to_source_dict()
+            if target.local:
+                try:
+                    payload["path"] = str(_resolve_source_path(payload["path"], config))
+                except PathPolicyError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            try:
+                source = _source_from_payload(payload)
+            except (ValueError, TypeError) as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid source: {exc}") from exc
+            registry.register_source(source)
+            # The engine resolves sources off the live config object, so a
+            # freshly registered source is invisible to sync until it lands
+            # there too (same step the /sources route takes).
+            config.sources = [s for s in config.sources if s.name != source.name]
+            config.sources.append(source)
+            audit(source.name, "quick_add", {"target": req.target, "type": target.type})
+            created.append(payload)
+
+        results = []
+        if req.sync_now:
+            from dataclasses import asdict
+
+            for entry in created:
+                try:
+                    results.append(asdict(engine.sync_source(entry["name"], req.sync_mode)))
+                except Exception as exc:  # surfaced per-source; others still run
+                    results.append(
+                        {"source_id": entry["name"], "status": "error", "error": str(exc)}
+                    )
+        return {"status": "registered", "sources": created, "sync_results": results}
+
     _mount_ui(app, config)
     return app
+
+
+def _mcp_tool_summaries() -> list[dict]:
+    """Name + one-line description for each public MCP tool.
+
+    Read off ``SyncSageTools`` rather than hand-maintained, so a tool added
+    there shows up in the UI without a second edit (rule 8: the tool
+    surface is public API, and this is one of its shop windows).
+    """
+    from syncsage.mcp_server.tools import SyncSageTools
+
+    summaries = []
+    for name in sorted(dir(SyncSageTools)):
+        if name.startswith("_"):
+            continue
+        member = getattr(SyncSageTools, name, None)
+        if not callable(member):
+            continue
+        doc = (member.__doc__ or "").strip().splitlines()
+        summaries.append({"name": name, "description": doc[0] if doc else ""})
+    return summaries
 
 
 def _mount_ui(app: FastAPI, config: SyncSageConfig) -> None:

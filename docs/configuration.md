@@ -37,6 +37,7 @@ syncsage config show --effective --profile dev --config syncsage.yaml
 | `sync` | Watcher, git polling, schedule, idempotency, and concurrency behavior. | Yes |
 | `obsidian` | Export controls for notes/canvas/frontmatter/backlinks/tags. | Optional |
 | `security` | Path allowlisting and source-read protections. | Strongly recommended |
+| `assistant` | Grounded chat over the index (the UI's chat layer). Query-time only. | Optional |
 | `sources` | All indexed repositories/folders/files/URLs. | Yes |
 
 ---
@@ -230,6 +231,40 @@ syncsage config show --effective --profile dev --config syncsage.yaml
 | `read_only_sources` | bool | `true` | Prevent source mutation operations. |
 | `deny_path_traversal` | bool | `true` | Block `..` traversal and unsafe resolution. |
 | `default_exclude_secrets` | bool | `true` | Apply secret-oriented default excludes. |
+
+---
+
+## `assistant` (grounded chat)
+
+Powers the UI's chat panel and `POST /assistant/chat`: retrieve from your own
+index, cite the passages, surface graph facts, then ask a chat model to write
+the answer from those passages alone.
+
+**This is a query-time surface only.** No LLM ever runs during indexing, so
+enabling it does not affect determinism — re-syncing unchanged content still
+produces byte-identical state. With no provider reachable the assistant still
+answers *extractively* (top passages + citations + facts), which is the
+default and works fully offline.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `true` | `false` makes `/assistant/chat` return 403. |
+| `provider` | str | `auto` | `auto` \| `anthropic` \| `openai` \| `gemini` \| `none`. `auto` picks the first provider whose key env var is set, in the order Anthropic → OpenAI → Gemini. |
+| `model` | str \| null | `null` | Provider default when unset (`claude-sonnet-5`, `gpt-4o-mini`, `gemini-2.5-flash`). |
+| `base_url` | str \| null | `null` | Point at a gateway or self-hosted OpenAI-spec endpoint. |
+| `api_key_env` | str \| null | `null` | Read the key from a differently-named variable. Defaults to the provider's own (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`). |
+| `allow_session_keys` | bool | `true` | Let a UI user paste a key for their browser session. Held in server memory behind an opaque token — never written to config, `/state`, or logs; dropped on expiry, revoke, or restart. Set `false` to require the env var. |
+| `session_key_ttl_minutes` | int | `720` | Lifetime of a session-supplied key. |
+| `max_context_chunks` | int | `8` | Passages retrieved and offered to the model. |
+| `max_output_tokens` | int | `4096` | Per-answer output cap sent to the provider. |
+| `request_timeout_seconds` | float | `90.0` | Provider HTTP timeout. A timeout degrades to the extractive answer rather than erroring. |
+| `max_facts` | int | `12` | Graph facts surfaced per answer, collected round-robin across the cited sources. |
+
+**The key never lands in config.** Both routes are indirections: an
+environment variable *name* here, or a runtime token in the browser. Nothing
+in this file is a secret.
+
+See the how-to guide: [Ask your knowledge base](how-to/chat-and-ui.md).
 
 ---
 

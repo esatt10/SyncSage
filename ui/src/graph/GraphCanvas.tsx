@@ -9,6 +9,8 @@ interface GraphCanvasProps {
   links: GraphLink[];
   selectedId: string | null;
   focusIds: string[];
+  /** Nodes cited by the current answer — outlined so prose maps to graph. */
+  citedIds?: string[];
   layoutName: string;
   spacing: number;
   shapeAlgorithm: ShapeAlgorithm;
@@ -22,6 +24,7 @@ export function GraphCanvas({
   links,
   selectedId,
   focusIds,
+  citedIds = [],
   layoutName,
   spacing,
   shapeAlgorithm,
@@ -31,13 +34,17 @@ export function GraphCanvas({
   const onSelectRef = useRef(onSelect);
   const listenerBoundRef = useRef(false);
   const selectedRef = useRef<string | null>(null);
-  const elements = useMemo(() => toElements(nodes, links, shapeAlgorithm), [nodes, links, shapeAlgorithm]);
+  const elements = useMemo(
+    () => toElements(nodes, links, shapeAlgorithm),
+    [nodes, links, shapeAlgorithm],
+  );
   const stylesheet = useMemo(() => buildStylesheet(), []);
   const layout = useMemo(
     () => layoutOptions(layoutName, spacing, elements.length),
     [layoutName, spacing, elements.length],
   );
   const [layouting, setLayouting] = useState(false);
+  const citedKey = citedIds.join("|");
 
   useEffect(() => {
     onSelectRef.current = onSelect;
@@ -58,7 +65,7 @@ export function GraphCanvas({
       };
       cy.one("layoutstop", finish);
       nextLayout.run();
-      window.setTimeout(finish, 1200);
+      window.setTimeout(finish, 1400);
     }, 40);
     return () => window.clearTimeout(handle);
   }, [elements.length, layout]);
@@ -75,31 +82,48 @@ export function GraphCanvas({
         focusIds.forEach((id) => focus.merge(cy.getElementById(id)));
         const neighborhood = focus.closedNeighborhood();
         cy.elements().difference(neighborhood).addClass("faded");
-        focus.addClass("focus");
+        neighborhood.addClass("focus");
       }
     });
   }, [focusIds, elements.length]);
+
+  // Outline the nodes the current answer cited.
+  useEffect(() => {
+    const cy = cyRef.current;
+    if (!cy) return;
+    cy.batch(() => {
+      cy.nodes(".cited").removeClass("cited");
+      citedIds.forEach((id) => cy.getElementById(id).addClass("cited"));
+    });
+  }, [citedKey, elements.length, citedIds]);
 
   useEffect(() => {
     const cy = cyRef.current;
     if (!cy) return;
     const previous = selectedRef.current;
     if (previous) cy.getElementById(previous).removeClass("selected");
-    if (selectedId) cy.getElementById(selectedId).addClass("selected");
+    if (selectedId) {
+      const node = cy.getElementById(selectedId);
+      node.addClass("selected");
+      // Bring a node selected from elsewhere (a citation chip, a fact, the
+      // source rail) into view rather than silently highlighting off-screen.
+      if (node.nonempty()) {
+        cy.animate({ center: { eles: node }, duration: 220, easing: "ease-out" });
+      }
+    }
     selectedRef.current = selectedId;
   }, [selectedId, elements.length]);
 
   return (
     <div className="graph-canvas-shell">
-      {layouting ? <div className="graph-busy">Arranging graph...</div> : null}
+      {layouting ? <div className="graph-busy">Arranging graph…</div> : null}
       <CytoscapeComponent
         elements={elements as never}
         stylesheet={stylesheet}
         layout={layout as never}
         style={{ width: "100%", height: "100%" }}
-        minZoom={0.1}
+        minZoom={0.08}
         maxZoom={3}
-        wheelSensitivity={0.2}
         cy={(cy: Core) => {
           cyRef.current = cy;
           if (listenerBoundRef.current) return;
@@ -111,27 +135,44 @@ export function GraphCanvas({
   );
 }
 
-function layoutOptions(layoutName: string, spacing: number, elementCount: number): Record<string, unknown> {
-  const name = layoutName === "auto"
-    ? elementCount > FORCE_LAYOUT_ELEMENT_LIMIT
-      ? "grid"
-      : "cose"
-    : layoutName;
-  const padding = Math.round(30 * spacing);
+function layoutOptions(
+  layoutName: string,
+  spacing: number,
+  elementCount: number,
+): Record<string, unknown> {
+  const name =
+    layoutName === "auto"
+      ? elementCount > FORCE_LAYOUT_ELEMENT_LIMIT
+        ? "concentric"
+        : "cose"
+      : layoutName;
+  const padding = Math.round(40 * spacing);
   if (name === "cose") {
     return {
       name,
       animate: false,
-      nodeRepulsion: Math.round(9000 * spacing),
-      idealEdgeLength: Math.round(90 * spacing),
+      // Roomier than the old defaults: the previous values packed labelled
+      // nodes close enough that the text overlapped and read as noise.
+      nodeRepulsion: Math.round(20000 * spacing),
+      idealEdgeLength: Math.round(130 * spacing),
+      nodeOverlap: Math.round(24 * spacing),
+      gravity: 0.35,
+      numIter: 1200,
       padding,
     };
   }
   if (name === "concentric") {
-    return { name, animate: false, minNodeSpacing: Math.round(30 * spacing), padding };
+    return {
+      name,
+      animate: false,
+      minNodeSpacing: Math.round(44 * spacing),
+      padding,
+      concentric: (node: { degree: () => number }) => node.degree(),
+      levelWidth: () => 2,
+    };
   }
   if (name === "breadthfirst") {
-    return { name, animate: false, spacingFactor: spacing, padding, directed: true };
+    return { name, animate: false, spacingFactor: spacing * 1.4, padding, directed: true };
   }
-  return { name, animate: false, spacingFactor: spacing, padding };
+  return { name, animate: false, spacingFactor: spacing * 1.3, padding };
 }

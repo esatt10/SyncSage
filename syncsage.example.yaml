@@ -154,6 +154,32 @@ security:
 # event (with the inline contract) is POSTed to <router_url>/v1/synapse/events;
 # webhook failures are logged, never raised.
 
+# Grounded chat over your index (the UI's chat layer). Query-time only — no
+# LLM ever runs during indexing, so re-syncing unchanged content stays
+# byte-for-byte deterministic.
+#
+# With no provider reachable the assistant still answers, extractively: the
+# top retrieved passages with their citations and graph facts. Point it at a
+# model to get those passages synthesized into prose.
+assistant:
+  enabled: true
+  # auto | anthropic | openai | gemini | none
+  # "auto" picks the first provider whose key env var is set on the container
+  # (ANTHROPIC_API_KEY, then OPENAI_API_KEY, then GEMINI_API_KEY).
+  provider: auto
+  # model: claude-sonnet-5      # provider default when unset
+  # base_url: https://api.anthropic.com
+  # api_key_env: ANTHROPIC_API_KEY   # env var NAME; the key never lands in config
+  # Let a UI user paste their own key for the life of a browser session. It is
+  # held in the server's memory behind an opaque token — never written to this
+  # file, to /state, or to logs — and dropped on expiry, revoke or restart.
+  allow_session_keys: true
+  session_key_ttl_minutes: 720
+  max_context_chunks: 8
+  max_output_tokens: 4096
+  request_timeout_seconds: 90.0
+  max_facts: 12
+
 sources:
   - name: syncsage-repo
     type: repository

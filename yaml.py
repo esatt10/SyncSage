@@ -75,6 +75,31 @@ def safe_load_all(stream: str):
     yield safe_load(stream)
 
 
+def _needs_quotes(text: str) -> bool:
+    """True when a bare scalar would not round-trip through this parser.
+
+    A list item containing ``:`` is read back as a mapping (see parse_block),
+    and a leading indicator character changes the node type — so URLs,
+    ``host:port`` pairs and ``*`` glob patterns all have to be quoted. PyYAML
+    accepts the quoted form identically, so the emitted document means the
+    same thing under either parser.
+    """
+    if text == "":
+        return True
+    return ":" in text or text[0] in "*&!%@`[{|>-?#,'\"" or text != text.strip()
+
+
+def _emit_scalar(value: Any) -> str:
+    if value is True: return "true"
+    if value is False: return "false"
+    if value is None: return "null"
+    if isinstance(value, (int, float)): return str(value)
+    text = str(value)
+    if _needs_quotes(text):
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return text
+
+
 def safe_dump(data: Any, sort_keys: bool = False, **_: Any) -> str:
     def emit(obj, indent=0):
         sp = " " * indent
@@ -84,14 +109,14 @@ def safe_dump(data: Any, sort_keys: bool = False, **_: Any) -> str:
             for k,v in items:
                 if isinstance(v, (dict, list)):
                     out.append(f"{sp}{k}:"); out.append(emit(v, indent+2))
-                else: out.append(f"{sp}{k}: {v}")
+                else: out.append(f"{sp}{k}: {_emit_scalar(v)}")
             return "\n".join(out)
         if isinstance(obj, list):
             out=[]
             for v in obj:
                 if isinstance(v, (dict, list)):
                     out.append(f"{sp}-"); out.append(emit(v, indent+2))
-                else: out.append(f"{sp}- {v}")
+                else: out.append(f"{sp}- {_emit_scalar(v)}")
             return "\n".join(out)
-        return f"{sp}{obj}"
+        return f"{sp}{_emit_scalar(obj)}"
     return emit(data) + "\n"

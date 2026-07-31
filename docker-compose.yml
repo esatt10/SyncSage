@@ -11,7 +11,11 @@ services:
       SYNCSAGE_CONFIG: /config/syncsage.yaml
     volumes:
       - ${SYNCSAGE_CONFIG_PATH:-./syncsage.example.yaml}:/config/syncsage.yaml:ro
-      - ${SYNCSAGE_WORKSPACE_PATH:-./workspace}:/workspace:ro
+      # The example config's only source is `path: /workspace`, so whatever is
+      # mounted here IS the demo corpus. It defaults to the repository root —
+      # mounting an empty ./workspace instead indexes nothing, and the UI then
+      # shows a single knowledge-base node with no graph around it.
+      - ${SYNCSAGE_WORKSPACE_PATH:-.}:/workspace:ro
       # Local files that live OUTSIDE ./workspace: point SYNCSAGE_DATA_PATH at
       # any host directory and it appears in the container at /data (an allowed
       # source root). This is how you index files that aren't a subdirectory of
