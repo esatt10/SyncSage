@@ -140,6 +140,15 @@ def replacements(version: str) -> list[Replacement]:
             replacement=image,
             label="Docker Compose default image",
         ),
+        # The UI sidecar is published from the same commit under the same
+        # version tag, so it moves with the backend rather than drifting on a
+        # hand-edited tag of its own.
+        Replacement(
+            path=Path("docker-compose.yml"),
+            pattern=re.compile(r"ghcr\.io/esatt10/syncsage-ui:[0-9A-Za-z._+-]+"),
+            replacement=f"ghcr.io/esatt10/syncsage-ui:{version}",
+            label="Docker Compose UI image",
+        ),
         Replacement(
             path=Path("syncsage.example.yaml"),
             pattern=re.compile(

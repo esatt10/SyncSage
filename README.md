@@ -73,7 +73,8 @@ syncsage host ~/notes --no-ui --port 9000
 ```
 
 Open <http://localhost:8080> for the web UI, or <http://localhost:8765> for the
-API and MCP endpoint.
+API and MCP endpoint. Trouble getting the UI up, or seeing a stale one? →
+**[Run the web UI](docs/how-to/run-the-ui.md)**.
 
 ### The longer way
 
@@ -101,11 +102,13 @@ Run locally:
 syncsage start --profile quickstart --config syncsage.yaml
 ```
 
-Or run through Docker Compose:
+Or run through Docker Compose (`--build` keeps the UI sidecar current; set
+`deployment.compose.workspace_path` in your config, or the generated env file
+mounts an empty `./workspace` and nothing gets indexed):
 
 ```bash
 syncsage compose-env syncsage.yaml --output .syncsage/compose.env
-docker compose --env-file .syncsage/compose.env up -d
+docker compose --env-file .syncsage/compose.env up -d --build
 ```
 
 Health checks:
@@ -315,11 +318,31 @@ panel, and a configuration editor (form + raw YAML + diff preview). What a
 given deployment can offer is read from the server rather than baked into the
 bundle. Routes are defined in `src/syncsage/api/app.py`.
 
+### Running it
+
+There are three supported ways to get the UI in front of you. Full
+instructions, including how to be sure you are looking at the *current* bundle:
+**[Run the web UI](docs/how-to/run-the-ui.md)**.
+
 ```bash
-cd ui && npm install && npm run dev   # dev server on http://localhost:5173
+# 1. Containers, one line — API on :8765, UI on :8080
+syncsage host ~/notes
+
+# 2. This repo's reference stack — always pass --build, or Compose reuses
+#    the UI image it built the first time and your changes never appear
+docker compose up -d --build            # UI on :8080, API on :8765
+
+# 3. No Docker: build the bundle once and SyncSage serves it on its own port
+cd ui && npm ci && npm run build && cd ..
+syncsage start --config syncsage.yaml   # UI + API on :8765
+
+# 4. Developing the UI itself: hot reload against a running SyncSage
+cd ui && npm install && npm run dev     # dev server on http://localhost:5173
 ```
 
-See [ui/README.md](ui/README.md) for build and deployment options.
+The UI and SyncSage images are published from the same commit under the same
+version tag, so upgrading one upgrades the other. See
+[ui/README.md](ui/README.md) for build variables and design notes.
 
 ## Deployment
 
@@ -371,7 +394,7 @@ It is published to GitHub Pages by `.github/workflows/docs.yml` on pushes to `ma
 
 - [Documentation home](docs/index.md)
 - Tutorials: [10-minute quickstart](docs/tutorials/quickstart.md) · [Multi-modal ingest](docs/tutorials/multimodal.md)
-- How-to: [Ask your knowledge base](docs/how-to/chat-and-ui.md) · [Customize the answering workflow](docs/how-to/agent-workflows.md) · [Configure sources](docs/how-to/sources.md) · [Vector self-search](docs/how-to/vector-search.md) · [Attach to a Synapse fleet](docs/how-to/attach-to-synapse.md) · [Backup & restore](docs/how-to/backup-restore.md)
+- How-to: [Run the web UI](docs/how-to/run-the-ui.md) · [Ask your knowledge base](docs/how-to/chat-and-ui.md) · [Customize the answering workflow](docs/how-to/agent-workflows.md) · [Configure sources](docs/how-to/sources.md) · [Vector self-search](docs/how-to/vector-search.md) · [Attach to a Synapse fleet](docs/how-to/attach-to-synapse.md) · [Backup & restore](docs/how-to/backup-restore.md)
 
 **Reference & explanation**
 

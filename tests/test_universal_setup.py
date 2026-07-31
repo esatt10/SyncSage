@@ -309,6 +309,46 @@ def test_host_generates_compose_and_container_config_without_docker(
     assert "/sources/notes" in container_config["security"]["allow_workspace_roots"]
 
 
+def test_host_pins_the_ui_image_and_builds_it_from_a_checkout(tmp_path: Path) -> None:
+    """The UI sidecar must resolve to a real image, and to the current one.
+
+    `latest` is never re-pulled once Docker has it locally, which is how an
+    upgraded stack keeps serving a months-old bundle; and a source checkout can
+    be ahead of any published tag, so it gets a build context too.
+    """
+    from syncsage.deployment.host import DEFAULT_UI_IMAGE, local_ui_context
+    from syncsage.version import __version__
+
+    assert DEFAULT_UI_IMAGE == f"ghcr.io/esatt10/syncsage-ui:{__version__}"
+
+    target = ResolvedTarget(
+        name="notes", type="markdown_folder", path=str(tmp_path / "notes"), description="d"
+    )
+    kwargs = {
+        "config_path": tmp_path / "c.yaml",
+        "state_dir": tmp_path / ".syncsage",
+        "port": 8765,
+        "ui_port": 8080,
+    }
+
+    ui = yaml.safe_load(render_compose([target], **kwargs))["services"]["syncsage-ui"]
+    assert ui["image"] == DEFAULT_UI_IMAGE
+    assert "build" not in ui, "no build stanza without a checkout to build from"
+
+    built = yaml.safe_load(render_compose([target], ui_build_context="/repo/ui", **kwargs))
+    assert built["services"]["syncsage-ui"]["build"] == {"context": "/repo/ui"}
+
+    # An explicit --ui-image is a deliberate choice of a published bundle.
+    pinned = yaml.safe_load(
+        render_compose([target], ui_image="my/ui:1.0", ui_build_context="/repo/ui", **kwargs)
+    )
+    assert pinned["services"]["syncsage-ui"]["image"] == "my/ui:1.0"
+    assert "build" not in pinned["services"]["syncsage-ui"]
+
+    # This repo IS a checkout, so the fallback resolves to its ui/ directory.
+    assert local_ui_context() == str(Path(__file__).resolve().parents[1] / "ui")
+
+
 def test_host_can_omit_the_ui_sidecar(tmp_path: Path) -> None:
     target = ResolvedTarget(
         name="notes", type="markdown_folder", path=str(tmp_path / "notes"), description="d"

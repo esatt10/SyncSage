@@ -1727,6 +1727,10 @@ def _mount_ui(app: FastAPI, config: SyncSageConfig) -> None:
     This is additive and off unless a built bundle exists; the indexing
     container image does not build the UI, so by default nothing is mounted.
     """
+    # Recorded either way so callers (the CLI's startup banner) can tell the
+    # user whether the UI is actually being served, instead of leaving them to
+    # guess why the port shows JSON.
+    app.state.ui_dist = None
     if not config.server.ui.enabled:
         return
     dist = os.environ.get("SYNCSAGE_UI_DIST")
@@ -1738,4 +1742,5 @@ def _mount_ui(app: FastAPI, config: SyncSageConfig) -> None:
     from fastapi.staticfiles import StaticFiles
 
     app.mount("/", StaticFiles(directory=str(target), html=True), name="ui")
+    app.state.ui_dist = str(target)
     logger.info("Serving SyncSage UI bundle from %s", target)

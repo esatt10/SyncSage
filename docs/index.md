@@ -49,6 +49,7 @@ as a federated **"brain region"** inside a **Synapse** fleet.
 | You want to… | Go here |
 |---|---|
 | Stand up a knowledge base in 10 minutes | [Quickstart tutorial](tutorials/quickstart.md) |
+| See it in the browser (Docker Compose or CLI) | [Run the web UI](how-to/run-the-ui.md) |
 | Index images and audio (offline) | [Multi-modal tutorial](tutorials/multimodal.md) |
 | Configure source types and sync modes | [Configure sources](how-to/sources.md) |
 | Turn on semantic / vector search | [Vector self-search](how-to/vector-search.md) |
