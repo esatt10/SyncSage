@@ -207,6 +207,63 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  /**
+   * The same answer, with each workflow step delivered as it completes.
+   *
+   * The agent loop can run for a while over a large index, so `onStep` fires
+   * per stage (plan, retrieve, grade, …) and the promise resolves with the
+   * finished answer. Falls back to nothing special on the client side: if the
+   * stream breaks, the error propagates like any other failed request.
+   */
+  chatStream: async (
+    body: {
+      question: string;
+      session_id?: string | null;
+      mode?: string;
+      max_results?: number;
+      source_name?: string | null;
+      workflow?: string | null;
+      options?: Record<string, unknown>;
+    },
+    onStep: (step: { name: string; detail: string; passages: number }) => void,
+    signal?: AbortSignal,
+  ): Promise<ChatAnswer> => {
+    const response = await fetch(`${API_BASE}/assistant/chat/stream`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!response.ok || !response.body) {
+      throw new Error(`${response.status} ${response.statusText}`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let answer: ChatAnswer | null = null;
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // SSE frames are separated by a blank line; a frame may arrive split
+      // across chunks, so only complete ones are consumed.
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop() ?? "";
+      for (const frame of frames) {
+        const line = frame.split("\n").find((l) => l.startsWith("data:"));
+        if (!line) continue;
+        const event = JSON.parse(line.slice(5).trim());
+        if (event.type === "step") onStep(event);
+        else if (event.type === "answer") answer = event.answer as ChatAnswer;
+        else if (event.type === "error") throw new Error(event.error);
+      }
+    }
+    if (!answer) throw new Error("the answer stream closed before an answer arrived");
+    return answer;
+  },
+
   // Semantic search (embeddings)
   embeddings: () => request<EmbeddingsStatus>("/search/embeddings"),
   updateEmbeddings: (body: {

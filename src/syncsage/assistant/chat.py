@@ -370,6 +370,7 @@ def answer_question(
     principal_groups: list[str] | None = None,
     workflow: str | None = None,
     options: dict | None = None,
+    on_step: Any = None,
 ) -> dict:
     """Answer ``question`` from the knowledge base, with citations and facts.
 
@@ -419,6 +420,9 @@ def answer_question(
         principal=principal,
         principal_groups=principal_groups or [],
         options=merged_options,
+        # Live progress for callers that want it (the streaming chat route).
+        # None keeps the workflow byte-identical to before.
+        on_step=on_step,
     )
 
     try:

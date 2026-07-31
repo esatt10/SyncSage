@@ -16,6 +16,7 @@ Acceptance:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -341,3 +342,44 @@ def test_status_ready_requires_a_resolvable_credential_not_just_a_provider_name(
     ready = client.get("/assistant/status").json()
     assert ready["ready"] is True
     assert ready["credential_source"] == "environment"
+
+
+def test_chat_stream_reports_steps_before_the_answer(loaded_config) -> None:
+    """Progress must arrive as work happens, not bundled with the answer.
+
+    Without a model configured the workflow is extractive, which still walks
+    retrieve → synthesize — enough to assert the stream's shape: one or more
+    `step` frames, then exactly one `answer`, then close.
+    """
+
+    from fastapi.testclient import TestClient
+
+    from syncsage.api.app import create_app
+
+    app = create_app(config=loaded_config)
+    app.state.engine.sync_source("architecture-notes", "full")
+    client = TestClient(app)
+
+    with client.stream(
+        "POST", "/assistant/chat/stream", json={"question": "what is the sync engine?"}
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = []
+        for line in response.iter_lines():
+            if line.startswith("data:"):
+                events.append(json.loads(line[5:].strip()))
+
+    kinds = [event["type"] for event in events]
+    assert kinds.count("answer") == 1, kinds
+    assert kinds[-1] == "answer", "the answer must be the last frame"
+    assert "step" in kinds, "no progress was reported"
+    # Every step frame names a stage and carries a human-readable detail.
+    for event in events:
+        if event["type"] == "step":
+            assert event["name"]
+            assert isinstance(event["detail"], str)
+
+    answer = next(event["answer"] for event in events if event["type"] == "answer")
+    assert answer["question"] == "what is the sync engine?"
+    assert "citations" in answer

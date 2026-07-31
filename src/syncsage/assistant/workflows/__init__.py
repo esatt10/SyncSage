@@ -29,6 +29,7 @@ reach the index arrives as a :class:`~syncsage.assistant.retrieval.SyncSageRetri
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib.metadata import entry_points
 from typing import Any, Protocol, runtime_checkable
@@ -49,6 +50,21 @@ class WorkflowRequest:
     principal: str | None = None
     principal_groups: list[str] = field(default_factory=list)
     options: dict[str, Any] = field(default_factory=dict)
+    #: Called with each :class:`WorkflowStep` the moment it completes, so a
+    #: caller can show progress instead of a spinner. Optional and best-effort:
+    #: a workflow that ignores it still works, and an exception raised by the
+    #: callback must never fail the answer.
+    on_step: Callable[[WorkflowStep], None] | None = None
+
+    def report(self, step: WorkflowStep) -> None:
+        """Publish one completed step. Never raises."""
+
+        if self.on_step is None:
+            return
+        try:
+            self.on_step(step)
+        except Exception:  # pragma: no cover - progress is never load-bearing
+            logger.debug("progress callback failed", exc_info=True)
 
 
 @dataclass

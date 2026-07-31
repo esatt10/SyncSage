@@ -17,6 +17,17 @@ interface ChatPanelProps {
   onConnectModel: () => void;
 }
 
+/** Workflow step names, said the way a person would say them. */
+const STEP_LABELS: Record<string, string> = {
+  plan: "Planning the search…",
+  retrieve: "Searching your sources…",
+  expand: "Following links in the graph…",
+  grade: "Checking the evidence…",
+  replan: "Evidence was thin — searching again…",
+  synthesize: "Writing the answer…",
+  verify: "Verifying citations…",
+};
+
 const SUGGESTIONS = [
   "What is this knowledge base about?",
   "Summarize the main themes across my sources.",
@@ -37,18 +48,31 @@ export function ChatPanel({
   const { turns, draft, sourceFilter, workflow } = state;
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Live workflow steps for the in-flight question. Local, not session state:
+  // they describe one request and are meaningless once it resolves.
+  const [progress, setProgress] = useState<{ name: string; detail: string }[]>([]);
 
   const ask = useMutation({
-    mutationFn: (question: string) =>
-      api.chat({
-        question,
-        session_id: sessionId,
-        source_name: sourceFilter,
-        workflow,
-      }),
-    onSuccess: (answer, question) => dispatch({ type: "answered", question, answer }),
-    onError: (error: Error, question) =>
-      dispatch({ type: "ask-failed", question, error: error.message }),
+    mutationFn: (question: string) => {
+      setProgress([]);
+      return api.chatStream(
+        {
+          question,
+          session_id: sessionId,
+          source_name: sourceFilter,
+          workflow,
+        },
+        (step) => setProgress((prev) => [...prev, { name: step.name, detail: step.detail }]),
+      );
+    },
+    onSuccess: (answer, question) => {
+      setProgress([]);
+      dispatch({ type: "answered", question, answer });
+    },
+    onError: (error: Error, question) => {
+      setProgress([]);
+      dispatch({ type: "ask-failed", question, error: error.message });
+    },
   });
 
   // Keep the newest turn in view as answers stream in.
@@ -117,10 +141,28 @@ export function ChatPanel({
               <div className="msg">
                 <span className="thinking">
                   <span className="spinner" />{" "}
-                  {workflow === "simple"
-                    ? "Searching your sources…"
-                    : "Planning, searching and checking the evidence…"}
+                  {progress.length > 0
+                    ? STEP_LABELS[progress[progress.length - 1].name] ??
+                      progress[progress.length - 1].name
+                    : workflow === "simple"
+                      ? "Searching your sources…"
+                      : "Planning the search…"}
                 </span>
+                {progress.length > 0 ? (
+                  <ol className="progress">
+                    {progress.map((step, index) => (
+                      <li
+                        key={`${step.name}-${index}`}
+                        className={index === progress.length - 1 ? "progress__now" : undefined}
+                      >
+                        <span className="progress__name">
+                          {STEP_LABELS[step.name] ?? step.name}
+                        </span>
+                        <span className="progress__detail">{step.detail}</span>
+                      </li>
+                    ))}
+                  </ol>
+                ) : null}
               </div>
             )}
           </div>

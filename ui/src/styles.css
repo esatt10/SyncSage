@@ -1077,6 +1077,43 @@ select.text-input {
   font-size: 13px;
 }
 
+/* Live workflow trace while an answer is being built. Completed steps stay
+   visible and recede; the current one stays legible — the point is to show
+   that work is happening and what kind, not to be read closely. */
+.progress {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0 0 0 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.progress li {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  opacity: 0.55;
+}
+
+.progress__now {
+  opacity: 1;
+  color: var(--text-soft);
+}
+
+.progress__name {
+  font-weight: 600;
+  flex: none;
+}
+
+.progress__detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .chat-empty {
   margin: auto;
   max-width: 480px;

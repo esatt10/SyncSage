@@ -40,6 +40,7 @@ from syncsage.sync.fingerprint import (
     source_fingerprint,
 )
 from syncsage.sync.locks import EngineLease, source_lock
+from syncsage.sync.pacing import serve_yield
 
 logger = logging.getLogger(__name__)
 
@@ -534,6 +535,9 @@ class SyncEngine:
                 }
                 indexed += 1
                 changed_ids.add(parsed.id)
+                # Let anything waiting on the API get a turn before the next
+                # file. Without this a long index makes the UI unusable.
+                serve_yield()
                 # Checkpoint mid-run. Without this the graph and the manifest
                 # only reach /state when a sync *finishes*, so stopping the
                 # container an hour into a first index threw that hour away:

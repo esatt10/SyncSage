@@ -50,6 +50,9 @@ class SimpleWorkflow:
                 passages=len(citations),
             )
         ]
+        # Progress is reported by every workflow, not just the agentic one:
+        # a caller streaming the answer should not have to know which one ran.
+        request.report(steps[-1])
 
         answer_mode = "extractive"
         error: str | None = None
@@ -60,6 +63,7 @@ class SimpleWorkflow:
                 )
                 answer_mode = "llm"
                 steps.append(WorkflowStep(name="answer", detail=f"synthesized with {llm.model_id}"))
+                request.report(steps[-1])
             except ProviderError as exc:
                 error = str(exc)
                 answer = extractive_answer(request.question, citations, reason=short_reason(error))

@@ -71,7 +71,17 @@ DEFAULTS: dict[str, Any] = {
     "max_rounds": 2,
     # Search modes to fan out over. "vector" is dropped automatically when no
     # vector index is built, so leaving it on is safe.
-    "retrieval_modes": ["hybrid", "vector"],
+    #
+    # Deliberately NOT "hybrid" here. Hybrid = text + vector + a linear scan of
+    # every graph node, and this loop issues one search per query per mode
+    # across up to `max_rounds` rounds — on a 500k-node graph that scan
+    # dominated everything else the agent did (measured: 10.3s per hybrid
+    # search vs 0.03s text, 1.6s vector, 0.6s for a model call). The graph is
+    # not lost by leaving it out: `expand_graph` below walks the graph out of
+    # the best hits, which is the structural signal this loop actually wants.
+    # Set `retrieval_modes: ["hybrid"]` per request to trade the latency back
+    # for graph-scored candidates.
+    "retrieval_modes": ["text", "vector"],
     # Walk the knowledge graph out of the best hits for related material.
     "expand_graph": True,
     "expand_depth": 1,
@@ -467,7 +477,19 @@ def build_graph(options: dict[str, Any], nodes: dict[str, Any] | None = None):
 
 def _bind(fn):
     def node(state, config):
-        return fn(state, config["configurable"]["ctx"])
+        ctx = config["configurable"]["ctx"]
+        before = len(state.get("steps") or [])
+        result = fn(state, ctx)
+        # Publish whatever this node appended, the moment it appended it. The
+        # loop can take a minute over a large index, and "planning… retrieving
+        # 35 passages… grading" is the difference between waiting and
+        # wondering whether it hung. Nodes return the whole steps list, so
+        # anything past the incoming length is new.
+        request = ctx.get("request")
+        if request is not None and isinstance(result, dict):
+            for step in (result.get("steps") or [])[before:]:
+                request.report(step)
+        return result
 
     node.__name__ = getattr(fn, "__name__", "node")
     return node

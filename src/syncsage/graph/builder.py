@@ -10,6 +10,7 @@ from syncsage.graph.enrichment import (
 )
 from syncsage.graph.simple import SimpleMultiDiGraph
 from syncsage.ingestion.pipeline import ParsedArtifact, utc_now
+from syncsage.sync.pacing import serve_yield
 
 
 class GraphBuilder:
@@ -198,8 +199,12 @@ class GraphBuilder:
                 if source_name and attrs.get("source_id") != source_name:
                     continue
                 artifacts.append((node_id, dict(attrs)))
-        for edge in self.similarity_pass.run(artifacts, changed_ids=changed_ids):
+        for index, edge in enumerate(self.similarity_pass.run(artifacts, changed_ids=changed_ids)):
             self.upsert_edge(edge.source, edge.target, edge.type, edge.attrs)
+            # Enrichment is one long CPU-bound stretch; without a yield it
+            # blocks every request thread for its whole duration.
+            if index % 500 == 499:
+                serve_yield()
 
     def add_cross_source_edges(self) -> int:
         """Resolve references whose targets resolve into a *different* source.
@@ -229,8 +234,10 @@ class GraphBuilder:
                         continue
                     ref_edges.append((source, target, edge_type, data.get("reference_type")))
         resolved = resolve_cross_source_edges(nodes, ref_edges)
-        for edge in resolved:
+        for index, edge in enumerate(resolved):
             self.upsert_edge(edge.source, edge.target, edge.type, dict(edge.attrs))
+            if index % 500 == 499:
+                serve_yield()
         return len(resolved)
 
     def remove_source_content(self, source_name: str) -> None:
