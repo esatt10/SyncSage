@@ -2,7 +2,7 @@ services:
   syncsage:
     build:
       context: .
-    image: ${SYNCSAGE_IMAGE:-ghcr.io/esatt10/syncsage:0.4.0}
+    image: ${SYNCSAGE_IMAGE:-ghcr.io/esatt10/syncsage:0.5.0}
     container_name: syncsage
     restart: unless-stopped
     ports:
