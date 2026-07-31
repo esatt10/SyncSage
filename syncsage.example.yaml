@@ -27,6 +27,22 @@ server:
   api:
     enabled: true
     openapi: true
+    # Browser origins allowed to call this API. The API is unauthenticated,
+    # so this list is what stops an arbitrary page in the user's browser from
+    # scripting it. The shipped UI proxies /api/* same-origin and needs none
+    # of these; they cover running the UI dev server or a separate host.
+    cors_origins:
+      - http://localhost:5173
+      - http://127.0.0.1:5173
+      - http://localhost:8765
+      - http://127.0.0.1:8765
+      - http://localhost:8080
+      - http://127.0.0.1:8080
+      - http://localhost:3000
+      - http://127.0.0.1:3000
+    # Restores the old `*` behavior. Only for deployments fronted by an
+    # ingress that authenticates before the request reaches SyncSage.
+    cors_allow_all_origins: false
   ui:
     enabled: true
     graph_visualization: true

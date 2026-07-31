@@ -94,6 +94,8 @@ syncsage config show --effective --profile dev --config syncsage.yaml
 |---|---|---|---|
 | `api.enabled` | bool | `true` | Enables REST API endpoints. |
 | `api.openapi` | bool | `true` | Exposes OpenAPI schema/docs endpoints. |
+| `api.cors_origins` | list[str] | localhost dev/UI origins | Browser origins allowed to call the API. The shipped UI proxies `/api/*` same-origin and needs no entry here. |
+| `api.cors_allow_all_origins` | bool | `false` | Restores `Access-Control-Allow-Origin: *`. The API is unauthenticated — only enable behind an authenticating ingress. |
 | `ui.enabled` | bool | `true` | Enables web UI routes (if packaged). |
 | `ui.graph_visualization` | bool | `true` | Enables graph visualization features in UI. |
 

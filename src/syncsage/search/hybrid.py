@@ -9,6 +9,11 @@ from syncsage.search.vector_store import VectorSearcher
 
 VALID_MODES = {"hybrid", "text", "graph", "vector"}
 
+#: Upper bound on a single query's result count. High enough that no
+#: legitimate caller notices, low enough that a hostile one cannot ask the
+#: region to load its whole index into memory.
+MAX_RESULTS_CEILING = 500
+
 
 class HybridSearch:
     def __init__(self, store: SearchStore, vector: VectorSearcher | None = None):
@@ -31,7 +36,11 @@ class HybridSearch:
         security: Any = None,
     ) -> dict:
         mode = mode if mode in VALID_MODES else "hybrid"
-        max_results = max(1, int(max_results or 10))
+        # Clamped, not just floored: `max_results` arrives straight off an
+        # unauthenticated HTTP body, and an over-fetching ACL pass multiplies
+        # it. Without a ceiling a single request can ask the region to
+        # materialize the entire index in memory.
+        max_results = min(max(1, int(max_results or 10)), MAX_RESULTS_CEILING)
 
         # Step 32.2 — principal-aware retrieval, opt-in via
         # security.acl_enforced. Candidates are over-fetched, filtered

@@ -213,10 +213,19 @@ def create_mcp_server(config: SyncSageConfig) -> Any:
         task: str,
         source_name: str | None = None,
         max_files: int = 8,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
     ) -> dict:
         """Return files likely needed for a coding or research task."""
 
-        return tools.get_relevant_files(knowledge_base, task, source_name, max_files)
+        return tools.get_relevant_files(
+            knowledge_base,
+            task,
+            source_name,
+            max_files,
+            principal=principal,
+            principal_groups=principal_groups,
+        )
 
     @mcp.tool()
     def get_graph_neighbors(

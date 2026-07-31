@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import mimetypes
 import re
 from abc import ABC, abstractmethod
@@ -16,6 +17,8 @@ from urllib.request import Request, urlopen
 from syncsage.config.schema import SourceConfig
 from syncsage.ingestion.pipeline import _match_any, sha256_file, utc_now, within_max_depth
 from syncsage.persistence.state_store import StateStore
+
+logger = logging.getLogger(__name__)
 
 
 class ConnectorUnavailable(RuntimeError):
@@ -254,6 +257,18 @@ class WebCollectionConnector(SourceConnector):
         self._require_experimental_enabled()
         items: list[ConnectorItem] = []
         for index, url in enumerate(self.source.urls):
+            if not is_fetchable_url(url):
+                # Drop it here rather than at read time, so one unfetchable
+                # URL (a `file://` that would have read the host filesystem)
+                # is a skipped item and not a failed sync for every other URL
+                # in the collection.
+                logger.warning(
+                    "source %s: skipping non-fetchable URL %r (only %s are fetched)",
+                    self.source.name,
+                    url,
+                    "/".join(sorted(FETCHABLE_SCHEMES)),
+                )
+                continue
             relative = _relative_url_path(url, index)
             if not self._allows_relative_path(relative):
                 continue
@@ -608,6 +623,34 @@ def _path_uri(path: Path) -> str:
         return str(path)
 
 
+#: Schemes the web/API connectors may fetch. ``urlopen`` also speaks
+#: ``file://`` and ``ftp://``; leaving those reachable turns a "web
+#: collection" source into an arbitrary local-file reader that indexes
+#: whatever it finds (``file:///proc/self/environ``, private keys) and
+#: serves it straight back out of ``/search``. Fetching remote documents is
+#: the feature; reading the host filesystem through the same door is not —
+#: local content has its own connector, with its own path policy.
+FETCHABLE_SCHEMES = frozenset({"http", "https"})
+
+
+def is_fetchable_url(url: str) -> bool:
+    """Whether the connectors may fetch ``url`` at all."""
+    return urlparse(url).scheme.lower() in FETCHABLE_SCHEMES
+
+
+def require_fetchable_url(url: str) -> str:
+    """Reject any URL whose scheme the connectors must not fetch."""
+    scheme = urlparse(url).scheme.lower()
+    if not is_fetchable_url(url):
+        raise ConnectorUnavailable(
+            f"refusing to fetch {url!r}: only "
+            f"{'/'.join(sorted(FETCHABLE_SCHEMES))} URLs may be fetched "
+            f"(got scheme {scheme or 'none'!r}). Index local content with a "
+            f"filesystem source instead."
+        )
+    return url
+
+
 def _urlopen(
     url: str,
     headers: dict[str, str],
@@ -615,6 +658,7 @@ def _urlopen(
     etag: str | None = None,
     last_modified: str | None = None,
 ) -> dict[str, Any]:
+    require_fetchable_url(url)
     request_headers = {"User-Agent": "SyncSage/0.1"}
     request_headers.update(headers)
     if etag:

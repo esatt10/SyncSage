@@ -21,6 +21,7 @@ never learns a new trick.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -112,6 +113,55 @@ def is_git_url(spec: str) -> bool:
     return False
 
 
+#: Transports a clone URL may name. Everything else — notably git's
+#: ``ext::`` helper, which runs an arbitrary shell command — is refused
+#: before it reaches ``git clone``.
+CLONE_SCHEMES = frozenset({"http", "https", "ssh", "git", "git+ssh"})
+
+#: ``user@host:path``, the scp-like remote form git accepts without a scheme.
+SCP_LIKE = re.compile(r"^[A-Za-z0-9._~+-]+@[A-Za-z0-9.-]+:(?!//).+$")
+
+
+def validate_clone_url(url: str) -> str:
+    """Refuse a clone URL that ``git clone`` must not be handed.
+
+    ``clone_url`` reaches ``git clone`` as an argv element, and the string
+    comes from whatever the caller typed (``syncsage up <x>``, or the
+    unauthenticated ``POST /sources/quick-add``). Two shapes are dangerous
+    regardless of how git happens to be configured on the host:
+
+    * a leading ``-`` is parsed by git as an *option*, not a URL, which turns
+      "clone this" into "run git with flags I chose";
+    * a transport helper such as ``ext::`` names a command for git to run.
+      Current git refuses ``ext`` by default, but that is git's defense, not
+      ours, and it is a configuration flag away from being off.
+
+    So the allowlist is positive: a known remote scheme, or the scp-like
+    ``user@host:path`` form.
+    """
+    candidate = url.strip()
+    if not candidate:
+        raise TargetError("empty clone URL")
+    if candidate.startswith("-"):
+        raise TargetError(
+            f"refusing to clone {url!r}: a URL starting with '-' would be read by git as an option"
+        )
+    scheme = urlparse(candidate).scheme.lower()
+    if scheme:
+        if scheme not in CLONE_SCHEMES:
+            raise TargetError(
+                f"refusing to clone {url!r}: unsupported transport {scheme!r} "
+                f"(allowed: {', '.join(sorted(CLONE_SCHEMES))})"
+            )
+        return candidate
+    if SCP_LIKE.match(candidate):
+        return candidate
+    raise TargetError(
+        f"refusing to clone {url!r}: expected a "
+        f"{'/'.join(sorted(CLONE_SCHEMES))} URL or a user@host:path remote"
+    )
+
+
 def repo_name_from_url(url: str) -> str:
     tail = url.rstrip("/").rsplit("/", 1)[-1]
     if tail.endswith(".git"):
@@ -177,6 +227,7 @@ def _local_target(path: Path, *, name: str | None, forced: SourceType | None) ->
 
 
 def _git_target(url: str, clone_root: Path, *, name: str | None) -> ResolvedTarget:
+    url = validate_clone_url(url)
     repo = name or repo_name_from_url(url)
     destination = (clone_root / repo).resolve()
     return ResolvedTarget(
@@ -335,6 +386,34 @@ def resolve_targets(
     return targets
 
 
+def _git_env() -> dict[str, str]:
+    """Environment for the git subprocesses this module runs.
+
+    Two things a clone must not do unattended: block on a credential prompt
+    (an interactive password prompt in a server process hangs the sync), and
+    speak a transport helper. ``protocol.allow=never`` plus explicit
+    per-protocol allowances pins the set to the ones ``validate_clone_url``
+    already accepts, so a hostile URL that slipped past parsing still has no
+    helper to reach.
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.setdefault("GIT_ASKPASS", "")
+    env["GIT_CONFIG_COUNT"] = "5"
+    for index, (key, value) in enumerate(
+        (
+            ("protocol.allow", "never"),
+            ("protocol.https.allow", "always"),
+            ("protocol.http.allow", "always"),
+            ("protocol.ssh.allow", "always"),
+            ("protocol.git.allow", "always"),
+        )
+    ):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+    return env
+
+
 def fetch_target(target: ResolvedTarget) -> str | None:
     """Materialize a remote target locally. Returns a status line, or None.
 
@@ -344,6 +423,10 @@ def fetch_target(target: ResolvedTarget) -> str | None:
     """
     if not target.clone_url:
         return None
+    # Re-check at the boundary: a ResolvedTarget can also be built by hand or
+    # rehydrated from config, so the validation must not live only in the
+    # classifier that usually produces one.
+    clone_url = validate_clone_url(target.clone_url)
     if shutil.which("git") is None:
         raise TargetError("git is required to clone a remote repository but was not found on PATH")
     destination = Path(target.path)
@@ -352,13 +435,16 @@ def fetch_target(target: ResolvedTarget) -> str | None:
             ["git", "-C", str(destination), "fetch", "--all", "--quiet"],
             check=False,
             capture_output=True,
+            env=_git_env(),
         )
         return f"{target.name}: reusing existing clone at {destination}"
     destination.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
-        ["git", "clone", "--quiet", target.clone_url, str(destination)],
+        # `--` ends option parsing, so nothing after it can be read as a flag.
+        ["git", "clone", "--quiet", "--", clone_url, str(destination)],
         capture_output=True,
         text=True,
+        env=_git_env(),
     )
     if result.returncode != 0:
         raise TargetError(

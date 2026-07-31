@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections import deque
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from syncsage.registry.knowledge_base_registry import KnowledgeBaseRegistry
 from syncsage.registry.source_registry import SourceRegistry
 from syncsage.search.hybrid import HybridSearch
 from syncsage.search.sqlite_store import SearchStore
-from syncsage.security.path_policy import resolve_under
+from syncsage.security.path_policy import resolve_config_write_target, resolve_under
 from syncsage.sync.engine import SyncEngine
 
 
@@ -178,9 +179,22 @@ class SyncSageTools:
         if write:
             if not config_path:
                 raise ValueError("config_path is required when write=True")
-            path = Path(config_path)
+            # An agent-supplied path must not become an arbitrary file write:
+            # promotion may only touch this region's own config, or a path
+            # under an allowed workspace root.
+            path = resolve_config_write_target(
+                config_path,
+                server_config_path=os.environ.get("SYNCSAGE_CONFIG", "/config/syncsage.yaml"),
+                allowed_roots=[
+                    self.config.syncsage.workspace_root,
+                    *self.config.security.allow_workspace_roots,
+                ],
+            )
             data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
-            data = data or {}
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"Refusing to overwrite {path}: it is not a SyncSage config mapping"
+                )
             existing = [
                 item for item in data.get("sources", []) or [] if item.get("name") != source.name
             ]
@@ -357,14 +371,24 @@ class SyncSageTools:
         task: str,
         source_name: str | None = None,
         max_files: int = 8,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
     ) -> dict:
         self._require_knowledge_base(knowledge_base)
+        # This is `search_context` with a different projection, so it runs
+        # under the same ACL enforcement — without `security` it returned
+        # unfiltered hits to every caller whenever acl_enforced was on.
+        # No `graph=`: this route answers with files, and graph nodes carry
+        # no path, so admitting them would crowd the file hits out.
         payload = self.searcher.search_context(
             knowledge_base or self.config.knowledge_base_id,
             task,
             "hybrid",
             max_files,
             source_name,
+            principal=principal,
+            principal_groups=principal_groups,
+            security=self.config.security,
         )
         return {"files": payload["results"]}
 

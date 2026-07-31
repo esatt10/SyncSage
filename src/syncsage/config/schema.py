@@ -146,6 +146,28 @@ class McpSettings(ModelMixin):
 class ApiSettings(ModelMixin):
     enabled: bool = True
     openapi: bool = True
+    # Browser origins allowed to call this API. The API is unauthenticated by
+    # design (a local-first tool behind the operator's own perimeter), which
+    # is exactly why the origin list must not be "*": with a wildcard, any
+    # page the user happens to visit can script the whole surface — read the
+    # index, rewrite the config, point the embedder at an attacker's host and
+    # ship a server-side API key with it. The defaults cover the UI sidecar
+    # and local dev; add explicit origins for anything else.
+    cors_origins: list[str] = field(
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:8765",
+            "http://127.0.0.1:8765",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ]
+    )
+    # Escape hatch for deployments that genuinely front this with their own
+    # authenticating ingress and need `*` back. Opt-in, never the default.
+    cors_allow_all_origins: bool = False
 
 
 @dataclass
