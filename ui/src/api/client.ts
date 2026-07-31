@@ -93,7 +93,12 @@ export const api = {
   graphSlice: (
     nodeId: string,
     depth = 1,
-    options: { limit?: number; edgeTypes?: string[] } = {},
+    options: {
+      limit?: number;
+      edgeTypes?: string[];
+      excludeEdgeTypes?: string[];
+      excludeTypes?: string[];
+    } = {},
   ) =>
     request<GraphSlice>(
       `/graph/slice${qs({
@@ -101,6 +106,10 @@ export const api = {
         depth,
         limit: options.limit,
         edge_types: options.edgeTypes?.join(","),
+        exclude_edge_types: options.excludeEdgeTypes?.join(","),
+        exclude_types: options.excludeTypes?.length
+          ? options.excludeTypes.join(",")
+          : undefined,
       })}`,
     ),
   graphNeighbors: (nodeId: string, depth = 1, edgeTypes?: string[]) =>

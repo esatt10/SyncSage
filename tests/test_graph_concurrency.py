@@ -78,6 +78,51 @@ def test_readers_tolerate_concurrent_sync_writes() -> None:
     assert not errors, f"writer failed: {errors[0]!r}"
 
 
+def test_maintained_aggregates_match_a_full_scan() -> None:
+    """Counters kept on write must never drift from the truth they replace.
+
+    ``number_of_edges``/``type_counts`` back endpoints the UI polls, so they
+    are maintained incrementally instead of scanned. A drifting counter is
+    worse than a slow one, so this walks the graph and compares.
+    """
+
+    def scanned(graph: SimpleMultiDiGraph) -> tuple[int, dict[str, int]]:
+        edges = sum(len(edge_map) for _endpoints, edge_map in graph.iter_edges())
+        types: dict[str, int] = {}
+        for _node_id, attrs in graph.iter_nodes():
+            node_type = attrs.get("type")
+            if node_type is not None:
+                types[str(node_type)] = types.get(str(node_type), 0) + 1
+        return edges, types
+
+    graph = SimpleMultiDiGraph()
+    for i in range(40):
+        graph.add_node(f"f{i}", id=f"f{i}", type="file", label=f"f{i}")
+        graph.add_node(f"c{i}", id=f"c{i}", type="concept", label=f"c{i}")
+        graph.add_edge(f"f{i}", f"c{i}", type="mentions")
+        graph.add_edge(f"f{i}", f"c{i}", type="references")  # parallel edge
+    assert (graph.number_of_edges(), graph.type_counts()) == scanned(graph)
+
+    # Re-typing a node moves it between buckets rather than double-counting.
+    graph.add_node("f0", id="f0", type="document", label="f0")
+    assert (graph.number_of_edges(), graph.type_counts()) == scanned(graph)
+
+    # Updating other attrs leaves the tally alone.
+    graph.add_node("f1", id="f1", label="renamed")
+    assert (graph.number_of_edges(), graph.type_counts()) == scanned(graph)
+
+    graph.remove_edges_from([("f2", "c2")])
+    assert (graph.number_of_edges(), graph.type_counts()) == scanned(graph)
+
+    graph.remove_nodes_from(["f3", "c3", "f4"])
+    assert (graph.number_of_edges(), graph.type_counts()) == scanned(graph)
+
+    # A graph reloaded from disk rebuilds the same aggregates.
+    reloaded = SimpleMultiDiGraph.from_node_link(graph.to_node_link())
+    assert reloaded.number_of_edges() == graph.number_of_edges()
+    assert reloaded.type_counts() == graph.type_counts()
+
+
 def test_concurrent_saves_do_not_collide_on_a_shared_tmp_file(tmp_path) -> None:
     """Two writers saving at once must both produce a complete file.
 
@@ -111,7 +156,9 @@ def test_concurrent_saves_do_not_collide_on_a_shared_tmp_file(tmp_path) -> None:
         thread.join(timeout=30)
 
     assert not errors, f"concurrent save failed: {errors[0]!r}"
-    payload = json.loads(store.graph_path("kb").read_text(encoding="utf-8"))
+    import zstandard as zstd
+
+    payload = json.loads(zstd.ZstdDecompressor().decompress(store.graph_path("kb").read_bytes()))
     assert len(payload["nodes"]) == 300
     assert not list(store.kb_dir("kb").glob("*.tmp")), "temp files left behind"
 

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import threading
+import time
 from pathlib import Path
 
 from syncsage.graph.simple import SimpleMultiDiGraph
@@ -53,9 +54,25 @@ class GraphStore:
         return path
 
     def graph_path(self, kb_id: str) -> Path:
+        """Where the current graph lives: zstd-compressed node-link JSON.
+
+        Uncompressed, a real index is enormous — 445k nodes and 1.5M edges
+        pretty-printed came to 928MB, which every checkpoint then rewrote and
+        every start re-parsed. The payload is highly repetitive JSON, so zstd
+        takes it down by roughly an order of magnitude for a few percent of
+        the CPU the write was already costing.
+        """
+
+        return self.kb_dir(kb_id) / "graph.latest.json.zst"
+
+    def legacy_graph_path(self, kb_id: str) -> Path:
+        """Pre-compression location, still read once so no state is stranded."""
+
         return self.kb_dir(kb_id) / "graph.latest.json"
 
     def save(self, kb_id: str, graph: SimpleMultiDiGraph) -> Path:
+        import zstandard as zstd
+
         path = self.graph_path(kb_id)
         tmp = _tmp_for(path)
         # Durable tmp+rename (Synapse step 21.2): fsync the file before the
@@ -63,8 +80,17 @@ class GraphStore:
         # never leaves a torn or vanished graph.latest.json.
         try:
             with self._write_lock:
-                with tmp.open("w", encoding="utf-8") as fh:
-                    fh.write(json.dumps(graph.to_node_link(), indent=2, sort_keys=True))
+                # Compact, key-sorted: sorting keeps the bytes deterministic
+                # for a given graph, and dropping the indentation removes
+                # hundreds of megabytes of whitespace nothing reads.
+                payload = json.dumps(
+                    graph.to_node_link(), sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+                with tmp.open("wb") as fh:
+                    # Level 3: the write path is latency-sensitive (it runs
+                    # mid-sync), and levels above this cost far more CPU for a
+                    # few percent of size. Snapshots, written rarely, use 10.
+                    fh.write(zstd.ZstdCompressor(level=3).compress(payload))
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(tmp, path)
@@ -72,13 +98,56 @@ class GraphStore:
             tmp.unlink(missing_ok=True)
             raise
         self._fsync_dir(path.parent)
+        self._retire_legacy(kb_id)
+        self._sweep_stale_tmp(path.parent)
         return path
 
+    @staticmethod
+    def _sweep_stale_tmp(directory: Path, max_age_s: float = 3600.0) -> None:
+        """Delete temp files no live writer could still own.
+
+        A writer cleans up its own temp on failure, but a killed process (a
+        container recreate mid-save) cannot — and those leftovers accumulate in
+        /state at full graph size. Only ``*.tmp`` written by this store is
+        touched, and only once it is far too old to belong to a running save.
+        """
+
+        cutoff = time.time() - max_age_s
+        for stale in directory.glob("*.tmp"):
+            try:
+                if stale.stat().st_mtime < cutoff:
+                    stale.unlink()
+            except OSError:  # pragma: no cover - racing another writer is fine
+                pass
+
+    def _retire_legacy(self, kb_id: str) -> None:
+        """One-shot: park a pre-compression graph beside the new one.
+
+        Renamed, never deleted — /state is user data — and only after the
+        compressed file it was replaced by is safely on disk.
+        """
+
+        legacy = self.legacy_graph_path(kb_id)
+        if not legacy.exists():
+            return
+        try:
+            legacy.rename(legacy.with_suffix(".json.migrated"))
+        except OSError:  # pragma: no cover - best effort, never fails a sync
+            pass
+
     def load(self, kb_id: str) -> SimpleMultiDiGraph:
+        import zstandard as zstd
+
         path = self.graph_path(kb_id)
-        if not path.exists():
-            return SimpleMultiDiGraph()
-        return SimpleMultiDiGraph.from_node_link(json.loads(path.read_text(encoding="utf-8")))
+        if path.exists():
+            raw = zstd.ZstdDecompressor().decompress(path.read_bytes())
+            return SimpleMultiDiGraph.from_node_link(json.loads(raw))
+        # Pre-compression state directory: read it once; the next save writes
+        # the compressed form and retires this file.
+        legacy = self.legacy_graph_path(kb_id)
+        if legacy.exists():
+            return SimpleMultiDiGraph.from_node_link(json.loads(legacy.read_bytes()))
+        return SimpleMultiDiGraph()
 
     # --- snapshots (Synapse step 21.6, session A) ---------------------------
 
@@ -127,7 +196,13 @@ class GraphStore:
         kb_dir = self.root / kb_id
         if not kb_dir.exists():
             return []
-        snapshots = [p for p in kb_dir.iterdir() if SNAPSHOT_PATTERN.match(p.name)]
+        # The current graph is `graph.latest.json.zst`, which matches the
+        # snapshot pattern by shape. It is not history and must never be
+        # offered to retention, which deletes what it is given.
+        live = self.graph_path(kb_id).name
+        snapshots = [
+            p for p in kb_dir.iterdir() if p.name != live and SNAPSHOT_PATTERN.match(p.name)
+        ]
         # Filenames embed a sortable ISO-8601 timestamp, so lexical sort on the
         # name is chronological; ties fall back to mtime for robustness.
         snapshots.sort(key=lambda p: (p.name, p.stat().st_mtime))

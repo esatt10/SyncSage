@@ -250,16 +250,54 @@ class SemanticSimilarityPass:
     def run(
         self,
         artifacts: list[tuple[str, dict[str, Any]]],
+        changed_ids: set[str] | None = None,
     ) -> list[EnrichmentEdge]:
-        edges: list[EnrichmentEdge] = []
-        for index, (left_id, left) in enumerate(artifacts):
-            left_terms = set(left.get("concept_terms") or [])
-            if len(left_terms) < 2:
+        """Similarity edges between artifacts that share concept terms.
+
+        Candidates come from an inverted term index rather than every pair.
+        Two artifacts with no term in common score exactly zero and are
+        dropped by the threshold below, so indexing the terms produces the
+        *same* edges as the old all-pairs walk — it just skips the pairs whose
+        answer was never in doubt. That matters: all-pairs is quadratic, and at
+        a few thousand artifacts it was the single most expensive thing a sync
+        did, re-run in full on every pass.
+
+        ``changed_ids`` narrows the walk further, to pairs where at least one
+        side was touched this sync. Untouched pairs already have their edges in
+        the graph and re-deriving them is pure waste.
+        """
+
+        terms_by_id: dict[str, set[str]] = {}
+        postings: dict[str, list[str]] = {}
+        for node_id, attrs in artifacts:
+            terms = set(attrs.get("concept_terms") or [])
+            if len(terms) < 2:
                 continue
-            for right_id, right in artifacts[index + 1:]:
-                right_terms = set(right.get("concept_terms") or [])
-                if len(right_terms) < 2:
+            terms_by_id[node_id] = terms
+            for term in terms:
+                postings.setdefault(term, []).append(node_id)
+
+        edges: list[EnrichmentEdge] = []
+        seen: set[tuple[str, str]] = set()
+        walk = (
+            [node_id for node_id in terms_by_id if node_id in changed_ids]
+            if changed_ids is not None
+            else list(terms_by_id)
+        )
+        for left_id in walk:
+            left_terms = terms_by_id[left_id]
+            candidates = {
+                candidate
+                for term in left_terms
+                for candidate in postings.get(term, ())
+                if candidate != left_id
+            }
+            for right_id in candidates:
+                pair = (left_id, right_id) if left_id < right_id else (right_id, left_id)
+                if pair in seen:
                     continue
+                seen.add(pair)
+                right_terms = terms_by_id[right_id]
                 shared = left_terms & right_terms
                 union = left_terms | right_terms
                 score = len(shared) / len(union)
@@ -270,8 +308,8 @@ class SemanticSimilarityPass:
                     "shared_concepts": sorted(shared)[:12],
                     "enrichment_pass": self.name,
                 }
-                edges.append(EnrichmentEdge(left_id, right_id, "similar_to", attrs))
-                edges.append(EnrichmentEdge(right_id, left_id, "similar_to", attrs))
+                edges.append(EnrichmentEdge(pair[0], pair[1], "similar_to", attrs))
+                edges.append(EnrichmentEdge(pair[1], pair[0], "similar_to", attrs))
         return edges
 
 

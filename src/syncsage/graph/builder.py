@@ -178,15 +178,27 @@ class GraphBuilder:
         for edge in enrichment.edges:
             self.upsert_edge(edge.source, edge.target, edge.type, edge.attrs)
 
-    def add_similarity_edges(self, source_name: str | None = None) -> None:
+    def add_similarity_edges(
+        self,
+        source_name: str | None = None,
+        changed_ids: set[str] | None = None,
+    ) -> None:
+        """Link artifacts that share concept terms.
+
+        ``changed_ids`` restricts the pass to pairs touching an artifact this
+        sync actually rewrote; the rest already have their edges and are
+        idempotent, so re-deriving them only costs CPU.
+        """
+
         artifacts = []
-        for node_id, attrs in self.graph.nodes(data=True):
-            if attrs.get("type") not in {"file", "markdown_note", "document"}:
-                continue
-            if source_name and attrs.get("source_id") != source_name:
-                continue
-            artifacts.append((node_id, attrs))
-        for edge in self.similarity_pass.run(artifacts):
+        with self.graph.reading():
+            for node_id, attrs in self.graph.iter_nodes():
+                if attrs.get("type") not in {"file", "markdown_note", "document"}:
+                    continue
+                if source_name and attrs.get("source_id") != source_name:
+                    continue
+                artifacts.append((node_id, dict(attrs)))
+        for edge in self.similarity_pass.run(artifacts, changed_ids=changed_ids):
             self.upsert_edge(edge.source, edge.target, edge.type, edge.attrs)
 
     def add_cross_source_edges(self) -> int:
@@ -200,17 +212,22 @@ class GraphBuilder:
         Returns the number of cross-source edges resolved this pass.
         """
 
-        nodes = list(self.graph.nodes(data=True))
         ref_edges: list[tuple[str, str, str, str | None]] = []
-        for (source, target), edge_map in self.graph.edges():
-            for data in edge_map.values():
-                edge_type = data.get("type")
-                if edge_type not in {"imports", "references"}:
+        # One lock hold, no copying: this walks every edge in the graph, so
+        # snapshotting them first (1.5M dict copies on a real index) cost more
+        # than the pass itself.
+        with self.graph.reading():
+            nodes = [(node_id, dict(attrs)) for node_id, attrs in self.graph.iter_nodes()]
+            node_map = self.graph.node_map()
+            for (source, target), edge_map in self.graph.iter_edges():
+                target_attrs = node_map.get(target)
+                if not target_attrs or target_attrs.get("type") != "external_reference":
                     continue
-                target_attrs = self.graph.nodes.get(target, {})
-                if target_attrs.get("type") != "external_reference":
-                    continue
-                ref_edges.append((source, target, edge_type, data.get("reference_type")))
+                for data in edge_map.values():
+                    edge_type = data.get("type")
+                    if edge_type not in {"imports", "references"}:
+                        continue
+                    ref_edges.append((source, target, edge_type, data.get("reference_type")))
         resolved = resolve_cross_source_edges(nodes, ref_edges)
         for edge in resolved:
             self.upsert_edge(edge.source, edge.target, edge.type, dict(edge.attrs))

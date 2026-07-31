@@ -53,18 +53,20 @@ def node_link(
         nodes = []
         selected_ids: set[str] = set()
         eligible = 0
-        for node_id, attrs in graph.nodes(data=True):
-            node = dict(attrs)
-            if not keep(node):
+        # Live iteration under the read lock: copying every node and edge up
+        # front cost seconds on a large graph, and the copy bought nothing
+        # because the lock already excludes the writer.
+        for node_id, attrs in graph.iter_nodes():
+            if not keep(attrs):
                 continue
             eligible += 1
             if len(nodes) >= max_nodes:
                 continue
-            nodes.append(node)
+            nodes.append(dict(attrs))
             selected_ids.add(node_id)
 
         links = []
-        for (source, target), edge_map in graph.edges():
+        for (source, target), edge_map in graph.iter_edges():
             if source not in selected_ids or target not in selected_ids:
                 continue
             for key, data in edge_map.items():

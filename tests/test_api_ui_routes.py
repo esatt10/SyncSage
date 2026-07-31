@@ -424,3 +424,49 @@ def test_bundle_is_mounted_and_reported_only_when_it_exists(
     assert disabled.state.ui_dist is None
     _report_ui(disabled, loaded_config)
     assert capsys.readouterr().out == ""
+
+
+def test_hierarchy_survives_a_bounded_horizon() -> None:
+    """A shortcut edge must not crowd the directory tree out of the view.
+
+    A source indexes every artifact directly, so a plain breadth-first walk
+    with a budget spends all of it hopping source→file and never descends the
+    directory chain — the parent/child structure is in the graph but absent
+    from every bounded view of it.
+    """
+
+    graph = SimpleMultiDiGraph()
+    graph.add_node("kb", id="kb", type="knowledge_base", label="kb")
+    graph.add_node("src", id="src", type="source", label="src")
+    graph.add_edge("kb", "src", type="contains")
+
+    # One deep directory chain, plus a wide flat fan-out of indexed files.
+    parent = "src"
+    for level in range(1, 5):
+        directory = f"dir:{level}"
+        graph.add_node(directory, id=directory, type="directory", label=directory)
+        graph.add_edge(parent, directory, type="contains")
+        parent = directory
+    deep_file = "file:deep.py"
+    graph.add_node(deep_file, id=deep_file, type="file", label="deep.py")
+    graph.add_edge(parent, deep_file, type="contains")
+
+    for i in range(200):
+        flat = f"file:flat{i}.py"
+        graph.add_node(flat, id=flat, type="file", label=f"flat{i}.py")
+        graph.add_edge("src", flat, type="indexes")
+
+    budget = 20
+    plain = graph_slice(graph, "kb", depth=6, limit=budget)
+    plain_types = {node["id"]: node.get("type") for node in plain["nodes"]}
+    assert sum(1 for t in plain_types.values() if t == "directory") >= 1
+
+    without_shortcut = graph_slice(
+        graph, "kb", depth=6, limit=budget, exclude_edge_types={"indexes"}
+    )
+    ids = {node["id"] for node in without_shortcut["nodes"]}
+    # The whole chain, and the file at the bottom of it, fit in the budget once
+    # the shortcut is out of the way.
+    assert {"dir:1", "dir:2", "dir:3", "dir:4", deep_file} <= ids
+    assert not any(node_id.startswith("file:flat") for node_id in ids)
+    assert without_shortcut["depths"][deep_file] == 6

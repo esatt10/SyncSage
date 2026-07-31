@@ -90,23 +90,25 @@ ingestion:
   transcriber:
     provider: stub
 
+# This demo READS a third-party repo; nobody is editing /workspace, and
+# upstream changes land daily at most. So nothing here watches for changes
+# minute to minute — polling a read-only mount every 15 minutes only buys
+# CPU burn. Re-check on demand any time with:
+#   curl -X POST http://127.0.0.1:8765/sync/agent-framework \
+#        -H 'content-type: application/json' -d '{"mode":"incremental"}'
 sync:
-  startup:
-    full_validation: true
-    repair_missing_indexes: true
   watcher:
-    enabled: true
-    max_watch_paths: 100
-    debounce_ms: 1500
-    batch_window_ms: 5000
+    # No filesystem watch: the mount is read-only and nothing local changes it.
+    enabled: false
   git:
     enabled: true
+    # Still notice a `git pull` in the clone, just not by polling for it.
     detect_commit_changes: true
     detect_branch_switch: true
     reindex_on_commit: true
   scheduler:
     enabled: true
-    interval_seconds: 900
+    interval_seconds: 86400   # daily
   idempotency:
     hash_algorithm: sha256
     compare_size_mtime_hash: true
@@ -204,7 +206,11 @@ sources:
       max_chars: 4000
       overlap_chars: 400
     sync:
+      # On startup this costs nothing when nothing changed: the manifest and
+      # graph are already in /state, every file's sha256 matches, and the
+      # global enrichment passes are skipped entirely when no artifact was
+      # rewritten.
       on_startup: true
-      on_file_change: debounce
+      on_file_change: none
       on_git_commit: true
-      interval_seconds: 900
+      interval_seconds: 86400   # daily

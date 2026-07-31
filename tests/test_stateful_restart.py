@@ -42,6 +42,14 @@ def _engine(config_file: Path) -> SyncEngine:
     return SyncEngine(load_config(config_file))
 
 
+def _read_graph(path: Path) -> dict:
+    """The stored graph is zstd-compressed node-link JSON."""
+
+    import zstandard as zstd
+
+    return json.loads(zstd.ZstdDecompressor().decompress(path.read_bytes()))
+
+
 def test_restart_reindexes_nothing_and_keeps_the_graph(tmp_path, workspace_copy) -> None:
     config_file = _render_config(tmp_path, "restart", workspace_copy)
 
@@ -105,7 +113,7 @@ def test_graph_and_manifest_are_checkpointed_mid_sync(tmp_path, workspace_copy) 
         engine.config.storage.graph_checkpoint_seconds = 0  # checkpoint only on demand
         engine.sync_source("syncsage-repo", "full")
         graph_path = engine.graph_store.graph_path(engine.config.knowledge_base_id)
-        saved = json.loads(graph_path.read_text(encoding="utf-8"))
+        saved = _read_graph(graph_path)
         assert len(saved["nodes"]) == engine.graph_builder.graph.number_of_nodes()
 
         # Work happening after the last save, then a shutdown.
@@ -114,7 +122,7 @@ def test_graph_and_manifest_are_checkpointed_mid_sync(tmp_path, workspace_copy) 
         manifest = {"source_id": "syncsage-repo", "artifacts": {"late.md": {"sha256": "a" * 64}}}
         assert engine.checkpoint_graph("syncsage-repo", manifest) is True
 
-        reloaded = json.loads(graph_path.read_text(encoding="utf-8"))
+        reloaded = _read_graph(graph_path)
         assert any(node.get("id") == "late:node" for node in reloaded["nodes"])
         assert "late.md" in engine.manifests.load("syncsage-repo").get("artifacts", {})
         # Nothing dirty: a second checkpoint writes nothing.

@@ -109,3 +109,65 @@ def test_hybrid_without_graph_falls_back_to_text() -> None:
     payload = hybrid.search_context("kb", "SyncEngine", mode="hybrid", max_results=5)
     assert payload["counts"]["graph"] == 0
     assert payload["results"] == []
+
+
+def test_fast_reject_never_changes_results() -> None:
+    """The blob pre-filter is an optimization, so it must be invisible.
+
+    Scoring every node is the reference behaviour; the pre-filter only skips
+    nodes that provably cannot score. Any divergence is a lost search hit, so
+    this compares the two over queries that hit labels, paths, types,
+    attribute values and nothing at all.
+    """
+
+    import syncsage.search.graph_search as gs
+
+    graph = _sample_graph()
+    # Add bulk the queries must not accidentally match, so the filter is
+    # actually doing work rather than passing everything through.
+    for i in range(200):
+        graph.add_node(
+            f"concept:noise:{i}",
+            id=f"concept:noise:{i}",
+            type="concept",
+            label=f"unrelated-topic-{i}",
+            source_id="repo",
+        )
+
+    queries = [
+        "SyncEngine",
+        "sync engine",
+        "sync_engine.py",
+        "repo",
+        "file",
+        "graph builder",
+        "zzz-no-such-thing",
+        "",
+        "  ",
+    ]
+
+    original = gs._may_match
+    try:
+        for query in queries:
+            filtered = search_graph(graph, query, max_results=25)
+            gs._may_match = lambda *_args, **_kwargs: True  # score everything
+            unfiltered = search_graph(graph, query, max_results=25)
+            assert filtered == unfiltered, f"fast reject changed results for {query!r}"
+    finally:
+        gs._may_match = original
+
+
+def test_search_blob_tracks_node_updates() -> None:
+    """A stale blob would silently hide a node from search."""
+
+    graph = SimpleMultiDiGraph()
+    graph.add_node("n1", id="n1", type="file", label="alpha.py", source_id="repo")
+    assert [hit["node_id"] for hit in search_graph(graph, "alpha")] == ["n1"]
+
+    # Rename: the old term stops matching, the new one starts.
+    graph.add_node("n1", id="n1", type="file", label="beta.py", source_id="repo")
+    assert search_graph(graph, "alpha") == []
+    assert [hit["node_id"] for hit in search_graph(graph, "beta")] == ["n1"]
+
+    graph.remove_nodes_from(["n1"])
+    assert search_graph(graph, "beta") == []

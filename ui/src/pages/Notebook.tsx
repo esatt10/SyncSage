@@ -1,4 +1,5 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { GraphFact, GraphNode } from "../api/types";
@@ -11,10 +12,16 @@ import { GraphLegend } from "../graph/GraphLegend";
 import { useHorizonGraph } from "../graph/useHorizonGraph";
 import { SourceRail } from "../components/SourceRail";
 import { EmptyState } from "../components/EmptyState";
+import { PaneResizer } from "../components/PaneResizer";
 import { WorkflowPanel } from "../components/WorkflowPanel";
 import { colorForNode } from "../graph/graphStyles";
 import { useSessionId } from "../hooks/useSessionId";
-import { useSession } from "../state/session";
+import {
+  DEFAULT_DEPTH,
+  DEFAULT_PANEL_WIDTH,
+  DEFAULT_RAIL_WIDTH,
+  useSession,
+} from "../state/session";
 
 /**
  * The workspace: sources on the left, conversation in the middle, knowledge on
@@ -31,6 +38,7 @@ export function Notebook() {
   const { state, dispatch } = useSession();
   const [showModelDialog, setShowModelDialog] = useState(false);
   const [showWorkflowDialog, setShowWorkflowDialog] = useState(false);
+  const layoutRef = useRef<HTMLDivElement>(null);
 
   const overview = useQuery({ queryKey: ["overview"], queryFn: api.overview });
   const status = useQuery({
@@ -96,7 +104,16 @@ export function Notebook() {
   }
 
   return (
-    <div className="notebook">
+    <div
+      className="notebook"
+      ref={layoutRef}
+      style={
+        {
+          "--rail": `${state.railWidth}px`,
+          "--panel": `${state.panelWidth}px`,
+        } as CSSProperties
+      }
+    >
       <aside className="pane pane--rail">
         <SourceRail
           sources={overview.data?.sources ?? []}
@@ -106,10 +123,30 @@ export function Notebook() {
         />
       </aside>
 
+      <PaneResizer
+        variable="--rail"
+        edge="left"
+        containerRef={layoutRef}
+        min={200}
+        max={560}
+        defaultWidth={DEFAULT_RAIL_WIDTH}
+        label="Resize sources"
+        onCommit={(width) => dispatch({ type: "set-pane-width", pane: "rail", width })}
+      />
+
       <section className="pane">
         <header className="pane__header">
           <span className="pane__title">Chat</span>
           <div className="pane__actions">
+            {state.turns.length > 0 ? (
+              <button
+                className="btn btn--small"
+                onClick={() => dispatch({ type: "new-conversation" })}
+                title="Clear this thread and start fresh"
+              >
+                New conversation
+              </button>
+            ) : null}
             <button
               className="btn btn--small"
               onClick={() => setShowWorkflowDialog(true)}
@@ -136,6 +173,17 @@ export function Notebook() {
           />
         </div>
       </section>
+
+      <PaneResizer
+        variable="--panel"
+        edge="right"
+        containerRef={layoutRef}
+        min={320}
+        max={1400}
+        defaultWidth={DEFAULT_PANEL_WIDTH}
+        label="Resize graph panel"
+        onCommit={(width) => dispatch({ type: "set-pane-width", pane: "panel", width })}
+      />
 
       <aside className="pane pane--panel">
         <header className="pane__header">
@@ -172,9 +220,17 @@ export function Notebook() {
                   surfacedCount={state.surfacedIds.length}
                   nodeCount={graph.nodes.length}
                   busy={isFetching}
+                  dirty={
+                    state.selectedId !== null ||
+                    state.centerId !== null ||
+                    state.surfacedIds.length > 0 ||
+                    state.showAll ||
+                    state.depth !== DEFAULT_DEPTH
+                  }
                   onDepth={(depth) => dispatch({ type: "set-depth", depth })}
                   onShowAll={(value) => dispatch({ type: "show-all", value })}
                   onClearAnswerFilter={() => dispatch({ type: "clear-answer-filter" })}
+                  onClear={() => dispatch({ type: "clear-view" })}
                 />
               </div>
               {isLoading ? (

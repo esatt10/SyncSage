@@ -128,6 +128,7 @@ class SyncEngine:
         # Mid-sync graph checkpointing (see _maybe_checkpoint_graph).
         self._graph_dirty = False
         self._last_checkpoint = time.monotonic()
+        self._last_save_seconds = 0.0
 
     def close(self) -> None:
         """Persist in-flight graph work, release the lease, close the store.
@@ -158,7 +159,9 @@ class SyncEngine:
             return False
         if source_name and manifest is not None:
             self.manifests.save(source_name, manifest)
+        started = time.monotonic()
         self.graph_store.save(self.config.knowledge_base_id, self.graph_builder.graph)
+        self._last_save_seconds = time.monotonic() - started
         self._graph_dirty = False
         self._last_checkpoint = time.monotonic()
         return True
@@ -175,6 +178,12 @@ class SyncEngine:
         interval = float(getattr(self.config.storage, "graph_checkpoint_seconds", 0) or 0)
         if interval <= 0:
             return
+        # Self-throttling: a checkpoint costs whatever the graph costs to
+        # serialize, and that grows with the index. Spacing checkpoints at
+        # ten times the last save keeps their overhead near 10% of the sync
+        # no matter how large the graph gets — a fixed interval eventually
+        # means a sync that spends most of its time saving.
+        interval = max(interval, self._last_save_seconds * 10)
         if time.monotonic() - self._last_checkpoint < interval:
             return
         try:
@@ -426,6 +435,7 @@ class SyncEngine:
             fetched = 0
             transfer_skipped = 0
             embedded_chunks = 0
+            changed_ids: set[str] = set()
             git_metadata = git_state(source.path) if source.type.value == "repository" else None
             for item in items:
                 previous = artifacts.get(item.relative_path)
@@ -523,6 +533,7 @@ class SyncEngine:
                     "git_commit": parsed.git_commit,
                 }
                 indexed += 1
+                changed_ids.add(parsed.id)
                 # Checkpoint mid-run. Without this the graph and the manifest
                 # only reach /state when a sync *finishes*, so stopping the
                 # container an hour into a first index threw that hour away:
@@ -542,13 +553,26 @@ class SyncEngine:
                     )
                 }
                 pruned_vectors = self.vectors.prune_source(source.name, live_chunk_ids)
-            self.graph_builder.add_similarity_edges(source.name)
-            # Synapse 21.6B: global cross-source edge pass. Resolves python
-            # imports / document links whose targets land in a *different*
-            # source into imports/references edges. Runs over the whole
-            # accumulated graph (sources sync independently) and is idempotent
-            # via edge upsert, so re-sync produces an identical graph.
-            self.graph_builder.add_cross_source_edges()
+            # Global enrichment is proportional to the whole graph, not to what
+            # changed — so it only runs when something actually changed. A
+            # scheduled sync over untouched content used to re-derive every
+            # similarity pair and re-scan every edge on each beat, which is
+            # what pinned a container's CPU while indexing nothing.
+            if indexed or mode == "full":
+                self.graph_builder.add_similarity_edges(
+                    source.name,
+                    # A full pass rebuilt this source from scratch, so every
+                    # pair is genuinely new; an incremental one only needs the
+                    # artifacts it rewrote.
+                    changed_ids=None if mode == "full" else changed_ids,
+                )
+                # Synapse 21.6B: global cross-source edge pass. Resolves python
+                # imports / document links whose targets land in a *different*
+                # source into imports/references edges. Runs over the whole
+                # accumulated graph (sources sync independently) and is
+                # idempotent via edge upsert, so re-sync produces an identical
+                # graph.
+                self.graph_builder.add_cross_source_edges()
             manifest["last_indexed_at"] = utc_now()
             manifest["connector"] = {"type": connector.connector_type}
             self.manifests.save(source.name, manifest)

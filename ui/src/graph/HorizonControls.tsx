@@ -8,9 +8,12 @@ interface HorizonControlsProps {
   surfacedCount: number;
   nodeCount: number;
   busy: boolean;
+  /** Anything the user has narrowed to: a selection, a center, an answer. */
+  dirty: boolean;
   onDepth: (depth: number) => void;
   onShowAll: (value: boolean) => void;
   onClearAnswerFilter: () => void;
+  onClear: () => void;
 }
 
 /**
@@ -26,9 +29,11 @@ export function HorizonControls({
   surfacedCount,
   nodeCount,
   busy,
+  dirty,
   onDepth,
   onShowAll,
   onClearAnswerFilter,
+  onClear,
 }: HorizonControlsProps) {
   const bounded = mode !== "all";
   return (
@@ -43,6 +48,15 @@ export function HorizonControls({
             title="Stop filtering to the last answer and go back to the full horizon"
           >
             {surfacedCount} from answer ✕
+          </button>
+        ) : null}
+        {dirty ? (
+          <button
+            className="graph-badge graph-badge--action"
+            onClick={onClear}
+            title="Clear the selected node, the answer filter and the center — back to the plain view"
+          >
+            Clear ✕
           </button>
         ) : null}
       </div>

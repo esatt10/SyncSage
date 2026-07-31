@@ -83,3 +83,69 @@ def test_graph_terms_improve_cross_file_search(
 
     assert "syncsage/sync_engine.py" in paths
     assert "syncsage/api.py" in paths
+
+
+def test_similarity_index_matches_all_pairs_exactly() -> None:
+    """The term index is an optimization, so it must emit the same edges.
+
+    Two artifacts sharing no concept term score zero and are dropped by the
+    threshold, so restricting candidates to "shares at least one term" cannot
+    change the outcome — only the cost. This asserts that against a literal
+    all-pairs implementation.
+    """
+
+    import random
+
+    from syncsage.graph.enrichment import SemanticSimilarityPass
+
+    def all_pairs(artifacts):
+        edges = []
+        for index, (left_id, left) in enumerate(artifacts):
+            left_terms = set(left.get("concept_terms") or [])
+            if len(left_terms) < 2:
+                continue
+            for right_id, right in artifacts[index + 1 :]:
+                right_terms = set(right.get("concept_terms") or [])
+                if len(right_terms) < 2:
+                    continue
+                shared = left_terms & right_terms
+                score = len(shared) / len(left_terms | right_terms)
+                if len(shared) < 2 and score < 0.25:
+                    continue
+                edges.append((left_id, right_id, round(min(1.0, score), 3)))
+                edges.append((right_id, left_id, round(min(1.0, score), 3)))
+        return sorted(edges)
+
+    random.seed(11)
+    vocabulary = [f"term{i}" for i in range(40)]
+    artifacts = []
+    for i in range(120):
+        terms = random.sample(vocabulary, random.randint(0, 6))
+        artifacts.append((f"file:src:{i}.py", {"concept_terms": terms}))
+
+    produced = sorted(
+        (edge.source, edge.target, edge.attrs["confidence"])
+        for edge in SemanticSimilarityPass().run(artifacts)
+    )
+    assert produced == all_pairs(artifacts)
+
+
+def test_similarity_can_be_limited_to_what_changed() -> None:
+    """An incremental sync only needs pairs touching a rewritten artifact."""
+
+    from syncsage.graph.enrichment import SemanticSimilarityPass
+
+    artifacts = [
+        ("a", {"concept_terms": ["alpha", "beta", "gamma"]}),
+        ("b", {"concept_terms": ["alpha", "beta", "delta"]}),
+        ("c", {"concept_terms": ["alpha", "beta", "epsilon"]}),
+    ]
+    every = SemanticSimilarityPass().run(artifacts)
+    assert {(edge.source, edge.target) for edge in every} == {
+        ("a", "b"), ("b", "a"), ("a", "c"), ("c", "a"), ("b", "c"), ("c", "b")
+    }
+
+    only_a = SemanticSimilarityPass().run(artifacts, changed_ids={"a"})
+    touched = {(edge.source, edge.target) for edge in only_a}
+    assert touched == {("a", "b"), ("b", "a"), ("a", "c"), ("c", "a")}
+    assert ("b", "c") not in touched, "untouched pair was re-derived"

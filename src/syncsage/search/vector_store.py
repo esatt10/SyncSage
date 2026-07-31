@@ -537,10 +537,32 @@ class VectorIndexer:
 class VectorSearcher:
     """Query-time vector candidates in the SearchStore result shape."""
 
+    #: Recent query embeddings, newest last. A vector query spends most of its
+    #: time waiting on the embedding provider, and the same question gets asked
+    #: repeatedly — re-running a search, an agent loop retrying with the same
+    #: sub-query, a user refining one word. Small and per-process on purpose:
+    #: this is a latency cache, not a store.
+    _QUERY_CACHE_SIZE = 256
+
     def __init__(self, embedder: Embedder, store: VectorStore, state: StateStore):
         self.embedder = embedder
         self.store = store
         self.state = state
+        self._query_cache: dict[str, list[float]] = {}
+
+    def embed_query(self, query: str) -> list[float]:
+        """Embed a query, reusing a recent identical one."""
+
+        cached = self._query_cache.get(query)
+        if cached is not None:
+            return cached
+        vector = self.embedder.embed([query])[0]
+        if len(self._query_cache) >= self._QUERY_CACHE_SIZE:
+            # Plain FIFO eviction: dicts keep insertion order, and at this size
+            # the difference between FIFO and LRU is not worth the bookkeeping.
+            self._query_cache.pop(next(iter(self._query_cache)), None)
+        self._query_cache[query] = vector
+        return vector
 
     def search(
         self,
@@ -550,7 +572,7 @@ class VectorSearcher:
     ) -> list[dict[str, Any]]:
         if not (query or "").strip():
             return []
-        query_vec = self.embedder.embed([query])[0]
+        query_vec = self.embed_query(query)
         if not any(query_vec):
             return []
         fetch = max_results * 4 if source_name else max_results

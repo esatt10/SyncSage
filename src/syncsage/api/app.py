@@ -344,12 +344,20 @@ def _source_payload(
     return payload
 
 
+#: Edges expanded before anything else at each hop. `contains` is the
+#: directory/file hierarchy, and walking it first is what makes a bounded
+#: horizon show a *tree* rather than an arbitrary slice of a flat fan-out.
+HIERARCHY_EDGE_TYPES = ("contains",)
+
+
 def graph_neighbors(
     graph: SimpleMultiDiGraph,
     node_id: str,
     depth: int = 1,
     edge_types: list[str] | None = None,
     max_nodes: int | None = None,
+    exclude_edge_types: set[str] | None = None,
+    exclude_node_types: set[str] | None = None,
 ) -> dict:
     """Breadth-first neighbor expansion (mirrors SyncSageTools.get_graph_neighbors).
 
@@ -373,12 +381,28 @@ def graph_neighbors(
         current, current_depth, path = queue.popleft()
         if current_depth >= max_depth:
             continue
-        for _source, target, edge_map in graph.out_edges(current):
+        # Hierarchy first. A source node carries an `indexes` shortcut to every
+        # one of its artifacts, so a plain fan-out spends the whole budget
+        # jumping straight to files and the directory tree between them never
+        # gets walked — the parent/child structure is present in the graph but
+        # invisible in any bounded view of it.
+        for _source, target, edge_map in _hierarchy_first(graph.out_edges(current)):
             matching = [
-                data for data in edge_map.values() if not allowed or data.get("type") in allowed
+                data
+                for data in edge_map.values()
+                if (not allowed or data.get("type") in allowed)
+                and not (exclude_edge_types and data.get("type") in exclude_edge_types)
             ]
             if not matching:
                 continue
+            # Types the caller hides are pruned here rather than after the
+            # fetch: a concept-heavy graph otherwise spends the entire budget
+            # on nodes the view is about to discard, and the structure the
+            # caller actually asked for never fits.
+            if exclude_node_types:
+                target_type = graph.nodes.get(target, {}).get("type")
+                if target_type in exclude_node_types:
+                    continue
             next_depth = current_depth + 1
             edge_type_values = sorted({data.get("type") for data in matching if data.get("type")})
             neighbors.append(
@@ -400,15 +424,40 @@ def graph_neighbors(
     return {"node_id": node_id, "depth": depth, "neighbors": neighbors}
 
 
+def _edge_type_set(value: str | None) -> set[str] | None:
+    items = {item.strip() for item in (value or "").split(",") if item.strip()}
+    return items or None
+
+
+def _hierarchy_first(out_edges: list) -> list:
+    """Structural edges before shortcuts, order otherwise preserved."""
+
+    def rank(entry) -> int:
+        types = {data.get("type") for data in entry[2].values()}
+        return 0 if types & set(HIERARCHY_EDGE_TYPES) else 1
+
+    return sorted(out_edges, key=rank)
+
+
 def graph_slice(
     graph: SimpleMultiDiGraph,
     node_id: str,
     depth: int = 1,
     edge_types: list[str] | None = None,
     limit: int = 100,
+    exclude_edge_types: set[str] | None = None,
+    exclude_node_types: set[str] | None = None,
 ) -> dict:
     """Connected sub-graph around a node (mirrors SyncSageTools.get_graph_slice)."""
-    traversal = graph_neighbors(graph, node_id, depth, edge_types, max_nodes=limit)
+    traversal = graph_neighbors(
+        graph,
+        node_id,
+        depth,
+        edge_types,
+        max_nodes=limit,
+        exclude_edge_types=exclude_edge_types,
+        exclude_node_types=exclude_node_types,
+    )
     kept = traversal["neighbors"][:limit]
     node_ids = [node_id] + [item["node_id"] for item in kept]
     node_set = set(node_ids)
@@ -1078,9 +1127,16 @@ def create_app(
         node_id: str,
         depth: int = 1,
         edge_types: str | None = None,
+        exclude_edge_types: str | None = None,
     ) -> dict:
         types = [t for t in edge_types.split(",") if t] if edge_types else None
-        return graph_neighbors(engine.graph_builder.graph, node_id, depth, types)
+        return graph_neighbors(
+            engine.graph_builder.graph,
+            node_id,
+            depth,
+            types,
+            exclude_edge_types=_edge_type_set(exclude_edge_types),
+        )
 
     @app.get("/graph/slice")
     def graph_slice_route(
@@ -1088,9 +1144,27 @@ def create_app(
         depth: int = 1,
         limit: int = 100,
         edge_types: str | None = None,
+        exclude_edge_types: str | None = None,
+        exclude_types: str | None = None,
     ) -> dict:
+        """A bounded sub-graph around a node.
+
+        ``exclude_edge_types`` drops edges from the *traversal*, not just the
+        output — the canvas uses it to leave out `indexes`, the source→artifact
+        shortcut that otherwise flattens the directory tree out of any bounded
+        view of the graph.
+        """
+
         types = [t for t in edge_types.split(",") if t] if edge_types else None
-        return graph_slice(engine.graph_builder.graph, node_id, depth, types, limit)
+        return graph_slice(
+            engine.graph_builder.graph,
+            node_id,
+            depth,
+            types,
+            limit,
+            exclude_edge_types=_edge_type_set(exclude_edge_types),
+            exclude_node_types=_edge_type_set(exclude_types),
+        )
 
     @app.get("/nodes/explain")
     def explain_node(node_id: str) -> dict:
@@ -1497,13 +1571,11 @@ def create_app(
     @app.get("/overview")
     def overview() -> dict:
         graph_obj = engine.graph_builder.graph
-        counts: dict[str, int] = {}
-        # One pinned read: the counts, the totals below and has_content all
-        # describe the same graph even if a sync is running.
+        # One pinned read of aggregates the graph maintains on write. This
+        # used to walk every node to tally types on an endpoint the UI hits on
+        # every page load — seconds of latency for numbers already known.
         with graph_obj.reading():
-            for _node_id, attrs in graph_obj.nodes(data=True):
-                node_type = str(attrs.get("type") or "unknown")
-                counts[node_type] = counts.get(node_type, 0) + 1
+            counts = graph_obj.type_counts()
             total_nodes = graph_obj.number_of_nodes()
             total_links = graph_obj.number_of_edges()
         registered = SourceRegistry(config, state).list_sources()

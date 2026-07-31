@@ -475,11 +475,46 @@ select.text-input {
 
 .notebook {
   display: grid;
-  grid-template-columns: var(--rail, 280px) minmax(0, 1fr) var(--panel, 400px);
+  /* Panes are separated by drag handles, so the track list alternates
+     pane / resizer / pane / resizer / pane. */
+  grid-template-columns: var(--rail, 280px) 8px minmax(0, 1fr) 8px var(--panel, 400px);
   height: 100%;
-  gap: 12px;
+  gap: 6px;
   padding: 12px;
   background: var(--bg-sunken);
+}
+
+/* A hit area wider than the visible grip: a 2px line is precise to look at
+   and miserable to grab. */
+.resizer {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: col-resize;
+  touch-action: none;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  transition: background 120ms ease;
+}
+
+.resizer:hover,
+.resizer:focus-visible,
+.resizer--active {
+  background: color-mix(in srgb, var(--accent, #4a8fa8) 22%, transparent);
+  outline: none;
+}
+
+.resizer__grip {
+  width: 2px;
+  height: 34px;
+  border-radius: 2px;
+  background: var(--border);
+}
+
+.resizer:hover .resizer__grip,
+.resizer--active .resizer__grip {
+  background: var(--accent, #4a8fa8);
 }
 
 .notebook--no-rail {
@@ -768,6 +803,73 @@ select.text-input {
 
 .msg__answer li {
   margin-bottom: 5px;
+}
+
+/* Rich text: headings step down from the answer's own size rather than the
+   document's, so a model emitting `##` does not shout. */
+.msg__answer h3,
+.msg__answer h4,
+.msg__answer h5,
+.msg__answer h6 {
+  margin: 16px 0 8px;
+  line-height: 1.35;
+  font-weight: 650;
+}
+
+.msg__answer h3 { font-size: 16px; }
+.msg__answer h4 { font-size: 14.5px; }
+.msg__answer h5,
+.msg__answer h6 { font-size: 13.5px; color: var(--text-soft); }
+
+.msg__answer h3:first-child,
+.msg__answer h4:first-child {
+  margin-top: 0;
+}
+
+.msg__answer strong {
+  font-weight: 650;
+}
+
+.msg__answer blockquote {
+  margin: 0 0 12px;
+  padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--border);
+  color: var(--text-soft);
+}
+
+.msg__answer hr {
+  margin: 16px 0;
+  border: none;
+  border-top: 1px solid var(--border);
+}
+
+.msg__answer a {
+  color: var(--accent, #1f6f8b);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* Code blocks scroll inside themselves — a long line must never widen the
+   chat pane and force the whole workspace to scroll sideways. */
+.answer-code {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 8px);
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.answer-code code {
+  display: block;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre;
 }
 
 .msg__answer code {

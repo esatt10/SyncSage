@@ -34,6 +34,17 @@ export interface HorizonOptions {
   enabled?: boolean;
 }
 
+/**
+ * Edges left out of the walk.
+ *
+ * `indexes` runs from a source straight to every artifact it holds, bypassing
+ * the directory tree. Walking it inside a bounded horizon means the budget is
+ * spent leaping to files, and the directory→file structure — which is present
+ * in the graph — never appears. Excluding it makes the canvas show the tree;
+ * the files are still one hop from their directory.
+ */
+const SHORTCUT_EDGE_TYPES = ["indexes"];
+
 /** Neighbours per slice. Generous for one center, tighter when unioning many. */
 const SINGLE_CENTER_LIMIT = 500;
 const PER_ANSWER_NODE_LIMIT = 150;
@@ -75,7 +86,14 @@ export function useHorizonGraph(options: HorizonOptions) {
       const slices = await Promise.all(
         targets.map((nodeId) =>
           api
-            .graphSlice(nodeId, depth, { limit })
+            .graphSlice(nodeId, depth, {
+              limit,
+              excludeEdgeTypes: SHORTCUT_EDGE_TYPES,
+              // Hidden types are pruned during the walk, not after it — the
+              // budget has to reach the structure, not be spent on nodes this
+              // view is about to drop.
+              excludeTypes: hiddenTypes,
+            })
             // One unreachable center must not blank the canvas.
             .catch(() => ({ node_id: nodeId, depth, nodes: [], links: [], depths: {} })),
         ),

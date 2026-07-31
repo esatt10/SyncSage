@@ -5,6 +5,27 @@ from collections import defaultdict
 from typing import Any
 
 
+def _search_blob(attrs: dict[str, Any]) -> str:
+    """Every attribute value of a node, lowercased into one searchable string.
+
+    A superset of what the scorer reads, deliberately: the blob is only ever
+    used to *reject* nodes that cannot match, so covering extra fields can
+    only cost a little scoring work, never a missed hit.
+    """
+
+    parts = []
+    for value in attrs.values():
+        if value is None or isinstance(value, bool):
+            continue
+        if isinstance(value, (str, int, float)):
+            parts.append(str(value))
+        elif isinstance(value, (list, tuple, set)):
+            parts.extend(str(item) for item in value)
+        elif isinstance(value, dict):
+            parts.extend(str(item) for item in value.values())
+    return " ".join(parts).lower()
+
+
 class NodeView:
     def __init__(self, graph):
         self.graph = graph
@@ -56,6 +77,17 @@ class SimpleMultiDiGraph:
         # Re-entrant: the writer path nests reads inside writes (upsert_node
         # reads created_at, graph_store.save serializes) on the same thread.
         self._lock = threading.RLock()
+        # Running aggregates. Summing 850k edge buckets or re-counting 240k
+        # node types per request was costing seconds on endpoints the UI polls;
+        # maintaining them on write makes those reads O(1).
+        self._edge_count = 0
+        self._type_counts: dict[str, int] = {}
+        # Lowercased concatenation of every node attribute value, built on
+        # write. Graph-mode search can only score a node above zero if a query
+        # token appears somewhere in its text, so this lets a query reject the
+        # overwhelming majority of nodes with one substring test instead of
+        # stringifying and weighting every attribute of every node.
+        self._search_blobs: dict[str, str] = {}
         self.nodes = NodeView(self)
 
     def reading(self):
@@ -79,29 +111,53 @@ class SimpleMultiDiGraph:
 
     def add_node(self, node, **attrs):
         with self._lock:
-            self._nodes[node] = {**self._nodes.get(node, {}), **attrs}
+            existing = self._nodes.get(node)
+            merged = {**(existing or {}), **attrs}
+            self._nodes[node] = merged
+            self._retype(existing.get("type") if existing else None, merged.get("type"))
+            self._search_blobs[node] = _search_blob(merged)
 
     def add_edge(self, source, target, **attrs):
         with self._lock:
             data = self._edges[(source, target)]
             data[len(data)] = attrs
+            self._edge_count += 1
             self._out.setdefault(source, {})[target] = None
+
+    def _retype(self, old: Any, new: Any) -> None:
+        """Keep the per-type tally in step with a node write. Lock held."""
+
+        if old == new:
+            return
+        if old is not None:
+            remaining = self._type_counts.get(str(old), 0) - 1
+            if remaining > 0:
+                self._type_counts[str(old)] = remaining
+            else:
+                self._type_counts.pop(str(old), None)
+        if new is not None:
+            self._type_counts[str(new)] = self._type_counts.get(str(new), 0) + 1
 
     def remove_nodes_from(self, nodes):
         remove = set(nodes)
         with self._lock:
             for node in remove:
-                self._nodes.pop(node, None)
+                existing = self._nodes.pop(node, None)
+                if existing is not None:
+                    self._retype(existing.get("type"), None)
+                self._search_blobs.pop(node, None)
                 self._out.pop(node, None)
             for edge in list(self._edges):
                 if edge[0] in remove or edge[1] in remove:
-                    self._edges.pop(edge, None)
+                    dropped = self._edges.pop(edge, None)
+                    self._edge_count -= len(dropped or ())
                     self._drop_adjacency(*edge)
 
     def remove_edges_from(self, edges):
         with self._lock:
             for source, target in edges:
-                self._edges.pop((source, target), None)
+                dropped = self._edges.pop((source, target), None)
+                self._edge_count -= len(dropped or ())
                 self._drop_adjacency(source, target)
 
     def _drop_adjacency(self, source: str, target: str) -> None:
@@ -152,8 +208,44 @@ class SimpleMultiDiGraph:
         return len(self._nodes)
 
     def number_of_edges(self):
+        return self._edge_count
+
+    def type_counts(self) -> dict[str, int]:
+        """Node count per type, maintained on write (was a full scan)."""
+
         with self._lock:
-            return sum(len(v) for v in self._edges.values())
+            return dict(self._type_counts)
+
+    # --- lock-held iteration ------------------------------------------------
+    # Snapshots are the safe default, but copying 240k nodes / 850k edges per
+    # request cost seconds on the endpoints the canvas polls. These hand back
+    # the live mappings for callers that hold ``reading()`` for the whole walk
+    # — no copying, and the writer still cannot mutate underneath them.
+
+    def iter_nodes(self):
+        """``(node_id, attrs)`` pairs. Caller MUST hold ``reading()``."""
+
+        return self._nodes.items()
+
+    def search_blobs(self):
+        """Live id→searchable-text mapping. Caller MUST hold ``reading()``."""
+
+        return self._search_blobs
+
+    def node_map(self):
+        """The live id→attrs mapping. Caller MUST hold ``reading()``.
+
+        For lock-held scans that look up many nodes: going through
+        ``nodes.get`` re-acquires the lock per lookup, which is measurable
+        when the scan touches every edge endpoint.
+        """
+
+        return self._nodes
+
+    def iter_edges(self):
+        """``((source, target), {key: attrs})``. Caller MUST hold ``reading()``."""
+
+        return self._edges.items()
 
     def to_node_link(self):
         with self._lock:

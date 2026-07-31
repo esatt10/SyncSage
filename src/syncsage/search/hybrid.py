@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from syncsage.graph.simple import SimpleMultiDiGraph
@@ -52,14 +53,39 @@ class HybridSearch:
         graph_results: list[dict[str, Any]] = []
         vector_results: list[dict[str, Any]] = []
 
+        # The three retrievers are independent, and in hybrid mode their costs
+        # are wildly different — a graph scan and a vector query that waits on
+        # a remote embedding have no reason to queue behind each other. Running
+        # them together makes hybrid cost about as much as its slowest arm
+        # instead of the sum of all three. Each is I/O or read-only work, so
+        # threads are enough (SQLite reads release the GIL; the embedder is a
+        # network call).
+        jobs: dict[str, Any] = {}
         if mode in {"hybrid", "text"}:
-            text_results = self.store.search(query, source_name=source_name, max_results=fetch_n)
+            jobs["text"] = lambda: self.store.search(
+                query, source_name=source_name, max_results=fetch_n
+            )
         # Graph search needs the live graph; callers that don't supply one
         # (e.g. CLI/MCP search_context) transparently fall back to text search.
         if mode in {"hybrid", "graph"} and graph is not None:
-            graph_results = search_graph(graph, query, max_results=fetch_n, source_name=source_name)
+            jobs["graph"] = lambda: search_graph(
+                graph, query, max_results=fetch_n, source_name=source_name
+            )
         if mode in {"hybrid", "vector"} and self.vector is not None:
-            vector_results = self.vector.search(query, source_name=source_name, max_results=fetch_n)
+            jobs["vector"] = lambda: self.vector.search(
+                query, source_name=source_name, max_results=fetch_n
+            )
+
+        if len(jobs) == 1:
+            name, job = next(iter(jobs.items()))
+            collected = {name: job()}
+        else:
+            with ThreadPoolExecutor(max_workers=len(jobs) or 1) as pool:
+                futures = {name: pool.submit(job) for name, job in jobs.items()}
+                collected = {name: future.result() for name, future in futures.items()}
+        text_results = collected.get("text", [])
+        graph_results = collected.get("graph", [])
+        vector_results = collected.get("vector", [])
 
         if enforced:
             from syncsage.security.acl import expand_principal, is_allowed

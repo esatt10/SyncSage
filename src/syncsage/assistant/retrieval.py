@@ -334,9 +334,7 @@ class SyncSageRetriever:
 
         node_counts: dict[str, int] = {}
         if self.graph is not None:
-            for _node_id, attrs in self.graph.nodes(data=True):
-                node_type = str(attrs.get("type") or "unknown")
-                node_counts[node_type] = node_counts.get(node_type, 0) + 1
+            node_counts = self.graph.type_counts()
 
         return RetrievalCapabilities(
             knowledge_base=self.knowledge_base,
