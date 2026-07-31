@@ -76,6 +76,21 @@ export interface SourceRecord {
   [key: string]: unknown;
 }
 
+export interface SourceTypeInfo {
+  id: string;
+  label: string;
+  description: string;
+  /** "required" — the connector reads this path; "unused" — schema ceremony. */
+  path_role: "required" | "unused";
+  builtin: boolean;
+}
+
+export interface SourceTypeCatalog {
+  types: SourceTypeInfo[];
+  /** What to send as `path` for a type whose path_role is "unused". */
+  placeholder_path: string;
+}
+
 export interface SourceWritePayload {
   name?: string;
   type?: string;
@@ -228,6 +243,73 @@ export interface GraphFact {
   confidence?: number;
 }
 
+/** One recorded step of an agent workflow, for the "what did it do" trace. */
+export interface WorkflowStep {
+  name: string;
+  detail: string;
+  passages: number;
+}
+
+export interface WorkflowInfo {
+  name: string;
+  label: string;
+  description: string;
+  builtin: boolean;
+}
+
+export interface WorkflowCatalog {
+  workflows: WorkflowInfo[];
+  configured: string;
+  /** What would actually run right now, after resolving "auto". */
+  active: string;
+  agent_extra_installed: boolean;
+  options: Record<string, unknown>;
+  option_defaults: Record<string, Record<string, unknown>>;
+}
+
+export interface EmbeddingsProvider {
+  id: string;
+  label: string;
+  needs_key: boolean;
+  description: string;
+}
+
+/** A vector backend, with whether its optional dependency is installed here. */
+export interface VectorStoreProvider {
+  id: string;
+  label: string;
+  available: boolean;
+  hint: string | null;
+}
+
+export interface EmbeddingsStatus {
+  enabled: boolean;
+  /** Config says on AND a usable indexer was actually built. */
+  active: boolean;
+  provider: string;
+  model: string;
+  base_url: string;
+  api_key_env: string;
+  api_key_present: boolean;
+  dimensions: number;
+  batch_size: number;
+  store_provider: string;
+  store_path: string;
+  vector_count: number;
+  chunk_count: number;
+  /** Fraction of indexed passages that have a vector. */
+  coverage: number;
+  dimensions_on_disk: number | null;
+  store_error: string | null;
+  providers: EmbeddingsProvider[];
+  store_providers: VectorStoreProvider[];
+  wrote_config?: boolean;
+  vectors_invalidated?: boolean;
+  reindex?: { embedded_chunks: number; artifacts_scanned: number; vector_count: number };
+  embedded_chunks?: number;
+  artifacts_scanned?: number;
+}
+
 export interface ChatAnswer {
   question: string;
   answer: string;
@@ -241,6 +323,10 @@ export interface ChatAnswer {
   focus_node_ids: string[];
   search_mode: string;
   counts: Record<string, number>;
+  /** Which workflow produced this answer. */
+  workflow?: string;
+  /** The agent's trace; empty for the single-pass workflow. */
+  steps?: WorkflowStep[];
 }
 
 export interface McpToolSummary {

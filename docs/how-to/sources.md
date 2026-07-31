@@ -5,6 +5,17 @@ Sources are the inputs SyncSage indexes. They live under `sources:` in your
 (`register_source`) and later promoted to durable config
 (`promote_runtime_source_to_config`).
 
+Three routes reach the same place, so pick whichever fits:
+
+- **One command / one field.** `syncsage up <target>` — or **+ Add source**
+  in the UI, or `POST /sources/quick-add` — takes a path, a git URL, a glob
+  or a connector name, detects what it is, names it, registers it and syncs
+  it. Nothing else to fill in.
+- **The form.** **Sources → Advanced…** in the UI exposes every field on this
+  page, with the type list read from `GET /sources/types` so installed
+  connector plugins appear automatically.
+- **The file.** Everything below.
+
 ## Source types
 
 | Type | Indexes |
@@ -37,7 +48,10 @@ config:
 sources:
   - name: team-notion
     type: notion
-    path: /unused            # required by the schema; Notion ignores it
+    path: /unused            # required by the schema; Notion ignores it.
+                             # Registering through the API or the UI form
+                             # fills this in for you — service-backed types
+                             # have `path_role: unused` in /sources/types.
     include: []
     connector:
       api_key_env: NOTION_TOKEN   # default; name of the env var

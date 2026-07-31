@@ -308,6 +308,49 @@ class SyncSageTools:
             security=self.config.security,
         )
 
+    def ask_knowledge_base(
+        self,
+        knowledge_base: str,
+        question: str,
+        workflow: str | None = None,
+        mode: str = "hybrid",
+        max_results: int = 8,
+        source_name: str | None = None,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
+        options: dict | None = None,
+    ) -> dict:
+        """Answer a question from the knowledge base, with citations and graph facts.
+
+        Runs the configured question-answering workflow — by default the
+        LangGraph agent when the ``[agent]`` extra is installed and a model
+        is reachable, otherwise a single retrieval pass. Prefer this over
+        ``search_context`` when you want a synthesized answer rather than
+        raw passages to reason over yourself; the returned ``steps`` show
+        what the agent actually did.
+
+        With no model configured the answer is extractive (the retrieved
+        passages, attributed), so this is always safe to call.
+        """
+        from syncsage.assistant.chat import answer_question
+
+        self._require_knowledge_base(knowledge_base)
+        return answer_question(
+            question,
+            search=self.searcher,
+            knowledge_base=knowledge_base or self.config.knowledge_base_id,
+            config=self.config,
+            graph=self.engine.graph_builder.graph,
+            state=self.state,
+            mode=mode,
+            max_results=max_results,
+            source_name=source_name,
+            principal=principal,
+            principal_groups=principal_groups,
+            workflow=workflow,
+            options=options,
+        )
+
     def get_relevant_files(
         self,
         knowledge_base: str,

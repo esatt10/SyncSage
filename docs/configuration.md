@@ -259,12 +259,36 @@ default and works fully offline.
 | `max_output_tokens` | int | `4096` | Per-answer output cap sent to the provider. |
 | `request_timeout_seconds` | float | `90.0` | Provider HTTP timeout. A timeout degrades to the extractive answer rather than erroring. |
 | `max_facts` | int | `12` | Graph facts surfaced per answer, collected round-robin across the cited sources. |
+| `workflow` | str | `auto` | Which agent workflow answers a question: `auto` \| `simple` \| `agentic` \| any registered plugin name. `auto` = `agentic` when the `[agent]` extra is installed *and* a model is reachable, else `simple`. An unknown or failing workflow degrades to `simple` with the reason attached to the answer. |
+| `workflow_options` | dict | `{}` | Per-workflow tuning, keyed by workflow name, merged over that workflow's defaults. Callers may override any key per request. |
 
 **The key never lands in config.** Both routes are indirections: an
 environment variable *name* here, or a runtime token in the browser. Nothing
 in this file is a secret.
 
-See the how-to guide: [Ask your knowledge base](how-to/chat-and-ui.md).
+The `agentic` workflow is a LangGraph state graph (plan → retrieve → expand →
+grade → synthesize → verify) and needs the optional extra:
+
+```bash
+pip install 'syncsage[agent]'
+```
+
+```yaml
+assistant:
+  workflow: agentic
+  workflow_options:
+    agentic:
+      max_rounds: 3
+      retrieval_modes: [hybrid, vector, graph]
+      expand_depth: 2
+```
+
+Third-party workflows register under the `syncsage.agent_workflows`
+entry-point group, the same plugin shape as the
+[Connector SDK](reference/connector-sdk.md).
+
+See the how-to guides: [Ask your knowledge base](how-to/chat-and-ui.md) and
+[Customize the answering workflow](how-to/agent-workflows.md).
 
 ---
 
@@ -275,7 +299,7 @@ Each source item supports:
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `name` | string | none | Unique source id/name. |
-| `type` | enum | `single_file` | One of `repository`, `markdown_folder`, `obsidian_vault`, `document_folder`, `web_collection`, `single_file`, `s3`, `api`. |
+| `type` | enum \| plugin name | `single_file` | One of `repository`, `markdown_folder`, `obsidian_vault`, `document_folder`, `web_collection`, `single_file`, `s3`, `api` — or any installed connector plugin (`notion`, `gdrive`, `slack`, `confluence`, `imap`, or your own). `GET /sources/types` lists what this deployment accepts. |
 | `path` | absolute path | none | Filesystem path for source root (or file). |
 | `description` | string/null | null | Human-readable context for operators. |
 | `enabled` | bool | `true` | Disable without deleting config. |

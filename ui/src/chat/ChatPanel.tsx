@@ -18,6 +18,8 @@ interface ChatPanelProps {
   sessionId: string | null;
   /** Restrict retrieval to one source, or null for the whole knowledge base. */
   sourceFilter: string | null;
+  /** Per-request workflow override, or null to use the configured default. */
+  workflow: string | null;
   hasContent: boolean;
   onAnswer: (answer: ChatAnswer) => void;
   onCitationClick: (nodeId: string | undefined) => void;
@@ -34,6 +36,7 @@ export function ChatPanel({
   status,
   sessionId,
   sourceFilter,
+  workflow,
   hasContent,
   onAnswer,
   onCitationClick,
@@ -50,6 +53,7 @@ export function ChatPanel({
         question,
         session_id: sessionId,
         source_name: sourceFilter,
+        workflow,
       }),
     onSuccess: (answer, question) => {
       setTurns((prev) =>
@@ -136,7 +140,10 @@ export function ChatPanel({
             ) : (
               <div className="msg">
                 <span className="thinking">
-                  <span className="spinner" /> Searching your sources…
+                  <span className="spinner" />{" "}
+                  {workflow === "simple"
+                    ? "Searching your sources…"
+                    : "Planning, searching and checking the evidence…"}
                 </span>
               </div>
             )}
@@ -194,6 +201,35 @@ export function ChatPanel({
   );
 }
 
+/**
+ * What the agent actually did.
+ *
+ * Collapsed by default — the answer is the product — but one click away,
+ * because "it searched three times and walked the graph" is the difference
+ * between trusting a slow answer and assuming it hung.
+ */
+function AgentTrace({ steps }: { steps: NonNullable<ChatAnswer["steps"]> }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="trace">
+      <button className="trace__toggle" onClick={() => setOpen((v) => !v)}>
+        {open ? "\u25be" : "\u25b8"} {steps.length} steps
+      </button>
+      {open ? (
+        <ol className="trace__list">
+          {steps.map((step, index) => (
+            <li key={`${step.name}-${index}`}>
+              <span className="trace__name">{step.name}</span>
+              <span className="trace__detail">{step.detail}</span>
+              {step.passages > 0 ? <span className="trace__count">{step.passages}</span> : null}
+            </li>
+          ))}
+        </ol>
+      ) : null}
+    </div>
+  );
+}
+
 function AnswerTurn({
   answer,
   onCitationClick,
@@ -213,7 +249,9 @@ function AnswerTurn({
       {answer.citations.length > 0 ? (
         <SourceStrip citations={answer.citations} onSelect={onCitationClick} />
       ) : null}
+      {answer.steps && answer.steps.length > 1 ? <AgentTrace steps={answer.steps} /> : null}
       <div className="msg__meta">
+        {answer.workflow ? <span className="pill">{answer.workflow}</span> : null}
         {answer.mode === "llm" ? (
           <span>
             {answer.provider}

@@ -1685,3 +1685,92 @@ select.text-input {
     display: none;
   }
 }
+
+/* ---------------------------------------------------------- agent trace */
+
+.trace {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.trace__toggle {
+  align-self: flex-start;
+  border: none;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  font-size: 11.5px;
+  color: var(--muted);
+  font-family: inherit;
+}
+
+.trace__toggle:hover {
+  color: var(--text-soft);
+}
+
+.trace__list {
+  margin: 0;
+  padding: 8px 10px;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-sunken);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  counter-reset: trace;
+}
+
+.trace__list li {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 11.5px;
+}
+
+.trace__name {
+  color: var(--accent-text);
+  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.trace__detail {
+  color: var(--text-soft);
+  overflow-wrap: anywhere;
+}
+
+.trace__count {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --------------------------------------------------------------- meters */
+
+.meter {
+  height: 7px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.meter__fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+
+.field-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.button-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}

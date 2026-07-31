@@ -21,10 +21,13 @@ sync, so re-indexing unchanged content stays byte-for-byte deterministic.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
-from syncsage.assistant.providers import PROVIDERS, ProviderError, complete
+from syncsage.assistant.providers import PROVIDERS
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are SyncSage, a research assistant answering strictly from a \
 user's own indexed knowledge base.
@@ -119,6 +122,49 @@ def build_citations(results: list[dict], limit: int) -> list[dict]:
     return citations
 
 
+def passages_to_citations(passages: list, limit: int) -> list[dict]:
+    """Numbered citation records from :class:`retrieval.Passage` objects.
+
+    The workflow-facing twin of :func:`build_citations` — same output shape,
+    so the API contract does not change with the workflow that produced it.
+    """
+    citations: list[dict] = []
+    seen: set[str] = set()
+    for passage in passages:
+        if len(citations) >= limit:
+            break
+        key = passage.key()
+        if key in seen:
+            continue
+        seen.add(key)
+        citations.append(
+            {
+                "index": len(citations) + 1,
+                "node_id": passage.node_id,
+                "chunk_id": passage.chunk_id,
+                "title": passage.title,
+                "relative_path": passage.relative_path,
+                "source_id": passage.source_id,
+                "type": passage.type,
+                "score": passage.score,
+                "snippet": passage.snippet,
+                # How this passage was found — direct hit in some search mode,
+                # or reached by walking the graph out of one.
+                "retrieved_by": passage.mode,
+                "used": False,
+            }
+        )
+    return citations
+
+
+def mark_used_citations(answer: str, citations: list[dict]) -> set[int]:
+    """Flag the citations an answer actually cited. Returns the indices."""
+    used = {int(n) for n in _CITATION_RE.findall(answer) if n.isdigit()}
+    for citation in citations:
+        citation["used"] = citation["index"] in used
+    return used
+
+
 def collect_facts(graph: Any, node_ids: list[str], limit: int = 12) -> list[dict]:
     """One-hop subject–predicate–object triples around the cited nodes.
 
@@ -202,7 +248,7 @@ def collect_facts(graph: Any, node_ids: list[str], limit: int = 12) -> list[dict
     return facts
 
 
-def _short_reason(error: str) -> str:
+def short_reason(error: str) -> str:
     """One clause of a provider error, for the user-facing degraded answer."""
     first = error.strip().splitlines()[0]
     return first if len(first) <= 120 else first[:117].rstrip() + "…"
@@ -227,7 +273,7 @@ def build_prompt(question: str, citations: list[dict], facts: list[dict]) -> str
     return "\n".join(lines)
 
 
-def _extractive_answer(question: str, citations: list[dict], reason: str | None = None) -> str:
+def extractive_answer(question: str, citations: list[dict], reason: str | None = None) -> str:
     """Deterministic offline answer: the top passages, attributed.
 
     ``reason`` distinguishes the two ways to land here — no model configured,
@@ -314,6 +360,7 @@ def answer_question(
     knowledge_base: str,
     config: Any,
     graph: Any = None,
+    state: Any = None,
     credential: Any = None,
     env: dict[str, str] | None = None,
     mode: str = "hybrid",
@@ -321,76 +368,84 @@ def answer_question(
     source_name: str | None = None,
     principal: str | None = None,
     principal_groups: list[str] | None = None,
+    workflow: str | None = None,
+    options: dict | None = None,
 ) -> dict:
-    """Answer ``question`` from the knowledge base, with citations and facts."""
+    """Answer ``question`` from the knowledge base, with citations and facts.
+
+    This is the single entry point behind the UI chat panel, ``POST
+    /assistant/chat`` and the MCP ``ask_knowledge_base`` tool. It resolves a
+    credential, builds the retrieval toolbelt, and hands both to the selected
+    :mod:`~syncsage.assistant.workflows` workflow — so which workflow runs is
+    a configuration choice, not a code path.
+    """
     import os
+
+    from syncsage.assistant.llm import llm_from_selection
+    from syncsage.assistant.retrieval import SyncSageRetriever
+    from syncsage.assistant.workflows import (
+        WorkflowRequest,
+        build_workflow,
+        resolve_workflow_name,
+    )
 
     settings = getattr(config, "assistant", None)
     env = env if env is not None else dict(os.environ)
     max_results = max_results or int(getattr(settings, "max_context_chunks", 8) or 8)
-    max_facts = int(getattr(settings, "max_facts", 12) or 12)
-
-    payload = search.search_context(
-        knowledge_base,
-        question,
-        mode,
-        max_results,
-        source_name,
-        graph=graph,
-        principal=principal,
-        principal_groups=principal_groups,
-        security=getattr(config, "security", None),
-    )
-    results = payload.get("results", [])
-    citations = build_citations(results, max_results)
-    node_ids = [c["node_id"] for c in citations if c.get("node_id")]
-    facts = collect_facts(graph, node_ids, max_facts)
 
     selected = resolve_provider(config, credential, env)
-    answer_mode = "extractive"
-    provider_id: str | None = None
-    model: str | None = None
-    error: str | None = None
+    llm = llm_from_selection(selected, settings)
+    retriever = SyncSageRetriever(
+        search=search,
+        knowledge_base=knowledge_base,
+        graph=graph,
+        state=state,
+        config=config,
+    )
 
-    if selected is not None and citations:
-        spec = PROVIDERS.get(selected["provider"])
-        provider_id = selected["provider"]
-        model = selected.get("model") or (spec.default_model if spec else None)
-        try:
-            answer = complete(
-                selected["provider"],
-                api_key=selected["api_key"],
-                system=SYSTEM_PROMPT,
-                prompt=build_prompt(question, citations, facts),
-                model=selected.get("model"),
-                base_url=selected.get("base_url"),
-                max_output_tokens=int(getattr(settings, "max_output_tokens", 4096) or 4096),
-                timeout=float(getattr(settings, "request_timeout_seconds", 90.0) or 90.0),
-            )
-            answer_mode = "llm"
-        except ProviderError as exc:
-            # Degrade to the extractive answer rather than failing the request:
-            # the retrieval result is still worth showing.
-            error = str(exc)
-            answer = _extractive_answer(question, citations, reason=_short_reason(error))
-    else:
-        answer = _extractive_answer(question, citations)
+    name = resolve_workflow_name(
+        workflow or getattr(settings, "workflow", "auto"), has_llm=llm is not None
+    )
+    merged_options = {
+        "max_facts": int(getattr(settings, "max_facts", 12) or 12),
+        **(dict(getattr(settings, "workflow_options", None) or {})),
+        **(options or {}),
+    }
+    request = WorkflowRequest(
+        question=question,
+        mode=mode,
+        max_results=max_results,
+        source_name=source_name,
+        principal=principal,
+        principal_groups=principal_groups or [],
+        options=merged_options,
+    )
 
-    used = {int(n) for n in _CITATION_RE.findall(answer) if n.isdigit()}
-    for citation in citations:
-        citation["used"] = citation["index"] in used
+    try:
+        result = build_workflow(name).run(request, retriever, llm)
+    except Exception as exc:  # a custom workflow must not take down the API
+        logger.exception("assistant workflow %r failed; falling back to simple", name)
+        from syncsage.assistant.workflows.simple import SimpleWorkflow
+
+        result = SimpleWorkflow().run(request, retriever, llm)
+        result.error = f"workflow {name!r} failed ({exc}); answered with the simple workflow"
 
     return {
         "question": question,
-        "answer": answer,
-        "mode": answer_mode,
-        "provider": provider_id,
-        "model": model,
+        "answer": result.answer,
+        "mode": result.mode,
+        "provider": result.provider,
+        "model": result.model,
         "credential_source": selected.get("source") if selected else None,
-        "error": error,
-        "citations": citations,
-        "facts": facts,
-        "focus_node_ids": node_ids,
-        "search_mode": payload.get("mode", mode),
-        "counts": payload.get("counts", {}),
+        "error": result.error,
+        "citations": result.citations,
+        "facts": result.facts,
+        "focus_node_ids": result.focus_node_ids,
+        "search_mode": result.search_mode,
+        "counts": result.counts,
+        "workflow": result.workflow,
+        "steps": [
+            {"name": step.name, "detail": step.detail, "passages": step.passages}
+            for step in result.steps
+        ],
     }

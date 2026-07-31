@@ -24,12 +24,14 @@ Legend: — means "not offered on this surface"; use one of the others.
 | Capability | CLI | HTTP | Web UI | MCP |
 |---|---|---|---|---|
 | List knowledge bases | — | `GET /knowledge-bases` | — | `list_knowledge_bases` |
-| List sources | — | `GET /sources` | Source manager | `list_sources` |
-| Register a source | (edit YAML) | `POST /sources` | Add-a-local-directory | `register_source` |
-| Update a source | (edit YAML) | `PUT /sources/{id}` | Source manager | — |
-| Disable a source | (edit YAML) | `POST /sources/{id}/disable` | Source manager | `disable_source` |
-| Remove a source | (edit YAML) | `DELETE /sources/{id}` | Source manager | `remove_source` |
-| Promote runtime source to config | — | `POST /sources/{id}/promote` | — | `promote_runtime_source_to_config` |
+| List sources | — | `GET /sources` | Sources page | `list_sources` |
+| Set up from one target (path/URL/glob) | `syncsage up <target>…` | `POST /sources/quick-add` | Sources → **+ Add source** | — |
+| List registerable source types (built-in + plugins) | — | `GET /sources/types` | Sources → Advanced… (type picker) | — |
+| Register a source (full schema) | (edit YAML) | `POST /sources` | Sources → **Advanced…** | `register_source` |
+| Update a source | (edit YAML) | `PUT /sources/{id}` | Sources → edit | — |
+| Disable a source | (edit YAML) | `POST /sources/{id}/disable` | Sources page | `disable_source` |
+| Remove a source | (edit YAML) | `DELETE /sources/{id}` | Sources page | `remove_source` |
+| Promote runtime source to config | — | `POST /sources/{id}/promote` | Sources → promote | `promote_runtime_source_to_config` |
 | Sync one source | `syncsage sync --source <name>` | `POST /sync/{id}` | Source manager | `sync_source` |
 | Sync all sources | `syncsage sync --all` | `POST /sync` | Source manager | `sync_all` |
 | Repair state | `syncsage repair`, `syncsage sync --mode repair` | `POST /sync` (mode) | — | — |
@@ -40,21 +42,32 @@ Legend: — means "not offered on this surface"; use one of the others.
 
 | Capability | CLI | HTTP | Web UI | MCP |
 |---|---|---|---|---|
-| Search (text/graph/vector/hybrid) | — | `POST /search` | Search box | `search_context` |
+| Search (text/graph/vector/hybrid) | — | `POST /search` | Search page | `search_context` |
+| Ask a question (grounded answer + citations + facts) | — | `POST /assistant/chat` | Chat pane | `ask_knowledge_base` |
+| List answering workflows | — | `GET /assistant/workflows` | Chat → **Workflow** | — |
+| Supply an LLM key for a session | — | `POST /assistant/key` | Chat → **Connect model** | — |
 | Relevant files for a task | — | `POST /relevant-files` | — | `get_relevant_files` |
 | File summary | — | `GET /files/summary` | Node inspector | `get_file_summary` |
 | Repo map | — | `GET /sources/{id}/repo-map` | — | `get_repo_map` |
 | Node content | — | `GET /nodes/content` | Node inspector | — |
-| Explain a node | — | `GET /nodes/explain` | Explain mode | `explain_node` |
-| Graph neighbors | — | `GET /graph/neighbors` | Graph workspace | `get_graph_neighbors` |
-| Browse filesystem | — | `GET /fs/list` | Add-a-local-directory | — |
+| Explain a node | — | `GET /nodes/explain` | — | `explain_node` |
+| Graph neighbors | — | `GET /graph/neighbors` | Knowledge panel | `get_graph_neighbors` |
+| Browse filesystem | — | `GET /fs/list` | Sources → Advanced… | — |
+
+## Semantic search (embeddings)
+
+| Capability | CLI | HTTP | Web UI | MCP |
+|---|---|---|---|---|
+| Inspect embeddings status + coverage | — | `GET /search/embeddings` | Settings → Semantic search | — |
+| Enable / configure embeddings | (edit YAML) | `PUT /search/embeddings` | Settings → Semantic search | — |
+| Embed already-indexed content | `syncsage sync --mode full` | `POST /search/embeddings/reindex` | **Build missing vectors** | — |
 
 ## Visualization
 
 | Capability | CLI | HTTP | Web UI | MCP |
 |---|---|---|---|---|
-| Full graph | — | `GET /graph` | Cytoscape graph workspace | — |
-| Graph slice (around a node) | — | `GET /graph/slice` | Drill-into sub-network | — |
+| Full graph (type / source filtered) | — | `GET /graph` | Knowledge panel + legend filter | — |
+| Graph slice (around a node) | — | `GET /graph/slice` | Click a citation or node | — |
 | Export node-link JSON | — | `GET /graph/export/node-link-json` | — | — |
 | Export Cytoscape JSON | — | `GET /graph/export/cytoscape-json` | — | — |
 | Obsidian projection | — | `POST /obsidian/export` | — | `export_obsidian_notes` |
@@ -75,6 +88,7 @@ Routing, fan-out, merge, and global cross-region search live on the **router**
 
 | Capability | CLI |
 |---|---|
+| Host a configured container (+ UI) for targets | `syncsage host <target>…` |
 | Start HTTP API + MCP | `syncsage start` |
 | Serve (container entrypoint) | `syncsage serve` |
 | Standalone MCP server | `syncsage mcp --transport stdio\|streamable-http\|sse` |

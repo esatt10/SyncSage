@@ -2,6 +2,7 @@ import type {
   AssistantStatus,
   ChatAnswer,
   ConfigResponse,
+  EmbeddingsStatus,
   ExplainResponse,
   FsListing,
   GraphSlice,
@@ -13,8 +14,10 @@ import type {
   SearchMode,
   SearchResponse,
   SourceRecord,
+  SourceTypeCatalog,
   SourceWritePayload,
   SyncResult,
+  WorkflowCatalog,
 } from "./types";
 
 // In dev, requests go to `/api/*` which Vite proxies to the SyncSage container.
@@ -99,6 +102,8 @@ export const api = {
 
   // Sources
   sources: () => request<SourceRecord[]>("/sources"),
+  /** Every type this deployment accepts — built-ins plus installed plugins. */
+  sourceTypes: () => request<SourceTypeCatalog>("/sources/types"),
   /** One-field source creation: a path, URL, glob or connector name. */
   quickAdd: (body: { target: string; name?: string; split?: boolean; sync_now?: boolean }) =>
     request<QuickAddResponse>("/sources/quick-add", {
@@ -163,16 +168,44 @@ export const api = {
     request<{ revoked: boolean }>(`/assistant/key${qs({ session_id: sessionId })}`, {
       method: "DELETE",
     }),
+  /** Every question-answering workflow this deployment can run. */
+  workflows: () => request<WorkflowCatalog>("/assistant/workflows"),
   chat: (body: {
     question: string;
     session_id?: string | null;
     mode?: string;
     max_results?: number;
     source_name?: string | null;
+    workflow?: string | null;
+    options?: Record<string, unknown>;
   }) =>
     request<ChatAnswer>("/assistant/chat", {
       method: "POST",
       body: JSON.stringify(body),
+    }),
+
+  // Semantic search (embeddings)
+  embeddings: () => request<EmbeddingsStatus>("/search/embeddings"),
+  updateEmbeddings: (body: {
+    enabled?: boolean;
+    provider?: string;
+    model?: string;
+    base_url?: string;
+    api_key_env?: string;
+    dimensions?: number;
+    batch_size?: number;
+    store_provider?: string;
+    persist?: boolean;
+    reindex?: boolean;
+  }) =>
+    request<EmbeddingsStatus>("/search/embeddings", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  /** Embed already-indexed content without re-reading the sources. */
+  rebuildVectors: (dropExisting = false) =>
+    request<EmbeddingsStatus>(`/search/embeddings/reindex${qs({ drop_existing: dropExisting })}`, {
+      method: "POST",
     }),
 
   // MCP

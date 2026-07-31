@@ -137,5 +137,48 @@ syncsage client-config claude-code -c syncsage.yaml -o .mcp.json
 | `assistant.session_key_ttl_minutes` | `720` | How long a session key survives. |
 | `assistant.max_context_chunks` | `8` | Passages retrieved and offered to the model. |
 | `assistant.max_facts` | `12` | Graph facts surfaced per answer. |
+| `assistant.workflow` | `auto` | Which agent workflow answers questions. See below. |
+| `assistant.workflow_options` | `{}` | Per-workflow tuning. |
 
 Full reference: [Configuration](../configuration.md).
+
+---
+
+## Choosing how questions get answered
+
+**Workflow** in the chat pane header picks the agent that answers. With the
+`[agent]` extra installed and a model connected, the default is a LangGraph
+agent that plans sub-queries, searches every mode, walks the graph for related
+material, grades its own evidence and loops when it is thin, then verifies its
+citations — and shows you the trace of what it did under the answer. A
+selection made here applies to your next question only; make it permanent with
+`assistant.workflow`.
+
+See [Customize the answering workflow](agent-workflows.md) for the tuning
+options and for writing your own.
+
+---
+
+## Managing sources and semantic search from the UI
+
+The UI is not a read-only viewport onto a YAML file — everything the config
+schema and the HTTP API can express is reachable from it.
+
+- **Sources → + Add source** takes a path, URL, glob or connector name and
+  infers the rest (`POST /sources/quick-add`, the same inference
+  `syncsage up` uses).
+- **Sources → Advanced…** exposes the full source schema: include/exclude
+  globs, folder depth, chunking, repository branch policy, sync triggers,
+  URLs, and connector settings. The type picker is populated from
+  `GET /sources/types`, so installed connector plugins (Notion, Slack,
+  Confluence, Google Drive, IMAP, or your own) appear alongside the built-in
+  types. Service-backed types skip the directory browser — there is no folder
+  to pick — and take their credentials as an `api_key_env` naming an
+  environment variable, never the secret itself.
+- **Settings → Semantic search** configures `search.embeddings` and
+  `search.vector_store`, shows what fraction of the index actually has
+  vectors, and can embed already-indexed content without re-reading a single
+  source file. See [Vector self-search](vector-search.md).
+
+Every one of those is the same HTTP endpoint a script would call, so a
+low-code user and a developer are operating one system rather than two.

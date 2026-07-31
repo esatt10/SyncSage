@@ -386,6 +386,14 @@ class AssistantSettings(ModelMixin):
     max_output_tokens: int = 4096
     request_timeout_seconds: float = 90.0
     max_facts: int = 12
+    # Which question-answering workflow runs. "auto" picks the LangGraph
+    # agent when the [agent] extra is installed AND a model is reachable,
+    # else the single-pass workflow. Any name registered through the
+    # `syncsage.agent_workflows` entry-point group is also valid.
+    workflow: str = "auto"
+    # Per-workflow knobs, passed through untouched (see the workflow's
+    # DEFAULTS for the keys it honors).
+    workflow_options: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

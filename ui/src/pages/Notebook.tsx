@@ -9,6 +9,7 @@ import { NodeInspector } from "../graph/NodeInspector";
 import { GraphLegend } from "../graph/GraphLegend";
 import { SourceRail } from "../components/SourceRail";
 import { EmptyState } from "../components/EmptyState";
+import { WorkflowPanel } from "../components/WorkflowPanel";
 import { NOISY_NODE_TYPES, colorForNode } from "../graph/graphStyles";
 import { useSessionId } from "../hooks/useSessionId";
 
@@ -32,6 +33,8 @@ export function Notebook() {
   const [answer, setAnswer] = useState<ChatAnswer | null>(null);
   const [panelTab, setPanelTab] = useState<PanelTab>("graph");
   const [showModelDialog, setShowModelDialog] = useState(false);
+  const [workflow, setWorkflow] = useState<string | null>(null);
+  const [showWorkflowDialog, setShowWorkflowDialog] = useState(false);
   const [expanding, setExpanding] = useState(false);
 
   const overview = useQuery({ queryKey: ["overview"], queryFn: api.overview });
@@ -161,6 +164,13 @@ export function Notebook() {
           <div className="pane__actions">
             <button
               className="btn btn--small"
+              onClick={() => setShowWorkflowDialog(true)}
+              title="Choose how questions are answered"
+            >
+              {workflow ?? "Workflow"}
+            </button>
+            <button
+              className="btn btn--small"
               onClick={() => setShowModelDialog(true)}
               title="Connect an LLM to synthesize answers"
             >
@@ -173,6 +183,7 @@ export function Notebook() {
             status={status.data}
             sessionId={sessionId}
             sourceFilter={sourceFilter}
+            workflow={workflow}
             hasContent={hasContent}
             onAnswer={onAnswer}
             onCitationClick={focusNode}
@@ -273,6 +284,29 @@ export function Notebook() {
           </div>
         ) : null}
       </aside>
+
+      {showWorkflowDialog ? (
+        <div className="modal-scrim" onClick={() => setShowWorkflowDialog(false)}>
+          <div className="modal" onClick={(event) => event.stopPropagation()}>
+            <header className="modal__header">
+              <h2>How questions are answered</h2>
+              <button
+                className="btn btn--ghost btn--icon"
+                onClick={() => setShowWorkflowDialog(false)}
+                aria-label="Close"
+              >
+                \u2715
+              </button>
+            </header>
+            <WorkflowPanel selected={workflow} onSelect={setWorkflow} />
+            <div className="modal__footer">
+              <button className="btn btn--primary" onClick={() => setShowWorkflowDialog(false)}>
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {showModelDialog ? (
         <ModelDialog

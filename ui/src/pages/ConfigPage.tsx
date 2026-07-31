@@ -3,6 +3,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import yaml from "js-yaml";
 import { api } from "../api/client";
 import { ObjectEditor } from "../config/ObjectEditor";
+import { EmbeddingsPanel } from "../components/EmbeddingsPanel";
+import { WorkflowPanel } from "../components/WorkflowPanel";
 import { lineDiff } from "../util/diff";
 
 type Mode = "form" | "yaml";
@@ -114,12 +116,32 @@ export function ConfigPage() {
   }
 
   return (
-    <div className="page">
+    <div className="page page--wide">
       <div className="page__header">
-        <h1>Configuration</h1>
+        <h1>Settings</h1>
         <div className="muted small">{configQuery.data?.path}</div>
       </div>
 
+      {/* The two things people most often want to change live above the raw
+          config editor, as purpose-built panels: what answers questions, and
+          whether semantic search is on. Everything else is still reachable
+          through the form/YAML editor below — the UI is a superset of the
+          file, not a subset. */}
+      <section className="section">
+        <h2 className="section__title">Question answering</h2>
+        <div className="card" style={{ padding: 16 }}>
+          <WorkflowPanel selected={null} onSelect={() => undefined} />
+        </div>
+      </section>
+
+      <section className="section">
+        <h2 className="section__title">Semantic search (embeddings)</h2>
+        <div className="card" style={{ padding: 16 }}>
+          <EmbeddingsPanel />
+        </div>
+      </section>
+
+      <h2 className="section__title">Full configuration</h2>
       <div className="config-toolbar">
         <div className="tabs">
           <button className={mode === "form" ? "tab active" : "tab"} onClick={() => setMode("form")}>

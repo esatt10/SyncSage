@@ -36,6 +36,52 @@ from syncsage.version import __version__
 
 logger = logging.getLogger(__name__)
 
+#: Stand-in for the schema's mandatory ``path`` on source types that pull from
+#: a service rather than the filesystem. Nothing ever opens it.
+PLUGIN_PLACEHOLDER_PATH = "/unused"
+
+#: ``(id, label, description, path_role)`` for the built-in source types, in
+#: the order a picker should show them. ``path_role`` is ``"required"`` when
+#: the connector actually reads that path and ``"unused"`` when the schema
+#: demands the field but the connector gets its content elsewhere.
+#: ``SourceType.memory`` is deliberately absent: agent-memory sources are
+#: created and owned by the memory store, not registered by hand.
+BUILTIN_SOURCE_TYPES: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "document_folder",
+        "Folder of documents",
+        "Mixed files — Markdown, PDF, DOCX, HTML, code, configs.",
+        "required",
+    ),
+    (
+        "repository",
+        "Git repository",
+        "A git checkout, with branch and commit metadata on every artifact.",
+        "required",
+    ),
+    (
+        "obsidian_vault",
+        "Obsidian vault",
+        "Notes plus wikilinks, tags and frontmatter as graph structure.",
+        "required",
+    ),
+    (
+        "markdown_folder",
+        "Folder of Markdown",
+        "Markdown only — the lighter version of a document folder.",
+        "required",
+    ),
+    ("single_file", "Single file", "One file, indexed on its own.", "required"),
+    (
+        "web_collection",
+        "Web pages",
+        "A list of URLs fetched over HTTP, with ETag-based incremental sync.",
+        "unused",
+    ),
+    ("api", "HTTP API", "A JSON endpoint paged with a cursor (experimental).", "unused"),
+    ("s3", "S3 bucket", "An S3-compatible bucket prefix (experimental).", "unused"),
+)
+
 
 class SearchRequest(BaseModel):
     # Step 32.2 — optional caller identity; enforced only when
@@ -123,6 +169,28 @@ class ChatRequest(BaseModel):
     source_name: str | None = None
     principal: str | None = None
     principal_groups: list[str] = []
+    # Override assistant.workflow for this one question ("simple",
+    # "agentic", or any registered plugin name).
+    workflow: str | None = None
+    # Per-request workflow knobs, merged over assistant.workflow_options.
+    options: dict | None = None
+
+
+class EmbeddingsRequest(BaseModel):
+    """Turn semantic search on/off and configure the provider."""
+
+    enabled: bool | None = None
+    provider: str | None = None
+    model: str | None = None
+    base_url: str | None = None
+    api_key_env: str | None = None
+    dimensions: int | None = None
+    batch_size: int | None = None
+    store_provider: str | None = None
+    # Persist to the config file as well as the live process.
+    persist: bool = True
+    # Build vectors for already-indexed content straight away.
+    reindex: bool = False
 
 
 class AssistantKeyRequest(BaseModel):
@@ -195,6 +263,32 @@ def _resolve_source_path(path: str, config: SyncSageConfig) -> Path:
             raise PathPolicyError(f"Path does not exist: {resolved}")
         return resolved
     return resolve_under(path, _allowed_roots(config))
+
+
+def _check_source_type(type_name: str) -> bool:
+    """Validate a ``sources[].type`` string; return whether it is built-in.
+
+    YAML accepts any type a connector plugin claims (Step 31.1), so the API
+    has to as well — otherwise the same source is configurable in a file and
+    rejected through the UI.
+    """
+    from syncsage.sync.connector_registry import list_connector_types
+
+    if type_name in {member.value for member in SourceType}:
+        return True
+    plugins = list_connector_types()
+    if type_name in plugins:
+        return False
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unknown source type: {type_name}. Built-in types: "
+        + ", ".join(sorted(member.value for member in SourceType))
+        + (
+            f". Installed connector plugins: {', '.join(plugins)}"
+            if plugins
+            else ". No connector plugins are installed."
+        ),
+    )
 
 
 def _source_from_payload(payload: dict) -> SourceConfig:
@@ -415,16 +509,56 @@ def create_app(
     def sources() -> list[dict]:
         return SourceRegistry(config, state).list_sources()
 
+    @app.get("/sources/types")
+    def source_types() -> dict:
+        """Every source type this deployment can register, built-in or plugin.
+
+        The form that creates sources has to offer exactly what YAML accepts,
+        which on a machine with connector plugins installed is more than the
+        built-in enum. ``path_role`` tells a caller whether the schema's
+        mandatory ``path`` is real for that type or just a placeholder the
+        connector never reads.
+        """
+        from syncsage.sync.connector_registry import list_connector_types
+
+        types = [
+            {
+                "id": type_id,
+                "label": label,
+                "description": description,
+                "path_role": path_role,
+                "builtin": True,
+            }
+            for type_id, label, description, path_role in BUILTIN_SOURCE_TYPES
+        ]
+        types.extend(
+            {
+                "id": name,
+                "label": name,
+                "description": "Connector plugin (syncsage.connectors entry point).",
+                # A plugin pulls from its own service; the path field is
+                # schema ceremony unless the plugin documents otherwise.
+                "path_role": "unused",
+                "builtin": False,
+            }
+            for name in list_connector_types()
+        )
+        return {"types": types, "placeholder_path": PLUGIN_PLACEHOLDER_PATH}
+
     @app.post("/sources")
     def register_source(req: RegisterSourceRequest) -> dict:
-        try:
-            resolved = _resolve_source_path(req.path, config)
-        except PathPolicyError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        try:
-            SourceType(req.type)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=f"Unknown source type: {req.type}") from exc
+        is_builtin = _check_source_type(req.type)
+        # A plugin connector reads from its own service, not the filesystem,
+        # so the schema's mandatory path is a placeholder — don't make the
+        # caller invent a real directory to register a Notion or Slack
+        # source. A path that *is* supplied still goes through path policy.
+        if not is_builtin and req.path.strip() in {"", PLUGIN_PLACEHOLDER_PATH}:
+            resolved = Path(PLUGIN_PLACEHOLDER_PATH)
+        else:
+            try:
+                resolved = _resolve_source_path(req.path, config)
+            except PathPolicyError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
             source = _source_from_payload(_source_payload(req, resolved))
         except (ValueError, TypeError) as exc:
@@ -457,17 +591,21 @@ def create_app(
             import json
 
             source = _source_from_payload(json.loads(row["config_json"]))
-        try:
-            resolved = _resolve_source_path(req.path, config) if req.path else source.path
-        except PathPolicyError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if req.type is not None:
+        # An edit that doesn't touch the type must not re-validate it: a
+        # plugin that got uninstalled shouldn't lock its source out of the
+        # form. Only a type the caller actually sends is checked.
+        is_builtin = (
+            _check_source_type(req.type)
+            if req.type is not None
+            else str(source.type) in {member.value for member in SourceType}
+        )
+        if not is_builtin and (req.path or "").strip() in {"", PLUGIN_PLACEHOLDER_PATH}:
+            resolved = Path(PLUGIN_PLACEHOLDER_PATH)
+        else:
             try:
-                SourceType(req.type)
-            except ValueError as exc:
-                raise HTTPException(
-                    status_code=400, detail=f"Unknown source type: {req.type}"
-                ) from exc
+                resolved = _resolve_source_path(req.path, config) if req.path else source.path
+            except PathPolicyError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
             updated = _source_from_payload(_source_payload(req, resolved, existing=source))
         except (ValueError, TypeError) as exc:
@@ -897,6 +1035,279 @@ def create_app(
             "effective": candidate.model_dump(mode="json"),
         }
 
+    # ------------------------------------------------------------------
+    # Semantic search (embeddings). Everything `search.embeddings` does in
+    # YAML, reachable from the UI — including building vectors for content
+    # that was indexed before embeddings were switched on.
+    # ------------------------------------------------------------------
+    # Last vector-backend probe failure, so a store that cannot actually run
+    # is reported as such instead of surfacing later as a 500 on reindex.
+    store_probe_error: dict[str, str | None] = {"error": None}
+
+    def _reload_vector_stack() -> None:
+        """Rebuild the embed-on-sync indexer and query-time searcher in place.
+
+        Embeddings are wired at engine construction, so flipping the config
+        without this leaves a live process that has agreed to embed and then
+        doesn't — the reindex would report success having written nothing.
+
+        Vector backends import lazily, so constructing an indexer proves
+        nothing about the backend being usable: a LanceDB store without the
+        ``[vector]`` extra builds fine and only fails on first touch. Probe
+        it here so enabling embeddings fails at the moment the user asks for
+        it, rather than reporting ``active: true`` and 500ing on reindex.
+        """
+        from syncsage.search.vector_store import vector_indexer_from_config
+
+        indexer = vector_indexer_from_config(config)
+        if indexer is not None:
+            try:
+                indexer.store.count()
+            except Exception as exc:
+                store_probe_error["error"] = str(exc)
+                engine.vectors = None
+                search.vector = None
+                raise
+        store_probe_error["error"] = None
+        engine.vectors = indexer
+        search.vector = engine.vector_searcher()
+
+    def _embeddings_status() -> dict:
+        from syncsage.search.vector_store import (
+            VECTOR_STORE_PROVIDERS,
+            vector_store_available,
+        )
+
+        settings = config.search.embeddings
+        vector_count = 0
+        dimensions_on_disk: int | None = None
+        store_error: str | None = store_probe_error["error"]
+        # An indexer exists but that only means it was *constructed*; the
+        # backend imports lazily. Touching the store is what proves it works,
+        # so a store that raises here is reported inactive rather than
+        # advertising a semantic search that would fail on first use.
+        active = engine.vectors is not None and store_error is None
+        if engine.vectors is not None:
+            try:
+                vector_count = int(engine.vectors.store.count())
+                vectors = getattr(engine.vectors.store, "all_vectors", None)
+                if callable(vectors):
+                    sample = vectors()
+                    if sample:
+                        dimensions_on_disk = len(sample[0][1])
+            except Exception as exc:  # a broken store must still render a page
+                store_error = str(exc)
+                active = False
+        chunk_rows = state.rows("SELECT COUNT(*) AS n FROM chunks")
+        chunk_count = int(chunk_rows[0]["n"]) if chunk_rows else 0
+        return {
+            "enabled": settings.enabled,
+            "active": active,
+            "provider": settings.provider,
+            "model": settings.model,
+            "base_url": settings.base_url,
+            "api_key_env": settings.api_key_env,
+            "api_key_present": bool(os.environ.get(settings.api_key_env)),
+            "dimensions": settings.dimensions,
+            "batch_size": settings.batch_size,
+            "store_provider": config.search.vector_store.provider,
+            "store_path": str(config.search.vector_store.path or ""),
+            "vector_count": vector_count,
+            "chunk_count": chunk_count,
+            # How much of the index is actually searchable semantically.
+            "coverage": round(vector_count / chunk_count, 4) if chunk_count else 0.0,
+            "dimensions_on_disk": dimensions_on_disk,
+            "store_error": store_error,
+            "providers": [
+                {
+                    "id": "stub",
+                    "label": "Deterministic stub (offline)",
+                    "needs_key": False,
+                    "description": "No network, no model. Useful for trying semantic "
+                    "search out and for tests.",
+                },
+                {
+                    "id": "openai-spec",
+                    "label": "OpenAI-spec endpoint",
+                    "needs_key": True,
+                    "description": "POST {base_url}/embeddings — OpenAI, or any "
+                    "gateway or self-hosted server speaking the same shape.",
+                },
+            ],
+            "store_providers": [
+                {
+                    "id": name,
+                    "label": label,
+                    "available": vector_store_available(name),
+                    "hint": hint,
+                }
+                for name, label, hint in VECTOR_STORE_PROVIDERS
+            ],
+        }
+
+    @app.get("/search/embeddings")
+    def embeddings_status() -> dict:
+        return _embeddings_status()
+
+    @app.put("/search/embeddings")
+    def embeddings_update(req: EmbeddingsRequest) -> dict:
+        from syncsage.search.vector_store import (
+            VECTOR_STORE_PROVIDERS,
+            vector_store_available,
+        )
+
+        settings = config.search.embeddings
+        # Refuse a backend this deployment cannot run *before* touching the
+        # config, so a bad choice leaves the running process exactly as it was
+        # instead of half-applied and inert.
+        target_store = req.store_provider or config.search.vector_store.provider
+        wants_on = settings.enabled if req.enabled is None else req.enabled
+        if wants_on and not vector_store_available(target_store):
+            hint = next(
+                (hint for name, _, hint in VECTOR_STORE_PROVIDERS if name == target_store),
+                None,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"Vector store {target_store!r} is not available in this deployment"
+                + (f" — {hint}" if hint else "")
+                + ". The 'numpy' store needs no extra dependencies.",
+            )
+        changes = {
+            key: value
+            for key, value in {
+                "enabled": req.enabled,
+                "provider": req.provider,
+                "model": req.model,
+                "base_url": req.base_url,
+                "api_key_env": req.api_key_env,
+                "dimensions": req.dimensions,
+                "batch_size": req.batch_size,
+            }.items()
+            if value is not None
+        }
+        # Changing the model or dimension invalidates every existing vector:
+        # a store mixing two embedding spaces returns nonsense similarities.
+        # Detect it here so the caller is told rather than finding out later.
+        dimension_change = (
+            "dimensions" in changes and changes["dimensions"] != settings.dimensions
+        ) or ("model" in changes and changes["model"] != settings.model)
+
+        for key, value in changes.items():
+            setattr(settings, key, value)
+        if req.store_provider is not None:
+            config.search.vector_store.provider = req.store_provider
+
+        try:
+            _reload_vector_stack()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Could not enable embeddings: {exc}"
+            ) from exc
+
+        wrote_config = False
+        if req.persist:
+            payload = {
+                "search": {
+                    "embeddings": settings.model_dump(mode="json"),
+                    "vector_store": config.search.vector_store.model_dump(mode="json"),
+                }
+            }
+            wrote_config = _merge_into_config_file(payload)
+        audit(None, "update_embeddings", {"changes": list(changes), "persisted": wrote_config})
+
+        result = {
+            "status": "updated",
+            "wrote_config": wrote_config,
+            "vectors_invalidated": dimension_change,
+            **_embeddings_status(),
+        }
+        if req.reindex and engine.vectors is not None:
+            result["reindex"] = _rebuild_vectors(drop_existing=dimension_change)
+        return result
+
+    def _rebuild_vectors(drop_existing: bool = False) -> dict:
+        """Embed everything already indexed, without re-reading the sources.
+
+        Vectors are keyed by content-addressed chunk id, so this is
+        idempotent: chunks already embedded are skipped and a second run
+        makes zero embedder calls.
+        """
+        if engine.vectors is None:
+            raise HTTPException(
+                status_code=400,
+                detail=store_probe_error["error"]
+                or "Embeddings are not enabled — turn them on first.",
+            )
+        embedded = 0
+        artifacts = state.rows("SELECT id, source_id FROM artifacts ORDER BY id")
+        try:
+            if drop_existing:
+                # A changed model/dimension means the old vectors are garbage.
+                for source_id in {
+                    str(row["source_id"])
+                    for row in state.rows("SELECT DISTINCT source_id FROM artifacts")
+                }:
+                    engine.vectors.prune_source(source_id, set())
+
+            for artifact in artifacts:
+                chunks = state.rows(
+                    "SELECT id, text, text_hash FROM chunks WHERE artifact_id=? "
+                    "ORDER BY chunk_index",
+                    (artifact["id"],),
+                )
+                if not chunks:
+                    continue
+                embedded += engine.vectors.index_artifact(
+                    str(artifact["source_id"]),
+                    str(artifact["id"]),
+                    [dict(chunk) for chunk in chunks],
+                )
+            vector_count = int(engine.vectors.store.count())
+        except (ModuleNotFoundError, ValueError) as exc:
+            # A missing optional extra or a mismatched embedding space is a
+            # configuration problem the caller can act on, not a server fault.
+            store_probe_error["error"] = str(exc)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        audit(None, "rebuild_vectors", {"embedded_chunks": embedded})
+        return {
+            "embedded_chunks": embedded,
+            "artifacts_scanned": len(artifacts),
+            "vector_count": vector_count,
+        }
+
+    @app.post("/search/embeddings/reindex")
+    def embeddings_reindex(drop_existing: bool = False) -> dict:
+        return {**_rebuild_vectors(drop_existing=drop_existing), **_embeddings_status()}
+
+    def _merge_into_config_file(patch: dict) -> bool:
+        """Deep-merge ``patch`` into the config file, preserving everything else.
+
+        Rendered the same way ``syncsage up`` renders configs: everything but
+        ``sources`` through the YAML dumper, then the sources list by hand —
+        ``safe_dump`` writes list-of-dict items in a shape the
+        dependency-light yaml shim cannot read back.
+        """
+        from syncsage.config.loader import deep_merge
+        from syncsage.quickstart import _render_sources_block
+
+        path = Path(app.state.config_path)
+        if not path.exists():
+            return False
+        try:
+            existing = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError:
+            return False
+        if not isinstance(existing, dict):
+            return False
+        merged = deep_merge(existing, patch)
+        sources = merged.pop("sources", []) or []
+        rendered = yaml.safe_dump(merged, sort_keys=False)
+        if sources:
+            rendered += _render_sources_block(sources)
+        path.write_text(rendered, encoding="utf-8")
+        return True
+
     @app.get("/config/effective")
     def config_effective(profile: str = "quickstart") -> dict:
         try:
@@ -1035,6 +1446,7 @@ def create_app(
             knowledge_base=config.knowledge_base_id,
             config=config,
             graph=engine.graph_builder.graph,
+            state=state,
             credential=app.state.session_keys.get(req.session_id),
             env=dict(os.environ),
             mode=req.mode,
@@ -1042,7 +1454,32 @@ def create_app(
             source_name=req.source_name,
             principal=req.principal,
             principal_groups=req.principal_groups,
+            workflow=req.workflow,
+            options=req.options,
         )
+
+    @app.get("/assistant/workflows")
+    def assistant_workflows() -> dict:
+        """Every question-answering workflow this deployment can run."""
+        from syncsage.assistant.chat import resolve_provider
+        from syncsage.assistant.workflows import (
+            langgraph_available,
+            list_workflows,
+            resolve_workflow_name,
+        )
+        from syncsage.assistant.workflows.agentic import DEFAULTS as AGENTIC_DEFAULTS
+
+        selected = resolve_provider(config, None, dict(os.environ))
+        return {
+            "workflows": list_workflows(),
+            "configured": config.assistant.workflow,
+            "active": resolve_workflow_name(
+                config.assistant.workflow, has_llm=selected is not None
+            ),
+            "agent_extra_installed": langgraph_available(),
+            "options": dict(config.assistant.workflow_options or {}),
+            "option_defaults": {"agentic": AGENTIC_DEFAULTS},
+        }
 
     # ------------------------------------------------------------------
     # MCP connection details, so the UI can hand an agent a working config.

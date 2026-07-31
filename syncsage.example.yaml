@@ -179,6 +179,25 @@ assistant:
   max_output_tokens: 4096
   request_timeout_seconds: 90.0
   max_facts: 12
+  # Which agent workflow answers a question.
+  #   auto     — "agentic" when a model is connected AND the [agent] extra is
+  #              installed, otherwise "simple". Never fails closed.
+  #   agentic  — LangGraph: plan → retrieve (multi-mode) → expand over the
+  #              graph → grade the evidence → synthesize → verify citations,
+  #              looping back to re-plan while the evidence is thin.
+  #   simple   — one retrieval pass, one synthesis call.
+  # Register your own under the `syncsage.agent_workflows` entry-point group
+  # and name it here; see docs/how-to/agent-workflows.md.
+  workflow: auto
+  # Per-workflow tuning, merged over the workflow's defaults. Callers can
+  # override any of these per request (`options` on POST /assistant/chat and
+  # on the MCP tool `ask_knowledge_base`).
+  workflow_options: {}
+  #  agentic:
+  #    max_rounds: 2
+  #    retrieval_modes: [hybrid, vector]
+  #    expand_graph: true
+  #    max_context_passages: 10
 
 sources:
   - name: syncsage-repo

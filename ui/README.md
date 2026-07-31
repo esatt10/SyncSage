@@ -28,9 +28,24 @@ the indexing container is unchanged (see
   doubles as the type filter. `concept` and `chunk` are hidden by default (they
   routinely make up most of a real index). Expand a node's sub-network, pivot
   across relationships, inspect identity/links/content.
+- **Workflow** — pick the agent that answers questions. With the `[agent]`
+  extra and a model connected, the default is a LangGraph agent that plans
+  sub-queries, searches every mode, walks the graph, grades its own evidence
+  and retries when it is thin, then verifies its citations — with the trace
+  shown under the answer. Custom workflows registered under the
+  `syncsage.agent_workflows` entry-point group appear here too:
+  [Customize the answering workflow](../docs/how-to/agent-workflows.md).
 - **Sources** — one field takes a path, URL, glob or connector name and
   SyncSage detects the rest; selecting a source scopes both chat and graph to
-  it. An advanced form still exposes every option.
+  it. **Advanced…** exposes the whole source schema — include/exclude globs,
+  depth, chunking, branch policy, sync triggers, connector settings — with the
+  type list read from the server, so installed connector plugins (Notion,
+  Slack, Confluence, Drive, IMAP, or your own) are offered alongside the
+  built-ins. Service-backed types skip the directory browser entirely.
+- **Semantic search** — turn embeddings on, pick a provider and a vector
+  backend (only ones installed here are offered), see what fraction of the
+  index actually has vectors, and embed already-indexed content without
+  re-reading a single source file.
 - **Onboarding** — when nothing is indexed you get an actionable empty state
   (add a source, or the one-line command), not an empty canvas.
 - **Connect agent** — MCP transports, a ready-to-paste `.mcp.json`, and the
@@ -48,7 +63,14 @@ the indexing container is unchanged (see
   symbols. Colour carries the finer distinction; size grows with connectivity.
 - **Nothing secret is stored here.** A chat API key the user pastes goes to the
   server, which holds it in memory behind an opaque token; the browser keeps
-  only that token, in `sessionStorage`.
+  only that token, in `sessionStorage`. Connector credentials are never typed
+  in at all — a source stores the *name* of an environment variable.
+- **Parity with the API.** Every control is a call the server already exposes;
+  the UI adds no capability of its own. If something is configurable in
+  `syncsage.yaml` it should be reachable here, and what a deployment can offer
+  (source types, vector backends, workflows) is read from the server rather
+  than hardcoded in this bundle — an installed plugin shows up without a
+  rebuild.
 
 ## Develop
 

@@ -42,9 +42,14 @@ export function SourcesPage() {
     <div className="page page--wide">
       <div className="page__header">
         <h1>Sources</h1>
-        <button className="btn btn--primary" onClick={() => setQuickAdd(true)}>
-          + Add source
-        </button>
+        <div className="button-row">
+          <button className="btn" onClick={() => setShowWizard(true)}>
+            Advanced…
+          </button>
+          <button className="btn btn--primary" onClick={() => setQuickAdd(true)}>
+            + Add source
+          </button>
+        </div>
       </div>
 
       {sources.isLoading && (
@@ -110,10 +115,10 @@ export function SourcesPage() {
       </div>
 
       <p className="muted small" style={{ marginTop: 14 }}>
-        Need every option (include globs, chunking, branch policy)?{" "}
-        <button className="btn btn--small btn--ghost" onClick={() => setShowWizard(true)}>
-          Open the advanced form
-        </button>
+        <strong>+ Add source</strong> takes a path, URL or glob and infers the rest.{" "}
+        <strong>Advanced…</strong> exposes every field the YAML schema has — include and
+        exclude globs, chunking, branch policy, sync triggers, and connector settings for
+        Notion, Slack, Confluence, Google Drive, IMAP or any installed plugin.
       </p>
 
       {quickAdd ? (
