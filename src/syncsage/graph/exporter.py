@@ -30,45 +30,49 @@ def node_link(
             return False
         return True
 
-    if node_limit is None and link_limit is None and not filtering:
-        payload = graph.to_node_link()
-        payload.update(
-            {
-                "total_nodes": graph.number_of_nodes(),
-                "total_links": graph.number_of_edges(),
-                "truncated": False,
-            }
-        )
-        return payload
+    # Pinned for the whole export: a sync running underneath must not be able
+    # to change the graph between the counts and the node/link walk (and a
+    # reader must never iterate the live dicts at all).
+    with graph.reading():
+        if node_limit is None and link_limit is None and not filtering:
+            payload = graph.to_node_link()
+            payload.update(
+                {
+                    "total_nodes": graph.number_of_nodes(),
+                    "total_links": graph.number_of_edges(),
+                    "truncated": False,
+                }
+            )
+            return payload
 
-    total_nodes = graph.number_of_nodes()
-    total_links = graph.number_of_edges()
-    max_nodes = total_nodes if node_limit is None else max(0, node_limit)
-    max_links = total_links if link_limit is None else max(0, link_limit)
+        total_nodes = graph.number_of_nodes()
+        total_links = graph.number_of_edges()
+        max_nodes = total_nodes if node_limit is None else max(0, node_limit)
+        max_links = total_links if link_limit is None else max(0, link_limit)
 
-    nodes = []
-    selected_ids: set[str] = set()
-    eligible = 0
-    for node_id in graph.nodes:
-        node = dict(graph.nodes[node_id])
-        if not keep(node):
-            continue
-        eligible += 1
-        if len(nodes) >= max_nodes:
-            continue
-        nodes.append(node)
-        selected_ids.add(node_id)
+        nodes = []
+        selected_ids: set[str] = set()
+        eligible = 0
+        for node_id, attrs in graph.nodes(data=True):
+            node = dict(attrs)
+            if not keep(node):
+                continue
+            eligible += 1
+            if len(nodes) >= max_nodes:
+                continue
+            nodes.append(node)
+            selected_ids.add(node_id)
 
-    links = []
-    for (source, target), edge_map in graph._edges.items():
-        if source not in selected_ids or target not in selected_ids:
-            continue
-        for key, data in edge_map.items():
+        links = []
+        for (source, target), edge_map in graph.edges():
+            if source not in selected_ids or target not in selected_ids:
+                continue
+            for key, data in edge_map.items():
+                if len(links) >= max_links:
+                    break
+                links.append({"source": source, "target": target, "key": key, **data})
             if len(links) >= max_links:
                 break
-            links.append({"source": source, "target": target, "key": key, **data})
-        if len(links) >= max_links:
-            break
 
     return {
         "directed": True,
@@ -85,7 +89,8 @@ def node_link(
 
 
 def cytoscape(graph: SimpleMultiDiGraph) -> dict:
-    elements = {"nodes": [{"data": data} for data in graph.to_node_link()["nodes"]], "edges": []}
-    for edge in graph.to_node_link()["links"]:
+    payload = graph.to_node_link()
+    elements = {"nodes": [{"data": data} for data in payload["nodes"]], "edges": []}
+    for edge in payload["links"]:
         elements["edges"].append({"data": edge})
     return {"elements": elements}

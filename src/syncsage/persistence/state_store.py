@@ -136,6 +136,15 @@ CREATE TABLE IF NOT EXISTS idp_sync_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- What the indexed state was built with, per scope (a source, or the vector
+-- space). A restart compares the live config against these: same fingerprint
+-- means the stored artifacts/chunks/vectors are still valid and there is
+-- nothing to redo. See syncsage.sync.fingerprint.
+CREATE TABLE IF NOT EXISTS sync_fingerprints (
+  scope TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 
@@ -166,6 +175,23 @@ class StateStore:
         if "acl" not in columns:
             self.conn.execute("ALTER TABLE artifacts ADD COLUMN acl TEXT")
         self.conn.commit()
+
+    def get_fingerprint(self, scope: str) -> str | None:
+        """What this scope was last indexed with, or None if never recorded."""
+
+        rows = self.rows("SELECT fingerprint FROM sync_fingerprints WHERE scope=?", (scope,))
+        return str(rows[0]["fingerprint"]) if rows else None
+
+    def set_fingerprint(self, scope: str, fingerprint: str, updated_at: str) -> None:
+        """Record a scope's fingerprint after a successful pass over it."""
+
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO sync_fingerprints (scope, fingerprint, updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(scope) DO UPDATE SET fingerprint=excluded.fingerprint, "
+                "updated_at=excluded.updated_at",
+                (scope, fingerprint, updated_at),
+            )
 
     def replace_idp_groups(self, mapping: dict[str, list[str]], synced_at: str) -> bool:
         """Persist one IdP sync pass (Step 32.4). Returns True when rows changed.

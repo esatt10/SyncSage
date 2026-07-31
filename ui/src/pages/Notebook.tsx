@@ -1,134 +1,86 @@
 import { useCallback, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
-import type { ChatAnswer, GraphFact, GraphLink, GraphNode } from "../api/types";
+import type { GraphFact, GraphNode } from "../api/types";
 import { ChatPanel } from "../chat/ChatPanel";
 import { ModelDialog } from "../chat/ModelDialog";
 import { GraphCanvas } from "../graph/GraphCanvas";
+import { HorizonControls } from "../graph/HorizonControls";
 import { NodeInspector } from "../graph/NodeInspector";
 import { GraphLegend } from "../graph/GraphLegend";
+import { useHorizonGraph } from "../graph/useHorizonGraph";
 import { SourceRail } from "../components/SourceRail";
 import { EmptyState } from "../components/EmptyState";
 import { WorkflowPanel } from "../components/WorkflowPanel";
-import { NOISY_NODE_TYPES, colorForNode } from "../graph/graphStyles";
+import { colorForNode } from "../graph/graphStyles";
 import { useSessionId } from "../hooks/useSessionId";
-
-type PanelTab = "graph" | "facts" | "node";
+import { useSession } from "../state/session";
 
 /**
  * The workspace: sources on the left, conversation in the middle, knowledge on
- * the right. Asking a question drives the graph — cited nodes get outlined and
- * focused — so the answer and the structure behind it stay side by side.
+ * the right. Asking a question drives the graph — the canvas filters to the
+ * nodes the answer surfaced — so the answer and the structure behind it stay
+ * side by side.
+ *
+ * No state lives in this component. It reads the session store and dispatches
+ * actions, which is what lets you walk to Sources or Settings and come back to
+ * exactly the view you left.
  */
 export function Notebook() {
   const [sessionId, setSessionId] = useSessionId();
-  const [hiddenTypes, setHiddenTypes] = useState<string[]>(NOISY_NODE_TYPES);
-  const [sourceFilter, setSourceFilter] = useState<string | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [focusIds, setFocusIds] = useState<string[]>([]);
-  const [extra, setExtra] = useState<{ nodes: GraphNode[]; links: GraphLink[] }>({
-    nodes: [],
-    links: [],
-  });
-  const [answer, setAnswer] = useState<ChatAnswer | null>(null);
-  const [panelTab, setPanelTab] = useState<PanelTab>("graph");
+  const { state, dispatch } = useSession();
   const [showModelDialog, setShowModelDialog] = useState(false);
-  const [workflow, setWorkflow] = useState<string | null>(null);
   const [showWorkflowDialog, setShowWorkflowDialog] = useState(false);
-  const [expanding, setExpanding] = useState(false);
 
   const overview = useQuery({ queryKey: ["overview"], queryFn: api.overview });
   const status = useQuery({
     queryKey: ["assistant-status", sessionId],
     queryFn: () => api.assistantStatus(sessionId),
   });
-  const graphQuery = useQuery({
-    queryKey: ["graph", hiddenTypes, sourceFilter],
-    queryFn: () =>
-      api.graph({
-        excludeTypes: hiddenTypes,
-        source: sourceFilter ?? undefined,
-      }),
+
+  // The knowledge-base root is the natural center before you pick one: it is
+  // the one node every source hangs off.
+  const centerId = state.centerId ?? overview.data?.knowledge_base ?? null;
+
+  const { graph, isLoading, isFetching, mode } = useHorizonGraph({
+    centerId,
+    depth: state.depth,
+    showAll: state.showAll,
+    surfacedIds: state.surfacedIds,
+    hiddenTypes: state.hiddenTypes,
+    sourceFilter: state.sourceFilter,
+    enabled: overview.isSuccess,
   });
 
-  const base = graphQuery.data ?? { nodes: [], links: [] };
-  const merged = useMemo(() => {
-    const nodeMap = new Map<string, GraphNode>();
-    [...base.nodes, ...extra.nodes].forEach((node) => node.id && nodeMap.set(node.id, node));
-    const linkKey = (link: GraphLink) =>
-      `${link.source}|${link.type}|${link.key ?? 0}|${link.target}`;
-    const linkMap = new Map<string, GraphLink>();
-    [...base.links, ...extra.links].forEach((link) => linkMap.set(linkKey(link), link));
-    return { nodes: [...nodeMap.values()], links: [...linkMap.values()] };
-  }, [base, extra]);
-
   const nodeById = useMemo(
-    () => new Map(merged.nodes.map((node) => [node.id, node])),
-    [merged.nodes],
+    () => new Map(graph.nodes.map((node) => [node.id, node])),
+    [graph.nodes],
   );
 
   const citedIds = useMemo(
-    () => (answer?.citations ?? []).filter((c) => c.node_id).map((c) => c.node_id as string),
-    [answer],
+    () => (state.answer?.citations ?? []).filter((c) => c.node_id).map((c) => c.node_id as string),
+    [state.answer],
   );
+
+  const centerLabel = useMemo(() => {
+    if (!centerId) return null;
+    return labelOf(nodeById.get(centerId), centerId);
+  }, [centerId, nodeById]);
 
   /**
-   * Focus a node that may not be in the current view — a citation can point at
-   * a chunk while chunks are hidden, or at a node beyond the preview limit.
-   * Pull its neighbourhood in rather than silently doing nothing.
+   * Focus a node that may not be inside the current horizon — a citation can
+   * point at a chunk while chunks are hidden, or at a node several layers out.
+   * Re-centering there is the action that brings it into view.
    */
   const focusNode = useCallback(
-    async (nodeId: string | undefined) => {
+    (nodeId: string | undefined) => {
       if (!nodeId) return;
-      setPanelTab("node");
-      if (nodeById.has(nodeId)) {
-        setSelectedId(nodeId);
-        setFocusIds([nodeId]);
-        return;
-      }
-      setExpanding(true);
-      try {
-        const slice = await api.graphSlice(nodeId, 1);
-        if (slice.nodes.length > 0) {
-          setExtra((prev) => ({
-            nodes: [...prev.nodes, ...slice.nodes],
-            links: [...prev.links, ...slice.links],
-          }));
-          setSelectedId(nodeId);
-          setFocusIds([nodeId, ...slice.nodes.map((n) => n.id)]);
-        }
-      } finally {
-        setExpanding(false);
-      }
+      dispatch({ type: "open-tab", tab: "node" });
+      if (nodeById.has(nodeId)) dispatch({ type: "select-node", nodeId });
+      else dispatch({ type: "center-node", nodeId });
     },
-    [nodeById],
+    [dispatch, nodeById],
   );
-
-  const expand = useCallback(async (nodeId: string, depth = 1) => {
-    setExpanding(true);
-    try {
-      const slice = await api.graphSlice(nodeId, depth);
-      setExtra((prev) => ({
-        nodes: [...prev.nodes, ...slice.nodes],
-        links: [...prev.links, ...slice.links],
-      }));
-      setFocusIds([nodeId, ...slice.nodes.map((n) => n.id)]);
-    } finally {
-      setExpanding(false);
-    }
-  }, []);
-
-  const onAnswer = useCallback((next: ChatAnswer) => {
-    setAnswer(next);
-    setPanelTab(next.facts.length > 0 ? "facts" : "graph");
-    // Light up the passages behind the answer on the canvas.
-    setFocusIds(next.focus_node_ids);
-  }, []);
-
-  const toggleType = (type: string) =>
-    setHiddenTypes((prev) =>
-      prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type],
-    );
 
   const hasContent = overview.data?.has_content ?? false;
 
@@ -138,7 +90,6 @@ export function Notebook() {
         overview={overview.data}
         onAdded={() => {
           overview.refetch();
-          graphQuery.refetch();
         }}
       />
     );
@@ -149,12 +100,9 @@ export function Notebook() {
       <aside className="pane pane--rail">
         <SourceRail
           sources={overview.data?.sources ?? []}
-          selected={sourceFilter}
-          onSelect={setSourceFilter}
-          onChanged={() => {
-            overview.refetch();
-            graphQuery.refetch();
-          }}
+          selected={state.sourceFilter}
+          onSelect={(source) => dispatch({ type: "filter-source", source })}
+          onChanged={() => overview.refetch()}
         />
       </aside>
 
@@ -167,7 +115,7 @@ export function Notebook() {
               onClick={() => setShowWorkflowDialog(true)}
               title="Choose how questions are answered"
             >
-              {workflow ?? "Workflow"}
+              {state.workflow ?? "Workflow"}
             </button>
             <button
               className="btn btn--small"
@@ -182,10 +130,7 @@ export function Notebook() {
           <ChatPanel
             status={status.data}
             sessionId={sessionId}
-            sourceFilter={sourceFilter}
-            workflow={workflow}
             hasContent={hasContent}
-            onAnswer={onAnswer}
             onCitationClick={focusNode}
             onConnectModel={() => setShowModelDialog(true)}
           />
@@ -196,89 +141,90 @@ export function Notebook() {
         <header className="pane__header">
           <div className="tabs" style={{ flex: 1 }}>
             <button
-              className={panelTab === "graph" ? "tab active" : "tab"}
-              onClick={() => setPanelTab("graph")}
+              className={state.panelTab === "graph" ? "tab active" : "tab"}
+              onClick={() => dispatch({ type: "open-tab", tab: "graph" })}
             >
               Graph
             </button>
             <button
-              className={panelTab === "facts" ? "tab active" : "tab"}
-              onClick={() => setPanelTab("facts")}
+              className={state.panelTab === "facts" ? "tab active" : "tab"}
+              onClick={() => dispatch({ type: "open-tab", tab: "facts" })}
             >
-              Facts{answer?.facts.length ? ` (${answer.facts.length})` : ""}
+              Facts{state.answer?.facts.length ? ` (${state.answer.facts.length})` : ""}
             </button>
             <button
-              className={panelTab === "node" ? "tab active" : "tab"}
-              onClick={() => setPanelTab("node")}
+              className={state.panelTab === "node" ? "tab active" : "tab"}
+              onClick={() => dispatch({ type: "open-tab", tab: "node" })}
             >
               Node
             </button>
           </div>
         </header>
 
-        {panelTab === "graph" ? (
+        {state.panelTab === "graph" ? (
           <>
             <div className="graph-pane__body">
               <div className="graph-overlay">
-                <span className="graph-badge">
-                  {merged.nodes.length}
-                  {graphQuery.data?.matched_nodes &&
-                  graphQuery.data.matched_nodes > merged.nodes.length
-                    ? ` of ${graphQuery.data.matched_nodes}`
-                    : ""}{" "}
-                  nodes
-                </span>
-                {citedIds.length > 0 ? (
-                  <span className="graph-badge">{citedIds.length} cited</span>
-                ) : null}
-                {expanding ? <span className="graph-badge">loading…</span> : null}
+                <HorizonControls
+                  mode={mode}
+                  depth={state.depth}
+                  centerLabel={centerLabel}
+                  surfacedCount={state.surfacedIds.length}
+                  nodeCount={graph.nodes.length}
+                  busy={isFetching}
+                  onDepth={(depth) => dispatch({ type: "set-depth", depth })}
+                  onShowAll={(value) => dispatch({ type: "show-all", value })}
+                  onClearAnswerFilter={() => dispatch({ type: "clear-answer-filter" })}
+                />
               </div>
-              {graphQuery.isLoading ? (
+              {isLoading ? (
                 <div className="centered muted">
                   <span className="spinner" />
                 </div>
-              ) : merged.nodes.length === 0 ? (
+              ) : graph.nodes.length === 0 ? (
                 <div className="centered muted small">
-                  Nothing to show with the current filters.
+                  Nothing within {state.depth} layers of here. Widen the depth, or show all.
                 </div>
               ) : (
                 <GraphCanvas
-                  nodes={merged.nodes}
-                  links={merged.links}
-                  selectedId={selectedId}
-                  focusIds={focusIds}
+                  nodes={graph.nodes}
+                  links={graph.links}
+                  depths={graph.depths}
+                  selectedId={state.selectedId}
+                  focusIds={state.focusIds}
                   citedIds={citedIds}
                   layoutName="auto"
                   spacing={1}
                   shapeAlgorithm="node_type"
                   onSelect={(id) => {
-                    setSelectedId(id);
-                    setPanelTab("node");
+                    dispatch({ type: "select-node", nodeId: id });
+                    dispatch({ type: "open-tab", tab: "node" });
                   }}
+                  onRecenter={(id) => dispatch({ type: "center-node", nodeId: id })}
                 />
               )}
             </div>
             <GraphLegend
               counts={overview.data?.node_counts ?? {}}
-              hidden={hiddenTypes}
-              onToggle={toggleType}
+              hidden={state.hiddenTypes}
+              onToggle={(nodeType) => dispatch({ type: "toggle-type", nodeType })}
             />
           </>
         ) : null}
 
-        {panelTab === "facts" ? (
+        {state.panelTab === "facts" ? (
           <div className="pane__body pane__body--pad">
-            <FactList facts={answer?.facts ?? []} onSelect={focusNode} />
+            <FactList facts={state.answer?.facts ?? []} onSelect={focusNode} />
           </div>
         ) : null}
 
-        {panelTab === "node" ? (
+        {state.panelTab === "node" ? (
           <div className="pane__body">
             <NodeInspector
-              selectedId={selectedId}
-              nodes={merged.nodes}
-              links={merged.links}
-              onExpand={expand}
+              selectedId={state.selectedId}
+              nodes={graph.nodes}
+              links={graph.links}
+              onExpand={(nodeId) => dispatch({ type: "center-node", nodeId })}
               onPivot={focusNode}
             />
           </div>
@@ -295,10 +241,13 @@ export function Notebook() {
                 onClick={() => setShowWorkflowDialog(false)}
                 aria-label="Close"
               >
-                \u2715
+                ✕
               </button>
             </header>
-            <WorkflowPanel selected={workflow} onSelect={setWorkflow} />
+            <WorkflowPanel
+              selected={state.workflow}
+              onSelect={(workflow) => dispatch({ type: "set-workflow", workflow })}
+            />
             <div className="modal__footer">
               <button className="btn btn--primary" onClick={() => setShowWorkflowDialog(false)}>
                 Done
@@ -321,6 +270,11 @@ export function Notebook() {
       ) : null}
     </div>
   );
+}
+
+function labelOf(node: GraphNode | undefined, fallback: string): string {
+  const label = node?.label ?? fallback;
+  return label.length > 40 ? `…${label.slice(label.length - 39)}` : label;
 }
 
 /**

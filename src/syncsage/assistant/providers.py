@@ -59,7 +59,11 @@ PROVIDERS: dict[str, ProviderSpec] = {
     "openai": ProviderSpec(
         id="openai",
         label="OpenAI",
-        default_model="gpt-4o-mini",
+        # Nano tier: the cheapest model that still synthesizes grounded prose
+        # well. Model ids are per-account — a key that cannot see this one gets
+        # a 404 model_not_found, which the chat surface reports verbatim rather
+        # than silently substituting. Override with assistant.model.
+        default_model="gpt-5.4-nano",
         default_base_url="https://api.openai.com/v1",
         api_key_env="OPENAI_API_KEY",
         key_hint="sk-…",

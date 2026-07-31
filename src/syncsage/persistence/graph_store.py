@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from pathlib import Path
 
 from syncsage.graph.simple import SimpleMultiDiGraph
@@ -20,10 +21,31 @@ def _ts_for_filename(utc_ts: str) -> str:
     return utc_ts.replace(":", "-")
 
 
+def _tmp_for(path: Path) -> Path:
+    """A temp sibling of ``path`` unique to the writer.
+
+    A fixed ``*.tmp`` name is not safe once two threads can save at the same
+    time — a sync pass and a ``DELETE /sources`` handler, say. Both wrote the
+    same file, the first ``os.replace`` renamed it away and the second raised
+    ``FileNotFoundError``; worse, their interleaved writes could leave a
+    corrupt payload behind. Keying the name on pid+thread keeps tmp+rename
+    atomic per writer, so concurrent saves are last-writer-wins over two
+    individually-complete files.
+    """
+
+    return path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+
+
 class GraphStore:
     def __init__(self, root: str | Path):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        # One store instance is shared by the sync thread and the API request
+        # threads (``DELETE /sources`` saves the graph too), so writes are
+        # serialized here: it keeps two threads from serializing the same
+        # graph twice, and on Windows a concurrent ``os.replace`` onto a
+        # destination another thread is replacing fails outright.
+        self._write_lock = threading.Lock()
 
     def kb_dir(self, kb_id: str) -> Path:
         path = self.root / kb_id
@@ -35,15 +57,20 @@ class GraphStore:
 
     def save(self, kb_id: str, graph: SimpleMultiDiGraph) -> Path:
         path = self.graph_path(kb_id)
-        tmp = path.with_suffix(".tmp")
+        tmp = _tmp_for(path)
         # Durable tmp+rename (Synapse step 21.2): fsync the file before the
         # rename and best-effort fsync the directory after it, so a crash
         # never leaves a torn or vanished graph.latest.json.
-        with tmp.open("w", encoding="utf-8") as fh:
-            fh.write(json.dumps(graph.to_node_link(), indent=2, sort_keys=True))
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        try:
+            with self._write_lock:
+                with tmp.open("w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(graph.to_node_link(), indent=2, sort_keys=True))
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         self._fsync_dir(path.parent)
         return path
 
@@ -69,14 +96,19 @@ class GraphStore:
         import zstandard as zstd
 
         path = self.snapshot_path(kb_id, utc_ts)
-        tmp = path.with_suffix(".tmp")
+        tmp = _tmp_for(path)
         payload = json.dumps(graph.to_node_link(), indent=2, sort_keys=True).encode("utf-8")
         compressed = zstd.ZstdCompressor(level=10).compress(payload)
-        with tmp.open("wb") as fh:
-            fh.write(compressed)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        try:
+            with self._write_lock:
+                with tmp.open("wb") as fh:
+                    fh.write(compressed)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         self._fsync_dir(path.parent)
         return path
 

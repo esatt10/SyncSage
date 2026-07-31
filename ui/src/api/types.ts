@@ -38,6 +38,8 @@ export interface GraphSlice {
   depth: number;
   nodes: GraphNode[];
   links: GraphLink[];
+  /** Hop distance from the slice's center, nearest wins. Center is 0. */
+  depths?: Record<string, number>;
 }
 
 export interface NeighborEntry {

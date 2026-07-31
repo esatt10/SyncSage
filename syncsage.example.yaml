@@ -72,6 +72,11 @@ storage:
   # retention cap (oldest evicted first; latest.json/db/contract never evicted).
   graph_snapshots: true
   graph_snapshot_interval_seconds: 900
+  # How often an in-progress sync writes graph.latest.json. The graph used to
+  # reach disk only when a sync *finished*, so stopping the container during a
+  # long first index threw that work away and the next start had to rebuild it.
+  # 0 = save at end of sync only.
+  graph_checkpoint_seconds: 60
   compression: zstd
   sqlite_path: /state/syncsage.db
   graph_path: /state/graphs

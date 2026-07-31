@@ -85,9 +85,23 @@ export const api = {
         source: options.source,
       })}`,
     ),
-  graphSlice: (nodeId: string, depth = 1, edgeTypes?: string[]) =>
+  /**
+   * The sub-graph within `depth` hops of a node. `limit` caps how many
+   * neighbours come back (BFS order, so nearest first) — the canvas asks for
+   * far more than the API default, which exists for one-hop lookups.
+   */
+  graphSlice: (
+    nodeId: string,
+    depth = 1,
+    options: { limit?: number; edgeTypes?: string[] } = {},
+  ) =>
     request<GraphSlice>(
-      `/graph/slice${qs({ node_id: nodeId, depth, edge_types: edgeTypes?.join(",") })}`,
+      `/graph/slice${qs({
+        node_id: nodeId,
+        depth,
+        limit: options.limit,
+        edge_types: options.edgeTypes?.join(","),
+      })}`,
     ),
   graphNeighbors: (nodeId: string, depth = 1, edgeTypes?: string[]) =>
     request<NeighborsResponse>(

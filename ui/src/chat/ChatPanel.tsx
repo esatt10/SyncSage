@@ -3,25 +3,16 @@ import type { KeyboardEvent } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { AssistantStatus, ChatAnswer } from "../api/types";
+import { useSession } from "../state/session";
 import { AnswerBody } from "./AnswerBody";
 import { SourceStrip } from "./SourceStrip";
 
-export interface ChatTurn {
-  id: string;
-  question: string;
-  answer?: ChatAnswer;
-  error?: string;
-}
+export type { ChatTurn } from "../state/session";
 
 interface ChatPanelProps {
   status?: AssistantStatus;
   sessionId: string | null;
-  /** Restrict retrieval to one source, or null for the whole knowledge base. */
-  sourceFilter: string | null;
-  /** Per-request workflow override, or null to use the configured default. */
-  workflow: string | null;
   hasContent: boolean;
-  onAnswer: (answer: ChatAnswer) => void;
   onCitationClick: (nodeId: string | undefined) => void;
   onConnectModel: () => void;
 }
@@ -35,15 +26,15 @@ const SUGGESTIONS = [
 export function ChatPanel({
   status,
   sessionId,
-  sourceFilter,
-  workflow,
   hasContent,
-  onAnswer,
   onCitationClick,
   onConnectModel,
 }: ChatPanelProps) {
-  const [turns, setTurns] = useState<ChatTurn[]>([]);
-  const [draft, setDraft] = useState("");
+  // The conversation, the draft and the retrieval scope live in the session
+  // store, so leaving for Sources or Settings and coming back finds the thread
+  // exactly where it was — including a half-typed question.
+  const { state, dispatch } = useSession();
+  const { turns, draft, sourceFilter, workflow } = state;
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -55,23 +46,9 @@ export function ChatPanel({
         source_name: sourceFilter,
         workflow,
       }),
-    onSuccess: (answer, question) => {
-      setTurns((prev) =>
-        prev.map((turn) =>
-          turn.question === question && !turn.answer && !turn.error ? { ...turn, answer } : turn,
-        ),
-      );
-      onAnswer(answer);
-    },
-    onError: (error: Error, question) => {
-      setTurns((prev) =>
-        prev.map((turn) =>
-          turn.question === question && !turn.answer && !turn.error
-            ? { ...turn, error: error.message }
-            : turn,
-        ),
-      );
-    },
+    onSuccess: (answer, question) => dispatch({ type: "answered", question, answer }),
+    onError: (error: Error, question) =>
+      dispatch({ type: "ask-failed", question, error: error.message }),
   });
 
   // Keep the newest turn in view as answers stream in.
@@ -82,8 +59,7 @@ export function ChatPanel({
   const submit = (text: string) => {
     const question = text.trim();
     if (!question || ask.isPending) return;
-    setTurns((prev) => [...prev, { id: `${Date.now()}-${prev.length}`, question }]);
-    setDraft("");
+    dispatch({ type: "ask", id: `${Date.now()}-${turns.length}`, question });
     if (textareaRef.current) textareaRef.current.style.height = "auto";
     ask.mutate(question);
   };
@@ -161,7 +137,7 @@ export function ChatPanel({
               sourceFilter ? `Ask about ${sourceFilter}…` : "Ask anything about your sources…"
             }
             onChange={(event) => {
-              setDraft(event.target.value);
+              dispatch({ type: "set-draft", text: event.target.value });
               const el = event.target;
               el.style.height = "auto";
               el.style.height = `${Math.min(el.scrollHeight, 160)}px`;

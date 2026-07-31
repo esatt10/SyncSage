@@ -202,12 +202,12 @@ class GraphBuilder:
 
         nodes = list(self.graph.nodes(data=True))
         ref_edges: list[tuple[str, str, str, str | None]] = []
-        for (source, target), edge_map in self.graph._edges.items():
+        for (source, target), edge_map in self.graph.edges():
             for data in edge_map.values():
                 edge_type = data.get("type")
                 if edge_type not in {"imports", "references"}:
                     continue
-                target_attrs = self.graph.nodes[target] if self.graph.has_node(target) else {}
+                target_attrs = self.graph.nodes.get(target, {})
                 if target_attrs.get("type") != "external_reference":
                     continue
                 ref_edges.append((source, target, edge_type, data.get("reference_type")))

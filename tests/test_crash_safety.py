@@ -25,7 +25,7 @@ import pytest
 from syncsage.config.loader import load_config
 from syncsage.persistence.state_store import StateStore
 from syncsage.sync.engine import SyncEngine
-from syncsage.sync.locks import EngineLease, EngineLeaseError
+from syncsage.sync.locks import EngineLease, EngineLeaseError, source_lock
 from tests.conftest import CONFIG_TEMPLATE
 
 POLL_TIMEOUT_S = 30.0
@@ -254,6 +254,62 @@ def test_lease_heartbeats_and_releases(tmp_path: Path) -> None:
     contender = EngineLease(tmp_path, heartbeat_interval_s=0.05, stale_after_s=60.0)
     with pytest.raises(EngineLeaseError, match="lease"):
         contender.acquire()
+
+
+def test_source_lock_from_a_dead_container_is_not_honoured(tmp_path: Path, caplog) -> None:
+    """A lock left by a killed container must not brick the next container.
+
+    The old container recorded ``pid: 1``; in the replacement container PID 1
+    is the server itself, so a PID-only liveness check kept every restart
+    failing with "Source is already locked". The recorded hostname (the
+    container id) is what makes the PID meaningful.
+    """
+
+    locks = tmp_path / "locks"
+    locks.mkdir()
+    (locks / "syncsage-repo.lock").write_text(
+        json.dumps(
+            {
+                "source_id": "syncsage-repo",
+                "pid": 1,  # alive in this namespace, but not the same namespace
+                "hostname": "a1b2c3d4e5f6",
+                "created_at": "2026-05-29T02:41:08+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="syncsage.sync.locks"):
+        with source_lock(locks, "syncsage-repo"):
+            payload = json.loads((locks / "syncsage-repo.lock").read_text(encoding="utf-8"))
+            assert payload["pid"] == os.getpid()
+            assert payload["hostname"] == socket.gethostname()
+    assert any("stale source lock" in record.message.lower() for record in caplog.records)
+    assert not (locks / "syncsage-repo.lock").exists()
+
+
+def test_legacy_source_lock_without_hostname_is_cleared(tmp_path: Path) -> None:
+    """Pre-fix locks carry no hostname, so their PID cannot be trusted."""
+
+    locks = tmp_path / "locks"
+    locks.mkdir()
+    (locks / "notes.lock").write_text(
+        json.dumps({"source_id": "notes", "pid": 1, "created_at": "2026-05-29T02:41:08+00:00"}),
+        encoding="utf-8",
+    )
+    with source_lock(locks, "notes"):
+        pass
+    assert not (locks / "notes.lock").exists()
+
+
+def test_live_source_lock_on_this_host_is_still_honoured(tmp_path: Path) -> None:
+    """The lock must keep doing its job for a real concurrent sync."""
+
+    locks = tmp_path / "locks"
+    with source_lock(locks, "syncsage-repo"):
+        with pytest.raises(RuntimeError, match="already locked"):
+            with source_lock(locks, "syncsage-repo"):
+                pass
 
 
 def test_legacy_manifests_migrate_exactly_once(

@@ -72,9 +72,9 @@ def _relationship_hits(
     source_name: str | None,
 ) -> list[tuple[float, dict[str, Any]]]:
     hits: list[tuple[float, dict[str, Any]]] = []
-    for (source, target), edge_map in graph._edges.items():
-        source_label = str(graph._nodes.get(source, {}).get("label") or source)
-        target_label = str(graph._nodes.get(target, {}).get("label") or target)
+    for (source, target), edge_map in graph.edges():
+        source_label = str(graph.nodes.get(source, {}).get("label") or source)
+        target_label = str(graph.nodes.get(target, {}).get("label") or target)
         for _key, data in edge_map.items():
             if source_name and data.get("source_id") != source_name:
                 continue

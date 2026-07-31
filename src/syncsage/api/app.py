@@ -36,6 +36,7 @@ from syncsage.security.path_policy import (
     resolve_under,
 )
 from syncsage.sync.engine import SyncEngine
+from syncsage.sync.fingerprint import EMBEDDING_SCOPE, embedding_fingerprint
 from syncsage.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -348,8 +349,17 @@ def graph_neighbors(
     node_id: str,
     depth: int = 1,
     edge_types: list[str] | None = None,
+    max_nodes: int | None = None,
 ) -> dict:
-    """Breadth-first neighbor expansion (mirrors SyncSageTools.get_graph_neighbors)."""
+    """Breadth-first neighbor expansion (mirrors SyncSageTools.get_graph_neighbors).
+
+    ``max_nodes`` stops the walk once that many neighbors are collected.
+    Callers that only keep the first N (the canvas asks for a bounded horizon)
+    must pass it: three hops off a hub node reaches most of the graph, and
+    enumerating all of it to then throw nearly all of it away is what made a
+    depth-3 slice take minutes. Truncation is in BFS order either way, so the
+    kept set is identical — only the work is smaller.
+    """
     if node_id not in graph:
         return {"node_id": node_id, "depth": depth, "neighbors": []}
     max_depth = max(1, min(int(depth or 1), 10))
@@ -358,6 +368,8 @@ def graph_neighbors(
     visited = {node_id}
     neighbors: list[dict] = []
     while queue:
+        if max_nodes is not None and len(neighbors) >= max_nodes:
+            break
         current, current_depth, path = queue.popleft()
         if current_depth >= max_depth:
             continue
@@ -375,12 +387,16 @@ def graph_neighbors(
                     "depth": next_depth,
                     "edge_types": edge_type_values,
                     "path": [*path, target],
-                    "node": dict(graph.nodes[target]),
+                    "node": dict(graph.nodes.get(target, {})),
                 }
             )
             if target not in visited:
                 visited.add(target)
                 queue.append((target, next_depth, [*path, target]))
+            # A single hub can have thousands of out-edges, so the budget has
+            # to bind inside the fan-out, not just between hops.
+            if max_nodes is not None and len(neighbors) >= max_nodes:
+                break
     return {"node_id": node_id, "depth": depth, "neighbors": neighbors}
 
 
@@ -392,9 +408,19 @@ def graph_slice(
     limit: int = 100,
 ) -> dict:
     """Connected sub-graph around a node (mirrors SyncSageTools.get_graph_slice)."""
-    traversal = graph_neighbors(graph, node_id, depth, edge_types)
-    node_ids = [node_id] + [item["node_id"] for item in traversal["neighbors"][:limit]]
+    traversal = graph_neighbors(graph, node_id, depth, edge_types, max_nodes=limit)
+    kept = traversal["neighbors"][:limit]
+    node_ids = [node_id] + [item["node_id"] for item in kept]
     node_set = set(node_ids)
+    # Hop distance per node, nearest wins (BFS order, so the first sighting is
+    # the shortest path). The UI rings the canvas by this and lets the user
+    # widen the horizon a layer at a time instead of rendering the whole graph.
+    depths: dict[str, int] = {node_id: 0}
+    for item in kept:
+        target = str(item["node_id"])
+        hop = int(item.get("depth") or 0)
+        if hop < depths.get(target, hop + 1):
+            depths[target] = hop
     links = []
     allowed = set(edge_types or [])
     for source in node_set:
@@ -410,8 +436,9 @@ def graph_slice(
     return {
         "node_id": node_id,
         "depth": depth,
-        "nodes": [dict(graph.nodes[item]) for item in node_ids if item in graph],
+        "nodes": [dict(attrs) for attrs in (graph.nodes.get(item) for item in node_ids) if attrs],
         "links": links,
+        "depths": depths,
     }
 
 
@@ -987,9 +1014,10 @@ def create_app(
     @app.get("/nodes/content")
     def node_content(node_id: str, principal: str | None = None) -> dict:
         graph = engine.graph_builder.graph
-        if node_id not in graph:
+        attrs = graph.nodes.get(node_id)
+        if attrs is None:
             raise HTTPException(status_code=404, detail=f"Unknown node: {node_id}")
-        node = dict(graph.nodes[node_id])
+        node = dict(attrs)
         if node.get("type") == "chunk":
             rows = state.rows(
                 "SELECT artifact_id, text FROM chunks WHERE id=? LIMIT 1",
@@ -1067,9 +1095,10 @@ def create_app(
     @app.get("/nodes/explain")
     def explain_node(node_id: str) -> dict:
         g = engine.graph_builder.graph
-        if node_id not in g:
+        attrs = g.nodes.get(node_id)
+        if attrs is None:
             return {"node_id": node_id, "explanation": "Node is not present in the current graph."}
-        node = dict(g.nodes[node_id])
+        node = dict(attrs)
         return {
             "node_id": node_id,
             "type": node.get("type"),
@@ -1356,6 +1385,10 @@ def create_app(
         }
         if req.reindex and engine.vectors is not None:
             result["reindex"] = _rebuild_vectors(drop_existing=dimension_change)
+            # Record the space we just embedded into, so the next restart sees
+            # a matching fingerprint and does not drop and re-embed all over
+            # again for a change that has already been applied.
+            state.set_fingerprint(EMBEDDING_SCOPE, embedding_fingerprint(config), utc_now())
         return result
 
     def _rebuild_vectors(drop_existing: bool = False) -> dict:
@@ -1363,7 +1396,9 @@ def create_app(
 
         Vectors are keyed by content-addressed chunk id, so this is
         idempotent: chunks already embedded are skipped and a second run
-        makes zero embedder calls.
+        makes zero embedder calls. The engine owns the same operation (it
+        runs it automatically when the embedding config changes under a
+        restart); this wrapper adds the HTTP-facing error shape.
         """
         if engine.vectors is None:
             raise HTTPException(
@@ -1463,9 +1498,14 @@ def create_app(
     def overview() -> dict:
         graph_obj = engine.graph_builder.graph
         counts: dict[str, int] = {}
-        for node_id in graph_obj.nodes:
-            node_type = str(graph_obj.nodes[node_id].get("type") or "unknown")
-            counts[node_type] = counts.get(node_type, 0) + 1
+        # One pinned read: the counts, the totals below and has_content all
+        # describe the same graph even if a sync is running.
+        with graph_obj.reading():
+            for _node_id, attrs in graph_obj.nodes(data=True):
+                node_type = str(attrs.get("type") or "unknown")
+                counts[node_type] = counts.get(node_type, 0) + 1
+            total_nodes = graph_obj.number_of_nodes()
+            total_links = graph_obj.number_of_edges()
         registered = SourceRegistry(config, state).list_sources()
         artifacts = state.rows("SELECT COUNT(*) AS n FROM artifacts")
         chunks = state.rows("SELECT COUNT(*) AS n FROM chunks")
@@ -1485,9 +1525,9 @@ def create_app(
             "indexed_artifacts": indexed,
             "chunk_count": int(chunks[0]["n"]) if chunks else 0,
             "node_counts": counts,
-            "total_nodes": graph_obj.number_of_nodes(),
-            "total_links": graph_obj.number_of_edges(),
-            "has_content": graph_obj.number_of_nodes() > structural and indexed > 0,
+            "total_nodes": total_nodes,
+            "total_links": total_links,
+            "has_content": total_nodes > structural and indexed > 0,
             "config_path": str(app.state.config_path),
         }
 

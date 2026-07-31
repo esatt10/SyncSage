@@ -1056,6 +1056,59 @@ select.text-input {
   box-shadow: var(--shadow-sm);
 }
 
+/* Horizon controls: depth is the main readability lever on a big graph, so it
+   sits on the canvas rather than in a menu. The overlay itself is
+   pointer-events:none so the canvas stays draggable; the controls opt back in. */
+.horizon {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  pointer-events: auto;
+}
+
+.horizon__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.horizon__row--center {
+  max-width: 260px;
+}
+
+.horizon__label {
+  font-size: 11px;
+  color: var(--text-soft);
+}
+
+.horizon__value {
+  min-width: 1.2em;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.horizon__center {
+  font-size: 11px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.graph-badge--action {
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+}
+
+.graph-badge--action:hover {
+  border-color: var(--accent, var(--border));
+  color: var(--text);
+}
+
 .graph-busy {
   position: absolute;
   left: 50%;

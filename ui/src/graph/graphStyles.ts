@@ -110,11 +110,15 @@ export interface CyElement {
   classes?: string;
 }
 
+/** Rings beyond this share the outermost styling. */
+export const MAX_STYLED_RING = 4;
+
 // Convert a node-link graph into Cytoscape elements, deduplicating ids.
 export function toElements(
   nodes: GraphNode[],
   links: GraphLink[],
   shapeAlgorithm: ShapeAlgorithm = "node_type",
+  depths?: Record<string, number>,
 ): CyElement[] {
   const seen = new Set<string>();
   const elements: CyElement[] = [];
@@ -127,6 +131,7 @@ export function toElements(
     if (!node.id || seen.has(node.id)) continue;
     seen.add(node.id);
     const connections = degree.get(node.id) ?? 0;
+    const hop = depths?.[node.id];
     elements.push({
       data: {
         id: node.id,
@@ -137,6 +142,10 @@ export function toElements(
         // separate "importance" legend.
         size: sizeForNode(node.type, connections, shapeAlgorithm),
       },
+      // Distance from the center reads as depth on the canvas: the center is
+      // solid, each ring out a little quieter, so "how far is this from what I
+      // asked about" is answerable at a glance.
+      classes: hop === undefined ? undefined : `ring-${Math.min(hop, MAX_STYLED_RING)}`,
     });
   }
   for (const link of links) {
@@ -249,6 +258,24 @@ export function buildStylesheet(): CyStylesheet[] {
         "z-index": 15,
       },
     },
+    // Rings: the center is emphatic, each layer out recedes. This is what
+    // makes a depth-3 horizon read as "near / middle / far" instead of as a
+    // flat blob of equally-loud nodes.
+    {
+      selector: "node.ring-0",
+      style: {
+        "border-width": 3,
+        "border-color": "#1c1b19",
+        "border-opacity": 0.55,
+        "font-size": 12,
+        "font-weight": 700,
+        "z-index": 12,
+      },
+    },
+    { selector: "node.ring-1", style: { opacity: 1 } },
+    { selector: "node.ring-2", style: { opacity: 0.85, "font-size": 9 } },
+    { selector: "node.ring-3", style: { opacity: 0.65, "font-size": 8.5 } },
+    { selector: "node.ring-4", style: { opacity: 0.5, label: "" } },
     // Faded, not erased: the surrounding structure is still the context that
     // makes a focused neighbourhood legible.
     { selector: ".faded", style: { opacity: 0.18 } },

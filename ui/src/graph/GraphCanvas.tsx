@@ -11,10 +11,14 @@ interface GraphCanvasProps {
   focusIds: string[];
   /** Nodes cited by the current answer — outlined so prose maps to graph. */
   citedIds?: string[];
+  /** Hop distance from the center, used to ring the canvas by nearness. */
+  depths?: Record<string, number>;
   layoutName: string;
   spacing: number;
   shapeAlgorithm: ShapeAlgorithm;
   onSelect: (nodeId: string) => void;
+  /** Double-tap: make this node the center the horizon is measured from. */
+  onRecenter?: (nodeId: string) => void;
 }
 
 const FORCE_LAYOUT_ELEMENT_LIMIT = 1000;
@@ -25,18 +29,21 @@ export function GraphCanvas({
   selectedId,
   focusIds,
   citedIds = [],
+  depths,
   layoutName,
   spacing,
   shapeAlgorithm,
   onSelect,
+  onRecenter,
 }: GraphCanvasProps) {
   const cyRef = useRef<Core | null>(null);
   const onSelectRef = useRef(onSelect);
+  const onRecenterRef = useRef(onRecenter);
   const listenerBoundRef = useRef(false);
   const selectedRef = useRef<string | null>(null);
   const elements = useMemo(
-    () => toElements(nodes, links, shapeAlgorithm),
-    [nodes, links, shapeAlgorithm],
+    () => toElements(nodes, links, shapeAlgorithm, depths),
+    [nodes, links, shapeAlgorithm, depths],
   );
   const stylesheet = useMemo(() => buildStylesheet(), []);
   const layout = useMemo(
@@ -48,7 +55,8 @@ export function GraphCanvas({
 
   useEffect(() => {
     onSelectRef.current = onSelect;
-  }, [onSelect]);
+    onRecenterRef.current = onRecenter;
+  }, [onSelect, onRecenter]);
 
   // Re-run layout whenever the element set changes (e.g. a sub-network is added).
   useEffect(() => {
@@ -129,6 +137,12 @@ export function GraphCanvas({
           if (listenerBoundRef.current) return;
           listenerBoundRef.current = true;
           cy.on("tap", "node", (event) => onSelectRef.current(event.target.id()));
+          // Double-tap re-aims the horizon at that node — the fastest way to
+          // walk a large graph without ever drawing all of it.
+          // Both spellings: Cytoscape emits `dblclick` for a mouse and
+          // `dbltap` for touch, and the reducer is idempotent if both land.
+          cy.on("dblclick", "node", (event) => onRecenterRef.current?.(event.target.id()));
+          cy.on("dbltap", "node", (event) => onRecenterRef.current?.(event.target.id()));
         }}
       />
     </div>

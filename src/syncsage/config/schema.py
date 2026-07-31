@@ -256,11 +256,16 @@ class StorageSettings(ModelMixin):
     - ``max_state_size_gb`` caps total snapshot bytes per KB; oldest snapshots
       are evicted first when exceeded. ``graph.latest.json``, the SQLite db, and
       the contract are never evicted.
+    - ``graph_checkpoint_seconds`` is the minimum spacing between mid-sync
+      writes of ``graph.latest.json``. The graph used to reach disk only when a
+      sync *completed*, so stopping the container during a first index threw
+      that work away. 0 disables checkpointing (end-of-sync save only).
     """
 
     graph_format: str = "node_link_json"
     graph_snapshots: bool = True
     graph_snapshot_interval_seconds: int = 900
+    graph_checkpoint_seconds: int = 60
     compression: str = "zstd"
     sqlite_path: Path | None = None
     graph_path: Path | None = None

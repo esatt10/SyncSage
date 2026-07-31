@@ -1,0 +1,39 @@
+# Demo overlay — layer it on top of the standard stack:
+#
+#   docker compose -f docker-compose.yml \
+#                  -f examples/demo-agent-framework/docker-compose.demo.yml \
+#                  up -d --build
+#
+# It changes four things and nothing else:
+#   1. builds the image with the [agent] extra (langgraph) so the agentic
+#      answer loop is available — the default image ships [mcp] only;
+#   2. mounts the demo config at /config/syncsage.yaml;
+#   3. mounts your agent-framework clone read-only at /workspace;
+#   4. passes OPENAI_API_KEY through from .env into the container env, where
+#      both the embedder and the assistant read it by name.
+#
+# A distinct image tag keeps this build from overwriting the lean default one.
+
+services:
+  syncsage:
+    build:
+      context: .
+      args:
+        SYNCSAGE_EXTRAS: ${SYNCSAGE_EXTRAS:-mcp,agent}
+    image: ${SYNCSAGE_IMAGE:-syncsage:demo-agent-framework}
+    environment:
+      SYNCSAGE_CONFIG: /config/syncsage.yaml
+      # Read by search.embeddings.api_key_env AND assistant.api_key_env. The
+      # value comes from .env; an empty value means the assistant answers
+      # extractively and the sync fails loudly on the first embed call.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env (see examples/demo-agent-framework/.env.demo.example)}
+    volumes:
+      - ./examples/demo-agent-framework/syncsage.demo.yaml:/config/syncsage.yaml:ro
+      - ${AGENT_FRAMEWORK_PATH:?set AGENT_FRAMEWORK_PATH in .env to your clone of microsoft/agent-framework}:/workspace:ro
+      - ${SYNCSAGE_VAULT_PATH:-./vault}:/vault
+      - syncsage-demo-state:/state
+      - syncsage-demo-exports:/exports
+
+volumes:
+  syncsage-demo-state:
+  syncsage-demo-exports:

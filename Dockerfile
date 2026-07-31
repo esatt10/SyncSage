@@ -19,10 +19,14 @@ RUN apt-get update \
 # Install from pyproject so the image's dependencies never drift from the
 # package's declared deps (a hand-maintained list previously omitted core deps
 # added later — numpy (21.4) and zstandard (21.6a) — breaking the smoke test).
-# ".[mcp]" = core deps + the MCP server extra the container serves.
+# ".[mcp]" = core deps + the MCP server extra the container serves. Override
+# SYNCSAGE_EXTRAS at build time to bake in more — "mcp,agent" adds the
+# LangGraph answer loop, "mcp,agent,vector" adds lancedb:
+#   docker build --build-arg SYNCSAGE_EXTRAS=mcp,agent .
+ARG SYNCSAGE_EXTRAS=mcp
 COPY pyproject.toml README.md LICENSE /app/
 COPY src /app/src
-RUN pip install --no-cache-dir ".[mcp]"
+RUN pip install --no-cache-dir ".[${SYNCSAGE_EXTRAS}]"
 
 COPY syncsage.example.yaml /config/syncsage.yaml
 
