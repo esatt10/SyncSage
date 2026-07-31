@@ -18,6 +18,12 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: syncsage
+  # The web UI is a separate workload (static bundle + nginx), so it is a
+  # separate image — but it is published from the same commit and tagged with
+  # the same version, so `syncsage host` and docker-compose.yml can pin the two
+  # together. Without this, the compose files reference a UI image that was
+  # never pushed and the sidecar fails to start.
+  UI_IMAGE_NAME: syncsage-ui
 
 concurrency:
   group: publish-container-main
@@ -60,6 +66,7 @@ jobs:
         run: |
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           echo "ref=${REGISTRY}/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "ui_ref=${REGISTRY}/${owner}/${UI_IMAGE_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Check version alignment
         run: python scripts/sync_version.py --check
@@ -117,3 +124,15 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.image.outputs.ref }}:${{ steps.version.outputs.version }}
+
+      # The UI sidecar, from the same commit and under the same version tag.
+      # `latest` is pushed too so compose files from older releases (which
+      # pinned `:latest`) resolve to a real image instead of failing to pull.
+      - name: Push UI image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./ui
+          push: true
+          tags: |
+            ${{ steps.image.outputs.ui_ref }}:${{ steps.version.outputs.version }}
+            ${{ steps.image.outputs.ui_ref }}:latest

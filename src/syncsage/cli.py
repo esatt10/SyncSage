@@ -60,12 +60,33 @@ def _sync_services(engine, cfg):
     )
 
 
-def _serve_app(cfg, config_path: str) -> None:
+def _report_ui(app_obj, cfg) -> None:
+    """Say whether the web UI is being served, and how to get it if not.
+
+    Going from "the CLI works" to "I can see the graph" is the step people get
+    stuck on: the API answers on the port either way, so a missing bundle is
+    otherwise silent.
+    """
+    host = "localhost" if cfg.server.host in ("0.0.0.0", "::") else cfg.server.host
+    if getattr(app_obj.state, "ui_dist", None):
+        print(f"Web UI:      http://{host}:{cfg.server.port}")
+    elif cfg.server.ui.enabled:
+        print(
+            "Web UI:      not served — no built bundle found.\n"
+            "             Build it with `npm --prefix ui ci && npm --prefix ui run build`,\n"
+            "             set SYNCSAGE_UI_DIST to an existing one, or run the container\n"
+            "             sidecar (`syncsage host`). See docs/how-to/run-the-ui.md."
+        )
+
+
+def _serve_app(cfg, config_path: str, *, report_ui: bool = True) -> None:
     import uvicorn
 
     from syncsage.api.app import create_app
 
     app_obj = create_app(cfg, config_path=config_path)
+    if report_ui:
+        _report_ui(app_obj, cfg)
     watcher, scheduler = _sync_services(app_obj.state.engine, cfg)
     watcher.start()
     scheduler.start()
@@ -290,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
         from syncsage.config.loader import load_config
 
         cfg = load_config(config_path)
-        print(f"Serving API + MCP on http://{cfg.server.host}:{cfg.server.port}")
+        print(f"API + MCP:   http://{cfg.server.host}:{cfg.server.port}")
         _serve_app(cfg, str(config_path))
         return 0
     if args.command == "host":
@@ -480,7 +501,9 @@ def main(argv: list[str] | None = None) -> int:
         from syncsage.config.loader import load_config
 
         cfg = load_config(Path(args.config))
-        _serve_app(cfg, args.config)
+        # `serve` is the container entrypoint, where the UI is a separate
+        # sidecar workload — an npm hint in the image's logs would be noise.
+        _serve_app(cfg, args.config, report_ui=False)
         return 0
     if args.command == "mcp":
         from syncsage.config.loader import load_config

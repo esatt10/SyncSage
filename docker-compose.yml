@@ -38,13 +38,20 @@ services:
       retries: 3
       start_period: 20s
 
-  # Optional web UI. A separate workload that serves the static React bundle and
-  # proxies /api/* to the syncsage service above. Bring it up with
-  # `docker compose up --build`; omit it to run SyncSage headless.
+  # Optional web UI at http://localhost:8080. A separate workload that serves the
+  # static React bundle and proxies /api/* to the syncsage service above.
+  #
+  #   docker compose up -d --build        # build this checkout's UI and run it
+  #   docker compose up -d --build syncsage-ui   # rebuild just the UI
+  #   docker compose up -d syncsage       # headless: API + MCP only, no UI
+  #
+  # Always pass --build when you want the CURRENT ui/ sources: with an `image:`
+  # tag already present locally, Compose reuses it and your UI changes appear to
+  # do nothing. See docs/how-to/run-the-ui.md.
   syncsage-ui:
     build:
       context: ./ui
-    image: ${SYNCSAGE_UI_IMAGE:-ghcr.io/esatt10/syncsage-ui:0.1.12}
+    image: ${SYNCSAGE_UI_IMAGE:-ghcr.io/esatt10/syncsage-ui:0.5.1}
     container_name: syncsage-ui
     restart: unless-stopped
     ports:

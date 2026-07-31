@@ -105,12 +105,23 @@ expansion still fetches focused graph slices on demand.
 
 ## Deploy
 
-- **Sidecar (default):** `docker compose up` — or `syncsage host <target>` —
-  builds this image and serves it behind nginx, proxying `/api/*` to the
-  SyncSage container.
-- **Served by SyncSage:** build to `dist/` and the API mounts it automatically,
-  or point `SYNCSAGE_UI_DIST` at a bundle elsewhere. Mounted only when
-  `server.ui.enabled` is true and the directory exists.
+Step-by-step for all of these, plus how to avoid serving a stale bundle:
+[Run the web UI](../docs/how-to/run-the-ui.md).
+
+- **Sidecar (default):** `docker compose up -d --build` — or
+  `syncsage host <target>` — builds this image and serves it behind nginx,
+  proxying `/api/*` to the SyncSage container, on `http://localhost:8080`.
+  Pass `--build` whenever the UI source changed: Compose reuses an existing
+  local image for the tag otherwise, so edits appear to do nothing.
+- **Served by SyncSage:** `npm run build` and the API mounts `dist/`
+  automatically at its own port (`http://localhost:8765`), or point
+  `SYNCSAGE_UI_DIST` at a bundle elsewhere. Mounted only when
+  `server.ui.enabled` is true and the directory exists. Build this one *without*
+  `VITE_SYNCSAGE_API_BASE` so the bundle calls the API same-origin rather than
+  through `/api`.
+- **Published image:** `ghcr.io/esatt10/syncsage-ui:<syncsage version>` — built
+  from the same commit as the SyncSage image and tagged with the same version,
+  so the pair always match.
 
 ## Backend routes used
 

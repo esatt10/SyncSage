@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -312,3 +313,46 @@ def test_sync_routes_map_domain_errors_to_4xx(loaded_config) -> None:
 
     unknown = client.post("/sync", json={"source_name": "no-such-source"})
     assert unknown.status_code == 404
+
+
+def test_bundle_is_mounted_and_reported_only_when_it_exists(
+    loaded_config, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Serving the UI is silent-by-default in both directions; make it legible.
+
+    A missing bundle is invisible — the API answers on the port either way —
+    which is the step people get stuck on between "the CLI works" and "I can
+    see the graph". `app.state.ui_dist` records the outcome and the CLI banner
+    reads it.
+    """
+    from syncsage.cli import _report_ui
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>ui</title>", encoding="utf-8")
+    monkeypatch.setenv("SYNCSAGE_UI_DIST", str(dist))
+
+    app = create_app(config=loaded_config)
+    assert app.state.ui_dist == str(dist)
+    client = TestClient(app)
+    assert "<title>ui</title>" in client.get("/").text
+    # The mount is added last, so API routes still win.
+    assert client.get("/health").status_code == 200
+    _report_ui(app, loaded_config)
+    assert f":{loaded_config.server.port}" in capsys.readouterr().out
+
+    # Nothing built anywhere: the banner has to say so and name the fix. (A
+    # stub app, because this checkout may well have a real ui/dist — the
+    # fallback candidate — sitting next to it.)
+    unmounted = SimpleNamespace(state=SimpleNamespace(ui_dist=None))
+    _report_ui(unmounted, loaded_config)
+    banner = capsys.readouterr().out
+    assert "not served" in banner
+    assert "npm --prefix ui run build" in banner
+
+    # Explicitly disabled: no mount, and no unsolicited advice either.
+    loaded_config.server.ui.enabled = False
+    disabled = create_app(config=loaded_config)
+    assert disabled.state.ui_dist is None
+    _report_ui(disabled, loaded_config)
+    assert capsys.readouterr().out == ""

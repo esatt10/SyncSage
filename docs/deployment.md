@@ -28,8 +28,15 @@ docker run --rm \
 ```bash
 cp syncsage.example.yaml syncsage.yaml
 syncsage compose-env syncsage.yaml --output .syncsage/compose.env
-docker compose --env-file .syncsage/compose.env up -d
+docker compose --env-file .syncsage/compose.env up -d --build
 ```
+
+This brings up two services: `syncsage` (API + MCP on `:8765`) and the optional
+`syncsage-ui` sidecar (web UI on `:8080`). Run `docker compose up -d syncsage`
+for a headless stack. `--build` matters for the UI: the sidecar has both a
+`build:` context and an `image:` tag, so without it Compose keeps serving the
+bundle it built the first time. Step-by-step UI instructions, including the
+non-Docker path, live in [Run the web UI](how-to/run-the-ui.md).
 
 `syncsage compose-env` renders the Docker Compose interpolation variables from the selected YAML. By default Compose mounts:
 
@@ -134,10 +141,10 @@ Validation and publishing are intentionally split across workflows.
 - `.github/workflows/ci.yml`: runs ruff correctness lint, dependency checks, source compilation, pytest on Python 3.11 and 3.12, package build, Docker Compose validation, Docker image build, and image smoke tests.
 - `.github/workflows/release-version.yml`: runs from trusted base-branch code, comments on PRs with valid release increments, and defaults to `patch` / `3` unless a maintainer comments with `minor`, `major`, `2`, or `1`.
 - `.github/workflows/container.yml`: publishes after CI passes on a push to `main`; it reads the merged PR release increment, bumps `pyproject.toml` and generated deployment tags on `main`, then builds the image.
-- Merged PR to `main`: publishes `ghcr.io/esatt10/syncsage:<pyproject version>`. Direct pushes to `main` are not releaseable because there is no PR release-increment comment to read.
+- Merged PR to `main`: publishes `ghcr.io/esatt10/syncsage:<pyproject version>` and, from the same commit, the web UI sidecar as `ghcr.io/esatt10/syncsage-ui:<pyproject version>` plus `:latest`. The shared version tag is what lets compose files pin the API and UI together. Direct pushes to `main` are not releaseable because there is no PR release-increment comment to read.
 - The workflow uses repository `GITHUB_TOKEN` permissions with `packages: write`.
 
-For public local installs, make the package public from the GitHub package settings after the first image is published. To block merges without validation and a checked release increment, require the CI checks and the `Release version selection` status in branch protection for `main`.
+For public local installs, make the package public from the GitHub package settings after the first image is published — **both** packages, `syncsage` and `syncsage-ui`, or the UI sidecar fails to pull for anyone who is not authenticated to the registry. To block merges without validation and a checked release increment, require the CI checks and the `Release version selection` status in branch protection for `main`.
 
 ## Version alignment
 

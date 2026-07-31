@@ -203,6 +203,8 @@ You're done when all of these are true:
 
 ## Where to next
 
+- **See it in a browser** — the graph, chat and source panes:
+  [Run the web UI](../how-to/run-the-ui.md).
 - Index **images and audio** (offline): [Multi-modal tutorial](multimodal.md).
 - Turn on **semantic search**: [Vector self-search](../how-to/vector-search.md).
 - Join a **Synapse fleet**: [Attach to a Synapse fleet](../how-to/attach-to-synapse.md).
