@@ -248,3 +248,102 @@ def test_engine_embeds_with_lancedb_backend(tmp_path: Path) -> None:
     assert engine.vectors.store.count() >= 2
     payload = _search(engine, "car", "vector")
     assert "vehicles.md" in _result_paths(payload)[0]
+
+
+def test_numpy_store_caches_the_decoded_matrix(tmp_path: Path) -> None:
+    """Regression test: search() must not re-decode the whole index every call.
+
+    Every vector is stored base64-encoded, and decoding all of them is a
+    pure-Python loop (struct.unpack per item) that does not release the GIL
+    between iterations -- so redoing it on every search() call meant N
+    concurrent searches cost roughly N times one search's worth of decode
+    work, GIL-serialized, regardless of thread count. Measured live: an
+    agentic retrieve step fanning out 4 concurrent vector searches took
+    21-29s against a 7,463-chunk index. The fix caches the decoded
+    (ids, matrix, norms) keyed off the same file signature `_items()`
+    already uses, so it is correctness-equivalent to the uncached version
+    and only rebuilds when the underlying file actually changes.
+    """
+    from syncsage.search.vector_store import NumpyVectorStore
+
+    store = NumpyVectorStore(tmp_path / "vectors")
+    store.upsert(
+        ["c1", "c2", "c3"],
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.9, 0.1, 0.0]],
+        [
+            {"source_id": "s1", "artifact_id": "a1", "text_hash": "h1"},
+            {"source_id": "s1", "artifact_id": "a1", "text_hash": "h2"},
+            {"source_id": "s2", "artifact_id": "a2", "text_hash": "h3"},
+        ],
+    )
+
+    first = store.search([1.0, 0.0, 0.0], k=2)
+    cache_after_first = store._matrix_cache
+
+    # Repeated searches against unchanged data must be identical...
+    second = store.search([1.0, 0.0, 0.0], k=2)
+    assert first == second
+    # ...and must not have rebuilt the decoded matrix (same object, not an
+    # equal-but-freshly-built one) -- this is the actual property being
+    # fixed, not just "results are still correct".
+    assert store._matrix_cache is cache_after_first
+
+    # A write must invalidate the cache. Invalidation is lazy -- the matrix
+    # is rebuilt on the *next search*, not eagerly on write -- so the write
+    # alone changes nothing yet; only after a search does identity change,
+    # and the new data is what it returns.
+    store.upsert(["c4"], [[0.0, 0.0, 1.0]], [{"source_id": "s3", "artifact_id": "a3"}])
+    after_write = store.search([0.0, 0.0, 1.0], k=1)
+    assert after_write[0][0] == "c4"
+    assert store._matrix_cache is not cache_after_first
+
+    # Deleting must invalidate it too, not just adding.
+    cache_before_delete = store._matrix_cache
+    store.delete(chunk_ids=["c4"])
+    remaining = store.search([0.0, 0.0, 1.0], k=5)
+    assert all(hit[0] != "c4" for hit in remaining)
+    assert store._matrix_cache is not cache_before_delete
+
+
+def test_numpy_store_concurrent_search_is_thread_safe(tmp_path: Path) -> None:
+    """Many threads racing to build the cache must not corrupt or crash."""
+    import threading
+
+    from syncsage.search.vector_store import NumpyVectorStore
+
+    store = NumpyVectorStore(tmp_path / "vectors")
+    # One-hot vectors: orthogonal, so cosine similarity to the query is
+    # exactly 1.0 for its own match and exactly 0.0 for every other id --
+    # unlike collinear vectors (e.g. [i, 0, 0]), which all tie at cosine
+    # similarity 1.0 and make "the top hit" undefined.
+    n = 200
+    store.upsert(
+        [f"c{i}" for i in range(n)],
+        [[1.0 if j == i else 0.0 for j in range(n)] for i in range(n)],
+        [{"source_id": "s", "artifact_id": f"a{i}"} for i in range(n)],
+    )
+    query = [1.0 if j == n - 1 else 0.0 for j in range(n)]
+
+    results: list[list] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        try:
+            hits = store.search(query, k=3)
+            with lock:
+                results.append(hits)
+        except BaseException as exc:  # noqa: BLE001
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors, f"concurrent search failed: {errors[0]!r}"
+    assert len(results) == 16
+    # Every thread must see the same, correct top hit.
+    assert all(r[0][0] == f"c{n - 1}" for r in results)

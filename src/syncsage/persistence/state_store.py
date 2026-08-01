@@ -170,37 +170,58 @@ CREATE TABLE IF NOT EXISTS sync_fingerprints (
 
 
 class StateStore:
+    """SQLite-backed state, one connection per thread.
+
+    WAL mode (set below) is SQLite's sanctioned way to let multiple threads
+    read the same database truly concurrently — but only when each thread
+    uses its *own* connection/cursor. An earlier version of this class shared
+    one `sqlite3.Connection` across every thread: the search paths
+    (text/vector/graph) run in parallel across threads (hybrid.py's per-mode
+    pool, nested inside multi_search's per-query pool for the agentic
+    workflow), and overlapping execute()+fetch calls on one shared connection
+    interleaved cursor state, handing back a Row missing an expected column
+    (reproduced as `row["chunk_id"]` raising IndexError from
+    vector_store.search() under concurrent load). The fix at the time was a
+    lock serializing every read through `rows()` — correct, but it throws
+    away the concurrency WAL mode exists to provide: with four queries
+    fanning out across three search modes, a global lock turned an
+    embarrassingly-parallel retrieve step into a mostly-serial one (measured:
+    the first, multi-query retrieve of an agentic run took 22-29s; a later
+    single-query retrieve over the same data took 1.3-2s).
+
+    Thread-local connections remove the shared state instead of locking
+    around it: every thread gets its own connection and cursor, so there is
+    nothing left to interleave, and reads run genuinely in parallel again.
+    Writes still only ever happen from the sync worker process (a different
+    process entirely — see sync/worker.py), so this process's connections are
+    all readers as far as WAL's MVCC snapshot isolation is concerned.
+    """
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn: sqlite3.Connection | None = None
-        # `check_same_thread=False` below only lifts sqlite3's same-thread
-        # affinity check; it does not make a single Connection safe for truly
-        # concurrent statement execution. The search paths (text/vector/graph)
-        # now run in parallel across threads that all share this one
-        # connection (hybrid.py's per-mode pool, nested inside multi_search's
-        # per-query pool for the agentic workflow) — without serializing
-        # access, overlapping execute()+fetch calls can interleave cursor
-        # state and hand back a Row missing an expected column. Reproduced:
-        # `row["chunk_id"]` raising IndexError from vector_store.search()
-        # under concurrent load from the agentic loop. This lock protects
-        # every read through `rows()`; the serving process never writes here
-        # (indexing runs in a separate worker process — see sync/worker.py),
-        # so this only serializes brief query execution, not the request.
-        self._read_lock = threading.RLock()
+        self._local = threading.local()
+        # Every connection ever opened, so close() can close all of them —
+        # not just whichever thread happens to call close().
+        self._all_conns: list[sqlite3.Connection] = []
+        self._registry_lock = threading.Lock()
 
     @property
     def conn(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._conn = sqlite3.connect(self.path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, check_same_thread=True)
+            conn.row_factory = sqlite3.Row
             # Crash/concurrency safety (Synapse step 21.2): WAL survives
             # kill -9 mid-write, busy_timeout rides out concurrent readers,
             # synchronous=NORMAL is the sanctioned WAL durability level.
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA busy_timeout=5000")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-        return self._conn
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn = conn
+            with self._registry_lock:
+                self._all_conns.append(conn)
+        return conn
 
     def migrate(self) -> None:
         self.conn.executescript(SCHEMA)
@@ -739,13 +760,20 @@ class StateStore:
         return dict(rows[0]) if rows else None
 
     def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-        # Serialized: see the note on `_read_lock` in __init__. `execute()`
-        # plus consuming the cursor into a list must happen as one atomic
-        # unit — releasing the lock between them would defeat the point.
-        with self._read_lock:
-            return list(self.conn.execute(sql, params))
+        # No lock: `self.conn` is this thread's own connection (see the class
+        # docstring), so there is no cursor state shared with any other
+        # thread to interleave.
+        return list(self.conn.execute(sql, params))
 
     def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        # Every thread that ever touched this store opened its own
+        # connection; close them all, not just the caller's.
+        with self._registry_lock:
+            conns, self._all_conns = self._all_conns, []
+        for conn in conns:
+            try:
+                conn.close()
+            except sqlite3.Error:  # pragma: no cover - best-effort cleanup
+                pass
+        if hasattr(self._local, "conn"):
+            del self._local.conn
