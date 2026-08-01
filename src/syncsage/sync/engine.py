@@ -25,6 +25,7 @@ from syncsage.persistence.manifest import ManifestStore
 from syncsage.persistence.paths import StatePaths
 from syncsage.persistence.state_store import StateStore
 from syncsage.registry.source_registry import SourceRegistry
+from syncsage.search.node_index import NodeIndex
 from syncsage.search.vector_store import (
     VectorSearcher,
     vector_indexer_from_config,
@@ -130,6 +131,9 @@ class SyncEngine:
         self._graph_dirty = False
         self._last_checkpoint = time.monotonic()
         self._last_save_seconds = 0.0
+        # Derived full-text index over graph nodes, so graph search does not
+        # have to scan the graph. Built from the graph, never authoritative.
+        self.node_index = NodeIndex(self.state)
 
     def close(self) -> None:
         """Persist in-flight graph work, release the lease, close the store.
@@ -160,12 +164,55 @@ class SyncEngine:
             return False
         if source_name and manifest is not None:
             self.manifests.save(source_name, manifest)
+        self.flush_node_index()
         started = time.monotonic()
         self.graph_store.save(self.config.knowledge_base_id, self.graph_builder.graph)
         self._last_save_seconds = time.monotonic() - started
         self._graph_dirty = False
         self._last_checkpoint = time.monotonic()
         return True
+
+    def flush_node_index(self) -> int:
+        """Push pending node writes into the search index. Never fatal.
+
+        The index is derived from the graph, so a failure here costs query
+        speed until the next flush or rebuild — never correctness, and never
+        a failed sync.
+        """
+
+        try:
+            upserts, removals = self.graph_builder.graph.take_index_delta()
+            if not upserts and not removals:
+                return 0
+            return self.node_index.apply(upserts, removals)
+        except Exception as exc:  # pragma: no cover - cache maintenance
+            logger.warning("Could not update the graph node index: %s", exc)
+            return 0
+
+    def rebuild_node_index(self) -> int:
+        """Rebuild the whole index from the in-memory graph."""
+
+        graph = self.graph_builder.graph
+        rows = graph.index_rows()
+        written = self.node_index.replace_all(rows)
+        # Everything pending is now represented.
+        graph.take_index_delta()
+        logger.info("Graph node index rebuilt: %d nodes", written)
+        return written
+
+    def ensure_node_index(self) -> int:
+        """Build the index if it is missing, e.g. after an upgrade.
+
+        Cheap when it already exists: one COUNT.
+        """
+
+        graph = self.graph_builder.graph
+        if graph.number_of_nodes() <= 1:
+            return 0
+        if self.node_index.count() > 0:
+            self.flush_node_index()
+            return 0
+        return self.rebuild_node_index()
 
     def _maybe_checkpoint(self, source_name: str, manifest: dict) -> None:
         """Checkpoint at most once per configured interval during a sync.
@@ -211,6 +258,7 @@ class SyncEngine:
         self.state.migrate()
         SourceRegistry(self.config, self.state).initialize()
         self.reconcile_embeddings()
+        self.ensure_node_index()
         results = []
         for source in self.config.sources:
             if source.enabled and source.sync.on_startup:
@@ -580,6 +628,7 @@ class SyncEngine:
             manifest["last_indexed_at"] = utc_now()
             manifest["connector"] = {"type": connector.connector_type}
             self.manifests.save(source.name, manifest)
+            self.flush_node_index()
             self.graph_store.save(self.config.knowledge_base_id, self.graph_builder.graph)
             self._graph_dirty = False
             self._last_checkpoint = time.monotonic()

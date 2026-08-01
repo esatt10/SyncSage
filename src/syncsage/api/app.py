@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -508,7 +509,11 @@ def create_app(
     state.migrate()
     SourceRegistry(config, state).initialize()
     engine = SyncEngine(config, paths, state)
-    search = HybridSearch(SearchStore(state), vector=engine.vector_searcher())
+    search = HybridSearch(
+        SearchStore(state),
+        vector=engine.vector_searcher(),
+        node_index=engine.node_index,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -534,6 +539,19 @@ def create_app(
                 )
 
             loop.run_in_executor(None, _run_startup)
+
+        # Warm the agent framework off the request path. Importing langgraph
+        # costs ~4s, and it used to be paid, lazily, by whoever asked the first
+        # question after a restart — which read as "the planner is slow" when
+        # nothing was planning yet. Best-effort and in the background: a
+        # missing [agent] extra just means the simple workflow answers.
+        def _warm_workflows() -> None:
+            from syncsage.assistant.workflows.agentic import warm
+
+            if warm():
+                logger.info("Agent workflow ready (langgraph imported and graph compiled)")
+
+        threading.Thread(target=_warm_workflows, name="syncsage-warm", daemon=True).start()
         yield
 
     app = FastAPI(title="SyncSage", version=__version__, lifespan=lifespan)

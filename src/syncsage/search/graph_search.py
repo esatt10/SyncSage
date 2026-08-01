@@ -28,6 +28,7 @@ def search_graph(
     max_results: int = 10,
     source_name: str | None = None,
     include_relationships: bool = True,
+    node_index: Any = None,
 ) -> list[dict[str, Any]]:
     """Search across graph nodes, relationships and their attributes.
 
@@ -46,13 +47,27 @@ def search_graph(
     # One lock hold for the whole scan, iterating live: the previous snapshot
     # copied every node and edge before scoring a single one, which on a
     # 240k-node graph was most of the query's latency.
+    # Ask the index which nodes could match. It returns None when it cannot
+    # answer (absent, empty, or FTS5 unavailable), and then — and only then —
+    # we fall back to scanning every node, which is correct but O(graph).
+    candidates = None
+    if node_index is not None:
+        candidates = node_index.candidates(tokens, source_name=source_name)
+
     # One compiled alternation runs the reject inside the regex engine rather
     # than as a Python loop per token per node — on a 400k-node graph that
     # loop overhead was most of what remained of the query.
     matcher = _reject_matcher(tokens, q)
     with graph.reading():
         blobs = graph.search_blobs()
-        for node_id, attrs in graph.iter_nodes():
+        walk = (
+            ((node_id, graph.nodes.get(node_id) or {}) for node_id in candidates)
+            if candidates is not None
+            else graph.iter_nodes()
+        )
+        for node_id, attrs in walk:
+            if not attrs:
+                continue
             if source_name and attrs.get("source_id") != source_name:
                 continue
             # Exact fast reject: scoring can only exceed zero when the query

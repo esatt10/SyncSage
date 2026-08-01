@@ -88,6 +88,11 @@ class SimpleMultiDiGraph:
         # overwhelming majority of nodes with one substring test instead of
         # stringifying and weighting every attribute of every node.
         self._search_blobs: dict[str, str] = {}
+        # Nodes written or removed since the search index last flushed. The
+        # index is a derived cache, so this is only bookkeeping for "what does
+        # it still owe"; losing it costs a rebuild, never correctness.
+        self._dirty_nodes: set[str] = set()
+        self._removed_nodes: set[str] = set()
         self.nodes = NodeView(self)
 
     def reading(self):
@@ -116,6 +121,8 @@ class SimpleMultiDiGraph:
             self._nodes[node] = merged
             self._retype(existing.get("type") if existing else None, merged.get("type"))
             self._search_blobs[node] = _search_blob(merged)
+            self._dirty_nodes.add(node)
+            self._removed_nodes.discard(node)
 
     def add_edge(self, source, target, **attrs):
         with self._lock:
@@ -146,6 +153,9 @@ class SimpleMultiDiGraph:
                 if existing is not None:
                     self._retype(existing.get("type"), None)
                 self._search_blobs.pop(node, None)
+                self._dirty_nodes.discard(node)
+                if existing is not None:
+                    self._removed_nodes.add(node)
                 self._out.pop(node, None)
             for edge in list(self._edges):
                 if edge[0] in remove or edge[1] in remove:
@@ -231,6 +241,38 @@ class SimpleMultiDiGraph:
         """Live id→searchable-text mapping. Caller MUST hold ``reading()``."""
 
         return self._search_blobs
+
+    def index_rows(self) -> list[tuple[str, str, str]]:
+        """Every node as ``(node_id, source_id, body)`` for the search index."""
+
+        with self._lock:
+            return [
+                (node_id, str(attrs.get("source_id") or ""), self._search_blobs.get(node_id, ""))
+                for node_id, attrs in self._nodes.items()
+            ]
+
+    def take_index_delta(self) -> tuple[list[tuple[str, str, str]], list[str]]:
+        """Claim what the search index still owes: ``(upserts, removals)``.
+
+        Claiming clears the pending sets, so a failed flush loses updates
+        rather than repeating them — acceptable because the index is a cache
+        and a rebuild restores it exactly.
+        """
+
+        with self._lock:
+            upserts = [
+                (
+                    node_id,
+                    str((self._nodes.get(node_id) or {}).get("source_id") or ""),
+                    self._search_blobs.get(node_id, ""),
+                )
+                for node_id in self._dirty_nodes
+                if node_id in self._nodes
+            ]
+            removals = list(self._removed_nodes)
+            self._dirty_nodes.clear()
+            self._removed_nodes.clear()
+            return upserts, removals
 
     def node_map(self):
         """The live id→attrs mapping. Caller MUST hold ``reading()``.

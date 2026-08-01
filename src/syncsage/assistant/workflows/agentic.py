@@ -442,6 +442,35 @@ NODES = {
 }
 
 
+#: The compiled default graph, built once per process.
+#:
+#: The topology below is fixed — it does not branch on ``options`` — and a
+#: compiled LangGraph holds no per-invocation state (state and ctx both arrive
+#: through ``invoke``), so there is nothing to rebuild per request. Compiling
+#: is cheap (~10ms); the expensive part is importing langgraph at all, which
+#: measured **4 seconds** and used to land on whoever asked the first question
+#: after a restart.
+_DEFAULT_GRAPH: Any = None
+
+
+def warm() -> bool:
+    """Pay the langgraph import + compile now, off the request path.
+
+    Called at server startup in the background. Returns False when the
+    ``[agent]`` extra is not installed, which is not an error: the assistant
+    falls back to the simple workflow.
+    """
+
+    try:
+        build_graph(DEFAULTS)
+    except ImportError:
+        return False
+    except Exception:  # pragma: no cover - warming must never break startup
+        logger.debug("agentic warm-up failed", exc_info=True)
+        return False
+    return True
+
+
 def build_graph(options: dict[str, Any], nodes: dict[str, Any] | None = None):
     """Compile the LangGraph state graph.
 
@@ -449,9 +478,18 @@ def build_graph(options: dict[str, Any], nodes: dict[str, Any] | None = None):
 
         from syncsage.assistant.workflows.agentic import build_graph, NODES
         graph = build_graph(options, nodes={**NODES, "grade": my_grader})
+
+    The default topology is compiled once and reused; pass ``nodes`` to get a
+    freshly compiled graph with your own node functions.
     """
+
+    global _DEFAULT_GRAPH
+    if nodes is None and _DEFAULT_GRAPH is not None:
+        return _DEFAULT_GRAPH
+
     from langgraph.graph import END, START, StateGraph
 
+    is_default = nodes is None
     nodes = nodes or NODES
     builder = StateGraph(AgentState)
     for name in ("plan", "retrieve", "expand", "grade", "synthesize", "verify"):
@@ -472,7 +510,10 @@ def build_graph(options: dict[str, Any], nodes: dict[str, Any] | None = None):
     )
     builder.add_edge("synthesize", "verify")
     builder.add_edge("verify", END)
-    return builder.compile()
+    compiled = builder.compile()
+    if is_default:
+        _DEFAULT_GRAPH = compiled
+    return compiled
 
 
 def _bind(fn):
@@ -516,7 +557,10 @@ class AgenticWorkflow:
         options["max_context_passages"] = max(
             int(options["max_context_passages"]), int(request.max_results)
         )
-        nodes = self._nodes or {**NODES, **(options.get("nodes") or {})}
+        # None means "the stock topology", which is the compiled-once path.
+        # Only a caller that actually swapped a node pays for a fresh compile.
+        overrides = options.get("nodes") or {}
+        nodes = self._nodes or ({**NODES, **overrides} if overrides else None)
 
         try:
             graph = build_graph(options, nodes)

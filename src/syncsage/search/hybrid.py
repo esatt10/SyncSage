@@ -17,12 +17,20 @@ MAX_RESULTS_CEILING = 500
 
 
 class HybridSearch:
-    def __init__(self, store: SearchStore, vector: VectorSearcher | None = None):
+    def __init__(
+        self,
+        store: SearchStore,
+        vector: VectorSearcher | None = None,
+        node_index: Any = None,
+    ):
         self.store = store
         # Optional semantic candidates (Synapse 21.4). None when
         # search.embeddings is disabled: "vector" contributes nothing and
         # every other mode behaves exactly as before.
         self.vector = vector
+        # Optional FTS index over graph nodes. None (or an empty index) makes
+        # graph search scan the graph in memory, which is what it always did.
+        self.node_index = node_index
 
     def search_context(
         self,
@@ -69,7 +77,11 @@ class HybridSearch:
         # (e.g. CLI/MCP search_context) transparently fall back to text search.
         if mode in {"hybrid", "graph"} and graph is not None:
             jobs["graph"] = lambda: search_graph(
-                graph, query, max_results=fetch_n, source_name=source_name
+                graph,
+                query,
+                max_results=fetch_n,
+                source_name=source_name,
+                node_index=self.node_index,
             )
         if mode in {"hybrid", "vector"} and self.vector is not None:
             jobs["vector"] = lambda: self.vector.search(

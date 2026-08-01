@@ -29,7 +29,11 @@ class SyncSageTools:
         self.state = StateStore(self.paths.sqlite)
         self.state.migrate()
         self.engine = SyncEngine(config, self.paths, self.state)
-        self.searcher = HybridSearch(SearchStore(self.state), vector=self.engine.vector_searcher())
+        self.searcher = HybridSearch(
+            SearchStore(self.state),
+            vector=self.engine.vector_searcher(),
+            node_index=self.engine.node_index,
+        )
 
     def list_knowledge_bases(self) -> dict:
         return {"knowledge_bases": KnowledgeBaseRegistry(self.state).list()}
