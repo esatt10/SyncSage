@@ -206,11 +206,15 @@ sources:
       max_chars: 4000
       overlap_chars: 400
     sync:
-      # On startup this costs nothing when nothing changed: the manifest and
-      # graph are already in /state, every file's sha256 matches, and the
-      # global enrichment passes are skipped entirely when no artifact was
-      # rewritten.
-      on_startup: true
+      # Off, because indexing now runs in a worker process: a sync on every
+      # boot means the server's graph and the worker's graph are both resident
+      # at once, and on a 500k-node graph that is ~3.7GB each — more than a
+      # default 8GB Docker VM has to give. Nothing is lost: the content is
+      # already in /state, this repo changes daily at most, and the scheduler
+      # below still picks up changes. Index on demand with:
+      #   curl -X POST http://127.0.0.1:8765/sync/agent-framework \
+      #        -H 'content-type: application/json' -d '{"mode":"incremental"}'
+      on_startup: false
       on_file_change: none
       on_git_commit: true
       interval_seconds: 86400   # daily

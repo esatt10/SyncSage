@@ -42,7 +42,7 @@ def _print_scan(report: dict) -> None:
         print("  within configured limits — sync would proceed")
 
 
-def _sync_services(engine, cfg):
+def _sync_services(engine, cfg, config_path=None):
     """Build the watcher + scheduler pair sharing one sync serialization lock.
 
     SyncEngine is not safe for concurrent syncs within a process, so both
@@ -54,6 +54,12 @@ def _sync_services(engine, cfg):
     from syncsage.sync.watcher import WatcherService
 
     sync_lock = threading.Lock()
+    if config_path is not None:
+        # Serving: background syncs run in a child process, so a scheduled
+        # re-index never competes with queries for the GIL.
+        from syncsage.sync.worker import WorkerBackedEngine
+
+        engine = WorkerBackedEngine(engine, config_path)
     return (
         WatcherService(engine, cfg, sync_lock=sync_lock),
         SchedulerService(engine, cfg, sync_lock=sync_lock),
@@ -87,7 +93,7 @@ def _serve_app(cfg, config_path: str, *, report_ui: bool = True) -> None:
     app_obj = create_app(cfg, config_path=config_path)
     if report_ui:
         _report_ui(app_obj, cfg)
-    watcher, scheduler = _sync_services(app_obj.state.engine, cfg)
+    watcher, scheduler = _sync_services(app_obj.state.engine, cfg, config_path=config_path)
     watcher.start()
     scheduler.start()
     try:
@@ -203,6 +209,11 @@ def main(argv: list[str] | None = None) -> int:
         "--full-scan",
         action="store_true",
         help="index everything: no depth cap and no size budget (sync.limits is ignored)",
+    )
+    sync_p.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the result as one JSON object (how the server's sync worker reports back)",
     )
     scan_p = sub.add_parser(
         "scan",
@@ -405,6 +416,12 @@ def main(argv: list[str] | None = None) -> int:
 
         engine = _engine(Path(args.config))
         try:
+            # This process owns the CPU cost of indexing, so it also owns
+            # building the graph search index when it is missing (after an
+            # upgrade, or a wiped cache). Doing it here keeps that work out of
+            # the server, which is the whole point of running sync out of
+            # process.
+            engine.ensure_node_index()
             results = (
                 engine.sync_all(args.mode, max_depth=args.depth, full_scan=args.full_scan)
                 if args.all or not args.source
@@ -422,6 +439,28 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         finally:
             engine.close()
+        if getattr(args, "json", False):
+            # One line, last: the server runs this command as a subprocess and
+            # reads the report off stdout.
+            import json as _json
+
+            payload = {
+                "status": "ok",
+                "results": [
+                    {
+                        "source_id": r.source_id,
+                        "indexed_artifacts": r.indexed_artifacts,
+                        "skipped_artifacts": r.skipped_artifacts,
+                        "graph_nodes": r.graph_nodes,
+                        "graph_edges": r.graph_edges,
+                        "status": r.status,
+                        "details": r.details,
+                    }
+                    for r in results
+                ],
+            }
+            print(_json.dumps(payload))
+            return 0 if all(r.status != "limit_exceeded" for r in results) else 1
         exit_code = 0
         for r in results:
             if r.status == "limit_exceeded":

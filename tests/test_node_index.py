@@ -58,8 +58,16 @@ def _render_config(tmp_path, workspace):
     return config_file
 
 
-def test_indexed_and_unindexed_search_agree(tmp_path, workspace_copy) -> None:
-    """The index may only change how fast an answer arrives."""
+def test_indexed_results_are_a_ranked_subset_of_scanning(tmp_path, workspace_copy) -> None:
+    """The contract the index actually offers.
+
+    Candidates come from token/prefix matching, where the scan used arbitrary
+    substrings — so ``sync`` still finds ``syncsage`` (prefix) but no longer
+    finds ``resync`` (infix). That makes indexed results a **subset** of
+    scanned ones, never a superset: the index must not invent a hit. Among the
+    hits both paths agree on, the ranking must be identical, because ranking
+    is still the original scorer's job.
+    """
 
     engine = SyncEngine(load_config(_render_config(tmp_path, workspace_copy)))
     try:
@@ -67,11 +75,14 @@ def test_indexed_and_unindexed_search_agree(tmp_path, workspace_copy) -> None:
         engine.rebuild_node_index()
 
         for query in ("executor", "dispatch", "readme", "workflow", "nothing-matches-this"):
-            with_index = search_graph(engine.graph_builder.graph, query, node_index=engine.node_index)
-            without = search_graph(engine.graph_builder.graph, query)
-            assert [hit["node_id"] for hit in with_index] == [
-                hit["node_id"] for hit in without
-            ], f"index changed results for {query!r}"
+            indexed = search_graph(engine.graph_builder.graph, query, node_index=engine.node_index)
+            scanned = search_graph(engine.graph_builder.graph, query)
+            indexed_ids = [hit["node_id"] for hit in indexed]
+            scanned_ids = [hit["node_id"] for hit in scanned]
+            assert set(indexed_ids) <= set(scanned_ids), f"index invented a hit for {query!r}"
+            # Relative order is preserved for everything they share.
+            shared = [node_id for node_id in scanned_ids if node_id in set(indexed_ids)]
+            assert indexed_ids == shared, f"index reordered results for {query!r}"
     finally:
         engine.close()
 
@@ -152,15 +163,20 @@ def test_index_is_disposable(tmp_path, workspace_copy) -> None:
     engine = SyncEngine(load_config(_render_config(tmp_path, workspace_copy)))
     try:
         engine.sync_source("syncsage-repo", "full")
-        before = search_graph(engine.graph_builder.graph, "sync", node_index=engine.node_index)
+        with_index = search_graph(engine.graph_builder.graph, "sync", node_index=engine.node_index)
+        assert with_index, "indexed search found nothing to begin with"
 
         with engine.state.conn:
             engine.state.conn.execute("DELETE FROM graph_nodes_fts")
         assert NodeIndex(engine.state).count() == 0
-        after_scan = search_graph(engine.graph_builder.graph, "sync", node_index=engine.node_index)
-        assert [h["node_id"] for h in after_scan] == [h["node_id"] for h in before]
 
-        # And it rebuilds from the graph alone.
+        # No index: search still answers, from the graph alone. It may find
+        # *more* than the index did (substring beats prefix), never less.
+        scanned = search_graph(engine.graph_builder.graph, "sync", node_index=engine.node_index)
+        assert scanned, "search stopped working without its cache"
+        assert {h["node_id"] for h in with_index} <= {h["node_id"] for h in scanned}
+
+        # And the cache rebuilds from the graph alone.
         assert engine.rebuild_node_index() == engine.graph_builder.graph.number_of_nodes()
     finally:
         engine.close()

@@ -526,8 +526,12 @@ def create_app(
             loop = asyncio.get_running_loop()
 
             def _run_startup() -> None:
+                from syncsage.sync.worker import WorkerBackedEngine
+
                 logger.info("Running startup sync for sources: %s", ", ".join(startup_sources))
-                results = engine.startup()
+                # Indexing happens in a child process so it cannot starve the
+                # requests this server exists to answer.
+                results = WorkerBackedEngine(engine, app.state.config_path).startup()
                 app.state.startup_sync_results = results
                 indexed = sum(result.indexed_artifacts for result in results)
                 skipped = sum(result.skipped_artifacts for result in results)
@@ -846,23 +850,38 @@ def create_app(
             "pagination": {"limit": limit, "offset": offset},
         }
 
+    def _index(
+        source_name: str | None,
+        mode: str,
+        depth: int | None = None,
+        full_scan: bool = False,
+    ) -> dict:
+        """Index in a worker process, then pick up the result.
+
+        The server deliberately does not index in-process: that work is
+        CPU-bound Python and, under the GIL, it starves the very requests this
+        API exists to answer. See :mod:`syncsage.sync.worker`.
+        """
+
+        from syncsage.sync.worker import WorkerBackedEngine
+
+        worker = WorkerBackedEngine(engine, app.state.config_path)
+        if source_name:
+            results = [worker.sync_source(source_name, mode, max_depth=depth, full_scan=full_scan)]
+        else:
+            results = worker.sync_all(mode, max_depth=depth, full_scan=full_scan)
+        failed = [r for r in results if r.status in {"failed", "timeout"}]
+        if failed:
+            raise HTTPException(
+                status_code=500,
+                detail=failed[0].details.get("error") or f"sync {failed[0].status}",
+            )
+        return {"results": [r.__dict__ for r in results]}
+
     @app.post("/sync")
     def sync_all(req: SyncRequest) -> dict:
         try:
-            if req.source_name:
-                result = engine.sync_source(
-                    req.source_name,
-                    req.mode,  # type: ignore[arg-type]
-                    max_depth=req.depth,
-                    full_scan=req.full_scan,
-                )
-                return {"results": [result.__dict__]}
-            results = engine.sync_all(
-                req.mode,  # type: ignore[arg-type]
-                max_depth=req.depth,
-                full_scan=req.full_scan,
-            )
-            return {"results": [r.__dict__ for r in results]}
+            return _index(req.source_name, req.mode, req.depth, req.full_scan)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -872,12 +891,15 @@ def create_app(
     def sync_source(source_id: str, req: SyncRequest | None = None) -> dict:
         mode = req.mode if req else "incremental"
         try:
-            return engine.sync_source(
+            report = _index(
                 source_id,
-                mode,  # type: ignore[arg-type]
-                max_depth=req.depth if req else None,
-                full_scan=req.full_scan if req else False,
-            ).__dict__
+                mode,
+                req.depth if req else None,
+                req.full_scan if req else False,
+            )
+            # This route has always returned one result object, not a list.
+            results = report.get("results") or []
+            return results[0] if results else report
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:

@@ -172,6 +172,27 @@ class SyncEngine:
         self._last_checkpoint = time.monotonic()
         return True
 
+    def reload_graph(self) -> int:
+        """Re-read the graph from /state, e.g. after a worker process synced.
+
+        The server does not index (see :mod:`syncsage.sync.worker`), so this is
+        how a freshly-indexed graph reaches the process that is serving it.
+        Reading a compressed graph is cheap; the swap is atomic from a
+        reader's point of view because the new graph replaces the reference in
+        one assignment.
+        """
+
+        loaded = self.graph_store.load(self.config.knowledge_base_id)
+        if not len(loaded):
+            return 0
+        self.graph_builder.graph = loaded
+        # The index on disk was written by the worker for this same graph, so
+        # nothing is owed; drop the delta the load itself generated.
+        loaded.take_index_delta()
+        self.node_index._populated = False
+        logger.info("Reloaded graph from state: %d nodes", loaded.number_of_nodes())
+        return loaded.number_of_nodes()
+
     def flush_node_index(self) -> int:
         """Push pending node writes into the search index. Never fatal.
 
@@ -944,6 +965,16 @@ class SyncEngine:
         for source in self.config.sources:
             if source.name == name:
                 return source
+        # Sources added at runtime (the UI's quick-add, POST /sources) live in
+        # the state registry, not the config file. Reading them back is what
+        # lets a *different process* — the sync worker, or the CLI — index a
+        # source that was never written to YAML.
+        row = self.state.get_source(name)
+        if row and row.get("config_json"):
+            payload = json.loads(row["config_json"])
+            resolved = SyncSageConfig.model_validate({"sources": [payload]}).sources[0]
+            self.config.sources.append(resolved)
+            return resolved
         raise KeyError(f"Unknown source: {name}")
 
     def _can_skip_before_read(

@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS graph_nodes_fts USING fts5(
 """
 
 #: FTS5 treats these as syntax; a query built from user text must not.
-_UNSAFE = re.compile(r'[^\w\s]', re.UNICODE)
+_UNSAFE = re.compile(r"[^\w\s]", re.UNICODE)
 
 
 class NodeIndex:
@@ -45,6 +46,11 @@ class NodeIndex:
     def __init__(self, state: Any) -> None:
         self.state = state
         self._ready = False
+        # Sticky "there is something in here". A query only needs to know
+        # empty-vs-not, and COUNT(*) over an FTS5 table is a full scan — on a
+        # 577k-row index that was costing more than the search it guarded.
+        # Only ever flips false→true, and writes set it directly.
+        self._populated = False
 
     def ensure(self) -> bool:
         """Create the table if needed. False when FTS5 is unavailable."""
@@ -61,10 +67,24 @@ class NodeIndex:
         return self._ready
 
     def count(self) -> int:
+        """Exact row count. Callers on the query path want :meth:`populated`."""
+
         if not self.ensure():
             return 0
         rows = self.state.rows("SELECT COUNT(*) AS n FROM graph_nodes_fts")
-        return int(rows[0]["n"]) if rows else 0
+        total = int(rows[0]["n"]) if rows else 0
+        self._populated = total > 0
+        return total
+
+    def populated(self) -> bool:
+        """Is there anything to search? One row, not a count."""
+
+        if self._populated:
+            return True
+        if not self.ensure():
+            return False
+        self._populated = bool(self.state.rows("SELECT rowid FROM graph_nodes_fts LIMIT 1"))
+        return self._populated
 
     def replace_all(self, nodes: Iterable[tuple[str, str, str]]) -> int:
         """Rebuild from scratch. ``nodes`` yields (node_id, source_id, body)."""
@@ -80,6 +100,7 @@ class NodeIndex:
                     batch,
                 )
                 written += len(batch)
+        self._populated = written > 0
         return written
 
     def apply(self, upserts: Iterable[tuple[str, str, str]], removals: Iterable[str]) -> int:
@@ -104,6 +125,8 @@ class NodeIndex:
                     "INSERT INTO graph_nodes_fts (node_id, source_id, body) VALUES (?,?,?)",
                     batch,
                 )
+        if upserts:
+            self._populated = True
         return len(upserts)
 
     def candidates(
@@ -124,7 +147,7 @@ class NodeIndex:
         match = _match_expression(tokens)
         if not match:
             return None
-        if self.count() == 0:
+        if not self.populated():
             return None
         sql = "SELECT node_id FROM graph_nodes_fts WHERE graph_nodes_fts MATCH ?"
         params: list[Any] = [match]
@@ -134,10 +157,18 @@ class NodeIndex:
         sql += " LIMIT ?"
         params.append(int(limit))
         try:
-            return [str(row["node_id"]) for row in self.state.rows(sql, tuple(params))]
+            found = [str(row["node_id"]) for row in self.state.rows(sql, tuple(params))]
         except Exception as exc:  # a malformed MATCH must not fail the search
             logger.debug("node index query failed (%s); falling back to scan", exc)
             return None
+        if found:
+            return found
+        # No hits is ambiguous: either nothing matches, or the index was
+        # emptied behind our back (a wipe, a fresh state dir). Distinguish the
+        # two with one cheap row probe, so an emptied index degrades to
+        # scanning instead of silently answering "nothing found".
+        self._populated = False
+        return found if self.populated() else None
 
 
 def _match_expression(tokens: list[str]) -> str:
