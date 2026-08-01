@@ -193,6 +193,16 @@ class SyncEngine:
         logger.info("Reloaded graph from state: %d nodes", loaded.number_of_nodes())
         return loaded.number_of_nodes()
 
+    #: Above this many changed nodes, rebuild the FTS index wholesale instead
+    #: of deleting each stale row individually. `node_id` on graph_nodes_fts
+    #: is UNINDEXED (it's read-only lookup data, not searched), so a batched
+    #: `DELETE ... WHERE node_id IN (...)` against it has no index to use and
+    #: degrades to a table scan per batch. Measured: concept-node
+    #: reconciliation removing ~387k of 543k nodes stalled for 10+ minutes
+    #: going through the per-row delete path; `replace_all` (one unfiltered
+    #: DELETE + bulk INSERT) is the cheap way to apply a change this size.
+    _INDEX_REBUILD_THRESHOLD = 20_000
+
     def flush_node_index(self) -> int:
         """Push pending node writes into the search index. Never fatal.
 
@@ -205,6 +215,8 @@ class SyncEngine:
             upserts, removals = self.graph_builder.graph.take_index_delta()
             if not upserts and not removals:
                 return 0
+            if len(upserts) + len(removals) > self._INDEX_REBUILD_THRESHOLD:
+                return self.rebuild_node_index()
             return self.node_index.apply(upserts, removals)
         except Exception as exc:  # pragma: no cover - cache maintenance
             logger.warning("Could not update the graph node index: %s", exc)
@@ -646,6 +658,21 @@ class SyncEngine:
                 # idempotent via edge upsert, so re-sync produces an identical
                 # graph.
                 self.graph_builder.add_cross_source_edges()
+                # Keep only the concepts that connect something. Runs last so
+                # similarity (which reads concept_terms off artifact nodes,
+                # not concept nodes) is unaffected.
+                pruned = self.graph_builder.reconcile_concepts(
+                    self.state,
+                    min_documents=int(self.config.graph.concept_min_documents),
+                    changed_ids=changed_ids,
+                )
+                if pruned["removed"] or pruned["restored"]:
+                    logger.info(
+                        "Concepts reconciled: kept=%s removed=%s restored=%s",
+                        pruned["kept"],
+                        pruned["removed"],
+                        pruned["restored"],
+                    )
             manifest["last_indexed_at"] = utc_now()
             manifest["connector"] = {"type": connector.connector_type}
             self.manifests.save(source.name, manifest)

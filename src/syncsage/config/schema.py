@@ -428,6 +428,26 @@ class SyncSettings(ModelMixin):
 
 
 @dataclass
+class GraphSettings(ModelMixin):
+    """How much graph the knowledge graph should actually keep.
+
+    ``concept_min_documents`` is the number of distinct documents that must
+    share a term before it becomes a concept *node*. A concept exists to link
+    the documents that share it, so one that links a single document is pure
+    weight: measured on microsoft/agent-framework, 74.5% of concept nodes were
+    mentioned by exactly one document, and concepts made up 96% of a
+    577k-node graph — memory, traversal budget and enrichment time spent
+    connecting nothing.
+
+    Nothing becomes unfindable: the term stays on the artifact's
+    ``concept_terms``, in ``artifact_terms``, and in the artifact's searchable
+    text. Set to 1 to keep every term as a node (the pre-2026-08 behavior).
+    """
+
+    concept_min_documents: int = 2
+
+
+@dataclass
 class ObsidianSettings(ModelMixin):
     enabled: bool = True
     write_mode: str = "upsert"
@@ -644,6 +664,7 @@ class SyncSageConfig(ModelMixin):
     search: SearchSettings = field(default_factory=SearchSettings)
     ingestion: IngestionSettings = field(default_factory=IngestionSettings)
     sync: SyncSettings = field(default_factory=SyncSettings)
+    graph: GraphSettings = field(default_factory=GraphSettings)
     obsidian: ObsidianSettings = field(default_factory=ObsidianSettings)
     security: SecuritySettings = field(default_factory=SecuritySettings)
     synapse: SynapseSettings = field(default_factory=SynapseSettings)

@@ -215,6 +215,13 @@ def test_concept_normalization_collapses_duplicate_nodes(tmp_path: Path) -> None
         "# Systems\n\nWe build systems. Systems are systems. A single System too.\n",
         encoding="utf-8",
     )
+    # Two documents, because a concept node exists to link documents: with
+    # graph.concept_min_documents at its default of 2, a term only one file
+    # mentions is not kept as a node (it stays on the artifact's terms).
+    (notes / "b.md").write_text(
+        "# Related\n\nOur System design notes, describing systems.\n",
+        encoding="utf-8",
+    )
     engine = _make_engine(
         tmp_path, [{"name": "notes", "type": "markdown_folder", "path": str(notes)}]
     )

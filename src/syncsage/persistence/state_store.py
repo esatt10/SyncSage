@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,9 @@ CREATE TABLE IF NOT EXISTS chunks (
   FOREIGN KEY (artifact_id) REFERENCES artifacts(id),
   FOREIGN KEY (source_id) REFERENCES sources(id)
 );
+-- Same per-artifact DELETE pattern as artifact_terms; see that index's
+-- comment.
+CREATE INDEX IF NOT EXISTS idx_chunks_artifact_id ON chunks(artifact_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   chunk_id UNINDEXED,
   source_id UNINDEXED,
@@ -81,6 +85,9 @@ CREATE TABLE IF NOT EXISTS symbols (
   docstring_summary TEXT,
   FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
 );
+-- Same per-artifact DELETE pattern as artifact_terms; see that index's
+-- comment.
+CREATE INDEX IF NOT EXISTS idx_symbols_artifact_id ON symbols(artifact_id);
 CREATE TABLE IF NOT EXISTS artifact_terms (
   id TEXT PRIMARY KEY,
   artifact_id TEXT NOT NULL,
@@ -93,6 +100,20 @@ CREATE TABLE IF NOT EXISTS artifact_terms (
   metadata_json TEXT NOT NULL,
   FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
 );
+-- Without this, `DELETE FROM artifact_terms WHERE artifact_id=?` (run once
+-- per artifact on every sync, in replace_artifact_enrichment) is a full
+-- table scan. On a table that grows past a million rows over a real sync,
+-- that turns a full-corpus sync into O(n^2): each artifact's delete gets
+-- slower as the table grows. Measured cause of a 2,132-file sync taking
+-- 1.5+ hours.
+CREATE INDEX IF NOT EXISTS idx_artifact_terms_artifact_id
+  ON artifact_terms(artifact_id);
+-- Supports GraphBuilder.reconcile_concepts: `WHERE node_type='concept'
+-- GROUP BY node_id, ... COUNT(DISTINCT artifact_id)`. Without it, that
+-- query is an unindexed scan + sort over the whole table — measured at
+-- 10+ minutes and still not finished on a 1.27M-row table.
+CREATE INDEX IF NOT EXISTS idx_artifact_terms_node_lookup
+  ON artifact_terms(node_type, node_id, artifact_id);
 CREATE TABLE IF NOT EXISTS sync_events (
   id TEXT PRIMARY KEY,
   source_id TEXT,
@@ -153,6 +174,20 @@ class StateStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: sqlite3.Connection | None = None
+        # `check_same_thread=False` below only lifts sqlite3's same-thread
+        # affinity check; it does not make a single Connection safe for truly
+        # concurrent statement execution. The search paths (text/vector/graph)
+        # now run in parallel across threads that all share this one
+        # connection (hybrid.py's per-mode pool, nested inside multi_search's
+        # per-query pool for the agentic workflow) — without serializing
+        # access, overlapping execute()+fetch calls can interleave cursor
+        # state and hand back a Row missing an expected column. Reproduced:
+        # `row["chunk_id"]` raising IndexError from vector_store.search()
+        # under concurrent load from the agentic loop. This lock protects
+        # every read through `rows()`; the serving process never writes here
+        # (indexing runs in a separate worker process — see sync/worker.py),
+        # so this only serializes brief query execution, not the request.
+        self._read_lock = threading.RLock()
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -704,7 +739,11 @@ class StateStore:
         return dict(rows[0]) if rows else None
 
     def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-        return list(self.conn.execute(sql, params))
+        # Serialized: see the note on `_read_lock` in __init__. `execute()`
+        # plus consuming the cursor into a list must happen as one atomic
+        # unit — releasing the lock between them would defeat the point.
+        with self._read_lock:
+            return list(self.conn.execute(sql, params))
 
     def close(self) -> None:
         if self._conn is not None:
