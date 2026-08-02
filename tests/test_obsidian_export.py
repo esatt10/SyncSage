@@ -100,6 +100,13 @@ def test_obsidian_preview_and_graph_driven_navigation(
     assert source_note.exists()
     assert file_note.exists()
     assert chunk_notes
-    assert "../Concepts/" in source_note.read_text(encoding="utf-8")
+    # No "../Concepts/" backlinks: concept extraction was retired, so the
+    # vault no longer projects a Concepts folder. On a real corpus that
+    # folder was 141,529 notes of terms like "limit" and "request info" —
+    # navigation that led nowhere. Source notes still link the files they
+    # index, which is the projection people actually walk.
+    body = source_note.read_text(encoding="utf-8")
+    assert "../Concepts/" not in body
+    assert "../Files/" in body
     assert "../Chunks/" in file_note.read_text(encoding="utf-8")
     assert "../Files/" in chunk_notes[0].read_text(encoding="utf-8")

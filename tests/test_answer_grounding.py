@@ -98,6 +98,21 @@ def _add_file(
                 f"h{index}",
             ),
         )
+        # The FTS row too — it is what backs `chunks_vocab`, which is now the
+        # source of the corpus's vocabulary.
+        store.conn.execute(
+            "INSERT INTO chunks_fts (chunk_id, source_id, artifact_id, title, path, "
+            "heading_path, text) VALUES (?,?,?,?,?,?,?)",
+            (
+                f"{node_id}#c{index}",
+                "demo",
+                node_id,
+                relative_path.rsplit("/", 1)[-1],
+                relative_path,
+                heading,
+                text,
+            ),
+        )
         line += lines
     for position, name in enumerate(symbols):
         store.conn.execute(
@@ -709,14 +724,11 @@ def test_the_planner_is_told_what_the_corpus_actually_is(tmp_path) -> None:
         store,
         "file:demo:docs/overview.md",
         "docs/overview.md",
-        [("", "overview")],
+        # The corpus's vocabulary now comes from the FTS index itself
+        # (chunks_vocab), not from a separate concept layer — so the words a
+        # planner is shown are literally the words in the documents.
+        [("", "checkpointing checkpointing durable resumable workflows")],
         artifact_type="markdown_note",
-    )
-    store.conn.execute(
-        "INSERT INTO artifact_terms (id, artifact_id, source_id, node_id, node_type, term, "
-        "normalized_term, weight, metadata_json) VALUES "
-        "('t1','file:demo:docs/overview.md','demo','concept:kb:checkpointing','concept',"
-        "'checkpointing','checkpointing',1.0,'{}')"
     )
     store.conn.commit()
 

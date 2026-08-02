@@ -31,6 +31,16 @@ export interface HorizonOptions {
   surfacedIds: string[];
   hiddenTypes: string[];
   sourceFilter: string | null;
+  /**
+   * The selected node always gets its own one-hop slice unioned in.
+   *
+   * The horizon is a *drawing* budget, but a selection is a question — "what
+   * is this connected to" — and answering it with "nothing, your depth filter
+   * is 2" is the filter lying about the graph. Its neighbours may sit outside
+   * the horizon, and `merge` drops any edge whose endpoint is missing, so
+   * selecting a node near the horizon's rim showed it with no links at all.
+   */
+  selectedId?: string | null;
   enabled?: boolean;
 }
 
@@ -50,9 +60,11 @@ const SINGLE_CENTER_LIMIT = 500;
 const PER_ANSWER_NODE_LIMIT = 150;
 /** How many surfaced nodes get their own neighbourhood after a question. */
 const MAX_ANSWER_CENTERS = 5;
+/** Neighbours pulled in for the selected node, outside the horizon. */
+const SELECTION_NEIGHBOUR_LIMIT = 120;
 
 export function useHorizonGraph(options: HorizonOptions) {
-  const { centerId, depth, showAll, surfacedIds, hiddenTypes, sourceFilter } = options;
+  const { centerId, depth, showAll, surfacedIds, hiddenTypes, sourceFilter, selectedId } = options;
   const centers = surfacedIds.slice(0, MAX_ANSWER_CENTERS);
   const mode: HorizonMode = showAll || !centerId ? "all" : centers.length > 0 ? "answer" : "center";
 
@@ -64,6 +76,9 @@ export function useHorizonGraph(options: HorizonOptions) {
       depth,
       hiddenTypes.join("|"),
       sourceFilter,
+      // The selection widens the fetch, so it belongs in the key — otherwise
+      // selecting a rim node would serve the cached, link-less slice.
+      selectedId ?? "",
     ],
     enabled: options.enabled ?? true,
     queryFn: async (): Promise<HorizonGraph> => {
@@ -83,11 +98,18 @@ export function useHorizonGraph(options: HorizonOptions) {
 
       const targets = mode === "answer" ? centers : [centerId as string];
       const limit = mode === "answer" ? PER_ANSWER_NODE_LIMIT : SINGLE_CENTER_LIMIT;
+      const requests = targets.map((nodeId) => ({ nodeId, hops: depth, limit }));
+      // The selected node's own neighbourhood, at one hop, regardless of the
+      // horizon. Small and bounded, so it costs one extra slice call and makes
+      // "what is this connected to" answerable at any depth setting.
+      if (selectedId && !targets.includes(selectedId)) {
+        requests.push({ nodeId: selectedId, hops: 1, limit: SELECTION_NEIGHBOUR_LIMIT });
+      }
       const slices = await Promise.all(
-        targets.map((nodeId) =>
+        requests.map(({ nodeId, hops, limit: sliceLimit }) =>
           api
-            .graphSlice(nodeId, depth, {
-              limit,
+            .graphSlice(nodeId, hops, {
+              limit: sliceLimit,
               excludeEdgeTypes: SHORTCUT_EDGE_TYPES,
               // Hidden types are pruned during the walk, not after it — the
               // budget has to reach the structure, not be spent on nodes this
@@ -95,7 +117,7 @@ export function useHorizonGraph(options: HorizonOptions) {
               excludeTypes: hiddenTypes,
             })
             // One unreachable center must not blank the canvas.
-            .catch(() => ({ node_id: nodeId, depth, nodes: [], links: [], depths: {} })),
+            .catch(() => ({ node_id: nodeId, depth: hops, nodes: [], links: [], depths: {} })),
         ),
       );
       return merge(slices, hiddenTypes, sourceFilter, mode);

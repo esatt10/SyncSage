@@ -16,7 +16,8 @@ interface GraphCanvasProps {
   layoutName: string;
   spacing: number;
   shapeAlgorithm: ShapeAlgorithm;
-  onSelect: (nodeId: string) => void;
+  /** `null` when the background was tapped — a deselect, not a reset. */
+  onSelect: (nodeId: string | null) => void;
   /** Double-tap: make this node the center the horizon is measured from. */
   onRecenter?: (nodeId: string) => void;
 }
@@ -110,6 +111,8 @@ export function GraphCanvas({
     if (!cy) return;
     const previous = selectedRef.current;
     if (previous) cy.getElementById(previous).removeClass("selected");
+    // Deselecting must not move the camera: the view you were looking at is
+    // the thing you were keeping.
     if (selectedId) {
       const node = cy.getElementById(selectedId);
       node.addClass("selected");
@@ -137,6 +140,13 @@ export function GraphCanvas({
           if (listenerBoundRef.current) return;
           listenerBoundRef.current = true;
           cy.on("tap", "node", (event) => onSelectRef.current(event.target.id()));
+          // Tapping empty canvas clears the selection and nothing else. Before
+          // this the only way out of a selection was "Clear", which also reset
+          // the depth, the center and the answer filter — so putting a node
+          // down meant losing the view you had navigated to.
+          cy.on("tap", (event) => {
+            if (event.target === cy) onSelectRef.current(null);
+          });
           // Double-tap re-aims the horizon at that node — the fastest way to
           // walk a large graph without ever drawing all of it.
           // Both spellings: Cytoscape emits `dblclick` for a mouse and

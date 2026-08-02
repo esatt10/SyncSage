@@ -57,6 +57,7 @@ export function Notebook() {
     surfacedIds: state.surfacedIds,
     hiddenTypes: state.hiddenTypes,
     sourceFilter: state.sourceFilter,
+    selectedId: state.selectedId,
     enabled: overview.isSuccess,
   });
 
@@ -254,7 +255,10 @@ export function Notebook() {
                   shapeAlgorithm="node_type"
                   onSelect={(id) => {
                     dispatch({ type: "select-node", nodeId: id });
-                    dispatch({ type: "open-tab", tab: "node" });
+                    // Only jump to the Node tab when there is a node to show;
+                    // a background tap is a deselect and should leave the
+                    // graph exactly as it is.
+                    if (id) dispatch({ type: "open-tab", tab: "node" });
                   }}
                   onRecenter={(id) => dispatch({ type: "center-node", nodeId: id })}
                 />

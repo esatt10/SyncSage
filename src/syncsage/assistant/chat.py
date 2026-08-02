@@ -173,7 +173,53 @@ _CITATION_RE = re.compile(r"\[(\d{1,2})\]")
 # a "surfaced fact" should point at.
 FACT_NODE_TYPES = {"concept", "entity", "symbol", "external_reference"}
 # Structural edges say "this file is in this folder"; they are noise as facts.
-STRUCTURAL_EDGES = {"contains", "has_chunk", "indexes"}
+# `derived_from` is the exact mirror of `mentions` (one per mentions edge —
+# 766,477 of each on the demo corpus), so surfacing it says the same thing
+# twice, backwards.
+STRUCTURAL_EDGES = {"contains", "has_chunk", "indexes", "derived_from"}
+
+#: What a fact is worth, by edge type. Lower sorts first.
+#:
+#: Without this the panel was worthless, and measurably so: `mentions` edges
+#: are 49.3% of the graph and `concept` nodes 87.2% of it, while the edges
+#: that carry real structure — imports, calls, references — are 0.57%
+#: combined. Collecting round-robin in graph order therefore filled all twelve
+#: slots with "this file mentions <term>" every single time. On a live query
+#: the whole panel read: "request info", "limit", "false policy", "request
+#: information" (yes, both) and "add edge executor b".
+#:
+#: A relationship someone can act on is what this surface is for: X imports Y,
+#: X calls Y. Those are rarer, so they have to be *preferred*, not merely
+#: allowed to compete.
+EDGE_PRIORITY = {
+    "imports": 0,
+    "calls": 0,
+    "references": 1,
+    "similar_to": 2,
+    "links_to": 2,
+    "mentions": 9,
+}
+#: Concept mentions are the noise floor: allowed in only to fill an otherwise
+#: empty panel, and never more than this many.
+MAX_WEAK_FACTS = 3
+
+#: Added to a fact's rank when it points out of the corpus. Fixing the edge
+#: ordering above surfaced real `imports` edges and immediately showed the
+#: next layer down: they were "imports argparse", "imports json", "imports
+#: pathlib". True, and no more use than the concepts they replaced. What a
+#: reader wants from this panel is how *their own* code hangs together, so a
+#: link to something inside the corpus outranks a link to the standard
+#: library. External references still appear when there is nothing internal
+#: to say — a dependency on a real third-party package is worth knowing.
+EXTERNAL_TARGET_PENALTY = 3
+
+
+def _fact_rank(fact: dict) -> int:
+    rank = EDGE_PRIORITY.get(fact["edge_type"], 5)
+    if fact.get("object_type") == "external_reference":
+        rank += EXTERNAL_TARGET_PENALTY
+    return rank
+
 
 EDGE_PHRASES = {
     "mentions": "mentions",
@@ -354,17 +400,39 @@ def collect_facts(graph: Any, node_ids: list[str], limit: int = 12) -> list[dict
                     }
                 )
         if candidates:
+            # Strongest relationships first *within* each node, so the
+            # round-robin below hands out real structure before noise. Ties
+            # keep graph order, which keeps the whole function deterministic.
+            candidates.sort(key=_fact_rank)
             per_node.append(candidates)
 
     facts: list[dict] = []
+    used_objects: set[str] = set()
+    weak = 0
     depth = 0
     while len(facts) < limit and per_node:
         progressed = False
         for candidates in per_node:
             if depth >= len(candidates):
                 continue
-            facts.append(candidates[depth])
+            candidate = candidates[depth]
             progressed = True
+            # One row per distinct object. Sibling files in a samples/ folder
+            # all call the same helper, and a panel that says "calls
+            # argparse.ArgumentParser" five times has spent five of twelve
+            # slots telling the reader one thing.
+            if candidate["object_id"] in used_objects:
+                continue
+            # A concept mention is the noise floor: it is allowed in only to
+            # keep an otherwise-empty panel from being empty, and only a few
+            # times. Without this cap the 87%-of-the-graph concept layer fills
+            # every slot before a single import or call edge is considered.
+            if _fact_rank(candidate) >= 9:
+                if weak >= MAX_WEAK_FACTS:
+                    continue
+                weak += 1
+            used_objects.add(candidate["object_id"])
+            facts.append(candidate)
             if len(facts) >= limit:
                 break
         if not progressed:

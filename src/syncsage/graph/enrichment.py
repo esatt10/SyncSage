@@ -481,10 +481,11 @@ def _base_concepts(
     artifact: ParsedArtifact,
     text: str,
 ) -> ArtifactEnrichment:
-    enrichment = ArtifactEnrichment()
-    for concept in _concept_candidates(text, artifact.relative_path):
-        _add_concept(enrichment, kb_id, source, artifact, concept, 1.0)
-    return enrichment
+    # Short-circuited with `_add_concept` (see its docstring for the
+    # measurements). Returning early also skips `_concept_candidates`, which
+    # tokenized and counted every word of every artifact on every sync — real
+    # CPU spent producing rows nothing read.
+    return ArtifactEnrichment()
 
 
 def _add_symbol(
@@ -610,23 +611,31 @@ def _add_concept(
     concept: str,
     weight: float,
 ) -> None:
-    normalized = _normalize_concept(concept)
-    if not normalized:
-        return
-    node_id = _node_id("concept", kb_id, source.name, normalized)
-    attrs = {
-        "source_id": source.name,
-        "enrichment_pass": "concept_extraction",
-    }
-    enrichment.nodes.append(EnrichmentNode(node_id, "concept", normalized, attrs))
-    enrichment.edges.append(
-        EnrichmentEdge(artifact.id, node_id, "mentions", {"source_id": source.name})
-    )
-    enrichment.edges.append(
-        EnrichmentEdge(node_id, artifact.id, "derived_from", {"source_id": source.name})
-    )
-    enrichment.terms.append(_term(artifact, node_id, "concept", normalized, weight))
-    enrichment.concept_terms.add(normalized)
+    """Retired. Concept extraction produced nothing any surface could use.
+
+    Kept as a no-op rather than deleted so the call sites above still read as
+    the passes they are, and so re-enabling is a one-function change if a
+    corpus ever turns up where this pays off. On the corpus it was measured
+    against (2,132 files, microsoft/agent-framework) it did not:
+
+    * **Retrieval** — the concept-term expansion in ``SearchStore.search``
+      only ran when FTS returned fewer than ``max_results``. Every real query
+      matched hundreds to thousands of chunks, so it never fired once.
+    * **Graph facts** — concepts were 87.2% of nodes and ``mentions`` +
+      ``derived_from`` 98.6% of edges, so the facts panel filled all twelve
+      slots with "this file mentions <term>" every time. The terms were
+      "request info", "limit", "false policy" — and "request information"
+      alongside "request info", which the normalizer failed to merge.
+    * **Similarity** — ``_similarity_edges`` keys off ``concept_terms``, and
+      the live graph contained **zero** ``similar_to`` edges. It produced
+      nothing at all.
+
+    The cost was 141,529 nodes, ~1.53M edges and 1.27M ``artifact_terms``
+    rows, which is graph memory, traversal budget and sync time spent
+    connecting nothing. Structure that a reader can act on — imports, calls,
+    references — was 0.57% of edges and permanently crowded out.
+    """
+    return
 
 
 def _add_entity(

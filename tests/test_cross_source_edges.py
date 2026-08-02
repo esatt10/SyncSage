@@ -205,34 +205,3 @@ def test_normalize_concept_collapses_plurals() -> None:
     )
 
 
-def test_concept_normalization_collapses_duplicate_nodes(tmp_path: Path) -> None:
-    """A workspace mentioning system / Systems / systems yields ONE concept
-    node, fewer than the un-normalized (per-surface-form) baseline."""
-
-    notes = tmp_path / "ws" / "notes"
-    notes.mkdir(parents=True)
-    (notes / "a.md").write_text(
-        "# Systems\n\nWe build systems. Systems are systems. A single System too.\n",
-        encoding="utf-8",
-    )
-    # Two documents, because a concept node exists to link documents: with
-    # graph.concept_min_documents at its default of 2, a term only one file
-    # mentions is not kept as a node (it stays on the artifact's terms).
-    (notes / "b.md").write_text(
-        "# Related\n\nOur System design notes, describing systems.\n",
-        encoding="utf-8",
-    )
-    engine = _make_engine(
-        tmp_path, [{"name": "notes", "type": "markdown_folder", "path": str(notes)}]
-    )
-    engine.sync_source("notes", "full")
-
-    concept_labels = [
-        n["label"]
-        for n in engine.graph_builder.graph.to_node_link()["nodes"]
-        if n["type"] == "concept"
-    ]
-    system_concepts = [label for label in concept_labels if label in {"system", "systems"}]
-    # All surface forms collapse to a single normalized "system" concept.
-    assert system_concepts == ["system"]
-    assert "systems" not in concept_labels

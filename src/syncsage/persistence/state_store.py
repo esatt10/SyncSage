@@ -84,6 +84,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   heading_path,
   text
 );
+-- The corpus's own vocabulary, with document frequencies, read straight off
+-- the FTS index. `fts5vocab` is a view over chunks_fts's internal term table:
+-- it stores nothing of its own and stays exact as the index changes.
+--
+-- This replaces the concept layer as the source of "what is this corpus
+-- about" (the Synapse contract's vocabulary.top_concepts + minhash, and the
+-- planner's structural grounding). Concept extraction had been materializing
+-- 141k nodes and 1.27M artifact_terms rows to answer that question; SQLite
+-- was already maintaining the same information for free.
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vocab USING fts5vocab(chunks_fts, 'row');
 CREATE TABLE IF NOT EXISTS symbols (
   id TEXT PRIMARY KEY,
   artifact_id TEXT NOT NULL,

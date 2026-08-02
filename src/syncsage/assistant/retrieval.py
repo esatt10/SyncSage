@@ -883,6 +883,8 @@ class SyncSageRetriever:
             cached.node_types = dict(node_counts or {})
             return cached
 
+        from syncsage.search.sqlite_store import corpus_vocabulary as _corpus_vocabulary
+
         def aggregate(sql: str, params: tuple = ()) -> list[tuple[str, int]]:
             try:
                 return [
@@ -922,20 +924,12 @@ class SyncSageRetriever:
                 "GROUP BY dir ORDER BY n DESC LIMIT 12"
             ),
             node_types=dict(node_counts or {}),
-            # The terms this corpus actually uses, ranked by how many
-            # documents use them. Grouped by `term` (the readable label) and
-            # not by `node_id`, which would be fully covered by the
-            # (node_type, node_id, artifact_id) index but hands the planner
-            # slugs to search with; the filter still rides that index's
-            # leading column, and the result is cached per sync.
-            concepts=[
-                label
-                for label, _ in aggregate(
-                    "SELECT term, COUNT(DISTINCT artifact_id) AS n FROM artifact_terms "
-                    "WHERE node_type = 'concept' GROUP BY term "
-                    "ORDER BY n DESC, term LIMIT 24"
-                )
-            ],
+            # The terms this corpus actually uses, by document frequency,
+            # read off the FTS index's own vocabulary table. Previously this
+            # came from `artifact_terms` concept rows; those were retired
+            # (graph.enrichment._add_concept) and this is the same question
+            # answered from the index SQLite already maintains.
+            concepts=[term for term, _ in _corpus_vocabulary(self.state, 24)],
             symbols=[
                 label
                 for label, _ in aggregate(
