@@ -35,6 +35,11 @@ from syncsage.api.app import graph_slice as _graph_slice
 
 VALID_MODES = ("hybrid", "text", "graph", "vector")
 
+#: ``(kb, artifacts, chunks)`` → :class:`RetrievalStructure`. The corpus's
+#: shape only changes when a sync does, so deriving it per question would be
+#: a fixed tax on every plan step for an answer that did not move.
+_STRUCTURE_CACHE: dict[tuple, Any] = {}
+
 
 @dataclass
 class Passage:
@@ -55,6 +60,244 @@ class Passage:
         return str(self.chunk_id or self.node_id or self.title)
 
 
+# Semantic edge types a graph walk can follow. The structural three
+# (contains / indexes / has_chunk) are deliberately omitted: they say "this
+# file is in this folder", which is never the reason to traverse.
+TRAVERSABLE_EDGES = ("mentions", "references", "imports", "calls", "similar_to")
+
+
+@dataclass
+class RetrievalStructure:
+    """How this knowledge base is *shaped*, not merely how big it is.
+
+    A planner told only "2,132 indexed files" writes generic queries against
+    a corpus it is guessing about. A planner told the corpus is a **git
+    repository** of Python under ``python/packages/``, whose own recurring
+    vocabulary is "workflow", "executor", "checkpoint", writes queries that
+    land on exact identifiers and real paths — which is what the lexical
+    half of the index rewards.
+
+    Every field is read straight off the index: SQL aggregates and the
+    graph's maintained type counts. No LLM, no sampling, no guessing, so the
+    same corpus always describes itself the same way.
+    """
+
+    sources: list[dict] = field(default_factory=list)
+    content_types: list[tuple[str, int]] = field(default_factory=list)
+    languages: list[tuple[str, int]] = field(default_factory=list)
+    top_directories: list[tuple[str, int]] = field(default_factory=list)
+    node_types: dict[str, int] = field(default_factory=dict)
+    concepts: list[str] = field(default_factory=list)
+    symbols: list[str] = field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not (self.sources or self.content_types or self.top_directories)
+
+    def as_lines(self) -> list[str]:
+        """The structural half of the planner's context."""
+        lines: list[str] = []
+        if self.sources:
+            lines.append("Sources:")
+            for source in self.sources:
+                kind = source.get("type") or "source"
+                lines.append(f"  - {source['name']} ({kind}, {source['artifacts']} files)")
+        if self.top_directories:
+            lines.append(
+                "Layout — top directories by file count: "
+                + ", ".join(f"{path}/ ({count})" for path, count in self.top_directories)
+            )
+        if self.content_types:
+            lines.append(
+                "File types: " + ", ".join(f"{name} ({count})" for name, count in self.content_types)
+            )
+        if self.languages:
+            lines.append(
+                "Code languages: "
+                + ", ".join(f"{name} ({count})" for name, count in self.languages)
+            )
+        if self.node_types:
+            ordered = sorted(self.node_types.items(), key=lambda kv: -kv[1])
+            lines.append(
+                "Knowledge graph nodes: "
+                + ", ".join(f"{name} ({count})" for name, count in ordered)
+            )
+            lines.append(f"Traversable edges: {', '.join(TRAVERSABLE_EDGES)}")
+        if self.concepts:
+            lines.append(
+                "Recurring vocabulary in this corpus (use these words): "
+                + ", ".join(self.concepts)
+            )
+        if self.symbols:
+            lines.append("Prominent code symbols: " + ", ".join(self.symbols))
+        return lines
+
+
+@dataclass
+class Document:
+    """A file reassembled from its chunks, with the metadata that frames it.
+
+    Search scores chunks; questions are answered by files. This is the
+    join-back: ordered chunk text under one heading, plus what the index
+    already knows about the artifact it came from.
+    """
+
+    node_id: str
+    text: str
+    relative_path: str | None = None
+    source_id: str | None = None
+    type: str | None = None
+    language: str | None = None
+    size_bytes: int | None = None
+    git_branch: str | None = None
+    chunk_count: int = 0
+    included_chunks: int = 0
+    line_span: tuple[int, int] | None = None
+    symbols: list[str] = field(default_factory=list)
+    truncated: bool = False
+
+    def describe(self) -> str:
+        """One line of provenance, for the prompt header above the text."""
+        bits: list[str] = []
+        if self.type:
+            bits.append(str(self.type))
+        if self.language and self.language != self.type:
+            bits.append(str(self.language))
+        if self.line_span:
+            bits.append(f"lines {self.line_span[0]}-{self.line_span[1]}")
+        if self.chunk_count:
+            if self.truncated:
+                bits.append(f"{self.included_chunks} of {self.chunk_count} chunks shown")
+            else:
+                bits.append(f"complete file, {self.chunk_count} chunk(s)")
+        if self.source_id:
+            bits.append(f"source: {self.source_id}")
+        if self.git_branch:
+            bits.append(f"branch: {self.git_branch}")
+        line = " · ".join(bits)
+        if self.symbols:
+            line += "\ndefines: " + ", ".join(self.symbols)
+        return line
+
+
+# Extensions whose files are read whole or not at all. Source and config
+# files are *structurally* meaningful: an excerpt of a Python module with the
+# imports cut off, or of a YAML file with half the keys, is not a smaller
+# answer — it is a misleading one, and it is what makes a model invent the
+# import it cannot see. They are also small: the threshold below exists for
+# the pathological vendored bundle, not for anything a human wrote.
+CODE_EXTENSIONS = frozenset(
+    {
+        ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb",
+        ".cs", ".cpp", ".cc", ".c", ".h", ".hpp", ".swift", ".kt", ".scala", ".php",
+        ".sh", ".bash", ".ps1", ".sql", ".r", ".m", ".lua", ".pl",
+        ".yaml", ".yml", ".toml", ".json", ".ini", ".cfg", ".env", ".tf",
+        ".dockerfile", ".gradle", ".proto", ".graphql",
+    }
+)
+
+#: Original-file size above which a *prose* document is excerpted rather than
+#: read whole. Deliberately measured against ``artifacts.size_bytes`` — what
+#: the file actually is — not against the reassembled text, so the policy is a
+#: property of the corpus rather than of whatever the budget happened to be.
+LARGE_FILE_BYTES = 40_000
+
+#: Chunks kept either side of a match when excerpting a large document.
+ADJACENT_CHUNKS = 1
+
+
+def _is_code(relative_path: str | None, language: str | None) -> bool:
+    """Whether a file is source/config, and so must never be excerpted."""
+    if language:  # the pipeline extracted symbols: something parsed it as code
+        return True
+    if not relative_path:
+        return False
+    suffix = relative_path[relative_path.rfind(".") :].lower() if "." in relative_path else ""
+    name = relative_path.rsplit("/", 1)[-1].lower()
+    return suffix in CODE_EXTENSIONS or name in ("dockerfile", "makefile")
+
+
+def _reassemble(
+    rows: list,
+    anchor_ids: set[str],
+    allowance: int,
+    *,
+    focused: bool = False,
+) -> tuple[str, int, bool]:
+    """Join a file's chunks back together, inside ``allowance`` characters.
+
+    Returns ``(text, chunks_included, truncated)``.
+
+    ``focused`` is the large-document policy: keep the chunks search matched
+    plus their immediate neighbours and stop, **even when the allowance would
+    permit more**. Filling the remaining budget with unrelated chunks of a
+    400 KB document is not free — it dilutes the evidence the answer is
+    supposed to be grounded in, and buries the matched region in the middle
+    of the prompt. Small files and every code/config file are assembled whole
+    instead (``focused=False``): there, the surrounding lines *are* the
+    context.
+    """
+    blocks: list[str] = []
+    for row in rows:
+        label_bits = []
+        if row["start_line"] is not None and row["end_line"] is not None:
+            label_bits.append(f"lines {row['start_line']}-{row['end_line']}")
+        heading = str(row["heading_path"] or "").strip()
+        if heading:
+            label_bits.append(heading)
+        label = f"--- {' · '.join(label_bits)} ---\n" if label_bits else ""
+        blocks.append(label + str(row["text"] or ""))
+
+    anchors = [i for i, row in enumerate(rows) if str(row["id"]) in anchor_ids]
+
+    if focused:
+        # Only the matched neighbourhood, plus chunk 0 so the reader can still
+        # tell which document this is (title, frontmatter, opening).
+        wanted = {0}
+        for anchor in anchors:
+            for offset in range(-ADJACENT_CHUNKS, ADJACENT_CHUNKS + 1):
+                if 0 <= anchor + offset < len(rows):
+                    wanted.add(anchor + offset)
+        order = sorted(wanted)
+    else:
+        total = sum(len(block) + 2 for block in blocks)
+        if total <= allowance:
+            return "\n\n".join(blocks), len(blocks), False
+        # Over budget: claim positions by value rather than lopping off the
+        # tail. Head first (what this file is), then what search matched (why
+        # it came back), then outward from those.
+        order = [0, *anchors]
+        for anchor in anchors:
+            for offset in (1, -1, 2, -2):
+                if 0 <= anchor + offset < len(rows):
+                    order.append(anchor + offset)
+        order.extend(range(len(rows)))
+
+    chosen: set[int] = set()
+    spent = 0
+    for index in order:
+        if index in chosen:
+            continue
+        cost = len(blocks[index]) + 2
+        if spent + cost > allowance:
+            continue
+        chosen.add(index)
+        spent += cost
+    if not chosen:  # a single chunk larger than the whole allowance
+        return blocks[order[0]][:allowance], 1, True
+
+    parts: list[str] = []
+    previous = -1
+    for index in sorted(chosen):
+        gap = index - previous - 1
+        if gap > 0 and previous >= 0:
+            parts.append(f"--- … {gap} chunk(s) omitted … ---")
+        parts.append(blocks[index])
+        previous = index
+    if previous < len(rows) - 1:
+        parts.append(f"--- … {len(rows) - 1 - previous} chunk(s) omitted … ---")
+    return "\n\n".join(parts), len(chosen), len(chosen) < len(rows)
+
+
 @dataclass
 class RetrievalCapabilities:
     """What this knowledge base can answer with, right now."""
@@ -67,15 +310,22 @@ class RetrievalCapabilities:
     chunk_count: int
     artifact_count: int
     node_counts: dict[str, int]
+    structure: RetrievalStructure = field(default_factory=RetrievalStructure)
 
     def as_prompt_context(self) -> str:
         """A compact description a planner LLM can reason over."""
         lines = [
             f"Knowledge base: {self.knowledge_base}",
-            f"Sources: {', '.join(self.sources) if self.sources else '(none)'}",
             f"Indexed files: {self.artifact_count}; passages: {self.chunk_count}",
-            f"Search modes available: {', '.join(self.modes)}",
         ]
+        structural = self.structure.as_lines()
+        if structural:
+            lines.extend(structural)
+        else:
+            # No structure available (no state store) — fall back to the flat
+            # source list rather than saying nothing about the corpus.
+            lines.append(f"Sources: {', '.join(self.sources) if self.sources else '(none)'}")
+        lines.append(f"Search modes available: {', '.join(self.modes)}")
         if self.vector_enabled:
             lines.append(f"Semantic (vector) index: {self.vector_count} vectors built")
         else:
@@ -327,6 +577,137 @@ class SyncSageRetriever:
         content = rows[0]["content"] if rows else None
         return str(content)[:max_chars] if content else None
 
+    def documents(
+        self,
+        node_ids: list[str],
+        *,
+        anchors: dict[str, list[str]] | None = None,
+        max_chars: int = 6000,
+        code_max_chars: int = 24_000,
+        large_file_bytes: int = LARGE_FILE_BYTES,
+        budget_chars: int = 60_000,
+    ) -> dict[str, Document]:
+        """Reassemble whole files from their chunks, with metadata attached.
+
+        Search retrieves *chunks* — that is what scoring works over — but a
+        question like "what does this repository do" or "how do I use this
+        tool" is answered by the **file**, not by one 500-character window
+        into it. This walks back up: the chunks of each cited artifact are
+        re-joined in ``chunk_index`` order, each labelled with the line span
+        and heading path recorded at index time, and wrapped in the file's
+        own metadata (path, type, language, size, the symbols it defines).
+
+        Three batched queries regardless of how many documents are asked
+        for — a per-node loop over ``content()`` was 2 queries *each*.
+
+        How much of each file comes back is decided by **what the file is**,
+        from ``artifacts.size_bytes`` — the original on-disk size — rather
+        than by how long the reassembled text happens to run:
+
+        * **Code and config** (``_is_code``) is never treated as large. A
+          Python module with its imports cut off, or half a YAML file, is not
+          a smaller answer but a wrong one, and it is exactly what makes a
+          model invent the symbol it could not see. These are capped only by
+          ``code_max_chars``, which is a guard against a vendored bundle, not
+          a policy for anything a person wrote.
+        * **Prose over ``large_file_bytes``** is excerpted to the matched
+          neighbourhood: the chunks search hit, their immediate neighbours,
+          and chunk 0 for orientation. Spending the rest of the budget on
+          unrelated chunks of a 400 KB document dilutes the evidence instead
+          of adding to it.
+        * **Everything else** is assembled whole up to ``max_chars``, and if
+          it still does not fit, claimed head → matched chunks → outward.
+
+        Omitted stretches are marked inline, so the model can see it is
+        reading an excerpt and say so rather than assume it saw the file.
+
+        ``budget_chars`` caps the whole batch; documents are funded in the
+        order given, which callers should keep as citation order so the
+        best-scoring hit is never the one that gets starved.
+        """
+        if self.state is None or not node_ids:
+            return {}
+        wanted = list(dict.fromkeys(node_id for node_id in node_ids if node_id))
+        if not wanted:
+            return {}
+
+        placeholders = ",".join("?" * len(wanted))
+        params = tuple(wanted)
+        meta = {
+            str(row["id"]): row
+            for row in self.state.rows(
+                "SELECT id, relative_path, source_id, type, size_bytes, git_branch "
+                f"FROM artifacts WHERE id IN ({placeholders})",
+                params,
+            )
+        }
+        chunks: dict[str, list[Any]] = {}
+        for row in self.state.rows(
+            "SELECT artifact_id, id, chunk_index, heading_path, start_line, end_line, text "
+            f"FROM chunks WHERE artifact_id IN ({placeholders}) ORDER BY artifact_id, chunk_index",
+            params,
+        ):
+            chunks.setdefault(str(row["artifact_id"]), []).append(row)
+        symbols: dict[str, list[str]] = {}
+        languages: dict[str, str] = {}
+        for row in self.state.rows(
+            "SELECT artifact_id, name, symbol_type, language "
+            f"FROM symbols WHERE artifact_id IN ({placeholders}) ORDER BY artifact_id, start_line",
+            params,
+        ):
+            artifact_id = str(row["artifact_id"])
+            name = str(row["name"] or "").strip()
+            if name and len(symbols.setdefault(artifact_id, [])) < 12:
+                symbols[artifact_id].append(name)
+            if row["language"] and artifact_id not in languages:
+                languages[artifact_id] = str(row["language"])
+
+        out: dict[str, Document] = {}
+        spent = 0
+        for node_id in wanted:
+            rows = chunks.get(node_id)
+            if not rows or spent >= budget_chars:
+                continue
+            row = meta.get(node_id)
+            relative_path = str(row["relative_path"]) if row and row["relative_path"] else None
+            language = languages.get(node_id)
+            size_bytes = int(row["size_bytes"]) if row and row["size_bytes"] else 0
+
+            if _is_code(relative_path, language):
+                allowance, focused = min(code_max_chars, budget_chars - spent), False
+            elif size_bytes > large_file_bytes:
+                allowance, focused = min(max_chars, budget_chars - spent), True
+            else:
+                allowance, focused = min(max_chars, budget_chars - spent), False
+
+            text, included, truncated = _reassemble(
+                rows,
+                set(anchors.get(node_id, []) if anchors else []),
+                allowance,
+                focused=focused,
+            )
+            if not text:
+                continue
+            spent += len(text)
+            starts = [r["start_line"] for r in rows if r["start_line"] is not None]
+            ends = [r["end_line"] for r in rows if r["end_line"] is not None]
+            out[node_id] = Document(
+                node_id=node_id,
+                relative_path=relative_path,
+                source_id=str(row["source_id"]) if row and row["source_id"] else None,
+                type=str(row["type"]) if row and row["type"] else None,
+                language=language,
+                size_bytes=size_bytes or None,
+                git_branch=str(row["git_branch"]) if row and row["git_branch"] else None,
+                chunk_count=len(rows),
+                included_chunks=included,
+                line_span=(int(min(starts)), int(max(ends))) if starts and ends else None,
+                symbols=symbols.get(node_id, []),
+                text=text,
+                truncated=truncated,
+            )
+        return out
+
     # ---------------------------------------------------------- capabilities
 
     def capabilities(self) -> RetrievalCapabilities:
@@ -371,7 +752,93 @@ class SyncSageRetriever:
             chunk_count=chunk_count,
             artifact_count=artifact_count,
             node_counts=node_counts,
+            structure=self.structure(artifact_count, chunk_count, node_counts),
         )
+
+    def structure(
+        self,
+        artifact_count: int = 0,
+        chunk_count: int = 0,
+        node_counts: dict[str, int] | None = None,
+    ) -> RetrievalStructure:
+        """The corpus's own shape and vocabulary, for grounding a plan.
+
+        Cached process-wide against ``(artifacts, chunks)`` — the same
+        signature trick the vector store uses. The aggregates are cheap per
+        row but the concept roll-up touches every ``artifact_terms`` row of
+        its type, and re-deriving that on every question would put a fixed
+        cost on the plan step for a fact that only changes when a sync does.
+        """
+        if self.state is None:
+            return RetrievalStructure(node_types=dict(node_counts or {}))
+        signature = (self.knowledge_base, artifact_count, chunk_count)
+        cached = _STRUCTURE_CACHE.get(signature)
+        if cached is not None:
+            cached.node_types = dict(node_counts or {})
+            return cached
+
+        def aggregate(sql: str, params: tuple = ()) -> list[tuple[str, int]]:
+            try:
+                return [
+                    (str(row[0]), int(row[1]))
+                    for row in self.state.rows(sql, params)
+                    if row[0] not in (None, "")
+                ]
+            except Exception:  # a structural nicety must never fail a question
+                return []
+
+        configured_types = {}
+        for source in getattr(self.config, "sources", None) or []:
+            source_type = getattr(source, "type", None)
+            configured_types[str(getattr(source, "name", ""))] = str(
+                getattr(source_type, "value", source_type) or ""
+            )
+        sources = [
+            {"name": name, "type": configured_types.get(name) or "source", "artifacts": count}
+            for name, count in aggregate(
+                "SELECT source_id, COUNT(*) FROM artifacts GROUP BY source_id ORDER BY 2 DESC"
+            )
+        ]
+        structure = RetrievalStructure(
+            sources=sources,
+            content_types=aggregate(
+                "SELECT type, COUNT(*) FROM artifacts GROUP BY type ORDER BY 2 DESC LIMIT 10"
+            ),
+            languages=aggregate(
+                "SELECT language, COUNT(*) FROM symbols WHERE language IS NOT NULL "
+                "GROUP BY language ORDER BY 2 DESC LIMIT 6"
+            ),
+            top_directories=aggregate(
+                "SELECT CASE WHEN instr(relative_path, '/') > 0 "
+                "THEN substr(relative_path, 1, instr(relative_path, '/') - 1) "
+                "ELSE '(root)' END AS dir, COUNT(*) AS n "
+                "FROM artifacts WHERE relative_path IS NOT NULL "
+                "GROUP BY dir ORDER BY n DESC LIMIT 12"
+            ),
+            node_types=dict(node_counts or {}),
+            # Straight off the covering index added with the concept-pruning
+            # work (node_type, node_id, artifact_id): the terms this corpus
+            # actually uses, ranked by how many documents use them.
+            concepts=[
+                label
+                for label, _ in aggregate(
+                    "SELECT node_id, COUNT(DISTINCT artifact_id) AS n FROM artifact_terms "
+                    "WHERE node_type = 'concept' GROUP BY node_id "
+                    "ORDER BY n DESC, node_id LIMIT 24"
+                )
+            ],
+            symbols=[
+                label
+                for label, _ in aggregate(
+                    "SELECT name, COUNT(DISTINCT artifact_id) AS n FROM symbols "
+                    "WHERE name IS NOT NULL AND symbol_type IN ('class', 'function', 'method') "
+                    "GROUP BY name ORDER BY n DESC, name LIMIT 20"
+                )
+            ],
+        )
+        _STRUCTURE_CACHE.clear()  # one knowledge base per process; keep it bounded
+        _STRUCTURE_CACHE[signature] = structure
+        return structure
 
 
 def _merge_modes(*modes: str) -> str:

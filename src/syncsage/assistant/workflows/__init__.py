@@ -1,14 +1,26 @@
 """Pluggable question-answering workflows.
 
-A *workflow* turns a question into a grounded answer. SyncSage ships two:
+A *workflow* turns a question into a grounded answer. SyncSage ships three:
 
+* ``knowledge-summary`` — the agentic graph pinned to the summarising
+  reading: breadth over depth, answering with what things are and how they
+  relate. For orienting yourself in an unfamiliar corpus.
+* ``agentic`` — the same **LangGraph** state graph, reading each question
+  for itself. It classifies the question as a knowledge summary or a
+  procedural how-to and plans, retrieves, grades and answers to match; then
+  it searches across modes, walks the knowledge graph for material lexical
+  search missed, loops when the evidence is thin, and verifies the citations
+  it emits. Requires ``pip install 'syncsage[agent]'``.
 * ``simple`` — one retrieval pass, one model call. Zero extra dependencies,
   always available, and the behavior the chat surface has had since it
   existed.
-* ``agentic`` — a **LangGraph** state graph that plans, retrieves across
-  every search mode, walks the knowledge graph for material lexical search
-  missed, grades its own evidence, loops when it is thin, and verifies the
-  citations it emits. Requires ``pip install 'syncsage[agent]'``.
+
+The two answer shapes (``knowledge`` / ``procedural``) are a property of the
+*question*, not of the workflow: "what does this repository do" wants a
+summary and "how do I use this tool" wants ordered steps with real code, and
+they need different evidence to get there. ``agentic`` picks per question;
+``knowledge-summary`` pins one. To pin the other, set
+``workflow_options: {intent: procedural}``.
 
 Both are ordinary registrations, so a third one you write is a first-class
 citizen rather than a fork. Register programmatically::
@@ -150,10 +162,19 @@ def _builtins() -> dict[str, Any]:
 
     registry: dict[str, Any] = {"simple": SimpleWorkflow}
     if langgraph_available():
-        from syncsage.assistant.workflows.agentic import AgenticWorkflow
+        from syncsage.assistant.workflows.agentic import (
+            AgenticWorkflow,
+            KnowledgeSummaryWorkflow,
+        )
 
         registry["agentic"] = AgenticWorkflow
+        registry["knowledge-summary"] = KnowledgeSummaryWorkflow
     return registry
+
+
+#: Names shipped in the box, in the order a picker should offer them:
+#: broadest reading first, cheapest last.
+BUILTIN_WORKFLOWS = ("knowledge-summary", "agentic", "simple")
 
 
 def langgraph_available() -> bool:
@@ -179,26 +200,37 @@ def get_workflow(name: str) -> Any | None:
 def list_workflows() -> list[dict[str, Any]]:
     """Every resolvable workflow, with enough detail for a UI picker."""
     described = {
+        "knowledge-summary": (
+            "Knowledge summary",
+            "The agentic graph pinned to summarising: reads more files, less of each, "
+            "and answers with what things are and how they fit together. Pick it to "
+            "orient yourself in a corpus.",
+        ),
+        "agentic": (
+            "Agentic (LangGraph)",
+            "Reads each question as a knowledge summary or a how-to and plans "
+            "accordingly, searches every mode, walks the graph for related material, "
+            "grades its own evidence and retries when it is thin, then verifies citations.",
+        ),
         "simple": (
             "Single pass",
             "One retrieval, one model call. Fast, predictable, no extra dependencies.",
         ),
-        "agentic": (
-            "Agentic (LangGraph)",
-            "Plans, searches every mode, walks the graph for related material, "
-            "grades its own evidence and retries when it is thin, then verifies citations.",
-        ),
     }
     names = set(_builtins()) | set(_load_entry_points()) | set(_programmatic)
+    # Built-ins in their offered order; anything registered by a plugin after,
+    # alphabetically, so the list is stable across processes.
+    ordered = [name for name in BUILTIN_WORKFLOWS if name in names]
+    ordered += sorted(name for name in names if name not in BUILTIN_WORKFLOWS)
     out = []
-    for name in sorted(names):
+    for name in ordered:
         label, description = described.get(name, (name, "Custom workflow."))
         out.append(
             {
                 "name": name,
                 "label": label,
                 "description": description,
-                "builtin": name in ("simple", "agentic"),
+                "builtin": name in BUILTIN_WORKFLOWS,
             }
         )
     return out
@@ -243,6 +275,7 @@ def reset_workflow_registry() -> None:
 
 
 __all__ = [
+    "BUILTIN_WORKFLOWS",
     "ENTRY_POINT_GROUP",
     "Workflow",
     "WorkflowRequest",

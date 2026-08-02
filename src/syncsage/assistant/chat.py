@@ -40,7 +40,118 @@ like [1] or [2][5]. Put the citation right after the sentence it supports.
 is missing. Do not guess, and do not pad the answer.
 - Be concise and concrete. Lead with the answer, then the supporting detail.
 - Prefer the user's own vocabulary from the passages over generic phrasing.
-- Plain prose or short lists. No preamble like "Based on the passages"."""
+- Plain prose or short lists. No preamble like "Based on the passages".
+- A passage marked "chunks omitted" is an excerpt. Do not claim the file \
+contains nothing else."""
+
+# The two answer shapes the agent plans and writes toward. They are not
+# stylistic variants: "what does this repository do" and "how do I use this
+# tool" want different *evidence* (breadth of files vs. depth on the few
+# that carry runnable examples) and different output (an oriented summary
+# vs. ordered steps you can follow). One prompt trying to serve both lands
+# in the middle and serves neither — see workflows/agentic.py INTENT_PROFILES
+# for the retrieval half of the same split.
+KNOWLEDGE_SYSTEM = (
+    SYSTEM_PROMPT
+    + """
+
+This is a KNOWLEDGE SUMMARY question — the reader wants to understand what \
+something is, what it does, and how its parts relate.
+
+Shape the answer:
+- Open with a direct two-or-three sentence answer to the question asked.
+- Then the substance: the main components or themes, what each is for, and \
+how they fit together. Group by structure, not by which passage you read.
+- Name the real files, directories, modules and identifiers the passages \
+show — they are how the reader navigates from your answer to the source.
+- Where the graph facts show a relationship the passages imply, say it.
+- Do not give instructions or steps unless the question asked for them."""
+)
+
+PROCEDURAL_SYSTEM = (
+    SYSTEM_PROMPT
+    + """
+
+This is a PROCEDURAL question — the reader wants to *do* something and \
+needs steps and working code, not an overview.
+
+Shape the answer:
+- Open with one line saying what the procedure accomplishes and what it needs.
+- Then numbered steps. Each step is one concrete action, in order.
+- Include code and configuration in fenced blocks, copied from the passages. \
+Keep imports, identifiers, argument names and option keys EXACTLY as they \
+appear — a renamed symbol is a broken instruction.
+- Say which file each example came from, so the reader can open it.
+- Call out prerequisites, required config keys and gotchas the passages state.
+- CRITICAL: never invent an API, flag, method or import that is not in the \
+passages. If the passages show the pieces but no complete example, give the \
+steps you can support and say plainly which part is not covered."""
+)
+
+#: Answer shapes the agent can be asked for. ``auto`` classifies per question.
+INTENTS = ("knowledge", "procedural")
+
+INTENT_SYSTEM_PROMPTS = {
+    "knowledge": KNOWLEDGE_SYSTEM,
+    "procedural": PROCEDURAL_SYSTEM,
+}
+
+# Deterministic intent classification. Runs before (and without) any model, so
+# the offline path and the LLM path agree on the default reading of a
+# question; the planner may override it, but never has to be asked.
+_PROCEDURAL_PATTERNS = (
+    r"\bhow (?:do|can|would|should) (?:i|we|you)\b",
+    r"\bhow to\b",
+    r"\bwalk me through\b",
+    r"\bstep[- ]by[- ]step\b",
+    r"\b(?:show|give) me (?:an? )?(?:example|snippet|code)\b",
+    r"\b(?:set ?up|configure|install|integrate|implement|instantiate|invoke)\b",
+    r"\b(?:leverage|use|call|run|build|create|add|enable|deploy|migrate)\b.*\?"
+    r"|^(?:leverage|use|call|run|build|create|add|enable|deploy|migrate)\b",
+    r"\b(?:usage|tutorial|quickstart|getting started|recipe|workflow for)\b",
+    r"\bwhat(?:'s| is) the (?:syntax|signature|api|command)\b",
+)
+_KNOWLEDGE_PATTERNS = (
+    r"\bwhat (?:does|do|is|are|was|were)\b",
+    r"\b(?:explain|describe|summari[sz]e|overview of|purpose of|architecture)\b",
+    r"\bwhy (?:does|is|are|do)\b",
+    r"\bwho (?:owns|wrote|maintains)\b",
+    r"\bwhere (?:is|does|are)\b",
+    r"\bhow (?:does|do|is|are) \w+ (?:work|structured|organi[sz]ed|related)\b",
+)
+
+
+def classify_intent(question: str) -> tuple[str, str]:
+    """Read a question as knowledge-summary or procedural. Returns (intent, why).
+
+    Deterministic and offline: the same question always classifies the same
+    way, which keeps the workflow reproducible and keeps the no-model path
+    from behaving differently than the model path.
+
+    Knowledge is the default because it is the safer failure. A summary
+    still reads as a useful answer to a procedural question, whereas
+    procedural framing applied to "what is X" invents steps nobody asked
+    for — and inventing steps is exactly what the grounding rules forbid.
+    """
+    text = " ".join((question or "").lower().split())
+    if not text:
+        return "knowledge", "empty question"
+    procedural = next((p for p in _PROCEDURAL_PATTERNS if re.search(p, text)), None)
+    knowledge = next((p for p in _KNOWLEDGE_PATTERNS if re.search(p, text)), None)
+    # "how does X work" is a knowledge question that trips the procedural
+    # verb list, so an explicit knowledge signal wins a tie.
+    if procedural and not knowledge:
+        return "procedural", "asks how to do something — wants steps and code"
+    if knowledge:
+        return "knowledge", "asks what something is or does — wants a summary"
+    if procedural:
+        return "procedural", "asks how to do something — wants steps and code"
+    return "knowledge", "no explicit signal; defaulting to a summary"
+
+
+def system_prompt_for(intent: str | None) -> str:
+    """The answering prompt for an intent, falling back to the base rules."""
+    return INTENT_SYSTEM_PROMPTS.get(str(intent or ""), SYSTEM_PROMPT)
 
 _CITATION_RE = re.compile(r"\[(\d{1,2})\]")
 
@@ -254,15 +365,110 @@ def short_reason(error: str) -> str:
     return first if len(first) <= 120 else first[:117].rstrip() + "…"
 
 
-def build_prompt(question: str, citations: list[dict], facts: list[dict]) -> str:
-    """Numbered passages + graph facts + the question."""
+#: Defaults for the file-level content pass, shared by every workflow so
+#: switching workflows does not silently change how much the model can see.
+CONTENT_DEFAULTS: dict[str, Any] = {
+    "include_full_content": True,
+    # Prose allowance per document.
+    "passage_chars": 6000,
+    # Code and config are never excerpted (see retrieval._is_code); this is
+    # only a ceiling against a vendored bundle, not a policy for real files.
+    "code_passage_chars": 24_000,
+    # Original file size above which a prose document is excerpted to the
+    # matched neighbourhood rather than read whole.
+    "large_file_bytes": 40_000,
+    # Ceiling across every passage in one answer.
+    "context_budget_chars": 60_000,
+}
+
+
+def hydrate_citations(retriever: Any, citations: list[dict], options: dict | None = None) -> dict:
+    """Pull the full indexed file behind each citation, keyed by index.
+
+    Search returns *chunks*, and a chunk preview is capped at 500 characters
+    in the SQL layer. Answering "what does this repository do" or "how do I
+    use this" from 500-character windows is why an answer can name exactly
+    the right files and still say nothing about them: the retrieval was
+    correct and the evidence was starved. This re-reads those files whole —
+    reassembled from their chunks with line spans, headings and artifact
+    metadata (see :meth:`retrieval.SyncSageRetriever.documents`).
+
+    Best-effort by construction: any failure returns ``{}`` and the caller
+    falls back to snippets, because a missing state store must degrade the
+    answer, not fail the question.
+
+    Only the *first* citation of a given file is hydrated. Two chunks of one
+    document produce two citations, and both matched chunks are already
+    anchored into the single reassembly, so hydrating the second would repeat
+    the same file inside the same prompt.
+    """
+    settings = {**CONTENT_DEFAULTS, **(options or {})}
+    if not settings.get("include_full_content") or retriever is None or not citations:
+        return {}
+
+    node_ids: list[str] = []
+    anchors: dict[str, list[str]] = {}
+    first_citation: dict[str, int] = {}
+    for citation in citations:
+        node_id = citation.get("node_id")
+        if not node_id:
+            continue
+        if node_id not in first_citation:
+            first_citation[node_id] = citation["index"]
+            node_ids.append(node_id)
+        if citation.get("chunk_id"):
+            anchors.setdefault(node_id, []).append(str(citation["chunk_id"]))
+
+    if not node_ids:
+        return {}
+    try:
+        documents = retriever.documents(
+            node_ids,
+            anchors=anchors,
+            max_chars=int(settings["passage_chars"]),
+            code_max_chars=int(settings["code_passage_chars"]),
+            large_file_bytes=int(settings["large_file_bytes"]),
+            budget_chars=int(settings["context_budget_chars"]),
+        )
+    except Exception:  # pragma: no cover - degrade to snippets, never fail
+        logger.debug("could not hydrate citation content", exc_info=True)
+        return {}
+    return {
+        first_citation[node_id]: document
+        for node_id, document in documents.items()
+        if node_id in first_citation
+    }
+
+
+def build_prompt(
+    question: str,
+    citations: list[dict],
+    facts: list[dict],
+    documents: dict | None = None,
+) -> str:
+    """Numbered passages + graph facts + the question.
+
+    ``documents`` maps a citation index to a reassembled
+    :class:`~syncsage.assistant.retrieval.Document`. When one is present the
+    model reads the whole file with its metadata instead of the 500-character
+    chunk preview; when it is absent (no state store, or content disabled)
+    the snippet is used and the prompt shape is unchanged.
+    """
+    documents = documents or {}
     lines = ["Passages from the knowledge base:", ""]
     for citation in citations:
         header = f"[{citation['index']}] {citation['title']}"
         if citation.get("relative_path") and citation["relative_path"] != citation["title"]:
             header += f" ({citation['relative_path']})"
         lines.append(header)
-        lines.append(citation["snippet"] or "(no preview available)")
+        document = documents.get(citation["index"])
+        if document is not None:
+            described = document.describe()
+            if described:
+                lines.append(described)
+            lines.append(document.text)
+        else:
+            lines.append(citation["snippet"] or "(no preview available)")
         lines.append("")
     if facts:
         lines.append("Relationships recorded in the knowledge graph:")
