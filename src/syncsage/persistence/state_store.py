@@ -6,6 +6,19 @@ import threading
 from pathlib import Path
 from typing import Any
 
+
+def _basename(path: str | None) -> str:
+    """Final path segment, for the FTS ``title`` column.
+
+    Deliberately not ``Path(...).name``: these are POSIX-style relative paths
+    recorded at index time, and on Windows ``PurePath`` would also split on
+    backslashes, so an indexed path containing one would produce a different
+    title than the same corpus indexed on Linux.
+    """
+    text = str(path or "")
+    return text.rsplit("/", 1)[-1] if "/" in text else text
+
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS knowledge_bases (
@@ -231,6 +244,47 @@ class StateStore:
         if "acl" not in columns:
             self.conn.execute("ALTER TABLE artifacts ADD COLUMN acl TEXT")
         self.conn.commit()
+        self._migrate_fts_titles()
+
+    def _migrate_fts_titles(self) -> None:
+        """Re-point ``chunks_fts.title`` at the file's basename.
+
+        It used to hold the full relative path — the identical string already
+        in ``path`` — so a filename carried no signal BM25 could weight
+        separately, and searching "readme" ranked by body brevity instead of
+        by name. Rebuilding is safe and needs no re-index: ``chunks_fts`` is a
+        derived cache over ``chunks`` + ``artifacts``, exactly like the graph
+        node index, so it can be regenerated from the tables that are the
+        truth. No user data is touched.
+
+        One-shot and idempotent: the presence of a '/' in any stored title is
+        the old format, and after the rebuild there is nothing left to detect.
+        """
+        try:
+            stale = self.conn.execute(
+                "SELECT 1 FROM chunks_fts WHERE title LIKE '%/%' LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:  # table absent or FTS5 unavailable — nothing to do
+            return
+        if stale is None:
+            return
+        with self.conn:
+            self.conn.execute("DELETE FROM chunks_fts")
+            self.conn.execute(
+                """INSERT INTO chunks_fts(
+                       chunk_id, source_id, artifact_id, title, path, heading_path, text)
+                   SELECT chunks.id, chunks.source_id, chunks.artifact_id,
+                          replace(
+                              COALESCE(artifacts.relative_path, artifacts.path),
+                              rtrim(COALESCE(artifacts.relative_path, artifacts.path),
+                                    replace(COALESCE(artifacts.relative_path, artifacts.path),
+                                            '/', '')),
+                              ''),
+                          COALESCE(artifacts.relative_path, artifacts.path),
+                          COALESCE(chunks.heading_path, ''),
+                          chunks.text
+                   FROM chunks JOIN artifacts ON artifacts.id = chunks.artifact_id"""
+            )
 
     def get_fingerprint(self, scope: str) -> str | None:
         """What this scope was last indexed with, or None if never recorded."""
@@ -256,9 +310,7 @@ class StateStore:
         call (an unchanged directory still counts as a fresh heartbeat —
         that heartbeat is the staleness-SLA clock).
         """
-        desired = {
-            (principal, group) for principal, groups in mapping.items() for group in groups
-        }
+        desired = {(principal, group) for principal, groups in mapping.items() for group in groups}
         current = {
             (row[0], row[1])
             for row in self.conn.execute("SELECT principal, group_name FROM idp_groups")
@@ -422,7 +474,11 @@ class StateStore:
                         chunk["id"],
                         chunk["source_id"],
                         chunk["artifact_id"],
-                        artifact["relative_path"] or artifact["path"],
+                        # title = basename, path = full relative path. Two
+                        # distinct signals so BM25 can weight a filename match
+                        # above a body match (see sqlite_store._BM25_WEIGHTS);
+                        # storing the same string twice made them one.
+                        _basename(artifact["relative_path"] or artifact["path"]),
                         artifact["relative_path"] or artifact["path"],
                         chunk.get("heading_path") or "",
                         chunk["text"],

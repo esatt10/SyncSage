@@ -153,6 +153,20 @@ def system_prompt_for(intent: str | None) -> str:
     """The answering prompt for an intent, falling back to the base rules."""
     return INTENT_SYSTEM_PROMPTS.get(str(intent or ""), SYSTEM_PROMPT)
 
+
+def _known_workflow_names() -> set[str]:
+    """Registered workflow names, for telling a per-workflow options block
+    apart from an ordinary option key. Failure is not fatal: an unresolvable
+    registry just means nested blocks for *other* workflows are treated as
+    plain keys, which is the pre-existing behavior."""
+    try:
+        from syncsage.assistant.workflows import list_workflows
+
+        return {entry["name"] for entry in list_workflows()}
+    except Exception:  # pragma: no cover - defensive
+        return set()
+
+
 _CITATION_RE = re.compile(r"\[(\d{1,2})\]")
 
 # Graph node types that carry meaning rather than structure — these are what
@@ -613,11 +627,23 @@ def answer_question(
     name = resolve_workflow_name(
         workflow or getattr(settings, "workflow", "auto"), has_llm=llm is not None
     )
-    merged_options = {
-        "max_facts": int(getattr(settings, "max_facts", 12) or 12),
-        **(dict(getattr(settings, "workflow_options", None) or {})),
-        **(options or {}),
-    }
+    # `workflow_options` is documented as "keyed by workflow name" and every
+    # example nests it that way — but this splatted it flat, so a config of
+    # `workflow_options: {agentic: {max_rounds: 3}}` produced an option
+    # literally named "agentic" and every key inside it was silently ignored.
+    # Accept both shapes: keys matching the selected workflow are merged in,
+    # any other workflow's block is skipped, and flat keys still work.
+    configured_options = dict(getattr(settings, "workflow_options", None) or {})
+    merged_options = {"max_facts": int(getattr(settings, "max_facts", 12) or 12)}
+    nested_for_workflow: dict = {}
+    for key, value in configured_options.items():
+        if isinstance(value, dict) and (key in _known_workflow_names() or key == name):
+            if key == name:
+                nested_for_workflow = value
+            continue  # another workflow's block — not ours
+        merged_options[key] = value
+    merged_options.update(nested_for_workflow)
+    merged_options.update(options or {})
     request = WorkflowRequest(
         question=question,
         mode=mode,

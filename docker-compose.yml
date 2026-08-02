@@ -31,12 +31,18 @@ services:
       - ${SYNCSAGE_VAULT_PATH:-./vault}:/vault
       - syncsage-state:/state
       - syncsage-exports:/exports
+    # Sized for a busy process, not just a dead one. /health returns a constant
+    # dict, but SyncSage answers from a single Python process: while a heavy
+    # agentic question or a graph walk holds the GIL, even that trivial handler
+    # waits its turn. A tight budget here does not detect a problem, it invents
+    # one — the container flips to unhealthy under exactly the load it is
+    # meant to be serving, which is what gates `syncsage-ui` below.
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   # Optional web UI at http://localhost:8080. A separate workload that serves the
   # static React bundle and proxies /api/* to the syncsage service above.

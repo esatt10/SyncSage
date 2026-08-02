@@ -42,22 +42,38 @@ spec:
               readOnly: true
             - name: exports
               mountPath: /exports
+          # Probe budgets are sized for a BUSY process, not just a dead one.
+          # SyncSage answers from one Python process: a heavy agentic question
+          # or a large graph walk holds the GIL for stretches, and /health —
+          # which returns a constant dict — still has to wait its turn behind
+          # that work. With the old budget (5s timeout, 3 failures, 30s period)
+          # a genuinely healthy pod under load could be killed after ~90s of
+          # slow replies, taking an in-flight sync with it. That is the probe
+          # interfering with the workload it is supposed to be protecting.
+          #
+          # Liveness therefore only asks "is this process gone", and answers it
+          # slowly: ~5 minutes of no response before a restart. A wedged
+          # process is still caught; a working one is left alone.
           livenessProbe:
             httpGet:
               path: /health
               port: http
             initialDelaySeconds: 20
             periodSeconds: 30
-            timeoutSeconds: 5
-            failureThreshold: 3
+            timeoutSeconds: 10
+            failureThreshold: 10
+          # Readiness gates Service endpoints. On a single-replica deployment
+          # pulling the only pod out mid-question does not shed load, it just
+          # 503s the user who is waiting — so this is forgiving too, and exists
+          # to cover startup rather than to react to saturation.
           readinessProbe:
             httpGet:
               path: /ready
               port: http
             initialDelaySeconds: 10
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 3
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
           resources:
             requests:
               cpu: 100m

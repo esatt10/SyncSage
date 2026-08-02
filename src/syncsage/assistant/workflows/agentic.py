@@ -158,6 +158,17 @@ terms a document answering it would contain.
 real directory, module, file name, symbol or corpus term. If the question \
 names a thing that appears in the vocabulary or symbol list, use that exact \
 spelling.
+- LOCATION IS A SEARCH TERM. Many files share a name — a repository has one \
+README.md per package, an __init__.py per module — so a bare file name cannot \
+identify one of them. When the question is about a specific component, put \
+its directory or package name IN the query beside the file kind: prefer \
+"devui readme" or "packages/devui README" over "devui package overview". \
+Ranking prefers files nearer the root, so a nested file needs its location \
+said out loud to be found; a query that names only the file kind will return \
+the project-wide one.
+- Say the file kind plainly when the question implies one ("readme", \
+"changelog", "pyproject", "test") — it matches the filename directly, which \
+ranks far above a paraphrase of what the file contains.
 - "modes" may include only the modes listed as available. Prefer "vector" \
 when the question is conceptual and "text" when it names an exact \
 identifier, path or symbol.
@@ -173,9 +184,21 @@ Reply with JSON only, no prose:
 {"sufficient": true|false, "missing": "what is absent", "next_query": "a \
 better search query, or empty"}
 
+Each passage is labelled with its file metadata — type, language, size, and \
+the symbols it defines. Use it. The *shape* of the result set is evidence in \
+its own right: passages that all come from documentation when the question \
+needs source, or all from one directory when the question spans several, are \
+a miss even when each one reads plausibly.
+
 Be strict about sufficiency but realistic: if the passages substantially \
 answer the question, say true. Only say false when a specific, nameable \
-piece of information is missing that a different search might find."""
+piece of information is missing that a different search might find — and let \
+"next_query" go after that gap by name (a symbol, a path, a file type).
+
+If the passages are the RIGHT KIND of file from the WRONG PLACE — a README \
+from another package, a test instead of the implementation — that is a \
+location miss, not a content miss. Say false and make "next_query" name the \
+directory or package explicitly alongside the file kind."""
 
 #: Sufficiency means different things for the two intents, and this is where
 #: the replan loop earns its keep: "the right file, with no runnable example
@@ -447,13 +470,25 @@ def grade_node(state: AgentState, ctx: dict) -> dict:
             "grade": {"sufficient": True, "missing": "", "next_query": ""},
         }
 
-    # Grading stays on snippets on purpose: it is a routing decision about
-    # whether to search again, and it runs on every round. Paying to
-    # re-read whole files here would buy a better-argued "yes" for the same
-    # answer, at the cost of the loop the reader is waiting on.
+    # Grading stays on snippets, not whole files: it is a routing decision
+    # about whether to search again, it runs every round, and re-reading
+    # everything here would buy a better-argued "yes" for the same answer at
+    # the cost of the loop the reader is waiting on.
+    #
+    # Metadata is the exception, because it is nearly free and it is most of
+    # what the decision turns on. Eight markdown notes under docs/ in answer
+    # to "how do I call this" is a miss no snippet reveals — the prose reads
+    # fine, it is the *shape* of the result set that is wrong. Handing the
+    # grader paths, types, languages and the symbols each file defines lets it
+    # say so, and name a next query that goes after the code.
+    shapes = ctx["retriever"].metadata([p.node_id for p in passages[:8] if p.node_id])
     evidence = "\n\n".join(
-        f"[{i + 1}] {p.title}\n{p.snippet[:500]}" for i, p in enumerate(passages[:8])
+        f"[{i + 1}] {p.title}{_describe(shapes.get(p.node_id or ''))}\n{p.snippet[:500]}"
+        for i, p in enumerate(passages[:8])
     )
+    if shapes:
+        kinds = sorted({str(meta.get("type") or "?") for meta in shapes.values()})
+        evidence += f"\n\nResult set: {len(passages)} passage(s), file types: {', '.join(kinds)}"
     raw = llm.try_complete(
         GRADER_SYSTEM + GRADER_CRITERIA.get(str(state.get("intent") or ""), ""),
         f"Question: {state['question']}\n\nPassages:\n{evidence}",
@@ -819,6 +854,22 @@ class KnowledgeSummaryWorkflow(AgenticWorkflow):
 
 
 # ------------------------------------------------------------------ helpers
+
+
+def _describe(meta: dict | None) -> str:
+    """One inline clause of file metadata, for the grader's evidence list."""
+    if not meta:
+        return ""
+    bits = [str(meta["type"])] if meta.get("type") else []
+    if meta.get("language"):
+        bits.append(str(meta["language"]))
+    if meta.get("lines"):
+        bits.append(f"{meta['lines']} lines")
+    if meta.get("chunk_count"):
+        bits.append(f"{meta['chunk_count']} chunk(s)")
+    if meta.get("symbols"):
+        bits.append("defines " + ", ".join(meta["symbols"]))
+    return f"  ({' · '.join(bits)})" if bits else ""
 
 
 def _dedupe(values: list[str]) -> list[str]:

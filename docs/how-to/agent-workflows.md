@@ -6,16 +6,17 @@ workflow turns a question into a grounded answer using SyncSage's own search;
 which one runs is configuration, and writing your own is a registration
 rather than a fork.
 
-SyncSage ships two.
+SyncSage ships three.
 
 | Workflow | What it does | Needs |
 |---|---|---|
+| `knowledge-summary` | The agentic graph pinned to summarising: reads more files, less of each, and answers with what things are and how they fit together. Pick it to orient yourself in an unfamiliar corpus. | `pip install 'syncsage[agent]'` |
+| `agentic` | The same [LangGraph](https://langchain-ai.github.io/langgraph/) state graph, reading each question for itself — as a knowledge summary or a procedural how-to — then planning sub-queries, retrieving across every search mode, walking the knowledge graph, grading its own evidence, looping when it is thin, and verifying its citations. | `pip install 'syncsage[agent]'` |
 | `simple` | One retrieval pass, one model call. Predictable and fast. | nothing |
-| `agentic` | A [LangGraph](https://langchain-ai.github.io/langgraph/) state graph that plans sub-queries, retrieves across every search mode, walks the knowledge graph, grades its own evidence, loops when it is thin, and verifies its citations. | `pip install 'syncsage[agent]'` |
 
 ```yaml
 assistant:
-  workflow: auto        # auto | simple | agentic | <your plugin>
+  workflow: auto        # auto | knowledge-summary | agentic | simple | <your plugin>
 ```
 
 `auto` (the default) resolves to `agentic` when the `[agent]` extra is
@@ -32,21 +33,55 @@ reason attached to the answer rather than returning a 500.
 
 ---
 
+## Two answer shapes
+
+"What does this repository do?" and "How do I use this tool?" are not the same
+question with different wording. They want different **evidence** and different
+**output**, and a single prompt trying to serve both lands in the middle and
+serves neither.
+
+| | `knowledge` | `procedural` |
+|---|---|---|
+| The reader wants | to understand what something is and how its parts relate | to *do* something, with steps that run |
+| Evidence | **breadth** — more files, less of each (`max_context_passages: 12`) | **depth** — fewer files read further (`passage_chars: 9000`) |
+| Enough? | you can say what it is and what its parts are for | there is a followable sequence **and** a real example with the actual identifiers. Naming the right file is *not* enough — this is what sends the loop back to `plan` |
+| Answer | direct answer, then components and how they fit, naming real paths | numbered steps, fenced code copied from the passages, never an invented API |
+
+The intent is classified deterministically from the question before any model
+call (so it costs nothing and reads the same offline), and the planner — which
+sees the corpus structure — may overturn it. Either way it appears in the trace
+as the `classify` step and in `counts.intent`, so you can see how a question was
+read before the answer arrives.
+
+```yaml
+assistant:
+  workflow: agentic
+  workflow_options:
+    intent: auto        # auto | knowledge | procedural
+```
+
+`knowledge-summary` is `agentic` with `intent: knowledge` pinned. To pin the
+other direction, set `intent: procedural`.
+
+---
+
 ## The agentic graph
 
 ```
-        ┌──────────────────────────── retry while evidence is thin
-        ▼                                                        │
-START → plan → retrieve → expand → grade ─── sufficient ──→ synthesize → verify → END
+                ┌──────────────────── retry while evidence is thin
+                ▼                                                │
+START → classify → plan → retrieve → expand → grade ─ sufficient ─→ synthesize → verify → END
 ```
 
 | Node | What it does |
 |---|---|
-| `plan` | Asks the model for 2–4 sub-queries and a search mode per query. Model-free or on a parse failure it falls back to the question verbatim — the graph never stalls on a bad plan. |
+| `classify` | Reads the question as a knowledge summary or a procedural how-to. Deterministic, model-free, and runs once — how a question was *asked* does not change because a search came back thin, so the retry edge re-enters at `plan`. |
+| `plan` | Asks the model for 2–4 sub-queries and a search mode per query, given a **structural description of the corpus**: its sources and their types, directory layout, file types and languages, the vocabulary its own documents use, and the symbols its code defines. Queries reusing real paths and identifiers hit the lexical index exactly; generic paraphrases do not. Model-free or on a parse failure it falls back to the question verbatim — the graph never stalls on a bad plan. |
 | `retrieve` | Fans the plan out over `hybrid`, `vector`, `text` and `graph`, merging by passage. Modes the deployment cannot serve (`vector` without embeddings) are dropped, not errored. |
 | `expand` | Walks the knowledge graph out of the best hits, pulling in material lexical search would never surface. This is the step that makes a *graph* worth having. |
-| `grade` | Asks the model whether the evidence answers the question. "No" sends it back to `plan` with what it learned, up to `max_rounds`. |
-| `synthesize` | Writes the answer from the selected passages only, citing `[1]`, `[2]`, … |
+| `grade` | Asks the model whether the evidence answers the question, against the bar for the classified intent. "No" sends it back to `plan` with what it learned, up to `max_rounds`. |
+| `read` | Rebuilds each cited **file** from its chunks — in order, with line spans, headings and artifact metadata. Search scores chunks and the SQL layer caps a preview at 500 characters; answering from those windows is how you get an answer that names exactly the right files and says nothing about them. |
+| `synthesize` | Writes the answer from the selected passages only, in the shape the intent calls for, citing `[1]`, `[2]`, … |
 | `verify` | Drops `[n]` markers that do not resolve to a real passage, so a hallucinated citation cannot reach the UI. |
 
 Every step is recorded. The answer carries a `steps[]` trace (name, detail,
@@ -80,6 +115,7 @@ curl -X POST http://localhost:8765/assistant/chat \
 
 | Option | Default | Effect |
 |---|---|---|
+| `intent` | `auto` | Answer shape: `auto` \| `knowledge` \| `procedural`. Also sets retrieval breadth-vs-depth and the sufficiency bar. |
 | `max_rounds` | `2` | plan → retrieve → grade loops before answering with what it has. |
 | `retrieval_modes` | `["hybrid", "vector"]` | Search modes to fan out over. Unavailable modes are dropped. |
 | `expand_graph` | `true` | Walk the graph out of the best hits. |
@@ -90,6 +126,27 @@ curl -X POST http://localhost:8765/assistant/chat \
 | `grade_evidence` | `true` | Ask the model whether its evidence is sufficient. |
 | `verify_citations` | `true` | Drop `[n]` markers with no matching passage. |
 | `max_facts` | `12` | Graph facts surfaced alongside the answer. |
+
+`intent` sets `max_context_passages`, `per_query_results`, `expand_per_node`
+and `passage_chars` to its profile — but only where you have not set them
+yourself. A key you name in `workflow_options` always wins.
+
+### How much of each file the model sees
+
+Both workflows send whole **files**, rebuilt from their chunks, rather than the
+500-character search preview. How much comes back is decided by what the file
+*is*, from its original on-disk size:
+
+| Option | Default | Effect |
+|---|---|---|
+| `include_full_content` | `true` | Turn off to fall back to chunk previews. Answers get noticeably thinner. |
+| `passage_chars` | `6000` | Prose allowance per file. |
+| `code_passage_chars` | `24000` | Ceiling for code and config, which are **never** excerpted — a module missing its imports is not a smaller answer, it is what makes a model invent one. This exists for a vendored bundle, not for anything a person wrote. |
+| `large_file_bytes` | `40000` | Original size above which prose is cut to the matched chunks and their neighbours instead of read whole. Filling the budget with unrelated chunks of a 400 KB document dilutes the evidence rather than adding to it. |
+| `context_budget_chars` | `60000` | Total across all passages. Files are funded in citation order, so the best hit is never the one that gets starved. |
+
+Excerpts are marked inline (`--- … 6 chunk(s) omitted … ---`) and the answering
+prompt tells the model not to claim an excerpted file contains nothing else.
 
 In the UI these are all under **Workflow** in the chat pane header; a
 selection there applies to your next question only, so you can compare

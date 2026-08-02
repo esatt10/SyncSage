@@ -14,12 +14,21 @@ It covers the full retrieval surface, not just "search":
   and ``POST /search`` make.
 * ``neighbors`` / ``slice`` — typed graph traversal, so a workflow can walk
   from a hit into related material that lexical search never surfaces.
-* ``content`` — full indexed text for a node, for when a preview is not
-  enough to answer.
+* ``documents`` — cited chunks joined back up into the **files** they came
+  from, in order, with line spans, headings and artifact metadata. Search
+  scores chunks; questions are answered by files, and a 500-character chunk
+  preview is how you get an answer that names exactly the right file and
+  says nothing about it.
+* ``metadata`` — the cheap half of that: what the index knows *about* a set
+  of files without reading them, for the grade step deciding whether to
+  search again.
+* ``content`` — full indexed text for a single node.
 * ``facts`` — one-hop subject–predicate–object triples off the graph.
-* ``capabilities`` — what this region can actually do right now (is a
-  vector index built? which sources exist?), so a workflow can *plan*
-  against reality instead of guessing.
+* ``capabilities`` — what this region can do right now *and how it is
+  shaped*: sources and their types, directory layout, languages, the
+  vocabulary its own documents use, the symbols its code defines. A planner
+  handed a row count writes generic queries; one handed the structure writes
+  queries that hit the lexical index exactly.
 
 Every method is read-only and side-effect free.
 """
@@ -108,7 +117,8 @@ class RetrievalStructure:
             )
         if self.content_types:
             lines.append(
-                "File types: " + ", ".join(f"{name} ({count})" for name, count in self.content_types)
+                "File types: "
+                + ", ".join(f"{name} ({count})" for name, count in self.content_types)
             )
         if self.languages:
             lines.append(
@@ -124,8 +134,7 @@ class RetrievalStructure:
             lines.append(f"Traversable edges: {', '.join(TRAVERSABLE_EDGES)}")
         if self.concepts:
             lines.append(
-                "Recurring vocabulary in this corpus (use these words): "
-                + ", ".join(self.concepts)
+                "Recurring vocabulary in this corpus (use these words): " + ", ".join(self.concepts)
             )
         if self.symbols:
             lines.append("Prominent code symbols: " + ", ".join(self.symbols))
@@ -187,11 +196,46 @@ class Document:
 # the pathological vendored bundle, not for anything a human wrote.
 CODE_EXTENSIONS = frozenset(
     {
-        ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb",
-        ".cs", ".cpp", ".cc", ".c", ".h", ".hpp", ".swift", ".kt", ".scala", ".php",
-        ".sh", ".bash", ".ps1", ".sql", ".r", ".m", ".lua", ".pl",
-        ".yaml", ".yml", ".toml", ".json", ".ini", ".cfg", ".env", ".tf",
-        ".dockerfile", ".gradle", ".proto", ".graphql",
+        ".py",
+        ".pyi",
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".java",
+        ".go",
+        ".rs",
+        ".rb",
+        ".cs",
+        ".cpp",
+        ".cc",
+        ".c",
+        ".h",
+        ".hpp",
+        ".swift",
+        ".kt",
+        ".scala",
+        ".php",
+        ".sh",
+        ".bash",
+        ".ps1",
+        ".sql",
+        ".r",
+        ".m",
+        ".lua",
+        ".pl",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".json",
+        ".ini",
+        ".cfg",
+        ".env",
+        ".tf",
+        ".dockerfile",
+        ".gradle",
+        ".proto",
+        ".graphql",
     }
 )
 
@@ -577,6 +621,68 @@ class SyncSageRetriever:
         content = rows[0]["content"] if rows else None
         return str(content)[:max_chars] if content else None
 
+    def metadata(self, node_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """What the index knows *about* these files, without reading them.
+
+        The cheap half of :meth:`documents` — three indexed queries and no
+        chunk text — because it is wanted at a different moment. The grader is
+        deciding whether to search *again*, and the shape of what came back is
+        most of that decision: eight markdown notes under ``docs/`` in answer
+        to "how do I call this" is a miss even when every snippet reads
+        plausibly, and no amount of snippet text says so. Feeding path, type,
+        language, size and the symbols each file defines into the grade step
+        turns that into something it can see and name in ``next_query``.
+        """
+        if self.state is None or not node_ids:
+            return {}
+        wanted = list(dict.fromkeys(node_id for node_id in node_ids if node_id))
+        if not wanted:
+            return {}
+        placeholders = ",".join("?" * len(wanted))
+        params = tuple(wanted)
+        out: dict[str, dict[str, Any]] = {}
+        try:
+            for row in self.state.rows(
+                "SELECT id, relative_path, source_id, type, size_bytes, git_branch "
+                f"FROM artifacts WHERE id IN ({placeholders})",
+                params,
+            ):
+                out[str(row["id"])] = {
+                    "relative_path": row["relative_path"],
+                    "source_id": row["source_id"],
+                    "type": row["type"],
+                    "size_bytes": row["size_bytes"],
+                    "git_branch": row["git_branch"],
+                    "symbols": [],
+                    "language": None,
+                    "chunk_count": 0,
+                    "lines": None,
+                }
+            for row in self.state.rows(
+                "SELECT artifact_id, COUNT(*) AS n, MAX(end_line) AS last_line FROM chunks "
+                f"WHERE artifact_id IN ({placeholders}) GROUP BY artifact_id",
+                params,
+            ):
+                entry = out.get(str(row["artifact_id"]))
+                if entry is not None:
+                    entry["chunk_count"] = int(row["n"])
+                    entry["lines"] = int(row["last_line"]) if row["last_line"] else None
+            for row in self.state.rows(
+                "SELECT artifact_id, name, language FROM symbols "
+                f"WHERE artifact_id IN ({placeholders}) ORDER BY artifact_id, start_line",
+                params,
+            ):
+                entry = out.get(str(row["artifact_id"]))
+                if entry is None:
+                    continue
+                if row["language"] and not entry["language"]:
+                    entry["language"] = str(row["language"])
+                if row["name"] and len(entry["symbols"]) < 8:
+                    entry["symbols"].append(str(row["name"]))
+        except Exception:  # pragma: no cover - context is a bonus, never a blocker
+            return out
+        return out
+
     def documents(
         self,
         node_ids: list[str],
@@ -816,15 +922,18 @@ class SyncSageRetriever:
                 "GROUP BY dir ORDER BY n DESC LIMIT 12"
             ),
             node_types=dict(node_counts or {}),
-            # Straight off the covering index added with the concept-pruning
-            # work (node_type, node_id, artifact_id): the terms this corpus
-            # actually uses, ranked by how many documents use them.
+            # The terms this corpus actually uses, ranked by how many
+            # documents use them. Grouped by `term` (the readable label) and
+            # not by `node_id`, which would be fully covered by the
+            # (node_type, node_id, artifact_id) index but hands the planner
+            # slugs to search with; the filter still rides that index's
+            # leading column, and the result is cached per sync.
             concepts=[
                 label
                 for label, _ in aggregate(
-                    "SELECT node_id, COUNT(DISTINCT artifact_id) AS n FROM artifact_terms "
-                    "WHERE node_type = 'concept' GROUP BY node_id "
-                    "ORDER BY n DESC, node_id LIMIT 24"
+                    "SELECT term, COUNT(DISTINCT artifact_id) AS n FROM artifact_terms "
+                    "WHERE node_type = 'concept' GROUP BY term "
+                    "ORDER BY n DESC, term LIMIT 24"
                 )
             ],
             symbols=[
