@@ -81,7 +81,7 @@ what is available:
 curl -s https://api.openai.com/v1/models   -H "Authorization: Bearer $OPENAI_API_KEY" | grep -o '"id": "gpt-5[^"]*"'
 ```
 
-The demo ships `gpt-5.4-nano`. Swap it in the config, or override per browser
+The demo ships `gpt-5.6-luna`. Swap it in the config, or override per browser
 session from the UI's "Connect model" dialog without touching the config.
 
 ## Notes

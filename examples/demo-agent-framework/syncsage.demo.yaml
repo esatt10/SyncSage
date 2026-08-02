@@ -131,7 +131,7 @@ security:
   deny_path_traversal: true
   default_exclude_secrets: true
 
-# --- RESULT SUMMATION: nano-tier chat model, agentic loop -----------------
+# --- RESULT SUMMATION: chat model + agentic loop --------------------------
 assistant:
   enabled: true
   provider: openai
@@ -140,7 +140,7 @@ assistant:
   #     -H "Authorization: Bearer $OPENAI_API_KEY" | grep -o '"id": "gpt-5[^"]*"'
   # A model the account cannot see fails with a 404 model_not_found, which the
   # chat surface reports verbatim rather than silently substituting one.
-  model: gpt-5.4-nano
+  model: gpt-5.6-luna
   base_url: https://api.openai.com/v1
   api_key_env: OPENAI_API_KEY
   # A browser user can still paste their own key for their session; it stays
