@@ -52,9 +52,7 @@ def _build_two_source_workspace(tmp_path: Path) -> SyncEngine:
     code = tmp_path / "ws" / "code"
     code.mkdir(parents=True)
     (code / "app.py").write_text(
-        "import shared.helpers\n\n"
-        "def run() -> None:\n"
-        "    shared.helpers.go()\n",
+        "import shared.helpers\n\ndef run() -> None:\n    shared.helpers.go()\n",
         encoding="utf-8",
     )
     (code / "guide.md").write_text(
@@ -163,9 +161,7 @@ def test_no_cross_source_edge_for_same_source_resolution(tmp_path: Path) -> None
     (code / "pkg" / "core.py").write_text("def f():\n    return 1\n", encoding="utf-8")
     (code / "main.py").write_text("import pkg.core\n", encoding="utf-8")
 
-    engine = _make_engine(
-        tmp_path, [{"name": "pkg", "type": "repository", "path": str(code)}]
-    )
+    engine = _make_engine(tmp_path, [{"name": "pkg", "type": "repository", "path": str(code)}])
     engine.sync_source("pkg", "full")
 
     assert not any(e.get("cross_source") for e in _edges(engine))
@@ -205,3 +201,81 @@ def test_normalize_concept_collapses_plurals() -> None:
     )
 
 
+def test_imports_resolve_to_files_inside_the_same_source() -> None:
+    """The connectivity the graph existed for, and did not have.
+
+    Per-artifact enrichment emits `imports` edges to an *external_reference*
+    node named after the module. Nothing turned those into a link to the file
+    that module actually is unless the target happened to live in a different
+    source — so a single-source knowledge base, which is the common case, had
+    zero file->file import edges. On the 2,132-file demo corpus that was 1,871
+    `imports` edges every one of which ended at a name.
+    """
+    from syncsage.graph.enrichment import resolve_cross_source_edges
+
+    nodes = [
+        (
+            "file:repo:pkg/runner.py",
+            {"type": "file", "relative_path": "pkg/runner.py", "source_id": "repo"},
+        ),
+        (
+            "file:repo:pkg/checkpoint.py",
+            {"type": "file", "relative_path": "pkg/checkpoint.py", "source_id": "repo"},
+        ),
+        (
+            "external:repo:pkg.checkpoint",
+            {
+                "type": "external_reference",
+                "reference": "pkg.checkpoint",
+                "source_id": "repo",
+            },
+        ),
+    ]
+    edges = [
+        ("file:repo:pkg/runner.py", "external:repo:pkg.checkpoint", "imports", "python_import")
+    ]
+
+    resolved = resolve_cross_source_edges(nodes, edges)
+
+    assert len(resolved) == 1
+    edge = resolved[0]
+    assert edge.source == "file:repo:pkg/runner.py"
+    assert edge.target == "file:repo:pkg/checkpoint.py"
+    assert edge.type == "imports"
+    # Same-source resolution is labelled distinctly, so the 21.6B cross-source
+    # feature stays observable and its own tests keep meaning what they said.
+    assert edge.attrs["cross_source"] is False
+    assert edge.attrs["enrichment_pass"] == "internal_resolution"
+
+
+def test_internal_resolution_is_idempotent_and_skips_self_imports() -> None:
+    from syncsage.graph.enrichment import resolve_cross_source_edges
+
+    nodes = [
+        (
+            "file:repo:pkg/mod.py",
+            {"type": "file", "relative_path": "pkg/mod.py", "source_id": "repo"},
+        ),
+        (
+            "external:repo:pkg.mod",
+            {"type": "external_reference", "reference": "pkg.mod", "source_id": "repo"},
+        ),
+    ]
+    # A module importing itself (re-export shims do this) must not self-loop.
+    edges = [("file:repo:pkg/mod.py", "external:repo:pkg.mod", "imports", "python_import")]
+    assert resolve_cross_source_edges(nodes, edges) == []
+
+    # And running twice yields the same edges, not duplicates.
+    nodes.append(
+        (
+            "file:repo:pkg/other.py",
+            {"type": "file", "relative_path": "pkg/other.py", "source_id": "repo"},
+        )
+    )
+    edges.append(("file:repo:pkg/other.py", "external:repo:pkg.mod", "imports", "python_import"))
+    first = resolve_cross_source_edges(nodes, edges)
+    second = resolve_cross_source_edges(nodes, edges)
+    assert len(first) == 1
+    assert [(e.source, e.target, e.type) for e in first] == [
+        (e.source, e.target, e.type) for e in second
+    ]

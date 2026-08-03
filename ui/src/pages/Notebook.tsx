@@ -228,6 +228,8 @@ export function Notebook() {
                     state.showAll ||
                     state.depth !== DEFAULT_DEPTH
                   }
+                  layout={state.layout}
+                  onLayout={(layout) => dispatch({ type: "set-layout", layout })}
                   onDepth={(depth) => dispatch({ type: "set-depth", depth })}
                   onShowAll={(value) => dispatch({ type: "show-all", value })}
                   onClearAnswerFilter={() => dispatch({ type: "clear-answer-filter" })}
@@ -250,7 +252,7 @@ export function Notebook() {
                   selectedId={state.selectedId}
                   focusIds={state.focusIds}
                   citedIds={citedIds}
-                  layoutName="auto"
+                  layoutName={state.layout}
                   spacing={1}
                   shapeAlgorithm="node_type"
                   onSelect={(id) => {

@@ -1,4 +1,5 @@
-import { MAX_DEPTH, MIN_DEPTH } from "../state/session";
+import { GRAPH_LAYOUTS, MAX_DEPTH, MIN_DEPTH } from "../state/session";
+import type { GraphLayout } from "../state/session";
 import type { HorizonMode } from "./useHorizonGraph";
 
 interface HorizonControlsProps {
@@ -10,6 +11,8 @@ interface HorizonControlsProps {
   busy: boolean;
   /** Anything the user has narrowed to: a selection, a center, an answer. */
   dirty: boolean;
+  layout: GraphLayout;
+  onLayout: (layout: GraphLayout) => void;
   onDepth: (depth: number) => void;
   onShowAll: (value: boolean) => void;
   onClearAnswerFilter: () => void;
@@ -25,6 +28,8 @@ interface HorizonControlsProps {
 export function HorizonControls({
   mode,
   depth,
+  layout,
+  onLayout,
   centerLabel,
   surfacedCount,
   nodeCount,
@@ -98,6 +103,20 @@ export function HorizonControls({
             </button>
           </>
         )}
+        <select
+          className="btn btn--small"
+          value={layout}
+          onChange={(event) => onLayout(event.target.value as GraphLayout)}
+          disabled={busy}
+          title="How the canvas arranges nodes"
+          aria-label="Graph layout"
+        >
+          {GRAPH_LAYOUTS.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
       </div>
 
       {bounded && centerLabel ? (

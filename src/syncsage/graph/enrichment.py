@@ -124,8 +124,7 @@ class ArtifactEnrichmentPass(Protocol):
         kb_id: str,
         source: SourceConfig,
         artifact: ParsedArtifact,
-    ) -> ArtifactEnrichment:
-        ...
+    ) -> ArtifactEnrichment: ...
 
 
 class CodeEnrichmentPass:
@@ -371,10 +370,22 @@ def resolve_cross_source_edges(
         for target in targets:
             if target.node_id == artifact_id:
                 continue
-            if target.source_id == source_id:
-                # Same source: existing intra-source enrichment already covers
-                # it; cross-source resolution intentionally only links across.
-                continue
+            # Same-source targets are resolved too. This used to `continue`
+            # here on the belief that "intra-source enrichment already covers
+            # it" — it does not. Per-artifact enrichment emits `imports` edges
+            # to an *external_reference* node named after the module, and
+            # nothing ever turned those into a link to the file that module
+            # actually is. So a single-source knowledge base (the common case)
+            # had ZERO file->file import edges: on a 2,132-file repository the
+            # graph carried 1,871 `imports` edges and every one of them ended
+            # at a name rather than at a document.
+            #
+            # That is the connectivity a reader wants — "_checkpoint.py
+            # imports _runner.py" — and it is what the graph-facts panel and
+            # the agent's graph walk had nothing better to offer than concept
+            # co-occurrence. Resolution is the same deterministic longest-
+            # suffix path match used across sources, so it costs one flag.
+            same_source = target.source_id == source_id
             key = (artifact_id, target.node_id, edge_type)
             if key in seen:
                 continue
@@ -389,8 +400,10 @@ def resolve_cross_source_edges(
                         "target_source_id": target.source_id,
                         "reference": reference,
                         "reference_type": reference_type,
-                        "cross_source": True,
-                        "enrichment_pass": "cross_source_resolution",
+                        "cross_source": not same_source,
+                        "enrichment_pass": (
+                            "internal_resolution" if same_source else "cross_source_resolution"
+                        ),
                     },
                 )
             )
@@ -671,10 +684,7 @@ def _concept_candidates(text: str, relative_path: str) -> set[str]:
     # "system" both increment one bucket) and collapse to one node.
     tokens = [_normalize_concept(token) for token in _split_identifier(Path(relative_path).stem)]
     normalized_tokens = [token for token in tokens if token and token not in STOPWORDS]
-    words = [
-        _normalize_concept(match)
-        for match in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text)
-    ]
+    words = [_normalize_concept(match) for match in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text)]
     words = [word for word in words if word and word not in STOPWORDS]
     counts = Counter(words)
     concepts = set(normalized_tokens)
