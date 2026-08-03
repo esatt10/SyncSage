@@ -215,11 +215,11 @@ syncsage.yaml
 syncsage.local.yaml
 syncsage.*.local.yaml
 .vscode/mcp.json
-.syncsage/
-workspace/
-state/
-vault/
-exports/
+/.syncsage/
+/workspace/
+/state/
+/vault/
+/exports/
 
 # Marimo
 marimo/_static/
