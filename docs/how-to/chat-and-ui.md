@@ -24,7 +24,7 @@ Every answer goes through the same four steps, and all four are inspectable:
    answer shows them all; the ones the answer actually used are at full
    strength, retrieved-but-unused ones are dimmed.
 3. **Surface facts** — one hop out from each cited passage into the
-   concept/entity/symbol layer of the graph, rendered as
+   entity/symbol/document layer of the graph, rendered as
    subject–predicate–object triples in the **Facts** tab. Facts are
    collected round-robin across the cited sources, so a well-connected
    document cannot crowd out the rest.
@@ -97,16 +97,28 @@ the environment variable instead.
 
 ## Reading the graph
 
-The graph panel is deliberately quiet by default. A real index produces far
-more `concept` nodes than anything else — often 80% of the graph — so
-`concept` and `chunk` are **hidden by default**. The legend at the bottom is
-also the filter: click any type to show or hide it.
+The graph panel is deliberately quiet by default. `chunk` nodes are **hidden
+by default** — there is one per passage and they add volume, not structure.
+The legend at the bottom is also the filter: click any type to show or hide it.
+
+(`concept` nodes used to be hidden here too, and were ~87% of a real graph.
+Concept extraction was retired on 2026-08-03 — see `docs/graph_model.md` — so
+the graph is now roughly a seventh of its former size and what remains is
+structure worth drawing.)
 
 - **Colour** encodes node type; **shape** is a small vocabulary (rounded
   rectangles are containers, rectangles are documents, circles are ideas,
   diamonds are code symbols) so the canvas reads as structure rather than
   decoration.
 - **Size** grows with connectivity, so hubs stand out without a second legend.
+- **Layout** is switchable from the canvas controls. `Kamada-Kawai` runs ELK's
+  stress majorization — edge length tracks graph distance, so clusters
+  separate and long paths read as long. It costs more than the default force
+  layout, which is why it is a choice rather than the default.
+- **Clicking empty canvas deselects** without resetting your depth, centre or
+  answer filter. A selected node also shows **all** of its links, even ones
+  whose far end sits outside the current depth horizon — the horizon is a
+  drawing budget, not a claim about what a node connects to.
 - Asking a question **outlines the cited nodes** and fades the rest to
   context strength.
 - Selecting a source in the left rail scopes both retrieval and the graph to
