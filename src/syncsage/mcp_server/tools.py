@@ -29,7 +29,11 @@ class SyncSageTools:
         self.state = StateStore(self.paths.sqlite)
         self.state.migrate()
         self.engine = SyncEngine(config, self.paths, self.state)
-        self.searcher = HybridSearch(SearchStore(self.state), vector=self.engine.vector_searcher())
+        self.searcher = HybridSearch(
+            SearchStore(self.state),
+            vector=self.engine.vector_searcher(),
+            node_index=self.engine.node_index,
+        )
 
     def list_knowledge_bases(self) -> dict:
         return {"knowledge_bases": KnowledgeBaseRegistry(self.state).list()}
@@ -470,7 +474,7 @@ class SyncSageTools:
                         "depth": next_depth,
                         "edge_types": edge_type_values,
                         "path": [*path, target],
-                        "node": dict(graph.nodes[target]),
+                        "node": dict(graph.nodes.get(target, {})),
                     }
                 )
                 if target not in visited:
@@ -506,9 +510,10 @@ class SyncSageTools:
     def explain_node(self, knowledge_base: str, node_id: str) -> dict:
         self._require_knowledge_base(knowledge_base)
         graph = self.engine.graph_builder.graph
-        if node_id not in graph:
+        attrs = graph.nodes.get(node_id)
+        if attrs is None:
             return {"node_id": node_id, "explanation": "Node is not present in the current graph."}
-        node = dict(graph.nodes[node_id])
+        node = dict(attrs)
         return {
             "node_id": node_id,
             "type": node.get("type"),
@@ -597,7 +602,9 @@ class SyncSageTools:
         return {
             "node_id": node_id,
             "depth": depth,
-            "nodes": [dict(graph.nodes[item]) for item in node_ids if item in graph],
+            "nodes": [
+                dict(attrs) for attrs in (graph.nodes.get(item) for item in node_ids) if attrs
+            ],
             "links": links,
         }
 

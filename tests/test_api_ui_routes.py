@@ -236,6 +236,74 @@ def test_pure_graph_helpers_traverse_typed_edges() -> None:
     assert len(sliced["links"]) == 2
 
 
+def test_bounded_traversal_matches_the_unbounded_prefix() -> None:
+    """``max_nodes`` may only stop the walk early — never change what is kept.
+
+    A hub three hops out reaches most of a real graph, so the traversal has to
+    stop at the caller's budget instead of enumerating everything and slicing
+    afterwards. The kept set must stay byte-identical to the old behaviour.
+    """
+
+    graph = SimpleMultiDiGraph()
+    graph.add_node("hub", id="hub", type="source", label="hub")
+    for i in range(60):
+        graph.add_node(f"f{i}", id=f"f{i}", type="file", label=f"f{i}")
+        graph.add_edge("hub", f"f{i}", type="contains")
+        graph.add_node(f"s{i}", id=f"s{i}", type="symbol", label=f"s{i}")
+        graph.add_edge(f"f{i}", f"s{i}", type="mentions")
+
+    full = graph_neighbors(graph, "hub", depth=3)
+    capped = graph_neighbors(graph, "hub", depth=3, max_nodes=25)
+    assert len(capped["neighbors"]) == 25
+    assert capped["neighbors"] == full["neighbors"][:25]
+
+
+def test_adjacency_index_survives_removals() -> None:
+    """out_edges/neighbors read an index, which must track every mutation."""
+
+    graph = SimpleMultiDiGraph()
+    for node_id in ("a", "b", "c"):
+        graph.add_node(node_id, id=node_id, type="file", label=node_id)
+    graph.add_edge("a", "b", type="contains")
+    graph.add_edge("a", "c", type="references")
+
+    assert graph.neighbors("a") == ["b", "c"]  # insertion order, deterministic
+    assert {t for _s, t, _m in graph.out_edges("a")} == {"b", "c"}
+
+    graph.remove_edges_from([("a", "b")])
+    assert graph.neighbors("a") == ["c"]
+
+    graph.remove_nodes_from(["c"])
+    assert graph.neighbors("a") == []
+    assert graph.out_edges("a") == []
+
+    # Re-adding relinks: the index is rebuilt through the normal write path.
+    graph.add_node("c", id="c", type="file", label="c")
+    graph.add_edge("a", "c", type="references")
+    assert graph.neighbors("a") == ["c"]
+
+
+def test_graph_slice_reports_hop_distance_per_node() -> None:
+    """The canvas rings nodes by distance, so a slice carries its own depths."""
+
+    graph = SimpleMultiDiGraph()
+    for node_id in ("center", "one", "two", "three"):
+        graph.add_node(node_id, id=node_id, type="file", label=node_id)
+    graph.add_edge("center", "one", type="contains")
+    graph.add_edge("one", "two", type="references")
+    graph.add_edge("two", "three", type="references")
+    # A shortcut edge: "three" is reachable in one hop as well as three, and the
+    # nearest sighting is the one that decides which ring it lands in.
+    graph.add_edge("center", "three", type="references")
+
+    sliced = graph_slice(graph, "center", depth=3)
+    assert sliced["depths"] == {"center": 0, "one": 1, "two": 2, "three": 1}
+
+    shallow = graph_slice(graph, "center", depth=1)
+    assert shallow["depths"] == {"center": 0, "one": 1, "three": 1}
+    assert "two" not in shallow["depths"]
+
+
 def test_node_content_concatenates_chunks_in_index_order(loaded_config) -> None:
     """GROUP_CONCAT must respect chunk_index even when rows were written out of order."""
     app = create_app(config=loaded_config)
@@ -356,3 +424,49 @@ def test_bundle_is_mounted_and_reported_only_when_it_exists(
     assert disabled.state.ui_dist is None
     _report_ui(disabled, loaded_config)
     assert capsys.readouterr().out == ""
+
+
+def test_hierarchy_survives_a_bounded_horizon() -> None:
+    """A shortcut edge must not crowd the directory tree out of the view.
+
+    A source indexes every artifact directly, so a plain breadth-first walk
+    with a budget spends all of it hopping source→file and never descends the
+    directory chain — the parent/child structure is in the graph but absent
+    from every bounded view of it.
+    """
+
+    graph = SimpleMultiDiGraph()
+    graph.add_node("kb", id="kb", type="knowledge_base", label="kb")
+    graph.add_node("src", id="src", type="source", label="src")
+    graph.add_edge("kb", "src", type="contains")
+
+    # One deep directory chain, plus a wide flat fan-out of indexed files.
+    parent = "src"
+    for level in range(1, 5):
+        directory = f"dir:{level}"
+        graph.add_node(directory, id=directory, type="directory", label=directory)
+        graph.add_edge(parent, directory, type="contains")
+        parent = directory
+    deep_file = "file:deep.py"
+    graph.add_node(deep_file, id=deep_file, type="file", label="deep.py")
+    graph.add_edge(parent, deep_file, type="contains")
+
+    for i in range(200):
+        flat = f"file:flat{i}.py"
+        graph.add_node(flat, id=flat, type="file", label=f"flat{i}.py")
+        graph.add_edge("src", flat, type="indexes")
+
+    budget = 20
+    plain = graph_slice(graph, "kb", depth=6, limit=budget)
+    plain_types = {node["id"]: node.get("type") for node in plain["nodes"]}
+    assert sum(1 for t in plain_types.values() if t == "directory") >= 1
+
+    without_shortcut = graph_slice(
+        graph, "kb", depth=6, limit=budget, exclude_edge_types={"indexes"}
+    )
+    ids = {node["id"] for node in without_shortcut["nodes"]}
+    # The whole chain, and the file at the bottom of it, fit in the budget once
+    # the shortcut is out of the way.
+    assert {"dir:1", "dir:2", "dir:3", "dir:4", deep_file} <= ids
+    assert not any(node_id.startswith("file:flat") for node_id in ids)
+    assert without_shortcut["depths"][deep_file] == 6

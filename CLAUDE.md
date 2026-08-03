@@ -374,6 +374,42 @@ Suite: **183 passed** (+19). Steps 31.2–31.6 (Notion/GDrive/Slack/
 Confluence/IMAP) build on this, one per session; contracts in the SR
 repo's `docs/PRODUCT_FRAMEWORK.md` §3.
 
+**Retrieval + graph overhaul landed 2026-08-03.** Driven by a concrete
+failure: asking the demo corpus to "locate readme" returned Python source
+while the repository's own `README.md` sat at rank 125.
+
+*Ranking* (`search/sqlite_store.py`, `search/hybrid.py`): query expansion now
+drops framing stopwords (a rare verb like "locate" — 15 chunks — outscored
+"readme" — 724 — because BM25 weights by rarity); `chunks_fts.title` holds the
+**basename** instead of a second copy of `path`, with BM25 column weights
+`8/3/2/1`; structural priors divide the score by path depth and by
+tests/samples membership; and hybrid merges by **Reciprocal Rank Fusion**
+instead of raw score — the three arms scored on incomparable scales (text
+0.86-0.92, vector 0.667-0.674, graph a flat 0.60), so hybrid had silently
+degraded to text-only while paying for all three. Measured MRR 0.230 → 0.594
+on the live 2,132-file corpus. One-shot idempotent FTS rebuild in
+`StateStore._migrate_fts_titles` — no re-index needed.
+
+*Concept extraction retired* (`graph.enrichment._add_concept`, now a no-op
+with the measurements in its docstring). It was 87.2% of nodes and 98.6% of
+edges and failed every test: the retrieval expansion path never fired, the
+facts panel filled with "limit"/"request info", and `similar_to` emitted zero
+edges. Result: sync 1.5h → **2m53s**, graph 915 MB → 2.3 MB, DB 1.4 GB → 321 MB.
+The Synapse contract's vocabulary moved to `fts5vocab` with the **wire format
+unchanged** — see the 2026-08-03 decision note in `docs/SYNAPSE_INTEGRATION.md`.
+
+*Internal reference resolution*: `resolve_cross_source_edges` no longer skips
+same-source targets, so imports/links resolve to the **file** they name
+(2,903 edges on the demo corpus). This is the file→file connectivity the graph
+advertised and never had.
+
+*Assistant*: answers are built from whole files reassembled from their chunks
+with metadata (`retrieval.documents`), not 500-char previews; questions are
+classified `knowledge` vs `procedural` and drive retrieval breadth-vs-depth,
+the sufficiency bar and the answering prompt; workflows are
+`knowledge-summary | agentic | simple`. Nested `workflow_options` (documented
+and previously ignored outright) now works.
+
 Full step contracts with acceptance criteria: `docs/SYNAPSE_INTEGRATION.md` §2.
 
 | Step | What | Fixes | Status |

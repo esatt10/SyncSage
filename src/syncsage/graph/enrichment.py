@@ -124,8 +124,7 @@ class ArtifactEnrichmentPass(Protocol):
         kb_id: str,
         source: SourceConfig,
         artifact: ParsedArtifact,
-    ) -> ArtifactEnrichment:
-        ...
+    ) -> ArtifactEnrichment: ...
 
 
 class CodeEnrichmentPass:
@@ -229,7 +228,7 @@ class MarkdownDocumentEnrichmentPass:
                 "references",
                 ref_type,
             )
-        for citation in re.findall(r"\[@?([A-Za-z0-9_.:-]+)\]", text):
+        for citation in _citation_candidates(text):
             _add_external_reference(
                 enrichment,
                 kb_id,
@@ -250,16 +249,54 @@ class SemanticSimilarityPass:
     def run(
         self,
         artifacts: list[tuple[str, dict[str, Any]]],
+        changed_ids: set[str] | None = None,
     ) -> list[EnrichmentEdge]:
-        edges: list[EnrichmentEdge] = []
-        for index, (left_id, left) in enumerate(artifacts):
-            left_terms = set(left.get("concept_terms") or [])
-            if len(left_terms) < 2:
+        """Similarity edges between artifacts that share concept terms.
+
+        Candidates come from an inverted term index rather than every pair.
+        Two artifacts with no term in common score exactly zero and are
+        dropped by the threshold below, so indexing the terms produces the
+        *same* edges as the old all-pairs walk — it just skips the pairs whose
+        answer was never in doubt. That matters: all-pairs is quadratic, and at
+        a few thousand artifacts it was the single most expensive thing a sync
+        did, re-run in full on every pass.
+
+        ``changed_ids`` narrows the walk further, to pairs where at least one
+        side was touched this sync. Untouched pairs already have their edges in
+        the graph and re-deriving them is pure waste.
+        """
+
+        terms_by_id: dict[str, set[str]] = {}
+        postings: dict[str, list[str]] = {}
+        for node_id, attrs in artifacts:
+            terms = set(attrs.get("concept_terms") or [])
+            if len(terms) < 2:
                 continue
-            for right_id, right in artifacts[index + 1:]:
-                right_terms = set(right.get("concept_terms") or [])
-                if len(right_terms) < 2:
+            terms_by_id[node_id] = terms
+            for term in terms:
+                postings.setdefault(term, []).append(node_id)
+
+        edges: list[EnrichmentEdge] = []
+        seen: set[tuple[str, str]] = set()
+        walk = (
+            [node_id for node_id in terms_by_id if node_id in changed_ids]
+            if changed_ids is not None
+            else list(terms_by_id)
+        )
+        for left_id in walk:
+            left_terms = terms_by_id[left_id]
+            candidates = {
+                candidate
+                for term in left_terms
+                for candidate in postings.get(term, ())
+                if candidate != left_id
+            }
+            for right_id in candidates:
+                pair = (left_id, right_id) if left_id < right_id else (right_id, left_id)
+                if pair in seen:
                     continue
+                seen.add(pair)
+                right_terms = terms_by_id[right_id]
                 shared = left_terms & right_terms
                 union = left_terms | right_terms
                 score = len(shared) / len(union)
@@ -270,8 +307,8 @@ class SemanticSimilarityPass:
                     "shared_concepts": sorted(shared)[:12],
                     "enrichment_pass": self.name,
                 }
-                edges.append(EnrichmentEdge(left_id, right_id, "similar_to", attrs))
-                edges.append(EnrichmentEdge(right_id, left_id, "similar_to", attrs))
+                edges.append(EnrichmentEdge(pair[0], pair[1], "similar_to", attrs))
+                edges.append(EnrichmentEdge(pair[1], pair[0], "similar_to", attrs))
         return edges
 
 
@@ -333,10 +370,22 @@ def resolve_cross_source_edges(
         for target in targets:
             if target.node_id == artifact_id:
                 continue
-            if target.source_id == source_id:
-                # Same source: existing intra-source enrichment already covers
-                # it; cross-source resolution intentionally only links across.
-                continue
+            # Same-source targets are resolved too. This used to `continue`
+            # here on the belief that "intra-source enrichment already covers
+            # it" — it does not. Per-artifact enrichment emits `imports` edges
+            # to an *external_reference* node named after the module, and
+            # nothing ever turned those into a link to the file that module
+            # actually is. So a single-source knowledge base (the common case)
+            # had ZERO file->file import edges: on a 2,132-file repository the
+            # graph carried 1,871 `imports` edges and every one of them ended
+            # at a name rather than at a document.
+            #
+            # That is the connectivity a reader wants — "_checkpoint.py
+            # imports _runner.py" — and it is what the graph-facts panel and
+            # the agent's graph walk had nothing better to offer than concept
+            # co-occurrence. Resolution is the same deterministic longest-
+            # suffix path match used across sources, so it costs one flag.
+            same_source = target.source_id == source_id
             key = (artifact_id, target.node_id, edge_type)
             if key in seen:
                 continue
@@ -351,8 +400,10 @@ def resolve_cross_source_edges(
                         "target_source_id": target.source_id,
                         "reference": reference,
                         "reference_type": reference_type,
-                        "cross_source": True,
-                        "enrichment_pass": "cross_source_resolution",
+                        "cross_source": not same_source,
+                        "enrichment_pass": (
+                            "internal_resolution" if same_source else "cross_source_resolution"
+                        ),
                     },
                 )
             )
@@ -443,10 +494,11 @@ def _base_concepts(
     artifact: ParsedArtifact,
     text: str,
 ) -> ArtifactEnrichment:
-    enrichment = ArtifactEnrichment()
-    for concept in _concept_candidates(text, artifact.relative_path):
-        _add_concept(enrichment, kb_id, source, artifact, concept, 1.0)
-    return enrichment
+    # Short-circuited with `_add_concept` (see its docstring for the
+    # measurements). Returning early also skips `_concept_candidates`, which
+    # tokenized and counted every word of every artifact on every sync — real
+    # CPU spent producing rows nothing read.
+    return ArtifactEnrichment()
 
 
 def _add_symbol(
@@ -572,23 +624,31 @@ def _add_concept(
     concept: str,
     weight: float,
 ) -> None:
-    normalized = _normalize_concept(concept)
-    if not normalized:
-        return
-    node_id = _node_id("concept", kb_id, source.name, normalized)
-    attrs = {
-        "source_id": source.name,
-        "enrichment_pass": "concept_extraction",
-    }
-    enrichment.nodes.append(EnrichmentNode(node_id, "concept", normalized, attrs))
-    enrichment.edges.append(
-        EnrichmentEdge(artifact.id, node_id, "mentions", {"source_id": source.name})
-    )
-    enrichment.edges.append(
-        EnrichmentEdge(node_id, artifact.id, "derived_from", {"source_id": source.name})
-    )
-    enrichment.terms.append(_term(artifact, node_id, "concept", normalized, weight))
-    enrichment.concept_terms.add(normalized)
+    """Retired. Concept extraction produced nothing any surface could use.
+
+    Kept as a no-op rather than deleted so the call sites above still read as
+    the passes they are, and so re-enabling is a one-function change if a
+    corpus ever turns up where this pays off. On the corpus it was measured
+    against (2,132 files, microsoft/agent-framework) it did not:
+
+    * **Retrieval** — the concept-term expansion in ``SearchStore.search``
+      only ran when FTS returned fewer than ``max_results``. Every real query
+      matched hundreds to thousands of chunks, so it never fired once.
+    * **Graph facts** — concepts were 87.2% of nodes and ``mentions`` +
+      ``derived_from`` 98.6% of edges, so the facts panel filled all twelve
+      slots with "this file mentions <term>" every time. The terms were
+      "request info", "limit", "false policy" — and "request information"
+      alongside "request info", which the normalizer failed to merge.
+    * **Similarity** — ``_similarity_edges`` keys off ``concept_terms``, and
+      the live graph contained **zero** ``similar_to`` edges. It produced
+      nothing at all.
+
+    The cost was 141,529 nodes, ~1.53M edges and 1.27M ``artifact_terms``
+    rows, which is graph memory, traversal budget and sync time spent
+    connecting nothing. Structure that a reader can act on — imports, calls,
+    references — was 0.57% of edges and permanently crowded out.
+    """
+    return
 
 
 def _add_entity(
@@ -624,10 +684,7 @@ def _concept_candidates(text: str, relative_path: str) -> set[str]:
     # "system" both increment one bucket) and collapse to one node.
     tokens = [_normalize_concept(token) for token in _split_identifier(Path(relative_path).stem)]
     normalized_tokens = [token for token in tokens if token and token not in STOPWORDS]
-    words = [
-        _normalize_concept(match)
-        for match in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text)
-    ]
+    words = [_normalize_concept(match) for match in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text)]
     words = [word for word in words if word and word not in STOPWORDS]
     counts = Counter(words)
     concepts = set(normalized_tokens)
@@ -651,6 +708,42 @@ def _entity_candidates(text: str) -> set[str]:
     candidates = set(re.findall(r"\b[A-Z][A-Za-z0-9]+(?:[A-Z][A-Za-z0-9]+)+\b", text))
     candidates.update(re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b", text))
     return candidates
+
+
+# Bracketed things in Markdown that are not citations. `[x]` and `[ ]` are
+# task-list checkboxes; `[Unreleased]`, `[X.Y.Z]` and bare version labels are
+# changelog headings and reference-link definitions. The old pattern captured
+# all of them as external references, which put "x", "provider" and
+# "Unreleased" into the graph — and, once artifact facts started surfacing,
+# straight into the facts panel as things a document "references".
+_CITATION_RE = re.compile(r"\[@?([A-Za-z0-9_.:-]+)\]")
+_CITATION_NOISE = frozenset(
+    {"x", "X", "ok", "tbd", "todo", "na", "n/a", "unreleased", "yes", "no", "y", "n"}
+)
+_VERSION_PLACEHOLDER_RE = re.compile(r"^[vV]?[\dxXyYzZ]+([._-][\dxXyYzZ]+)*$")
+
+
+def _citation_candidates(text: str) -> list[str]:
+    """Bracketed citation labels worth recording, in document order.
+
+    Deterministic and rule-based (rule 1): a fixed stoplist plus two shape
+    tests, no NLP and no sampling, so the same document always yields the
+    same references.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _CITATION_RE.findall(text):
+        label = match.strip()
+        lowered = label.lower()
+        if len(label) < 3 or lowered in _CITATION_NOISE:
+            continue
+        if _VERSION_PLACEHOLDER_RE.match(label):
+            continue
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        out.append(label)
+    return out
 
 
 def _markdown_links(text: str) -> set[str]:

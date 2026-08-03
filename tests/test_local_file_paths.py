@@ -14,7 +14,10 @@ directly in the subdirectory of the container":
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import pytest
 
 from syncsage.api.app import _configured_roots
 from syncsage.config.schema import SyncSageConfig
@@ -86,6 +89,10 @@ def test_resolve_under_rejection_is_actionable() -> None:
         raise AssertionError("resolve_under accepted a path outside the allowlist")
 
 
+# `allow_workspace_roots` holds *container* paths, which are POSIX by
+# definition (SyncSage runs in Docker). On Windows Path("/data") correctly
+# resolves to C:/data, so it is the assertion that is POSIX-only, not the code.
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only; see comment above.")
 def test_configured_roots_keeps_unmounted_allowlisted_root(tmp_path: Path) -> None:
     config = SyncSageConfig.model_validate(
         {
@@ -101,6 +108,9 @@ def test_configured_roots_keeps_unmounted_allowlisted_root(tmp_path: Path) -> No
     assert not Path("/data-not-mounted").exists()
 
 
+# Same as above: the allowlist is in-container POSIX roots, which a native
+# Windows run resolves against the current drive.
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only; see comment above.")
 def test_fs_list_flags_unmounted_root(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
 

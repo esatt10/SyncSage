@@ -2,8 +2,22 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
+
+
+def _basename(path: str | None) -> str:
+    """Final path segment, for the FTS ``title`` column.
+
+    Deliberately not ``Path(...).name``: these are POSIX-style relative paths
+    recorded at index time, and on Windows ``PurePath`` would also split on
+    backslashes, so an indexed path containing one would produce a different
+    title than the same corpus indexed on Linux.
+    """
+    text = str(path or "")
+    return text.rsplit("/", 1)[-1] if "/" in text else text
+
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -58,6 +72,9 @@ CREATE TABLE IF NOT EXISTS chunks (
   FOREIGN KEY (artifact_id) REFERENCES artifacts(id),
   FOREIGN KEY (source_id) REFERENCES sources(id)
 );
+-- Same per-artifact DELETE pattern as artifact_terms; see that index's
+-- comment.
+CREATE INDEX IF NOT EXISTS idx_chunks_artifact_id ON chunks(artifact_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   chunk_id UNINDEXED,
   source_id UNINDEXED,
@@ -67,6 +84,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   heading_path,
   text
 );
+-- The corpus's own vocabulary, with document frequencies, read straight off
+-- the FTS index. `fts5vocab` is a view over chunks_fts's internal term table:
+-- it stores nothing of its own and stays exact as the index changes.
+--
+-- This replaces the concept layer as the source of "what is this corpus
+-- about" (the Synapse contract's vocabulary.top_concepts + minhash, and the
+-- planner's structural grounding). Concept extraction had been materializing
+-- 141k nodes and 1.27M artifact_terms rows to answer that question; SQLite
+-- was already maintaining the same information for free.
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vocab USING fts5vocab(chunks_fts, 'row');
 CREATE TABLE IF NOT EXISTS symbols (
   id TEXT PRIMARY KEY,
   artifact_id TEXT NOT NULL,
@@ -81,6 +108,9 @@ CREATE TABLE IF NOT EXISTS symbols (
   docstring_summary TEXT,
   FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
 );
+-- Same per-artifact DELETE pattern as artifact_terms; see that index's
+-- comment.
+CREATE INDEX IF NOT EXISTS idx_symbols_artifact_id ON symbols(artifact_id);
 CREATE TABLE IF NOT EXISTS artifact_terms (
   id TEXT PRIMARY KEY,
   artifact_id TEXT NOT NULL,
@@ -93,6 +123,20 @@ CREATE TABLE IF NOT EXISTS artifact_terms (
   metadata_json TEXT NOT NULL,
   FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
 );
+-- Without this, `DELETE FROM artifact_terms WHERE artifact_id=?` (run once
+-- per artifact on every sync, in replace_artifact_enrichment) is a full
+-- table scan. On a table that grows past a million rows over a real sync,
+-- that turns a full-corpus sync into O(n^2): each artifact's delete gets
+-- slower as the table grows. Measured cause of a 2,132-file sync taking
+-- 1.5+ hours.
+CREATE INDEX IF NOT EXISTS idx_artifact_terms_artifact_id
+  ON artifact_terms(artifact_id);
+-- Supports GraphBuilder.reconcile_concepts: `WHERE node_type='concept'
+-- GROUP BY node_id, ... COUNT(DISTINCT artifact_id)`. Without it, that
+-- query is an unindexed scan + sort over the whole table — measured at
+-- 10+ minutes and still not finished on a 1.27M-row table.
+CREATE INDEX IF NOT EXISTS idx_artifact_terms_node_lookup
+  ON artifact_terms(node_type, node_id, artifact_id);
 CREATE TABLE IF NOT EXISTS sync_events (
   id TEXT PRIMARY KEY,
   source_id TEXT,
@@ -136,27 +180,71 @@ CREATE TABLE IF NOT EXISTS idp_sync_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- What the indexed state was built with, per scope (a source, or the vector
+-- space). A restart compares the live config against these: same fingerprint
+-- means the stored artifacts/chunks/vectors are still valid and there is
+-- nothing to redo. See syncsage.sync.fingerprint.
+CREATE TABLE IF NOT EXISTS sync_fingerprints (
+  scope TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 
 class StateStore:
+    """SQLite-backed state, one connection per thread.
+
+    WAL mode (set below) is SQLite's sanctioned way to let multiple threads
+    read the same database truly concurrently — but only when each thread
+    uses its *own* connection/cursor. An earlier version of this class shared
+    one `sqlite3.Connection` across every thread: the search paths
+    (text/vector/graph) run in parallel across threads (hybrid.py's per-mode
+    pool, nested inside multi_search's per-query pool for the agentic
+    workflow), and overlapping execute()+fetch calls on one shared connection
+    interleaved cursor state, handing back a Row missing an expected column
+    (reproduced as `row["chunk_id"]` raising IndexError from
+    vector_store.search() under concurrent load). The fix at the time was a
+    lock serializing every read through `rows()` — correct, but it throws
+    away the concurrency WAL mode exists to provide: with four queries
+    fanning out across three search modes, a global lock turned an
+    embarrassingly-parallel retrieve step into a mostly-serial one (measured:
+    the first, multi-query retrieve of an agentic run took 22-29s; a later
+    single-query retrieve over the same data took 1.3-2s).
+
+    Thread-local connections remove the shared state instead of locking
+    around it: every thread gets its own connection and cursor, so there is
+    nothing left to interleave, and reads run genuinely in parallel again.
+    Writes still only ever happen from the sync worker process (a different
+    process entirely — see sync/worker.py), so this process's connections are
+    all readers as far as WAL's MVCC snapshot isolation is concerned.
+    """
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn: sqlite3.Connection | None = None
+        self._local = threading.local()
+        # Every connection ever opened, so close() can close all of them —
+        # not just whichever thread happens to call close().
+        self._all_conns: list[sqlite3.Connection] = []
+        self._registry_lock = threading.Lock()
 
     @property
     def conn(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._conn = sqlite3.connect(self.path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, check_same_thread=True)
+            conn.row_factory = sqlite3.Row
             # Crash/concurrency safety (Synapse step 21.2): WAL survives
             # kill -9 mid-write, busy_timeout rides out concurrent readers,
             # synchronous=NORMAL is the sanctioned WAL durability level.
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA busy_timeout=5000")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-        return self._conn
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn = conn
+            with self._registry_lock:
+                self._all_conns.append(conn)
+        return conn
 
     def migrate(self) -> None:
         self.conn.executescript(SCHEMA)
@@ -166,6 +254,64 @@ class StateStore:
         if "acl" not in columns:
             self.conn.execute("ALTER TABLE artifacts ADD COLUMN acl TEXT")
         self.conn.commit()
+        self._migrate_fts_titles()
+
+    def _migrate_fts_titles(self) -> None:
+        """Re-point ``chunks_fts.title`` at the file's basename.
+
+        It used to hold the full relative path — the identical string already
+        in ``path`` — so a filename carried no signal BM25 could weight
+        separately, and searching "readme" ranked by body brevity instead of
+        by name. Rebuilding is safe and needs no re-index: ``chunks_fts`` is a
+        derived cache over ``chunks`` + ``artifacts``, exactly like the graph
+        node index, so it can be regenerated from the tables that are the
+        truth. No user data is touched.
+
+        One-shot and idempotent: the presence of a '/' in any stored title is
+        the old format, and after the rebuild there is nothing left to detect.
+        """
+        try:
+            stale = self.conn.execute(
+                "SELECT 1 FROM chunks_fts WHERE title LIKE '%/%' LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:  # table absent or FTS5 unavailable — nothing to do
+            return
+        if stale is None:
+            return
+        with self.conn:
+            self.conn.execute("DELETE FROM chunks_fts")
+            self.conn.execute(
+                """INSERT INTO chunks_fts(
+                       chunk_id, source_id, artifact_id, title, path, heading_path, text)
+                   SELECT chunks.id, chunks.source_id, chunks.artifact_id,
+                          replace(
+                              COALESCE(artifacts.relative_path, artifacts.path),
+                              rtrim(COALESCE(artifacts.relative_path, artifacts.path),
+                                    replace(COALESCE(artifacts.relative_path, artifacts.path),
+                                            '/', '')),
+                              ''),
+                          COALESCE(artifacts.relative_path, artifacts.path),
+                          COALESCE(chunks.heading_path, ''),
+                          chunks.text
+                   FROM chunks JOIN artifacts ON artifacts.id = chunks.artifact_id"""
+            )
+
+    def get_fingerprint(self, scope: str) -> str | None:
+        """What this scope was last indexed with, or None if never recorded."""
+
+        rows = self.rows("SELECT fingerprint FROM sync_fingerprints WHERE scope=?", (scope,))
+        return str(rows[0]["fingerprint"]) if rows else None
+
+    def set_fingerprint(self, scope: str, fingerprint: str, updated_at: str) -> None:
+        """Record a scope's fingerprint after a successful pass over it."""
+
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO sync_fingerprints (scope, fingerprint, updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(scope) DO UPDATE SET fingerprint=excluded.fingerprint, "
+                "updated_at=excluded.updated_at",
+                (scope, fingerprint, updated_at),
+            )
 
     def replace_idp_groups(self, mapping: dict[str, list[str]], synced_at: str) -> bool:
         """Persist one IdP sync pass (Step 32.4). Returns True when rows changed.
@@ -174,9 +320,7 @@ class StateStore:
         call (an unchanged directory still counts as a fresh heartbeat —
         that heartbeat is the staleness-SLA clock).
         """
-        desired = {
-            (principal, group) for principal, groups in mapping.items() for group in groups
-        }
+        desired = {(principal, group) for principal, groups in mapping.items() for group in groups}
         current = {
             (row[0], row[1])
             for row in self.conn.execute("SELECT principal, group_name FROM idp_groups")
@@ -340,7 +484,11 @@ class StateStore:
                         chunk["id"],
                         chunk["source_id"],
                         chunk["artifact_id"],
-                        artifact["relative_path"] or artifact["path"],
+                        # title = basename, path = full relative path. Two
+                        # distinct signals so BM25 can weight a filename match
+                        # above a body match (see sqlite_store._BM25_WEIGHTS);
+                        # storing the same string twice made them one.
+                        _basename(artifact["relative_path"] or artifact["path"]),
                         artifact["relative_path"] or artifact["path"],
                         chunk.get("heading_path") or "",
                         chunk["text"],
@@ -678,9 +826,20 @@ class StateStore:
         return dict(rows[0]) if rows else None
 
     def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+        # No lock: `self.conn` is this thread's own connection (see the class
+        # docstring), so there is no cursor state shared with any other
+        # thread to interleave.
         return list(self.conn.execute(sql, params))
 
     def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        # Every thread that ever touched this store opened its own
+        # connection; close them all, not just the caller's.
+        with self._registry_lock:
+            conns, self._all_conns = self._all_conns, []
+        for conn in conns:
+            try:
+                conn.close()
+            except sqlite3.Error:  # pragma: no cover - best-effort cleanup
+                pass
+        if hasattr(self._local, "conn"):
+            del self._local.conn

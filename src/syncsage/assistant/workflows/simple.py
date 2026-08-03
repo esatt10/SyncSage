@@ -15,12 +15,14 @@ from __future__ import annotations
 from typing import Any
 
 from syncsage.assistant.chat import (
-    SYSTEM_PROMPT,
     build_prompt,
+    classify_intent,
     extractive_answer,
+    hydrate_citations,
     mark_used_citations,
     passages_to_citations,
     short_reason,
+    system_prompt_for,
 )
 from syncsage.assistant.providers import ProviderError
 from syncsage.assistant.workflows import WorkflowRequest, WorkflowResult, WorkflowStep
@@ -50,16 +52,38 @@ class SimpleWorkflow:
                 passages=len(citations),
             )
         ]
+        # Progress is reported by every workflow, not just the agentic one:
+        # a caller streaming the answer should not have to know which one ran.
+        request.report(steps[-1])
+
+        # One pass, but not a starved one: the same file-level content and the
+        # same intent-shaped prompt the agentic graph uses. What "single pass"
+        # buys you is fewer model calls, not a worse answer per call.
+        intent = str(request.options.get("intent") or "").strip().lower()
+        if intent not in ("knowledge", "procedural"):
+            intent, _why = classify_intent(request.question)
 
         answer_mode = "extractive"
         error: str | None = None
         if llm is not None and citations:
+            documents = hydrate_citations(retriever, citations, request.options)
+            if documents:
+                steps.append(
+                    WorkflowStep(
+                        name="read",
+                        detail=f"read {len(documents)} file(s) in full from their chunks",
+                        passages=len(documents),
+                    )
+                )
+                request.report(steps[-1])
             try:
                 answer = llm.complete(
-                    SYSTEM_PROMPT, build_prompt(request.question, citations, facts)
+                    system_prompt_for(intent),
+                    build_prompt(request.question, citations, facts, documents),
                 )
                 answer_mode = "llm"
                 steps.append(WorkflowStep(name="answer", detail=f"synthesized with {llm.model_id}"))
+                request.report(steps[-1])
             except ProviderError as exc:
                 error = str(exc)
                 answer = extractive_answer(request.question, citations, reason=short_reason(error))
@@ -77,7 +101,7 @@ class SimpleWorkflow:
             model=llm.model_id if llm else None,
             error=error,
             search_mode=request.mode,
-            counts={"passages": len(passages), "citations": len(citations)},
+            counts={"passages": len(passages), "citations": len(citations), "intent": intent},
             steps=steps,
             workflow=self.name,
         )

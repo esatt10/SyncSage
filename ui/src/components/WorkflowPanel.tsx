@@ -75,6 +75,14 @@ export function WorkflowPanel({
       ) : null}
 
       <p className="muted small" style={{ margin: 0 }}>
+        <strong>Agentic</strong> reads each question for itself: “what does this repo
+        do?” is answered as a <em>knowledge summary</em> (more files, less of each),
+        “how do I use this tool?” as <em>procedural steps</em> with real code from the
+        index (fewer files, read further). The chat trace shows which way it went. To
+        pin the other direction, set <code>{'workflow_options: {intent: procedural}'}</code>.
+      </p>
+
+      <p className="muted small" style={{ margin: 0 }}>
         Selected here it applies to your next question only. To make it the default set{" "}
         <code>assistant.workflow: {effective}</code> in Settings → Raw YAML. To ship your
         own, register it under the <code>syncsage.agent_workflows</code> entry-point group.
@@ -115,6 +123,11 @@ export function WorkflowPanel({
 }
 
 const OPTION_HELP: [string, string][] = [
+  [
+    "intent",
+    "Answer shape: auto reads it off the question, or pin knowledge / procedural. " +
+      "Also sets retrieval breadth-vs-depth and the sufficiency bar.",
+  ],
   ["max_rounds", "How many plan → retrieve → grade loops before answering with what it has."],
   ["retrieval_modes", "Search modes to fan out over. Unavailable modes are dropped."],
   ["expand_graph", "Walk the knowledge graph out of the best hits for related material."],
@@ -125,4 +138,21 @@ const OPTION_HELP: [string, string][] = [
   ["grade_evidence", "Ask the model whether its evidence is sufficient before answering."],
   ["verify_citations", "Drop [n] markers that do not resolve to a real passage."],
   ["max_facts", "Graph facts surfaced alongside the answer."],
+  [
+    "include_full_content",
+    "Read the whole cited file, rebuilt from its chunks, instead of the 500-character " +
+      "search preview. Turning this off makes answers noticeably thinner.",
+  ],
+  ["passage_chars", "Prose allowance per file."],
+  [
+    "code_passage_chars",
+    "Ceiling for code and config, which are never excerpted — a module missing its " +
+      "imports is what makes a model invent one.",
+  ],
+  [
+    "large_file_bytes",
+    "Original file size above which prose is cut to the matched chunks and their " +
+      "neighbours rather than read whole.",
+  ],
+  ["context_budget_chars", "Total characters of file content across all passages."],
 ];

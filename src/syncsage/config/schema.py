@@ -256,11 +256,16 @@ class StorageSettings(ModelMixin):
     - ``max_state_size_gb`` caps total snapshot bytes per KB; oldest snapshots
       are evicted first when exceeded. ``graph.latest.json``, the SQLite db, and
       the contract are never evicted.
+    - ``graph_checkpoint_seconds`` is the minimum spacing between mid-sync
+      writes of ``graph.latest.json``. The graph used to reach disk only when a
+      sync *completed*, so stopping the container during a first index threw
+      that work away. 0 disables checkpointing (end-of-sync save only).
     """
 
     graph_format: str = "node_link_json"
     graph_snapshots: bool = True
     graph_snapshot_interval_seconds: int = 900
+    graph_checkpoint_seconds: int = 60
     compression: str = "zstd"
     sqlite_path: Path | None = None
     graph_path: Path | None = None
@@ -420,6 +425,26 @@ class SyncSettings(ModelMixin):
     git: GitSettings = field(default_factory=GitSettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
     limits: SyncLimitsSettings = field(default_factory=SyncLimitsSettings)
+
+
+@dataclass
+class GraphSettings(ModelMixin):
+    """How much graph the knowledge graph should actually keep.
+
+    ``concept_min_documents`` is the number of distinct documents that must
+    share a term before it becomes a concept *node*. A concept exists to link
+    the documents that share it, so one that links a single document is pure
+    weight: measured on microsoft/agent-framework, 74.5% of concept nodes were
+    mentioned by exactly one document, and concepts made up 96% of a
+    577k-node graph — memory, traversal budget and enrichment time spent
+    connecting nothing.
+
+    Nothing becomes unfindable: the term stays on the artifact's
+    ``concept_terms``, in ``artifact_terms``, and in the artifact's searchable
+    text. Set to 1 to keep every term as a node (the pre-2026-08 behavior).
+    """
+
+    concept_min_documents: int = 2
 
 
 @dataclass
@@ -639,6 +664,7 @@ class SyncSageConfig(ModelMixin):
     search: SearchSettings = field(default_factory=SearchSettings)
     ingestion: IngestionSettings = field(default_factory=IngestionSettings)
     sync: SyncSettings = field(default_factory=SyncSettings)
+    graph: GraphSettings = field(default_factory=GraphSettings)
     obsidian: ObsidianSettings = field(default_factory=ObsidianSettings)
     security: SecuritySettings = field(default_factory=SecuritySettings)
     synapse: SynapseSettings = field(default_factory=SynapseSettings)

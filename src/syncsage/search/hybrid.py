@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from syncsage.graph.simple import SimpleMultiDiGraph
@@ -16,12 +17,20 @@ MAX_RESULTS_CEILING = 500
 
 
 class HybridSearch:
-    def __init__(self, store: SearchStore, vector: VectorSearcher | None = None):
+    def __init__(
+        self,
+        store: SearchStore,
+        vector: VectorSearcher | None = None,
+        node_index: Any = None,
+    ):
         self.store = store
         # Optional semantic candidates (Synapse 21.4). None when
         # search.embeddings is disabled: "vector" contributes nothing and
         # every other mode behaves exactly as before.
         self.vector = vector
+        # Optional FTS index over graph nodes. None (or an empty index) makes
+        # graph search scan the graph in memory, which is what it always did.
+        self.node_index = node_index
 
     def search_context(
         self,
@@ -52,14 +61,43 @@ class HybridSearch:
         graph_results: list[dict[str, Any]] = []
         vector_results: list[dict[str, Any]] = []
 
+        # The three retrievers are independent, and in hybrid mode their costs
+        # are wildly different — a graph scan and a vector query that waits on
+        # a remote embedding have no reason to queue behind each other. Running
+        # them together makes hybrid cost about as much as its slowest arm
+        # instead of the sum of all three. Each is I/O or read-only work, so
+        # threads are enough (SQLite reads release the GIL; the embedder is a
+        # network call).
+        jobs: dict[str, Any] = {}
         if mode in {"hybrid", "text"}:
-            text_results = self.store.search(query, source_name=source_name, max_results=fetch_n)
+            jobs["text"] = lambda: self.store.search(
+                query, source_name=source_name, max_results=fetch_n
+            )
         # Graph search needs the live graph; callers that don't supply one
         # (e.g. CLI/MCP search_context) transparently fall back to text search.
         if mode in {"hybrid", "graph"} and graph is not None:
-            graph_results = search_graph(graph, query, max_results=fetch_n, source_name=source_name)
+            jobs["graph"] = lambda: search_graph(
+                graph,
+                query,
+                max_results=fetch_n,
+                source_name=source_name,
+                node_index=self.node_index,
+            )
         if mode in {"hybrid", "vector"} and self.vector is not None:
-            vector_results = self.vector.search(query, source_name=source_name, max_results=fetch_n)
+            jobs["vector"] = lambda: self.vector.search(
+                query, source_name=source_name, max_results=fetch_n
+            )
+
+        if len(jobs) == 1:
+            name, job = next(iter(jobs.items()))
+            collected = {name: job()}
+        else:
+            with ThreadPoolExecutor(max_workers=len(jobs) or 1) as pool:
+                futures = {name: pool.submit(job) for name, job in jobs.items()}
+                collected = {name: future.result() for name, future in futures.items()}
+        text_results = collected.get("text", [])
+        graph_results = collected.get("graph", [])
+        vector_results = collected.get("vector", [])
 
         if enforced:
             from syncsage.security.acl import expand_principal, is_allowed
@@ -96,14 +134,7 @@ class HybridSearch:
             vector_results = [r for r in vector_results if visible(r)]
             graph_results = [r for r in graph_results if visible(r)]
 
-        chunk_candidates = text_results + vector_results
-        if text_results and vector_results:
-            # Both engines contributed: order chunk candidates by their
-            # normalized [0, 1] scores before merging with graph hits.
-            chunk_candidates = sorted(
-                chunk_candidates, key=lambda item: -float(item.get("score") or 0.0)
-            )
-        results = _merge(chunk_candidates, graph_results, max_results)
+        results = _merge_rrf(text_results, vector_results, graph_results, max_results)
         return {
             "query": query,
             "knowledge_base": knowledge_base,
@@ -116,6 +147,93 @@ class HybridSearch:
                 "returned": len(results),
             },
         }
+
+
+#: Reciprocal-rank-fusion constant. 60 is the value from the original RRF
+#: paper and the usual default; it damps the top ranks just enough that one
+#: arm's confident first place cannot alone decide the merge.
+RRF_K = 60
+
+
+def _merge_rrf(
+    text_results: list[dict[str, Any]],
+    vector_results: list[dict[str, Any]],
+    graph_results: list[dict[str, Any]],
+    max_results: int,
+) -> list[dict[str, Any]]:
+    """Fuse the arms on **rank**, not on their scores.
+
+    The three retrievers score on scales that are not comparable, and merging
+    them by raw score silently reduced hybrid to whichever arm scored highest
+    in absolute terms. Measured on a real corpus: text (BM25-derived) returned
+    0.86-0.92, vector (cosine) 0.6679-0.6735, graph a flat 0.60 — so text won
+    every position, every time, and the other two arms cost latency while
+    contributing nothing to the ordering. Worse, each arm's internal spread
+    was tiny (vector separated unrelated files by 0.006), so even within an
+    arm the numbers barely ranked anything.
+
+    Reciprocal rank fusion sidesteps calibration entirely: an item scores
+    ``sum(1 / (RRF_K + rank))`` over the arms that returned it, so only each
+    arm's own ordering matters and agreement between arms is what promotes a
+    result. That is the property hybrid search was supposed to have.
+
+    Ordering is deterministic: ties break on the fused score, then on the best
+    rank any arm gave the item, then on node id.
+    """
+
+    def key_of(item: dict[str, Any]) -> str:
+        return str(item.get("chunk_id") or item.get("node_id") or item.get("title") or "")
+
+    fused: dict[str, dict[str, Any]] = {}
+    scores: dict[str, float] = {}
+    best_rank: dict[str, int] = {}
+    contributors: dict[str, set[str]] = {}
+
+    for arm, results in (
+        ("text", text_results),
+        ("vector", vector_results),
+        ("graph", graph_results),
+    ):
+        for rank, item in enumerate(results, start=1):
+            key = key_of(item)
+            if not key:
+                continue
+            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+            best_rank[key] = min(best_rank.get(key, rank), rank)
+            contributors.setdefault(key, set()).add(arm)
+            # Keep the richest record: chunk hits carry previews and line
+            # ranges that graph hits do not, so a text/vector row wins the slot
+            # even when the graph arm saw the item first.
+            if key not in fused or (arm != "graph" and fused[key].get("kind") == "node"):
+                fused[key] = item
+
+    ordered = sorted(
+        fused.values(),
+        key=lambda item: (
+            -scores[key_of(item)],
+            best_rank[key_of(item)],
+            key_of(item),
+        ),
+    )
+
+    results: list[dict[str, Any]] = []
+    seen_nodes: set[str] = set()
+    for item in ordered:
+        if len(results) >= max_results:
+            break
+        node_id = item.get("node_id")
+        if item.get("kind") != "relationship" and node_id and node_id in seen_nodes:
+            continue
+        if node_id:
+            seen_nodes.add(node_id)
+        key = key_of(item)
+        item["score"] = round(scores[key], 6)
+        item["retrieved_by"] = "+".join(sorted(contributors[key]))
+        results.append(item)
+
+    for rank, item in enumerate(results, start=1):
+        item["rank"] = rank
+    return results
 
 
 def _merge(

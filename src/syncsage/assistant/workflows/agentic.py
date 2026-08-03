@@ -54,12 +54,16 @@ import re
 from typing import Any, TypedDict
 
 from syncsage.assistant.chat import (
-    SYSTEM_PROMPT,
+    CONTENT_DEFAULTS,
+    INTENTS,
     build_prompt,
+    classify_intent,
     extractive_answer,
+    hydrate_citations,
     mark_used_citations,
     passages_to_citations,
     short_reason,
+    system_prompt_for,
 )
 from syncsage.assistant.providers import ProviderError
 from syncsage.assistant.workflows import WorkflowRequest, WorkflowResult, WorkflowStep
@@ -67,11 +71,24 @@ from syncsage.assistant.workflows import WorkflowRequest, WorkflowResult, Workfl
 logger = logging.getLogger(__name__)
 
 DEFAULTS: dict[str, Any] = {
+    # Which answer shape to plan and write toward: "auto" reads it off the
+    # question (chat.classify_intent), or pin "knowledge" / "procedural".
+    "intent": "auto",
     # How many plan→retrieve→grade rounds before answering with what we have.
     "max_rounds": 2,
     # Search modes to fan out over. "vector" is dropped automatically when no
     # vector index is built, so leaving it on is safe.
-    "retrieval_modes": ["hybrid", "vector"],
+    #
+    # Deliberately NOT "hybrid" here. Hybrid = text + vector + a linear scan of
+    # every graph node, and this loop issues one search per query per mode
+    # across up to `max_rounds` rounds — on a 500k-node graph that scan
+    # dominated everything else the agent did (measured: 10.3s per hybrid
+    # search vs 0.03s text, 1.6s vector, 0.6s for a model call). The graph is
+    # not lost by leaving it out: `expand_graph` below walks the graph out of
+    # the best hits, which is the structural signal this loop actually wants.
+    # Set `retrieval_modes: ["hybrid"]` per request to trade the latency back
+    # for graph-scored candidates.
+    "retrieval_modes": ["text", "vector"],
     # Walk the knowledge graph out of the best hits for related material.
     "expand_graph": True,
     "expand_depth": 1,
@@ -85,23 +102,80 @@ DEFAULTS: dict[str, Any] = {
     # Drop [n] markers that do not resolve to a real citation.
     "verify_citations": True,
     "max_facts": 12,
+    # Read whole files behind the hits, not 500-char chunk previews.
+    **CONTENT_DEFAULTS,
+}
+
+#: The retrieval half of the knowledge/procedural split. The two intents want
+#: measurably different *evidence*, not just different wording:
+#:
+#: * a knowledge summary is answered by **breadth** — more documents, less of
+#:   each, because the answer is how the parts relate;
+#: * a procedural answer is answered by **depth** — fewer documents read
+#:   further, because a usage example that stops halfway is not an example.
+#:
+#: Anything the caller set explicitly in ``workflow_options`` still wins; a
+#: profile only overrides values that were still at their default.
+INTENT_PROFILES: dict[str, dict[str, Any]] = {
+    "knowledge": {
+        "per_query_results": 6,
+        "max_context_passages": 12,
+        "expand_graph": True,
+        "expand_per_node": 3,
+        "passage_chars": 5000,
+    },
+    "procedural": {
+        "per_query_results": 8,
+        "max_context_passages": 8,
+        "expand_graph": True,
+        # Tighter: a procedural answer drifts if the graph walk wanders into
+        # material that merely shares a concept with the tool being used.
+        "expand_per_node": 2,
+        "passage_chars": 9000,
+    },
 }
 
 PLANNER_SYSTEM = """You plan retrieval over a private knowledge base. \
-Given a question and a description of what the knowledge base contains, \
-produce the search queries most likely to surface the answer.
+Given a question and a STRUCTURAL DESCRIPTION of the knowledge base, produce \
+the search queries most likely to surface the answer.
+
+The description tells you what this corpus actually is: its sources and \
+their types, its directory layout, its file types and languages, the \
+vocabulary its own documents use, and the symbols its code defines. Plan \
+against that structure. Queries reusing the corpus's real directory names, \
+file names, identifiers and vocabulary hit the lexical index exactly; \
+generic paraphrases of the question do not.
 
 Reply with JSON only, no prose:
-{"queries": ["...", "..."], "modes": ["hybrid"], "reasoning": "one short line"}
+{"queries": ["...", "..."], "modes": ["text"], "intent": "knowledge", \
+"reasoning": "one short line"}
 
 Rules:
-- 1 to 3 queries. Use the user's own likely vocabulary and, where the \
-question is compound, split it into its parts.
+- 1 to 3 queries. Where the question is compound, split it into its parts.
 - Do not restate the question verbatim as the only query; add the specific \
 terms a document answering it would contain.
-- "modes" may include only the modes listed as available.
-- Prefer "vector" when the question is conceptual and "text" when it names \
-an exact identifier, path or symbol."""
+- Ground at least one query in something structural from the description: a \
+real directory, module, file name, symbol or corpus term. If the question \
+names a thing that appears in the vocabulary or symbol list, use that exact \
+spelling.
+- LOCATION IS A SEARCH TERM. Many files share a name — a repository has one \
+README.md per package, an __init__.py per module — so a bare file name cannot \
+identify one of them. When the question is about a specific component, put \
+its directory or package name IN the query beside the file kind: prefer \
+"devui readme" or "packages/devui README" over "devui package overview". \
+Ranking prefers files nearer the root, so a nested file needs its location \
+said out loud to be found; a query that names only the file kind will return \
+the project-wide one.
+- Say the file kind plainly when the question implies one ("readme", \
+"changelog", "pyproject", "test") — it matches the filename directly, which \
+ranks far above a paraphrase of what the file contains.
+- "modes" may include only the modes listed as available. Prefer "vector" \
+when the question is conceptual and "text" when it names an exact \
+identifier, path or symbol.
+- "intent" is "procedural" when the asker wants to DO something (steps, \
+usage, configuration, code examples) and "knowledge" when they want to \
+UNDERSTAND something (what it is, what it does, how it is organised). A \
+first reading is given to you below; change it only if it is clearly wrong."""
 
 GRADER_SYSTEM = """You judge whether retrieved passages are sufficient to \
 answer a question.
@@ -110,9 +184,38 @@ Reply with JSON only, no prose:
 {"sufficient": true|false, "missing": "what is absent", "next_query": "a \
 better search query, or empty"}
 
+Each passage is labelled with its file metadata — type, language, size, and \
+the symbols it defines. Use it. The *shape* of the result set is evidence in \
+its own right: passages that all come from documentation when the question \
+needs source, or all from one directory when the question spans several, are \
+a miss even when each one reads plausibly.
+
 Be strict about sufficiency but realistic: if the passages substantially \
 answer the question, say true. Only say false when a specific, nameable \
-piece of information is missing that a different search might find."""
+piece of information is missing that a different search might find — and let \
+"next_query" go after that gap by name (a symbol, a path, a file type).
+
+If the passages are the RIGHT KIND of file from the WRONG PLACE — a README \
+from another package, a test instead of the implementation — that is a \
+location miss, not a content miss. Say false and make "next_query" name the \
+directory or package explicitly alongside the file kind."""
+
+#: Sufficiency means different things for the two intents, and this is where
+#: the replan loop earns its keep: "the right file, with no runnable example
+#: in it" is a *pass* for a summary and a *fail* for a how-to.
+GRADER_CRITERIA = {
+    "knowledge": """
+This is a knowledge-summary question. Sufficient means the passages let you \
+say what the thing is, what its main parts are, and what each is for. \
+Exhaustive coverage is not required — orientation is.""",
+    "procedural": """
+This is a procedural question. Sufficient means the passages contain a \
+followable sequence AND at least one real example with the actual \
+identifiers, imports, arguments or config keys. Passages that merely name \
+the right file, or describe a capability in prose without showing its use, \
+are NOT sufficient — say false and ask for the usage or example directly \
+(e.g. the symbol name plus "example", "usage", or the caller's file).""",
+}
 
 
 class AgentState(TypedDict, total=False):
@@ -120,6 +223,10 @@ class AgentState(TypedDict, total=False):
 
     question: str
     options: dict
+    #: Option keys the caller set explicitly. An intent profile may override
+    #: a default, but never something the user asked for by name.
+    explicit_options: list[str]
+    intent: str
     capabilities: Any
     queries: list[str]
     modes: list[str]
@@ -135,6 +242,26 @@ class AgentState(TypedDict, total=False):
     steps: list[WorkflowStep]
 
 
+def resolve_options(state: AgentState) -> dict:
+    """The options in force for this question, with the intent profile applied.
+
+    Layered lowest-to-highest: ``DEFAULTS`` → the profile for the classified
+    intent → whatever the caller passed in ``workflow_options`` or the request
+    body. The middle layer is why a "how do I…" question reads fewer files
+    further in without anyone configuring it, and why pinning
+    ``passage_chars`` by hand still wins.
+    """
+    options = dict(state.get("options") or {})
+    profile = INTENT_PROFILES.get(str(state.get("intent") or ""), {})
+    explicit = set(state.get("explicit_options") or ())
+    for key, value in profile.items():
+        if key not in explicit:
+            options[key] = value
+    floor = int(options.get("min_context_passages") or 0)
+    options["max_context_passages"] = max(int(options["max_context_passages"]), floor)
+    return options
+
+
 # --------------------------------------------------------------------- nodes
 # Each node is a plain function of (state, ctx) -> partial state. `ctx` carries
 # the retriever and llm. Override any of them by name via
@@ -142,13 +269,47 @@ class AgentState(TypedDict, total=False):
 # graph.
 
 
+INTENT_LABELS = {
+    "knowledge": "knowledge summary",
+    "procedural": "procedural steps and examples",
+}
+
+
+def classify_node(state: AgentState, ctx: dict) -> dict:
+    """Read the question as a knowledge-summary or a procedural one.
+
+    Deterministic and model-free — the classification is a property of the
+    question, so it costs nothing, cannot fail, and reads the same offline as
+    it does with a provider attached. The planner may still overturn it with
+    better judgement (see :func:`plan_node`); it is never *asked* to.
+
+    Its own step exists because the reader should be able to see which way the
+    agent took the question before the answer arrives. A summary served to
+    someone who asked "how do I…" is the failure mode this whole split exists
+    to prevent, and it is much easier to correct if the trace says so.
+    """
+    configured = str((state.get("options") or {}).get("intent") or "auto").strip().lower()
+    if configured in INTENTS:
+        intent, why = configured, "pinned by configuration"
+    else:
+        intent, why = classify_intent(state["question"])
+    return {
+        "intent": intent,
+        "steps": [
+            *state.get("steps", []),
+            WorkflowStep(name="classify", detail=f"{INTENT_LABELS[intent]} — {why}"),
+        ],
+    }
+
+
 def plan_node(state: AgentState, ctx: dict) -> dict:
     """Decide what to search for, and in which modes."""
     retriever, llm = ctx["retriever"], ctx["llm"]
-    options = state["options"]
+    options = resolve_options(state)
     capabilities = state.get("capabilities") or retriever.capabilities()
     question = state["question"]
     round_index = state.get("round", 0)
+    intent = str(state.get("intent") or "knowledge")
 
     available = [m for m in options["retrieval_modes"] if m in capabilities.modes]
     if not available:
@@ -175,10 +336,13 @@ def plan_node(state: AgentState, ctx: dict) -> dict:
 
     queries = [question]
     notes = "asked as-is"
+    steps = list(state.get("steps", []))
     if llm is not None:
         raw = llm.try_complete(
             PLANNER_SYSTEM,
-            f"{capabilities.as_prompt_context()}\n\nQuestion: {question}",
+            f"{capabilities.as_prompt_context()}\n\n"
+            f"First reading of the question: {intent}\n"
+            f"Question: {question}",
             max_output_tokens=400,
         )
         parsed = _parse_json(raw)
@@ -192,14 +356,28 @@ def plan_node(state: AgentState, ctx: dict) -> dict:
             planned_modes = [str(m) for m in parsed.get("modes", []) if m in capabilities.modes]
             if planned_modes:
                 available = planned_modes
+            # The planner reads the question with the corpus in front of it,
+            # so it is allowed to overturn the heuristic — but only when the
+            # intent was left on "auto", never when it was pinned.
+            planned_intent = str(parsed.get("intent") or "").strip().lower()
+            pinned = str(options.get("intent") or "auto").lower() in INTENTS
+            if planned_intent in INTENTS and planned_intent != intent and not pinned:
+                steps.append(
+                    WorkflowStep(
+                        name="reclassify",
+                        detail=f"planner read this as {INTENT_LABELS[planned_intent]} instead",
+                    )
+                )
+                intent = planned_intent
 
     return {
+        "intent": intent,
         "queries": queries,
         "modes": available,
         "capabilities": capabilities,
         "plan_notes": [*state.get("plan_notes", []), notes],
         "steps": [
-            *state.get("steps", []),
+            *steps,
             WorkflowStep(
                 name="plan",
                 detail=f"{notes} → {len(queries)} quer{'y' if len(queries) == 1 else 'ies'} "
@@ -213,7 +391,7 @@ def retrieve_node(state: AgentState, ctx: dict) -> dict:
     """Fan out across every planned query and mode, then merge."""
     retriever = ctx["retriever"]
     request: WorkflowRequest = ctx["request"]
-    options = state["options"]
+    options = resolve_options(state)
 
     found = retriever.multi_search(
         state.get("queries") or [state["question"]],
@@ -246,7 +424,7 @@ def expand_node(state: AgentState, ctx: dict) -> dict:
     concepts, imports and calls SyncSage recorded at index time.
     """
     retriever = ctx["retriever"]
-    options = state["options"]
+    options = resolve_options(state)
     if not options["expand_graph"]:
         return {}
     passages = state.get("passages", [])
@@ -275,7 +453,7 @@ def expand_node(state: AgentState, ctx: dict) -> dict:
 def grade_node(state: AgentState, ctx: dict) -> dict:
     """Decide whether the evidence answers the question."""
     llm = ctx["llm"]
-    options = state["options"]
+    options = resolve_options(state)
     passages = state.get("passages", [])
     round_index = state.get("round", 0) + 1
 
@@ -292,11 +470,27 @@ def grade_node(state: AgentState, ctx: dict) -> dict:
             "grade": {"sufficient": True, "missing": "", "next_query": ""},
         }
 
+    # Grading stays on snippets, not whole files: it is a routing decision
+    # about whether to search again, it runs every round, and re-reading
+    # everything here would buy a better-argued "yes" for the same answer at
+    # the cost of the loop the reader is waiting on.
+    #
+    # Metadata is the exception, because it is nearly free and it is most of
+    # what the decision turns on. Eight markdown notes under docs/ in answer
+    # to "how do I call this" is a miss no snippet reveals — the prose reads
+    # fine, it is the *shape* of the result set that is wrong. Handing the
+    # grader paths, types, languages and the symbols each file defines lets it
+    # say so, and name a next query that goes after the code.
+    shapes = ctx["retriever"].metadata([p.node_id for p in passages[:8] if p.node_id])
     evidence = "\n\n".join(
-        f"[{i + 1}] {p.title}\n{p.snippet[:500]}" for i, p in enumerate(passages[:8])
+        f"[{i + 1}] {p.title}{_describe(shapes.get(p.node_id or ''))}\n{p.snippet[:500]}"
+        for i, p in enumerate(passages[:8])
     )
+    if shapes:
+        kinds = sorted({str(meta.get("type") or "?") for meta in shapes.values()})
+        evidence += f"\n\nResult set: {len(passages)} passage(s), file types: {', '.join(kinds)}"
     raw = llm.try_complete(
-        GRADER_SYSTEM,
+        GRADER_SYSTEM + GRADER_CRITERIA.get(str(state.get("intent") or ""), ""),
         f"Question: {state['question']}\n\nPassages:\n{evidence}",
         max_output_tokens=300,
     )
@@ -323,9 +517,16 @@ def grade_node(state: AgentState, ctx: dict) -> dict:
 
 
 def synthesize_node(state: AgentState, ctx: dict) -> dict:
-    """Write the grounded answer over the accumulated evidence."""
+    """Write the grounded answer over the accumulated evidence.
+
+    This is where retrieval stops being a list of the right files and starts
+    being an answer about them: the cited chunks are joined back up into the
+    files they came from (:func:`~syncsage.assistant.chat.hydrate_citations`)
+    and the answering prompt is the one for the classified intent.
+    """
     retriever, llm = ctx["retriever"], ctx["llm"]
-    options = state["options"]
+    options = resolve_options(state)
+    intent = str(state.get("intent") or "knowledge")
     passages = state.get("passages", [])[: int(options["max_context_passages"])]
     citations = passages_to_citations(passages, int(options["max_context_passages"]))
     node_ids = [c["node_id"] for c in citations if c.get("node_id")]
@@ -338,18 +539,35 @@ def synthesize_node(state: AgentState, ctx: dict) -> dict:
             "answer": extractive_answer(state["question"], citations),
             "answer_mode": "extractive",
         }
+    documents = hydrate_citations(retriever, citations, options)
+    steps = list(state.get("steps", []))
+    if documents:
+        whole = sum(1 for doc in documents.values() if not doc.truncated)
+        steps.append(
+            WorkflowStep(
+                name="read",
+                detail=f"read {len(documents)} file(s) in full from their chunks"
+                if whole == len(documents)
+                else f"read {len(documents)} file(s) from their chunks "
+                f"({len(documents) - whole} excerpted)",
+                passages=len(documents),
+            )
+        )
     try:
-        answer = llm.complete(SYSTEM_PROMPT, build_prompt(state["question"], citations, facts))
+        answer = llm.complete(
+            system_prompt_for(intent),
+            build_prompt(state["question"], citations, facts, documents),
+        )
         return {
             "citations": citations,
             "facts": facts,
             "answer": answer,
             "answer_mode": "llm",
             "steps": [
-                *state.get("steps", []),
+                *steps,
                 WorkflowStep(
                     name="synthesize",
-                    detail=f"answered from {len(citations)} passages",
+                    detail=f"wrote a {INTENT_LABELS[intent]} answer from {len(citations)} passages",
                     passages=len(citations),
                 ),
             ],
@@ -373,7 +591,7 @@ def verify_node(state: AgentState, ctx: dict) -> dict:
     passages it was given. Emitting that unchecked would put a link in the UI
     that goes nowhere, which is worse than no citation at all.
     """
-    options = state["options"]
+    options = resolve_options(state)
     answer = state.get("answer", "")
     citations = state.get("citations", [])
     if not options["verify_citations"] or not answer:
@@ -409,7 +627,7 @@ def verify_node(state: AgentState, ctx: dict) -> dict:
 
 def should_retry(state: AgentState, ctx: dict) -> str:
     """Conditional edge: loop back to planning, or go answer."""
-    options = state["options"]
+    options = resolve_options(state)
     grade = state.get("grade") or {}
     if grade.get("sufficient", True):
         return "synthesize"
@@ -423,6 +641,7 @@ def should_retry(state: AgentState, ctx: dict) -> str:
 
 
 NODES = {
+    "classify": classify_node,
     "plan": plan_node,
     "retrieve": retrieve_node,
     "expand": expand_node,
@@ -432,6 +651,35 @@ NODES = {
 }
 
 
+#: The compiled default graph, built once per process.
+#:
+#: The topology below is fixed — it does not branch on ``options`` — and a
+#: compiled LangGraph holds no per-invocation state (state and ctx both arrive
+#: through ``invoke``), so there is nothing to rebuild per request. Compiling
+#: is cheap (~10ms); the expensive part is importing langgraph at all, which
+#: measured **4 seconds** and used to land on whoever asked the first question
+#: after a restart.
+_DEFAULT_GRAPH: Any = None
+
+
+def warm() -> bool:
+    """Pay the langgraph import + compile now, off the request path.
+
+    Called at server startup in the background. Returns False when the
+    ``[agent]`` extra is not installed, which is not an error: the assistant
+    falls back to the simple workflow.
+    """
+
+    try:
+        build_graph(DEFAULTS)
+    except ImportError:
+        return False
+    except Exception:  # pragma: no cover - warming must never break startup
+        logger.debug("agentic warm-up failed", exc_info=True)
+        return False
+    return True
+
+
 def build_graph(options: dict[str, Any], nodes: dict[str, Any] | None = None):
     """Compile the LangGraph state graph.
 
@@ -439,19 +687,32 @@ def build_graph(options: dict[str, Any], nodes: dict[str, Any] | None = None):
 
         from syncsage.assistant.workflows.agentic import build_graph, NODES
         graph = build_graph(options, nodes={**NODES, "grade": my_grader})
+
+    The default topology is compiled once and reused; pass ``nodes`` to get a
+    freshly compiled graph with your own node functions.
     """
+
+    global _DEFAULT_GRAPH
+    if nodes is None and _DEFAULT_GRAPH is not None:
+        return _DEFAULT_GRAPH
+
     from langgraph.graph import END, START, StateGraph
 
+    is_default = nodes is None
     nodes = nodes or NODES
     builder = StateGraph(AgentState)
-    for name in ("plan", "retrieve", "expand", "grade", "synthesize", "verify"):
+    for name in ("classify", "plan", "retrieve", "expand", "grade", "synthesize", "verify"):
         # LangGraph calls node(state, config); ctx rides on the config so the
         # nodes stay plain, testable functions of (state, ctx).
         builder.add_node(
             name,
             _bind(nodes[name]),
         )
-    builder.add_edge(START, "plan")
+    builder.add_edge(START, "classify")
+    # classify runs once, ahead of the loop: how the question was read does
+    # not change because a search came back thin, so the replan edge below
+    # re-enters at `plan`, not here.
+    builder.add_edge("classify", "plan")
     builder.add_edge("plan", "retrieve")
     builder.add_edge("retrieve", "expand")
     builder.add_edge("expand", "grade")
@@ -462,12 +723,27 @@ def build_graph(options: dict[str, Any], nodes: dict[str, Any] | None = None):
     )
     builder.add_edge("synthesize", "verify")
     builder.add_edge("verify", END)
-    return builder.compile()
+    compiled = builder.compile()
+    if is_default:
+        _DEFAULT_GRAPH = compiled
+    return compiled
 
 
 def _bind(fn):
     def node(state, config):
-        return fn(state, config["configurable"]["ctx"])
+        ctx = config["configurable"]["ctx"]
+        before = len(state.get("steps") or [])
+        result = fn(state, ctx)
+        # Publish whatever this node appended, the moment it appended it. The
+        # loop can take a minute over a large index, and "planning… retrieving
+        # 35 passages… grading" is the difference between waiting and
+        # wondering whether it hung. Nodes return the whole steps list, so
+        # anything past the incoming length is new.
+        request = ctx.get("request")
+        if request is not None and isinstance(result, dict):
+            for step in (result.get("steps") or [])[before:]:
+                request.report(step)
+        return result
 
     node.__name__ = getattr(fn, "__name__", "node")
     return node
@@ -482,19 +758,33 @@ def _bind_router(fn):
 
 
 class AgenticWorkflow:
-    """Plan → retrieve → expand → grade → (loop) → synthesize → verify."""
+    """Classify → plan → retrieve → expand → grade → (loop) → synthesize → verify."""
 
     name = "agentic"
+    #: Subclasses pin one of :data:`~syncsage.assistant.chat.INTENTS`; ``None``
+    #: means classify per question.
+    intent: str | None = None
 
     def __init__(self, nodes: dict[str, Any] | None = None) -> None:
         self._nodes = nodes
 
     def run(self, request: WorkflowRequest, retriever: Any, llm: Any) -> WorkflowResult:
-        options = {**DEFAULTS, **(request.options or {})}
+        requested = dict(request.options or {})
+        options = {**DEFAULTS, **requested}
+        if self.intent:
+            # Choosing this workflow *is* choosing the intent; an explicit
+            # per-request `intent` still wins so the pin stays overridable.
+            options["intent"] = requested.get("intent") or self.intent
+        # A caller asking for N results must not get fewer because an intent
+        # profile prefers a smaller context.
+        options["min_context_passages"] = int(request.max_results)
         options["max_context_passages"] = max(
             int(options["max_context_passages"]), int(request.max_results)
         )
-        nodes = self._nodes or {**NODES, **(options.get("nodes") or {})}
+        # None means "the stock topology", which is the compiled-once path.
+        # Only a caller that actually swapped a node pays for a fresh compile.
+        overrides = options.get("nodes") or {}
+        nodes = self._nodes or ({**NODES, **overrides} if overrides else None)
 
         try:
             graph = build_graph(options, nodes)
@@ -508,6 +798,7 @@ class AgenticWorkflow:
         initial: AgentState = {
             "question": request.question,
             "options": options,
+            "explicit_options": list(requested),
             "passages": [],
             "round": 0,
             "plan_notes": [],
@@ -538,13 +829,47 @@ class AgenticWorkflow:
                 "rounds": final.get("round", 0),
                 "passages": len(final.get("passages", [])),
                 "citations": len(citations),
+                # How the question was read. Surfaced so a caller can tell a
+                # summary from a how-to without re-parsing the answer.
+                "intent": final.get("intent", "knowledge"),
             },
             steps=final.get("steps", []),
             workflow=self.name,
         )
 
 
+class KnowledgeSummaryWorkflow(AgenticWorkflow):
+    """The agentic graph, pinned to the knowledge-summary reading.
+
+    Same topology and the same nodes — only the intent is fixed, which fixes
+    the retrieval profile (breadth over depth), the sufficiency bar and the
+    answering prompt with it. Worth its own registration because "explain this
+    corpus to me" is a standing mode of use, not a per-question accident: a
+    reader browsing an unfamiliar knowledge base wants orientation even when
+    a particular question happens to contain the word "use".
+    """
+
+    name = "knowledge-summary"
+    intent = "knowledge"
+
+
 # ------------------------------------------------------------------ helpers
+
+
+def _describe(meta: dict | None) -> str:
+    """One inline clause of file metadata, for the grader's evidence list."""
+    if not meta:
+        return ""
+    bits = [str(meta["type"])] if meta.get("type") else []
+    if meta.get("language"):
+        bits.append(str(meta["language"]))
+    if meta.get("lines"):
+        bits.append(f"{meta['lines']} lines")
+    if meta.get("chunk_count"):
+        bits.append(f"{meta['chunk_count']} chunk(s)")
+    if meta.get("symbols"):
+        bits.append("defines " + ", ".join(meta["symbols"]))
+    return f"  ({' · '.join(bits)})" if bits else ""
 
 
 def _dedupe(values: list[str]) -> list[str]:

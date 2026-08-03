@@ -458,3 +458,37 @@ def test_ask_knowledge_base_is_exposed_over_mcp(loaded_config) -> None:
     assert "ask_knowledge_base" in names
     # Rule 8: the pre-existing tool surface is additive-only.
     assert {"search_context", "sync_source", "get_graph_neighbors"} <= names
+
+
+def test_default_topology_is_compiled_once() -> None:
+    """Recompiling per request buys nothing and hides a 4s import.
+
+    The topology does not depend on `options`, and a compiled graph carries no
+    per-invocation state, so the stock graph is built once per process. A
+    caller that swaps a node still gets its own compile.
+    """
+
+    pytest.importorskip("langgraph")
+    from syncsage.assistant.workflows import agentic
+
+    agentic._DEFAULT_GRAPH = None  # start from a cold process
+    first = agentic.build_graph(agentic.DEFAULTS)
+    second = agentic.build_graph({**agentic.DEFAULTS, "max_rounds": 5})
+    assert first is second, "the stock graph was recompiled"
+
+    custom = agentic.build_graph(agentic.DEFAULTS, nodes={**agentic.NODES})
+    assert custom is not first, "a custom node set must not reuse the cached graph"
+    # ...and must not have replaced the cached one either.
+    assert agentic.build_graph(agentic.DEFAULTS) is first
+
+
+def test_warm_reports_whether_the_agent_extra_is_available() -> None:
+    """Startup warming is best-effort and never raises."""
+
+    from syncsage.assistant.workflows import agentic
+
+    agentic._DEFAULT_GRAPH = None
+    result = agentic.warm()
+    assert result in {True, False}
+    if result:
+        assert agentic._DEFAULT_GRAPH is not None

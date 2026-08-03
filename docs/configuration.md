@@ -317,15 +317,15 @@ default and works fully offline.
 | `max_output_tokens` | int | `4096` | Per-answer output cap sent to the provider. |
 | `request_timeout_seconds` | float | `90.0` | Provider HTTP timeout. A timeout degrades to the extractive answer rather than erroring. |
 | `max_facts` | int | `12` | Graph facts surfaced per answer, collected round-robin across the cited sources. |
-| `workflow` | str | `auto` | Which agent workflow answers a question: `auto` \| `simple` \| `agentic` \| any registered plugin name. `auto` = `agentic` when the `[agent]` extra is installed *and* a model is reachable, else `simple`. An unknown or failing workflow degrades to `simple` with the reason attached to the answer. |
+| `workflow` | str | `auto` | Which agent workflow answers a question: `auto` \| `knowledge-summary` \| `agentic` \| `simple` \| any registered plugin name. `auto` = `agentic` when the `[agent]` extra is installed *and* a model is reachable, else `simple`. An unknown or failing workflow degrades to `simple` with the reason attached to the answer. |
 | `workflow_options` | dict | `{}` | Per-workflow tuning, keyed by workflow name, merged over that workflow's defaults. Callers may override any key per request. |
 
 **The key never lands in config.** Both routes are indirections: an
 environment variable *name* here, or a runtime token in the browser. Nothing
 in this file is a secret.
 
-The `agentic` workflow is a LangGraph state graph (plan → retrieve → expand →
-grade → synthesize → verify) and needs the optional extra:
+The `agentic` workflow is a LangGraph state graph (classify → plan → retrieve →
+expand → grade → synthesize → verify) and needs the optional extra:
 
 ```bash
 pip install 'syncsage[agent]'
@@ -335,11 +335,23 @@ pip install 'syncsage[agent]'
 assistant:
   workflow: agentic
   workflow_options:
-    agentic:
-      max_rounds: 3
-      retrieval_modes: [hybrid, vector, graph]
-      expand_depth: 2
+    intent: auto            # auto | knowledge | procedural
+    max_rounds: 3
+    retrieval_modes: [hybrid, vector, graph]
+    expand_depth: 2
+    passage_chars: 6000     # how much of each cited file the model sees
 ```
+
+`classify` reads the question as a **knowledge summary** ("what does this
+repository do") or a **procedural** one ("how do I use this tool") and shifts
+retrieval, the sufficiency bar and the answering prompt to match — breadth
+over depth for the first, depth and real code examples for the second.
+`knowledge-summary` is the same graph with that reading pinned. See
+[Customize the question-answering workflow](how-to/agent-workflows.md).
+
+Both workflows send the model whole **files**, rebuilt from their chunks with
+line spans and metadata, rather than the 500-character search preview. Code and
+config are never excerpted; large prose is cut to the matched neighbourhood.
 
 Third-party workflows register under the `syncsage.agent_workflows`
 entry-point group, the same plugin shape as the

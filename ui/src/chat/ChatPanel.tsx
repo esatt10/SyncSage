@@ -3,28 +3,30 @@ import type { KeyboardEvent } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { AssistantStatus, ChatAnswer } from "../api/types";
+import { useSession } from "../state/session";
 import { AnswerBody } from "./AnswerBody";
 import { SourceStrip } from "./SourceStrip";
 
-export interface ChatTurn {
-  id: string;
-  question: string;
-  answer?: ChatAnswer;
-  error?: string;
-}
+export type { ChatTurn } from "../state/session";
 
 interface ChatPanelProps {
   status?: AssistantStatus;
   sessionId: string | null;
-  /** Restrict retrieval to one source, or null for the whole knowledge base. */
-  sourceFilter: string | null;
-  /** Per-request workflow override, or null to use the configured default. */
-  workflow: string | null;
   hasContent: boolean;
-  onAnswer: (answer: ChatAnswer) => void;
   onCitationClick: (nodeId: string | undefined) => void;
   onConnectModel: () => void;
 }
+
+/** Workflow step names, said the way a person would say them. */
+const STEP_LABELS: Record<string, string> = {
+  plan: "Planning the search…",
+  retrieve: "Searching your sources…",
+  expand: "Following links in the graph…",
+  grade: "Checking the evidence…",
+  replan: "Evidence was thin — searching again…",
+  synthesize: "Writing the answer…",
+  verify: "Verifying citations…",
+};
 
 const SUGGESTIONS = [
   "What is this knowledge base about?",
@@ -35,42 +37,41 @@ const SUGGESTIONS = [
 export function ChatPanel({
   status,
   sessionId,
-  sourceFilter,
-  workflow,
   hasContent,
-  onAnswer,
   onCitationClick,
   onConnectModel,
 }: ChatPanelProps) {
-  const [turns, setTurns] = useState<ChatTurn[]>([]);
-  const [draft, setDraft] = useState("");
+  // The conversation, the draft and the retrieval scope live in the session
+  // store, so leaving for Sources or Settings and coming back finds the thread
+  // exactly where it was — including a half-typed question.
+  const { state, dispatch } = useSession();
+  const { turns, draft, sourceFilter, workflow } = state;
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Live workflow steps for the in-flight question. Local, not session state:
+  // they describe one request and are meaningless once it resolves.
+  const [progress, setProgress] = useState<{ name: string; detail: string }[]>([]);
 
   const ask = useMutation({
-    mutationFn: (question: string) =>
-      api.chat({
-        question,
-        session_id: sessionId,
-        source_name: sourceFilter,
-        workflow,
-      }),
-    onSuccess: (answer, question) => {
-      setTurns((prev) =>
-        prev.map((turn) =>
-          turn.question === question && !turn.answer && !turn.error ? { ...turn, answer } : turn,
-        ),
+    mutationFn: (question: string) => {
+      setProgress([]);
+      return api.chatStream(
+        {
+          question,
+          session_id: sessionId,
+          source_name: sourceFilter,
+          workflow,
+        },
+        (step) => setProgress((prev) => [...prev, { name: step.name, detail: step.detail }]),
       );
-      onAnswer(answer);
+    },
+    onSuccess: (answer, question) => {
+      setProgress([]);
+      dispatch({ type: "answered", question, answer });
     },
     onError: (error: Error, question) => {
-      setTurns((prev) =>
-        prev.map((turn) =>
-          turn.question === question && !turn.answer && !turn.error
-            ? { ...turn, error: error.message }
-            : turn,
-        ),
-      );
+      setProgress([]);
+      dispatch({ type: "ask-failed", question, error: error.message });
     },
   });
 
@@ -82,8 +83,7 @@ export function ChatPanel({
   const submit = (text: string) => {
     const question = text.trim();
     if (!question || ask.isPending) return;
-    setTurns((prev) => [...prev, { id: `${Date.now()}-${prev.length}`, question }]);
-    setDraft("");
+    dispatch({ type: "ask", id: `${Date.now()}-${turns.length}`, question });
     if (textareaRef.current) textareaRef.current.style.height = "auto";
     ask.mutate(question);
   };
@@ -141,10 +141,28 @@ export function ChatPanel({
               <div className="msg">
                 <span className="thinking">
                   <span className="spinner" />{" "}
-                  {workflow === "simple"
-                    ? "Searching your sources…"
-                    : "Planning, searching and checking the evidence…"}
+                  {progress.length > 0
+                    ? STEP_LABELS[progress[progress.length - 1].name] ??
+                      progress[progress.length - 1].name
+                    : workflow === "simple"
+                      ? "Searching your sources…"
+                      : "Planning the search…"}
                 </span>
+                {progress.length > 0 ? (
+                  <ol className="progress">
+                    {progress.map((step, index) => (
+                      <li
+                        key={`${step.name}-${index}`}
+                        className={index === progress.length - 1 ? "progress__now" : undefined}
+                      >
+                        <span className="progress__name">
+                          {STEP_LABELS[step.name] ?? step.name}
+                        </span>
+                        <span className="progress__detail">{step.detail}</span>
+                      </li>
+                    ))}
+                  </ol>
+                ) : null}
               </div>
             )}
           </div>
@@ -161,7 +179,7 @@ export function ChatPanel({
               sourceFilter ? `Ask about ${sourceFilter}…` : "Ask anything about your sources…"
             }
             onChange={(event) => {
-              setDraft(event.target.value);
+              dispatch({ type: "set-draft", text: event.target.value });
               const el = event.target;
               el.style.height = "auto";
               el.style.height = `${Math.min(el.scrollHeight, 160)}px`;

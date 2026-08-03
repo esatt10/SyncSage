@@ -39,10 +39,16 @@ SyncSage owns the generated `SyncSage/` folder inside the vault. User-authored n
 /vault/SyncSage/
   Index.md
   Sources/
-  Concepts/
   Files/
   Chunks/
 ```
+
+!!! note "No `Concepts/` folder since 2026-08-03"
+    Concept extraction was retired (see `docs/graph_model.md`), so the vault no
+    longer projects a Concepts folder or the backlinks into it. On a real
+    corpus that folder held 141,529 notes for terms like "limit" and "request
+    info" — navigation that led nowhere. Source and file notes still link the
+    documents they index, which is the projection people actually walk.
 
 ## Note types
 

@@ -1,8 +1,26 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import CytoscapeComponent from "react-cytoscapejs";
-import type { Core } from "cytoscape";
+import cytoscape, { type Core } from "cytoscape";
+// @ts-expect-error -- cytoscape-elk ships no type declarations
+import elk from "cytoscape-elk";
 import type { GraphLink, GraphNode } from "../api/types";
 import { buildStylesheet, type ShapeAlgorithm, toElements } from "./graphStyles";
+
+// Kamada-Kawai arrives through ELK's `stress` algorithm, which *is* stress
+// majorization — the same objective KK minimizes (edge lengths proportional
+// to graph-theoretic distance). There is no `cytoscape-kamada-kawai` package;
+// the alternative was hand-rolling all-pairs shortest paths plus the descent,
+// which is a lot of unverifiable numerics for a layout you judge by eye.
+let elkRegistered = false;
+if (!elkRegistered) {
+  try {
+    cytoscape.use(elk);
+    elkRegistered = true;
+  } catch {
+    // Already registered (hot reload) — harmless.
+    elkRegistered = true;
+  }
+}
 
 interface GraphCanvasProps {
   nodes: GraphNode[];
@@ -11,10 +29,15 @@ interface GraphCanvasProps {
   focusIds: string[];
   /** Nodes cited by the current answer — outlined so prose maps to graph. */
   citedIds?: string[];
+  /** Hop distance from the center, used to ring the canvas by nearness. */
+  depths?: Record<string, number>;
   layoutName: string;
   spacing: number;
   shapeAlgorithm: ShapeAlgorithm;
-  onSelect: (nodeId: string) => void;
+  /** `null` when the background was tapped — a deselect, not a reset. */
+  onSelect: (nodeId: string | null) => void;
+  /** Double-tap: make this node the center the horizon is measured from. */
+  onRecenter?: (nodeId: string) => void;
 }
 
 const FORCE_LAYOUT_ELEMENT_LIMIT = 1000;
@@ -25,18 +48,21 @@ export function GraphCanvas({
   selectedId,
   focusIds,
   citedIds = [],
+  depths,
   layoutName,
   spacing,
   shapeAlgorithm,
   onSelect,
+  onRecenter,
 }: GraphCanvasProps) {
   const cyRef = useRef<Core | null>(null);
   const onSelectRef = useRef(onSelect);
+  const onRecenterRef = useRef(onRecenter);
   const listenerBoundRef = useRef(false);
   const selectedRef = useRef<string | null>(null);
   const elements = useMemo(
-    () => toElements(nodes, links, shapeAlgorithm),
-    [nodes, links, shapeAlgorithm],
+    () => toElements(nodes, links, shapeAlgorithm, depths),
+    [nodes, links, shapeAlgorithm, depths],
   );
   const stylesheet = useMemo(() => buildStylesheet(), []);
   const layout = useMemo(
@@ -48,7 +74,8 @@ export function GraphCanvas({
 
   useEffect(() => {
     onSelectRef.current = onSelect;
-  }, [onSelect]);
+    onRecenterRef.current = onRecenter;
+  }, [onSelect, onRecenter]);
 
   // Re-run layout whenever the element set changes (e.g. a sub-network is added).
   useEffect(() => {
@@ -102,6 +129,8 @@ export function GraphCanvas({
     if (!cy) return;
     const previous = selectedRef.current;
     if (previous) cy.getElementById(previous).removeClass("selected");
+    // Deselecting must not move the camera: the view you were looking at is
+    // the thing you were keeping.
     if (selectedId) {
       const node = cy.getElementById(selectedId);
       node.addClass("selected");
@@ -129,6 +158,19 @@ export function GraphCanvas({
           if (listenerBoundRef.current) return;
           listenerBoundRef.current = true;
           cy.on("tap", "node", (event) => onSelectRef.current(event.target.id()));
+          // Tapping empty canvas clears the selection and nothing else. Before
+          // this the only way out of a selection was "Clear", which also reset
+          // the depth, the center and the answer filter — so putting a node
+          // down meant losing the view you had navigated to.
+          cy.on("tap", (event) => {
+            if (event.target === cy) onSelectRef.current(null);
+          });
+          // Double-tap re-aims the horizon at that node — the fastest way to
+          // walk a large graph without ever drawing all of it.
+          // Both spellings: Cytoscape emits `dblclick` for a mouse and
+          // `dbltap` for touch, and the reducer is idempotent if both land.
+          cy.on("dblclick", "node", (event) => onRecenterRef.current?.(event.target.id()));
+          cy.on("dbltap", "node", (event) => onRecenterRef.current?.(event.target.id()));
         }}
       />
     </div>
@@ -159,6 +201,21 @@ function layoutOptions(
       gravity: 0.35,
       numIter: 1200,
       padding,
+    };
+  }
+  if (name === "kamada-kawai") {
+    // Stress majorization: edge lengths track graph distance, so clusters
+    // separate and long paths read as long. Slower than cose and worth it on
+    // a horizon-sized graph, which is what the canvas draws.
+    return {
+      name: "elk",
+      animate: false,
+      padding,
+      elk: {
+        algorithm: "stress",
+        "elk.stress.desiredEdgeLength": Math.round(120 * spacing),
+        "elk.stress.epsilon": 0.0001,
+      },
     };
   }
   if (name === "concentric") {

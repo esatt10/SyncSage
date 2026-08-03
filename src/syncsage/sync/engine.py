@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -24,6 +25,7 @@ from syncsage.persistence.manifest import ManifestStore
 from syncsage.persistence.paths import StatePaths
 from syncsage.persistence.state_store import StateStore
 from syncsage.registry.source_registry import SourceRegistry
+from syncsage.search.node_index import NodeIndex
 from syncsage.search.vector_store import (
     VectorSearcher,
     vector_indexer_from_config,
@@ -31,7 +33,17 @@ from syncsage.search.vector_store import (
 from syncsage.synapse.events import EventStream, RouterWebhook
 from syncsage.synapse.publisher import ContractPublisher
 from syncsage.sync.connectors import ConnectorItem, ItemNotModified, connector_for_source
+from syncsage.sync.fingerprint import (
+    EMBEDDING_SCOPE,
+    SOURCE_SCOPE,
+    embedding_change,
+    embedding_fingerprint,
+    source_fingerprint,
+)
 from syncsage.sync.locks import EngineLease, source_lock
+from syncsage.sync.pacing import serve_yield
+
+logger = logging.getLogger(__name__)
 
 SyncMode = Literal["incremental", "full", "validate_only", "repair"]
 SYNC_MODES = {"incremental", "full", "validate_only", "repair"}
@@ -115,21 +127,260 @@ class SyncEngine:
             config.synapse.router_url,
             timeout=config.synapse.webhook_timeout_seconds,
         )
+        # Mid-sync graph checkpointing (see _maybe_checkpoint_graph).
+        self._graph_dirty = False
+        self._last_checkpoint = time.monotonic()
+        self._last_save_seconds = 0.0
+        # Derived full-text index over graph nodes, so graph search does not
+        # have to scan the graph. Built from the graph, never authoritative.
+        self.node_index = NodeIndex(self.state)
 
     def close(self) -> None:
-        """Release the writer lease and close the state store."""
+        """Persist in-flight graph work, release the lease, close the store.
+
+        Called from the server's shutdown path, so `docker compose stop`
+        keeps whatever the running sync had built instead of discarding it.
+        """
+        try:
+            self.checkpoint_graph()
+        except Exception as exc:  # pragma: no cover - shutdown must not raise
+            logger.warning("Could not checkpoint graph on shutdown: %s", exc)
         self.lease.release()
         self.state.close()
 
+    def checkpoint_graph(
+        self,
+        source_name: str | None = None,
+        manifest: dict | None = None,
+    ) -> bool:
+        """Persist in-flight sync work now. True if anything was written.
+
+        The manifest goes with the graph: it is what an incremental pass reads
+        to decide a file is unchanged, so checkpointing one without the other
+        would still make a resumed sync re-read everything.
+        """
+
+        if not self._graph_dirty:
+            return False
+        if source_name and manifest is not None:
+            self.manifests.save(source_name, manifest)
+        self.flush_node_index()
+        started = time.monotonic()
+        self.graph_store.save(self.config.knowledge_base_id, self.graph_builder.graph)
+        self._last_save_seconds = time.monotonic() - started
+        self._graph_dirty = False
+        self._last_checkpoint = time.monotonic()
+        return True
+
+    def reload_graph(self) -> int:
+        """Re-read the graph from /state, e.g. after a worker process synced.
+
+        The server does not index (see :mod:`syncsage.sync.worker`), so this is
+        how a freshly-indexed graph reaches the process that is serving it.
+        Reading a compressed graph is cheap; the swap is atomic from a
+        reader's point of view because the new graph replaces the reference in
+        one assignment.
+        """
+
+        loaded = self.graph_store.load(self.config.knowledge_base_id)
+        if not len(loaded):
+            return 0
+        self.graph_builder.graph = loaded
+        # The index on disk was written by the worker for this same graph, so
+        # nothing is owed; drop the delta the load itself generated.
+        loaded.take_index_delta()
+        self.node_index._populated = False
+        logger.info("Reloaded graph from state: %d nodes", loaded.number_of_nodes())
+        return loaded.number_of_nodes()
+
+    #: Above this many changed nodes, rebuild the FTS index wholesale instead
+    #: of deleting each stale row individually. `node_id` on graph_nodes_fts
+    #: is UNINDEXED (it's read-only lookup data, not searched), so a batched
+    #: `DELETE ... WHERE node_id IN (...)` against it has no index to use and
+    #: degrades to a table scan per batch. Measured: concept-node
+    #: reconciliation removing ~387k of 543k nodes stalled for 10+ minutes
+    #: going through the per-row delete path; `replace_all` (one unfiltered
+    #: DELETE + bulk INSERT) is the cheap way to apply a change this size.
+    _INDEX_REBUILD_THRESHOLD = 20_000
+
+    def flush_node_index(self) -> int:
+        """Push pending node writes into the search index. Never fatal.
+
+        The index is derived from the graph, so a failure here costs query
+        speed until the next flush or rebuild — never correctness, and never
+        a failed sync.
+        """
+
+        try:
+            upserts, removals = self.graph_builder.graph.take_index_delta()
+            if not upserts and not removals:
+                return 0
+            if len(upserts) + len(removals) > self._INDEX_REBUILD_THRESHOLD:
+                return self.rebuild_node_index()
+            return self.node_index.apply(upserts, removals)
+        except Exception as exc:  # pragma: no cover - cache maintenance
+            logger.warning("Could not update the graph node index: %s", exc)
+            return 0
+
+    def rebuild_node_index(self) -> int:
+        """Rebuild the whole index from the in-memory graph."""
+
+        graph = self.graph_builder.graph
+        rows = graph.index_rows()
+        written = self.node_index.replace_all(rows)
+        # Everything pending is now represented.
+        graph.take_index_delta()
+        logger.info("Graph node index rebuilt: %d nodes", written)
+        return written
+
+    def ensure_node_index(self) -> int:
+        """Build the index if it is missing, e.g. after an upgrade.
+
+        Cheap when it already exists: one COUNT.
+        """
+
+        graph = self.graph_builder.graph
+        if graph.number_of_nodes() <= 1:
+            return 0
+        if self.node_index.count() > 0:
+            self.flush_node_index()
+            return 0
+        return self.rebuild_node_index()
+
+    def _maybe_checkpoint(self, source_name: str, manifest: dict) -> None:
+        """Checkpoint at most once per configured interval during a sync.
+
+        Time-based rather than every-N-artifacts: the cost of a save scales
+        with graph size, not with how many artifacts went into it, so a fixed
+        count would checkpoint far too often on a large graph.
+        """
+
+        self._graph_dirty = True
+        interval = float(getattr(self.config.storage, "graph_checkpoint_seconds", 0) or 0)
+        if interval <= 0:
+            return
+        # Self-throttling: a checkpoint costs whatever the graph costs to
+        # serialize, and that grows with the index. Spacing checkpoints at
+        # ten times the last save keeps their overhead near 10% of the sync
+        # no matter how large the graph gets — a fixed interval eventually
+        # means a sync that spends most of its time saving.
+        interval = max(interval, self._last_save_seconds * 10)
+        if time.monotonic() - self._last_checkpoint < interval:
+            return
+        try:
+            self.checkpoint_graph(source_name, manifest)
+        except Exception as exc:  # a checkpoint hiccup must not fail the sync
+            logger.warning("Checkpoint failed (continuing): %s", exc)
+
     def startup(self) -> list[SyncResult]:
+        """Bring a restarted container back to a serving state.
+
+        The expensive work (reading files, chunking, embedding) has already
+        happened and lives in /state, so a restart over unchanged content and
+        an unchanged config is close to free. Only two things can be stale,
+        and each is repaired the cheap way:
+
+        * the vector space, if the embedding config changed — re-embedded from
+          the chunks already in SQLite, without re-reading a single file;
+        * the graph, if a sync was interrupted before its last checkpoint —
+          healed by a repair pass that re-reads only the artifacts actually
+          missing from it.
+        """
+
         self.paths.ensure()
         self.state.migrate()
         SourceRegistry(self.config, self.state).initialize()
+        self.reconcile_embeddings()
+        self.ensure_node_index()
         results = []
         for source in self.config.sources:
             if source.enabled and source.sync.on_startup:
-                results.append(self.sync_source(source.name, "incremental"))
+                mode: SyncMode = "incremental"
+                # Unconditional: a graph missing artifacts SQLite already has
+                # is never a state anyone wants served, and repair is the
+                # cheap fix (re-reads only what is missing, re-embeds nothing).
+                if self._graph_gap(source.name):
+                    logger.info(
+                        "Source %s has indexed artifacts missing from the graph "
+                        "(interrupted sync?) — repairing instead of re-indexing",
+                        source.name,
+                    )
+                    mode = "repair"
+                results.append(self.sync_source(source.name, mode))
         return results
+
+    def reconcile_embeddings(self) -> dict:
+        """Align the vector store with the current embedding config.
+
+        Returns a small report; a no-op transition reports ``embedded: 0`` and
+        makes no embedder call, so an unchanged restart costs nothing.
+        """
+
+        current = embedding_fingerprint(self.config)
+        previous = self.state.get_fingerprint(EMBEDDING_SCOPE)
+        change = embedding_change(previous, current)
+        report = {"change": change, "embedded": 0, "dropped": False}
+
+        if change in {"none", "disabled"} or self.vectors is None:
+            # "disabled" still records the transition, so turning embeddings
+            # back on later is recognised as a return to a known space rather
+            # than a fresh introduction.
+            if change != "none":
+                self.state.set_fingerprint(EMBEDDING_SCOPE, current, utc_now())
+            return report
+
+        # "invalidated" = a different model/dimension/store: the old vectors
+        # are not comparable with new ones and must go. "introduced" = chunks
+        # exist but were never embedded; keep whatever is there and fill in.
+        drop_existing = change == "invalidated"
+        logger.info(
+            "Embedding config %s — re-embedding from stored chunks (drop_existing=%s)",
+            change,
+            drop_existing,
+        )
+        report["dropped"] = drop_existing
+        report["embedded"] = self.rebuild_vectors(drop_existing=drop_existing)
+        self.state.set_fingerprint(EMBEDDING_SCOPE, current, utc_now())
+        return report
+
+    def rebuild_vectors(self, drop_existing: bool = False) -> int:
+        """Embed everything already indexed, without re-reading any source.
+
+        The text is already in SQLite and chunk ids are content-addressed, so
+        this is both cheaper than a re-scan and idempotent: a second run makes
+        zero embedder calls.
+        """
+
+        if self.vectors is None:
+            return 0
+        if drop_existing:
+            for row in self.state.rows("SELECT DISTINCT source_id FROM artifacts"):
+                self.vectors.prune_source(str(row["source_id"]), set())
+        embedded = 0
+        for artifact in self.state.rows("SELECT id, source_id FROM artifacts ORDER BY id"):
+            chunks = self.state.rows(
+                "SELECT id, text, text_hash FROM chunks WHERE artifact_id=? ORDER BY chunk_index",
+                (artifact["id"],),
+            )
+            if not chunks:
+                continue
+            embedded += self.vectors.index_artifact(
+                str(artifact["source_id"]),
+                str(artifact["id"]),
+                [dict(chunk) for chunk in chunks],
+            )
+        return embedded
+
+    def _graph_gap(self, source_name: str) -> bool:
+        """True when SQLite has artifacts the loaded graph does not know about."""
+
+        graph = self.graph_builder.graph
+        for row in self.state.rows(
+            "SELECT id FROM artifacts WHERE source_id=? LIMIT 2000", (source_name,)
+        ):
+            if not graph.has_node(str(row["id"])):
+                return True
+        return False
 
     def sync_all(
         self,
@@ -165,6 +416,21 @@ class SyncEngine:
         source = self.config.effective_source(
             self._source(source_name), max_depth=max_depth, full_scan=full_scan
         )
+        # A container restart must never re-index by itself, but a config edit
+        # that changes what the content pipeline produces must. Compare what
+        # this source was last indexed with against what it is configured with
+        # now; only a real difference escalates to a full pass.
+        fingerprint = source_fingerprint(source)
+        previous_fingerprint = self.state.get_fingerprint(SOURCE_SCOPE.format(name=source.name))
+        config_changed = previous_fingerprint is not None and previous_fingerprint != fingerprint
+        if config_changed and mode in {"incremental", "repair"}:
+            logger.info(
+                "Source %s config changed since it was indexed (globs/chunking) — "
+                "escalating %s sync to full",
+                source.name,
+                mode,
+            )
+            mode = "full"
         self.lease.acquire()
         # Test-only hook (Synapse 21.2 crash-safety tests): widens the window
         # between per-artifact writes so a kill -9 can land mid-sync.
@@ -251,6 +517,7 @@ class SyncEngine:
             fetched = 0
             transfer_skipped = 0
             embedded_chunks = 0
+            changed_ids: set[str] = set()
             git_metadata = git_state(source.path) if source.type.value == "repository" else None
             for item in items:
                 previous = artifacts.get(item.relative_path)
@@ -348,6 +615,16 @@ class SyncEngine:
                     "git_commit": parsed.git_commit,
                 }
                 indexed += 1
+                changed_ids.add(parsed.id)
+                # Let anything waiting on the API get a turn before the next
+                # file. Without this a long index makes the UI unusable.
+                serve_yield()
+                # Checkpoint mid-run. Without this the graph and the manifest
+                # only reach /state when a sync *finishes*, so stopping the
+                # container an hour into a first index threw that hour away:
+                # the next start re-read every file (stale manifest) and
+                # rebuilt the whole graph.
+                self._maybe_checkpoint(source.name, manifest)
                 if slow_sync_s:
                     time.sleep(slow_sync_s)
             pruned_vectors = 0
@@ -361,17 +638,54 @@ class SyncEngine:
                     )
                 }
                 pruned_vectors = self.vectors.prune_source(source.name, live_chunk_ids)
-            self.graph_builder.add_similarity_edges(source.name)
-            # Synapse 21.6B: global cross-source edge pass. Resolves python
-            # imports / document links whose targets land in a *different*
-            # source into imports/references edges. Runs over the whole
-            # accumulated graph (sources sync independently) and is idempotent
-            # via edge upsert, so re-sync produces an identical graph.
-            self.graph_builder.add_cross_source_edges()
+            # Global enrichment is proportional to the whole graph, not to what
+            # changed — so it only runs when something actually changed. A
+            # scheduled sync over untouched content used to re-derive every
+            # similarity pair and re-scan every edge on each beat, which is
+            # what pinned a container's CPU while indexing nothing.
+            if indexed or mode == "full":
+                self.graph_builder.add_similarity_edges(
+                    source.name,
+                    # A full pass rebuilt this source from scratch, so every
+                    # pair is genuinely new; an incremental one only needs the
+                    # artifacts it rewrote.
+                    changed_ids=None if mode == "full" else changed_ids,
+                )
+                # Synapse 21.6B: global cross-source edge pass. Resolves python
+                # imports / document links whose targets land in a *different*
+                # source into imports/references edges. Runs over the whole
+                # accumulated graph (sources sync independently) and is
+                # idempotent via edge upsert, so re-sync produces an identical
+                # graph.
+                self.graph_builder.add_cross_source_edges()
+                # Keep only the concepts that connect something. Runs last so
+                # similarity (which reads concept_terms off artifact nodes,
+                # not concept nodes) is unaffected.
+                pruned = self.graph_builder.reconcile_concepts(
+                    self.state,
+                    min_documents=int(self.config.graph.concept_min_documents),
+                    changed_ids=changed_ids,
+                )
+                if pruned["removed"] or pruned["restored"]:
+                    logger.info(
+                        "Concepts reconciled: kept=%s removed=%s restored=%s",
+                        pruned["kept"],
+                        pruned["removed"],
+                        pruned["restored"],
+                    )
             manifest["last_indexed_at"] = utc_now()
             manifest["connector"] = {"type": connector.connector_type}
             self.manifests.save(source.name, manifest)
+            self.flush_node_index()
             self.graph_store.save(self.config.knowledge_base_id, self.graph_builder.graph)
+            self._graph_dirty = False
+            self._last_checkpoint = time.monotonic()
+            # Recorded only after the pass succeeded, so a sync that dies
+            # halfway is retried rather than being remembered as "done with
+            # this config".
+            self.state.set_fingerprint(
+                SOURCE_SCOPE.format(name=source.name), fingerprint, utc_now()
+            )
             # Synapse 21.6A: compressed timestamped graph snapshots + retention.
             # Additive history beside graph.latest.json, throttled by the
             # configured interval and bounded by max_state_size_gb. Fail-soft so
@@ -678,6 +992,16 @@ class SyncEngine:
         for source in self.config.sources:
             if source.name == name:
                 return source
+        # Sources added at runtime (the UI's quick-add, POST /sources) live in
+        # the state registry, not the config file. Reading them back is what
+        # lets a *different process* — the sync worker, or the CLI — index a
+        # source that was never written to YAML.
+        row = self.state.get_source(name)
+        if row and row.get("config_json"):
+            payload = json.loads(row["config_json"])
+            resolved = SyncSageConfig.model_validate({"sources": [payload]}).sources[0]
+            self.config.sources.append(resolved)
+            return resolved
         raise KeyError(f"Unknown source: {name}")
 
     def _can_skip_before_read(
@@ -705,6 +1029,11 @@ class SyncEngine:
             return True
         state = self.state.artifact_state(source_id, artifact_id)
         if state is None:
+            return True
+        # A node missing from the graph is as broken as a missing chunk row —
+        # it is the case an interrupted sync leaves behind, and it is what
+        # makes "repair" cheaper than "index it all again".
+        if not self.graph_builder.graph.has_node(artifact_id):
             return True
         return (
             state.get("sha256") != sha256

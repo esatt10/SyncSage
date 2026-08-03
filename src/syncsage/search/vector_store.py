@@ -54,6 +54,7 @@ import logging
 import os
 import re
 import struct
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from urllib.request import Request, urlopen
@@ -239,6 +240,22 @@ class NumpyVectorStore:
         self.path = self.directory / "index.json"
         self._cache: dict[str, dict[str, Any]] | None = None
         self._cache_sig: tuple[int, int] | None = None
+        # Decoded (ids, matrix, norms) built from `_cache`. Every vector is
+        # stored base64-encoded, and decoding it is a pure-Python loop
+        # (base64.b64decode + struct.unpack per item) that does not release
+        # the GIL between iterations -- so without caching the *decoded*
+        # form, every concurrent search() call redid the full decode from
+        # scratch, and the GIL serialized that CPU-bound work across
+        # threads regardless of how many search() calls ran "concurrently".
+        # Measured: an agentic retrieve step fanning out 4 concurrent
+        # searches against a 7,463-chunk index took 21-29s (~5-7s each) --
+        # almost entirely this decode, not the embedding API call or the
+        # actual similarity math (a real numpy matmul over an already-
+        # decoded matrix is fast). Keyed off the same file signature as
+        # `_cache`, so it invalidates exactly when the raw JSON cache does.
+        self._matrix_cache: tuple[list[str], Any, Any] | None = None
+        self._matrix_sig: tuple[int, int] | None = None
+        self._matrix_lock = threading.Lock()
 
     # -- persistence -------------------------------------------------
 
@@ -314,27 +331,63 @@ class NumpyVectorStore:
             self._save(items)
         return removed
 
-    def search(self, query_vec: list[float], k: int) -> list[tuple[str, float, dict[str, Any]]]:
+    def _decoded_matrix(self) -> tuple[list[str], Any, Any] | None:
+        """The whole index as ``(ids, matrix, norms)``, decoded once per file version.
+
+        `_items()` already avoids re-reading the file when it hasn't changed;
+        this avoids redoing the (much more expensive) per-vector decode and
+        the full-matrix norm computation on every call. The check-then-build
+        is locked so N threads racing in on a cold/stale cache build it once,
+        not N times; once built, `self._matrix_cache` is only ever replaced by
+        a fresh atomic assignment (never mutated in place), so reads of an
+        already-built cache need no lock.
+        """
+
         items = self._items()
-        if not items or k < 1:
+        if not items:
+            return None
+        cached = self._matrix_cache
+        if cached is not None and self._matrix_sig == self._cache_sig:
+            return cached
+        with self._matrix_lock:
+            # Re-check: another thread may have just finished building it
+            # while this one was waiting for the lock.
+            if self._matrix_cache is not None and self._matrix_sig == self._cache_sig:
+                return self._matrix_cache
+            ids = list(items)
+            matrix = np.stack([self._decode(items[chunk_id]["v"]) for chunk_id in ids])
+            norms = np.linalg.norm(matrix, axis=1)
+            norms[norms == 0.0] = 1.0
+            built = (ids, matrix, norms)
+            self._matrix_cache = built
+            self._matrix_sig = self._cache_sig
+            return built
+
+    def search(self, query_vec: list[float], k: int) -> list[tuple[str, float, dict[str, Any]]]:
+        decoded = self._decoded_matrix()
+        if decoded is None or k < 1:
             return []
+        ids, matrix, norms = decoded
         query = np.asarray(query_vec, dtype=np.float64)
         query_norm = float(np.linalg.norm(query))
         if query_norm == 0.0:
             return []
-        ids = list(items)
-        matrix = np.stack([self._decode(items[chunk_id]["v"]) for chunk_id in ids])
         if matrix.shape[1] != query.shape[0]:
             raise ValueError(
                 f"Vector dimension mismatch: index has {matrix.shape[1]}, query has "
                 f"{query.shape[0]}. Re-sync with mode=full after changing embedding settings."
             )
-        norms = np.linalg.norm(matrix, axis=1)
-        norms[norms == 0.0] = 1.0
         similarities = (matrix @ query) / (norms * query_norm)
         order = np.argsort(-similarities)[:k]
+        # A second `_items()` call: writes to this store only ever happen
+        # from the separate sync-worker process (never from this one), so an
+        # id vanishing between the two calls in this process is not possible
+        # in practice -- `.get()` here is defensive-in-depth, not a race this
+        # process can trigger on its own.
+        items = self._items()
         return [
-            (ids[i], float(similarities[i]), dict(items[ids[i]].get("payload", {}))) for i in order
+            (ids[i], float(similarities[i]), dict(items.get(ids[i], {}).get("payload", {})))
+            for i in order
         ]
 
     def count(self) -> int:
@@ -537,10 +590,32 @@ class VectorIndexer:
 class VectorSearcher:
     """Query-time vector candidates in the SearchStore result shape."""
 
+    #: Recent query embeddings, newest last. A vector query spends most of its
+    #: time waiting on the embedding provider, and the same question gets asked
+    #: repeatedly — re-running a search, an agent loop retrying with the same
+    #: sub-query, a user refining one word. Small and per-process on purpose:
+    #: this is a latency cache, not a store.
+    _QUERY_CACHE_SIZE = 256
+
     def __init__(self, embedder: Embedder, store: VectorStore, state: StateStore):
         self.embedder = embedder
         self.store = store
         self.state = state
+        self._query_cache: dict[str, list[float]] = {}
+
+    def embed_query(self, query: str) -> list[float]:
+        """Embed a query, reusing a recent identical one."""
+
+        cached = self._query_cache.get(query)
+        if cached is not None:
+            return cached
+        vector = self.embedder.embed([query])[0]
+        if len(self._query_cache) >= self._QUERY_CACHE_SIZE:
+            # Plain FIFO eviction: dicts keep insertion order, and at this size
+            # the difference between FIFO and LRU is not worth the bookkeeping.
+            self._query_cache.pop(next(iter(self._query_cache)), None)
+        self._query_cache[query] = vector
+        return vector
 
     def search(
         self,
@@ -550,7 +625,7 @@ class VectorSearcher:
     ) -> list[dict[str, Any]]:
         if not (query or "").strip():
             return []
-        query_vec = self.embedder.embed([query])[0]
+        query_vec = self.embed_query(query)
         if not any(query_vec):
             return []
         fetch = max_results * 4 if source_name else max_results

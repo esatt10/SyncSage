@@ -28,6 +28,7 @@ def search_graph(
     max_results: int = 10,
     source_name: str | None = None,
     include_relationships: bool = True,
+    node_index: Any = None,
 ) -> list[dict[str, Any]]:
     """Search across graph nodes, relationships and their attributes.
 
@@ -43,13 +44,42 @@ def search_graph(
         return []
 
     node_hits: list[tuple[float, dict[str, Any]]] = []
-    for node_id, attrs in graph.nodes(data=True):
-        if source_name and attrs.get("source_id") != source_name:
-            continue
-        score, field = _node_score(attrs, tokens, q)
-        if score <= 0:
-            continue
-        node_hits.append((score, _node_result(node_id, attrs, score, field)))
+    # One lock hold for the whole scan, iterating live: the previous snapshot
+    # copied every node and edge before scoring a single one, which on a
+    # 240k-node graph was most of the query's latency.
+    # Ask the index which nodes could match. It returns None when it cannot
+    # answer (absent, empty, or FTS5 unavailable), and then — and only then —
+    # we fall back to scanning every node, which is correct but O(graph).
+    candidates = None
+    if node_index is not None:
+        candidates = node_index.candidates(tokens, source_name=source_name)
+
+    # One compiled alternation runs the reject inside the regex engine rather
+    # than as a Python loop per token per node — on a 400k-node graph that
+    # loop overhead was most of what remained of the query.
+    matcher = _reject_matcher(tokens, q)
+    with graph.reading():
+        blobs = graph.search_blobs()
+        walk = (
+            ((node_id, graph.nodes.get(node_id) or {}) for node_id in candidates)
+            if candidates is not None
+            else graph.iter_nodes()
+        )
+        for node_id, attrs in walk:
+            if not attrs:
+                continue
+            if source_name and attrs.get("source_id") != source_name:
+                continue
+            # Exact fast reject: scoring can only exceed zero when the query
+            # or one of its tokens appears somewhere in the node's text, and
+            # the blob is that text prepared once at write time.
+            blob = blobs.get(node_id)
+            if blob is not None and not _may_match(blob, tokens, q, matcher):
+                continue
+            score, field = _node_score(attrs, tokens, q)
+            if score <= 0:
+                continue
+            node_hits.append((score, _node_result(node_id, attrs, score, field)))
 
     node_hits.sort(key=lambda item: (-item[0], str(item[1].get("title") or "")))
     results = [hit for _, hit in node_hits[:max_results]]
@@ -65,6 +95,35 @@ def search_graph(
     return results
 
 
+def _reject_matcher(tokens: list[str], q: str) -> re.Pattern[str] | None:
+    """Alternation over the query terms, or None when there is nothing to match."""
+
+    terms = [re.escape(term) for term in {*tokens, q} if term]
+    if not terms:
+        return None
+    return re.compile("|".join(terms))
+
+
+def _may_match(
+    blob: str,
+    tokens: list[str],
+    q: str,
+    matcher: re.Pattern[str] | None = None,
+) -> bool:
+    """Could any field of this node score above zero? Cheap and exact.
+
+    ``_field_score`` returns 0 unless ``q`` or a token is a substring of the
+    field, so "nothing matches the whole blob" implies "nothing matches any
+    field" — rejecting here can never drop a hit the full scorer would keep.
+    """
+
+    if matcher is not None:
+        return matcher.search(blob) is not None
+    if q and q in blob:
+        return True
+    return any(token in blob for token in tokens)
+
+
 def _relationship_hits(
     graph: SimpleMultiDiGraph,
     tokens: list[str],
@@ -72,9 +131,24 @@ def _relationship_hits(
     source_name: str | None,
 ) -> list[tuple[float, dict[str, Any]]]:
     hits: list[tuple[float, dict[str, Any]]] = []
-    for (source, target), edge_map in graph._edges.items():
-        source_label = str(graph._nodes.get(source, {}).get("label") or source)
-        target_label = str(graph._nodes.get(target, {}).get("label") or target)
+    with graph.reading():
+        hits.extend(_scan_edges(graph, tokens, q, source_name))
+    return hits
+
+
+def _scan_edges(
+    graph: SimpleMultiDiGraph,
+    tokens: list[str],
+    q: str,
+    source_name: str | None,
+) -> list[tuple[float, dict[str, Any]]]:
+    """Score every edge. Caller holds ``reading()``."""
+
+    hits: list[tuple[float, dict[str, Any]]] = []
+    nodes = graph.node_map()
+    for (source, target), edge_map in graph.iter_edges():
+        source_label = str((nodes.get(source) or {}).get("label") or source)
+        target_label = str((nodes.get(target) or {}).get("label") or target)
         for _key, data in edge_map.items():
             if source_name and data.get("source_id") != source_name:
                 continue

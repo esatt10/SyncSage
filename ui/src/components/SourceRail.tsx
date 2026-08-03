@@ -16,11 +16,13 @@ export function SourceRail({
   selected,
   onSelect,
   onChanged,
+  onCollapse,
 }: {
   sources: SourceRecord[];
   selected: string | null;
   onSelect: (name: string | null) => void;
   onChanged: () => void;
+  onCollapse?: () => void;
 }) {
   const [adding, setAdding] = useState(false);
 
@@ -34,6 +36,16 @@ export function SourceRail({
       <header className="pane__header">
         <span className="pane__title">Sources</span>
         <div className="pane__actions">
+          {onCollapse ? (
+            <button
+              className="btn btn--small btn--icon"
+              onClick={onCollapse}
+              title="Collapse sources to give the graph and chat more room"
+              aria-label="Collapse sources"
+            >
+              ‹
+            </button>
+          ) : null}
           <button
             className="btn btn--small btn--primary"
             onClick={() => setAdding(true)}

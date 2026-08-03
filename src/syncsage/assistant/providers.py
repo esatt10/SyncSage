@@ -59,7 +59,15 @@ PROVIDERS: dict[str, ProviderSpec] = {
     "openai": ProviderSpec(
         id="openai",
         label="OpenAI",
-        default_model="gpt-4o-mini",
+        # Luna tier: enough headroom to actually read the whole-file context
+        # the assistant now assembles (see chat.hydrate_citations) and hold a
+        # dozen files in mind while writing one grounded answer — which the
+        # previous nano default could not, and which is where the answer
+        # quality on a large corpus is won. Model ids are per-account: a key
+        # that cannot see this one gets a 404 model_not_found, which the chat
+        # surface reports verbatim rather than silently substituting.
+        # Override with assistant.model.
+        default_model="gpt-5.6-luna",
         default_base_url="https://api.openai.com/v1",
         api_key_env="OPENAI_API_KEY",
         key_hint="sk-…",

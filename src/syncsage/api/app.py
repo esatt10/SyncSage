@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -36,6 +37,7 @@ from syncsage.security.path_policy import (
     resolve_under,
 )
 from syncsage.sync.engine import SyncEngine
+from syncsage.sync.fingerprint import EMBEDDING_SCOPE, embedding_fingerprint
 from syncsage.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -343,13 +345,30 @@ def _source_payload(
     return payload
 
 
+#: Edges expanded before anything else at each hop. `contains` is the
+#: directory/file hierarchy, and walking it first is what makes a bounded
+#: horizon show a *tree* rather than an arbitrary slice of a flat fan-out.
+HIERARCHY_EDGE_TYPES = ("contains",)
+
+
 def graph_neighbors(
     graph: SimpleMultiDiGraph,
     node_id: str,
     depth: int = 1,
     edge_types: list[str] | None = None,
+    max_nodes: int | None = None,
+    exclude_edge_types: set[str] | None = None,
+    exclude_node_types: set[str] | None = None,
 ) -> dict:
-    """Breadth-first neighbor expansion (mirrors SyncSageTools.get_graph_neighbors)."""
+    """Breadth-first neighbor expansion (mirrors SyncSageTools.get_graph_neighbors).
+
+    ``max_nodes`` stops the walk once that many neighbors are collected.
+    Callers that only keep the first N (the canvas asks for a bounded horizon)
+    must pass it: three hops off a hub node reaches most of the graph, and
+    enumerating all of it to then throw nearly all of it away is what made a
+    depth-3 slice take minutes. Truncation is in BFS order either way, so the
+    kept set is identical — only the work is smaller.
+    """
     if node_id not in graph:
         return {"node_id": node_id, "depth": depth, "neighbors": []}
     max_depth = max(1, min(int(depth or 1), 10))
@@ -358,15 +377,33 @@ def graph_neighbors(
     visited = {node_id}
     neighbors: list[dict] = []
     while queue:
+        if max_nodes is not None and len(neighbors) >= max_nodes:
+            break
         current, current_depth, path = queue.popleft()
         if current_depth >= max_depth:
             continue
-        for _source, target, edge_map in graph.out_edges(current):
+        # Hierarchy first. A source node carries an `indexes` shortcut to every
+        # one of its artifacts, so a plain fan-out spends the whole budget
+        # jumping straight to files and the directory tree between them never
+        # gets walked — the parent/child structure is present in the graph but
+        # invisible in any bounded view of it.
+        for _source, target, edge_map in _hierarchy_first(graph.out_edges(current)):
             matching = [
-                data for data in edge_map.values() if not allowed or data.get("type") in allowed
+                data
+                for data in edge_map.values()
+                if (not allowed or data.get("type") in allowed)
+                and not (exclude_edge_types and data.get("type") in exclude_edge_types)
             ]
             if not matching:
                 continue
+            # Types the caller hides are pruned here rather than after the
+            # fetch: a concept-heavy graph otherwise spends the entire budget
+            # on nodes the view is about to discard, and the structure the
+            # caller actually asked for never fits.
+            if exclude_node_types:
+                target_type = graph.nodes.get(target, {}).get("type")
+                if target_type in exclude_node_types:
+                    continue
             next_depth = current_depth + 1
             edge_type_values = sorted({data.get("type") for data in matching if data.get("type")})
             neighbors.append(
@@ -375,13 +412,32 @@ def graph_neighbors(
                     "depth": next_depth,
                     "edge_types": edge_type_values,
                     "path": [*path, target],
-                    "node": dict(graph.nodes[target]),
+                    "node": dict(graph.nodes.get(target, {})),
                 }
             )
             if target not in visited:
                 visited.add(target)
                 queue.append((target, next_depth, [*path, target]))
+            # A single hub can have thousands of out-edges, so the budget has
+            # to bind inside the fan-out, not just between hops.
+            if max_nodes is not None and len(neighbors) >= max_nodes:
+                break
     return {"node_id": node_id, "depth": depth, "neighbors": neighbors}
+
+
+def _edge_type_set(value: str | None) -> set[str] | None:
+    items = {item.strip() for item in (value or "").split(",") if item.strip()}
+    return items or None
+
+
+def _hierarchy_first(out_edges: list) -> list:
+    """Structural edges before shortcuts, order otherwise preserved."""
+
+    def rank(entry) -> int:
+        types = {data.get("type") for data in entry[2].values()}
+        return 0 if types & set(HIERARCHY_EDGE_TYPES) else 1
+
+    return sorted(out_edges, key=rank)
 
 
 def graph_slice(
@@ -390,11 +446,31 @@ def graph_slice(
     depth: int = 1,
     edge_types: list[str] | None = None,
     limit: int = 100,
+    exclude_edge_types: set[str] | None = None,
+    exclude_node_types: set[str] | None = None,
 ) -> dict:
     """Connected sub-graph around a node (mirrors SyncSageTools.get_graph_slice)."""
-    traversal = graph_neighbors(graph, node_id, depth, edge_types)
-    node_ids = [node_id] + [item["node_id"] for item in traversal["neighbors"][:limit]]
+    traversal = graph_neighbors(
+        graph,
+        node_id,
+        depth,
+        edge_types,
+        max_nodes=limit,
+        exclude_edge_types=exclude_edge_types,
+        exclude_node_types=exclude_node_types,
+    )
+    kept = traversal["neighbors"][:limit]
+    node_ids = [node_id] + [item["node_id"] for item in kept]
     node_set = set(node_ids)
+    # Hop distance per node, nearest wins (BFS order, so the first sighting is
+    # the shortest path). The UI rings the canvas by this and lets the user
+    # widen the horizon a layer at a time instead of rendering the whole graph.
+    depths: dict[str, int] = {node_id: 0}
+    for item in kept:
+        target = str(item["node_id"])
+        hop = int(item.get("depth") or 0)
+        if hop < depths.get(target, hop + 1):
+            depths[target] = hop
     links = []
     allowed = set(edge_types or [])
     for source in node_set:
@@ -410,8 +486,9 @@ def graph_slice(
     return {
         "node_id": node_id,
         "depth": depth,
-        "nodes": [dict(graph.nodes[item]) for item in node_ids if item in graph],
+        "nodes": [dict(attrs) for attrs in (graph.nodes.get(item) for item in node_ids) if attrs],
         "links": links,
+        "depths": depths,
     }
 
 
@@ -432,7 +509,11 @@ def create_app(
     state.migrate()
     SourceRegistry(config, state).initialize()
     engine = SyncEngine(config, paths, state)
-    search = HybridSearch(SearchStore(state), vector=engine.vector_searcher())
+    search = HybridSearch(
+        SearchStore(state),
+        vector=engine.vector_searcher(),
+        node_index=engine.node_index,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -445,8 +526,12 @@ def create_app(
             loop = asyncio.get_running_loop()
 
             def _run_startup() -> None:
+                from syncsage.sync.worker import WorkerBackedEngine
+
                 logger.info("Running startup sync for sources: %s", ", ".join(startup_sources))
-                results = engine.startup()
+                # Indexing happens in a child process so it cannot starve the
+                # requests this server exists to answer.
+                results = WorkerBackedEngine(engine, app.state.config_path).startup()
                 app.state.startup_sync_results = results
                 indexed = sum(result.indexed_artifacts for result in results)
                 skipped = sum(result.skipped_artifacts for result in results)
@@ -458,6 +543,19 @@ def create_app(
                 )
 
             loop.run_in_executor(None, _run_startup)
+
+        # Warm the agent framework off the request path. Importing langgraph
+        # costs ~4s, and it used to be paid, lazily, by whoever asked the first
+        # question after a restart — which read as "the planner is slow" when
+        # nothing was planning yet. Best-effort and in the background: a
+        # missing [agent] extra just means the simple workflow answers.
+        def _warm_workflows() -> None:
+            from syncsage.assistant.workflows.agentic import warm
+
+            if warm():
+                logger.info("Agent workflow ready (langgraph imported and graph compiled)")
+
+        threading.Thread(target=_warm_workflows, name="syncsage-warm", daemon=True).start()
         yield
 
     app = FastAPI(title="SyncSage", version=__version__, lifespan=lifespan)
@@ -752,23 +850,38 @@ def create_app(
             "pagination": {"limit": limit, "offset": offset},
         }
 
+    def _index(
+        source_name: str | None,
+        mode: str,
+        depth: int | None = None,
+        full_scan: bool = False,
+    ) -> dict:
+        """Index in a worker process, then pick up the result.
+
+        The server deliberately does not index in-process: that work is
+        CPU-bound Python and, under the GIL, it starves the very requests this
+        API exists to answer. See :mod:`syncsage.sync.worker`.
+        """
+
+        from syncsage.sync.worker import WorkerBackedEngine
+
+        worker = WorkerBackedEngine(engine, app.state.config_path)
+        if source_name:
+            results = [worker.sync_source(source_name, mode, max_depth=depth, full_scan=full_scan)]
+        else:
+            results = worker.sync_all(mode, max_depth=depth, full_scan=full_scan)
+        failed = [r for r in results if r.status in {"failed", "timeout"}]
+        if failed:
+            raise HTTPException(
+                status_code=500,
+                detail=failed[0].details.get("error") or f"sync {failed[0].status}",
+            )
+        return {"results": [r.__dict__ for r in results]}
+
     @app.post("/sync")
     def sync_all(req: SyncRequest) -> dict:
         try:
-            if req.source_name:
-                result = engine.sync_source(
-                    req.source_name,
-                    req.mode,  # type: ignore[arg-type]
-                    max_depth=req.depth,
-                    full_scan=req.full_scan,
-                )
-                return {"results": [result.__dict__]}
-            results = engine.sync_all(
-                req.mode,  # type: ignore[arg-type]
-                max_depth=req.depth,
-                full_scan=req.full_scan,
-            )
-            return {"results": [r.__dict__ for r in results]}
+            return _index(req.source_name, req.mode, req.depth, req.full_scan)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -778,12 +891,15 @@ def create_app(
     def sync_source(source_id: str, req: SyncRequest | None = None) -> dict:
         mode = req.mode if req else "incremental"
         try:
-            return engine.sync_source(
+            report = _index(
                 source_id,
-                mode,  # type: ignore[arg-type]
-                max_depth=req.depth if req else None,
-                full_scan=req.full_scan if req else False,
-            ).__dict__
+                mode,
+                req.depth if req else None,
+                req.full_scan if req else False,
+            )
+            # This route has always returned one result object, not a list.
+            results = report.get("results") or []
+            return results[0] if results else report
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -987,9 +1103,10 @@ def create_app(
     @app.get("/nodes/content")
     def node_content(node_id: str, principal: str | None = None) -> dict:
         graph = engine.graph_builder.graph
-        if node_id not in graph:
+        attrs = graph.nodes.get(node_id)
+        if attrs is None:
             raise HTTPException(status_code=404, detail=f"Unknown node: {node_id}")
-        node = dict(graph.nodes[node_id])
+        node = dict(attrs)
         if node.get("type") == "chunk":
             rows = state.rows(
                 "SELECT artifact_id, text FROM chunks WHERE id=? LIMIT 1",
@@ -1050,9 +1167,16 @@ def create_app(
         node_id: str,
         depth: int = 1,
         edge_types: str | None = None,
+        exclude_edge_types: str | None = None,
     ) -> dict:
         types = [t for t in edge_types.split(",") if t] if edge_types else None
-        return graph_neighbors(engine.graph_builder.graph, node_id, depth, types)
+        return graph_neighbors(
+            engine.graph_builder.graph,
+            node_id,
+            depth,
+            types,
+            exclude_edge_types=_edge_type_set(exclude_edge_types),
+        )
 
     @app.get("/graph/slice")
     def graph_slice_route(
@@ -1060,16 +1184,35 @@ def create_app(
         depth: int = 1,
         limit: int = 100,
         edge_types: str | None = None,
+        exclude_edge_types: str | None = None,
+        exclude_types: str | None = None,
     ) -> dict:
+        """A bounded sub-graph around a node.
+
+        ``exclude_edge_types`` drops edges from the *traversal*, not just the
+        output — the canvas uses it to leave out `indexes`, the source→artifact
+        shortcut that otherwise flattens the directory tree out of any bounded
+        view of the graph.
+        """
+
         types = [t for t in edge_types.split(",") if t] if edge_types else None
-        return graph_slice(engine.graph_builder.graph, node_id, depth, types, limit)
+        return graph_slice(
+            engine.graph_builder.graph,
+            node_id,
+            depth,
+            types,
+            limit,
+            exclude_edge_types=_edge_type_set(exclude_edge_types),
+            exclude_node_types=_edge_type_set(exclude_types),
+        )
 
     @app.get("/nodes/explain")
     def explain_node(node_id: str) -> dict:
         g = engine.graph_builder.graph
-        if node_id not in g:
+        attrs = g.nodes.get(node_id)
+        if attrs is None:
             return {"node_id": node_id, "explanation": "Node is not present in the current graph."}
-        node = dict(g.nodes[node_id])
+        node = dict(attrs)
         return {
             "node_id": node_id,
             "type": node.get("type"),
@@ -1356,6 +1499,10 @@ def create_app(
         }
         if req.reindex and engine.vectors is not None:
             result["reindex"] = _rebuild_vectors(drop_existing=dimension_change)
+            # Record the space we just embedded into, so the next restart sees
+            # a matching fingerprint and does not drop and re-embed all over
+            # again for a change that has already been applied.
+            state.set_fingerprint(EMBEDDING_SCOPE, embedding_fingerprint(config), utc_now())
         return result
 
     def _rebuild_vectors(drop_existing: bool = False) -> dict:
@@ -1363,7 +1510,9 @@ def create_app(
 
         Vectors are keyed by content-addressed chunk id, so this is
         idempotent: chunks already embedded are skipped and a second run
-        makes zero embedder calls.
+        makes zero embedder calls. The engine owns the same operation (it
+        runs it automatically when the embedding config changes under a
+        restart); this wrapper adds the HTTP-facing error shape.
         """
         if engine.vectors is None:
             raise HTTPException(
@@ -1462,10 +1611,13 @@ def create_app(
     @app.get("/overview")
     def overview() -> dict:
         graph_obj = engine.graph_builder.graph
-        counts: dict[str, int] = {}
-        for node_id in graph_obj.nodes:
-            node_type = str(graph_obj.nodes[node_id].get("type") or "unknown")
-            counts[node_type] = counts.get(node_type, 0) + 1
+        # One pinned read of aggregates the graph maintains on write. This
+        # used to walk every node to tally types on an endpoint the UI hits on
+        # every page load — seconds of latency for numbers already known.
+        with graph_obj.reading():
+            counts = graph_obj.type_counts()
+            total_nodes = graph_obj.number_of_nodes()
+            total_links = graph_obj.number_of_edges()
         registered = SourceRegistry(config, state).list_sources()
         artifacts = state.rows("SELECT COUNT(*) AS n FROM artifacts")
         chunks = state.rows("SELECT COUNT(*) AS n FROM chunks")
@@ -1485,9 +1637,9 @@ def create_app(
             "indexed_artifacts": indexed,
             "chunk_count": int(chunks[0]["n"]) if chunks else 0,
             "node_counts": counts,
-            "total_nodes": graph_obj.number_of_nodes(),
-            "total_links": graph_obj.number_of_edges(),
-            "has_content": graph_obj.number_of_nodes() > structural and indexed > 0,
+            "total_nodes": total_nodes,
+            "total_links": total_links,
+            "has_content": total_nodes > structural and indexed > 0,
             "config_path": str(app.state.config_path),
         }
 
@@ -1588,6 +1740,90 @@ def create_app(
             principal_groups=req.principal_groups,
             workflow=req.workflow,
             options=req.options,
+        )
+
+    @app.post("/assistant/chat/stream")
+    def assistant_chat_stream(req: ChatRequest):
+        """The same answer as ``/assistant/chat``, with progress as it happens.
+
+        Server-sent events: one ``step`` per workflow stage the moment it
+        finishes, then a single ``answer`` (or ``error``) and the stream
+        closes. The agent loop can take a while over a large index, and a
+        client that shows "planning… retrieved 35 passages… grading" is
+        waiting rather than wondering. The work runs in a worker thread and
+        the steps arrive through a queue, so a slow reader can never stall the
+        workflow itself.
+        """
+
+        import json as json_module
+        import queue as queue_module
+        import threading
+
+        from starlette.responses import StreamingResponse
+
+        from syncsage.assistant.chat import answer_question
+
+        if not config.assistant.enabled:
+            raise HTTPException(status_code=403, detail="The assistant is disabled")
+        if not req.question.strip():
+            raise HTTPException(status_code=400, detail="question must not be empty")
+
+        events: queue_module.Queue = queue_module.Queue()
+        credential = app.state.session_keys.get(req.session_id)
+        environ = dict(os.environ)
+
+        def run() -> None:
+            try:
+                answer = answer_question(
+                    req.question,
+                    search=search,
+                    knowledge_base=config.knowledge_base_id,
+                    config=config,
+                    graph=engine.graph_builder.graph,
+                    state=state,
+                    credential=credential,
+                    env=environ,
+                    mode=req.mode,
+                    max_results=req.max_results,
+                    source_name=req.source_name,
+                    principal=req.principal,
+                    principal_groups=req.principal_groups,
+                    workflow=req.workflow,
+                    options=req.options,
+                    on_step=lambda step: events.put(
+                        {
+                            "type": "step",
+                            "name": step.name,
+                            "detail": step.detail,
+                            "passages": step.passages,
+                        }
+                    ),
+                )
+                events.put({"type": "answer", "answer": answer})
+            except Exception as exc:  # surfaced to the client, never a 500 mid-stream
+                logger.exception("streaming chat failed")
+                events.put({"type": "error", "error": str(exc)})
+            finally:
+                events.put(None)
+
+        threading.Thread(target=run, name="syncsage-chat-stream", daemon=True).start()
+
+        def publish():
+            while True:
+                item = events.get()
+                if item is None:
+                    return
+                yield f"data: {json_module.dumps(item)}\n\n"
+
+        return StreamingResponse(
+            publish(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                # nginx sits in front of this in the compose stack and would
+                # otherwise buffer the whole stream into one write.
+                "X-Accel-Buffering": "no",
+            },
         )
 
     @app.get("/assistant/workflows")

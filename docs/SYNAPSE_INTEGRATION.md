@@ -20,6 +20,33 @@
 
 ---
 
+
+## Decision 2026-08-03 — contract vocabulary now comes from the FTS index
+
+`vocabulary.top_concepts` and its MinHash used to be read from
+`artifact_terms` rows of `node_type='concept'`. Concept extraction was retired
+this day (see `docs/graph_model.md` and `graph.enrichment._add_concept`), so
+that source no longer exists.
+
+**The wire format is unchanged.** `top_concepts` keeps its shape and weight
+scale, the MinHash is computed over the same kind of term set, and the router
+scores contracts exactly as before — so the vendored schema and fixtures are
+untouched, there is no schema bump, and `tests/test_contract_parity.py` stays
+green without a re-vendor. This is a change of *source*, not of contract.
+
+Terms now come from `chunks_vocab`, an `fts5vocab` view over the FTS index.
+That is strictly better provenance for a region advertising what it knows: the
+vocabulary is literally what is searchable in the region, it cannot drift from
+the index, and it costs no storage — SQLite already maintains the term →
+document-frequency table. Weights are document frequencies normalized to
+(0, 1] against the most common term, so they stay comparable across regions of
+different sizes. Ordering by *document* frequency rather than raw count is
+deliberate: a term repeated 400 times in one file describes that file, while a
+term appearing once in 400 files describes the corpus.
+
+Rule 6 note: the contract schema remains canonical in subjective-retrieval and
+nothing under `contracts/` was hand-edited.
+
 ## Internal spec — SyncSage as a Brain Region
 
 **Status:** authoritative SyncSage-side spec (2026-06-10). The system-wide

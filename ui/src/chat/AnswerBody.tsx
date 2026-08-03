@@ -2,14 +2,20 @@ import { Fragment } from "react";
 import type { ReactNode } from "react";
 
 /**
- * Renders an answer, turning `[1]` markers into clickable citation chips.
+ * Renders an answer as rich text, turning `[1]` markers into clickable chips.
  *
  * The chips are the whole point of the surface: a claim in the prose and the
  * passage it came from are one click apart, and clicking also highlights the
- * cited node on the graph. Markdown is handled with a deliberately small
- * subset (paragraphs, bullets, inline code) rather than a full renderer —
- * grounded answers are short, and a heavyweight renderer would fight the
- * citation splitting for control of the text nodes.
+ * cited node on the graph. That is why this is a small hand-rolled renderer
+ * rather than a markdown library — the citation splitting has to own the text
+ * nodes, and a general renderer would fight it for them (and drag in a parser
+ * plus sanitizer for a bundle that is already 770kB).
+ *
+ * Supported, because it is what models actually emit in grounded answers:
+ * headings, **bold**, *italic*, `inline code`, ```fenced code```, bullet and
+ * numbered lists, > blockquotes, --- rules, and [links](url). Anything else
+ * renders as its literal text — never as raw HTML, since nothing here builds
+ * markup from model output.
  */
 export function AnswerBody({
   text,
@@ -18,85 +24,139 @@ export function AnswerBody({
   text: string;
   onCite: (index: number) => void;
 }) {
-  const blocks = text.split(/\n{2,}/);
-  return (
-    <>
-      {blocks.map((block, blockIndex) => {
-        const lines = block.split("\n");
-        const isList = lines.every((line) => /^\s*[-*•]\s+/.test(line) || line.trim() === "");
-        const isOrdered = lines.every((line) => /^\s*\d+[.)]\s+/.test(line) || line.trim() === "");
-
-        if (isList && lines.some((line) => line.trim())) {
-          return (
-            <ul key={blockIndex}>
-              {lines
-                .filter((line) => line.trim())
-                .map((line, i) => (
-                  <li key={i}>{withCitations(line.replace(/^\s*[-*•]\s+/, ""), onCite)}</li>
-                ))}
-            </ul>
-          );
-        }
-        if (isOrdered && lines.some((line) => line.trim())) {
-          return (
-            <ol key={blockIndex}>
-              {lines
-                .filter((line) => line.trim())
-                .map((line, i) => (
-                  <li key={i}>{withCitations(line.replace(/^\s*\d+[.)]\s+/, ""), onCite)}</li>
-                ))}
-            </ol>
-          );
-        }
-        return <p key={blockIndex}>{withCitations(block, onCite)}</p>;
-      })}
-    </>
-  );
+  return <>{renderBlocks(text, onCite)}</>;
 }
 
-const CITATION = /\[(\d{1,2})\]/g;
-const INLINE_CODE = /`([^`]+)`/g;
-
-function withCitations(text: string, onCite: (index: number) => void): ReactNode[] {
+function renderBlocks(text: string, onCite: (index: number) => void): ReactNode[] {
   const out: ReactNode[] = [];
-  let cursor = 0;
-  let key = 0;
-  CITATION.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = CITATION.exec(text)) !== null) {
-    if (match.index > cursor) {
-      out.push(<Fragment key={key++}>{withCode(text.slice(cursor, match.index), key)}</Fragment>);
+  // Split fenced code out first: its contents must survive verbatim, with no
+  // inline formatting and no citation chips inside.
+  const segments = text.split(/```/);
+  segments.forEach((segment, segmentIndex) => {
+    if (segmentIndex % 2 === 1) {
+      const newline = segment.indexOf("\n");
+      const language = newline > 0 ? segment.slice(0, newline).trim() : "";
+      const body = newline > 0 ? segment.slice(newline + 1) : segment;
+      out.push(
+        <pre className="answer-code" key={`code-${segmentIndex}`} data-language={language || undefined}>
+          <code>{body.replace(/\n$/, "")}</code>
+        </pre>,
+      );
+      return;
     }
-    const index = Number(match[1]);
-    out.push(
-      <button
-        key={key++}
-        className="cite-chip"
-        onClick={() => onCite(index)}
-        title={`Show source ${index}`}
-      >
-        {index}
-      </button>,
-    );
-    cursor = match.index + match[0].length;
-  }
-  if (cursor < text.length) {
-    out.push(<Fragment key={key++}>{withCode(text.slice(cursor), key)}</Fragment>);
-  }
+    segment
+      .split(/\n{2,}/)
+      .forEach((block, blockIndex) =>
+        out.push(...renderBlock(block, `${segmentIndex}-${blockIndex}`, onCite)),
+      );
+  });
   return out;
 }
 
-function withCode(text: string, seed: number): ReactNode[] {
-  const out: ReactNode[] = [];
-  let cursor = 0;
-  let key = seed * 1000;
-  INLINE_CODE.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = INLINE_CODE.exec(text)) !== null) {
-    if (match.index > cursor) out.push(text.slice(cursor, match.index));
-    out.push(<code key={key++}>{match[1]}</code>);
-    cursor = match.index + match[0].length;
+function renderBlock(
+  block: string,
+  key: string,
+  onCite: (index: number) => void,
+): ReactNode[] {
+  const lines = block.split("\n").filter((line) => line.trim());
+  if (lines.length === 0) return [];
+
+  if (lines.every((line) => /^\s*(---|\*\*\*|___)\s*$/.test(line))) {
+    return [<hr key={key} />];
   }
-  if (cursor < text.length) out.push(text.slice(cursor));
+
+  const heading = lines[0].match(/^(#{1,4})\s+(.*)$/);
+  if (heading && lines.length === 1) {
+    const level = heading[1].length;
+    const Tag = (["h3", "h4", "h5", "h6"] as const)[level - 1];
+    return [<Tag key={key}>{inline(heading[2], onCite)}</Tag>];
+  }
+
+  if (lines.every((line) => /^\s*>\s?/.test(line))) {
+    return [
+      <blockquote key={key}>
+        {inline(lines.map((line) => line.replace(/^\s*>\s?/, "")).join(" "), onCite)}
+      </blockquote>,
+    ];
+  }
+
+  if (lines.every((line) => /^\s*[-*•]\s+/.test(line))) {
+    return [
+      <ul key={key}>
+        {lines.map((line, i) => (
+          <li key={i}>{inline(line.replace(/^\s*[-*•]\s+/, ""), onCite)}</li>
+        ))}
+      </ul>,
+    ];
+  }
+
+  if (lines.every((line) => /^\s*\d+[.)]\s+/.test(line))) {
+    return [
+      <ol key={key}>
+        {lines.map((line, i) => (
+          <li key={i}>{inline(line.replace(/^\s*\d+[.)]\s+/, ""), onCite)}</li>
+        ))}
+      </ol>,
+    ];
+  }
+
+  return [<p key={key}>{inline(block, onCite)}</p>];
+}
+
+/**
+ * One pass over a run of text, splitting on whichever inline construct comes
+ * first. Ordering matters: citations before emphasis, so `[1]` next to bold
+ * text still becomes a chip, and code before emphasis so `*` inside code is
+ * literal.
+ */
+const INLINE = /(\[\d{1,2}\])|(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*\n]+\*)|(\[[^\]]+\]\([^)\s]+\))/;
+
+function inline(text: string, onCite: (index: number) => void): ReactNode[] {
+  const out: ReactNode[] = [];
+  let rest = text;
+  let key = 0;
+  while (rest) {
+    const match = rest.match(INLINE);
+    if (!match || match.index === undefined) {
+      out.push(rest);
+      break;
+    }
+    if (match.index > 0) out.push(<Fragment key={key++}>{rest.slice(0, match.index)}</Fragment>);
+    const token = match[0];
+
+    if (/^\[\d{1,2}\]$/.test(token)) {
+      const index = Number(token.slice(1, -1));
+      out.push(
+        <button
+          key={key++}
+          className="cite-chip"
+          onClick={() => onCite(index)}
+          title={`Show source ${index}`}
+        >
+          {index}
+        </button>,
+      );
+    } else if (token.startsWith("`")) {
+      out.push(<code key={key++}>{token.slice(1, -1)}</code>);
+    } else if (token.startsWith("**")) {
+      out.push(<strong key={key++}>{token.slice(2, -2)}</strong>);
+    } else if (token.startsWith("*")) {
+      out.push(<em key={key++}>{token.slice(1, -1)}</em>);
+    } else {
+      const link = token.match(/^\[([^\]]+)\]\(([^)\s]+)\)$/);
+      if (link && /^https?:\/\//i.test(link[2])) {
+        // Only http(s) becomes a link: a model-authored javascript: or data:
+        // URL must never be clickable.
+        out.push(
+          <a key={key++} href={link[2]} target="_blank" rel="noreferrer noopener">
+            {link[1]}
+          </a>,
+        );
+      } else {
+        out.push(<Fragment key={key++}>{token}</Fragment>);
+      }
+    }
+    rest = rest.slice(match.index + token.length);
+  }
   return out;
 }

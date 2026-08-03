@@ -133,6 +133,9 @@ def test_walk_is_deterministic(home: Path) -> None:
     assert walk_source(home, **kwargs).files == walk_source(home, **kwargs).files
 
 
+# Creating a symlink on Windows needs Administrator or Developer Mode, so the
+# fixture cannot be built. The traversal guard itself is platform-neutral.
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only; see comment above.")
 def test_symlinks_are_not_followed_by_default(tmp_path: Path) -> None:
     """A home directory routinely contains links that escape or loop."""
 

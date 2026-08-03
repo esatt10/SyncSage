@@ -30,6 +30,21 @@ def _lock_is_active(lock: Path) -> bool:
         payload = json.loads(lock.read_text(encoding="utf-8"))
     except Exception:
         return False
+    # A PID only means something inside the namespace that recorded it. A lock
+    # left behind by a killed container names a PID — usually 1 — that is very
+    # much alive in the *next* container, so a purely PID-based check declared
+    # the source locked forever and bricked every restart. A lock written by
+    # anything other than this host/container is stale by definition; live
+    # cross-process writers are excluded by ``EngineLease`` (heartbeat-based),
+    # not by this file. Legacy locks carry no hostname and are treated the same.
+    if payload.get("hostname") != socket.gethostname():
+        logger.warning(
+            "Clearing stale source lock %s from another host (hostname=%s, pid=%s)",
+            lock,
+            payload.get("hostname"),
+            payload.get("pid"),
+        )
+        return False
     pid = payload.get("pid")
     return isinstance(pid, int) and _pid_is_running(pid)
 
@@ -47,6 +62,7 @@ def source_lock(lock_dir: str | Path, source_id: str):
     payload = {
         "source_id": source_id,
         "pid": os.getpid(),
+        "hostname": socket.gethostname(),
         "created_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
     }
     try:

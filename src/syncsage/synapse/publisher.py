@@ -420,16 +420,29 @@ class ContractPublisher:
         return []
 
     def _vocabulary(self) -> dict[str, Any]:
-        rows = self.state.rows(
-            """SELECT normalized_term AS term, SUM(weight) AS weight
-               FROM artifact_terms
-               WHERE node_type='concept'
-               GROUP BY normalized_term
-               ORDER BY weight DESC, normalized_term ASC
-               LIMIT ?""",
-            (MAX_VOCAB_TERMS,),
-        )
-        top_concepts = [{"term": str(row["term"]), "weight": float(row["weight"])} for row in rows]
+        """What this region is about, for the router to score against.
+
+        Sourced from the FTS index's own term/document-frequency table rather
+        than from concept-extraction nodes, which were retired (see
+        ``graph.enrichment._add_concept``). **The wire format is unchanged** —
+        same ``top_concepts`` shape, same ``weight`` scale, same minhash over
+        the same kind of term set — so the vendored schema, the fixtures and
+        the router's scoring are all untouched. Only where the terms come
+        from changed, and they now come from what is actually searchable in
+        this region instead of a derived layer that duplicated it.
+
+        Weights are document frequencies normalized to (0, 1] against the most
+        common term, keeping them comparable across regions of different sizes
+        the way the summed concept weights were meant to be.
+        """
+        from syncsage.search.sqlite_store import corpus_vocabulary
+
+        vocabulary = corpus_vocabulary(self.state, MAX_VOCAB_TERMS)
+        top = float(vocabulary[0][1]) if vocabulary else 0.0
+        top_concepts = [
+            {"term": term, "weight": round(count / top, 6) if top else 0.0}
+            for term, count in vocabulary
+        ]
         terms = sorted({concept["term"] for concept in top_concepts})
         minhash = _encode_u64_b64(_minhash_signature(terms)) if terms else None
         return {
