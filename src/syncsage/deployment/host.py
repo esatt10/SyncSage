@@ -13,10 +13,11 @@ file must never require a Docker daemon.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 import yaml
@@ -201,6 +202,30 @@ def host_stack(args) -> int:
     return 0
 
 
+def _host_path_key(path: object) -> str:
+    """Comparable form of a host path, for matching config values to targets.
+
+    The remap below pairs a path recorded on a target with the same path as it
+    was written into the generated YAML, and those two are not always the same
+    *string*: on Windows one side can carry backslashes and the other forward
+    slashes, and the drive letter's case is not stable either. An exact string
+    match therefore silently missed on Windows, and
+    ``_write_container_config`` emitted a container config whose source path
+    was still ``C:\\Users\\...`` — a path that cannot exist inside the
+    container, so the generated stack was broken for every Windows user while
+    the POSIX path happened to match on Linux and CI stayed green.
+
+    Normalizing separators (and case, which only matters where the filesystem
+    is case-insensitive) makes the comparison mean "the same location" rather
+    than "the same spelling".
+    """
+    text = str(path or "")
+    if not text:
+        return ""
+    normalized = PurePath(text).as_posix().rstrip("/")
+    return normalized.lower() if os.name == "nt" else normalized
+
+
 def _write_container_config(source: Path, destination: Path, targets: list) -> None:
     """Copy the generated config with host paths remapped to /sources/<name>."""
     from syncsage.quickstart import _render_sources_block
@@ -209,13 +234,13 @@ def _write_container_config(source: Path, destination: Path, targets: list) -> N
     remapped = {}
     for index, target in enumerate(targets):
         if target.local:
-            remapped[target.path] = _container_path(index, target.name)
+            remapped[_host_path_key(target.path)] = _container_path(index, target.name)
 
     sources = data.pop("sources", []) or []
     for entry in sources:
-        path = str(entry.get("path", ""))
-        if path in remapped:
-            entry["path"] = remapped[path]
+        key = _host_path_key(entry.get("path", ""))
+        if key in remapped:
+            entry["path"] = remapped[key]
 
     syncsage = data.setdefault("syncsage", {})
     syncsage.update(

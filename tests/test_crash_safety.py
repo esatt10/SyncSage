@@ -101,6 +101,8 @@ def test_state_store_connections_use_wal_and_timeouts(tmp_path: Path) -> None:
         store.close()
 
 
+# Needs SIGKILL and a POSIX process tree to simulate an unclean mid-sync kill.
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only; see comment above.")
 def test_kill9_mid_sync_then_restart_recovers_without_repair(
     tmp_path: Path,
     workspace_copy: Path,
@@ -200,6 +202,9 @@ def test_stale_lease_is_taken_over_with_warning(
         engine.close()
 
 
+# Lease takeover probes PID liveness with POSIX signal 0. Windows has no
+# equivalent that distinguishes "dead" from "not permitted".
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only; see comment above.")
 def test_dead_pid_on_this_host_is_taken_over(
     tmp_path: Path,
     workspace_copy: Path,
