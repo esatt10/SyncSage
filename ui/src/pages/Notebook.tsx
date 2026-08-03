@@ -106,7 +106,7 @@ export function Notebook() {
 
   return (
     <div
-      className="notebook"
+      className={`notebook${state.railCollapsed ? " notebook--rail-collapsed" : ""}`}
       ref={layoutRef}
       style={
         {
@@ -116,14 +116,30 @@ export function Notebook() {
       }
     >
       <aside className="pane pane--rail">
+        {state.railCollapsed ? (
+          <div className="rail-collapsed__body">
+            <button
+              className="btn btn--small btn--icon"
+              onClick={() => dispatch({ type: "toggle-rail" })}
+              title="Show sources"
+              aria-label="Show sources"
+            >
+              ›
+            </button>
+            <span className="rail-collapsed__label">Sources</span>
+          </div>
+        ) : (
         <SourceRail
+          onCollapse={() => dispatch({ type: "toggle-rail" })}
           sources={overview.data?.sources ?? []}
           selected={state.sourceFilter}
           onSelect={(source) => dispatch({ type: "filter-source", source })}
           onChanged={() => overview.refetch()}
         />
+        )}
       </aside>
 
+      {state.railCollapsed ? null : (
       <PaneResizer
         variable="--rail"
         edge="left"
@@ -134,6 +150,7 @@ export function Notebook() {
         label="Resize sources"
         onCommit={(width) => dispatch({ type: "set-pane-width", pane: "rail", width })}
       />
+      )}
 
       <section className="pane">
         <header className="pane__header">
@@ -180,7 +197,7 @@ export function Notebook() {
         edge="right"
         containerRef={layoutRef}
         min={320}
-        max={1400}
+        max={2400}
         defaultWidth={DEFAULT_PANEL_WIDTH}
         label="Resize graph panel"
         onCommit={(width) => dispatch({ type: "set-pane-width", pane: "panel", width })}

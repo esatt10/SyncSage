@@ -1322,6 +1322,70 @@ select.text-input {
   flex-direction: column;
   gap: 14px;
   padding: 14px;
+  /* Fill the pane so the content tab can hand its leftover space to
+     .content-block rather than stopping at an arbitrary height. */
+  height: 100%;
+  min-height: 0;
+}
+
+/* The tab body inside the inspector; also a column so content can stretch. */
+.inspector__tabbody {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+}
+
+.content-toolbar {
+  display: flex;
+  gap: 6px;
+}
+
+/* Rendered Markdown reads as prose, not as a code block. */
+.content-block--rich {
+  font-family: inherit;
+  font-size: 13px;
+  white-space: normal;
+}
+
+.content-block--rich pre {
+  background: var(--bg);
+  padding: 10px;
+  border-radius: var(--radius);
+  overflow: auto;
+}
+
+.content-block--rich img {
+  max-width: 100%;
+}
+
+.content-block--rich table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+/* --------------------------------------------------- collapsible rail */
+
+.notebook--rail-collapsed {
+  grid-template-columns: 44px 8px minmax(0, 1fr) 8px var(--panel, 400px);
+}
+
+.rail-collapsed__body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 10px;
+}
+
+.rail-collapsed__label {
+  writing-mode: vertical-rl;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .inspector--empty {
@@ -1458,7 +1522,11 @@ select.text-input {
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  max-height: 460px;
+  /* Was max-height: 460px, which cut long files off in the middle of a pane
+     that had room to spare. The inspector is a flex column, so the content
+     block claims what is left and scrolls inside itself. */
+  flex: 1;
+  min-height: 0;
   overflow: auto;
 }
 
