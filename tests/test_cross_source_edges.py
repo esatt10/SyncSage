@@ -279,3 +279,30 @@ def test_internal_resolution_is_idempotent_and_skips_self_imports() -> None:
     assert [(e.source, e.target, e.type) for e in first] == [
         (e.source, e.target, e.type) for e in second
     ]
+
+
+def test_markdown_checkboxes_are_not_citations() -> None:
+    """`- [x] done` is a checkbox, not a reference.
+
+    The citation pattern captured every bracketed token, so task lists,
+    changelog headings and version placeholders became `external_reference`
+    nodes. Harmless while facts were buried under concepts; visible the moment
+    the panel started surfacing what documents reference.
+    """
+    from syncsage.graph.enrichment import _citation_candidates
+
+    text = (
+        "- [x] shipped\n- [ ] pending\n## [Unreleased]\n"
+        "Bump to [X.Y.Z] / [v1.2.3] / [1.0].\n"
+        "As shown in [Smith2024] and [KernelFunction].\n"
+    )
+    assert _citation_candidates(text) == ["Smith2024", "KernelFunction"]
+
+
+def test_citation_extraction_is_deterministic_and_deduped() -> None:
+    from syncsage.graph.enrichment import _citation_candidates
+
+    text = "[Alpha] then [alpha] then [Beta] then [Alpha]"
+    first = _citation_candidates(text)
+    assert first == _citation_candidates(text)
+    assert first == ["Alpha", "Beta"]

@@ -252,3 +252,56 @@ def test_rrf_prefers_the_record_carrying_a_preview() -> None:
     merged = _merge_rrf(text, [], graph, 5)
     assert len(merged) == 1
     assert merged[0].get("kind") == "chunk"
+
+
+# ----------------------------------------------------------- graph facts
+
+
+def _graph_with_facts():
+    from syncsage.graph.simple import SimpleMultiDiGraph
+
+    graph = SimpleMultiDiGraph()
+    graph.add_node("f:a", type="markdown_note", label="CONTRIBUTING.md")
+    graph.add_node("f:b", type="markdown_note", label="dotnet/AGENTS.md")
+    graph.add_node("ext:x", type="external_reference", label="./dotnet/AGENTS.md")
+    graph.add_node("c:noise", type="concept", label="limit")
+    # The same link produces both an unresolved name and, after internal
+    # resolution, the document it points at.
+    graph.add_edge("f:a", "ext:x", type="references")
+    graph.add_edge("f:a", "f:b", type="references", enrichment_pass="internal_resolution")
+    graph.add_edge("f:a", "c:noise", type="mentions")
+    return graph
+
+
+def test_a_resolved_document_outranks_the_name_that_pointed_at_it() -> None:
+    from syncsage.assistant.chat import collect_facts
+
+    facts = collect_facts(_graph_with_facts(), ["f:a"], 12)
+
+    assert facts, "file->file edges must reach the panel at all"
+    assert facts[0]["object_id"] == "f:b"
+    assert facts[0]["object_type"] == "markdown_note"
+    # Concept mentions are the noise floor and must not lead.
+    assert facts[0]["edge_type"] != "mentions"
+
+
+def test_facts_do_not_come_all_from_one_subject() -> None:
+    """A well-linked README has more one-hop edges than the whole budget."""
+    from syncsage.assistant.chat import MAX_FACTS_PER_SUBJECT, collect_facts
+    from syncsage.graph.simple import SimpleMultiDiGraph
+
+    graph = SimpleMultiDiGraph()
+    for subject in ("s1", "s2", "s3"):
+        graph.add_node(subject, type="markdown_note", label=subject)
+        for i in range(8):
+            target = f"{subject}-t{i}"
+            graph.add_node(target, type="markdown_note", label=target)
+            graph.add_edge(subject, target, type="references")
+
+    facts = collect_facts(graph, ["s1", "s2", "s3"], 12)
+
+    per_subject: dict[str, int] = {}
+    for fact in facts:
+        per_subject[fact["subject_id"]] = per_subject.get(fact["subject_id"], 0) + 1
+    assert len(per_subject) == 3, per_subject
+    assert max(per_subject.values()) <= MAX_FACTS_PER_SUBJECT

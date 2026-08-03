@@ -171,7 +171,24 @@ _CITATION_RE = re.compile(r"\[(\d{1,2})\]")
 
 # Graph node types that carry meaning rather than structure — these are what
 # a "surfaced fact" should point at.
-FACT_NODE_TYPES = {"concept", "entity", "symbol", "external_reference"}
+#
+# Artifact types are in here deliberately. They were not, and that silently
+# discarded the best facts in the graph: internal resolution turns a file's
+# imports and document links into edges pointing at the *file* they resolve to
+# (2,903 of them on the demo corpus), and every one was dropped on the way to
+# the panel because `file` was not a permitted target. "CONTRIBUTING.md
+# references dotnet/AGENTS.md" is the most useful thing this surface can say.
+#
+# Structural edges are excluded separately (STRUCTURAL_EDGES), so admitting
+# artifacts here does not let "directory contains file" back in.
+ARTIFACT_FACT_TYPES = {"file", "markdown_note", "document"}
+FACT_NODE_TYPES = {
+    "concept",
+    "entity",
+    "symbol",
+    "external_reference",
+    *ARTIFACT_FACT_TYPES,
+}
 # Structural edges say "this file is in this folder"; they are noise as facts.
 # `derived_from` is the exact mirror of `mentions` (one per mentions edge —
 # 766,477 of each on the demo corpus), so surfacing it says the same thing
@@ -213,11 +230,28 @@ MAX_WEAK_FACTS = 3
 #: to say — a dependency on a real third-party package is worth knowing.
 EXTERNAL_TARGET_PENALTY = 3
 
+#: Subtracted when a fact points at another indexed document. A resolved
+#: target ("references dotnet/AGENTS.md") beats the unresolved name the same
+#: link also produced ("references ./dotnet/AGENTS.md"), so the panel shows the
+#: destination rather than the string that pointed at it. Both edges exist —
+#: enrichment records the reference, internal resolution adds the resolved
+#: one — and without this they compete on equal terms.
+RESOLVED_TARGET_BONUS = 2
+
+#: Facts drawn from any single subject. The round-robin already alternates
+#: between cited nodes, but a well-linked README can hold more one-hop edges
+#: than the entire budget, and then a panel meant to show what an answer drew
+#: on shows twelve things about one file.
+MAX_FACTS_PER_SUBJECT = 3
+
 
 def _fact_rank(fact: dict) -> int:
     rank = EDGE_PRIORITY.get(fact["edge_type"], 5)
-    if fact.get("object_type") == "external_reference":
+    object_type = fact.get("object_type")
+    if object_type == "external_reference":
         rank += EXTERNAL_TARGET_PENALTY
+    elif object_type in ARTIFACT_FACT_TYPES:
+        rank -= RESOLVED_TARGET_BONUS
     return rank
 
 
@@ -408,6 +442,7 @@ def collect_facts(graph: Any, node_ids: list[str], limit: int = 12) -> list[dict
 
     facts: list[dict] = []
     used_objects: set[str] = set()
+    per_subject: dict[str, int] = {}
     weak = 0
     depth = 0
     while len(facts) < limit and per_node:
@@ -423,6 +458,8 @@ def collect_facts(graph: Any, node_ids: list[str], limit: int = 12) -> list[dict
             # slots telling the reader one thing.
             if candidate["object_id"] in used_objects:
                 continue
+            if per_subject.get(candidate["subject_id"], 0) >= MAX_FACTS_PER_SUBJECT:
+                continue
             # A concept mention is the noise floor: it is allowed in only to
             # keep an otherwise-empty panel from being empty, and only a few
             # times. Without this cap the 87%-of-the-graph concept layer fills
@@ -432,6 +469,7 @@ def collect_facts(graph: Any, node_ids: list[str], limit: int = 12) -> list[dict
                     continue
                 weak += 1
             used_objects.add(candidate["object_id"])
+            per_subject[candidate["subject_id"]] = per_subject.get(candidate["subject_id"], 0) + 1
             facts.append(candidate)
             if len(facts) >= limit:
                 break

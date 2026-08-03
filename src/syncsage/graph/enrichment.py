@@ -228,7 +228,7 @@ class MarkdownDocumentEnrichmentPass:
                 "references",
                 ref_type,
             )
-        for citation in re.findall(r"\[@?([A-Za-z0-9_.:-]+)\]", text):
+        for citation in _citation_candidates(text):
             _add_external_reference(
                 enrichment,
                 kb_id,
@@ -708,6 +708,42 @@ def _entity_candidates(text: str) -> set[str]:
     candidates = set(re.findall(r"\b[A-Z][A-Za-z0-9]+(?:[A-Z][A-Za-z0-9]+)+\b", text))
     candidates.update(re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b", text))
     return candidates
+
+
+# Bracketed things in Markdown that are not citations. `[x]` and `[ ]` are
+# task-list checkboxes; `[Unreleased]`, `[X.Y.Z]` and bare version labels are
+# changelog headings and reference-link definitions. The old pattern captured
+# all of them as external references, which put "x", "provider" and
+# "Unreleased" into the graph — and, once artifact facts started surfacing,
+# straight into the facts panel as things a document "references".
+_CITATION_RE = re.compile(r"\[@?([A-Za-z0-9_.:-]+)\]")
+_CITATION_NOISE = frozenset(
+    {"x", "X", "ok", "tbd", "todo", "na", "n/a", "unreleased", "yes", "no", "y", "n"}
+)
+_VERSION_PLACEHOLDER_RE = re.compile(r"^[vV]?[\dxXyYzZ]+([._-][\dxXyYzZ]+)*$")
+
+
+def _citation_candidates(text: str) -> list[str]:
+    """Bracketed citation labels worth recording, in document order.
+
+    Deterministic and rule-based (rule 1): a fixed stoplist plus two shape
+    tests, no NLP and no sampling, so the same document always yields the
+    same references.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _CITATION_RE.findall(text):
+        label = match.strip()
+        lowered = label.lower()
+        if len(label) < 3 or lowered in _CITATION_NOISE:
+            continue
+        if _VERSION_PLACEHOLDER_RE.match(label):
+            continue
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        out.append(label)
+    return out
 
 
 def _markdown_links(text: str) -> set[str]:
