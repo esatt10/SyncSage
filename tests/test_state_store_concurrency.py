@@ -85,27 +85,48 @@ def test_concurrent_rows_calls_never_return_a_row_with_the_wrong_shape(tmp_path)
 
 
 def test_each_thread_gets_its_own_connection(tmp_path) -> None:
-    """The structural guarantee the correctness fix relies on."""
+    """The structural guarantee the correctness fix relies on.
 
+    Keyed by a worker index, not by ``threading.get_ident()``. Idents are
+    recycled once a thread dies, so on a fast machine an early worker could
+    finish and hand its ident to a later one — eight threads then recorded
+    seven entries and the test failed while the code under test was correct.
+    That is how this flaked on CI after passing locally several times.
+
+    The barrier is the other half of the fix, and it strengthens the claim:
+    every worker holds its connection until all eight exist, so this observes
+    eight *simultaneous* distinct connections rather than eight sequential
+    ones that might have reused a single slot.
+    """
+
+    workers = 8
     store = StateStore(tmp_path / "state.db")
     store.migrate()
 
     seen: dict[int, int] = {}
+    errors: list[BaseException] = []
     lock = threading.Lock()
+    barrier = threading.Barrier(workers)
 
-    def worker() -> None:
-        conn_id = id(store.conn)
-        with lock:
-            seen[threading.get_ident()] = conn_id
+    def worker(index: int) -> None:
+        try:
+            conn_id = id(store.conn)
+            barrier.wait(timeout=10)
+            with lock:
+                seen[index] = conn_id
+        except BaseException as exc:  # noqa: BLE001 - surface, never swallow
+            with lock:
+                errors.append(exc)
 
-    threads = [threading.Thread(target=worker) for _ in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=10)
+    threads = [threading.Thread(target=worker, args=(index,)) for index in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
 
-    assert len(threads) == len(seen)
-    assert len(set(seen.values())) == len(seen), "two threads shared one connection"
+    assert not errors, f"worker failed: {errors[0]!r}"
+    assert len(seen) == workers
+    assert len(set(seen.values())) == workers, "two threads shared one connection"
     store.close()
 
 
@@ -137,7 +158,12 @@ def test_a_slow_read_does_not_block_a_concurrent_read(tmp_path) -> None:
         conn = store.conn  # this thread's own connection
         conn.create_function("slow_sleep", 1, lambda seconds: time.sleep(seconds) or 0)
         slow_started.set()
-        store.rows("SELECT slow_sleep(?)", (1.0,))
+        # Generous on purpose: the assertion is that a trivial `SELECT 1`
+        # finishes inside this window on another thread. A shared CI runner can
+        # stall a thread for a noticeable fraction of a second, and a margin
+        # measured in tenths would fail for scheduling reasons rather than
+        # because reads were serialized.
+        store.rows("SELECT slow_sleep(?)", (3.0,))
         slow_done.set()
 
     def fast_worker() -> None:
@@ -150,8 +176,8 @@ def test_a_slow_read_does_not_block_a_concurrent_read(tmp_path) -> None:
     fast = threading.Thread(target=fast_worker)
     slow.start()
     fast.start()
-    slow.join(timeout=10)
-    fast.join(timeout=10)
+    slow.join(timeout=30)
+    fast.join(timeout=30)
 
     assert fast_finished_while_slow_still_running.is_set(), (
         "a fast read waited for an unrelated slow read on another thread -- "
