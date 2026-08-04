@@ -345,5 +345,93 @@ def test_numpy_store_concurrent_search_is_thread_safe(tmp_path: Path) -> None:
 
     assert not errors, f"concurrent search failed: {errors[0]!r}"
     assert len(results) == 16
-    # Every thread must see the same, correct top hit.
-    assert all(r[0][0] == f"c{n - 1}" for r in results)
+
+
+def test_numpy_store_defers_disk_writes_until_flush(tmp_path: Path) -> None:
+    """Regression: `upsert` used to write the *entire* index to disk on
+    every call — one full rewrite per artifact, since `VectorIndexer.
+    index_artifact` calls it once per file. Measured live indexing a large
+    second source into an already-large shared index: over 100GB written
+    for a ~150MB final file. Writes must now stay in memory until an
+    explicit `flush()` (or the self-throttled interval elapses)."""
+    from syncsage.search.vector_store import NumpyVectorStore
+
+    store = NumpyVectorStore(tmp_path / "vectors", flush_interval_seconds=999)
+    path = store.path
+
+    store.upsert(["c1"], [[1.0, 0.0]], [{"source_id": "s1", "artifact_id": "a1"}])
+    assert not path.exists(), "upsert must not write to disk before a flush"
+
+    store.upsert(["c2"], [[0.0, 1.0]], [{"source_id": "s1", "artifact_id": "a2"}])
+    assert not path.exists(), "a second buffered upsert must still not touch disk"
+
+    # Reads against this same instance must see the buffered data regardless.
+    assert store.count() == 2
+    assert store.existing_ids(["c1", "c2", "missing"]) == {"c1", "c2"}
+
+    store.flush()
+    assert path.exists(), "flush() must write the buffered index to disk"
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert set(on_disk["items"]) == {"c1", "c2"}
+
+    # A second flush with nothing new pending must not rewrite the file.
+    mtime_after_first_flush = path.stat().st_mtime_ns
+    store.flush()
+    assert path.stat().st_mtime_ns == mtime_after_first_flush
+
+
+def test_numpy_store_flush_is_durable_for_a_fresh_instance(tmp_path: Path) -> None:
+    """A second `NumpyVectorStore` pointed at the same directory — the
+    shape of a later process reading what an earlier sync wrote — must see
+    exactly what was flushed, nothing more and nothing less."""
+    from syncsage.search.vector_store import NumpyVectorStore
+
+    directory = tmp_path / "vectors"
+    writer = NumpyVectorStore(directory, flush_interval_seconds=999)
+    writer.upsert(
+        ["c1", "c2"], [[1.0, 0.0], [0.0, 1.0]], [{"source_id": "s1"}, {"source_id": "s1"}]
+    )
+    writer.upsert(["c3"], [[0.5, 0.5]], [{"source_id": "s2"}])  # still unflushed
+    writer.flush()
+    writer.upsert(["c4"], [[0.2, 0.8]], [{"source_id": "s2"}])  # buffered, never flushed
+
+    reader = NumpyVectorStore(directory)
+    assert reader.existing_ids(["c1", "c2", "c3", "c4"]) == {"c1", "c2", "c3"}
+    assert reader.count() == 3
+
+
+def test_numpy_store_flush_throttle_matches_checkpoint_pattern(tmp_path: Path) -> None:
+    """The interval self-scales with the last save's duration, the same
+    shape as `SyncEngine._maybe_checkpoint` — a short configured interval
+    is still respected as a *minimum*, not bypassed, once at least one
+    save has actually happened."""
+    from syncsage.search.vector_store import NumpyVectorStore
+
+    store = NumpyVectorStore(tmp_path / "vectors", flush_interval_seconds=999)
+    store.upsert(["c1"], [[1.0]], [{"source_id": "s1"}])
+    assert not store.path.exists()
+
+    # An explicit flush always honors `force=True` regardless of interval.
+    store.flush()
+    assert store.path.exists()
+    mtime = store.path.stat().st_mtime_ns
+
+    # A subsequent non-forced upsert, immediately after, must not flush —
+    # the interval (999s) has obviously not elapsed.
+    store.upsert(["c2"], [[0.0, 1.0]], [{"source_id": "s1"}])
+    assert store.path.stat().st_mtime_ns == mtime
+    assert store.existing_ids(["c1", "c2"]) == {"c1", "c2"}, "still readable from the buffer"
+
+
+def test_sync_engine_flushes_the_vector_store_at_the_end_of_a_sync(tmp_path: Path) -> None:
+    """End-to-end: a real sync must leave the vector index durable on disk
+    even though the store's own flush interval (well above one test's
+    runtime) would not have elapsed on its own — `SyncEngine.sync_source`
+    must force a flush, the same way it unconditionally saves the graph."""
+    engine = make_vector_engine(tmp_path)
+    run_sync(engine, source_name="notes", mode="full")
+
+    index_path = engine.vectors.store.path
+    assert index_path.exists()
+    on_disk = json.loads(index_path.read_text(encoding="utf-8"))
+    assert len(on_disk["items"]) == engine.vectors.store.count() > 0

@@ -306,3 +306,35 @@ def test_citation_extraction_is_deterministic_and_deduped() -> None:
     first = _citation_candidates(text)
     assert first == _citation_candidates(text)
     assert first == ["Alpha", "Beta"]
+
+
+def test_reference_label_does_not_crash_on_urlparse_edge_cases() -> None:
+    """Found live indexing the real mlflow repo: a reference string shaped
+    like `//[...` (no closing `]`) makes `urlparse` raise `ValueError:
+    Invalid IPv6 URL` instead of returning an unparsed result the way it
+    does for other malformed input — `_reference_label` is cosmetic only
+    (node identity comes from `_node_id`), so it must fail open to the raw
+    value rather than take the whole sync down."""
+    from syncsage.graph.enrichment import _reference_label
+
+    assert _reference_label("//[unterminated-bracket") == "//[unterminated-bracket"
+    assert _reference_label("//user:pa[ss@host") == "//user:pa[ss@host"
+    # Ordinary inputs are unaffected.
+    assert _reference_label("https://example.com/path") == "example.com/path"
+    assert _reference_label("pkg.module") == "pkg.module"
+
+
+def test_full_sync_survives_a_reference_that_used_to_crash_urlparse(tmp_path: Path) -> None:
+    """End-to-end: the same shape, indexed for real, must not fail the sync."""
+    code = tmp_path / "ws" / "code"
+    code.mkdir(parents=True)
+    (code / "guide.md").write_text(
+        "# Guide\n\nSee [broken](//[unterminated) for details.\n",
+        encoding="utf-8",
+    )
+    engine = _make_engine(tmp_path, [{"name": "code", "type": "repository", "path": str(code)}])
+    engine.sync_source("code", "full")  # must not raise
+    assert any(
+        n["type"] == "external_reference"
+        for n in engine.graph_builder.graph.to_node_link()["nodes"]
+    )

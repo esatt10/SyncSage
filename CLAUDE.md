@@ -655,6 +655,100 @@ correctly not built.
 
 ---
 
+## Dogfooding fallout, 2026-08-04 — background sync, graph UI cleanup, a live crash fix
+
+Not Phase-34 scoped — a follow-up UI/UX + bugfix session prompted by
+actually using the demo-agent-framework deployment (adding a second real
+source, mlflow, through the UI) rather than only curling the API.
+
+**Sync no longer blocks the request that started it — `wait: false`.**
+Adding a source through the UI's quick-add hit a **504** on a repo the size
+of mlflow: `POST /sources/quick-add` (and `POST /sources` with
+`sync_now`, and `POST /sync/{id}`) ran the sync *inside* the request/
+response cycle, so a first index that takes minutes outlives what a
+browser tab or reverse proxy holds a connection open for — even though the
+sync went on to succeed server-side, the client only ever saw a timeout.
+Fixed with a new `wait: bool` field on all three endpoints (default
+`true` — the original blocking contract, still what `syncsage up`/CLI
+callers and the existing `test_quick_add_registers_and_syncs_a_pasted_path`
+test get). `wait: false` hands the sync to a background thread (the same
+`sync/worker.py` subprocess `_index` already used, not a new path) and
+returns immediately; `app.state.syncing_sources`/`sync_outcomes`
+(lock-guarded, process-lifetime, in-memory) track it, surfaced as
+`syncing`/`sync_error` on every source in `GET /sources` and `GET
+/overview`. The UI's quick-add, "Advanced…" wizard, and both sync buttons
+(Sources page + the Notebook sources rail) all set `wait: false` now and
+poll (`refetchInterval`, active only while something is syncing) instead
+of blocking their own form/button on the result — the reported "stuck at
+the form, have to scroll back up to where I was" complaint was really "the
+form can't return until a multi-minute sync finishes," which no scroll fix
+could have addressed.
+
+**Regression caught by the live demo, not by the unit tests first
+written:** the `wait: false` validation checked `source_id` against
+`config.sources` only. A source registered at runtime (quick-add) lives in
+the state registry immediately but only reaches *that process's*
+`config.sources` — `SyncEngine._source` already has a state-registry
+fallback for exactly this (a second process, e.g. the sync worker, reading
+a source the YAML never mentioned), and the new validation had to check
+the same place or a perfectly good source 404s the instant a fresh process
+(here: this container after a rebuild/restart) is asked to sync it in the
+background. Reproduced with a two-`TestClient`-same-`/state` regression
+test before trusting the fix
+(`test_sync_source_with_wait_false_accepts_a_source_known_only_to_the_state_registry`).
+
+**A second live-only bug, found once the sync actually ran to completion
+on mlflow's real content:** `graph/enrichment.py`'s `_reference_label`
+(a cosmetic display label over a reference string — node identity comes
+from `_node_id`, unaffected) called `urlparse(value)` unguarded.
+`urllib.parse` raises `ValueError: Invalid IPv6 URL` — not a graceful
+"can't parse, return unparsed" the way it handles other malformed
+input — for a netloc-position string starting with `[` and never closing
+it (minimal repro: `"//[foo"`), which crashed the entire sync the moment
+mlflow's real markdown produced one. Fixed with a narrow `try/except
+ValueError: return value` (fail open to the raw string, exactly what
+every other branch of this function already does for "didn't parse as a
+URL"). Regression tests at both the unit level and a full `sync_source`
+end-to-end call with the crashing shape actually indexed.
+
+**Graph canvas cleanup, reported live as "Kamada-Kawai breaks the UI" +
+"entity/external_reference should be hidden by default":** removed the
+`kamada-kawai` layout option (ELK's `stress` algorithm via
+`cytoscape-elk` — the package's only caller) from `GraphCanvas.tsx` and
+`state/session.tsx`'s `GRAPH_LAYOUTS`, and dropped the now-unused
+`cytoscape-elk` dependency — regenerating `package-lock.json` via a
+throwaway `node:22-alpine` container (no local npm here) and confirming
+`npm ci` still resolves cleanly. Side effect: the UI's production JS
+bundle shrank from **2,309 kB to 847 kB** (ELK.js is large). Added
+`"entity"` and `"external_reference"` to `NOISY_NODE_TYPES` — the existing
+default-hidden-legend-types mechanism (`chunk`/`concept` were already in
+it) — so both hide by default in a fresh session, matching the other two
+noisy-by-volume types already there; a browser with prior localStorage
+keeps whatever it already had toggled, which is the correct behavior for
+a default change, not a bug.
+
+**Chat scroll-jump fix (from the immediately preceding turn, same
+session):** `ChatPanel.tsx`'s post-answer effect scrolled the whole
+conversation pane to its absolute bottom on every turn update. For an
+answer longer than a screenful this put the viewport at the *end* of the
+answer, with the user's own question — and the start of the answer —
+scrolled out of view above, needing a manual scroll back up to resume
+reading. Replaced with `scrollIntoView({block: "start"})` on the latest
+turn's own element (tracked per-turn-id in a `Map` ref, since the same
+turn re-renders in place when its answer arrives), pinning the question to
+the top of the viewport instead of chasing the bottom of whatever text
+just arrived.
+
+Full suite: **554 passed, 7 skipped** (+7 over the Phase 34 total: 4
+background-sync tests, 1 state-registry-fallback regression, 2
+`_reference_label`/urlparse tests). `tsc -b && vite build` clean. All
+changes verified live against the running demo-agent-framework stack
+(rebuild → real sync → real 404/500 → fix → rebuild → real success), not
+just unit-tested in isolation — both live-only bugs above would not have
+been caught by the pre-existing test suite alone.
+
+---
+
 ## 6. Pointers
 
 - **Region-side Synapse spec:** `docs/SYNAPSE_INTEGRATION.md`

@@ -853,7 +853,17 @@ def _normalize_concept(value: str) -> str:
 
 
 def _reference_label(value: str) -> str:
-    parsed = urlparse(value)
+    # Cosmetic only — node identity comes from _node_id, not this label.
+    # `urlparse` raises ValueError on some malformed-but-real reference text
+    # (found live on mlflow's real corpus: a markdown reference containing a
+    # bracketed sequence `urlsplit` mistakes for an unterminated IPv6 host
+    # literal, e.g. `[...]` with no closing bracket before further `:`/`/`
+    # characters) rather than returning an unparsed result the way it does
+    # for other malformed input — fail open to the raw value.
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return value
     if parsed.netloc:
         return parsed.netloc + parsed.path
     return value

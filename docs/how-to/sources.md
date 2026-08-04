@@ -10,7 +10,14 @@ Three routes reach the same place, so pick whichever fits:
 - **One command / one field.** `syncsage up <target>` — or **+ Add source**
   in the UI, or `POST /sources/quick-add` — takes a path, a git URL, a glob
   or a connector name, detects what it is, names it, registers it and syncs
-  it. Nothing else to fill in.
+  it. Nothing else to fill in. In the UI, registration is immediate and the
+  first sync runs in the background (`wait: false` — see
+  [HTTP API reference](../reference/http-api.md#sync)) — the form closes
+  right away instead of holding the connection open for however long a
+  large source's first clone + index takes; watch it land on the Sources
+  page, which shows a live "syncing" state per source until it finishes.
+  `syncsage up`/CLI calls still block by default (`wait: true`), matching
+  the shell's own expectation of a command that returns when it's done.
 - **The form.** **Sources → Advanced…** in the UI exposes every field on this
   page, with the type list read from `GET /sources/types` so installed
   connector plugins appear automatically.

@@ -145,6 +145,11 @@ class SyncEngine:
             self.checkpoint_graph()
         except Exception as exc:  # pragma: no cover - shutdown must not raise
             logger.warning("Could not checkpoint graph on shutdown: %s", exc)
+        if self.vectors is not None:
+            try:
+                self.vectors.flush()
+            except Exception as exc:  # pragma: no cover - shutdown must not raise
+                logger.warning("Could not flush vector store on shutdown: %s", exc)
         self.lease.release()
         self.state.close()
 
@@ -369,6 +374,7 @@ class SyncEngine:
                 str(artifact["id"]),
                 [dict(chunk) for chunk in chunks],
             )
+        self.vectors.flush()
         return embedded
 
     def _graph_gap(self, source_name: str) -> bool:
@@ -678,6 +684,14 @@ class SyncEngine:
             self.manifests.save(source.name, manifest)
             self.flush_node_index()
             self.graph_store.save(self.config.knowledge_base_id, self.graph_builder.graph)
+            if self.vectors is not None:
+                # Guaranteed final flush of whatever NumpyVectorStore has
+                # buffered (LanceDB's flush() is a no-op) — mirrors the
+                # unconditional graph save on the line above, for the same
+                # reason: the periodic self-throttled flush inside upsert()
+                # only guarantees durability up to its last threshold, not
+                # up to this artifact.
+                self.vectors.flush()
             self._graph_dirty = False
             self._last_checkpoint = time.monotonic()
             # Recorded only after the pass succeeded, so a sync that dies

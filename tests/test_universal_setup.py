@@ -455,6 +455,34 @@ def test_sync_source_with_wait_false_returns_immediately_and_settles(
     assert settled["sync_error"] is None
 
 
+def test_sync_source_with_wait_false_does_not_start_a_second_overlapping_sync(
+    loaded_config, config_path: Path, tmp_path: Path
+) -> None:
+    """Regression: found live — a source with no checkpoint yet (every
+    attempt does a full pass) got a background sync started twice in close
+    succession (a container-startup trigger landing on top of a manual
+    one), running two concurrent embedding-heavy passes over the same
+    source. That tripped the OpenAI embeddings endpoint's rate limit and
+    duplicated disk/CPU work for nothing. A second `wait: false` trigger
+    for a source that is already syncing must be a no-op, not a second
+    thread."""
+
+    external = tmp_path / "pasted-notes-bg4"
+    external.mkdir()
+    (external / "note.md").write_text("# Pasted\nStill more content.\n", encoding="utf-8")
+    loaded_config.security.allow_user_selected_source_paths = True
+    client = TestClient(create_app(config=loaded_config, config_path=config_path))
+    client.post("/sources/quick-add", json={"target": str(external), "sync_now": False})
+
+    first = client.post("/sync/pasted-notes-bg4", json={"wait": False})
+    second = client.post("/sync/pasted-notes-bg4", json={"wait": False})
+
+    assert first.json()["status"] == "syncing"
+    assert second.json() == {"status": "already_syncing", "source_id": "pasted-notes-bg4"}
+    settled = _wait_until_not_syncing(client, "pasted-notes-bg4")
+    assert settled["sync_error"] is None
+
+
 def test_sync_source_with_wait_false_rejects_an_unknown_source(loaded_config) -> None:
     client = TestClient(create_app(config=loaded_config))
     response = client.post("/sync/does-not-exist", json={"wait": False})
@@ -480,9 +508,7 @@ def test_sync_source_with_wait_false_accepts_a_source_known_only_to_the_state_re
     (external / "note.md").write_text("# Pasted\nEven more content.\n", encoding="utf-8")
     loaded_config.security.allow_user_selected_source_paths = True
     first_process = TestClient(create_app(config=loaded_config, config_path=config_path))
-    first_process.post(
-        "/sources/quick-add", json={"target": str(external), "sync_now": False}
-    )
+    first_process.post("/sources/quick-add", json={"target": str(external), "sync_now": False})
 
     # A fresh config load, same `/state` on disk — a new process's starting
     # point, with an empty `config.sources` for anything not in the YAML.

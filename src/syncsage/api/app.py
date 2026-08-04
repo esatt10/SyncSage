@@ -928,24 +928,19 @@ def create_app(
             )
         return {"results": [r.__dict__ for r in results]}
 
-    def _run_background_sync(source_name: str | None, mode: str) -> None:
+    def _run_background_sync(source_name: str | None, mode: str, names: list[str]) -> None:
         """The `wait=false` path: same worker-subprocess sync as `_index`,
         off the request thread, outcome recorded instead of returned.
 
-        `syncing_sources` marks every name involved *before* the sync
-        starts, so a `GET /sources` poll immediately after triggering one
-        already sees it — there's no gap where the source looks idle. Both
-        dicts are mutated under `sync_lock`, and every name is guaranteed to
-        leave `syncing_sources` in the `finally`, success or failure, sync
-        error or unexpected exception, so a source can never get stuck
-        showing "syncing" forever.
+        ``names`` is exactly what `_start_background_sync` already marked
+        as syncing (under `sync_lock`, before this thread was even
+        started) — every one of them is guaranteed to leave
+        `syncing_sources` in the `finally`, success or failure, sync error
+        or unexpected exception, so a source can never get stuck showing
+        "syncing" forever.
         """
         from syncsage.sync.worker import WorkerBackedEngine
 
-        names = [source_name] if source_name else [s.name for s in config.sources if s.enabled]
-        with app.state.sync_lock:
-            for name in names:
-                app.state.syncing_sources[name] = {"mode": mode, "started_at": utc_now()}
         try:
             worker = WorkerBackedEngine(engine, app.state.config_path)
             if source_name:
@@ -977,13 +972,35 @@ def create_app(
                     "finished_at": utc_now(),
                 }
 
-    def _start_background_sync(source_name: str | None, mode: str) -> None:
+    def _start_background_sync(source_name: str | None, mode: str) -> bool:
+        """Returns False (no-op) instead of starting a second overlapping
+        pass over a source that is already syncing in the background.
+
+        Found live: a source with `sync.on_startup: true` and no checkpoint
+        yet (so every attempt does a full, expensive pass) got resynced by
+        both a container-startup trigger and a manual `wait: false` trigger
+        landing close together — two concurrent embedding-heavy syncs over
+        the same large source, which tripped the OpenAI embeddings
+        endpoint's rate limit and multiplied disk/CPU work for no benefit.
+        The mark-as-syncing step happens *here*, under one lock acquisition
+        that also checks for an existing entry, rather than inside the
+        thread — so the check-and-mark is atomic against a second caller
+        racing in before the first thread has even started.
+        """
+        names = [source_name] if source_name else [s.name for s in config.sources if s.enabled]
+        with app.state.sync_lock:
+            to_start = [n for n in names if n not in app.state.syncing_sources]
+            for name in to_start:
+                app.state.syncing_sources[name] = {"mode": mode, "started_at": utc_now()}
+        if not to_start:
+            return False
         threading.Thread(
             target=_run_background_sync,
-            args=(source_name, mode),
+            args=(source_name, mode, to_start),
             name=f"syncsage-bgsync-{source_name or 'all'}",
             daemon=True,
         ).start()
+        return True
 
     @app.post("/sync")
     def sync_all(req: SyncRequest) -> dict:
@@ -1012,8 +1029,11 @@ def create_app(
             )
             if not known:
                 raise HTTPException(status_code=404, detail=f"Unknown source: {source_id}")
-            _start_background_sync(source_id, mode)
-            return {"status": "syncing", "source_id": source_id}
+            started = _start_background_sync(source_id, mode)
+            return {
+                "status": "syncing" if started else "already_syncing",
+                "source_id": source_id,
+            }
         try:
             report = _index(
                 source_id,
