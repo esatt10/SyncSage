@@ -595,6 +595,13 @@ class S3Connector(SourceConnector):
 
 
 def connector_for_source(source: SourceConfig, state: StateStore) -> SourceConnector:
+    if source.connector.runtime == "sandboxed":
+        # Synapse Step 34.1+: opt-in per source, checked before the
+        # source.type dispatch below so it takes precedence. Default
+        # "native" leaves every existing source byte-identical to pre-34.1.
+        from syncsage.sandbox.connector import SandboxedConnector
+
+        return SandboxedConnector(source, state)
     if source.type.value in {
         "repository",
         "markdown_folder",

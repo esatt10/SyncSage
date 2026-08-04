@@ -1,26 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import CytoscapeComponent from "react-cytoscapejs";
-import cytoscape, { type Core } from "cytoscape";
-// @ts-expect-error -- cytoscape-elk ships no type declarations
-import elk from "cytoscape-elk";
+import type { Core } from "cytoscape";
 import type { GraphLink, GraphNode } from "../api/types";
 import { buildStylesheet, type ShapeAlgorithm, toElements } from "./graphStyles";
-
-// Kamada-Kawai arrives through ELK's `stress` algorithm, which *is* stress
-// majorization — the same objective KK minimizes (edge lengths proportional
-// to graph-theoretic distance). There is no `cytoscape-kamada-kawai` package;
-// the alternative was hand-rolling all-pairs shortest paths plus the descent,
-// which is a lot of unverifiable numerics for a layout you judge by eye.
-let elkRegistered = false;
-if (!elkRegistered) {
-  try {
-    cytoscape.use(elk);
-    elkRegistered = true;
-  } catch {
-    // Already registered (hot reload) — harmless.
-    elkRegistered = true;
-  }
-}
 
 interface GraphCanvasProps {
   nodes: GraphNode[];
@@ -92,7 +74,14 @@ export function GraphCanvas({
       };
       cy.one("layoutstop", finish);
       nextLayout.run();
-      window.setTimeout(finish, 1400);
+      // cose's own default `numIter` (1200) with `animate: true` (see
+      // layoutOptions below) spreads across roughly numIter/refresh ≈ 60
+      // requestAnimationFrame-scheduled chunks rather than one blocking
+      // call, so this fallback needs enough headroom for that to
+      // genuinely finish before it fires — not just cover a fixed
+      // worst-case wall-clock budget the way the old synchronous layout's
+      // 1400ms guess did.
+      window.setTimeout(finish, 8000);
     }, 40);
     return () => window.clearTimeout(handle);
   }, [elements.length, layout]);
@@ -192,30 +181,31 @@ function layoutOptions(
   if (name === "cose") {
     return {
       name,
-      animate: false,
+      // `animate: false` used to run all `numIter` iterations in one
+      // synchronous while-loop (verified against cytoscape's own source —
+      // the `else` branch of CoseLayout.prototype.run) with zero yielding
+      // back to the browser, which is what froze the rest of the UI while
+      // a force layout ran — clicks, chat, other React updates all queue
+      // up behind it. `animate: true` runs the identical algorithm through
+      // cytoscape's own chunking (`refresh: 20` iterations per
+      // requestAnimationFrame call, its default), so the main thread is
+      // free between frames. This is "Force" being the default layout now
+      // (not just an "auto" fallback for small graphs), so it has to hold
+      // up at whatever size a knowledge base actually reaches.
+      animate: true,
       // Roomier than the old defaults: the previous values packed labelled
       // nodes close enough that the text overlapped and read as noise.
       nodeRepulsion: Math.round(20000 * spacing),
       idealEdgeLength: Math.round(130 * spacing),
       nodeOverlap: Math.round(24 * spacing),
       gravity: 0.35,
-      numIter: 1200,
+      // Scaled down for large graphs so a legitimately huge horizon still
+      // settles in a bounded number of frames — `animate: true` keeps the
+      // UI responsive throughout, but "responsive for two minutes" is
+      // still worse than "done in a few seconds" when 1200 iterations
+      // means 1200 iterations regardless of how many nodes each one costs.
+      numIter: elementCount > FORCE_LAYOUT_ELEMENT_LIMIT ? 400 : 1200,
       padding,
-    };
-  }
-  if (name === "kamada-kawai") {
-    // Stress majorization: edge lengths track graph distance, so clusters
-    // separate and long paths read as long. Slower than cose and worth it on
-    // a horizon-sized graph, which is what the canvas draws.
-    return {
-      name: "elk",
-      animate: false,
-      padding,
-      elk: {
-        algorithm: "stress",
-        "elk.stress.desiredEdgeLength": Math.round(120 * spacing),
-        "elk.stress.epsilon": 0.0001,
-      },
     };
   }
   if (name === "concentric") {

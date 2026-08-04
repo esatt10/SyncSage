@@ -28,11 +28,11 @@ See [Attach to a Synapse fleet](../how-to/attach-to-synapse.md).
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/knowledge-bases` | List knowledge bases. |
-| GET | `/overview` | One call for a UI cold start: knowledge base, sources, node counts, whether anything is indexed. |
-| GET | `/sources` | List configured + runtime sources. |
+| GET | `/overview` | One call for a UI cold start: knowledge base, sources, node counts, whether anything is indexed. Each source in `sources[]` carries live `syncing`/`sync_error` (see Sync below). |
+| GET | `/sources` | List configured + runtime sources. Each entry carries `syncing: bool` (a background sync — `wait: false` — is running now) and `sync_error: string \| null` (error from the most recent *background* sync, independent of `last_status`). |
 | GET | `/sources/types` | Registerable source types — built-ins plus installed connector plugins — each with a `path_role` of `required` or `unused`. |
-| POST | `/sources/quick-add` | One-field setup: a path, URL, glob or connector name is detected, named, registered and (by default) synced. Same inference as `syncsage up`. |
-| POST | `/sources` | Register a runtime source (full schema). Accepts plugin types; a plugin source needs no local path. |
+| POST | `/sources/quick-add` | One-field setup: a path, URL, glob or connector name is detected, named, registered and (by default) synced. Same inference as `syncsage up`. `sync_now` (default `true`) gates syncing at all; `wait` (default `true`) gates whether the response blocks on it — see Sync below. `wait: false` returns `sync_results: []` and `syncing: [names]` immediately; poll `GET /sources` for progress. |
+| POST | `/sources` | Register a runtime source (full schema). Accepts plugin types; a plugin source needs no local path. Same `sync_now`/`wait` fields as quick-add. |
 | PUT | `/sources/{source_id}` | Update a source. |
 | POST | `/sources/{source_id}/disable` | Disable a source. |
 | DELETE | `/sources/{source_id}` | Remove a source. |
@@ -44,9 +44,27 @@ See [Attach to a Synapse fleet](../how-to/attach-to-synapse.md).
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/sync` | Sync all sources (mode in body). |
+| POST | `/sync` | Sync all sources (`mode` in body). |
 | POST | `/sync/{source_id}` | Sync one source. |
 | GET | `/sync/status` | Current sync status. |
+
+`/sync` and `/sync/{source_id}` both accept `wait` in the JSON body
+(default `true`, preserving the original blocking contract: the request
+holds open until the sync finishes and returns its full
+indexed/skipped/graph counts). Set `wait: false` to return immediately —
+`{"status": "syncing", ...}` — while the sync runs in a background thread
+(the same `sync/worker.py` subprocess path `wait: true` uses; nothing
+about *how* the sync runs changes, only whether the caller waits for it).
+This exists because a large source's first sync (clone + full index) can
+run well past what a browser tab or reverse proxy will hold a connection
+open for — the SyncSage UI hit exactly this as a 504 on `/sources/
+quick-add` even though the sync went on to succeed server-side. Poll
+`GET /sources` (or `/overview`) for `syncing`/`sync_error` to track a
+background sync to completion; a source is only ever "unknown" (404) if
+it exists in neither `config.sources` nor the state registry — a source
+registered by quick-add/`POST /sources` and never written to YAML is
+still valid here, resolved through the same state-registry fallback
+`SyncEngine._source` uses.
 
 ## Search & retrieval
 

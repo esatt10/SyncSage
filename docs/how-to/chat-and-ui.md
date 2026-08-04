@@ -97,9 +97,10 @@ the environment variable instead.
 
 ## Reading the graph
 
-The graph panel is deliberately quiet by default. `chunk` nodes are **hidden
-by default** — there is one per passage and they add volume, not structure.
-The legend at the bottom is also the filter: click any type to show or hide it.
+The graph panel is deliberately quiet by default. `chunk`, `entity` and
+`external_reference` nodes are **hidden by default** — one per passage, one
+per unresolved import/link — they add volume, not structure. The legend at
+the bottom is also the filter: click any type to show or hide it.
 
 (`concept` nodes used to be hidden here too, and were ~87% of a real graph.
 Concept extraction was retired on 2026-08-03 — see `docs/graph_model.md` — so
@@ -111,10 +112,11 @@ structure worth drawing.)
   diamonds are code symbols) so the canvas reads as structure rather than
   decoration.
 - **Size** grows with connectivity, so hubs stand out without a second legend.
-- **Layout** is switchable from the canvas controls. `Kamada-Kawai` runs ELK's
-  stress majorization — edge length tracks graph distance, so clusters
-  separate and long paths read as long. It costs more than the default force
-  layout, which is why it is a choice rather than the default.
+- **Layout** is switchable from the canvas controls: Automatic, Force,
+  Concentric or Hierarchy. (A `Kamada-Kawai` option — ELK's stress
+  majorization — used to be here; it broke the canvas in practice and was
+  removed along with the `cytoscape-elk` dependency, which also shrank the
+  UI bundle by about 1.5 MB.)
 - **Clicking empty canvas deselects** without resetting your depth, centre or
   answer filter. A selected node also shows **all** of its links, even ones
   whose far end sits outside the current depth horizon — the horizon is a

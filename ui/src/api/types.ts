@@ -75,6 +75,10 @@ export interface SourceRecord {
   last_status?: string;
   last_indexed_at?: string;
   checkpoint?: Record<string, unknown> | null;
+  /** A background sync (registered/triggered with `wait: false`) is running now. */
+  syncing?: boolean;
+  /** Error from the most recent *background* sync, cleared by the next one. Independent of `last_status`. */
+  sync_error?: string | null;
   [key: string]: unknown;
 }
 
@@ -109,6 +113,8 @@ export interface SourceWritePayload {
   urls?: string[];
   sync_now?: boolean;
   sync_mode?: string;
+  /** false = register/sync without blocking the response; poll SourceRecord.syncing instead. Default true. */
+  wait?: boolean;
 }
 
 export interface FsEntry {
@@ -350,4 +356,6 @@ export interface QuickAddResponse {
   status: string;
   sources: { name: string; type: string; path: string; description?: string }[];
   sync_results: SyncResult[];
+  /** Names of sources whose first sync was handed off to a background thread (wait: false). */
+  syncing: string[];
 }

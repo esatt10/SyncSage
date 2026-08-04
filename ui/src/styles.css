@@ -460,6 +460,18 @@ select.text-input {
   color: var(--text-soft);
 }
 
+/* Visible from every page (rendered once in TopBar) — a source registered
+   or synced from anywhere in the app stays visible as "in progress" even
+   after leaving the dialog that started it. */
+.sync-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
 .health-badge__dot {
   width: 7px;
   height: 7px;
@@ -762,7 +774,13 @@ select.text-input {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-width: 760px;
+  /* Fills whatever width the chat pane actually has — the pane itself is
+     already fluid (`.notebook`'s middle grid track is `minmax(0, 1fr)`,
+     and the resizer lets it grow further), but a fixed 760px cap here
+     meant a message never grew past that regardless of how wide the pane
+     got, leaving dead space on a wide window instead of the chat actually
+     expanding into it. */
+  max-width: 100%;
   width: 100%;
 }
 

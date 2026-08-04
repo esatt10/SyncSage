@@ -40,7 +40,15 @@ export function Notebook() {
   const [showWorkflowDialog, setShowWorkflowDialog] = useState(false);
   const layoutRef = useRef<HTMLDivElement>(null);
 
-  const overview = useQuery({ queryKey: ["overview"], queryFn: api.overview });
+  const overview = useQuery({
+    queryKey: ["overview"],
+    queryFn: api.overview,
+    // Mirrors SourcesPage: a background sync (wait: false) reports its
+    // progress here, so the Sources rail needs to keep polling while one is
+    // running rather than only refreshing on the events this page already
+    // triggers (asking a question, switching sources).
+    refetchInterval: (query) => (query.state.data?.sources?.some((s) => s.syncing) ? 1500 : false),
+  });
   const status = useQuery({
     queryKey: ["assistant-status", sessionId],
     queryFn: () => api.assistantStatus(sessionId),

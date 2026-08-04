@@ -33,6 +33,7 @@ class SyncSageTools:
             SearchStore(self.state),
             vector=self.engine.vector_searcher(),
             node_index=self.engine.node_index,
+            wasm_relationship_search=config.search.wasm_relationship_search,
         )
 
     def list_knowledge_bases(self) -> dict:

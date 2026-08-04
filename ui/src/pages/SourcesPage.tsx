@@ -9,7 +9,15 @@ const SYNC_MODES = ["incremental", "full", "validate_only", "repair"];
 
 export function SourcesPage() {
   const queryClient = useQueryClient();
-  const sources = useQuery({ queryKey: ["sources"], queryFn: api.sources });
+  const sources = useQuery({
+    queryKey: ["sources"],
+    queryFn: api.sources,
+    // Sync now runs in the background (wait: false) rather than blocking
+    // the request that started it, so this is how its progress actually
+    // reaches the page — poll while anything is in flight, stop the moment
+    // nothing is (a static page shouldn't tick a network request forever).
+    refetchInterval: (query) => (query.state.data?.some((s) => s.syncing) ? 1500 : false),
+  });
   const [quickAdd, setQuickAdd] = useState(false);
   const [showWizard, setShowWizard] = useState(false);
   const [editingSource, setEditingSource] = useState<SourceRecord | null>(null);
@@ -82,9 +90,24 @@ export function SourcesPage() {
               <td className="path-cell" title={source.path}>
                 {source.path}
               </td>
-              <td className="muted small">{source.last_status ?? "—"}</td>
+              <td className="muted small">
+                {source.syncing ? (
+                  <span className="thinking">
+                    <span className="spinner" /> syncing…
+                  </span>
+                ) : source.sync_error ? (
+                  <span className="error" title={source.sync_error}>
+                    sync failed
+                  </span>
+                ) : (
+                  (source.last_status ?? "—")
+                )}
+              </td>
               <td className="actions-cell">
-                <SyncControl onSync={(mode) => sync.mutate({ name: source.name, mode })} />
+                <SyncControl
+                  disabled={Boolean(source.syncing)}
+                  onSync={(mode) => sync.mutate({ name: source.name, mode })}
+                />
                 <button className="btn btn--small" onClick={() => setEditingSource(source)}>
                   edit
                 </button>
@@ -155,7 +178,13 @@ export function SourcesPage() {
   );
 }
 
-function SyncControl({ onSync }: { onSync: (mode: string) => void }) {
+function SyncControl({
+  onSync,
+  disabled,
+}: {
+  onSync: (mode: string) => void;
+  disabled?: boolean;
+}) {
   const [mode, setMode] = useState("incremental");
   return (
     <span className="sync-control">
@@ -164,6 +193,7 @@ function SyncControl({ onSync }: { onSync: (mode: string) => void }) {
         value={mode}
         onChange={(e) => setMode(e.target.value)}
         style={{ width: "auto" }}
+        disabled={disabled}
       >
         {SYNC_MODES.map((m) => (
           <option key={m} value={m}>
@@ -171,8 +201,12 @@ function SyncControl({ onSync }: { onSync: (mode: string) => void }) {
           </option>
         ))}
       </select>
-      <button className="btn btn--small btn--primary" onClick={() => onSync(mode)}>
-        sync
+      <button
+        className="btn btn--small btn--primary"
+        onClick={() => onSync(mode)}
+        disabled={disabled}
+      >
+        {disabled ? "syncing…" : "sync"}
       </button>
     </span>
   );

@@ -46,8 +46,12 @@ export function ChatPanel({
   // exactly where it was — including a half-typed question.
   const { state, dispatch } = useSession();
   const { turns, draft, sourceFilter, workflow } = state;
-  const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Keyed by turn id rather than a single ref: the effect below always needs
+  // *the newest turn's* element, and turns re-render with new array
+  // identities (new question appended, then the same turn updated in place
+  // with its answer) rather than staying at a fixed index.
+  const turnRefs = useRef(new Map<string, HTMLDivElement>());
   // Live workflow steps for the in-flight question. Local, not session state:
   // they describe one request and are meaningless once it resolves.
   const [progress, setProgress] = useState<{ name: string; detail: string }[]>([]);
@@ -75,9 +79,17 @@ export function ChatPanel({
     },
   });
 
-  // Keep the newest turn in view as answers stream in.
+  // Keep the newest turn's *question* pinned near the top of the viewport —
+  // both when it's first asked and again once its answer lands. Scrolling to
+  // the container's absolute bottom instead (the previous behavior) put the
+  // viewport at the end of whatever answer just arrived, which for anything
+  // longer than a screenful meant the question — and the start of the
+  // answer — scrolled out of view above, forcing a manual scroll back up to
+  // resume reading from where the turn began.
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+    const latest = turns[turns.length - 1];
+    if (!latest) return;
+    turnRefs.current.get(latest.id)?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, [turns, ask.isPending]);
 
   const submit = (text: string) => {
@@ -99,7 +111,7 @@ export function ChatPanel({
 
   return (
     <div className="chat">
-      <div className="chat__scroll" ref={scrollRef}>
+      <div className="chat__scroll">
         {turns.length === 0 ? (
           <div className="chat-empty">
             <h2>Ask your knowledge base</h2>
@@ -125,7 +137,13 @@ export function ChatPanel({
         ) : null}
 
         {turns.map((turn) => (
-          <div key={turn.id}>
+          <div
+            key={turn.id}
+            ref={(el) => {
+              if (el) turnRefs.current.set(turn.id, el);
+              else turnRefs.current.delete(turn.id);
+            }}
+          >
             <div className="msg msg--user">
               <div className="msg__bubble">{turn.question}</div>
             </div>

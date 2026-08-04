@@ -165,6 +165,11 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
       payload.name = name;
       payload.sync_now = syncNow;
       payload.sync_mode = syncMode;
+      // The first sync of a freshly registered source is exactly the case
+      // that produced a 504 for a large repo (indexing minutes long, well
+      // past what a browser/reverse proxy holds a request open for) — never
+      // block registration on it; the Sources page shows live progress.
+      payload.wait = false;
     }
     return payload;
   };
@@ -397,6 +402,14 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
                     ))}
                   </select>
                 </label>
+              </div>
+            )}
+
+            {(editing || syncNow) && (
+              <div className="banner banner--warn" style={{ marginBottom: 0 }}>
+                {editing
+                  ? "Saving re-syncs this source in the background — search and chat may respond more slowly until it finishes."
+                  : "Search and chat may respond more slowly while this source syncs in the background, especially for a large one — that settles once it finishes. Progress shows on the Sources page and the \"Syncing…\" indicator at the top of every page."}
               </div>
             )}
 

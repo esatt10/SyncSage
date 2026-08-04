@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import re
 import shutil
+import time
 from pathlib import Path
 
 import pytest
@@ -390,6 +391,136 @@ def test_quick_add_rejects_a_bad_target(loaded_config, tmp_path: Path) -> None:
     client = TestClient(create_app(config=loaded_config))
     response = client.post("/sources/quick-add", json={"target": str(tmp_path / "nowhere")})
     assert response.status_code == 400
+
+
+def _wait_until_not_syncing(client: TestClient, name: str, timeout_s: float = 30.0) -> dict:
+    deadline = time.monotonic() + timeout_s
+    record = None
+    while time.monotonic() < deadline:
+        record = next((s for s in client.get("/sources").json() if s["name"] == name), None)
+        if record is not None and not record["syncing"]:
+            return record
+        time.sleep(0.2)
+    raise AssertionError(f"{name} never finished background-syncing within {timeout_s}s")
+
+
+def test_quick_add_with_wait_false_registers_immediately_and_syncs_in_background(
+    loaded_config, config_path: Path, tmp_path: Path
+) -> None:
+    """The fix for the UI's "stuck at the form" / 504 report: registering a
+    source must return before indexing finishes, and GET /sources must show
+    live progress rather than the caller having to hold the connection open
+    for however long the first sync takes."""
+
+    external = tmp_path / "pasted-notes-bg"
+    external.mkdir()
+    (external / "note.md").write_text("# Pasted\nSome content.\n", encoding="utf-8")
+    loaded_config.security.allow_user_selected_source_paths = True
+    client = TestClient(create_app(config=loaded_config, config_path=config_path))
+
+    response = client.post("/sources/quick-add", json={"target": str(external), "wait": False})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["sources"][0]["name"] == "pasted-notes-bg"
+    # Nothing was awaited — no synchronous sync result yet.
+    assert body["sync_results"] == []
+    assert body["syncing"] == ["pasted-notes-bg"]
+
+    # Visible as syncing immediately, before the background thread has
+    # necessarily even started — this is what a client polls right after
+    # the registration response to show a live "syncing" badge.
+    immediate = next(s for s in client.get("/sources").json() if s["name"] == "pasted-notes-bg")
+    assert immediate["syncing"] is True
+
+    settled = _wait_until_not_syncing(client, "pasted-notes-bg")
+    assert settled["sync_error"] is None
+
+
+def test_sync_source_with_wait_false_returns_immediately_and_settles(
+    loaded_config, config_path: Path, tmp_path: Path
+) -> None:
+    external = tmp_path / "pasted-notes-bg2"
+    external.mkdir()
+    (external / "note.md").write_text("# Pasted\nMore content.\n", encoding="utf-8")
+    loaded_config.security.allow_user_selected_source_paths = True
+    client = TestClient(create_app(config=loaded_config, config_path=config_path))
+    client.post("/sources/quick-add", json={"target": str(external), "sync_now": False})
+
+    response = client.post("/sync/pasted-notes-bg2", json={"wait": False})
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "syncing", "source_id": "pasted-notes-bg2"}
+    settled = _wait_until_not_syncing(client, "pasted-notes-bg2")
+    assert settled["sync_error"] is None
+
+
+def test_sync_source_with_wait_false_does_not_start_a_second_overlapping_sync(
+    loaded_config, config_path: Path, tmp_path: Path
+) -> None:
+    """Regression: found live — a source with no checkpoint yet (every
+    attempt does a full pass) got a background sync started twice in close
+    succession (a container-startup trigger landing on top of a manual
+    one), running two concurrent embedding-heavy passes over the same
+    source. That tripped the OpenAI embeddings endpoint's rate limit and
+    duplicated disk/CPU work for nothing. A second `wait: false` trigger
+    for a source that is already syncing must be a no-op, not a second
+    thread."""
+
+    external = tmp_path / "pasted-notes-bg4"
+    external.mkdir()
+    (external / "note.md").write_text("# Pasted\nStill more content.\n", encoding="utf-8")
+    loaded_config.security.allow_user_selected_source_paths = True
+    client = TestClient(create_app(config=loaded_config, config_path=config_path))
+    client.post("/sources/quick-add", json={"target": str(external), "sync_now": False})
+
+    first = client.post("/sync/pasted-notes-bg4", json={"wait": False})
+    second = client.post("/sync/pasted-notes-bg4", json={"wait": False})
+
+    assert first.json()["status"] == "syncing"
+    assert second.json() == {"status": "already_syncing", "source_id": "pasted-notes-bg4"}
+    settled = _wait_until_not_syncing(client, "pasted-notes-bg4")
+    assert settled["sync_error"] is None
+
+
+def test_sync_source_with_wait_false_rejects_an_unknown_source(loaded_config) -> None:
+    client = TestClient(create_app(config=loaded_config))
+    response = client.post("/sync/does-not-exist", json={"wait": False})
+    assert response.status_code == 404
+
+
+def test_sync_source_with_wait_false_accepts_a_source_known_only_to_the_state_registry(
+    loaded_config, config_path: Path, tmp_path: Path
+) -> None:
+    """Regression: a source registered at runtime (quick-add) lives in the
+    state registry immediately, but only lands in *this process's*
+    `config.sources` list. A second process reading the same `/state` —
+    the sync worker, or (as happened live) the API server after a
+    container restart — starts with a `config.sources` that has never
+    heard of it; only `SyncEngine._source`'s state-registry fallback makes
+    it syncable there. The `wait=false` validation must check the same
+    place `_source` ultimately does, not just `config.sources`, or a
+    perfectly good source 404s the moment a fresh process is asked to
+    sync it in the background."""
+
+    external = tmp_path / "pasted-notes-bg3"
+    external.mkdir()
+    (external / "note.md").write_text("# Pasted\nEven more content.\n", encoding="utf-8")
+    loaded_config.security.allow_user_selected_source_paths = True
+    first_process = TestClient(create_app(config=loaded_config, config_path=config_path))
+    first_process.post("/sources/quick-add", json={"target": str(external), "sync_now": False})
+
+    # A fresh config load, same `/state` on disk — a new process's starting
+    # point, with an empty `config.sources` for anything not in the YAML.
+    fresh_config = load_config(config_path)
+    assert not any(s.name == "pasted-notes-bg3" for s in fresh_config.sources)
+    second_process = TestClient(create_app(config=fresh_config, config_path=config_path))
+
+    response = second_process.post("/sync/pasted-notes-bg3", json={"wait": False})
+
+    assert response.status_code == 200, response.json()
+    settled = _wait_until_not_syncing(second_process, "pasted-notes-bg3")
+    assert settled["sync_error"] is None
 
 
 def test_overview_reports_whether_there_is_a_graph_to_show(loaded_config) -> None:

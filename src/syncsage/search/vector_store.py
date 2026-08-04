@@ -55,6 +55,7 @@ import os
 import re
 import struct
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from urllib.request import Request, urlopen
@@ -120,6 +121,14 @@ class VectorStore(Protocol):
     def existing_ids(self, chunk_ids: list[str]) -> set[str]: ...
 
     def source_chunk_ids(self, source_id: str) -> set[str]: ...
+
+    def flush(self) -> None:
+        """Persist any writes a backend may have deferred. Backends that
+        already write durably on every `upsert`/`delete` (e.g. LanceDB) make
+        this a no-op; callers must still call it at the end of a sync to
+        guarantee durability for backends that don't (e.g. `NumpyVectorStore`,
+        see its docstring)."""
+        ...
 
 
 class StubEmbedder:
@@ -233,13 +242,41 @@ class OpenAISpecEmbedder:
 
 
 class NumpyVectorStore:
-    """Always-available flat-file backend (also the offline test backend)."""
+    """Always-available flat-file backend (also the offline test backend).
 
-    def __init__(self, directory: str | Path):
+    ``index.json`` holds every vector in the knowledge base as one JSON
+    object, so a write is always "read the whole thing, merge, write the
+    whole thing back" — there is no incremental/append path, unlike a real
+    embedded database (`LanceDBVectorStore`). Writing on *every*
+    `upsert()` call (one per artifact, i.e. once per file — see
+    `VectorIndexer.index_artifact`) is therefore O(n^2) in the number of
+    artifacts once the index is non-trivially large: each of N files pays a
+    full rewrite of an index that has grown to include the previous N-1.
+    Measured live indexing a second large source into an already-large
+    shared index (both sources share one index per knowledge base): over
+    100GB written for a ~150MB final file, entirely from this pattern.
+    `upsert`/`delete` now buffer in memory and flush to disk on the same
+    self-throttled schedule `SyncEngine._maybe_checkpoint` already uses for
+    the graph — `flush()` forces a save and callers (`SyncEngine`) MUST call
+    it at the end of a sync to guarantee durability for whatever hasn't hit
+    the periodic threshold yet.
+    """
+
+    def __init__(self, directory: str | Path, *, flush_interval_seconds: float = 20.0):
         self.directory = Path(directory)
         self.path = self.directory / "index.json"
         self._cache: dict[str, dict[str, Any]] | None = None
         self._cache_sig: tuple[int, int] | None = None
+        # Bumped on every *content* change to `_cache` — an upsert/delete
+        # (flushed or not) or a disk re-read that found different content.
+        # `_cache_sig` (the on-disk file's mtime+size) does NOT change while
+        # a write is buffered in memory, so it cannot be used to invalidate
+        # the decoded-matrix cache below; this can.
+        self._version = 0
+        self._dirty = False
+        self._flush_interval = max(1.0, float(flush_interval_seconds))
+        self._last_flush = time.monotonic()
+        self._last_flush_seconds = 0.0
         # Decoded (ids, matrix, norms) built from `_cache`. Every vector is
         # stored base64-encoded, and decoding it is a pure-Python loop
         # (base64.b64decode + struct.unpack per item) that does not release
@@ -251,10 +288,10 @@ class NumpyVectorStore:
         # searches against a 7,463-chunk index took 21-29s (~5-7s each) --
         # almost entirely this decode, not the embedding API call or the
         # actual similarity math (a real numpy matmul over an already-
-        # decoded matrix is fast). Keyed off the same file signature as
-        # `_cache`, so it invalidates exactly when the raw JSON cache does.
+        # decoded matrix is fast). Keyed off `_version`, so it invalidates
+        # on any content change, flushed to disk or still buffered.
         self._matrix_cache: tuple[list[str], Any, Any] | None = None
-        self._matrix_sig: tuple[int, int] | None = None
+        self._matrix_sig: int | None = None
         self._matrix_lock = threading.Lock()
 
     # -- persistence -------------------------------------------------
@@ -267,6 +304,10 @@ class NumpyVectorStore:
         return (stat.st_mtime_ns, stat.st_size)
 
     def _items(self) -> dict[str, dict[str, Any]]:
+        if self._dirty:
+            # Buffered writes are ahead of disk (or disk has nothing yet) —
+            # re-reading here would silently discard them.
+            return self._cache if self._cache is not None else {}
         signature = self._signature()
         if signature is None:
             self._cache, self._cache_sig = {}, None
@@ -275,6 +316,7 @@ class NumpyVectorStore:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             self._cache = payload.get("items", {})
             self._cache_sig = signature
+            self._version += 1
         return self._cache
 
     def _save(self, items: dict[str, dict[str, Any]]) -> None:
@@ -287,6 +329,26 @@ class NumpyVectorStore:
         os.replace(tmp, self.path)
         self._cache = items
         self._cache_sig = self._signature()
+
+    def _maybe_flush(self, *, force: bool = False) -> None:
+        if not self._dirty:
+            return
+        # Self-throttling, same shape as SyncEngine._maybe_checkpoint: a
+        # save's cost scales with index size (the whole thing is rewritten
+        # every time), so spacing flushes at ~10x the last save's duration
+        # keeps their overhead a bounded fraction of the sync no matter how
+        # large the index gets, instead of a full rewrite per artifact.
+        interval = max(self._flush_interval, self._last_flush_seconds * 10)
+        if not force and time.monotonic() - self._last_flush < interval:
+            return
+        started = time.monotonic()
+        self._save(self._cache or {})
+        self._last_flush_seconds = time.monotonic() - started
+        self._last_flush = time.monotonic()
+        self._dirty = False
+
+    def flush(self) -> None:
+        self._maybe_flush(force=True)
 
     @staticmethod
     def _encode(vector: list[float]) -> str:
@@ -308,7 +370,10 @@ class NumpyVectorStore:
         items = dict(self._items())
         for chunk_id, vector, payload in zip(chunk_ids, vectors, payloads, strict=True):
             items[chunk_id] = {"v": self._encode(vector), "payload": payload}
-        self._save(items)
+        self._cache = items
+        self._version += 1
+        self._dirty = True
+        self._maybe_flush()
 
     def delete(
         self,
@@ -328,7 +393,10 @@ class NumpyVectorStore:
             if items.pop(chunk_id, None) is not None:
                 removed += 1
         if removed:
-            self._save(items)
+            self._cache = items
+            self._version += 1
+            self._dirty = True
+            self._maybe_flush()
         return removed
 
     def _decoded_matrix(self) -> tuple[list[str], Any, Any] | None:
@@ -347,12 +415,12 @@ class NumpyVectorStore:
         if not items:
             return None
         cached = self._matrix_cache
-        if cached is not None and self._matrix_sig == self._cache_sig:
+        if cached is not None and self._matrix_sig == self._version:
             return cached
         with self._matrix_lock:
             # Re-check: another thread may have just finished building it
             # while this one was waiting for the lock.
-            if self._matrix_cache is not None and self._matrix_sig == self._cache_sig:
+            if self._matrix_cache is not None and self._matrix_sig == self._version:
                 return self._matrix_cache
             ids = list(items)
             matrix = np.stack([self._decode(items[chunk_id]["v"]) for chunk_id in ids])
@@ -360,7 +428,7 @@ class NumpyVectorStore:
             norms[norms == 0.0] = 1.0
             built = (ids, matrix, norms)
             self._matrix_cache = built
-            self._matrix_sig = self._cache_sig
+            self._matrix_sig = self._version
             return built
 
     def search(self, query_vec: list[float], k: int) -> list[tuple[str, float, dict[str, Any]]]:
@@ -528,6 +596,10 @@ class LanceDBVectorStore:
             if row["source_id"] == source_id
         }
 
+    def flush(self) -> None:
+        """No-op: `upsert`/`delete` already write through to the LanceDB
+        table on every call — nothing is ever buffered here."""
+
     def all_vectors(self) -> list[tuple[str, list[float]]]:
         """Bulk (chunk_id, vector) reader used by the contract publisher."""
 
@@ -585,6 +657,13 @@ class VectorIndexer:
         if not stale:
             return 0
         return self.store.delete(chunk_ids=stale)
+
+    def flush(self) -> None:
+        """Force any writes the store buffered to disk now. The caller
+        (`SyncEngine`) MUST call this at the end of a sync, alongside its
+        own final graph save — see `NumpyVectorStore`'s docstring for why
+        this exists."""
+        self.store.flush()
 
 
 class VectorSearcher:
