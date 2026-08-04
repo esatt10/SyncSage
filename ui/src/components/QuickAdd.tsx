@@ -89,8 +89,14 @@ export function QuickAdd({ onClose, onAdded }: { onClose: () => void; onAdded: (
             document folder, web collection, bucket or connector — then indexes it. The
             equivalent command is <code>syncsage up {target.trim() || "<target>"}</code>.
             Registration is immediate; indexing continues in the background and its
-            progress shows up on the Sources page.
+            progress shows up on the Sources page (and the "Syncing…" indicator at the
+            top of every page until it finishes).
           </p>
+
+          <div className="banner banner--warn" style={{ marginBottom: 0 }}>
+            Search and chat may respond more slowly while a new source is syncing,
+            especially for a large one — that settles once it finishes.
+          </div>
 
           {add.isError ? (
             <div className="banner banner--error" style={{ marginBottom: 0 }}>

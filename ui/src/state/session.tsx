@@ -66,7 +66,11 @@ const INITIAL: SessionState = {
   centerId: null,
   depth: DEFAULT_DEPTH,
   showAll: false,
-  layout: "auto",
+  // Force-directed is the default now — "auto" degrades to "concentric"
+  // above FORCE_LAYOUT_ELEMENT_LIMIT (GraphCanvas.tsx), which reads as a
+  // surprising layout switch on a knowledge base large enough to cross
+  // that threshold rather than the force layout most users expect.
+  layout: "cose",
   railCollapsed: false,
   surfacedIds: [],
   focusIds: [],

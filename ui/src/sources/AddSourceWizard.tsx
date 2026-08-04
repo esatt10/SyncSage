@@ -405,6 +405,14 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
               </div>
             )}
 
+            {(editing || syncNow) && (
+              <div className="banner banner--warn" style={{ marginBottom: 0 }}>
+                {editing
+                  ? "Saving re-syncs this source in the background — search and chat may respond more slowly until it finishes."
+                  : "Search and chat may respond more slowly while this source syncs in the background, especially for a large one — that settles once it finishes. Progress shows on the Sources page and the \"Syncing…\" indicator at the top of every page."}
+              </div>
+            )}
+
             {(error || mutation.isError) && <p className="error">{error ?? (mutation.error as Error).message}</p>}
 
             <button
