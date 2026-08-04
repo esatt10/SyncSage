@@ -513,6 +513,7 @@ def create_app(
         SearchStore(state),
         vector=engine.vector_searcher(),
         node_index=engine.node_index,
+        wasm_relationship_search=config.search.wasm_relationship_search,
     )
 
     @asynccontextmanager

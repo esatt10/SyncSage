@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
 from syncsage.graph.simple import SimpleMultiDiGraph
+
+logger = logging.getLogger(__name__)
 
 # Attribute keys that carry no useful search signal (timestamps, opaque hashes,
 # foreign keys). Skipping them keeps attribute matches meaningful instead of
@@ -29,6 +32,7 @@ def search_graph(
     source_name: str | None = None,
     include_relationships: bool = True,
     node_index: Any = None,
+    wasm_relationship_search: bool = False,
 ) -> list[dict[str, Any]]:
     """Search across graph nodes, relationships and their attributes.
 
@@ -85,7 +89,7 @@ def search_graph(
     results = [hit for _, hit in node_hits[:max_results]]
 
     if include_relationships and len(results) < max_results:
-        rel_hits = _relationship_hits(graph, tokens, q, source_name)
+        rel_hits = _relationship_hits(graph, tokens, q, source_name, wasm_relationship_search)
         rel_hits.sort(key=lambda item: -item[0])
         for _, hit in rel_hits[: max_results - len(results)]:
             results.append(hit)
@@ -129,11 +133,41 @@ def _relationship_hits(
     tokens: list[str],
     q: str,
     source_name: str | None,
+    wasm_relationship_search: bool = False,
 ) -> list[tuple[float, dict[str, Any]]]:
     hits: list[tuple[float, dict[str, Any]]] = []
     with graph.reading():
-        hits.extend(_scan_edges(graph, tokens, q, source_name))
+        if wasm_relationship_search:
+            hits.extend(_scan_edges_accelerated(graph, tokens, q, source_name))
+        else:
+            hits.extend(_scan_edges(graph, tokens, q, source_name))
     return hits
+
+
+def _scan_edges_accelerated(
+    graph: SimpleMultiDiGraph,
+    tokens: list[str],
+    q: str,
+    source_name: str | None,
+) -> list[tuple[float, dict[str, Any]]]:
+    """Synapse Step 34.5b: WASM-accelerated ``_scan_edges``, pure-Python fallback.
+
+    Opt-in via ``search.wasm_relationship_search`` (caller already checked
+    the flag; this function's job is just the try/fallback). Any failure —
+    the ``[wasm]`` extra missing, a sandbox error, anything — falls back to
+    the pure-Python scan rather than dropping relationship results;
+    acceleration is a performance path, never a correctness dependency.
+    Caller already holds ``graph.reading()``.
+    """
+    try:
+        from syncsage.sandbox.accel import scan_edges_wasm
+
+        return scan_edges_wasm(graph, tokens, q, source_name)
+    except Exception:
+        logger.warning(
+            "WASM relationship search failed; falling back to pure Python", exc_info=True
+        )
+        return _scan_edges(graph, tokens, q, source_name)
 
 
 def _scan_edges(
@@ -162,7 +196,9 @@ def _scan_edges(
             for attr_key, value in data.items():
                 if attr_key in _SKIP_KEYS or attr_key == "type":
                     continue
-                attr_score = max(attr_score, _field_score(_stringify(value), tokens, q, 0.5, 0.35, 0.3))
+                attr_score = max(
+                    attr_score, _field_score(_stringify(value), tokens, q, 0.5, 0.35, 0.3)
+                )
             score = max(type_score, endpoint_score, attr_score)
             if score <= 0:
                 continue
@@ -189,7 +225,9 @@ def _scan_edges(
     return hits
 
 
-def _node_result(node_id: str, attrs: dict[str, Any], score: float, field: str | None) -> dict[str, Any]:
+def _node_result(
+    node_id: str, attrs: dict[str, Any], score: float, field: str | None
+) -> dict[str, Any]:
     label = str(attrs.get("label") or node_id)
     return {
         "kind": "node",

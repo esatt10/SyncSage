@@ -421,6 +421,218 @@ Full step contracts with acceptance criteria: `docs/SYNAPSE_INTEGRATION.md` §2.
 | 21.5 | Semantic-contract publisher + NDJSON event stream + router webhook **[x-repo]** | no sync-completion signal; no contract | done (2026-06-14) |
 | 21.6 | Graph snapshots (zstd) + retention + backup/restore; cross-source edges + concept normalization | dead storage config; no backup; no cross-source links | done (session A 2026-06-18; session B 2026-06-18) — Phase 21 complete |
 
+**Phase 34 (WASM sandboxing & selective acceleration) queued 2026-08-03.**
+Full step contracts in `docs/SYNAPSE_INTEGRATION.md` §5. Not
+Synapse-contract work — no wire-format impact, no `[x-repo]` obligation.
+Anchored on two confirmed, unmitigated gaps found by reading the hot paths
+directly (judged against what's left *after* the 2026-08-03 concept-extraction
+retirement above, not against that already-solved cost): (1) third-party
+connector plugins run fully-trusted, unsandboxed Python in-process
+(`sync/connector_registry.py`'s `ep.load()`, ambient secrets via
+`os.environ`); (2) two O(graph) hot loops that scale with multi-source
+growth — `graph/builder.py:add_cross_source_edges` (every sync, can't be
+`changed_ids`-gated like `add_similarity_edges` because references need both
+sides indexed) and `search/graph_search.py:_scan_edges` (every relationship
+query, no FTS5-style prefilter unlike node search). Sandboxing
+(`wasmtime`/WASI, new `[wasm]` extra, opt-in `connector.runtime: sandboxed`
+tier alongside native) and speed work (WASM-accelerated cross-source
+resolution + relationship search, gated on a benchmark spike) are independent
+tracks; mono-container-per-KB architecture is unchanged. Steps 34.1-34.7, one
+per session, `runs/<ts>-synapse-34.N/SUMMARY.md` each.
+
+**Step 34.1 (host harness) landed here 2026-08-03.** New
+`src/syncsage/sandbox/wasm_runtime.py`: `WasmSandbox` wraps one `wasmtime`
+guest instance — deterministic fuel metering (`Config.consume_fuel` +
+`Store.set_fuel`, not a wall-clock timeout), a per-instance linear-memory cap
+(`Store.set_limits`), and a capability-scoped `host_fetch_len`/
+`host_fetch_read` import pair gated by `HostCapabilities.allowed_hosts` (no
+ambient WASI env/fs/net; reuses `sync/connectors.py`'s `require_fetchable_url`
+rather than reimplementing scheme checks). Traps translate to typed
+exceptions (`SandboxFuelExhausted`, `SandboxMemoryLimitExceeded`,
+`SandboxCapabilityDenied`, `SandboxTrapped`); a region without the new
+`[wasm]` extra (`wasmtime>=20`) stays byte-identical
+(`WasmRuntimeUnavailable` raised only on actual use, never on import).
+**Toolchain note:** no Rust/TinyGo toolchain was available in this
+environment, so guest fixtures are hand-authored WAT text compiled by
+`wasmtime.Module`'s built-in WAT parser — no external compiler needed for
+the reference/test guests; a real toolchain is still expected for
+third-party connector authors (unchanged from the plan).
+`tests/test_wasm_harness.py` (6 tests): hello-wasm runs, fuel exhaustion and
+memory-cap overrun both fail closed, a `host_fetch` round trip succeeds for
+an allowlisted host and is denied otherwise, gated-import guarantee holds.
+Suite: **516 passed, 7 skipped** (+6).
+
+**Step 34.2 (reference sandboxed connector) landed here 2026-08-03.** New
+`src/syncsage/sandbox/connector.py`: `SandboxedConnector` ports
+`StaticDirConnector`'s shape — lists/reads `*.txt` files host-side (guarded
+by `security/path_policy.resolve_under`, reused not duplicated) and runs
+each file's bytes through a bundled WASM guest's `normalize()` export
+(CRLF→LF) inside the 34.1 harness before hashing/storing.
+`connector_for_source` (`sync/connectors.py`) now checks
+`source.connector.runtime == "sandboxed"` before its `source.type` dispatch
+(new `SourceConnectorSettings.{runtime, allowed_hosts, wasm_module_path}`,
+all additive, `runtime` default `"native"` — an untouched source is
+byte-identical to pre-34.1). **Deviation from the plan text:** listing/read
+stays host-side rather than the guest doing its own WASI
+`fd_readdir`/`path_open` syscalls — hand-authoring WASI preview1's
+filesystem ABI in raw WAT (no Rust/TinyGo toolchain available, per 34.1) was
+judged too easy to get subtly wrong without a way to validate it; the guest
+still processes real untrusted per-item bytes under the fuel/memory cap,
+which is the actual threat-model target (Confluence's in-process
+BeautifulSoup parse of untrusted remote XHTML is the named example) — full
+rationale in the run summary. `syncsage.testing.ConnectorConformance`
+needed **no code changes** — it was already connector-agnostic, so the
+sandboxed connector gets the identical bar for free via a new subclass.
+`tests/test_sandboxed_connector.py` (9 tests, +9). Suite: **525 passed, 7
+skipped**.
+
+**Step 34.3 (adversarial limit enforcement) landed here 2026-08-03.**
+`WasmSandbox.__init__` now wraps `linker.instantiate`: a guest declaring an
+import the sandbox never wires (e.g. `wasi_snapshot_preview1.environ_get` —
+no ambient WASI env is ever provided) fails to **load at all**, surfaced as
+`SandboxCapabilityDenied` rather than a raw `wasmtime.WasmtimeError`.
+`tests/test_wasm_adversarial.py` (5 tests) proves all four named adversarial
+shapes fail closed with the specific properties the step calls for: unbounded
+memory / infinite loop both raise their typed exception inside a wall-clock
+bound (no hang); ambient env read is denied before any guest code runs; two
+SSRF-shaped host_fetch attempts (`file:///etc/passwd` scheme disguise, a
+`169.254.169.254` metadata-endpoint host) are both denied with the fetcher
+asserted **never invoked** (no secret leak) and the guest's result buffer
+staying all-zero (no partial write). New fixtures:
+`tests/fixtures/wasm/{wasi_env_leak,host_fetch_ssrf}.wat`. Suite: **530
+passed, 7 skipped** (+5). **Scope note:** the plan's broader manual
+end-to-end check (malicious connector wired into a live `syncsage sync`,
+confirming the parent API server keeps serving via `sync/worker.py`'s
+pre-existing child-process isolation) is left as a documented follow-up —
+34.3's own acceptance is fully covered by the automated suite, and that
+check exercises Phase 21.1 process isolation rather than anything new here.
+This **closes the sandboxing arc (34.1-34.3)**. Next: Step 34.4 (benchmark
+spike — no production code expected, numbers only).
+
+**Step 34.4 (benchmark spike) partially landed here 2026-08-03 — blocked on
+a toolchain decision.** `runs/2026-08-03-synapse-34.4/benchmark.py` measures
+the pure-Python baseline for both named hot loops at 6 scale points each:
+`resolve_cross_source_edges` is confirmed genuinely O(V+E) (flat ~5-6
+μs/edge, 2→64 sources) when relative paths are globally unique, but a
+previously-undocumented **O(sources²)** degenerate case was found when N
+sources share the same relative-path layout (a single `by_path` bucket fans
+out to N candidates — `enrichment.py:346-354`, not a WASM problem, an
+algorithmic fix if ever addressed). `graph_search._scan_edges` is confirmed
+O(edges) (~10-14 μs/edge, 500→16,000 edges) but lands on the **query path**
+with no index prefilter — ~225ms at 16k edges, extrapolating to ~2.2s at
+160k, the stronger practical case for acceleration. **No WASM comparison arm
+was produced**: a faithful port needs a hash-map-backed path index +
+Python-identical string-matching rules (far more code than the 34.1-34.3
+fixtures), and this repo still has no Rust/TinyGo toolchain — hand-authoring
+that logic in raw WAT risks a silent wrong-answer bug (unlike a sandboxing
+fixture, there's no fail-closed trap to catch it), so it was not attempted
+without a toolchain decision. User chose: install a real toolchain. `rustup` (GNU host, no MSVC
+dependency) + `wasm32-unknown-unknown` installed and verified end-to-end
+(smoke-test crate: Rust → wasm → wasmtime → correct result) before writing
+the real port.
+
+**Step 34.4 completed here 2026-08-03 (for (a)/(b) — (c)/(d) deferred per
+the plan's own priority order).** `runs/2026-08-03-synapse-34.4/wasm_bench/`
+(a spike-only Rust crate, not shipped under `src/syncsage`) ports
+`resolve_cross_source_edges`'s `python_import` path and the full
+`_scan_edges` scoring logic to `wasm32-unknown-unknown`. Every one of 12
+tested scale points asserts the WASM output is byte-for-byte identical to
+the Python reference before any timing counts — correctness parity-verified,
+not assumed. **Finding #1 (implementation-critical):** a naive
+per-call-compiled sandbox makes WASM 5-20x *slower* than Python at every
+scale (`WasmSandbox.__init__` JIT-compiles the module every construction) —
+any real integration must compile the module once at startup and reuse it;
+a steady-state harness (module precompiled, fresh `Store`/`Instance` per
+call) is the number that actually matters. **Finding #2 — the two loops
+diverge sharply:** `_scan_edges` steady-state WASM is a consistent, growing
+2-8x win at every scale tested (500→64,000 edges) — highest-confidence part
+of the spike, on the query-latency-sensitive function with no existing
+mitigation. `resolve_cross_source_edges` steady-state WASM **loses to
+Python below ~1,300-2,500 edges** and only starts winning above that — and
+today's actual demo corpus (2,903 cross-source edges, per this file's
+2026-08-03 retrieval-overhaul entry) sits almost exactly at that breakeven
+point. **Go/no-go: 34.5b is a GO; 34.5a is a CONDITIONAL GO** (recommend
+pairing with a marshal-format optimization — string-interning repeated
+paths/source-ids instead of repeating them per edge — which would likely
+lower the crossover and widen the margin, not just shift it). No production
+code changed this step (git-confirmed); benchmark scripts + Rust crate live
+under `runs/2026-08-03-synapse-34.4/` (gitignored). Next: Step 34.5,
+34.5b prioritized over 34.5a, both compiling their guest module once at
+startup per Finding #1.
+
+**Step 34.5 (WASM-accelerated cross-source resolution + relationship
+search) landed here 2026-08-03.** Solved Finding #1 (naive per-call
+compile) with `wasmtime`'s AOT module serialization: a fresh `Config`+
+`Engine`+`deserialize` (fully matching a cold `sync/worker.py` subprocess —
+`subprocess.run`, one call per process lifetime, no second call to
+amortize an in-process compile against) loads a precompiled artifact in
+under 1ms vs. ~103ms to JIT-compile from raw `.wasm` bytes. New
+`src/syncsage/sandbox/accel/`: a production Rust crate
+(vendored compiled `accel.wasm`, 112KB) + `loader.py` (process-wide
+singleton, machine-local `.cwasm` cache under the OS temp dir — deliberately
+**not** under any KB's `/state`, since the compiled binary is
+knowledge-base-**independent** by design: same binary for every KB, graph
+data is a call argument, never baked into the module; the cache is a
+build-cache-for-a-generic-binary, not KB state — directly answers the
+deployment-genericity question raised before this step). **Correctness
+scope note:** 34.5a is a **full** port of
+`resolve_cross_source_edges` — both `python_import` *and*
+`document_link`/`url` reference-type paths, unlike the 34.4 spike which
+only covered the former; shipping a partial port behind a config flag would
+have silently broken markdown/document-link cross-source edges, not just
+changed performance. A subtle catch during the port: Python's
+`str.lstrip("./")` strips a *character set* (every leading `.` or `/`), not
+the two-char literal `"./"` once — a naive `trim_start_matches("./")` would
+have silently under-stripped `"../../foo.md"`-shaped links; caught by the
+parity tests before it shipped. Both accelerators are wired opt-in
+(`graph.wasm_cross_source_resolution`, `search.wasm_relationship_search`,
+both default **off**) with a broad `except Exception` → pure-Python
+fallback + logged warning at every call site — acceleration is a
+performance path, never a correctness dependency, verified by dedicated
+failure-injection tests (monkeypatch the WASM wrapper to raise, confirm the
+end-to-end result is still correct). `tests/test_wasm_accel.py` (8, function
+parity incl. edge cases the 34.4 spike never exercised),
+`tests/test_wasm_accel_integration.py` (5, flag on/off byte-identical
+through a real sync/search + fallback-under-failure),
+`tests/test_wasm_accel_loader.py` (4, the AOT cache mechanism itself,
+including proving a "fresh process" loads from cache rather than
+recompiling by patching `Module.__init__` to raise if called). Suite:
+**547 passed, 7 skipped** (+17).
+
+**Steps 34.6 and 34.7 evaluated and closed here 2026-08-03 — both NO-GO,
+neither implemented, completing Phase 34.** Ran the missing 34.4c/34.4d
+benchmark slices rather than skip straight to implementation:
+
+- **34.4c / 34.6 (chunking):** `chunk_text` runs once per **file**, not
+  once per sync — the "small units, called often" shape the plan already
+  flagged as weak. Measured: Python chunks a 2 KB file in 35 μs, a 10 KB
+  file in 219 μs, a 50 KB file in 2,865 μs; the bare fixed cost of a WASM
+  Store+Instance (no marshal, no compute) is 115 μs. WASM loses outright
+  on typical small files before doing any work, and only large files leave
+  enough headroom to plausibly win — while every file, regardless of size,
+  pays the call. No Rust port was written: the numbers already answer it,
+  and a faithful port has a real correctness hazard 34.5 didn't (Python's
+  `text[start:end]` slices by Unicode code point; a naive byte-oriented
+  Rust port would silently mis-chunk any non-ASCII content).
+- **34.4d / 34.7 (packed graph representation):** measured live (uncompressed,
+  in-process) `SimpleMultiDiGraph` memory via `tracemalloc` at the actual
+  demo-corpus scale (2,132 files → 13,503 nodes/13,502 edges) and a 10x
+  stress scale (21,320 files → 135K/135K): **20.5 MB and 205 MB**
+  respectively. Not a memory problem at either scale by any reasonable
+  container budget — the plan's own "2.3 MB compressed" reference
+  undersold how small this already is once measured live rather than
+  assumed. No implementation attempted; touching `SimpleMultiDiGraph`
+  (the core structure the whole indexing/search/enrichment pipeline reads
+  and writes) isn't justified without a real constraint to fix.
+
+Both write-ups are full run summaries with the reasoning and numbers, not
+just a one-line "skipped" — the plan explicitly wanted the spike's answer
+recorded even when the answer is no. **Phase 34 (WASM sandboxing &
+selective acceleration) is complete**: 34.1-34.3 shipped (sandboxing),
+34.4 shipped (benchmark data + the toolchain), 34.5 shipped (both
+accelerated hot loops, production-wired, opt-in), 34.6-34.7 evaluated and
+correctly not built.
+
 ---
 
 ## 6. Pointers

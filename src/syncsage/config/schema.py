@@ -311,6 +311,12 @@ class SearchSettings(ModelMixin):
     max_results_default: int = 10
     embeddings: EmbeddingsSettings = field(default_factory=EmbeddingsSettings)
     vector_store: VectorStoreSettings = field(default_factory=VectorStoreSettings)
+    # Synapse Step 34.5b: run search.graph_search._scan_edges through the
+    # vendored WASM accelerator instead of pure Python. Default off — needs
+    # the [wasm] extra; falls back to pure Python on any failure or if the
+    # extra isn't installed. 34.4 benchmark: a consistent 2-8x win, growing
+    # with edge count, at every scale tested (500-64,000 edges).
+    wasm_relationship_search: bool = False
 
 
 @dataclass
@@ -445,6 +451,14 @@ class GraphSettings(ModelMixin):
     """
 
     concept_min_documents: int = 2
+    # Synapse Step 34.5a: run graph.enrichment.resolve_cross_source_edges
+    # through the vendored WASM accelerator instead of pure Python. Default
+    # off — needs the [wasm] extra; falls back to pure Python on any
+    # failure or if the extra isn't installed. 34.4 benchmark: a
+    # conditional win — loses to Python below ~1,300-2,500 edges (today's
+    # demo corpus sits at ~2,900, right at the breakeven point), wins
+    # modestly above that. Opt in for large/growing multi-source graphs.
+    wasm_cross_source_resolution: bool = False
 
 
 @dataclass
@@ -624,6 +638,16 @@ class SourceConnectorSettings(ModelMixin):
     api_content_field: str = "content"
     s3_bucket: str | None = None
     s3_prefix: str = ""
+    # Synapse Step 34.1+: "native" (default, in-process trusted Python) or
+    # "sandboxed" (fuel/memory-capped WASM guest via syncsage.sandbox).
+    # Opt-in per source; unset is byte-identical to pre-34.1.
+    runtime: str = "native"
+    # Hostnames a sandboxed connector's guest may reach via host_fetch.
+    # Empty (default) denies every fetch.
+    allowed_hosts: list[str] = field(default_factory=list)
+    # Path to a guest module (.wat text or compiled .wasm) for a sandboxed
+    # connector. None uses the connector class's bundled reference guest.
+    wasm_module_path: str | None = None
 
 
 @dataclass

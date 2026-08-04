@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from syncsage.config.schema import SourceConfig, SyncSageConfig
@@ -13,6 +14,8 @@ from syncsage.graph.enrichment import (
 from syncsage.graph.simple import SimpleMultiDiGraph
 from syncsage.ingestion.pipeline import ParsedArtifact, utc_now
 from syncsage.sync.pacing import serve_yield
+
+logger = logging.getLogger(__name__)
 
 
 class GraphBuilder:
@@ -30,9 +33,7 @@ class GraphBuilder:
     def upsert_node(self, node_id: str, node_type: str, label: str, attrs: dict) -> None:
         now = utc_now()
         existing_created = (
-            self.graph.nodes[node_id].get("created_at")
-            if self.graph.has_node(node_id)
-            else now
+            self.graph.nodes[node_id].get("created_at") if self.graph.has_node(node_id) else now
         )
         self.graph.add_node(
             node_id,
@@ -82,7 +83,9 @@ class GraphBuilder:
         self.upsert_edge(self.kb_id, node_id, "contains", {"source_id": source.name})
         return node_id
 
-    def add_directory_chain(self, source: SourceConfig, relative_path: str, branch: str | None) -> str:
+    def add_directory_chain(
+        self, source: SourceConfig, relative_path: str, branch: str | None
+    ) -> str:
         source_node = self.add_source(source)
         parent = source_node
         parts = [part for part in relative_path.replace("\\", "/").split("/")[:-1] if part]
@@ -235,12 +238,38 @@ class GraphBuilder:
                     if edge_type not in {"imports", "references"}:
                         continue
                     ref_edges.append((source, target, edge_type, data.get("reference_type")))
-        resolved = resolve_cross_source_edges(nodes, ref_edges)
+        resolved = self._resolve_cross_source_edges(nodes, ref_edges)
         for index, edge in enumerate(resolved):
             self.upsert_edge(edge.source, edge.target, edge.type, dict(edge.attrs))
             if index % 500 == 499:
                 serve_yield()
         return len(resolved)
+
+    def _resolve_cross_source_edges(
+        self,
+        nodes: list[tuple[str, dict[str, Any]]],
+        ref_edges: list[tuple[str, str, str, str | None]],
+    ) -> list[Any]:
+        """Synapse Step 34.5a: optional WASM acceleration, pure-Python default.
+
+        Opt-in via ``graph.wasm_cross_source_resolution`` (default off — see
+        the 34.4 benchmark spike for why this one is conditional rather than
+        a clear win). Any failure — the ``[wasm]`` extra missing, a sandbox
+        error, anything — falls back to the pure-Python function rather than
+        failing the sync; acceleration is a performance path, never a
+        correctness dependency.
+        """
+        if not self.config.graph.wasm_cross_source_resolution:
+            return resolve_cross_source_edges(nodes, ref_edges)
+        try:
+            from syncsage.sandbox.accel import resolve_cross_source_edges_wasm
+
+            return resolve_cross_source_edges_wasm(nodes, ref_edges)
+        except Exception:
+            logger.warning(
+                "WASM cross-source resolution failed; falling back to pure Python", exc_info=True
+            )
+            return resolve_cross_source_edges(nodes, ref_edges)
 
     def reconcile_concepts(
         self,

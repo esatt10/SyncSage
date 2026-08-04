@@ -761,7 +761,11 @@ class SyncEngine:
         from syncsage.search.hybrid import HybridSearch
         from syncsage.search.sqlite_store import SearchStore
 
-        return HybridSearch(SearchStore(self.state), vector=self.vector_searcher()).search_context(
+        return HybridSearch(
+            SearchStore(self.state),
+            vector=self.vector_searcher(),
+            wasm_relationship_search=self.config.search.wasm_relationship_search,
+        ).search_context(
             self.config.knowledge_base_id,
             query,
             max_results=max_results,
