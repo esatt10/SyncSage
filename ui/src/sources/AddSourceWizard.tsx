@@ -165,6 +165,11 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
       payload.name = name;
       payload.sync_now = syncNow;
       payload.sync_mode = syncMode;
+      // The first sync of a freshly registered source is exactly the case
+      // that produced a 504 for a large repo (indexing minutes long, well
+      // past what a browser/reverse proxy holds a request open for) — never
+      // block registration on it; the Sources page shows live progress.
+      payload.wait = false;
     }
     return payload;
   };

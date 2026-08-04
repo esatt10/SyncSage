@@ -101,16 +101,14 @@ export type SessionAction =
 /**
  * Canvas layout algorithms.
  *
- * `kamada-kawai` runs ELK's stress majorization, where edge length tracks
- * graph-theoretic distance — clusters separate and long paths read as long.
- * It costs more than `cose`, which is why it is a choice rather than the
- * default.
+ * `kamada-kawai` (ELK's stress majorization) used to be an option here; it
+ * broke the canvas in practice and was removed along with the `cytoscape-elk`
+ * dependency it was the only user of.
  */
-export type GraphLayout = "auto" | "kamada-kawai" | "cose" | "concentric" | "breadthfirst";
+export type GraphLayout = "auto" | "cose" | "concentric" | "breadthfirst";
 
 export const GRAPH_LAYOUTS: { value: GraphLayout; label: string }[] = [
   { value: "auto", label: "Automatic" },
-  { value: "kamada-kawai", label: "Kamada-Kawai" },
   { value: "cose", label: "Force" },
   { value: "concentric", label: "Concentric" },
   { value: "breadthfirst", label: "Hierarchy" },

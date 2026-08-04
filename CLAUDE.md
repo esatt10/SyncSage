@@ -509,6 +509,26 @@ check exercises Phase 21.1 process isolation rather than anything new here.
 This **closes the sandboxing arc (34.1-34.3)**. Next: Step 34.4 (benchmark
 spike — no production code expected, numbers only).
 
+**Live validation against the real demo-agent-framework corpus, 2026-08-04.**
+Rebuilt `examples/demo-agent-framework/` with `SYNCSAGE_EXTRAS=mcp,agent,
+wasm` and both 34.5 flags on, ran a real full sync (2,132 files → 22,683
+nodes / 54,406 edges). Found and fixed a real bug in the process: `graph:`
+config sections were silently discarded entirely —
+`SyncSageConfig.model_validate`'s constructor call was missing
+`graph=build(GraphSettings, data.get("graph"))`, so `concept_min_documents`
+was ALSO never configurable via YAML, not just the new WASM flag; no test
+caught it because none exercised the `graph:` section. Fixed in
+`config/schema.py`; regression test in `tests/test_config_loading.py`.
+Both accelerators then confirmed correct on the real corpus (WASM AOT
+cache file appeared exactly at sync completion; a direct in-container
+check found `_scan_edges` producing identical hits — 10,861 — between
+Python and WASM). **Revised finding:** real-world `_scan_edges` speedup was
+only ~1.13x (1.278s → 1.130s), far below the 34.4 synthetic benchmark's
+~5x at comparable edge counts — the synthetic fixture's short placeholder
+strings understated real marshal cost; the scaling *shape* held, the
+*magnitude* did not transfer. Full detail:
+`runs/2026-08-04-synapse-34-live-validation/SUMMARY.md`.
+
 **Step 34.4 (benchmark spike) partially landed here 2026-08-03 — blocked on
 a toolchain decision.** `runs/2026-08-03-synapse-34.4/benchmark.py` measures
 the pure-Python baseline for both named hot loops at 6 scale points each:

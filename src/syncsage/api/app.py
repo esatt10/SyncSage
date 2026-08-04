@@ -119,6 +119,12 @@ class SyncRequest(BaseModel):
     # `full_scan` lifts both the depth cap and sync.limits. Neither persists.
     depth: int | None = None
     full_scan: bool = False
+    # Default True preserves the documented, tested contract: block until
+    # the sync finishes and return its full result. A caller that would
+    # rather not hold a connection open for a possibly-long sync (the UI's
+    # "sync now" button) sets this false and polls `GET /sources`'
+    # `syncing`/`sync_error` fields instead.
+    wait: bool = True
 
 
 class ObsidianExportRequest(BaseModel):
@@ -143,6 +149,11 @@ class RegisterSourceRequest(BaseModel):
     urls: list[str] | None = None
     sync_now: bool = False
     sync_mode: str = "incremental"
+    # See SyncRequest.wait — default True keeps register-then-block the
+    # existing behavior; the UI sets this false so registering a source
+    # never holds the connection open for however long the first sync
+    # takes.
+    wait: bool = True
 
 
 class UpdateSourceRequest(BaseModel):
@@ -218,6 +229,11 @@ class QuickAddRequest(BaseModel):
     split: bool = False
     sync_now: bool = True
     sync_mode: str = "incremental"
+    # See SyncRequest.wait — default True keeps the existing, tested
+    # register-then-block-on-sync contract; the UI's quick-add sets this
+    # false so pasting a large repo's URL never blocks the form (and the
+    # reverse proxy in front of it) on however long the first index takes.
+    wait: bool = True
 
 
 def _allowed_roots(config: SyncSageConfig) -> list[Path]:
@@ -567,6 +583,15 @@ def create_app(
     # Chat API keys a user pastes in the browser live here and nowhere else:
     # process memory, TTL'd, gone on restart.
     app.state.session_keys = SessionKeyStore(config.assistant.session_key_ttl_minutes)
+    # Background-sync bookkeeping (`wait=false` on quick-add/register/sync):
+    # in-memory only, process lifetime, guarded by one lock. `syncing` holds
+    # a source name while its background thread is running; `sync_outcomes`
+    # keeps the *last* background result per source (cleared on the next
+    # background sync of that source) so a client that missed the transient
+    # `syncing` window still sees why it failed instead of just "not syncing".
+    app.state.sync_lock = threading.Lock()
+    app.state.syncing_sources = {}
+    app.state.sync_outcomes = {}
 
     # The web UI is a separate workload that talks to this API over HTTP, so the
     # browser origin differs in development — but this API is unauthenticated,
@@ -644,9 +669,27 @@ def create_app(
     def knowledge_bases() -> dict:
         return {"knowledge_bases": KnowledgeBaseRegistry(state).list()}
 
+    def _with_sync_state(records: list[dict]) -> list[dict]:
+        """Overlay live background-sync state (`_run_background_sync`) onto
+        persisted source rows, for every route that lists sources — a client
+        polling either one sees a source currently syncing, and the outcome
+        of the last one that ran in the background even after it finishes:
+        `syncing` alone would flicker to nothing the instant a background
+        sync completes, which is exactly when a caller most wants to know
+        whether it succeeded.
+        """
+        with app.state.sync_lock:
+            syncing = dict(app.state.syncing_sources)
+            outcomes = dict(app.state.sync_outcomes)
+        for record in records:
+            name = record.get("name")
+            record["syncing"] = name in syncing
+            record["sync_error"] = (outcomes.get(name) or {}).get("error")
+        return records
+
     @app.get("/sources")
     def sources() -> list[dict]:
-        return SourceRegistry(config, state).list_sources()
+        return _with_sync_state(SourceRegistry(config, state).list_sources())
 
     @app.get("/sources/types")
     def source_types() -> dict:
@@ -707,16 +750,22 @@ def create_app(
         config.sources.append(source)
         audit(source.name, "register_source", {"source": source.model_dump(mode="json")})
         result = None
+        syncing = False
         if req.sync_now:
-            try:
-                result = engine.sync_source(source.name, req.sync_mode).__dict__
-            except (KeyError, ValueError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if req.wait:
+                try:
+                    result = engine.sync_source(source.name, req.sync_mode).__dict__
+                except (KeyError, ValueError) as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            else:
+                _start_background_sync(source.name, req.sync_mode)
+                syncing = True
         return {
             "status": "registered",
             "knowledge_base": config.knowledge_base_id,
             "source": source.model_dump(mode="json"),
             "sync_result": result,
+            "syncing": syncing,
             "config_update_required": True,
         }
 
@@ -879,8 +928,68 @@ def create_app(
             )
         return {"results": [r.__dict__ for r in results]}
 
+    def _run_background_sync(source_name: str | None, mode: str) -> None:
+        """The `wait=false` path: same worker-subprocess sync as `_index`,
+        off the request thread, outcome recorded instead of returned.
+
+        `syncing_sources` marks every name involved *before* the sync
+        starts, so a `GET /sources` poll immediately after triggering one
+        already sees it — there's no gap where the source looks idle. Both
+        dicts are mutated under `sync_lock`, and every name is guaranteed to
+        leave `syncing_sources` in the `finally`, success or failure, sync
+        error or unexpected exception, so a source can never get stuck
+        showing "syncing" forever.
+        """
+        from syncsage.sync.worker import WorkerBackedEngine
+
+        names = [source_name] if source_name else [s.name for s in config.sources if s.enabled]
+        with app.state.sync_lock:
+            for name in names:
+                app.state.syncing_sources[name] = {"mode": mode, "started_at": utc_now()}
+        try:
+            worker = WorkerBackedEngine(engine, app.state.config_path)
+            if source_name:
+                results = [worker.sync_source(source_name, mode)]
+            else:
+                results = worker.sync_all(mode)
+        except Exception as exc:  # background thread — never propagate, just record
+            with app.state.sync_lock:
+                for name in names:
+                    app.state.sync_outcomes[name] = {
+                        "status": "error",
+                        "error": str(exc),
+                        "finished_at": utc_now(),
+                    }
+            return
+        finally:
+            with app.state.sync_lock:
+                for name in names:
+                    app.state.syncing_sources.pop(name, None)
+        with app.state.sync_lock:
+            for result in results:
+                app.state.sync_outcomes[result.source_id] = {
+                    "status": result.status,
+                    "error": (
+                        result.details.get("error")
+                        if result.status in {"failed", "timeout"}
+                        else None
+                    ),
+                    "finished_at": utc_now(),
+                }
+
+    def _start_background_sync(source_name: str | None, mode: str) -> None:
+        threading.Thread(
+            target=_run_background_sync,
+            args=(source_name, mode),
+            name=f"syncsage-bgsync-{source_name or 'all'}",
+            daemon=True,
+        ).start()
+
     @app.post("/sync")
     def sync_all(req: SyncRequest) -> dict:
+        if not req.wait:
+            _start_background_sync(None, req.mode)
+            return {"status": "syncing", "sources": [s.name for s in config.sources if s.enabled]}
         try:
             return _index(req.source_name, req.mode, req.depth, req.full_scan)
         except KeyError as exc:
@@ -891,6 +1000,20 @@ def create_app(
     @app.post("/sync/{source_id}")
     def sync_source(source_id: str, req: SyncRequest | None = None) -> dict:
         mode = req.mode if req else "incremental"
+        if req is not None and not req.wait:
+            # A source registered at runtime (quick-add, POST /sources) lives
+            # in the state registry, not necessarily yet in `config.sources`
+            # — SyncEngine._source lazily pulls it in from there on first
+            # sync. Validating against `config.sources` alone would 404 a
+            # perfectly syncable source (e.g. right after a restart, before
+            # anything has re-triggered that lazy load).
+            known = any(s.name == source_id for s in config.sources) or bool(
+                state.get_source(source_id)
+            )
+            if not known:
+                raise HTTPException(status_code=404, detail=f"Unknown source: {source_id}")
+            _start_background_sync(source_id, mode)
+            return {"status": "syncing", "source_id": source_id}
         try:
             report = _index(
                 source_id,
@@ -1619,7 +1742,7 @@ def create_app(
             counts = graph_obj.type_counts()
             total_nodes = graph_obj.number_of_nodes()
             total_links = graph_obj.number_of_edges()
-        registered = SourceRegistry(config, state).list_sources()
+        registered = _with_sync_state(SourceRegistry(config, state).list_sources())
         artifacts = state.rows("SELECT COUNT(*) AS n FROM artifacts")
         chunks = state.rows("SELECT COUNT(*) AS n FROM chunks")
         indexed = int(artifacts[0]["n"]) if artifacts else 0
@@ -1921,17 +2044,34 @@ def create_app(
             created.append(payload)
 
         results = []
+        syncing: list[str] = []
         if req.sync_now:
-            from dataclasses import asdict
+            if req.wait:
+                from dataclasses import asdict
 
-            for entry in created:
-                try:
-                    results.append(asdict(engine.sync_source(entry["name"], req.sync_mode)))
-                except Exception as exc:  # surfaced per-source; others still run
-                    results.append(
-                        {"source_id": entry["name"], "status": "error", "error": str(exc)}
-                    )
-        return {"status": "registered", "sources": created, "sync_results": results}
+                for entry in created:
+                    try:
+                        results.append(asdict(engine.sync_source(entry["name"], req.sync_mode)))
+                    except Exception as exc:  # surfaced per-source; others still run
+                        results.append(
+                            {"source_id": entry["name"], "status": "error", "error": str(exc)}
+                        )
+            else:
+                # Cloning (above) still happens on this request — it's the
+                # bounded part. Indexing is the unbounded part (a big repo's
+                # first full parse+chunk+embed pass can run well past any
+                # reverse-proxy timeout), so that's what moves to the
+                # background; the caller gets sources back already
+                # registered and polls GET /sources' `syncing` field.
+                for entry in created:
+                    _start_background_sync(entry["name"], req.sync_mode)
+                    syncing.append(entry["name"])
+        return {
+            "status": "registered",
+            "sources": created,
+            "sync_results": results,
+            "syncing": syncing,
+        }
 
     _mount_ui(app, config)
     return app

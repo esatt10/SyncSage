@@ -53,8 +53,18 @@ storage:
   compression: zstd
   max_state_size_gb: 10
 
+# --- Phase 34.5: WASM-accelerated hot loops -------------------------------
+# Both opt-in, both default off elsewhere. agent-framework is a real,
+# large, multi-language repo — the corpus this demo exists to exercise at
+# realistic scale — so it is the natural place to turn these on: needs the
+# `wasm` extra above (SYNCSAGE_EXTRAS), falls back to pure Python on any
+# failure either way.
+graph:
+  wasm_cross_source_resolution: true
+
 search:
   default_mode: hybrid
+  wasm_relationship_search: true
   keyword:
     enabled: true
     engine: sqlite_fts5

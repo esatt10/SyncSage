@@ -88,7 +88,17 @@ export function SourceRail({
                 </span>
                 <span className="source-item__meta">
                   <span className="pill">{source.type}</span>
-                  {source.last_status ? <span>{source.last_status}</span> : null}
+                  {source.syncing ? (
+                    <span className="thinking">
+                      <span className="spinner" /> syncing…
+                    </span>
+                  ) : source.sync_error ? (
+                    <span className="error" title={source.sync_error}>
+                      sync failed
+                    </span>
+                  ) : source.last_status ? (
+                    <span>{source.last_status}</span>
+                  ) : null}
                 </span>
                 <span className="source-item__path">{source.path}</span>
               </button>
@@ -96,9 +106,11 @@ export function SourceRail({
                 <button
                   className="btn btn--small btn--ghost"
                   onClick={() => sync.mutate(source.name)}
-                  disabled={sync.isPending}
+                  disabled={sync.isPending || Boolean(source.syncing)}
                 >
-                  {sync.isPending && sync.variables === source.name ? "syncing…" : "sync"}
+                  {(sync.isPending && sync.variables === source.name) || source.syncing
+                    ? "syncing…"
+                    : "sync"}
                 </button>
               </div>
             </div>

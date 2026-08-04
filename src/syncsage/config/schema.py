@@ -754,6 +754,7 @@ class SyncSageConfig(ModelMixin):
             search=build(SearchSettings, data.get("search")),
             ingestion=build(IngestionSettings, data.get("ingestion")),
             sync=build(SyncSettings, data.get("sync")),
+            graph=build(GraphSettings, data.get("graph")),
             obsidian=build(ObsidianSettings, data.get("obsidian")),
             security=build(SecuritySettings, data.get("security")),
             synapse=build(SynapseSettings, data.get("synapse")),

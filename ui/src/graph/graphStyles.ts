@@ -50,7 +50,7 @@ export const ALL_NODE_TYPES = Object.keys(NODE_COLORS);
  * the structure the user actually came to navigate. They stay one click away in
  * the legend rather than being the first thing you see.
  */
-export const NOISY_NODE_TYPES = ["concept", "chunk"];
+export const NOISY_NODE_TYPES = ["concept", "chunk", "entity", "external_reference"];
 
 export type ShapeAlgorithm = "node_type" | "degree" | "uniform";
 

@@ -1,26 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import CytoscapeComponent from "react-cytoscapejs";
-import cytoscape, { type Core } from "cytoscape";
-// @ts-expect-error -- cytoscape-elk ships no type declarations
-import elk from "cytoscape-elk";
+import type { Core } from "cytoscape";
 import type { GraphLink, GraphNode } from "../api/types";
 import { buildStylesheet, type ShapeAlgorithm, toElements } from "./graphStyles";
-
-// Kamada-Kawai arrives through ELK's `stress` algorithm, which *is* stress
-// majorization — the same objective KK minimizes (edge lengths proportional
-// to graph-theoretic distance). There is no `cytoscape-kamada-kawai` package;
-// the alternative was hand-rolling all-pairs shortest paths plus the descent,
-// which is a lot of unverifiable numerics for a layout you judge by eye.
-let elkRegistered = false;
-if (!elkRegistered) {
-  try {
-    cytoscape.use(elk);
-    elkRegistered = true;
-  } catch {
-    // Already registered (hot reload) — harmless.
-    elkRegistered = true;
-  }
-}
 
 interface GraphCanvasProps {
   nodes: GraphNode[];
@@ -201,21 +183,6 @@ function layoutOptions(
       gravity: 0.35,
       numIter: 1200,
       padding,
-    };
-  }
-  if (name === "kamada-kawai") {
-    // Stress majorization: edge lengths track graph distance, so clusters
-    // separate and long paths read as long. Slower than cose and worth it on
-    // a horizon-sized graph, which is what the canvas draws.
-    return {
-      name: "elk",
-      animate: false,
-      padding,
-      elk: {
-        algorithm: "stress",
-        "elk.stress.desiredEdgeLength": Math.round(120 * spacing),
-        "elk.stress.epsilon": 0.0001,
-      },
     };
   }
   if (name === "concentric") {

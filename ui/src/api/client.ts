@@ -128,7 +128,13 @@ export const api = {
   /** Every type this deployment accepts — built-ins plus installed plugins. */
   sourceTypes: () => request<SourceTypeCatalog>("/sources/types"),
   /** One-field source creation: a path, URL, glob or connector name. */
-  quickAdd: (body: { target: string; name?: string; split?: boolean; sync_now?: boolean }) =>
+  quickAdd: (body: {
+    target: string;
+    name?: string;
+    split?: boolean;
+    sync_now?: boolean;
+    wait?: boolean;
+  }) =>
     request<QuickAddResponse>("/sources/quick-add", {
       method: "POST",
       body: JSON.stringify(body),
@@ -152,15 +158,17 @@ export const api = {
       `/sources/${encodeURIComponent(name)}/promote`,
       { method: "POST", body: JSON.stringify({ write }) },
     ),
-  syncSource: (name: string, mode = "incremental") =>
-    request<SyncResult>(`/sync/${encodeURIComponent(name)}`, {
+  /** `wait: false` (the UI's default for interactive use) returns as soon as the
+   * sync is handed to a background thread; poll `sources()` for `syncing`/`sync_error`. */
+  syncSource: (name: string, mode = "incremental", wait = false) =>
+    request<SyncResult | { status: string; source_id: string }>(
+      `/sync/${encodeURIComponent(name)}`,
+      { method: "POST", body: JSON.stringify({ mode, wait }) },
+    ),
+  syncAll: (mode = "incremental", wait = false) =>
+    request<{ results: SyncResult[] } | { status: string; sources: string[] }>("/sync", {
       method: "POST",
-      body: JSON.stringify({ mode }),
-    }),
-  syncAll: (mode = "incremental") =>
-    request<{ results: SyncResult[] }>("/sync", {
-      method: "POST",
-      body: JSON.stringify({ mode }),
+      body: JSON.stringify({ mode, wait }),
     }),
 
   // Filesystem (allowlist-scoped)

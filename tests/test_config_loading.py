@@ -89,3 +89,30 @@ def test_cli_validate_accepts_rendered_config(config_path: Path) -> None:
     result = call_cli(["validate", str(config_path)])
     assert result.returncode == 0, result.stderr or result.stdout
     assert "error" not in result.stderr.lower()
+
+
+def test_graph_section_of_the_yaml_is_actually_applied() -> None:
+    """`SyncSageConfig.model_validate` must respect a `graph:` YAML section.
+
+    Regression test: `graph=build(GraphSettings, data.get("graph"))` was
+    missing from `model_validate`'s constructor call, so ANY `graph:`
+    section in a config file — `concept_min_documents`,
+    `wasm_cross_source_resolution` — was silently discarded in favor of
+    `GraphSettings()` defaults, with no error and no test catching it.
+    Found live: `docker-compose`-deployed config showed
+    `wasm_cross_source_resolution: false` in the resolved `/config`
+    response despite the mounted YAML setting it `true`.
+    """
+    from syncsage.config.schema import SyncSageConfig
+
+    config = SyncSageConfig.model_validate(
+        {
+            "syncsage": {"name": "graph-section-regression"},
+            "graph": {
+                "concept_min_documents": 5,
+                "wasm_cross_source_resolution": True,
+            },
+        }
+    )
+    assert config.graph.concept_min_documents == 5
+    assert config.graph.wasm_cross_source_resolution is True
