@@ -2,7 +2,7 @@ services:
   pheasant:
     build:
       context: .
-    image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.7.0}
+    image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.8.0}
     container_name: pheasant
     restart: unless-stopped
     ports:
@@ -57,7 +57,7 @@ services:
   pheasant-ui:
     build:
       context: ./ui
-    image: ${PHEASANT_UI_IMAGE:-ghcr.io/esatt10/pheasant-ui:0.7.0}
+    image: ${PHEASANT_UI_IMAGE:-ghcr.io/esatt10/pheasant-ui:0.8.0}
     container_name: pheasant-ui
     restart: unless-stopped
     ports:
