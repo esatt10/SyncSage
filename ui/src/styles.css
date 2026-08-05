@@ -160,20 +160,15 @@ a {
   white-space: nowrap;
 }
 
+/* The mark is full-colour artwork on a transparent ground, so it sits directly
+   on the bar rather than in a tinted tile — a solid fill behind it would fight
+   the illustration's own greens and creams in both themes. */
 .topbar__logo {
   display: grid;
   place-items: center;
-  width: 26px;
-  height: 26px;
-  border-radius: 8px;
-  background: var(--accent);
-  color: #fff;
-  font-size: 13px;
-  font-weight: 700;
-}
-
-:root[data-theme="dark"] .topbar__logo {
-  color: #1b2012;
+  width: 30px;
+  height: 30px;
+  flex: none;
 }
 
 .topbar__kb {

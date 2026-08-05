@@ -26,7 +26,7 @@ export function TopBar() {
     <header className="topbar">
       <div className="topbar__brand">
         <span className="topbar__logo" aria-hidden>
-          <PheasantMark size={17} />
+          <PheasantMark />
         </span>
         pheasant
         {overview.data ? <span className="topbar__kb">{overview.data.name}</span> : null}
