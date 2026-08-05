@@ -1,27 +1,27 @@
 # Configuration
 
-SyncSage reads YAML from `/config/syncsage.yaml` by default. Start from `syncsage.example.yaml` and mount it read-only into the container.
+pheasant reads YAML from `/config/pheasant.yaml` by default. Start from `pheasant.example.yaml` and mount it read-only into the container.
 
-The local `syncsage.yaml` copy is intentionally ignored by git because it contains host-specific mount assumptions. Commit changes to `syncsage.example.yaml` when you want to update the shared pattern. Docker Compose env files generated under `.syncsage/` are ignored.
+The local `pheasant.yaml` copy is intentionally ignored by git because it contains host-specific mount assumptions. Commit changes to `pheasant.example.yaml` when you want to update the shared pattern. Docker Compose env files generated under `.pheasant/` are ignored.
 
 For a one-line local run, use a profile:
 
 ```bash
-syncsage start --profile quickstart --config syncsage.yaml
+pheasant start --profile quickstart --config pheasant.yaml
 ```
 
 Config is resolved as base defaults + profile + YAML + `--set` overrides. Inspect the result with:
 
 ```bash
-syncsage config show --effective --profile dev --config syncsage.yaml
+pheasant config show --effective --profile dev --config pheasant.yaml
 ```
 
 ## How to use this guide
 
-1. Copy `syncsage.example.yaml` to your runtime config path.
+1. Copy `pheasant.example.yaml` to your runtime config path.
 2. Keep the top-level sections in place and only edit values you need.
 3. For each setting below, choose values based on your deployment mode and data sensitivity.
-4. Validate by starting SyncSage and checking startup logs for loaded source counts and enabled transports.
+4. Validate by starting pheasant and checking startup logs for loaded source counts and enabled transports.
 
 ---
 
@@ -30,7 +30,7 @@ syncsage config show --effective --profile dev --config syncsage.yaml
 | Section | Purpose | Required |
 |---|---|---|
 | `deployment` | Image and mount hints used by deployment tooling/templates. | Recommended |
-| `syncsage` | Instance identity, environment label, and core filesystem roots. | Yes |
+| `pheasant` | Instance identity, environment label, and core filesystem roots. | Yes |
 | `server` | API/MCP/UI network bindings and feature toggles. | Yes |
 | `storage` | Database/graph/manifests locations and state limits. | Yes |
 | `search` | Retrieval modes and ranking behavior. | Yes |
@@ -48,18 +48,18 @@ syncsage config show --effective --profile dev --config syncsage.yaml
 
 | Key | Type | Example | What it controls |
 |---|---|---|---|
-| `image_repository` | string | `ghcr.io/esatt10/syncsage` | Container image registry/repository for Compose-based runs. |
+| `image_repository` | string | `ghcr.io/esatt10/pheasant` | Container image registry/repository for Compose-based runs. |
 | `image_tag` | string | `0.1.3` | Image version tag used by deployment helpers. |
-| `workspace_path` | path-like string | `./workspace` | Host path mounted to SyncSage `workspace_root`. |
-| `vault_path` | path-like string | `./vault` | Host path mounted to SyncSage `vault_path`. |
+| `workspace_path` | path-like string | `./workspace` | Host path mounted to pheasant `workspace_root`. |
+| `vault_path` | path-like string | `./vault` | Host path mounted to pheasant `vault_path`. |
 
 ---
 
-## `syncsage` (core instance settings)
+## `pheasant` (core instance settings)
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `name` | string | `local-syncsage` | Used as instance/knowledge-base identifier. |
+| `name` | string | `local-pheasant` | Used as instance/knowledge-base identifier. |
 | `description` | string | `Lightweight MCP knowledge graph and retrieval server` | Human-readable descriptor for operators. |
 | `environment` | string | `local` | Label (for example `local`, `dev`, `staging`, `prod`). |
 | `log_level` | string | `INFO` | Typical values: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
@@ -76,7 +76,7 @@ syncsage config show --effective --profile dev --config syncsage.yaml
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `host` | string | `0.0.0.0` | Bind address. `syncsage up` generates `127.0.0.1`; containers keep `0.0.0.0` (loopback inside a container is unreachable from the host) and compose publishes them to `127.0.0.1` instead. |
+| `host` | string | `0.0.0.0` | Bind address. `pheasant up` generates `127.0.0.1`; containers keep `0.0.0.0` (loopback inside a container is unreachable from the host) and compose publishes them to `127.0.0.1` instead. |
 | `port` | integer | `8765` | Primary service port. |
 
 The API is unauthenticated, so the bind address is a security control, not
@@ -110,7 +110,7 @@ just a networking detail — see [security.md](security.md#trust-model-for-the-h
 |---|---|---|---|
 | `graph_format` | string | `node_link_json` | Graph serialization format. |
 | `graph_snapshot_interval_seconds` | integer | `900` | Graph snapshot cadence. |
-| `sqlite_path` | absolute path | `/state/syncsage.db` | Main SQLite database file. |
+| `sqlite_path` | absolute path | `/state/pheasant.db` | Main SQLite database file. |
 | `graph_path` | absolute path | `/state/graphs` | Directory for graph snapshots. |
 | `manifest_path` | absolute path | `/state/manifests` | Directory for source manifests. Connector checkpoints are stored in SQLite. |
 | `max_state_size_gb` | integer | `10` | Soft state budget for cleanup/policy logic. |
@@ -120,7 +120,7 @@ just a networking detail — see [security.md](security.md#trust-model-for-the-h
 | `retention.keep_event_days` | integer | `30` (example) | Event retention age target in days. |
 
 > Notes:
-> - If `sqlite_path`, `graph_path`, or `manifest_path` are omitted, they are derived from `syncsage.state_path`.
+> - If `sqlite_path`, `graph_path`, or `manifest_path` are omitted, they are derived from `pheasant.state_path`.
 
 ---
 
@@ -206,11 +206,11 @@ directory is worse than a clear stop. The sync returns
 subtrees. Your options are: narrow it (`max_depth`, tighter `include`, more
 `exclude`), raise the limits, or sync once with `--full-scan`.
 
-### Knowing the size first (`syncsage scan`)
+### Knowing the size first (`pheasant scan`)
 
 ```bash
-syncsage scan -c syncsage.yaml            # every enabled source
-syncsage scan -s notes --depth 2 --json   # one source, machine-readable
+pheasant scan -c pheasant.yaml            # every enabled source
+pheasant scan -s notes --depth 2 --json   # one source, machine-readable
 ```
 
 `scan` walks without reading or indexing anything and reports the file
@@ -227,7 +227,7 @@ standing behavior of a scheduled one.
 
 | Surface | Depth cap | Full scan |
 |---|---|---|
-| CLI | `syncsage sync --depth N` | `syncsage sync --full-scan` |
+| CLI | `pheasant sync --depth N` | `pheasant sync --full-scan` |
 | HTTP | `{"depth": N}` on `/sync`, `/sync/{id}` | `{"full_scan": true}` |
 | MCP | `max_depth=N` on `sync_source`/`sync_all` | `full_scan=true` |
 
@@ -262,7 +262,7 @@ standing behavior of a scheduled one.
 |---|---|---|---|
 | `enabled` | bool | `true` | Master toggle for Obsidian exports. |
 | `write_mode` | string | `upsert` | Export strategy (`upsert`, etc.). |
-| `note_root` | string | `SyncSage` | Top-level folder/note namespace in the vault. |
+| `note_root` | string | `pheasant` | Top-level folder/note namespace in the vault. |
 | `template_profile` | string | `engineering` | One of `engineering`, `research`, or `project-ops`. |
 | `create_index_notes` | bool | `true` | Generate index/navigation notes. |
 | `create_source_notes` | bool | `true` | Generate one note per source. |
@@ -275,7 +275,7 @@ standing behavior of a scheduled one.
 | `frontmatter.include_graph_node_id` | bool | `true` | Include graph node IDs in metadata. |
 | `backlinks.enabled` | bool | `true` | Generate backlinks. |
 | `backlinks.style` | string | `wikilink` | Backlink rendering style. |
-| `tags.base` | list[string] | `[syncsage]` | Base tags appended to generated notes. |
+| `tags.base` | list[string] | `[pheasant]` | Base tags appended to generated notes. |
 | `tags.by_source_type` | bool | `true` | Add tags based on source type. |
 
 ---
@@ -328,7 +328,7 @@ The `agentic` workflow is a LangGraph state graph (classify → plan → retriev
 expand → grade → synthesize → verify) and needs the optional extra:
 
 ```bash
-pip install 'syncsage[agent]'
+pip install 'pheasant-kb[agent]'
 ```
 
 ```yaml
@@ -353,7 +353,7 @@ Both workflows send the model whole **files**, rebuilt from their chunks with
 line spans and metadata, rather than the 500-character search preview. Code and
 config are never excerpted; large prose is cut to the matched neighbourhood.
 
-Third-party workflows register under the `syncsage.agent_workflows`
+Third-party workflows register under the `pheasant.agent_workflows`
 entry-point group, the same plugin shape as the
 [Connector SDK](reference/connector-sdk.md).
 
@@ -446,7 +446,7 @@ sources:
 When a PR changes deployable server behavior and is merged, the release/version check expects a **new image version**. In practice:
 
 - `pyproject.toml` version and deployment image tags must remain aligned for a release.
-- `deployment.compose.image_tag` in `syncsage.example.yaml` is one of the generated references that should be incremented to the new server version during release prep.
+- `deployment.compose.image_tag` in `pheasant.example.yaml` is one of the generated references that should be incremented to the new server version during release prep.
 - Use `python scripts/sync_version.py --check` in CI/local validation to confirm all generated version references are synchronized.
 
 If this check fails on merge/release automation, bump the project version and re-run the sync script so config and deployment manifests match.
@@ -462,12 +462,12 @@ Use this for single-machine local development with mounted host directories.
 ```yaml
 deployment:
   compose:
-    image_repository: ghcr.io/esatt10/syncsage
+    image_repository: ghcr.io/esatt10/pheasant
     image_tag: 0.1.3
     workspace_path: ./workspace
     vault_path: ./vault
 
-syncsage:
+pheasant:
   environment: local
   log_level: INFO
   state_path: /state
@@ -490,7 +490,7 @@ server:
 Use this when multiple clients connect over network and you want stricter controls.
 
 ```yaml
-syncsage:
+pheasant:
   environment: prod
   log_level: INFO
 
@@ -526,7 +526,7 @@ Use this when export quality to vault notes/canvas/backlinks is your top priorit
 obsidian:
   enabled: true
   write_mode: upsert
-  note_root: SyncSage
+  note_root: pheasant
   create_index_notes: true
   create_source_notes: true
   create_file_notes: true
@@ -542,7 +542,7 @@ obsidian:
     style: wikilink
   tags:
     base:
-      - syncsage
+      - pheasant
     by_source_type: true
 
 sources:
@@ -595,8 +595,8 @@ sources:
 ## Practical tuning checklist
 
 - Start with the example file defaults.
-- Use `syncsage init --profile <name>` to generate a focused starter config.
-- Use `syncsage doctor --profile <name> --config syncsage.yaml` before long-running syncs.
+- Use `pheasant init --profile <name>` to generate a focused starter config.
+- Use `pheasant doctor --profile <name> --config pheasant.yaml` before long-running syncs.
 - Confirm every `sources[].path` is under an allowed security root.
 - Trim `include` patterns first; then harden `exclude` patterns.
 - Keep `scheduler.interval_seconds` enabled as a safety net even when watcher is on.

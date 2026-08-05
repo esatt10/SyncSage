@@ -12,7 +12,7 @@ const EXAMPLES = [
 /**
  * One field, anything in it.
  *
- * This is the UI half of `syncsage up <target>`: the server does the same
+ * This is the UI half of `pheasant up <target>`: the server does the same
  * detection (folder vs vault vs repo vs URL vs bucket vs connector), clones
  * what needs cloning, registers the source and syncs it. The user picks
  * nothing — no type dropdown, no include globs, no wizard steps.
@@ -85,9 +85,9 @@ export function QuickAdd({ onClose, onAdded }: { onClose: () => void; onAdded: (
           </label>
 
           <p className="muted small" style={{ margin: 0 }}>
-            SyncSage detects what it is — repository, Obsidian vault, notes folder,
+            pheasant detects what it is — repository, Obsidian vault, notes folder,
             document folder, web collection, bucket or connector — then indexes it. The
-            equivalent command is <code>syncsage up {target.trim() || "<target>"}</code>.
+            equivalent command is <code>pheasant up {target.trim() || "<target>"}</code>.
             Registration is immediate; indexing continues in the background and its
             progress shows up on the Sources page (and the "Syncing…" indicator at the
             top of every page until it finishes).

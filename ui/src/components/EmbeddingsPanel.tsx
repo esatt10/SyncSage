@@ -138,7 +138,7 @@ export function EmbeddingsPanel() {
         <div className="banner banner--warn" style={{ marginBottom: 0 }}>
           Embeddings are switched on but no indexer could be built
           {data.store_error ? `: ${data.store_error}` : ""}. Check the provider and, for
-          the <code>lancedb</code> store, that <code>pip install 'syncsage[vector]'</code>{" "}
+          the <code>lancedb</code> store, that <code>pip install 'pheasant-kb[vector]'</code>{" "}
           has run.
         </div>
       ) : null}

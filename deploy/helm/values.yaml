@@ -1,5 +1,5 @@
 image:
-  repository: ghcr.io/esatt10/syncsage
+  repository: ghcr.io/esatt10/pheasant
   tag: 0.7.0
   pullPolicy: IfNotPresent
 
@@ -10,9 +10,9 @@ service:
   port: 8765
 
 config:
-  syncsageYaml: |
-    syncsage:
-      name: helm-syncsage
+  pheasantYaml: |
+    pheasant:
+      name: helm-pheasant
       environment: kubernetes
       state_path: /state
       vault_path: /vault
@@ -28,7 +28,7 @@ config:
       api:
         enabled: true
     storage:
-      sqlite_path: /state/syncsage.db
+      sqlite_path: /state/pheasant.db
       graph_path: /state/graphs
       manifest_path: /state/manifests
     search:
@@ -41,7 +41,7 @@ config:
         interval_seconds: 900
     obsidian:
       enabled: true
-      note_root: SyncSage
+      note_root: pheasant
     sources: []
 
 persistence:

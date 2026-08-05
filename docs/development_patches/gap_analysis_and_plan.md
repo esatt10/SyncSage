@@ -2,7 +2,7 @@
 
 ## Intended product goal (north star)
 
-SyncSage should support:
+pheasant should support:
 
 1. Reliable sync for **nearly any directory source**, including local filesystems and cloud-backed mounts/connectors.
 2. **Enriched knowledge graph formation** that captures semantic and structural relationships (not just file/chunk containment).
@@ -71,7 +71,7 @@ What exists now:
 Key gaps:
 - One-line startup exists operationally, but not as a first-class profile system with discoverable overrides.
 - Large option surface is documented, but no layered config strategy (`baseline + profile + overrides`) for progressive complexity.
-- No `syncsage init`/`syncsage doctor` UX for guided setup and validation with minimal friction.
+- No `pheasant init`/`pheasant doctor` UX for guided setup and validation with minimal friction.
 
 ---
 
@@ -172,10 +172,10 @@ Use a **layered configuration model**:
 - **Overrides**: highest-precedence one-off changes for automation.
 
 ### Concrete UX additions
-1. `syncsage start --profile quickstart` (one-line run path).
-2. `syncsage init --profile <name>` to generate commented YAML with only relevant sections expanded.
-3. `syncsage config show --effective` to display resolved config after layering.
-4. `syncsage doctor` to validate mounts, paths, connector auth, and MCP transport readiness.
+1. `pheasant start --profile quickstart` (one-line run path).
+2. `pheasant init --profile <name>` to generate commented YAML with only relevant sections expanded.
+3. `pheasant config show --effective` to display resolved config after layering.
+4. `pheasant doctor` to validate mounts, paths, connector auth, and MCP transport readiness.
 
 ### Why this is the best fit
 - Preserves one-line startup for most users.

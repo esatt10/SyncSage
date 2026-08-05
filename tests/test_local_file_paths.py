@@ -19,17 +19,17 @@ from pathlib import Path
 
 import pytest
 
-from syncsage.api.app import _configured_roots
-from syncsage.config.schema import SyncSageConfig
-from syncsage.security.path_policy import PathPolicyError, resolve_under
-from syncsage.sync.engine import SyncEngine
+from pheasant.api.app import _configured_roots
+from pheasant.config.schema import PheasantConfig
+from pheasant.security.path_policy import PathPolicyError, resolve_under
+from pheasant.sync.engine import SyncEngine
 
 
 def _base_config(tmp_path: Path, sources: list[dict]) -> dict:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
     return {
-        "syncsage": {
+        "pheasant": {
             "name": "path-tests",
             "state_path": str(tmp_path / "state"),
             "vault_path": str(tmp_path / "vault"),
@@ -41,7 +41,7 @@ def _base_config(tmp_path: Path, sources: list[dict]) -> dict:
 
 
 def test_relative_filesystem_source_anchors_to_workspace_root(tmp_path: Path) -> None:
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         _base_config(tmp_path, [{"name": "docs", "type": "document_folder", "path": "docs"}])
     )
     source = config.sources[0]
@@ -51,7 +51,7 @@ def test_relative_filesystem_source_anchors_to_workspace_root(tmp_path: Path) ->
 
 def test_absolute_filesystem_source_path_is_unchanged(tmp_path: Path) -> None:
     absolute = tmp_path / "elsewhere" / "docs"
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         _base_config(tmp_path, [{"name": "docs", "type": "document_folder", "path": str(absolute)}])
     )
     assert config.sources[0].path == absolute
@@ -59,7 +59,7 @@ def test_absolute_filesystem_source_path_is_unchanged(tmp_path: Path) -> None:
 
 def test_relative_web_source_path_is_not_anchored(tmp_path: Path) -> None:
     # URL/connector-backed types don't read a local path; leave it verbatim.
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         _base_config(tmp_path, [{"name": "web", "type": "web_collection", "path": "placeholder"}])
     )
     assert config.sources[0].path == Path("placeholder")
@@ -67,7 +67,7 @@ def test_relative_web_source_path_is_not_anchored(tmp_path: Path) -> None:
 
 def test_missing_filesystem_root_reports_path_missing(tmp_path: Path) -> None:
     missing = tmp_path / "not-mounted"  # never created
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         _base_config(tmp_path, [{"name": "ghost", "type": "document_folder", "path": str(missing)}])
     )
     engine = SyncEngine(config)
@@ -90,11 +90,11 @@ def test_resolve_under_rejection_is_actionable() -> None:
 
 
 # `allow_workspace_roots` holds *container* paths, which are POSIX by
-# definition (SyncSage runs in Docker). On Windows Path("/data") correctly
+# definition (pheasant runs in Docker). On Windows Path("/data") correctly
 # resolves to C:/data, so it is the assertion that is POSIX-only, not the code.
 @pytest.mark.skipif(os.name == "nt", reason="POSIX-only; see comment above.")
 def test_configured_roots_keeps_unmounted_allowlisted_root(tmp_path: Path) -> None:
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         {
             **_base_config(tmp_path, []),
             "security": {
@@ -114,9 +114,9 @@ def test_configured_roots_keeps_unmounted_allowlisted_root(tmp_path: Path) -> No
 def test_fs_list_flags_unmounted_root(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
 
-    from syncsage.api.app import create_app
+    from pheasant.api.app import create_app
 
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         {
             **_base_config(tmp_path, []),
             "security": {

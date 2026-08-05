@@ -1,4 +1,4 @@
-# SyncSage Build & Specification Document
+# pheasant Build & Specification Document
 
 **Version:** 0.1.0 draft  
 **Date:** 2026-05-15  
@@ -10,9 +10,9 @@
 
 ## 1. Executive Summary
 
-SyncSage is a lightweight, Docker-first Model Context Protocol server that creates and maintains local knowledge graphs over repositories, Markdown files, web-derived content, documents, and watched folders. Its purpose is to give agentic workflows a precise, low-token, tool-callable context layer without requiring a heavy enterprise search platform such as Azure AI Search, a hosted vector database, or a large application stack.
+pheasant is a lightweight, Docker-first Model Context Protocol server that creates and maintains local knowledge graphs over repositories, Markdown files, web-derived content, documents, and watched folders. Its purpose is to give agentic workflows a precise, low-token, tool-callable context layer without requiring a heavy enterprise search platform such as Azure AI Search, a hosted vector database, or a large application stack.
 
-SyncSage operates as a local or enterprise-deployable server that:
+pheasant operates as a local or enterprise-deployable server that:
 
 1. Registers knowledge sources through a YAML configuration file or API/tool call.
 2. Indexes each source into a persistent graph and search store.
@@ -50,22 +50,22 @@ Without an index, agents tend to either:
 - Lose accuracy after new commits because their context becomes stale.
 - Require a heavy external search system that is overkill for local or early-stage workflows.
 
-SyncSage solves this by maintaining a local graph + search index that can be referenced by name.
+pheasant solves this by maintaining a local graph + search index that can be referenced by name.
 
 ### 2.2 Desired User Experience
 
 A user should be able to define a YAML file such as:
 
 ```yaml
-syncsage:
+pheasant:
   name: personal-dev-knowledge
   vault_path: /vault
   state_path: /state
 
 sources:
-  - name: syncsage-repo
+  - name: pheasant-repo
     type: repository
-    path: /workspace/syncsage
+    path: /workspace/pheasant
     branch_policy: current
     sync:
       on_startup: true
@@ -92,17 +92,17 @@ sources:
       - "**/node_modules/**"
 ```
 
-Then start SyncSage with a single command:
+Then start pheasant with a single command:
 
 ```bash
 docker run --rm \
-  --name syncsage \
+  --name pheasant \
   -p 8765:8765 \
-  -v "$PWD/syncsage.yaml:/config/syncsage.yaml:ro" \
+  -v "$PWD/pheasant.yaml:/config/pheasant.yaml:ro" \
   -v "$HOME/projects:/workspace" \
-  -v "$HOME/SyncSageVault:/vault" \
-  -v syncsage-state:/state \
-  ghcr.io/<org>/syncsage:latest
+  -v "$HOME/pheasant-vault:/vault" \
+  -v pheasant-state:/state \
+  ghcr.io/<org>/pheasant:latest
 ```
 
 After startup, an agentic workflow should be able to call MCP tools such as:
@@ -118,13 +118,13 @@ After startup, an agentic workflow should be able to call MCP tools such as:
 - `explain_node`
 - `export_obsidian_notes`
 
-The agent should not need to know the full file system layout. It should call SyncSage by knowledge base name and intent.
+The agent should not need to know the full file system layout. It should call pheasant by knowledge base name and intent.
 
 ---
 
 ## 3. Non-Goals
 
-SyncSage should remain lightweight. The initial build should avoid becoming a full enterprise search platform.
+pheasant should remain lightweight. The initial build should avoid becoming a full enterprise search platform.
 
 Out of scope for the first implementation:
 
@@ -137,7 +137,7 @@ Out of scope for the first implementation:
 - Deep semantic code understanding equal to language servers or commercial code intelligence systems
 - Automatic execution of arbitrary agent code from untrusted prompts
 
-SyncSage should be designed so these features can be added later, but the first product should stay small, inspectable, and easy to deploy.
+pheasant should be designed so these features can be added later, but the first product should stay small, inspectable, and easy to deploy.
 
 ---
 
@@ -171,7 +171,7 @@ SyncSage should be designed so these features can be added later, but the first 
    Users should be able to inspect the graph through Obsidian-compatible Markdown, JSON graph exports, and optionally a simple web UI with a force-directed graph.
 
 10. **No unnecessary orchestration**  
-   Multiple SyncSage instances can run separately with their own volumes and namespaces. A central coordinator is optional, not required.
+   Multiple pheasant instances can run separately with their own volumes and namespaces. A central coordinator is optional, not required.
 
 ---
 
@@ -188,7 +188,7 @@ SyncSage should be designed so these features can be added later, but the first 
                              | MCP tools/resources/prompts
                              v
 +--------------------------------------------------------------+
-|                           SyncSage                            |
+|                           pheasant                            |
 |                                                              |
 |  +-------------------+    +-------------------+               |
 |  | MCP Server Layer  |    | REST/Admin API    |               |
@@ -233,7 +233,7 @@ SyncSage should be designed so these features can be added later, but the first 
 
 | Component | Responsibility |
 |---|---|
-| MCP server | Exposes SyncSage as tools/resources/prompts for agentic workflows. |
+| MCP server | Exposes pheasant as tools/resources/prompts for agentic workflows. |
 | Admin API | Provides HTTP endpoints for config inspection, health checks, sync triggers, graph exports, and UI access. |
 | Source registry | Stores configured sources and runtime registration metadata. |
 | Sync engine | Orchestrates startup scans, file watcher events, git commit events, scheduled refreshes, and manual refreshes. |
@@ -257,7 +257,7 @@ SyncSage should be designed so these features can be added later, but the first 
 | API server | `fastapi` | Admin API, health endpoints, optional graph UI backend. |
 | ASGI runtime | `uvicorn` | Runs FastAPI. |
 | Data validation | `pydantic` | Config, API contracts, graph models. |
-| YAML config | `pyyaml` or `ruamel.yaml` | Load and validate `syncsage.yaml`. |
+| YAML config | `pyyaml` or `ruamel.yaml` | Load and validate `pheasant.yaml`. |
 | Graph modeling | `networkx` | In-memory graph creation, traversal, centrality, exports. |
 | File watching | `watchdog` | Event-driven watching of folders/files. |
 | SQLite persistence | `sqlite3` stdlib or `apsw` | Metadata, manifests, FTS search, idempotency. |
@@ -266,7 +266,7 @@ SyncSage should be designed so these features can be added later, but the first 
 | HTML/XML parsing | `beautifulsoup4`, `lxml` | Parse local HTML/XML and web-derived artifacts. |
 | PDF parsing | `pymupdf` | Extract text, tables, and metadata from PDF files. |
 | DOCX parsing | `python-docx` | Extract text from Word documents. |
-| CLI | `typer` | Local commands such as `syncsage init`, `syncsage validate`, `syncsage sync`. |
+| CLI | `typer` | Local commands such as `pheasant init`, `pheasant validate`, `pheasant sync`. |
 | Logging | `structlog` or stdlib `logging` | Structured logs for sync and retrieval activity. |
 | Tests | `pytest`, `pytest-asyncio` | Unit and integration tests. |
 
@@ -297,7 +297,7 @@ For the first build, use:
 - `markdown-it-py`, `beautifulsoup4`, `pymupdf`, `python-docx` for parsing.
 - Obsidian vault compatibility through Markdown files and YAML frontmatter, not by running the Obsidian desktop app inside the container.
 
-The recommended architecture is to treat Obsidian as the **user experience layer** over a mounted vault folder. SyncSage writes Markdown notes into that vault. The user can open the vault in the desktop Obsidian app, while the container keeps the vault files updated.
+The recommended architecture is to treat Obsidian as the **user experience layer** over a mounted vault folder. pheasant writes Markdown notes into that vault. The user can open the vault in the desktop Obsidian app, while the container keeps the vault files updated.
 
 Running the Obsidian desktop GUI inside the same Docker container is not recommended for v0.1 because it adds unnecessary GUI/VNC complexity and weakens the one-line local workflow.
 
@@ -308,19 +308,19 @@ Running the Obsidian desktop GUI inside the same Docker container is not recomme
 Recommended open-source repository layout:
 
 ```text
-syncsage/
+pheasant/
   README.md
   LICENSE
   pyproject.toml
   uv.lock or poetry.lock
   Dockerfile
   docker-compose.yml
-  syncsage.example.yaml
+  pheasant.example.yaml
   .env.example
   .gitignore
 
   src/
-    syncsage/
+    pheasant/
       __init__.py
       main.py
       cli.py
@@ -470,14 +470,14 @@ syncsage/
 Default path inside container:
 
 ```text
-/config/syncsage.yaml
+/config/pheasant.yaml
 ```
 
 ### 8.2 Example Full Config
 
 ```yaml
-syncsage:
-  name: local-syncsage
+pheasant:
+  name: local-pheasant
   description: Lightweight MCP knowledge graph and retrieval server
   environment: local
   log_level: INFO
@@ -505,7 +505,7 @@ server:
 storage:
   graph_format: node_link_json
   graph_snapshot_interval_seconds: 900
-  sqlite_path: /state/syncsage.db
+  sqlite_path: /state/pheasant.db
   graph_path: /state/graphs
   manifest_path: /state/manifests
   max_state_size_gb: 10
@@ -565,7 +565,7 @@ sync:
 obsidian:
   enabled: true
   write_mode: upsert
-  note_root: SyncSage
+  note_root: pheasant
   create_index_notes: true
   create_source_notes: true
   create_file_notes: true
@@ -581,14 +581,14 @@ obsidian:
     style: wikilink
   tags:
     base:
-      - syncsage
+      - pheasant
     by_source_type: true
 
 sources:
-  - name: syncsage-codebase
+  - name: pheasant-codebase
     type: repository
-    path: /workspace/syncsage
-    description: SyncSage project repository
+    path: /workspace/pheasant
+    description: pheasant project repository
     enabled: true
     include:
       - "**/*.py"
@@ -680,7 +680,7 @@ Inside mounted state volume:
 
 ```text
 /state/
-  syncsage.db
+  pheasant.db
   graphs/
     <knowledge_base_id>/
       graph.latest.json
@@ -699,21 +699,21 @@ Inside mounted Obsidian vault:
 
 ```text
 /vault/
-  SyncSage/
+  pheasant/
     Index.md
     Sources/
-      syncsage-codebase.md
+      pheasant-codebase.md
       documents.md
     Repositories/
-      syncsage-codebase/
+      pheasant-codebase/
         Repo Map.md
         Files/
-          src__syncsage__main.py.md
+          src__pheasant__main.py.md
     Documents/
       product-documents/
         Some PDF.md
     Graphs/
-      syncsage-codebase.canvas
+      pheasant-codebase.canvas
     Queries/
       recent-searches.md
 ```
@@ -732,7 +732,7 @@ Inside mounted Obsidian vault:
 
 ### 9.3 Why Not Store Everything in Obsidian?
 
-Obsidian is excellent as a human-readable vault and graph UI, but it should not be the only persistence layer for SyncSage because:
+Obsidian is excellent as a human-readable vault and graph UI, but it should not be the only persistence layer for pheasant because:
 
 - Raw graph state can grow large.
 - Search metadata and manifests require fast machine queries.
@@ -922,11 +922,11 @@ Recommended ID format:
 Examples:
 
 ```text
-source:local-syncsage:syncsage-codebase
-file:syncsage-codebase:src/syncsage/main.py:branch=main
-chunk:syncsage-codebase:src/syncsage/main.py:sha256=abc123:chunk=0004
-symbol:syncsage-codebase:src/syncsage/main.py:SyncSageServer.start
-commit:syncsage-codebase:6f2a9c1
+source:local-pheasant:pheasant-codebase
+file:pheasant-codebase:src/pheasant/main.py:branch=main
+chunk:pheasant-codebase:src/pheasant/main.py:sha256=abc123:chunk=0004
+symbol:pheasant-codebase:src/pheasant/main.py:PheasantServer.start
+commit:pheasant-codebase:6f2a9c1
 ```
 
 ### 11.5 Node Attributes
@@ -935,17 +935,17 @@ Every node should include:
 
 ```json
 {
-  "id": "file:syncsage-codebase:src/syncsage/main.py",
+  "id": "file:pheasant-codebase:src/pheasant/main.py",
   "type": "file",
   "label": "main.py",
-  "source_id": "syncsage-codebase",
-  "knowledge_base_id": "local-syncsage",
+  "source_id": "pheasant-codebase",
+  "knowledge_base_id": "local-pheasant",
   "created_at": "2026-05-15T20:00:00Z",
   "updated_at": "2026-05-15T20:05:00Z",
   "hash": "sha256:...",
   "provenance": {
-    "path": "/workspace/syncsage/src/syncsage/main.py",
-    "relative_path": "src/syncsage/main.py",
+    "path": "/workspace/pheasant/src/pheasant/main.py",
+    "relative_path": "src/pheasant/main.py",
     "git_branch": "main",
     "git_commit": "6f2a9c1"
   }
@@ -959,7 +959,7 @@ Every edge should include:
 ```json
 {
   "type": "contains",
-  "source_id": "syncsage-codebase",
+  "source_id": "pheasant-codebase",
   "created_at": "2026-05-15T20:00:00Z",
   "confidence": 1.0,
   "provenance": {
@@ -975,7 +975,7 @@ Every edge should include:
 
 ### 12.1 Retrieval Goals
 
-SyncSage retrieval should reduce token usage by returning:
+pheasant retrieval should reduce token usage by returning:
 
 - Relevant files instead of whole repositories.
 - Relevant chunks instead of whole files.
@@ -1013,16 +1013,16 @@ Rank results using:
 ```json
 {
   "query": "where is the sync engine implemented?",
-  "knowledge_base": "local-syncsage",
+  "knowledge_base": "local-pheasant",
   "mode": "hybrid",
   "results": [
     {
       "rank": 1,
-      "node_id": "file:syncsage-codebase:src/syncsage/sync/engine.py",
+      "node_id": "file:pheasant-codebase:src/pheasant/sync/engine.py",
       "type": "file",
       "title": "sync/engine.py",
-      "path": "/workspace/syncsage/src/syncsage/sync/engine.py",
-      "relative_path": "src/syncsage/sync/engine.py",
+      "path": "/workspace/pheasant/src/pheasant/sync/engine.py",
+      "relative_path": "src/pheasant/sync/engine.py",
       "score": 0.93,
       "reason": "Exact symbol and keyword match for sync engine",
       "summary": "Coordinates startup scans, watcher events, git events, and scheduled sync jobs.",
@@ -1040,7 +1040,7 @@ Rank results using:
         "contains": ["SyncEngine", "SyncEvent"]
       },
       "provenance": {
-        "source_id": "syncsage-codebase",
+        "source_id": "pheasant-codebase",
         "git_branch": "main",
         "git_commit": "6f2a9c1",
         "indexed_at": "2026-05-15T20:05:00Z"
@@ -1072,8 +1072,8 @@ Output:
 {
   "knowledge_bases": [
     {
-      "id": "local-syncsage",
-      "name": "local-syncsage",
+      "id": "local-pheasant",
+      "name": "local-pheasant",
       "source_count": 3,
       "last_indexed_at": "2026-05-15T20:05:00Z",
       "status": "healthy"
@@ -1090,7 +1090,7 @@ Input:
 
 ```json
 {
-  "knowledge_base": "local-syncsage",
+  "knowledge_base": "local-pheasant",
   "source": {
     "name": "new-repo",
     "type": "repository",
@@ -1119,8 +1119,8 @@ Input:
 
 ```json
 {
-  "knowledge_base": "local-syncsage",
-  "source_name": "syncsage-codebase",
+  "knowledge_base": "local-pheasant",
+  "source_name": "pheasant-codebase",
   "mode": "incremental"
 }
 ```
@@ -1140,7 +1140,7 @@ Input:
 
 ```json
 {
-  "knowledge_base": "local-syncsage",
+  "knowledge_base": "local-pheasant",
   "mode": "incremental"
 }
 ```
@@ -1153,7 +1153,7 @@ Input:
 
 ```json
 {
-  "knowledge_base": "local-syncsage",
+  "knowledge_base": "local-pheasant",
   "query": "where does repository sync happen?",
   "mode": "hybrid",
   "max_results": 10,
@@ -1170,9 +1170,9 @@ Input:
 
 ```json
 {
-  "knowledge_base": "local-syncsage",
+  "knowledge_base": "local-pheasant",
   "task": "Add git commit event detection to the sync engine",
-  "source_name": "syncsage-codebase",
+  "source_name": "pheasant-codebase",
   "max_files": 8
 }
 ```
@@ -1185,8 +1185,8 @@ Input:
 
 ```json
 {
-  "knowledge_base": "local-syncsage",
-  "node_id": "file:syncsage-codebase:src/syncsage/sync/engine.py",
+  "knowledge_base": "local-pheasant",
+  "node_id": "file:pheasant-codebase:src/pheasant/sync/engine.py",
   "depth": 2,
   "edge_types": ["imports", "defines_symbol", "contains"]
 }
@@ -1200,9 +1200,9 @@ Input:
 
 ```json
 {
-  "knowledge_base": "local-syncsage",
-  "path": "src/syncsage/sync/engine.py",
-  "source_name": "syncsage-codebase"
+  "knowledge_base": "local-pheasant",
+  "path": "src/pheasant/sync/engine.py",
+  "source_name": "pheasant-codebase"
 }
 ```
 
@@ -1214,8 +1214,8 @@ Input:
 
 ```json
 {
-  "knowledge_base": "local-syncsage",
-  "source_name": "syncsage-codebase",
+  "knowledge_base": "local-pheasant",
+  "source_name": "pheasant-codebase",
   "depth": 3
 }
 ```
@@ -1228,8 +1228,8 @@ Input:
 
 ```json
 {
-  "knowledge_base": "local-syncsage",
-  "node_id": "symbol:syncsage-codebase:src/syncsage/sync/engine.py:SyncEngine"
+  "knowledge_base": "local-pheasant",
+  "node_id": "symbol:pheasant-codebase:src/pheasant/sync/engine.py:SyncEngine"
 }
 ```
 
@@ -1241,8 +1241,8 @@ Input:
 
 ```json
 {
-  "knowledge_base": "local-syncsage",
-  "source_name": "syncsage-codebase",
+  "knowledge_base": "local-pheasant",
+  "source_name": "pheasant-codebase",
   "scope": "source"
 }
 ```
@@ -1255,7 +1255,7 @@ Input:
 
 ```json
 {
-  "knowledge_base": "local-syncsage"
+  "knowledge_base": "local-pheasant"
 }
 ```
 
@@ -1264,24 +1264,24 @@ Input:
 Expose resources such as:
 
 ```text
-syncsage://knowledge-bases
-syncsage://knowledge-bases/{kb_id}/sources
-syncsage://knowledge-bases/{kb_id}/graph
-syncsage://knowledge-bases/{kb_id}/sources/{source_id}/manifest
-syncsage://knowledge-bases/{kb_id}/sources/{source_id}/repo-map
-syncsage://knowledge-bases/{kb_id}/nodes/{node_id}
+pheasant://knowledge-bases
+pheasant://knowledge-bases/{kb_id}/sources
+pheasant://knowledge-bases/{kb_id}/graph
+pheasant://knowledge-bases/{kb_id}/sources/{source_id}/manifest
+pheasant://knowledge-bases/{kb_id}/sources/{source_id}/repo-map
+pheasant://knowledge-bases/{kb_id}/nodes/{node_id}
 ```
 
 ### 13.3 MCP Prompts
 
 Include reusable prompts:
 
-#### `use_syncsage_for_coding_task`
+#### `use_pheasant_for_coding_task`
 
-Purpose: Instruct a coding agent to call SyncSage before editing.
+Purpose: Instruct a coding agent to call pheasant before editing.
 
 ```markdown
-You are working in a repository indexed by SyncSage. Before making changes:
+You are working in a repository indexed by pheasant. Before making changes:
 
 1. Call `get_relevant_files` with the user's task.
 2. Inspect the returned files and chunks.
@@ -1291,10 +1291,10 @@ You are working in a repository indexed by SyncSage. Before making changes:
 6. Continue the next task using the updated index.
 ```
 
-#### `use_syncsage_for_document_research`
+#### `use_pheasant_for_document_research`
 
 ```markdown
-You are researching a document collection indexed by SyncSage. Use `search_context` first. Prefer chunks with explicit provenance, headings, and source paths. Do not summarize beyond retrieved evidence. Ask SyncSage for graph neighbors when a source references related material.
+You are researching a document collection indexed by pheasant. Use `search_context` first. Prefer chunks with explicit provenance, headings, and source paths. Do not summarize beyond retrieved evidence. Ask pheasant for graph neighbors when a source references related material.
 ```
 
 ---
@@ -1359,7 +1359,7 @@ GET /obsidian/status
 
 ## 15. Sync Methods
 
-SyncSage should support multiple syncing methods. These should be composable and idempotent.
+pheasant should support multiple syncing methods. These should be composable and idempotent.
 
 ### 15.1 Startup Full Validation
 
@@ -1398,7 +1398,7 @@ Required behavior:
 
 ### 15.3 Git Commit Trigger
 
-For repositories, SyncSage should monitor `.git` state and commit changes locally.
+For repositories, pheasant should monitor `.git` state and commit changes locally.
 
 Possible implementation options:
 
@@ -1416,7 +1416,7 @@ Recommended v0.1 approach:
 
 ### 15.4 Agent-Initiated Sync
 
-Agents should explicitly call SyncSage after meaningful changes:
+Agents should explicitly call pheasant after meaningful changes:
 
 ```text
 edit files -> run tests -> commit -> call sync_source(source, incremental)
@@ -1442,11 +1442,11 @@ sync:
 CLI examples:
 
 ```bash
-syncsage sync --all
-syncsage sync --source syncsage-codebase --mode incremental
-syncsage sync --source syncsage-codebase --mode full
-syncsage validate
-syncsage repair
+pheasant sync --all
+pheasant sync --source pheasant-codebase --mode incremental
+pheasant sync --source pheasant-codebase --mode full
+pheasant validate
+pheasant repair
 ```
 
 ---
@@ -1518,10 +1518,10 @@ Error categories:
 Provide:
 
 ```bash
-syncsage validate
-syncsage repair
-syncsage rebuild --source <source>
-syncsage rebuild --all
+pheasant validate
+pheasant repair
+pheasant rebuild --source <source>
+pheasant rebuild --all
 ```
 
 Repair should:
@@ -1543,7 +1543,7 @@ Multi-agent coding can break or confuse sync if:
 - Branch switches occur while indexing is running.
 - Rebase/merge changes rewrite commits quickly.
 - The watcher indexes half-written files.
-- Multiple SyncSage instances point to the same state volume.
+- Multiple pheasant instances point to the same state volume.
 - A repository is deleted or moved while watchers are active.
 
 ### 17.2 Required Protections
@@ -1567,7 +1567,7 @@ Multi-agent coding can break or confuse sync if:
    If branch or commit changes during indexing, mark the sync stale and retry.
 
 7. **No shared write volume across independent instances**  
-   Multiple SyncSage containers should not write to the same `/state` unless an explicit coordination mode exists.
+   Multiple pheasant containers should not write to the same `/state` unless an explicit coordination mode exists.
 
 ### 17.3 Recommended Agent Workflow
 
@@ -1594,7 +1594,7 @@ Obsidian should act as:
 - Markdown-based audit and navigation layer.
 - Optional prompt/instruction authoring environment.
 
-Obsidian should not be required for MCP functionality. SyncSage should run without Obsidian enabled.
+Obsidian should not be required for MCP functionality. pheasant should run without Obsidian enabled.
 
 ### 18.2 Obsidian Output Format
 
@@ -1602,18 +1602,18 @@ Each generated note should include frontmatter:
 
 ```markdown
 ---
-syncsage: true
-node_id: file:syncsage-codebase:src/syncsage/sync/engine.py
-source_id: syncsage-codebase
+pheasant: true
+node_id: file:pheasant-codebase:src/pheasant/sync/engine.py
+source_id: pheasant-codebase
 source_type: repository
-relative_path: src/syncsage/sync/engine.py
+relative_path: src/pheasant/sync/engine.py
 content_hash: sha256:abc123
 last_indexed_at: 2026-05-15T20:05:00Z
 git_branch: main
 git_commit: 6f2a9c1
 tags:
-  - syncsage
-  - syncsage/repository
+  - pheasant
+  - pheasant/repository
 ---
 
 # sync/engine.py
@@ -1624,7 +1624,7 @@ Coordinates startup scans, watcher events, git events, and scheduled sync jobs.
 
 ## Relationships
 
-- Source: [[syncsage-codebase]]
+- Source: [[pheasant-codebase]]
 - Imports: [[watcher.py]], [[git_monitor.py]], [[manifest.py]]
 - Defines: `SyncEngine`, `SyncEvent`
 
@@ -1663,7 +1663,7 @@ To avoid making Obsidian too large for Git:
 
 ### 19.1 Graph JSON Export
 
-SyncSage should export graph data in:
+pheasant should export graph data in:
 
 - NetworkX node-link JSON
 - Cytoscape JSON
@@ -1672,7 +1672,7 @@ SyncSage should export graph data in:
 Endpoint:
 
 ```http
-GET /graph/export/cytoscape-json?source_id=syncsage-codebase&depth=2
+GET /graph/export/cytoscape-json?source_id=pheasant-codebase&depth=2
 ```
 
 ### 19.2 UI Requirements
@@ -1706,19 +1706,19 @@ Use case:
 - Individual laptop.
 - Local agent workflows.
 - Simple one-line startup.
-- One SyncSage instance managing one or more local source folders.
+- One pheasant instance managing one or more local source folders.
 
 Command:
 
 ```bash
 docker run --rm \
-  --name syncsage \
+  --name pheasant \
   -p 8765:8765 \
-  -v "$PWD/syncsage.yaml:/config/syncsage.yaml:ro" \
+  -v "$PWD/pheasant.yaml:/config/pheasant.yaml:ro" \
   -v "$HOME/projects:/workspace" \
-  -v "$HOME/SyncSageVault:/vault" \
-  -v syncsage-state:/state \
-  ghcr.io/<org>/syncsage:latest
+  -v "$HOME/pheasant-vault:/vault" \
+  -v pheasant-state:/state \
+  ghcr.io/<org>/pheasant:latest
 ```
 
 ### 20.2 Deployment Method 2: Docker Compose
@@ -1730,21 +1730,21 @@ Use case:
 
 ```yaml
 services:
-  syncsage:
-    image: ghcr.io/<org>/syncsage:latest
-    container_name: syncsage
+  pheasant:
+    image: ghcr.io/<org>/pheasant:latest
+    container_name: pheasant
     ports:
       - "8765:8765"
     volumes:
-      - ./syncsage.yaml:/config/syncsage.yaml:ro
+      - ./pheasant.yaml:/config/pheasant.yaml:ro
       - ~/projects:/workspace
-      - ~/SyncSageVault:/vault
-      - syncsage-state:/state
+      - ~/pheasant-vault:/vault
+      - pheasant-state:/state
     environment:
-      - SYNCSAGE_CONFIG=/config/syncsage.yaml
+      - PHEASANT_CONFIG=/config/pheasant.yaml
 
 volumes:
-  syncsage-state:
+  pheasant-state:
 ```
 
 ### 20.3 Deployment Method 3: Local Kubernetes via Docker Desktop
@@ -1752,23 +1752,23 @@ volumes:
 Use case:
 
 - Simulate enterprise deployments locally.
-- Multiple isolated SyncSage instances.
-- One namespace per SyncSage instance.
+- Multiple isolated pheasant instances.
+- One namespace per pheasant instance.
 
 Pattern:
 
 ```text
-namespace: syncsage-project-a
-  deployment: syncsage
-  configmap: syncsage-config
-  pvc: syncsage-state
-  service: syncsage
+namespace: pheasant-project-a
+  deployment: pheasant
+  configmap: pheasant-config
+  pvc: pheasant-state
+  service: pheasant
 
-namespace: syncsage-project-b
-  deployment: syncsage
-  configmap: syncsage-config
-  pvc: syncsage-state
-  service: syncsage
+namespace: pheasant-project-b
+  deployment: pheasant
+  configmap: pheasant-config
+  pvc: pheasant-state
+  service: pheasant
 ```
 
 ### 20.4 Deployment Method 4: Enterprise Kubernetes Namespace
@@ -1776,7 +1776,7 @@ namespace: syncsage-project-b
 Use case:
 
 - Enterprise deployment.
-- One SyncSage instance per team/project/namespace.
+- One pheasant instance per team/project/namespace.
 - Persistent volume claim for state.
 - ConfigMap or mounted Secret for config.
 - Optional ingress for UI/API.
@@ -1799,16 +1799,16 @@ Required Kubernetes resources:
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: syncsage-project-a
+  name: pheasant-project-a
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: syncsage-config
-  namespace: syncsage-project-a
+  name: pheasant-config
+  namespace: pheasant-project-a
 data:
-  syncsage.yaml: |
-    syncsage:
+  pheasant.yaml: |
+    pheasant:
       name: project-a
       state_path: /state
       vault_path: /vault
@@ -1818,8 +1818,8 @@ data:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: syncsage-state
-  namespace: syncsage-project-a
+  name: pheasant-state
+  namespace: pheasant-project-a
 spec:
   accessModes:
     - ReadWriteOnce
@@ -1830,26 +1830,26 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: syncsage
-  namespace: syncsage-project-a
+  name: pheasant
+  namespace: pheasant-project-a
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: syncsage
+      app: pheasant
   template:
     metadata:
       labels:
-        app: syncsage
+        app: pheasant
     spec:
       containers:
-        - name: syncsage
-          image: ghcr.io/<org>/syncsage:latest
+        - name: pheasant
+          image: ghcr.io/<org>/pheasant:latest
           ports:
             - containerPort: 8765
           env:
-            - name: SYNCSAGE_CONFIG
-              value: /config/syncsage.yaml
+            - name: PHEASANT_CONFIG
+              value: /config/pheasant.yaml
           volumeMounts:
             - name: config
               mountPath: /config
@@ -1874,10 +1874,10 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: syncsage-config
+            name: pheasant-config
         - name: state
           persistentVolumeClaim:
-            claimName: syncsage-state
+            claimName: pheasant-state
 ```
 
 ---
@@ -1891,7 +1891,7 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    SYNCSAGE_CONFIG=/config/syncsage.yaml
+    PHEASANT_CONFIG=/config/pheasant.yaml
 
 WORKDIR /app
 
@@ -1911,7 +1911,7 @@ RUN mkdir -p /config /state /workspace /vault /exports
 
 EXPOSE 8765
 
-CMD ["syncsage", "serve", "--config", "/config/syncsage.yaml"]
+CMD ["pheasant", "serve", "--config", "/config/pheasant.yaml"]
 ```
 
 ### 21.2 Image Requirements
@@ -1955,7 +1955,7 @@ Target:
 
 ### 22.4 Obsidian Compatibility
 
-SyncSage should write standard Markdown files with YAML frontmatter and wikilinks. Users can open the mounted vault in Obsidian desktop. SyncSage should not require an Obsidian plugin for v0.1.
+pheasant should write standard Markdown files with YAML frontmatter and wikilinks. Users can open the mounted vault in Obsidian desktop. pheasant should not require an Obsidian plugin for v0.1.
 
 ---
 
@@ -2065,8 +2065,8 @@ Deliverables:
 
 Acceptance criteria:
 
-- `syncsage --help` works.
-- `syncsage validate --config syncsage.example.yaml` works.
+- `pheasant --help` works.
+- `pheasant validate --config pheasant.example.yaml` works.
 - Docker image builds.
 
 ### Phase 1: Config, Registry, and Persistence
@@ -2180,7 +2180,7 @@ Deliverables:
 
 Acceptance criteria:
 
-- Obsidian vault shows generated SyncSage notes.
+- Obsidian vault shows generated pheasant notes.
 - Re-export updates notes instead of creating duplicates.
 - Vault stays Git-friendly.
 
@@ -2341,7 +2341,7 @@ This section is intended to guide a coding agent or multi-agent development work
 Create `agent/build_agent_config.yaml`:
 
 ```yaml
-project: SyncSage
+project: pheasant
 mission: Build a lightweight Docker-first MCP server for graph-based local knowledge indexing and agentic retrieval.
 
 principles:
@@ -2371,8 +2371,8 @@ architecture_constraints:
 
 required_acceptance:
   - docker build succeeds
-  - syncsage validate works
-  - syncsage serve starts API and MCP server
+  - pheasant validate works
+  - pheasant serve starts API and MCP server
   - sample repository can be indexed
   - search_context returns relevant chunks with provenance
   - repeated sync is idempotent
@@ -2394,7 +2394,7 @@ Responsibilities:
 Prompt:
 
 ```markdown
-You are the Product Architect for SyncSage. Your job is to preserve the lightweight MCP + graph indexing architecture. Review changes for scope creep, unclear abstractions, missing provenance, and violations of Docker-first deployment. Prefer simple local-first choices unless the spec explicitly requires enterprise scale.
+You are the Product Architect for pheasant. Your job is to preserve the lightweight MCP + graph indexing architecture. Review changes for scope creep, unclear abstractions, missing provenance, and violations of Docker-first deployment. Prefer simple local-first choices unless the spec explicitly requires enterprise scale.
 ```
 
 #### Backend Engineer Agent
@@ -2409,7 +2409,7 @@ Responsibilities:
 Prompt:
 
 ```markdown
-You are the Backend Engineer for SyncSage. Implement typed Python modules with clear boundaries. Use Pydantic for contracts, SQLite for persistence, and FastAPI for admin APIs. Do not mix parsing, persistence, and API logic in the same module. Add tests for every public service method.
+You are the Backend Engineer for pheasant. Implement typed Python modules with clear boundaries. Use Pydantic for contracts, SQLite for persistence, and FastAPI for admin APIs. Do not mix parsing, persistence, and API logic in the same module. Add tests for every public service method.
 ```
 
 #### MCP Engineer Agent
@@ -2423,7 +2423,7 @@ Responsibilities:
 Prompt:
 
 ```markdown
-You are the MCP Engineer for SyncSage. Expose SyncSage through MCP tools, resources, and prompts. Every tool response must include source IDs, paths, timestamps, and confidence/reason fields where relevant. Avoid tools that execute arbitrary shell commands. Retrieval tools should minimize tokens by returning concise summaries and targeted chunks.
+You are the MCP Engineer for pheasant. Expose pheasant through MCP tools, resources, and prompts. Every tool response must include source IDs, paths, timestamps, and confidence/reason fields where relevant. Avoid tools that execute arbitrary shell commands. Retrieval tools should minimize tokens by returning concise summaries and targeted chunks.
 ```
 
 #### Graph Engineer Agent
@@ -2438,7 +2438,7 @@ Responsibilities:
 Prompt:
 
 ```markdown
-You are the Graph Engineer for SyncSage. Build a deterministic graph model using NetworkX. Use stable node IDs and typed edge relationships. Repeated indexing must not duplicate nodes or edges. Provide graph exports for node-link JSON and Cytoscape JSON. Keep graph algorithms simple and explainable.
+You are the Graph Engineer for pheasant. Build a deterministic graph model using NetworkX. Use stable node IDs and typed edge relationships. Repeated indexing must not duplicate nodes or edges. Provide graph exports for node-link JSON and Cytoscape JSON. Keep graph algorithms simple and explainable.
 ```
 
 #### Ingestion Engineer Agent
@@ -2453,7 +2453,7 @@ Responsibilities:
 Prompt:
 
 ```markdown
-You are the Ingestion Engineer for SyncSage. Build deterministic parsers for repositories, Markdown, PDFs, DOCX, HTML, XML, and text. Respect include/exclude patterns. Never execute indexed source code. Parser failures should be recorded and isolated so one bad file does not stop an entire source sync.
+You are the Ingestion Engineer for pheasant. Build deterministic parsers for repositories, Markdown, PDFs, DOCX, HTML, XML, and text. Respect include/exclude patterns. Never execute indexed source code. Parser failures should be recorded and isolated so one bad file does not stop an entire source sync.
 ```
 
 #### Sync/Reliability Agent
@@ -2468,7 +2468,7 @@ Responsibilities:
 Prompt:
 
 ```markdown
-You are the Sync/Reliability Engineer for SyncSage. Your job is to make indexing reliable under file changes, git commits, branch switches, cold starts, and crashes. All sync operations must be idempotent. Use source-level locks, event debouncing, startup validation, and transactional state updates.
+You are the Sync/Reliability Engineer for pheasant. Your job is to make indexing reliable under file changes, git commits, branch switches, cold starts, and crashes. All sync operations must be idempotent. Use source-level locks, event debouncing, startup validation, and transactional state updates.
 ```
 
 #### Obsidian Integration Agent
@@ -2482,7 +2482,7 @@ Responsibilities:
 Prompt:
 
 ```markdown
-You are the Obsidian Integration Engineer for SyncSage. Treat Obsidian as a Markdown vault and UX layer. Write stable, concise notes with YAML frontmatter, backlinks, and tags. Do not export every chunk by default. Generated notes must update in place and remain Git-friendly.
+You are the Obsidian Integration Engineer for pheasant. Treat Obsidian as a Markdown vault and UX layer. Write stable, concise notes with YAML frontmatter, backlinks, and tags. Do not export every chunk by default. Generated notes must update in place and remain Git-friendly.
 ```
 
 #### DevOps Agent
@@ -2498,7 +2498,7 @@ Responsibilities:
 Prompt:
 
 ```markdown
-You are the DevOps Engineer for SyncSage. Make SyncSage easy to run with one Docker command, Docker Compose, Docker Desktop Kubernetes, and enterprise Kubernetes. Use persistent volumes for state. Keep the image portable and secure. Include health/readiness probes and resource limits.
+You are the DevOps Engineer for pheasant. Make pheasant easy to run with one Docker command, Docker Compose, Docker Desktop Kubernetes, and enterprise Kubernetes. Use persistent volumes for state. Keep the image portable and secure. Include health/readiness probes and resource limits.
 ```
 
 #### QA Agent
@@ -2513,7 +2513,7 @@ Responsibilities:
 Prompt:
 
 ```markdown
-You are the QA Engineer for SyncSage. Test idempotency, incremental sync, parser failure isolation, file watcher debounce, git branch changes, Obsidian export stability, and MCP tool contracts. Build fixtures that simulate real repositories and document folders.
+You are the QA Engineer for pheasant. Test idempotency, incremental sync, parser failure isolation, file watcher debounce, git branch changes, Obsidian export stability, and MCP tool contracts. Build fixtures that simulate real repositories and document folders.
 ```
 
 #### Security Reviewer Agent
@@ -2528,7 +2528,7 @@ Responsibilities:
 Prompt:
 
 ```markdown
-You are the Security Reviewer for SyncSage. Ensure SyncSage does not execute indexed code, does not follow unsafe paths outside allowed roots, excludes secrets by default, and does not expose sensitive local paths unnecessarily. MCP tools must be safe and scoped.
+You are the Security Reviewer for pheasant. Ensure pheasant does not execute indexed code, does not follow unsafe paths outside allowed roots, excludes secrets by default, and does not expose sensitive local paths unnecessarily. MCP tools must be safe and scoped.
 ```
 
 ---
@@ -2560,8 +2560,8 @@ After every substantial repository change, the build agent should:
 ```text
 1. Run tests.
 2. Commit changes.
-3. Call SyncSage sync_source if SyncSage is already running.
-4. Use SyncSage get_relevant_files for the next task.
+3. Call pheasant sync_source if pheasant is already running.
+4. Use pheasant get_relevant_files for the next task.
 ```
 
 ---
@@ -2570,7 +2570,7 @@ After every substantial repository change, the build agent should:
 
 ### 29.1 Name
 
-Project name: **SyncSage**
+Project name: **pheasant**
 
 Meaning:
 
@@ -2579,7 +2579,7 @@ Meaning:
 
 ### 29.2 Suggested Tagline
 
-> SyncSage is a lightweight MCP knowledge graph server that keeps local repositories, documents, and Obsidian vaults indexed for agentic workflows.
+> pheasant is a lightweight MCP knowledge graph server that keeps local repositories, documents, and Obsidian vaults indexed for agentic workflows.
 
 ### 29.3 Suggested GitHub Description
 
@@ -2595,19 +2595,19 @@ Consider Apache-2.0 if the goal is permissive open source with explicit patent g
 
 The v0.1 MVP is complete when:
 
-1. A user can run SyncSage with one Docker command.
-2. SyncSage can load a YAML config.
-3. SyncSage can index at least:
+1. A user can run pheasant with one Docker command.
+2. pheasant can load a YAML config.
+3. pheasant can index at least:
    - One local repository.
    - One Markdown folder.
    - One document folder with PDF or DOCX.
-4. SyncSage creates a persistent graph and search index.
-5. SyncSage exposes MCP tools for search and sync.
-6. SyncSage supports idempotent re-indexing.
-7. SyncSage detects file changes with debounce.
-8. SyncSage can detect Git commit/branch state changes.
-9. SyncSage writes useful Obsidian-compatible notes.
-10. SyncSage has Docker and Kubernetes deployment examples.
+4. pheasant creates a persistent graph and search index.
+5. pheasant exposes MCP tools for search and sync.
+6. pheasant supports idempotent re-indexing.
+7. pheasant detects file changes with debounce.
+8. pheasant can detect Git commit/branch state changes.
+9. pheasant writes useful Obsidian-compatible notes.
+10. pheasant has Docker and Kubernetes deployment examples.
 
 ---
 
@@ -2623,7 +2623,7 @@ The v0.1 MVP is complete when:
 | Secrets get indexed | Default excludes, optional secret scanner, path allowlisting. |
 | Branch switches during indexing | Detect branch/HEAD changes and retry or mark stale. |
 | Heavy parsing slows container | Incremental indexing, include/exclude filters, parser timeouts. |
-| Enterprise deployments need isolation | One namespace/PVC per SyncSage instance. |
+| Enterprise deployments need isolation | One namespace/PVC per pheasant instance. |
 
 ---
 
@@ -2706,8 +2706,8 @@ The v0.1 MVP is complete when:
 ### 33.1 Config Test
 
 ```text
-Given syncsage.example.yaml
-When syncsage validate is run
+Given pheasant.example.yaml
+When pheasant validate is run
 Then config loads successfully and all paths are validated or clearly reported
 ```
 
@@ -2732,7 +2732,7 @@ Then only that artifact and related chunks are updated
 ```text
 Given an indexed git repository
 When a file is changed and committed
-Then SyncSage detects the new commit SHA and updates repository metadata
+Then pheasant detects the new commit SHA and updates repository metadata
 ```
 
 ### 33.5 Search Test
@@ -2783,7 +2783,7 @@ Then /health and /ready pass and MCP tools are available
 - Language-server-based code intelligence.
 - Tree-sitter symbol extraction for more languages.
 - Agent action audit graph.
-- Obsidian plugin for live SyncSage status.
+- Obsidian plugin for live pheasant status.
 - GitHub app integration.
 - Remote source connectors.
 - Cross-instance federation.
@@ -2796,12 +2796,12 @@ Then /health and /ready pass and MCP tools are available
 
 ## 36. Final Build Instruction to Agentic Workflow
 
-Build SyncSage as a small, reliable, Docker-first MCP knowledge graph server. Start with deterministic local indexing, durable graph/search state, and clean MCP retrieval tools. Keep Obsidian as a Markdown-compatible projection layer, not the source of operational truth. Prioritize idempotency, provenance, cold-start recovery, and simple deployment. Only add semantic/vector complexity after the basic graph + SQLite FTS system works end to end.
+Build pheasant as a small, reliable, Docker-first MCP knowledge graph server. Start with deterministic local indexing, durable graph/search state, and clean MCP retrieval tools. Keep Obsidian as a Markdown-compatible projection layer, not the source of operational truth. Prioritize idempotency, provenance, cold-start recovery, and simple deployment. Only add semantic/vector complexity after the basic graph + SQLite FTS system works end to end.
 
 The successful first version should feel like this:
 
 ```text
-Point SyncSage at my folders.
+Point pheasant at my folders.
 Run one container.
 Let it index and watch.
 Let my agents ask it where to look.

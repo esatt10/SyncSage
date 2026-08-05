@@ -11,15 +11,15 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("wasmtime", reason="wasmtime not installed (pip install 'syncsage[wasm]')")
+pytest.importorskip("wasmtime", reason="wasmtime not installed (pip install 'pheasant-kb[wasm]')")
 
-from syncsage.graph.enrichment import resolve_cross_source_edges  # noqa: E402
-from syncsage.graph.simple import SimpleMultiDiGraph  # noqa: E402
-from syncsage.sandbox.accel import (  # noqa: E402
+from pheasant.graph.enrichment import resolve_cross_source_edges  # noqa: E402
+from pheasant.graph.simple import SimpleMultiDiGraph  # noqa: E402
+from pheasant.sandbox.accel import (  # noqa: E402
     resolve_cross_source_edges_wasm,
     scan_edges_wasm,
 )
-from syncsage.search.graph_search import _scan_edges, _tokens  # noqa: E402
+from pheasant.search.graph_search import _scan_edges, _tokens  # noqa: E402
 
 
 def _edge_key(edge):

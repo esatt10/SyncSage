@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from syncsage.mcp_server.tools import SyncSageTools
+from pheasant.mcp_server.tools import PheasantTools
 
 
 def test_runtime_source_lifecycle_sync_query_and_promote(
@@ -15,7 +15,7 @@ def test_runtime_source_lifecycle_sync_query_and_promote(
         "# Runtime Context\n\nRuntime promoted source contains durable configuration notes.\n",
         encoding="utf-8",
     )
-    tools = SyncSageTools(loaded_config)
+    tools = PheasantTools(loaded_config)
     knowledge_base = loaded_config.knowledge_base_id
 
     registered = tools.register_source(

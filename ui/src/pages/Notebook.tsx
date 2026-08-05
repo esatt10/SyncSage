@@ -379,7 +379,7 @@ function FactList({
   if (facts.length === 0) {
     return (
       <p className="muted small">
-        Ask a question and the relationships SyncSage found around the cited passages
+        Ask a question and the relationships pheasant found around the cited passages
         show up here.
       </p>
     );

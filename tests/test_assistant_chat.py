@@ -22,11 +22,11 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from syncsage.api.app import create_app
-from syncsage.assistant import chat as chat_module
-from syncsage.assistant import providers as providers_module
-from syncsage.assistant.credentials import SessionKeyStore
-from syncsage.graph.simple import SimpleMultiDiGraph
+from pheasant.api.app import create_app
+from pheasant.assistant import chat as chat_module
+from pheasant.assistant import providers as providers_module
+from pheasant.assistant.credentials import SessionKeyStore
+from pheasant.graph.simple import SimpleMultiDiGraph
 
 
 class _FakeSearch:
@@ -288,7 +288,7 @@ def test_session_keys_expire() -> None:
 
 
 def test_chat_http_round_trip_and_key_lifecycle(loaded_config, workspace_copy: Path) -> None:
-    loaded_config.syncsage.workspace_root = workspace_copy
+    loaded_config.pheasant.workspace_root = workspace_copy
     app = create_app(config=loaded_config)
     app.state.engine.sync_source("architecture-notes", "full")
     client = TestClient(app)
@@ -354,7 +354,7 @@ def test_chat_stream_reports_steps_before_the_answer(loaded_config) -> None:
 
     from fastapi.testclient import TestClient
 
-    from syncsage.api.app import create_app
+    from pheasant.api.app import create_app
 
     app = create_app(config=loaded_config)
     app.state.engine.sync_source("architecture-notes", "full")

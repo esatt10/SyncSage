@@ -1,46 +1,47 @@
-/* SyncSage design tokens.
+/* pheasant design tokens.
    Light by default — this is a reading and research tool, and long sessions
    over documents read better on paper-like surfaces. Dark is opt-in via
    [data-theme="dark"] on <html>, set by the theme toggle and persisted. */
 
 :root {
   --bg: #ffffff;
-  --bg-sunken: #f7f7f5;
+  --bg-sunken: #f7f5f0;
   --bg-raised: #ffffff;
-  --bg-hover: #f0efec;
-  --bg-active: #e8e6e1;
+  --bg-hover: #f0ece4;
+  --bg-active: #e6e1d6;
 
-  --border: #e3e1dc;
-  --border-strong: #cdcac2;
+  --border: #e3ded3;
+  --border-strong: #cac3b4;
 
-  --text: #1c1b19;
-  --text-soft: #55524c;
-  --muted: #85817a;
+  --text: #1f1c17;
+  --text-soft: #57524a;
+  --muted: #8a8377;
 
-  --accent: #2f6f4f;
-  --accent-soft: #eaf3ee;
-  --accent-border: #b9d6c6;
-  --accent-text: #1f5138;
+  --accent: #5f6b45;
+  --accent-soft: #eef0e7;
+  --accent-border: #c4cbb0;
+  --accent-text: #46512f;
 
-  --danger: #b3261e;
-  --danger-soft: #fdecea;
-  --warn: #8a6100;
-  --warn-soft: #fdf3df;
-  --ok: #2f6f4f;
+  --danger: #9c3f2f;
+  --danger-soft: #f8ede9;
+  --warn: #856022;
+  --warn-soft: #f7efdd;
+  --ok: #5f6b45;
 
   --radius-sm: 6px;
+  --radius-md: 8px;
   --radius: 10px;
   --radius-lg: 16px;
   --radius-pill: 999px;
 
-  --shadow-sm: 0 1px 2px rgba(28, 27, 25, 0.06);
-  --shadow: 0 2px 8px rgba(28, 27, 25, 0.07);
-  --shadow-lg: 0 12px 32px rgba(28, 27, 25, 0.14);
+  --shadow-sm: 0 1px 2px rgba(31, 28, 23, 0.06);
+  --shadow: 0 2px 8px rgba(31, 28, 23, 0.07);
+  --shadow-lg: 0 12px 32px rgba(31, 28, 23, 0.14);
 
-  --graph-bg: #fbfaf8;
-  --graph-grid: #efeee9;
-  --graph-edge: #c9c6be;
-  --graph-label: #4a4741;
+  --graph-bg: #faf8f4;
+  --graph-grid: #efece4;
+  --graph-edge: #c7c0b2;
+  --graph-label: #4b463d;
 
   --font: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
@@ -50,38 +51,38 @@
 }
 
 :root[data-theme="dark"] {
-  --bg: #16151a;
-  --bg-sunken: #100f13;
-  --bg-raised: #1e1d23;
-  --bg-hover: #26252c;
-  --bg-active: #2f2d36;
+  --bg: #191713;
+  --bg-sunken: #131110;
+  --bg-raised: #211e19;
+  --bg-hover: #2a2620;
+  --bg-active: #34302a;
 
-  --border: #2c2a33;
-  --border-strong: #403d49;
+  --border: #302c26;
+  --border-strong: #47423a;
 
-  --text: #ece9f0;
-  --text-soft: #b9b4c2;
-  --muted: #8d8898;
+  --text: #ece7dd;
+  --text-soft: #bcb4a6;
+  --muted: #8e8778;
 
-  --accent: #6fd39b;
-  --accent-soft: #1b2c23;
-  --accent-border: #2f5340;
-  --accent-text: #8fe0b3;
+  --accent: #a9b485;
+  --accent-soft: #23271a;
+  --accent-border: #4b5337;
+  --accent-text: #bfc99c;
 
-  --danger: #f2837a;
-  --danger-soft: #35201e;
-  --warn: #e0b25a;
-  --warn-soft: #332a17;
-  --ok: #6fd39b;
+  --danger: #d68d7c;
+  --danger-soft: #33211d;
+  --warn: #d9b06a;
+  --warn-soft: #33291a;
+  --ok: #a9b485;
 
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
   --shadow-lg: 0 14px 36px rgba(0, 0, 0, 0.55);
 
-  --graph-bg: #131218;
-  --graph-grid: #1d1c23;
-  --graph-edge: #45424f;
-  --graph-label: #b9b4c2;
+  --graph-bg: #16140f;
+  --graph-grid: #201d17;
+  --graph-edge: #4a453c;
+  --graph-label: #bcb4a6;
 
   color-scheme: dark;
 }
@@ -159,20 +160,15 @@ a {
   white-space: nowrap;
 }
 
+/* The mark is full-colour artwork on a transparent ground, so it sits directly
+   on the bar rather than in a tinted tile — a solid fill behind it would fight
+   the illustration's own greens and creams in both themes. */
 .topbar__logo {
   display: grid;
   place-items: center;
-  width: 26px;
-  height: 26px;
-  border-radius: 8px;
-  background: var(--accent);
-  color: #fff;
-  font-size: 13px;
-  font-weight: 700;
-}
-
-:root[data-theme="dark"] .topbar__logo {
-  color: #10221a;
+  width: 30px;
+  height: 30px;
+  flex: none;
 }
 
 .topbar__kb {
@@ -260,7 +256,7 @@ a {
 }
 
 :root[data-theme="dark"] .btn--primary {
-  color: #10221a;
+  color: #1b2012;
 }
 
 .btn--primary:hover:not(:disabled) {
@@ -513,7 +509,7 @@ select.text-input {
 .resizer:hover,
 .resizer:focus-visible,
 .resizer--active {
-  background: color-mix(in srgb, var(--accent, #4a8fa8) 22%, transparent);
+  background: color-mix(in srgb, var(--accent, #5f6b45) 22%, transparent);
   outline: none;
 }
 
@@ -526,7 +522,7 @@ select.text-input {
 
 .resizer:hover .resizer__grip,
 .resizer--active .resizer__grip {
-  background: var(--accent, #4a8fa8);
+  background: var(--accent, #5f6b45);
 }
 
 .notebook--no-rail {
@@ -751,7 +747,7 @@ select.text-input {
 }
 
 :root[data-theme="dark"] .composer__send {
-  color: #10221a;
+  color: #1b2012;
 }
 
 .composer__send:disabled {
@@ -862,7 +858,7 @@ select.text-input {
 }
 
 .msg__answer a {
-  color: var(--accent, #1f6f8b);
+  color: var(--accent, #5f6b45);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
@@ -1791,7 +1787,7 @@ select.text-input {
 .modal-scrim {
   position: fixed;
   inset: 0;
-  background: rgba(20, 19, 17, 0.45);
+  background: rgba(25, 23, 19, 0.5);
   backdrop-filter: blur(2px);
   display: grid;
   place-items: center;

@@ -1,0 +1,32 @@
+pheasant:
+  name: acceptance-knowledge
+  vault_path: "{vault_path}"
+  state_path: "{state_path}"
+  exports_path: "{exports_path}"
+
+sources:
+  - name: pheasant-repo
+    type: repository
+    path: "{workspace_path}/pheasant-repo"
+    branch_policy: current
+    sync:
+      on_startup: true
+      on_file_change: debounce
+      on_git_commit: true
+      interval_seconds: 900
+
+  - name: architecture-notes
+    type: markdown_folder
+    path: "{workspace_path}/notes/architecture"
+    sync:
+      on_startup: true
+      on_file_change: debounce
+
+  - name: product-documents
+    type: document_folder
+    path: "{workspace_path}/docs"
+    include:
+      - "**/*.md"
+    exclude:
+      - "**/.git/**"
+      - "**/node_modules/**"

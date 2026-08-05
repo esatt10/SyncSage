@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from syncsage.graph.simple import SimpleMultiDiGraph
-from syncsage.search.graph_search import search_graph
-from syncsage.search.hybrid import HybridSearch
+from pheasant.graph.simple import SimpleMultiDiGraph
+from pheasant.search.graph_search import search_graph
+from pheasant.search.hybrid import HybridSearch
 
 
 def _sample_graph() -> SimpleMultiDiGraph:
@@ -13,8 +13,8 @@ def _sample_graph() -> SimpleMultiDiGraph:
         "file:repo:sync_engine.py",
         id="file:repo:sync_engine.py",
         type="file",
-        label="syncsage/sync_engine.py",
-        relative_path="syncsage/sync_engine.py",
+        label="pheasant/sync_engine.py",
+        relative_path="pheasant/sync_engine.py",
         source_id="repo",
     )
     graph.add_node(
@@ -120,7 +120,7 @@ def test_fast_reject_never_changes_results() -> None:
     attribute values and nothing at all.
     """
 
-    import syncsage.search.graph_search as gs
+    import pheasant.search.graph_search as gs
 
     graph = _sample_graph()
     # Add bulk the queries must not accidentally match, so the filter is

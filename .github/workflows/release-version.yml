@@ -21,7 +21,7 @@ permissions:
   statuses: write
 
 env:
-  IMAGE_NAME: syncsage
+  IMAGE_NAME: pheasant
 
 jobs:
   release-version:

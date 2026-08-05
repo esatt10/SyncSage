@@ -210,12 +210,12 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
-# SyncSage local runtime/config
-syncsage.yaml
-syncsage.local.yaml
-syncsage.*.local.yaml
+# pheasant local runtime/config
+pheasant.yaml
+pheasant.local.yaml
+pheasant.*.local.yaml
 .vscode/mcp.json
-/.syncsage/
+/.pheasant/
 /workspace/
 /state/
 /vault/

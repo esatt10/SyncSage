@@ -1,4 +1,4 @@
-project: SyncSage
+project: pheasant
 mission: Build a lightweight Docker-first MCP server for graph-based local knowledge indexing and agentic retrieval.
 
 principles:
@@ -28,8 +28,8 @@ architecture_constraints:
 
 required_acceptance:
   - docker build succeeds
-  - syncsage validate works
-  - syncsage serve starts API and MCP server
+  - pheasant validate works
+  - pheasant serve starts API and MCP server
   - sample repository can be indexed
   - search_context returns relevant chunks with provenance
   - repeated sync is idempotent

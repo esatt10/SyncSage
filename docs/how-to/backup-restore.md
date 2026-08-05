@@ -1,16 +1,16 @@
 # How to back up and restore region state
 
-`/state` is SyncSage's operational source of truth — SQLite, the graph and its
+`/state` is pheasant's operational source of truth — SQLite, the graph and its
 snapshots, manifests, the published contract, the event stream, and the vector
 index. Treat it as **user data** and back it up.
 
 ## What's in a backup
 
-`syncsage backup` writes a single `.tar.zst` archive containing:
+`pheasant backup` writes a single `.tar.zst` archive containing:
 
 | Item | Notes |
 |---|---|
-| `syncsage.db` | A **consistent** SQLite snapshot via `VACUUM INTO` (never a raw copy; survives WAL). |
+| `pheasant.db` | A **consistent** SQLite snapshot via `VACUUM INTO` (never a raw copy; survives WAL). |
 | `graphs/` | `graph.latest.json` plus all `graph.<ts>.json.zst` snapshots. |
 | `contract.latest.json` | The published Synapse contract, when present. |
 | `events/` | The append-only NDJSON sync-event stream, when present. |
@@ -21,8 +21,8 @@ The archive is written durably (temp file + fsync + atomic rename).
 ## Create a backup
 
 ```bash
-syncsage backup ./backups/syncsage-$(date -u +%Y%m%dT%H%M%SZ).tar.zst \
-  --config syncsage.yaml
+pheasant backup ./backups/pheasant-$(date -u +%Y%m%dT%H%M%SZ).tar.zst \
+  --config pheasant.yaml
 ```
 
 The first positional argument is the output path; `--config` / `-c` points at
@@ -31,8 +31,8 @@ your config so the correct `/state` is located.
 ## Restore a backup
 
 ```bash
-syncsage restore ./backups/syncsage-20260621T120000Z.tar.zst \
-  --config syncsage.yaml
+pheasant restore ./backups/pheasant-20260621T120000Z.tar.zst \
+  --config pheasant.yaml
 ```
 
 Restore is **safe by default**:
@@ -46,8 +46,8 @@ Restore is **safe by default**:
 To overwrite an existing populated state:
 
 ```bash
-syncsage restore ./backups/syncsage-20260621T120000Z.tar.zst \
-  --config syncsage.yaml --force
+pheasant restore ./backups/pheasant-20260621T120000Z.tar.zst \
+  --config pheasant.yaml --force
 ```
 
 ## Validate after restore
@@ -56,14 +56,14 @@ After a restore, confirm the region is healthy and consistent:
 
 ```bash
 # config + environment
-syncsage validate syncsage.yaml
-syncsage doctor --config syncsage.yaml
+pheasant validate pheasant.yaml
+pheasant doctor --config pheasant.yaml
 
 # rebuild any missing/invalid derived state from manifests + DB
-syncsage repair --config syncsage.yaml
+pheasant repair --config pheasant.yaml
 
 # runtime health
-syncsage start --config syncsage.yaml &
+pheasant start --config pheasant.yaml &
 curl http://localhost:8765/health
 curl http://localhost:8765/ready
 ```
@@ -72,13 +72,13 @@ If a source looks stale or partially indexed, run a targeted repair or a full
 sync:
 
 ```bash
-syncsage sync --config syncsage.yaml --source <name> --mode repair
-syncsage sync --config syncsage.yaml --source <name> --mode full
+pheasant sync --config pheasant.yaml --source <name> --mode repair
+pheasant sync --config pheasant.yaml --source <name> --mode full
 ```
 
 ## Graph snapshots and retention
 
-Independently of explicit backups, SyncSage writes zstd-compressed, timestamped
+Independently of explicit backups, pheasant writes zstd-compressed, timestamped
 graph snapshots after a successful sync
 (`graphs/<kb_id>/graph.<utc-ts>.json.zst`), beside the uncompressed
 `graph.latest.json`. They are:
@@ -96,12 +96,12 @@ storage:
   max_state_size_gb: 10
 ```
 
-Snapshots are point-in-time history; `syncsage backup` is the portable archive
+Snapshots are point-in-time history; `pheasant backup` is the portable archive
 you copy off-box.
 
 ## Operational notes
 
-- Never point two independent SyncSage instances at the same writable `/state`.
+- Never point two independent pheasant instances at the same writable `/state`.
   Use one volume per instance.
 - Back up before upgrades or migrations. State migrations are one-shot and
   idempotent and preserve originals, but a fresh archive is cheap insurance.

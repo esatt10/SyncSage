@@ -1,14 +1,14 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: syncsage
-  namespace: syncsage
+  name: pheasant
+  namespace: pheasant
   labels:
-    app.kubernetes.io/name: syncsage
+    app.kubernetes.io/name: pheasant
 spec:
   type: ClusterIP
   selector:
-    app.kubernetes.io/name: syncsage
+    app.kubernetes.io/name: pheasant
   ports:
     - name: http
       port: 8765

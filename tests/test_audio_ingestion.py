@@ -17,11 +17,11 @@ from typing import Any
 
 import pytest
 
-from syncsage.config.schema import SyncSageConfig
-from syncsage.ingestion.transcriber import StubTranscriber, build_transcriber
-from syncsage.search.hybrid import HybridSearch
-from syncsage.search.sqlite_store import SearchStore
-from syncsage.sync.engine import SyncEngine
+from pheasant.config.schema import PheasantConfig
+from pheasant.ingestion.transcriber import StubTranscriber, build_transcriber
+from pheasant.search.hybrid import HybridSearch
+from pheasant.search.sqlite_store import SearchStore
+from pheasant.sync.engine import SyncEngine
 
 FIXTURE_AUDIO = Path(__file__).parent / "fixtures" / "sample_workspace" / "audio" / "briefing.wav"
 FIXTURE_SIDECAR = FIXTURE_AUDIO.with_name(FIXTURE_AUDIO.name + ".transcript.txt")
@@ -43,9 +43,9 @@ def _make_audio_engine(tmp_path: Path, *, with_embeddings: bool = False) -> Sync
             "embeddings": {"enabled": True, "provider": "stub", "dimensions": 64},
             "vector_store": {"provider": "numpy"},
         }
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         {
-            "syncsage": {
+            "pheasant": {
                 "name": "audio-acceptance",
                 "state_path": str(tmp_path / "state"),
                 "vault_path": str(tmp_path / "vault"),
@@ -91,7 +91,7 @@ def test_stub_transcriber_is_deterministic_and_sidecar_wins() -> None:
 
 
 def test_build_transcriber_provider_selection() -> None:
-    from syncsage.config.schema import TranscriberSettings
+    from pheasant.config.schema import TranscriberSettings
 
     assert isinstance(build_transcriber(TranscriberSettings(provider="stub")), StubTranscriber)
     with pytest.raises(ValueError, match="Unsupported"):
@@ -135,9 +135,9 @@ def test_text_only_region_builds_no_transcriber(tmp_path: Path) -> None:
     notes = tmp_path / "workspace" / "notes"
     notes.mkdir(parents=True, exist_ok=True)
     (notes / "a.md").write_text("# Notes\n\nplain text only.\n", encoding="utf-8")
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         {
-            "syncsage": {
+            "pheasant": {
                 "name": "text-only-audio",
                 "state_path": str(tmp_path / "state"),
                 "vault_path": str(tmp_path / "vault"),
@@ -159,7 +159,7 @@ def test_text_only_region_builds_no_transcriber(tmp_path: Path) -> None:
 def test_contract_modalities_include_audio_when_audio_source_present(tmp_path: Path) -> None:
     engine = _make_audio_engine(tmp_path)
     engine.sync_source("audio", mode="full")
-    from syncsage.synapse.publisher import ContractPublisher
+    from pheasant.synapse.publisher import ContractPublisher
 
     publisher = ContractPublisher(engine.config, engine.state)
     contract = publisher.build(generated_at="2026-06-21T00:00:00Z")
@@ -171,9 +171,9 @@ def test_contract_modalities_omit_audio_for_text_region(tmp_path: Path) -> None:
     notes = tmp_path / "workspace" / "notes"
     notes.mkdir(parents=True, exist_ok=True)
     (notes / "a.md").write_text("# Notes\n\nplain text only.\n", encoding="utf-8")
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         {
-            "syncsage": {
+            "pheasant": {
                 "name": "text-only-audio",
                 "state_path": str(tmp_path / "state"),
                 "vault_path": str(tmp_path / "vault"),
@@ -185,7 +185,7 @@ def test_contract_modalities_omit_audio_for_text_region(tmp_path: Path) -> None:
     )
     engine = SyncEngine(config)
     engine.sync_source("notes", mode="full")
-    from syncsage.synapse.publisher import ContractPublisher
+    from pheasant.synapse.publisher import ContractPublisher
 
     contract = ContractPublisher(config, engine.state).build(generated_at="2026-06-21T00:00:00Z")
     assert "audio" not in contract["capabilities"]["modalities"]

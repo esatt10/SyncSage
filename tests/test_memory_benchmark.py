@@ -4,7 +4,7 @@ The harness runs the real write→index→search path; the thresholds below are
 the regression gate for the two retrieval fixes it flushed out (FTS5
 implicit-AND on natural-language questions, inverted bm25→relevance
 mapping). Full-size numbers are recorded in the SR repo's
-``docs/RESULTS.md`` §9d; reproduce with ``python -m syncsage.memory.benchmark``.
+``docs/RESULTS.md`` §9d; reproduce with ``python -m pheasant.memory.benchmark``.
 """
 
 from __future__ import annotations
@@ -13,9 +13,9 @@ from pathlib import Path
 
 import pytest
 
-from syncsage.config.loader import load_config
-from syncsage.mcp_server.tools import SyncSageTools
-from syncsage.memory.benchmark import (
+from pheasant.config.loader import load_config
+from pheasant.mcp_server.tools import PheasantTools
+from pheasant.memory.benchmark import (
     MemoryBenchSpec,
     generate_cases,
     run_memory_recall_benchmark,
@@ -24,11 +24,11 @@ from syncsage.memory.benchmark import (
 CI_SPEC = MemoryBenchSpec(n_facts=12, n_distractors=40, n_updates=4, n_abstain=4)
 
 
-def _tools(tmp_path: Path) -> SyncSageTools:
+def _tools(tmp_path: Path) -> PheasantTools:
     (tmp_path / "memory").mkdir(exist_ok=True)
-    config_path = tmp_path / "syncsage.yaml"
+    config_path = tmp_path / "pheasant.yaml"
     config_path.write_text(
-        f"""syncsage:
+        f"""pheasant:
   name: membench
   state_path: {tmp_path / "state"}
   vault_path: {tmp_path / "vault"}
@@ -46,7 +46,7 @@ sources:
 """,
         encoding="utf-8",
     )
-    return SyncSageTools(load_config(config_path))
+    return PheasantTools(load_config(config_path))
 
 
 def test_case_generation_is_deterministic() -> None:
@@ -90,7 +90,7 @@ def test_benchmark_requires_a_memory_source(tmp_path: Path) -> None:
     config_path = tmp_path / "s.yaml"
     (tmp_path / "docs").mkdir()
     config_path.write_text(
-        f"""syncsage:
+        f"""pheasant:
   name: nomem
   state_path: {tmp_path / "state"}
   vault_path: {tmp_path / "vault"}
@@ -103,7 +103,7 @@ sources:
 """,
         encoding="utf-8",
     )
-    tools = SyncSageTools(load_config(config_path))
+    tools = PheasantTools(load_config(config_path))
     try:
         with pytest.raises(ValueError, match="memory"):
             run_memory_recall_benchmark(tools, CI_SPEC)

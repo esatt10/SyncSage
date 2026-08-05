@@ -14,9 +14,9 @@ from pathlib import Path
 
 import pytest
 
-from syncsage.config.loader import load_config
-from syncsage.mcp_server.tools import SyncSageTools
-from syncsage.memory.store import MEMORY_RECORD_VERSION, MemoryRecord, MemoryStore, memory_source
+from pheasant.config.loader import load_config
+from pheasant.mcp_server.tools import PheasantTools
+from pheasant.memory.store import MEMORY_RECORD_VERSION, MemoryRecord, MemoryStore, memory_source
 
 PINNED_NOW = datetime(2026, 7, 16, 12, 0, 0, tzinfo=UTC)
 
@@ -30,13 +30,13 @@ def _write_config(tmp_path: Path, *, include_memory: bool = True) -> Path:
         if include_memory
         else ""
     )
-    config_path = tmp_path / "syncsage.yaml"
+    config_path = tmp_path / "pheasant.yaml"
     config_path.write_text(
-        f"""syncsage:
+        f"""pheasant:
   name: memory-test
-  state_path: {tmp_path / ".syncsage" / "state"}
-  vault_path: {tmp_path / ".syncsage" / "vault"}
-  exports_path: {tmp_path / ".syncsage" / "exports"}
+  state_path: {tmp_path / ".pheasant" / "state"}
+  vault_path: {tmp_path / ".pheasant" / "vault"}
+  exports_path: {tmp_path / ".pheasant" / "exports"}
   workspace_root: {tmp_path}
 sync:
   watcher:
@@ -141,7 +141,7 @@ def test_memory_write_is_searchable_immediately_and_resync_is_zero_work(
 ) -> None:
     config = load_config(_write_config(tmp_path))
     assert memory_source(config) is not None
-    tools = SyncSageTools(config)
+    tools = PheasantTools(config)
     try:
         result = tools.memory_write(
             "memory-test",
@@ -170,7 +170,7 @@ def test_memory_write_is_searchable_immediately_and_resync_is_zero_work(
 
 def test_memory_write_without_memory_source_is_actionable(tmp_path: Path) -> None:
     config = load_config(_write_config(tmp_path, include_memory=False))
-    tools = SyncSageTools(config)
+    tools = PheasantTools(config)
     try:
         with pytest.raises(ValueError, match="type: memory"):
             tools.memory_write("memory-test", "anything")
@@ -185,7 +185,7 @@ def test_memory_write_without_memory_source_is_actionable(tmp_path: Path) -> Non
 
 def test_http_memory_write_and_list(tmp_path: Path) -> None:
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
-    from syncsage.api.app import create_app
+    from pheasant.api.app import create_app
 
     config_path = _write_config(tmp_path)
     app = create_app(load_config(config_path), config_path=str(config_path))
@@ -215,7 +215,7 @@ def test_http_memory_write_and_list(tmp_path: Path) -> None:
 
 def test_http_memory_without_source_is_400(tmp_path: Path) -> None:
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
-    from syncsage.api.app import create_app
+    from pheasant.api.app import create_app
 
     config_path = _write_config(tmp_path, include_memory=False)
     app = create_app(load_config(config_path), config_path=str(config_path))
@@ -233,8 +233,8 @@ def test_http_memory_without_source_is_400(tmp_path: Path) -> None:
 
 
 def test_publisher_advertises_memory_modality(tmp_path: Path) -> None:
-    from syncsage.persistence.state_store import StateStore
-    from syncsage.synapse.publisher import ContractPublisher
+    from pheasant.persistence.state_store import StateStore
+    from pheasant.synapse.publisher import ContractPublisher
 
     state = StateStore(tmp_path / "pub-state.db")
     state.migrate()
@@ -308,10 +308,10 @@ def test_ttl_none_means_scope_never_expires(tmp_path: Path) -> None:
 
 
 def test_maintenance_reindexes_so_search_forgets_archived_records(tmp_path: Path) -> None:
-    from syncsage.memory.maintenance import run_memory_maintenance
+    from pheasant.memory.maintenance import run_memory_maintenance
 
     config = load_config(_write_config(tmp_path))
-    tools = SyncSageTools(config)
+    tools = PheasantTools(config)
     try:
         first = tools.memory_write("memory-test", "The rollout password is BANANAS.", scope="org")
         old_id = first["record"]["record_id"]
@@ -347,10 +347,10 @@ def test_maintenance_reindexes_so_search_forgets_archived_records(tmp_path: Path
 
 
 def test_maintenance_respects_disable_and_missing_source(tmp_path: Path) -> None:
-    from syncsage.memory.maintenance import run_memory_maintenance
+    from pheasant.memory.maintenance import run_memory_maintenance
 
     no_source = load_config(_write_config(tmp_path, include_memory=False))
-    tools = SyncSageTools(no_source)
+    tools = PheasantTools(no_source)
     try:
         assert run_memory_maintenance(tools.engine) is None
         assert "skipped" in tools.memory_consolidate("memory-test")
@@ -364,7 +364,7 @@ def test_maintenance_respects_disable_and_missing_source(tmp_path: Path) -> None
         config_path.read_text(encoding="utf-8") + "memory:\n  consolidation_enabled: false\n",
         encoding="utf-8",
     )
-    tools2 = SyncSageTools(load_config(config_path))
+    tools2 = PheasantTools(load_config(config_path))
     try:
         assert run_memory_maintenance(tools2.engine) is None
     finally:
@@ -373,7 +373,7 @@ def test_maintenance_respects_disable_and_missing_source(tmp_path: Path) -> None
 
 def test_http_consolidate_endpoint(tmp_path: Path) -> None:
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
-    from syncsage.api.app import create_app
+    from pheasant.api.app import create_app
 
     config_path = _write_config(tmp_path)
     app = create_app(load_config(config_path), config_path=str(config_path))

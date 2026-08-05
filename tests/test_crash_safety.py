@@ -22,21 +22,21 @@ from pathlib import Path
 
 import pytest
 
-from syncsage.config.loader import load_config
-from syncsage.persistence.state_store import StateStore
-from syncsage.sync.engine import SyncEngine
-from syncsage.sync.locks import EngineLease, EngineLeaseError, source_lock
+from pheasant.config.loader import load_config
+from pheasant.persistence.state_store import StateStore
+from pheasant.sync.engine import SyncEngine
+from pheasant.sync.locks import EngineLease, EngineLeaseError, source_lock
 from tests.conftest import CONFIG_TEMPLATE
 
 POLL_TIMEOUT_S = 30.0
 
 SYNC_DRIVER = """\
 import sys
-from syncsage.config.loader import load_config
-from syncsage.sync.engine import SyncEngine
+from pheasant.config.loader import load_config
+from pheasant.sync.engine import SyncEngine
 
 engine = SyncEngine(load_config(sys.argv[1]))
-engine.sync_source("syncsage-repo", "full")
+engine.sync_source("pheasant-repo", "full")
 print("SYNC_COMPLETE", flush=True)
 """
 
@@ -51,7 +51,7 @@ def _render_config(tmp_path: Path, name: str, workspace: Path) -> Path:
         vault_path=(base / "vault").as_posix(),
         exports_path=(base / "exports").as_posix(),
     )
-    config_file = base / "syncsage.yaml"
+    config_file = base / "pheasant.yaml"
     config_file.write_text(rendered, encoding="utf-8")
     return config_file
 
@@ -73,7 +73,7 @@ def _artifact_count(db_path: Path) -> int:
         return 0
 
 
-def _manifest_sha_map(engine: SyncEngine, source: str = "syncsage-repo") -> dict[str, str]:
+def _manifest_sha_map(engine: SyncEngine, source: str = "pheasant-repo") -> dict[str, str]:
     artifacts = engine.manifests.load(source)["artifacts"]
     return {relative: entry["sha256"] for relative, entry in artifacts.items()}
 
@@ -109,9 +109,9 @@ def test_kill9_mid_sync_then_restart_recovers_without_repair(
 ) -> None:
     crashed_cfg = _render_config(tmp_path, "crashed", workspace_copy)
     control_cfg = _render_config(tmp_path, "control", workspace_copy)
-    db_path = _state_dir(crashed_cfg) / "syncsage.db"
+    db_path = _state_dir(crashed_cfg) / "pheasant.db"
 
-    env = {**os.environ, "SYNCSAGE_TEST_SLOW_SYNC_MS": "500"}
+    env = {**os.environ, "PHEASANT_TEST_SLOW_SYNC_MS": "500"}
     proc = subprocess.Popen(
         [sys.executable, "-c", SYNC_DRIVER, str(crashed_cfg)],
         env=env,
@@ -139,12 +139,12 @@ def test_kill9_mid_sync_then_restart_recovers_without_repair(
     engine = SyncEngine(load_config(crashed_cfg))
     try:
         assert engine.state.rows("PRAGMA integrity_check")[0][0] == "ok"
-        result = engine.sync_source("syncsage-repo", "incremental")
+        result = engine.sync_source("pheasant-repo", "incremental")
         assert result.status == "healthy"
 
         control = SyncEngine(load_config(control_cfg))
         try:
-            control.sync_source("syncsage-repo", "full")
+            control.sync_source("pheasant-repo", "full")
             assert _manifest_sha_map(engine) == _manifest_sha_map(control)
             assert engine.stats == control.stats
         finally:
@@ -194,7 +194,7 @@ def test_stale_lease_is_taken_over_with_warning(
     )
     engine = SyncEngine(load_config(config_file))
     try:
-        with caplog.at_level(logging.WARNING, logger="syncsage.sync.locks"):
+        with caplog.at_level(logging.WARNING, logger="pheasant.sync.locks"):
             engine.lease.acquire()
         assert any("stale" in record.message.lower() for record in caplog.records)
         assert json.loads(lease_path.read_text(encoding="utf-8"))["pid"] == os.getpid()
@@ -272,10 +272,10 @@ def test_source_lock_from_a_dead_container_is_not_honoured(tmp_path: Path, caplo
 
     locks = tmp_path / "locks"
     locks.mkdir()
-    (locks / "syncsage-repo.lock").write_text(
+    (locks / "pheasant-repo.lock").write_text(
         json.dumps(
             {
-                "source_id": "syncsage-repo",
+                "source_id": "pheasant-repo",
                 "pid": 1,  # alive in this namespace, but not the same namespace
                 "hostname": "a1b2c3d4e5f6",
                 "created_at": "2026-05-29T02:41:08+00:00",
@@ -284,13 +284,13 @@ def test_source_lock_from_a_dead_container_is_not_honoured(tmp_path: Path, caplo
         encoding="utf-8",
     )
 
-    with caplog.at_level(logging.WARNING, logger="syncsage.sync.locks"):
-        with source_lock(locks, "syncsage-repo"):
-            payload = json.loads((locks / "syncsage-repo.lock").read_text(encoding="utf-8"))
+    with caplog.at_level(logging.WARNING, logger="pheasant.sync.locks"):
+        with source_lock(locks, "pheasant-repo"):
+            payload = json.loads((locks / "pheasant-repo.lock").read_text(encoding="utf-8"))
             assert payload["pid"] == os.getpid()
             assert payload["hostname"] == socket.gethostname()
     assert any("stale source lock" in record.message.lower() for record in caplog.records)
-    assert not (locks / "syncsage-repo.lock").exists()
+    assert not (locks / "pheasant-repo.lock").exists()
 
 
 def test_legacy_source_lock_without_hostname_is_cleared(tmp_path: Path) -> None:
@@ -311,9 +311,9 @@ def test_live_source_lock_on_this_host_is_still_honoured(tmp_path: Path) -> None
     """The lock must keep doing its job for a real concurrent sync."""
 
     locks = tmp_path / "locks"
-    with source_lock(locks, "syncsage-repo"):
+    with source_lock(locks, "pheasant-repo"):
         with pytest.raises(RuntimeError, match="already locked"):
-            with source_lock(locks, "syncsage-repo"):
+            with source_lock(locks, "pheasant-repo"):
                 pass
 
 
@@ -326,11 +326,11 @@ def test_legacy_manifests_migrate_exactly_once(
     manifests_dir = _state_dir(config_file) / "manifests"
     manifests_dir.mkdir(parents=True, exist_ok=True)
     legacy_payload = {
-        "source_id": "syncsage-repo",
+        "source_id": "pheasant-repo",
         "artifacts": {
             "README.md": {
                 "sha256": "a" * 64,
-                "artifact_id": "file:syncsage-repo:README.md:branch=main",
+                "artifact_id": "file:pheasant-repo:README.md:branch=main",
                 "last_indexed_at": "2026-06-01T00:00:00+00:00",
                 "git_branch": "main",
                 "git_commit": "deadbeef",
@@ -339,15 +339,15 @@ def test_legacy_manifests_migrate_exactly_once(
         "last_indexed_at": "2026-06-01T00:00:00+00:00",
         "connector": {"type": "filesystem"},
     }
-    legacy_file = manifests_dir / "syncsage-repo.manifest.json"
+    legacy_file = manifests_dir / "pheasant-repo.manifest.json"
     legacy_file.write_text(json.dumps(legacy_payload, indent=2, sort_keys=True), encoding="utf-8")
 
     first = SyncEngine(config)
     try:
         # Row present with equivalent content; original renamed, never deleted.
-        assert first.manifests.load("syncsage-repo") == legacy_payload
+        assert first.manifests.load("pheasant-repo") == legacy_payload
         assert not legacy_file.exists()
-        migrated_file = manifests_dir / "syncsage-repo.manifest.json.migrated"
+        migrated_file = manifests_dir / "pheasant-repo.manifest.json.migrated"
         assert migrated_file.exists()
         assert json.loads(migrated_file.read_text(encoding="utf-8")) == legacy_payload
     finally:
@@ -355,7 +355,7 @@ def test_legacy_manifests_migrate_exactly_once(
 
     listing = sorted(path.name for path in manifests_dir.iterdir())
     mtimes = {path.name: path.stat().st_mtime_ns for path in manifests_dir.iterdir()}
-    snapshot_store = StateStore(_state_dir(config_file) / "syncsage.db")
+    snapshot_store = StateStore(_state_dir(config_file) / "pheasant.db")
     rows = [
         (row["source_name"], row["payload_json"], row["updated_at"])
         for row in snapshot_store.rows(

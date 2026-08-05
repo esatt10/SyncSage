@@ -1,9 +1,9 @@
 {
-  "name": "syncsage-ui",
+  "name": "pheasant-ui",
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Light React front end for SyncSage: knowledge-graph navigation, source management, and configuration.",
+  "description": "Light React front end for pheasant: knowledge-graph navigation, source management, and configuration.",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

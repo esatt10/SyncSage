@@ -30,12 +30,12 @@ def test_config_loads_example_yaml_with_expected_sources(loaded_config: object, 
     """The rendered example config should load and preserve configured paths/sources."""
 
     assert _source_names(loaded_config) == {
-        "syncsage-repo",
+        "pheasant-repo",
         "architecture-notes",
         "product-documents",
     }
 
-    settings = _get(loaded_config, "syncsage") if isinstance(loaded_config, Mapping) else loaded_config
+    settings = _get(loaded_config, "pheasant") if isinstance(loaded_config, Mapping) else loaded_config
     state_value = str(_get(settings, "state_path"))
     vault_value = str(_get(settings, "vault_path"))
     assert str(state_path) in state_value
@@ -47,12 +47,12 @@ def test_config_validation_reports_missing_source_path(tmp_path: Path, config_pa
 
     bad_config = tmp_path / "missing-source.yaml"
     bad_config.write_text(
-        config_path.read_text(encoding="utf-8").replace("/syncsage-repo", "/missing-repo"),
+        config_path.read_text(encoding="utf-8").replace("/pheasant-repo", "/missing-repo"),
         encoding="utf-8",
     )
 
-    config_module = import_any(("syncsage.config.loader", "syncsage.config"))
-    loader = require_attr(config_module, ("load_config", "load_syncsage_config", "load", "from_yaml"), "config loader")
+    config_module = import_any(("pheasant.config.loader", "pheasant.config"))
+    loader = require_attr(config_module, ("load_config", "load_pheasant_config", "load", "from_yaml"), "config loader")
     try:
         loaded = loader(bad_config)
     except Exception as exc:  # noqa: BLE001 - acceptance test checks user-facing validation text.
@@ -84,7 +84,7 @@ def test_config_validation_reports_missing_source_path(tmp_path: Path, config_pa
 
 
 def test_cli_validate_accepts_rendered_config(config_path: Path) -> None:
-    """The user-facing `syncsage validate` command should accept the example config."""
+    """The user-facing `pheasant validate` command should accept the example config."""
 
     result = call_cli(["validate", str(config_path)])
     assert result.returncode == 0, result.stderr or result.stdout
@@ -92,7 +92,7 @@ def test_cli_validate_accepts_rendered_config(config_path: Path) -> None:
 
 
 def test_graph_section_of_the_yaml_is_actually_applied() -> None:
-    """`SyncSageConfig.model_validate` must respect a `graph:` YAML section.
+    """`PheasantConfig.model_validate` must respect a `graph:` YAML section.
 
     Regression test: `graph=build(GraphSettings, data.get("graph"))` was
     missing from `model_validate`'s constructor call, so ANY `graph:`
@@ -103,11 +103,11 @@ def test_graph_section_of_the_yaml_is_actually_applied() -> None:
     `wasm_cross_source_resolution: false` in the resolved `/config`
     response despite the mounted YAML setting it `true`.
     """
-    from syncsage.config.schema import SyncSageConfig
+    from pheasant.config.schema import PheasantConfig
 
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         {
-            "syncsage": {"name": "graph-section-regression"},
+            "pheasant": {"name": "graph-section-regression"},
             "graph": {
                 "concept_min_documents": 5,
                 "wasm_cross_source_resolution": True,

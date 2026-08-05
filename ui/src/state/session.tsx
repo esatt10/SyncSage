@@ -257,7 +257,7 @@ function surfacedFrom(answer: ChatAnswer): string[] {
   return [...new Set(ordered)];
 }
 
-const STORAGE_KEY = "syncsage.workspace.v1";
+const STORAGE_KEY = "pheasant.workspace.v1";
 
 /**
  * What survives a reload — view preferences only.

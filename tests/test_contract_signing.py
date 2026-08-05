@@ -6,7 +6,7 @@ Offline + deterministic test keypair. Two halves:
    is set, and is unsigned (standalone-safe) when it is not.
 2. The vendored ``signed-demo-region`` fixture — produced by *this* signing
    path — verifies under a plain ``cryptography`` check over the same canonical
-   body bytes the router uses, and a tampered copy fails. This is the SyncSage
+   body bytes the router uses, and a tampered copy fails. This is the pheasant
    side of the cross-repo signing-parity guarantee (the SR side asserts the
    sibling router's ``verify_signature`` accepts the same fixture).
 """
@@ -20,10 +20,10 @@ from typing import Any
 
 import pytest
 
-from syncsage.config.schema import SyncSageConfig
-from syncsage.synapse import signing
-from syncsage.synapse.publisher import ContractPublisher, contract_path
-from syncsage.sync.engine import SyncEngine
+from pheasant.config.schema import PheasantConfig
+from pheasant.synapse import signing
+from pheasant.synapse.publisher import ContractPublisher, contract_path
+from pheasant.sync.engine import SyncEngine
 from tests.conftest import run_sync
 
 pytest.importorskip("cryptography")
@@ -55,9 +55,9 @@ def _no_embed_engine(tmp_path: Path, **synapse: Any) -> SyncEngine:
     notes = tmp_path / "ws" / "notes"
     notes.mkdir(parents=True, exist_ok=True)
     (notes / "a.md").write_text("# A\n\nThe automobile fleet needs inspection.\n", "utf-8")
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         {
-            "syncsage": {
+            "pheasant": {
                 "name": "signing-region",
                 "state_path": str(tmp_path / "state"),
                 "vault_path": str(tmp_path / "vault"),
@@ -78,10 +78,10 @@ def _no_embed_engine(tmp_path: Path, **synapse: Any) -> SyncEngine:
 
 
 def test_publisher_signs_when_key_ref_set(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("SYNCSAGE_SIGNING_KEY", TEST_KEY_B64)
-    engine = _no_embed_engine(tmp_path, signing_key_ref="env://SYNCSAGE_SIGNING_KEY")
+    monkeypatch.setenv("PHEASANT_SIGNING_KEY", TEST_KEY_B64)
+    engine = _no_embed_engine(tmp_path, signing_key_ref="env://PHEASANT_SIGNING_KEY")
     run_sync(engine, source_name="notes", mode="full")
-    payload = json.loads(contract_path(engine.config.syncsage.state_path).read_text("utf-8"))
+    payload = json.loads(contract_path(engine.config.pheasant.state_path).read_text("utf-8"))
     assert payload["integrity"]["signature"] is not None
     assert _verify(payload, TEST_PUBKEY_B64)
 
@@ -89,16 +89,16 @@ def test_publisher_signs_when_key_ref_set(tmp_path: Path, monkeypatch) -> None:
 def test_publisher_unsigned_by_default(tmp_path: Path) -> None:
     engine = _no_embed_engine(tmp_path)  # no signing_key_ref
     run_sync(engine, source_name="notes", mode="full")
-    payload = json.loads(contract_path(engine.config.syncsage.state_path).read_text("utf-8"))
+    payload = json.loads(contract_path(engine.config.pheasant.state_path).read_text("utf-8"))
     assert payload["integrity"]["signature"] is None
 
 
 def test_signing_does_not_change_content_hash(tmp_path: Path, monkeypatch) -> None:
     """The signature lives outside the hashed body, so signing leaves the hash."""
-    monkeypatch.setenv("SYNCSAGE_SIGNING_KEY", TEST_KEY_B64)
-    engine = _no_embed_engine(tmp_path, signing_key_ref="env://SYNCSAGE_SIGNING_KEY")
+    monkeypatch.setenv("PHEASANT_SIGNING_KEY", TEST_KEY_B64)
+    engine = _no_embed_engine(tmp_path, signing_key_ref="env://PHEASANT_SIGNING_KEY")
     run_sync(engine, source_name="notes", mode="full")
-    payload = json.loads(contract_path(engine.config.syncsage.state_path).read_text("utf-8"))
+    payload = json.loads(contract_path(engine.config.pheasant.state_path).read_text("utf-8"))
     body = {k: v for k, v in payload.items() if k != "integrity"}
     assert payload["integrity"]["content_hash"] == signing.content_hash(body)
 

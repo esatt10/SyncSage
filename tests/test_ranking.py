@@ -21,9 +21,9 @@ from __future__ import annotations
 
 import pytest
 
-from syncsage.persistence.state_store import StateStore, _basename
-from syncsage.search.hybrid import RRF_K, _merge_rrf
-from syncsage.search.sqlite_store import SearchStore, _query_tokens
+from pheasant.persistence.state_store import StateStore, _basename
+from pheasant.search.hybrid import RRF_K, _merge_rrf
+from pheasant.search.sqlite_store import SearchStore, _query_tokens
 
 
 def _index(tmp_path, files: dict[str, str]) -> SearchStore:
@@ -258,7 +258,7 @@ def test_rrf_prefers_the_record_carrying_a_preview() -> None:
 
 
 def _graph_with_facts():
-    from syncsage.graph.simple import SimpleMultiDiGraph
+    from pheasant.graph.simple import SimpleMultiDiGraph
 
     graph = SimpleMultiDiGraph()
     graph.add_node("f:a", type="markdown_note", label="CONTRIBUTING.md")
@@ -274,7 +274,7 @@ def _graph_with_facts():
 
 
 def test_a_resolved_document_outranks_the_name_that_pointed_at_it() -> None:
-    from syncsage.assistant.chat import collect_facts
+    from pheasant.assistant.chat import collect_facts
 
     facts = collect_facts(_graph_with_facts(), ["f:a"], 12)
 
@@ -287,8 +287,8 @@ def test_a_resolved_document_outranks_the_name_that_pointed_at_it() -> None:
 
 def test_facts_do_not_come_all_from_one_subject() -> None:
     """A well-linked README has more one-hop edges than the whole budget."""
-    from syncsage.assistant.chat import MAX_FACTS_PER_SUBJECT, collect_facts
-    from syncsage.graph.simple import SimpleMultiDiGraph
+    from pheasant.assistant.chat import MAX_FACTS_PER_SUBJECT, collect_facts
+    from pheasant.graph.simple import SimpleMultiDiGraph
 
     graph = SimpleMultiDiGraph()
     for subject in ("s1", "s2", "s3"):

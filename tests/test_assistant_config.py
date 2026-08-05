@@ -1,6 +1,6 @@
 """The `assistant:` config block must actually reach the config object.
 
-Adding a dataclass field is not enough — ``SyncSageConfig.model_validate``
+Adding a dataclass field is not enough — ``PheasantConfig.model_validate``
 builds each section explicitly, so a section missing from that list is
 silently ignored and every setting falls back to its default. This test is
 the guard: it round-trips a full non-default block through YAML and back.
@@ -13,18 +13,18 @@ from pathlib import Path
 import pytest
 import yaml
 
-from syncsage.config.loader import load_config, load_layered_config
-from syncsage.config.schema import SyncSageConfig
+from pheasant.config.loader import load_config, load_layered_config
+from pheasant.config.schema import PheasantConfig
 
 
 def _write(tmp_path: Path, body: str) -> Path:
-    config = tmp_path / "syncsage.yaml"
+    config = tmp_path / "pheasant.yaml"
     config.write_text(body, encoding="utf-8")
     return config
 
 
 def test_defaults_are_offline_and_permissive(tmp_path: Path) -> None:
-    config = SyncSageConfig()
+    config = PheasantConfig()
     assert config.assistant.enabled is True
     assert config.assistant.provider == "auto"
     assert config.assistant.allow_session_keys is True
@@ -37,7 +37,7 @@ def test_defaults_are_offline_and_permissive(tmp_path: Path) -> None:
 def test_assistant_block_is_loaded_from_yaml(tmp_path: Path) -> None:
     config_path = _write(
         tmp_path,
-        "syncsage:\n"
+        "pheasant:\n"
         "  name: kb\n"
         "assistant:\n"
         "  provider: openai\n"
@@ -72,12 +72,12 @@ def test_assistant_block_round_trips_through_model_dump(tmp_path: Path) -> None:
     dumped = original.model_dump(mode="json")
     assert dumped["assistant"]["provider"] == "anthropic"
 
-    reloaded = SyncSageConfig.model_validate(yaml.safe_load(yaml.safe_dump(dumped)))
+    reloaded = PheasantConfig.model_validate(yaml.safe_load(yaml.safe_dump(dumped)))
     assert reloaded.assistant.provider == "anthropic"
 
 
 @pytest.mark.parametrize("value", ["3", 3])
 def test_scalar_fields_are_coerced(tmp_path: Path, value) -> None:
     """YAML shims can hand back strings where ints are declared."""
-    config = SyncSageConfig.model_validate({"assistant": {"max_context_chunks": value}})
+    config = PheasantConfig.model_validate({"assistant": {"max_context_chunks": value}})
     assert config.assistant.max_context_chunks == 3

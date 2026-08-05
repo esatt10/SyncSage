@@ -1,11 +1,11 @@
 # HTTP API reference
 
-SyncSage serves a FastAPI admin/retrieval API on port `8765` (configurable via
+pheasant serves a FastAPI admin/retrieval API on port `8765` (configurable via
 `server.port`). When `server.api.openapi` is enabled, interactive docs are
 available at `/docs` and the schema at `/openapi.json`.
 
 The routes below are the consolidated surface defined in
-`src/syncsage/api/app.py`.
+`src/pheasant/api/app.py`.
 
 ## Health & ops
 
@@ -31,7 +31,7 @@ See [Attach to a Synapse fleet](../how-to/attach-to-synapse.md).
 | GET | `/overview` | One call for a UI cold start: knowledge base, sources, node counts, whether anything is indexed. Each source in `sources[]` carries live `syncing`/`sync_error` (see Sync below). |
 | GET | `/sources` | List configured + runtime sources. Each entry carries `syncing: bool` (a background sync — `wait: false` — is running now) and `sync_error: string \| null` (error from the most recent *background* sync, independent of `last_status`). |
 | GET | `/sources/types` | Registerable source types — built-ins plus installed connector plugins — each with a `path_role` of `required` or `unused`. |
-| POST | `/sources/quick-add` | One-field setup: a path, URL, glob or connector name is detected, named, registered and (by default) synced. Same inference as `syncsage up`. `sync_now` (default `true`) gates syncing at all; `wait` (default `true`) gates whether the response blocks on it — see Sync below. `wait: false` returns `sync_results: []` and `syncing: [names]` immediately; poll `GET /sources` for progress. |
+| POST | `/sources/quick-add` | One-field setup: a path, URL, glob or connector name is detected, named, registered and (by default) synced. Same inference as `pheasant up`. `sync_now` (default `true`) gates syncing at all; `wait` (default `true`) gates whether the response blocks on it — see Sync below. `wait: false` returns `sync_results: []` and `syncing: [names]` immediately; poll `GET /sources` for progress. |
 | POST | `/sources` | Register a runtime source (full schema). Accepts plugin types; a plugin source needs no local path. Same `sync_now`/`wait` fields as quick-add. |
 | PUT | `/sources/{source_id}` | Update a source. |
 | POST | `/sources/{source_id}/disable` | Disable a source. |
@@ -57,7 +57,7 @@ indexed/skipped/graph counts). Set `wait: false` to return immediately —
 about *how* the sync runs changes, only whether the caller waits for it).
 This exists because a large source's first sync (clone + full index) can
 run well past what a browser tab or reverse proxy will hold a connection
-open for — the SyncSage UI hit exactly this as a 504 on `/sources/
+open for — the pheasant UI hit exactly this as a 504 on `/sources/
 quick-add` even though the sync went on to succeed server-side. Poll
 `GET /sources` (or `/overview`) for `syncing`/`sync_error` to track a
 background sync to completion; a source is only ever "unknown" (404) if

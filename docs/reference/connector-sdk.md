@@ -1,28 +1,28 @@
 # Connector SDK
 
-Add a new source type to SyncSage from your own package — no fork required
+Add a new source type to pheasant from your own package — no fork required
 (Product Framework Step 31.1). A connector plugin is a
-`SourceConnector` subclass published under a `syncsage.connectors` entry
+`SourceConnector` subclass published under a `pheasant.connectors` entry
 point; the entry-point **name** is the `sources[].type` string users write
-in `syncsage.yaml`.
+in `pheasant.yaml`.
 
 ## The shape of a connector package
 
 The canonical example lives in the repo at
-`tests/fixtures/syncsage-connector-example/`:
+`tests/fixtures/pheasant-connector-example/`:
 
 ```toml
 # pyproject.toml
 [project]
-name = "syncsage-connector-example"
-dependencies = ["syncsage>=0.3"]
+name = "pheasant-connector-example"
+dependencies = ["pheasant-kb>=0.3"]
 
-[project.entry-points."syncsage.connectors"]
-staticdir = "syncsage_connector_example:StaticDirConnector"
+[project.entry-points."pheasant.connectors"]
+staticdir = "pheasant_connector_example:StaticDirConnector"
 ```
 
 ```python
-from syncsage.sync.connectors import ConnectorItem, ConnectorPayload, SourceConnector
+from pheasant.sync.connectors import ConnectorItem, ConnectorPayload, SourceConnector
 
 class StaticDirConnector(SourceConnector):
     connector_type = "staticdir"
@@ -68,7 +68,7 @@ Hold your connector to the same harness the built-ins pass. In your
 package's test suite:
 
 ```python
-from syncsage.testing import ConnectorConformance
+from pheasant.testing import ConnectorConformance
 
 class TestMyConnectorConformance(ConnectorConformance):
     def make_connector(self, tmp_path, state):
@@ -98,11 +98,11 @@ tests:
 | `slack` | Channel transcripts | per-channel `latest_ts` cursor | `is_private` / `is_shared` |
 | `confluence` | Space pages (storage XHTML → text) | per-page version number | space key + creator |
 | `imap` | A mailbox (immutable messages) | UID high-watermark (lists only new) | From / To / Cc |
-| `staticdir` | Example plugin (`tests/fixtures/syncsage-connector-example/`) | mtime watermark | — |
+| `staticdir` | Example plugin (`tests/fixtures/pheasant-connector-example/`) | mtime watermark | — |
 
 For your own package, copy the example package's shape — it now includes
 the canonical certification test
-(`tests/fixtures/syncsage-connector-example/tests/test_conformance.py`):
+(`tests/fixtures/pheasant-connector-example/tests/test_conformance.py`):
 subclass `ConnectorConformance`, provide `make_connector`, run pytest.
 Publication of the example as a standalone PyPI/cookiecutter template is
 release-channel work.
@@ -110,7 +110,7 @@ release-channel work.
 ## Programmatic registration (embedders, tests)
 
 ```python
-from syncsage.sync.connector_registry import register_connector_class
+from pheasant.sync.connector_registry import register_connector_class
 
 register_connector_class("mytype", MyConnector)   # wins over entry points
 ```

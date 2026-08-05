@@ -1,6 +1,6 @@
 # Give your agents durable memory
 
-A SyncSage region can be an **agent memory store** (Product Framework Step
+A pheasant region can be an **agent memory store** (Product Framework Step
 33.1): agents write facts through MCP or HTTP, and those facts become
 ordinary indexed knowledge — searchable with the same `search_context` /
 `/search` surface as everything else, provenance included. No separate
@@ -8,7 +8,7 @@ memory database, no second retrieval path.
 
 ## 1. Configure a memory source
 
-One block in `syncsage.yaml`:
+One block in `pheasant.yaml`:
 
 ```yaml
 sources:

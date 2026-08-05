@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("wasmtime", reason="wasmtime not installed (pip install 'syncsage[wasm]')")
+pytest.importorskip("wasmtime", reason="wasmtime not installed (pip install 'pheasant-kb[wasm]')")
 
-from syncsage.sandbox.accel import loader  # noqa: E402
+from pheasant.sandbox.accel import loader  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

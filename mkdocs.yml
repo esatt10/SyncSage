@@ -1,10 +1,10 @@
-site_name: SyncSage
+site_name: pheasant
 site_description: >-
   A Docker-first, local-first MCP context server that turns your sources into a
   queryable knowledge graph — and attaches to a Synapse fleet as a federated region.
-site_url: https://esatt10.github.io/SyncSage/
-repo_url: https://github.com/esatt10/SyncSage
-repo_name: esatt10/SyncSage
+site_url: https://esatt10.github.io/pheasant/
+repo_url: https://github.com/esatt10/pheasant
+repo_name: esatt10/pheasant
 edit_uri: edit/main/docs/
 
 docs_dir: docs
@@ -91,7 +91,7 @@ nav:
       - Architecture: architecture.md
       - Troubleshooting: troubleshooting.md
   - Contributor / internal:
-      - SyncSage as a Synapse region (internal spec): SYNAPSE_INTEGRATION.md
+      - pheasant as a Synapse region (internal spec): SYNAPSE_INTEGRATION.md
       - Roadmap — context & knowledge management (region side): ROADMAP_CONTEXT_KNOWLEDGE_MGMT.md
       - Agentic workflows: agentic_workflows.md
       - UI recommendation: ui_recommendation.md

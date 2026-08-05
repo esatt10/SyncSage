@@ -8,7 +8,7 @@ Acceptance:
    installed *and* a model reachable); everything degrades to ``simple``.
 3. The LangGraph agent really is a graph, not a chain: a thin first round
    loops back through ``plan`` with a *different* query.
-4. It exercises SyncSage's whole retrieval surface — multiple modes, and a
+4. It exercises pheasant's whole retrieval surface — multiple modes, and a
    graph walk that reaches documents lexical search never returned.
 5. It verifies its own citations, dropping ``[n]`` markers with no passage.
 6. Every path works with no model at all, and a broken custom workflow
@@ -23,11 +23,11 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from syncsage.api.app import create_app
-from syncsage.assistant import providers as providers_module
-from syncsage.assistant.llm import LLM
-from syncsage.assistant.retrieval import SyncSageRetriever
-from syncsage.assistant.workflows import (
+from pheasant.api.app import create_app
+from pheasant.assistant import providers as providers_module
+from pheasant.assistant.llm import LLM
+from pheasant.assistant.retrieval import PheasantRetriever
+from pheasant.assistant.workflows import (
     WorkflowRequest,
     WorkflowResult,
     build_workflow,
@@ -37,8 +37,8 @@ from syncsage.assistant.workflows import (
     reset_workflow_registry,
     resolve_workflow_name,
 )
-from syncsage.assistant.workflows.simple import SimpleWorkflow
-from syncsage.graph.simple import SimpleMultiDiGraph
+from pheasant.assistant.workflows.simple import SimpleWorkflow
+from pheasant.graph.simple import SimpleMultiDiGraph
 
 langgraph = pytest.importorskip if False else None  # keep the import list tidy
 
@@ -71,7 +71,7 @@ class _FakeSearch:
             if keyword in query.lower():
                 results.extend(hits)
         if not results:
-            results = [_hit("docs/overview.md", "SyncSage indexes sources.", 1.0)]
+            results = [_hit("docs/overview.md", "pheasant indexes sources.", 1.0)]
         return {"query": query, "mode": mode, "results": results[:max_results], "counts": {}}
 
 
@@ -106,8 +106,8 @@ def _graph() -> SimpleMultiDiGraph:
     return graph
 
 
-def _retriever(search=None, graph=None) -> SyncSageRetriever:
-    return SyncSageRetriever(
+def _retriever(search=None, graph=None) -> PheasantRetriever:
+    return PheasantRetriever(
         search=search or _FakeSearch(),
         knowledge_base="kb",
         graph=graph if graph is not None else _graph(),
@@ -231,7 +231,7 @@ def test_capabilities_describe_what_the_region_can_do() -> None:
     assert "hybrid" in caps.modes and "graph" in caps.modes and "vector" in caps.modes
     assert "Search modes available" in caps.as_prompt_context()
 
-    no_vector = SyncSageRetriever(
+    no_vector = PheasantRetriever(
         search=type("S", (), {"search_context": lambda *a, **k: {"results": []}})(),
         knowledge_base="kb",
         graph=None,
@@ -267,7 +267,7 @@ def test_simple_workflow_synthesizes_with_a_model() -> None:
 @pytest.fixture()
 def agentic():
     pytest.importorskip("langgraph")
-    from syncsage.assistant.workflows.agentic import AgenticWorkflow
+    from pheasant.assistant.workflows.agentic import AgenticWorkflow
 
     return AgenticWorkflow()
 
@@ -379,7 +379,7 @@ def test_agentic_survives_an_unreachable_planner(agentic, monkeypatch) -> None:
 
 def test_agentic_json_parsing_tolerates_code_fences() -> None:
     pytest.importorskip("langgraph")
-    from syncsage.assistant.workflows.agentic import _parse_json
+    from pheasant.assistant.workflows.agentic import _parse_json
 
     assert _parse_json('```json\n{"a": 1}\n```') == {"a": 1}
     assert _parse_json('Sure! {"a": 2} hope that helps') == {"a": 2}
@@ -390,7 +390,7 @@ def test_agentic_json_parsing_tolerates_code_fences() -> None:
 def test_nodes_are_replaceable(agentic) -> None:
     """Full customization: swap a node, keep the rest of the graph."""
     pytest.importorskip("langgraph")
-    from syncsage.assistant.workflows.agentic import NODES, AgenticWorkflow
+    from pheasant.assistant.workflows.agentic import NODES, AgenticWorkflow
 
     seen = {}
 
@@ -421,7 +421,7 @@ def test_workflows_route_describes_the_deployment(loaded_config) -> None:
 
 
 def test_chat_can_select_a_workflow_per_request(loaded_config, workspace_copy: Path) -> None:
-    loaded_config.syncsage.workspace_root = workspace_copy
+    loaded_config.pheasant.workspace_root = workspace_copy
     app = create_app(config=loaded_config)
     app.state.engine.sync_source("architecture-notes", "full")
     client = TestClient(app)
@@ -469,7 +469,7 @@ def test_default_topology_is_compiled_once() -> None:
     """
 
     pytest.importorskip("langgraph")
-    from syncsage.assistant.workflows import agentic
+    from pheasant.assistant.workflows import agentic
 
     agentic._DEFAULT_GRAPH = None  # start from a cold process
     first = agentic.build_graph(agentic.DEFAULTS)
@@ -485,7 +485,7 @@ def test_default_topology_is_compiled_once() -> None:
 def test_warm_reports_whether_the_agent_extra_is_available() -> None:
     """Startup warming is best-effort and never raises."""
 
-    from syncsage.assistant.workflows import agentic
+    from pheasant.assistant.workflows import agentic
 
     agentic._DEFAULT_GRAPH = None
     result = agentic.warm()

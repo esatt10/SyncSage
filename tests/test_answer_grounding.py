@@ -32,18 +32,18 @@ import json
 
 import pytest
 
-from syncsage.assistant.chat import (
+from pheasant.assistant.chat import (
     CONTENT_DEFAULTS,
     build_prompt,
     classify_intent,
     hydrate_citations,
     system_prompt_for,
 )
-from syncsage.assistant.llm import LLM
-from syncsage.assistant.retrieval import LARGE_FILE_BYTES, SyncSageRetriever, _is_code
-from syncsage.assistant.workflows import BUILTIN_WORKFLOWS, WorkflowRequest, list_workflows
-from syncsage.assistant.workflows.simple import SimpleWorkflow
-from syncsage.persistence.state_store import StateStore
+from pheasant.assistant.llm import LLM
+from pheasant.assistant.retrieval import LARGE_FILE_BYTES, PheasantRetriever, _is_code
+from pheasant.assistant.workflows import BUILTIN_WORKFLOWS, WorkflowRequest, list_workflows
+from pheasant.assistant.workflows.simple import SimpleWorkflow
+from pheasant.persistence.state_store import StateStore
 
 # --------------------------------------------------------------- a real index
 
@@ -124,7 +124,7 @@ def _add_file(
 
 
 def _retriever(store, **kwargs):
-    return SyncSageRetriever(
+    return PheasantRetriever(
         search=kwargs.pop("search", None) or _FakeSearch(),
         knowledge_base="kb",
         graph=kwargs.pop("graph", None),
@@ -374,7 +374,7 @@ def test_two_chunks_of_one_file_hydrate_once(tmp_path) -> None:
 def test_hydration_degrades_to_snippets_rather_than_failing(tmp_path) -> None:
     """No state store is a normal deployment, not an error branch."""
     citations = [_citation(1, "file:demo:x.md", "x.md")]
-    retriever = SyncSageRetriever(search=_FakeSearch(), knowledge_base="kb", state=None)
+    retriever = PheasantRetriever(search=_FakeSearch(), knowledge_base="kb", state=None)
 
     assert hydrate_citations(retriever, citations, CONTENT_DEFAULTS) == {}
     assert "a 500-character preview" in build_prompt("q", citations, [], {})
@@ -476,7 +476,7 @@ def _agentic_llm():
 
 
 def _agentic_retriever(store):
-    from syncsage.graph.simple import SimpleMultiDiGraph
+    from pheasant.graph.simple import SimpleMultiDiGraph
 
     class Search:
         vector = None
@@ -499,21 +499,21 @@ def _agentic_retriever(store):
                 "counts": {},
             }
 
-    return SyncSageRetriever(
+    return PheasantRetriever(
         search=Search(), knowledge_base="kb", graph=SimpleMultiDiGraph(), state=store
     )
 
 
 def test_a_procedural_question_is_classified_planned_and_answered_as_one(tmp_path) -> None:
     pytest.importorskip("langgraph")
-    from syncsage.assistant.workflows.agentic import AgenticWorkflow
+    from pheasant.assistant.workflows.agentic import AgenticWorkflow
 
     store = _store(tmp_path)
     _add_file(
         store,
         "file:demo:docs/guide.md",
         "docs/guide.md",
-        [("Guide", "from syncsage import Client\nclient = Client()")],
+        [("Guide", "from pheasant import Client\nclient = Client()")],
     )
     llm = _agentic_llm()
 
@@ -532,13 +532,13 @@ def test_a_procedural_question_is_classified_planned_and_answered_as_one(tmp_pat
     # The answering call used the procedural prompt, not the generic one.
     assert any("PROCEDURAL" in system for system in llm.systems)
     # ...over the whole file, not the 500-character preview.
-    assert "from syncsage import Client" in llm.prompt
+    assert "from pheasant import Client" in llm.prompt
     assert "read" in names
 
 
 def test_a_knowledge_question_gets_the_summary_prompt(tmp_path) -> None:
     pytest.importorskip("langgraph")
-    from syncsage.assistant.workflows.agentic import AgenticWorkflow
+    from pheasant.assistant.workflows.agentic import AgenticWorkflow
 
     store = _store(tmp_path)
     _add_file(store, "file:demo:docs/guide.md", "docs/guide.md", [("Guide", "body")])
@@ -557,7 +557,7 @@ def test_a_knowledge_question_gets_the_summary_prompt(tmp_path) -> None:
 def test_the_knowledge_summary_workflow_pins_the_intent(tmp_path) -> None:
     """Picking it *is* choosing the reading, even for a "how do I" question."""
     pytest.importorskip("langgraph")
-    from syncsage.assistant.workflows.agentic import KnowledgeSummaryWorkflow
+    from pheasant.assistant.workflows.agentic import KnowledgeSummaryWorkflow
 
     store = _store(tmp_path)
     _add_file(store, "file:demo:docs/guide.md", "docs/guide.md", [("Guide", "body")])
@@ -576,7 +576,7 @@ def test_the_knowledge_summary_workflow_pins_the_intent(tmp_path) -> None:
 
 def test_intent_profiles_yield_to_an_explicit_option(tmp_path) -> None:
     pytest.importorskip("langgraph")
-    from syncsage.assistant.workflows.agentic import INTENT_PROFILES, resolve_options
+    from pheasant.assistant.workflows.agentic import INTENT_PROFILES, resolve_options
 
     base = {"intent": "auto", "max_context_passages": 10, "passage_chars": 6000}
 
@@ -603,7 +603,7 @@ def test_intent_profiles_yield_to_an_explicit_option(tmp_path) -> None:
 
 def test_the_two_intents_actually_retrieve_differently() -> None:
     pytest.importorskip("langgraph")
-    from syncsage.assistant.workflows.agentic import INTENT_PROFILES
+    from pheasant.assistant.workflows.agentic import INTENT_PROFILES
 
     knowledge = INTENT_PROFILES["knowledge"]
     procedural = INTENT_PROFILES["procedural"]
@@ -667,7 +667,7 @@ def test_metadata_describes_files_without_reading_them(tmp_path) -> None:
 def test_the_grader_is_shown_what_kind_of_files_came_back(tmp_path) -> None:
     """ "All docs, no source" is a miss no snippet reveals."""
     pytest.importorskip("langgraph")
-    from syncsage.assistant.workflows.agentic import AgenticWorkflow
+    from pheasant.assistant.workflows.agentic import AgenticWorkflow
 
     store = _store(tmp_path)
     _add_file(
@@ -757,7 +757,7 @@ def test_structure_is_cached_against_the_index_signature(tmp_path) -> None:
 
 
 def test_structure_survives_a_region_with_no_state() -> None:
-    retriever = SyncSageRetriever(search=_FakeSearch(), knowledge_base="kb", state=None)
+    retriever = PheasantRetriever(search=_FakeSearch(), knowledge_base="kb", state=None)
     context = retriever.capabilities().as_prompt_context()
 
     assert "Sources:" in context

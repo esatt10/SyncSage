@@ -106,7 +106,7 @@ def set_pyproject_version(version: str) -> None:
 
 
 def replacements(version: str) -> list[Replacement]:
-    image = f"ghcr.io/esatt10/syncsage:{version}"
+    image = f"ghcr.io/esatt10/pheasant:{version}"
     return [
         Replacement(
             path=Path("deploy/helm/Chart.yaml"),
@@ -130,13 +130,13 @@ def replacements(version: str) -> list[Replacement]:
         ),
         Replacement(
             path=Path("deploy/kubernetes/deployment.yaml"),
-            pattern=re.compile(r"ghcr\.io/esatt10/syncsage:[0-9A-Za-z._+-]+"),
+            pattern=re.compile(r"ghcr\.io/esatt10/pheasant:[0-9A-Za-z._+-]+"),
             replacement=image,
             label="Kubernetes deployment image",
         ),
         Replacement(
             path=Path("docker-compose.yml"),
-            pattern=re.compile(r"ghcr\.io/esatt10/syncsage:[0-9A-Za-z._+-]+"),
+            pattern=re.compile(r"ghcr\.io/esatt10/pheasant:[0-9A-Za-z._+-]+"),
             replacement=image,
             label="Docker Compose default image",
         ),
@@ -145,12 +145,12 @@ def replacements(version: str) -> list[Replacement]:
         # hand-edited tag of its own.
         Replacement(
             path=Path("docker-compose.yml"),
-            pattern=re.compile(r"ghcr\.io/esatt10/syncsage-ui:[0-9A-Za-z._+-]+"),
-            replacement=f"ghcr.io/esatt10/syncsage-ui:{version}",
+            pattern=re.compile(r"ghcr\.io/esatt10/pheasant-ui:[0-9A-Za-z._+-]+"),
+            replacement=f"ghcr.io/esatt10/pheasant-ui:{version}",
             label="Docker Compose UI image",
         ),
         Replacement(
-            path=Path("syncsage.example.yaml"),
+            path=Path("pheasant.example.yaml"),
             pattern=re.compile(
                 r"(?ms)^(deployment:\r?\n(?:[ \t]+[^\r\n]*\r?\n)*?[ \t]+image_tag:\s*)[^\r\n#]+"
             ),
@@ -300,7 +300,7 @@ def check_image_version_increment(version: str, existing_tags: set[str]) -> None
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Keep generated SyncSage version references aligned."
+        description="Keep generated pheasant version references aligned."
     )
     parser.add_argument(
         "--print", dest="print_version", action="store_true", help="Print pyproject version."
@@ -326,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--owner", help="GitHub owner that owns the container package.")
-    parser.add_argument("--package", default="syncsage", help="GitHub container package name.")
+    parser.add_argument("--package", default="pheasant", help="GitHub container package name.")
     parser.add_argument("--token", help="GitHub token for package tag lookup.")
     parser.add_argument(
         "--api-url", default="https://api.github.com", help="GitHub API base URL."

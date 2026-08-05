@@ -1,13 +1,13 @@
-# How to attach SyncSage to a Synapse fleet
+# How to attach pheasant to a Synapse fleet
 
-A standalone SyncSage is a complete knowledge base. This guide shows how to also
+A standalone pheasant is a complete knowledge base. This guide shows how to also
 make it a **federated region** in a **Synapse** fleet: it publishes a bounded
 **semantic contract** describing what it knows, and a Synapse **router** uses
 that contract to route global, cross-region queries to it.
 
 !!! tip "Standalone-first is the default"
     Every setting on this page is **off by default**. With no `synapse:` block,
-    SyncSage behaves exactly like a router-less knowledge base. Opting in is
+    pheasant behaves exactly like a router-less knowledge base. Opting in is
     purely additive and never changes how the region indexes or self-searches.
 
 ## How it fits together
@@ -22,18 +22,18 @@ that contract to route global, cross-region queries to it.
         ┌─────────────────────┼─────────────────────┐
         ▼                     ▼                     ▼
    ┌─────────┐          ┌─────────┐          ┌─────────┐
-   │SyncSage │          │SyncSage │          │SyncSage │   ← regions (this repo)
+   │pheasant │          │pheasant │          │pheasant │   ← regions (this repo)
    │ region  │          │ region  │          │ region  │
    │ contract│          │ contract│          │ contract│
    └─────────┘          └─────────┘          └─────────┘
 ```
 
 The boundary is **contract JSON over HTTP** — there is no Python dependency
-between SyncSage and the router.
+between pheasant and the router.
 
 ## Step 1 — opt in
 
-Add a `synapse:` block to `syncsage.yaml`. All keys default to off/`null`:
+Add a `synapse:` block to `pheasant.yaml`. All keys default to off/`null`:
 
 ```yaml
 synapse:
@@ -78,7 +78,7 @@ curl http://localhost:8765/contract | head -c 400
 ```
 
 It's also available as an MCP resource
-(`syncsage://knowledge-bases/{kb_id}/contract`) and via the
+(`pheasant://knowledge-bases/{kb_id}/contract`) and via the
 `get_contract` MCP tool.
 
 Confirm `capabilities.modalities` reflects what you index — it auto-includes
@@ -100,7 +100,7 @@ To let the router verify a contract's authenticity, sign it with an Ed25519 key.
 1. Install the signing extra:
 
     ```bash
-    pip install 'syncsage[a2a]'
+    pip install 'pheasant-kb[a2a]'
     ```
 
 2. Provide the key as a **secret reference** — never the key itself in config:
@@ -118,7 +118,7 @@ To let the router verify a contract's authenticity, sign it with an Ed25519 key.
 
 When set, the contract's `integrity.signature` is filled with the Ed25519
 signature; when unset it stays `null` and the region is unsigned (and a
-standalone SyncSage is unchanged). The signing key's **public key** is
+standalone pheasant is unchanged). The signing key's **public key** is
 distributed to the router **out-of-band** (it lives in the router's trust store
 config), so the contract wire format is unchanged.
 

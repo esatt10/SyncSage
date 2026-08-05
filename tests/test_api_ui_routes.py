@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
-from syncsage.api.app import create_app, graph_neighbors, graph_slice
-from syncsage.graph.simple import SimpleMultiDiGraph
+from pheasant.api.app import create_app, graph_neighbors, graph_slice
+from pheasant.graph.simple import SimpleMultiDiGraph
 
 
 def _client(config) -> TestClient:
@@ -22,7 +22,7 @@ def test_config_route_returns_effective_and_profiles(loaded_config) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert "effective" in payload
-    assert payload["effective"]["syncsage"]["name"] == "acceptance-knowledge"
+    assert payload["effective"]["pheasant"]["name"] == "acceptance-knowledge"
     assert "quickstart" in payload["profiles"]
 
 
@@ -64,7 +64,7 @@ def test_graph_route_can_return_bounded_preview(loaded_config) -> None:
 
 
 def test_fs_list_lists_roots_and_rejects_escapes(loaded_config, workspace_copy: Path) -> None:
-    loaded_config.syncsage.workspace_root = workspace_copy
+    loaded_config.pheasant.workspace_root = workspace_copy
     loaded_config.security.allow_user_selected_source_paths = False
     client = _client(loaded_config)
 
@@ -84,7 +84,7 @@ def test_fs_list_and_register_accept_user_selected_path(loaded_config, tmp_path:
     external = tmp_path / "external"
     external.mkdir()
     (external / "note.md").write_text("# External\n", encoding="utf-8")
-    loaded_config.syncsage.workspace_root = tmp_path / "workspace"
+    loaded_config.pheasant.workspace_root = tmp_path / "workspace"
     loaded_config.security.allow_user_selected_source_paths = True
     client = _client(loaded_config)
 
@@ -110,7 +110,7 @@ def test_fs_list_and_register_accept_user_selected_path(loaded_config, tmp_path:
 
 
 def test_register_source_appears_in_listing(loaded_config, workspace_copy: Path) -> None:
-    loaded_config.syncsage.workspace_root = workspace_copy
+    loaded_config.pheasant.workspace_root = workspace_copy
     client = _client(loaded_config)
     target = workspace_copy / "notes"
 
@@ -133,7 +133,7 @@ def test_register_source_appears_in_listing(loaded_config, workspace_copy: Path)
 
 
 def test_register_source_rejects_path_outside_roots(loaded_config, workspace_copy: Path) -> None:
-    loaded_config.syncsage.workspace_root = workspace_copy
+    loaded_config.pheasant.workspace_root = workspace_copy
     loaded_config.security.allow_user_selected_source_paths = False
     client = _client(loaded_config)
     response = client.post(
@@ -144,12 +144,12 @@ def test_register_source_rejects_path_outside_roots(loaded_config, workspace_cop
 
 
 def test_update_source_persists_custom_runtime_config(loaded_config, workspace_copy: Path) -> None:
-    loaded_config.syncsage.workspace_root = workspace_copy
+    loaded_config.pheasant.workspace_root = workspace_copy
     client = _client(loaded_config)
     response = client.put(
-        "/sources/syncsage-repo",
+        "/sources/pheasant-repo",
         json={
-            "path": str(workspace_copy / "syncsage-repo"),
+            "path": str(workspace_copy / "pheasant-repo"),
             "type": "repository",
             "max_depth": 1,
             "include": ["**/*.py"],
@@ -183,9 +183,9 @@ def test_node_content_route_returns_full_indexed_text(loaded_config) -> None:
 
 
 def test_promote_source_generates_patch(loaded_config, workspace_copy: Path) -> None:
-    loaded_config.syncsage.workspace_root = workspace_copy
+    loaded_config.pheasant.workspace_root = workspace_copy
     client = _client(loaded_config)
-    response = client.post("/sources/syncsage-repo/promote", json={"write": False})
+    response = client.post("/sources/pheasant-repo/promote", json={"write": False})
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "patch_generated"
@@ -197,7 +197,7 @@ def test_put_config_validates_and_writes(loaded_config, tmp_path: Path) -> None:
     client = TestClient(create_app(config=loaded_config, config_path=config_file))
     payload = {
         "config": {
-            "syncsage": {"name": "rewritten"},
+            "pheasant": {"name": "rewritten"},
             "server": {"port": 9001},
         }
     }
@@ -357,7 +357,7 @@ def test_node_content_concatenates_chunks_in_index_order(loaded_config) -> None:
 
 
 def test_register_source_invalid_payload_returns_400(loaded_config, workspace_copy: Path) -> None:
-    loaded_config.syncsage.workspace_root = workspace_copy
+    loaded_config.pheasant.workspace_root = workspace_copy
     client = _client(loaded_config)
     response = client.post(
         "/sources",
@@ -393,12 +393,12 @@ def test_bundle_is_mounted_and_reported_only_when_it_exists(
     see the graph". `app.state.ui_dist` records the outcome and the CLI banner
     reads it.
     """
-    from syncsage.cli import _report_ui
+    from pheasant.cli import _report_ui
 
     dist = tmp_path / "dist"
     dist.mkdir()
     (dist / "index.html").write_text("<!doctype html><title>ui</title>", encoding="utf-8")
-    monkeypatch.setenv("SYNCSAGE_UI_DIST", str(dist))
+    monkeypatch.setenv("PHEASANT_UI_DIST", str(dist))
 
     app = create_app(config=loaded_config)
     assert app.state.ui_dist == str(dist)

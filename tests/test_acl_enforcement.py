@@ -13,11 +13,11 @@ from typing import Any
 
 import pytest
 
-from syncsage.config.loader import load_config
-from syncsage.mcp_server.tools import SyncSageTools
-from syncsage.security.acl import expand_principal, is_allowed, normalize_acl
-from syncsage.sync import connector_registry
-from syncsage.sync.connectors import ConnectorItem, ConnectorPayload, SourceConnector
+from pheasant.config.loader import load_config
+from pheasant.mcp_server.tools import PheasantTools
+from pheasant.security.acl import expand_principal, is_allowed, normalize_acl
+from pheasant.sync import connector_registry
+from pheasant.sync.connectors import ConnectorItem, ConnectorPayload, SourceConnector
 
 DOCS = {
     "alice-notes.txt": ("Project mercury launch codes for alice.", {"allow": ["user:alice"]}),
@@ -53,9 +53,9 @@ class AclTestConnector(SourceConnector):
 
 
 def _config(tmp_path: Path, *, enforced: bool) -> Any:
-    config_path = tmp_path / "syncsage.yaml"
+    config_path = tmp_path / "pheasant.yaml"
     config_path.write_text(
-        f"""syncsage:
+        f"""pheasant:
   name: acl-test
   state_path: {tmp_path / "state"}
   vault_path: {tmp_path / "vault"}
@@ -81,19 +81,19 @@ sources:
 def synced_tools(tmp_path: Path):
     connector_registry.reset_connector_registry()
     connector_registry.register_connector_class("acltest", AclTestConnector)
-    tools = SyncSageTools(_config(tmp_path, enforced=True))
+    tools = PheasantTools(_config(tmp_path, enforced=True))
     tools.sync_source("acl-test", "docs", "incremental")
     yield tools
     tools.engine.close()
     connector_registry.reset_connector_registry()
 
 
-def _titles(tools: SyncSageTools, query: str, **kwargs: Any) -> set[str]:
+def _titles(tools: PheasantTools, query: str, **kwargs: Any) -> set[str]:
     payload = tools.search_context("acl-test", query, mode="text", max_results=10, **kwargs)
     return {str(r.get("relative_path")) for r in payload["results"]}
 
 
-def test_leak_gate_principal_scoping(synced_tools: SyncSageTools) -> None:
+def test_leak_gate_principal_scoping(synced_tools: PheasantTools) -> None:
     # Alice: her doc + public. NEVER bob's.
     seen = _titles(synced_tools, "project handbook", principal="user:alice")
     assert "alice-notes.txt" in seen and "handbook.txt" in seen
@@ -126,7 +126,7 @@ def test_leak_gate_principal_scoping(synced_tools: SyncSageTools) -> None:
 def test_enforcement_off_is_pre32_behavior(tmp_path: Path) -> None:
     connector_registry.reset_connector_registry()
     connector_registry.register_connector_class("acltest", AclTestConnector)
-    tools = SyncSageTools(_config(tmp_path, enforced=False))
+    tools = PheasantTools(_config(tmp_path, enforced=False))
     try:
         tools.sync_source("acl-test", "docs", "incremental")
         seen = _titles(tools, "project handbook")
@@ -138,12 +138,12 @@ def test_enforcement_off_is_pre32_behavior(tmp_path: Path) -> None:
 
 def test_http_search_forwards_principal(tmp_path: Path) -> None:
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
-    from syncsage.api.app import create_app
+    from pheasant.api.app import create_app
 
     connector_registry.reset_connector_registry()
     connector_registry.register_connector_class("acltest", AclTestConnector)
     config = _config(tmp_path, enforced=True)
-    app = create_app(config, config_path=str(tmp_path / "syncsage.yaml"))
+    app = create_app(config, config_path=str(tmp_path / "pheasant.yaml"))
     client = fastapi_testclient.TestClient(app)
     try:
         app.state.engine.sync_source("docs", "incremental")

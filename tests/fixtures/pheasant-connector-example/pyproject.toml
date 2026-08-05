@@ -1,0 +1,18 @@
+# Canonical third-party connector package shape (Product Step 31.1).
+# The entry-point NAME is the `sources[].type` users write in pheasant.yaml.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pheasant-connector-example"
+version = "0.1.0"
+description = "Example pheasant connector plugin: indexes .txt files from a static directory."
+requires-python = ">=3.11"
+dependencies = ["pheasant-kb>=0.3"]
+
+[project.entry-points."pheasant.connectors"]
+staticdir = "pheasant_connector_example:StaticDirConnector"
+
+[tool.setuptools.packages.find]
+include = ["pheasant_connector_example*"]

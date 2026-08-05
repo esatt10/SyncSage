@@ -14,15 +14,15 @@ from pathlib import Path
 
 import pytest
 
-from syncsage.config.loader import load_config
-from syncsage.config.schema import PluginSourceType, SourceConfig
-from syncsage.connectors.notion import NotionConnector
-from syncsage.persistence.paths import StatePaths
-from syncsage.persistence.state_store import StateStore
-from syncsage.sync import connector_registry
-from syncsage.sync.connectors import ConnectorUnavailable, ItemNotModified
-from syncsage.sync.engine import SyncEngine
-from syncsage.testing import ConnectorConformance
+from pheasant.config.loader import load_config
+from pheasant.config.schema import PluginSourceType, SourceConfig
+from pheasant.connectors.notion import NotionConnector
+from pheasant.persistence.paths import StatePaths
+from pheasant.persistence.state_store import StateStore
+from pheasant.sync import connector_registry
+from pheasant.sync.connectors import ConnectorUnavailable, ItemNotModified
+from pheasant.sync.engine import SyncEngine
+from pheasant.testing import ConnectorConformance
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "notion"
 PAGE_A = "aaaa1111-0000-0000-0000-000000000001"
@@ -74,7 +74,7 @@ class FakeNotionAPI:
 @pytest.fixture()
 def fake_api(monkeypatch: pytest.MonkeyPatch) -> FakeNotionAPI:
     api = FakeNotionAPI()
-    monkeypatch.setattr("syncsage.connectors.notion._notion_request", api)
+    monkeypatch.setattr("pheasant.connectors.notion._notion_request", api)
     monkeypatch.setenv("NOTION_TOKEN", "secret-test-token")
     return api
 
@@ -158,9 +158,9 @@ def test_engine_e2e_idempotent_and_incremental(tmp_path: Path, fake_api: FakeNot
     connector_registry.reset_connector_registry()
     connector_registry.register_connector_class("notion", NotionConnector)
     try:
-        config_path = tmp_path / "syncsage.yaml"
+        config_path = tmp_path / "pheasant.yaml"
         config_path.write_text(
-            f"""syncsage:
+            f"""pheasant:
   name: notion-test
   state_path: {tmp_path / "state"}
   vault_path: {tmp_path / "vault"}
@@ -220,8 +220,8 @@ def test_pyproject_declares_the_entry_point() -> None:
     with pyproject.open("rb") as fh:
         data = tomllib.load(fh)
     assert (
-        data["project"]["entry-points"]["syncsage.connectors"]["notion"]
-        == "syncsage.connectors.notion:NotionConnector"
+        data["project"]["entry-points"]["pheasant.connectors"]["notion"]
+        == "pheasant.connectors.notion:NotionConnector"
     )
 
 

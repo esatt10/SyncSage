@@ -1,4 +1,4 @@
-"""The source form must offer exactly what ``syncsage.yaml`` accepts.
+"""The source form must offer exactly what ``pheasant.yaml`` accepts.
 
 Connector plugins (Step 31.1) add source types by entry point, so the set of
 valid ``sources[].type`` strings is a property of the *deployment*, not of
@@ -23,12 +23,12 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from syncsage.api.app import create_app
-from syncsage.sync.connector_registry import (
+from pheasant.api.app import create_app
+from pheasant.sync.connector_registry import (
     register_connector_class,
     reset_connector_registry,
 )
-from syncsage.sync.connectors import SourceConnector
+from pheasant.sync.connectors import SourceConnector
 
 
 class DemoConnector(SourceConnector):
@@ -43,7 +43,7 @@ class DemoConnector(SourceConnector):
 
 @pytest.fixture
 def client(loaded_config, workspace_copy: Path):
-    loaded_config.syncsage.workspace_root = workspace_copy
+    loaded_config.pheasant.workspace_root = workspace_copy
     return TestClient(create_app(config=loaded_config))
 
 
@@ -51,7 +51,7 @@ def client(loaded_config, workspace_copy: Path):
 def plugin_client(loaded_config, workspace_copy: Path):
     reset_connector_registry()
     register_connector_class("demo-saas", DemoConnector)
-    loaded_config.syncsage.workspace_root = workspace_copy
+    loaded_config.pheasant.workspace_root = workspace_copy
     yield TestClient(create_app(config=loaded_config))
     reset_connector_registry()
 

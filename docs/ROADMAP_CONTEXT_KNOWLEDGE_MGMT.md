@@ -11,13 +11,13 @@ both suites green.
 
 ---
 
-## 1. Why SyncSage is the load-bearing half
+## 1. Why pheasant is the load-bearing half
 
 The 2026 landscape research (sourced in the canonical doc) converged on three
 findings that all point at the region:
 
 1. **Knowledge-base MCP is the largest unmet demand in the MCP ecosystem**
-   (10,000+ public servers, no established KB answer). SyncSage *is* a KB MCP
+   (10,000+ public servers, no established KB answer). pheasant *is* a KB MCP
    server — the gap is packaging and distribution, not capability.
 2. **Permission-aware retrieval is the #1 enterprise blocker** for GenAI
    rollouts, and the consensus is that enforcement must live in the retrieval
@@ -28,7 +28,7 @@ findings that all point at the region:
    contract travels. Every enterprise-search competitor (Glean, Onyx) is
    structurally centralized and cannot cheaply retrofit this.
 
-SyncSage's design pillars — deterministic parsing (no LLM in the indexing
+pheasant's design pillars — deterministic parsing (no LLM in the indexing
 path), idempotent/incremental sync, local-first persistence split — are the
 *differentiators* against LLM-graph rivals (GraphRAG/LightRAG), not
 limitations. They stay inviolate through every phase below.
@@ -37,7 +37,7 @@ limitations. They stay inviolate through every phase below.
 
 | Phase | Region-side work (this repo) | Key invariants to preserve |
 |---|---|---|
-| **30 — Packaging & first-run** | 30.1 `syncsage up` personal quickstart (vault/folder autodetect → config → index → UI, no YAML on the happy path); 30.3 published GHCR images [x-repo]; 30.5 "attach your KB to a coding agent in 5 min" MCP packaging + registry listings | Standalone mode is the product here — no router required anywhere in the personal path |
+| **30 — Packaging & first-run** | 30.1 `pheasant up` personal quickstart (vault/folder autodetect → config → index → UI, no YAML on the happy path); 30.3 published GHCR images [x-repo]; 30.5 "attach your KB to a coding agent in 5 min" MCP packaging + registry listings | Standalone mode is the product here — no router required anywhere in the personal path |
 | **31 — Connector SDK + connectors** | 31.1 entry-point connector SDK (checkpoint API, manifest integration, idempotency harness — the four pillars enforced by contract); 31.2–31.6 Notion, Google Drive, Slack, Confluence/Jira, IMAP/email — each with incremental cursors and **ACL-capture fields reserved** for Phase 32; 31.7 conformance suite + template | No LLM in path; `tests/test_sync_idempotency.py` grows per connector; recorded-fixture offline tests |
 | **32 — Permission-aware federation** [x-repo] | 32.1 per-artifact ACL metadata at ingest (SQLite alongside chunks; stable-ID grammar unchanged); 32.2 principal-context filtering in self-search *before* scoring/return; 32.4 ACL/group sync loop with a documented staleness SLA; 32.6 leak-test suite (permanent gate) | Contracts stay ACL-free (Tier-1 untouched); defaults off — a standalone/ACL-less region is byte-identical to today |
 | **33 — Agent memory as a region** | 33.1 memory region type: `memory_write` MCP tool + HTTP append of schema-versioned memory records flowing through the normal chunk→embed→graph path; 33.2 temporal validity (asserted-at/superseded-at) + consolidation/decay on the 21.1 scheduler | Content arrives via API but indexing stays deterministic; one-shot idempotent state migrations for the new artifact |
@@ -51,19 +51,19 @@ Canonical contracts live in
 `subjective-retrieval/docs/PRODUCT_FRAMEWORK.md` §2; this section mirrors
 only the steps that land **here**.
 
-### Step 30.1 — `syncsage up` personal quickstart — **landed 2026-07-15**
+### Step 30.1 — `pheasant up` personal quickstart — **landed 2026-07-15**
 
 One command takes a directory (default `.`) from nothing to an indexed,
 queryable knowledge base: **detect** (`.obsidian/` → `obsidian_vault`,
 `.git/` → `repository`, else `document_folder`) → **generate** a
 laptop-shaped config if absent (quickstart profile, one source with the
 detected type + absolute path, name slugged from the dir, state anchored
-under `./.syncsage/{state,vault,exports}`, `workspace_root` = target;
+under `./.pheasant/{state,vault,exports}`, `workspace_root` = target;
 an existing config is **reused unchanged**, never overwritten) →
 **index** via the normal `SyncEngine.sync_all("incremental")` →
-**serve** as `syncsage start` does (`--no-serve` stops after sync,
+**serve** as `pheasant start` does (`--no-serve` stops after sync,
 `--port` sets the generated port). Acceptance: fixture-workspace run
-indexes > 0 artifacts with state under `./.syncsage/state`; second run is
+indexes > 0 artifacts with state under `./.pheasant/state`; second run is
 byte-stable config + zero re-index (idempotency spine); detection tests
 for all three types; fully offline; no synapse config emitted (standalone
 mode untouched).
@@ -71,17 +71,17 @@ mode untouched).
 ### Step 30.3 — published images — **landed 2026-07-15 (defaults alignment)**
 
 This repo's half pre-existed: `.github/workflows/container.yml` publishes
-`ghcr.io/<owner>/syncsage:<semver>` on every merged release. The SR side
+`ghcr.io/<owner>/pheasant:<semver>` on every merged release. The SR side
 aligned its Helm/compose/docs defaults to the published-image path (its
 `docs/PRODUCT_FRAMEWORK.md` §2 has the full contract). No change here.
 
 ### Step 30.5 — KB-MCP wedge — **landed 2026-07-15**
 
-`syncsage client-config claude-code|cursor [--mode local|docker-exec|
-docker-run]`: new `src/syncsage/mcp_client/agents.py` emits the shared
+`pheasant client-config claude-code|cursor [--mode local|docker-exec|
+docker-run]`: new `src/pheasant/mcp_client/agents.py` emits the shared
 `mcpServers` config shape (project `.mcp.json` / `.cursor/mcp.json`).
 `local` mode runs the pip-installed binary over stdio — the zero-docker
-path that pairs with `syncsage up` (whose ready-message now prints the
+path that pairs with `pheasant up` (whose ready-message now prints the
 attach command); docker modes reuse the VS Code arg vectors. Guide:
 `docs/how-to/attach-to-coding-agent.md`. MCP tool surface unchanged
 (additive-only rule respected). Acceptance: agent-config cases in
@@ -98,7 +98,7 @@ Canonical contracts: `subjective-retrieval/docs/PRODUCT_FRAMEWORK.md` §3.
 
 Third parties add a source type without forking: connector classes resolve
 by `sources[].type` name through `importlib.metadata` entry points (group
-`syncsage.connectors`, new `sync/connector_registry.py`) or programmatic
+`pheasant.connectors`, new `sync/connector_registry.py`) or programmatic
 `register_connector_class`; loaded objects must subclass
 `SourceConnector`. Config accepts unknown type strings as
 `PluginSourceType` (a `str` with a `.value` property — every existing
@@ -106,11 +106,11 @@ by `sources[].type` name through `importlib.metadata` entry points (group
 plugin types); resolution happens at dispatch, and a missing plugin fails
 the sync naming the type + installed plugins. Built-ins stay hardcoded in
 `connector_for_source` — the zero-plugin path is byte-identical. The
-public quality bar is `syncsage.testing.ConnectorConformance` (declared
+public quality bar is `pheasant.testing.ConnectorConformance` (declared
 type, healthy validate, deterministic unique identities, stable payloads
 or `ItemNotModified`, JSON-serializable checkpoint round-trip, full-mode
 bypass) — **FilesystemConnector passes the same harness**. Canonical
-third-party shape: `tests/fixtures/syncsage-connector-example/`
+third-party shape: `tests/fixtures/pheasant-connector-example/`
 (`StaticDirConnector`), driven end-to-end through `SyncEngine` with an
 idempotent second sync in `tests/test_connector_sdk.py`; conformance for
 both connectors in `tests/test_connector_conformance.py`. Docs:
@@ -119,8 +119,8 @@ both connectors in `tests/test_connector_conformance.py`. Docs:
 ### Step 31.2 — Notion connector — **landed 2026-07-16**
 
 The first SaaS connector, built as a **first-party SDK plugin**
-(dogfooding 31.1: `src/syncsage/connectors/notion.py`, declared under the
-`syncsage.connectors` entry-point group in this repo's `pyproject.toml`,
+(dogfooding 31.1: `src/pheasant/connectors/notion.py`, declared under the
+`pheasant.connectors` entry-point group in this repo's `pyproject.toml`,
 config `type: notion`). Pages via paginated `POST /v1/search`; content =
 each page's block tree rendered to **deterministic Markdown** (headings /
 paragraphs / lists / to-dos / quotes / callouts / code / dividers, nested
@@ -141,7 +141,7 @@ edit re-indexes exactly one page), conformance pass, entry-point guard.
 ### Steps 31.3–31.7 — GDrive, Slack, Confluence, IMAP + certification — **landed 2026-07-16 (Phase 31 complete)**
 
 All four ride the 31.2 pattern (full contracts: SR `PRODUCT_FRAMEWORK.md`
-§3): entry-point SDK plugins in `src/syncsage/connectors/`, one
+§3): entry-point SDK plugins in `src/pheasant/connectors/`, one
 monkeypatch-friendly network touchpoint each (stdlib urllib / imaplib —
 zero new deps), deterministic rendering, version-proxy `item.sha256`,
 per-item incremental cursors (`ItemNotModified`), secrets via
@@ -168,14 +168,14 @@ Canonical contracts: `subjective-retrieval/docs/PRODUCT_FRAMEWORK.md` §3c.
 
 **Memory records are source content** — the write path only creates files;
 indexing stays the ordinary deterministic pipeline. New
-`src/syncsage/memory/store.py`: append-only `MemoryStore` (one Markdown
+`src/pheasant/memory/store.py`: append-only `MemoryStore` (one Markdown
 file per record under `<memory-source>/<scope>/<record_id>.md`,
 frontmatter with `schema_version: 1` / scope / subject / `asserted_at` /
 optional `supersedes` + `tags`; deterministic id
 `mem-<instant>-<blake2b8(scope|subject|text)>`; identical write →
 `created: false`, nothing ever overwritten). `SourceType.memory` is a
 built-in filesystem source type (watcher/scheduler/globs/anchoring as any
-folder). Write surfaces (additive): MCP `memory_write` on `SyncSageTools`
+folder). Write surfaces (additive): MCP `memory_write` on `PheasantTools`
 + `POST /memory` / `GET /memory` on the API — `sync=true` default gives
 read-your-writes via ordinary `search_context`; no memory source →
 actionable error. The contract publisher advertises `"memory"` in
@@ -207,7 +207,7 @@ no-ops, HTTP round-trip).
 
 ### Step 33.4 — Memory-recall benchmark — **landed 2026-07-16 (Phase 33 complete)**
 
-`memory/benchmark.py` (`python -m syncsage.memory.benchmark`):
+`memory/benchmark.py` (`python -m pheasant.memory.benchmark`):
 LongMemEval-style, deterministic, offline — seeded cases through the
 **real** `memory_write` → batch index → `search_context` (hybrid) path;
 categories: single-hop recall, multi-session interference, knowledge

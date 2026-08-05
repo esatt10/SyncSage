@@ -1,18 +1,18 @@
 {
   "servers": {
-    "syncsage": {
+    "pheasant": {
       "type": "stdio",
       "command": "docker",
       "args": [
         "exec",
         "-i",
-        "syncsage",
+        "pheasant",
         "python",
         "-m",
-        "syncsage",
+        "pheasant",
         "mcp",
         "--config",
-        "/config/syncsage.yaml",
+        "/config/pheasant.yaml",
         "--transport",
         "stdio"
       ]

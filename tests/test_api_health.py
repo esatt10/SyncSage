@@ -14,7 +14,7 @@ def test_health_and_ready_endpoints_report_ok(loaded_config: object) -> None:
     fastapi_testclient = import_any(("fastapi.testclient",))
     TestClient = require_attr(fastapi_testclient, ("TestClient",), "FastAPI TestClient")
 
-    api_module = import_any(("syncsage.api", "syncsage.server", "syncsage.http"))
+    api_module = import_any(("pheasant.api", "pheasant.server", "pheasant.http"))
     app = first_attr(api_module, ("app", "application"))
     if app is None or isinstance(app, ModuleType):
         factory: Callable[..., object] = require_attr(

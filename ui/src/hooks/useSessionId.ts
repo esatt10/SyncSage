@@ -1,6 +1,6 @@
 import { useCallback, useState } from "react";
 
-const KEY = "syncsage.assistant.session";
+const KEY = "pheasant.assistant.session";
 
 /**
  * The opaque handle for a chat key the user pasted.

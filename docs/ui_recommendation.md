@@ -1,18 +1,18 @@
-# SyncSage Web UI — Design Recommendation
+# pheasant Web UI — Design Recommendation
 
 > Status: **implemented**. This document originated as a design recommendation
 > and has since been executed. The light React front end lives in [`ui/`](../ui)
-> and the supporting HTTP routes were added to `src/syncsage/api/app.py`. The
+> and the supporting HTTP routes were added to `src/pheasant/api/app.py`. The
 > design below is retained as the rationale, grounded in the FastAPI surface, the
-> configuration schema (`src/syncsage/config/schema.py`), and the knowledge-graph
+> configuration schema (`src/pheasant/config/schema.py`), and the knowledge-graph
 > model (`docs/graph_model.md`). See §11 for the as-built route list.
 
 ## 1. Goals and constraints
 
-The UI exists to make SyncSage approachable without removing the power of the
+The UI exists to make pheasant approachable without removing the power of the
 YAML workflow. Concretely:
 
-1. **Keep YAML as a first-class path.** The existing `syncsage.example.yaml` +
+1. **Keep YAML as a first-class path.** The existing `pheasant.example.yaml` +
    profile + `--set` override model stays exactly as-is. The UI is an *additive*
    surface that reads and writes the same effective config; it never becomes the
    only way in. Operators who prefer files keep using them.
@@ -33,13 +33,13 @@ YAML workflow. Concretely:
    whose numerical behavior is written in LaTeX.
 7. **All core config options are reachable in the UI.** Every field in the config
    schema is editable through the UI, organized to match the YAML sections.
-8. **The SyncSage container is its own workload and does not change.** The UI is a
+8. **The pheasant container is its own workload and does not change.** The UI is a
    separate workload (static bundle / sidecar), not new weight inside the
    indexing container. See §8.
 
 ## 2. Where the UI plugs into what already exists
 
-SyncSage already ships almost everything a read/visualize UI needs. The table
+pheasant already ships almost everything a read/visualize UI needs. The table
 maps each UI capability to an existing backend affordance, and flags the few
 gaps that a future backend PR would need to close (this doc does not implement
 them).
@@ -66,7 +66,7 @@ them).
 already existed. The remaining work was a small, well-bounded set of HTTP routes
 that re-expose already-implemented traversal/register/explain/history logic plus
 two new ones (`/fs/list`, `/config`). All of these now exist in
-`src/syncsage/api/app.py` and are covered by `tests/test_api_ui_routes.py`.
+`src/pheasant/api/app.py` and are covered by `tests/test_api_ui_routes.py`.
 
 ## 3. Recommended technology
 
@@ -160,12 +160,12 @@ The centerpiece — "navigating a knowledge graph" made literal.
 
 ### 4.3 Configuration editor (all core options)
 
-Every section of `SyncSageConfig` is editable, laid out to mirror the YAML so
+Every section of `PheasantConfig` is editable, laid out to mirror the YAML so
 the mental model transfers both directions:
 
 | UI panel | Schema source | Notable fields |
 |---|---|---|
-| Instance | `SyncSageSettings` | name, description, environment, log_level, state/vault/workspace/exports paths |
+| Instance | `PheasantSettings` | name, description, environment, log_level, state/vault/workspace/exports paths |
 | Server | `ServerSettings` / `McpSettings` / `ApiSettings` / `UiSettings` | host, port, MCP transports (stdio/streamable_http/sse), api.enabled, api.openapi, **ui.enabled, ui.graph_visualization** |
 | Storage | `StorageSettings` | graph_format, snapshot interval, sqlite/graph/manifest paths, max_state_size_gb, compression, retention |
 | Search | `SearchSettings` | default_mode, keyword engine, embeddings, vector_store, ranking boosts, max_results_default |
@@ -179,14 +179,14 @@ Editor behavior:
 - **Profile-aware.** A profile picker (`quickstart` / `dev` / `team` /
   `cloud-hybrid`) seeds the form using the same layering the CLI uses
   (`load_layered_config`). The form shows base + profile + user overrides as the
-  effective values, matching `syncsage config show --effective`.
+  effective values, matching `pheasant config show --effective`.
 - **Diff before apply.** Saving shows a YAML diff (the rendered effective config
   vs. current file) — the UI equivalent of inspecting the resolved config — then
   writes via a `PUT /config` route. This is the single biggest cure for the
   "YAML was hard to set up" complaint: validation + preview before commit.
 - **Validation.** Client-side Zod mirrors the schema; server-side validation
   reuses `validate_source_paths` so path/allowlist errors are reported the same
-  way `syncsage doctor` reports them.
+  way `pheasant doctor` reports them.
 - **YAML escape hatch.** A "Raw YAML" tab shows the underlying file and lets
   power users edit text directly — the UI and YAML stay two views of one source
   of truth, satisfying "we don't have to take YAML away."
@@ -214,7 +214,7 @@ source**, so there is one definition per concept, surfaced in two densities
 
 ## 6. Markdown + LaTeX reference panel
 
-A slide-over panel ("How SyncSage works") rendered with
+A slide-over panel ("How pheasant works") rendered with
 `react-markdown + remark-math + rehype-katex`. It documents each component in
 prose and expresses the **numerical** behavior in LaTeX. These formulas are
 transcriptions of behavior already in the codebase, so the docs stay truthful.
@@ -301,37 +301,37 @@ src/
     CommandPalette.tsx     # quick jump to node/source/search
 ```
 
-## 8. Deployment — the SyncSage container stays its own workload
+## 8. Deployment — the pheasant container stays its own workload
 
-This is a hard constraint: adding a UI must not change what the SyncSage
+This is a hard constraint: adding a UI must not change what the pheasant
 indexing container *is* or how it is operated. The recommendation keeps them
 decoupled and offers two deployment shapes, both leaving the existing container
 build (`Dockerfile`, `docker-compose.yml`) functionally unchanged.
 
-**Build-time:** the React app builds to a static `dist/`. It talks to SyncSage
+**Build-time:** the React app builds to a static `dist/`. It talks to pheasant
 purely over the existing HTTP API. There is no Python/runtime coupling.
 
 - **Option A — sidecar (recommended).** Ship the UI as a *separate* container
   (e.g. an nginx/static-file image serving `dist/`) in the same compose project /
-  Kubernetes pod, alongside SyncSage. The SyncSage container is untouched; it
+  Kubernetes pod, alongside pheasant. The pheasant container is untouched; it
   remains a self-contained indexing workload with its own lifecycle, health
   check, and state volume. The UI container is independently
   scalable/removable, and in `team`/`prod` you can drop it entirely without
-  touching SyncSage. This best honors "the SyncSage container should be
+  touching pheasant. This best honors "the pheasant container should be
   considered its own workload."
 
   ```yaml
-  # additive compose service; existing syncsage service is unchanged
-  syncsage-ui:
-    image: ghcr.io/esatt10/syncsage-ui:0.1.x
+  # additive compose service; existing pheasant service is unchanged
+  pheasant-ui:
+    image: ghcr.io/esatt10/pheasant-ui:0.1.x
     ports: ["8080:80"]
     environment:
-      SYNCSAGE_API_BASE: http://syncsage:8765
-    depends_on: [syncsage]
+      PHEASANT_API_BASE: http://pheasant:8765
+    depends_on: [pheasant]
   ```
 
 - **Option B — optional static mount.** If a single-container deployment is
-  preferred for `quickstart`, SyncSage can *optionally* serve the prebuilt
+  preferred for `quickstart`, pheasant can *optionally* serve the prebuilt
   `dist/` via FastAPI `StaticFiles`, gated behind the already-present
   `server.ui.enabled` toggle, and only when the bundle is present. This adds no
   new runtime dependency to the image (static files only) and stays off in
@@ -371,12 +371,12 @@ The UI inherits, and must not weaken, the existing controls:
 3. **Phase 3 — full config editor.** All schema sections, profile layering, diff
    preview, raw YAML tab, `GET/PUT /config`.
 
-Each phase is independently shippable and leaves the SyncSage container as its
+Each phase is independently shippable and leaves the pheasant container as its
 own unchanged workload.
 
 ## 11. Backend routes (as built)
 
-The following routes were added to `src/syncsage/api/app.py` to support the UI.
+The following routes were added to `src/pheasant/api/app.py` to support the UI.
 All reuse existing security and validation primitives, keep the indexing
 container Python-only, and are covered by `tests/test_api_ui_routes.py`:
 
@@ -386,9 +386,9 @@ container Python-only, and are covered by `tests/test_api_ui_routes.py`:
 - `POST /sources` (register, allowlist-scoped, optional `sync_now`), `POST /sources/{id}/promote`, `POST /sources/{id}/disable`, `DELETE /sources/{id}`.
 - `GET /sources/{id}/history` → audit timeline.
 - `GET /fs/list` → allowlist-scoped directory listing via `resolve_under` (rejects paths outside `workspace_root` / `vault_path` / `exports_path` with HTTP 403).
-- `GET /config`, `PUT /config` → effective-config read + validated write (validation mirrors `syncsage doctor`; server-level changes require a restart).
+- `GET /config`, `PUT /config` → effective-config read + validated write (validation mirrors `pheasant doctor`; server-level changes require a restart).
 - CORS is enabled so the UI can run as a separate workload in development.
 
-The pre-built UI can optionally be served by SyncSage itself via
-`SYNCSAGE_UI_DIST`, gated behind `server.ui.enabled` (Option B in §8); by default
+The pre-built UI can optionally be served by pheasant itself via
+`PHEASANT_UI_DIST`, gated behind `server.ui.enabled` (Option B in §8); by default
 nothing is mounted, so the container image is unchanged.

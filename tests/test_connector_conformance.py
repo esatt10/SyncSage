@@ -1,8 +1,8 @@
 """Step 31.1 — the public conformance bar, applied to us first.
 
 The built-in FilesystemConnector and the canonical example plugin
-(``tests/fixtures/syncsage-connector-example``) both pass the exact
-``syncsage.testing.ConnectorConformance`` harness a third-party package
+(``tests/fixtures/pheasant-connector-example``) both pass the exact
+``pheasant.testing.ConnectorConformance`` harness a third-party package
 would subclass.
 """
 
@@ -11,12 +11,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from syncsage.config.schema import PluginSourceType, SourceConfig, SourceType
-from syncsage.persistence.state_store import StateStore
-from syncsage.sync.connectors import FilesystemConnector, SourceConnector
-from syncsage.testing import ConnectorConformance
+from pheasant.config.schema import PluginSourceType, SourceConfig, SourceType
+from pheasant.persistence.state_store import StateStore
+from pheasant.sync.connectors import FilesystemConnector, SourceConnector
+from pheasant.testing import ConnectorConformance
 
-EXAMPLE_PKG = Path(__file__).resolve().parent / "fixtures" / "syncsage-connector-example"
+EXAMPLE_PKG = Path(__file__).resolve().parent / "fixtures" / "pheasant-connector-example"
 
 
 def _sample_content(tmp_path: Path) -> Path:
@@ -42,7 +42,7 @@ class TestExampleConnectorConformance(ConnectorConformance):
     def make_connector(self, tmp_path: Path, state: StateStore) -> SourceConnector:
         sys.path.insert(0, str(EXAMPLE_PKG))
         try:
-            from syncsage_connector_example import StaticDirConnector
+            from pheasant_connector_example import StaticDirConnector
         finally:
             sys.path.remove(str(EXAMPLE_PKG))
         source = SourceConfig(

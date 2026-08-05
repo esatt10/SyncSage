@@ -1,6 +1,6 @@
 # How to ingest images and audio
 
-SyncSage indexes images by **captioning** them and audio by **transcribing**
+pheasant indexes images by **captioning** them and audio by **transcribing**
 it into text that flows through the normal chunk → embed → graph path. For a
 hands-on walkthrough, see the [multi-modal tutorial](../tutorials/multimodal.md);
 this page is the configuration reference.
@@ -10,7 +10,7 @@ this page is the configuration reference.
 Captioning/transcription is **opt-in by file extension**. The captioner is only
 built when a source's `include` globs admit an image extension; the transcriber
 only when they admit an audio extension. A text-only config builds neither and
-is byte-identical to a SyncSage without multi-modal.
+is byte-identical to a pheasant without multi-modal.
 
 | Modality | Extensions | Built when `include` admits | Producer |
 |---|---|---|---|
@@ -29,7 +29,7 @@ sources:
 
 ## Three sources of text (in priority order)
 
-For each media file, SyncSage picks the caption/transcript text like this:
+For each media file, pheasant picks the caption/transcript text like this:
 
 1. **Sidecar file** — if `<file>.caption.txt` (image) or
    `<file>.transcript.txt` (audio) exists next to the media file, its contents

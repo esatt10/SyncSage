@@ -28,7 +28,7 @@ from __future__ import annotations
 import threading
 import time
 
-from syncsage.persistence.state_store import StateStore
+from pheasant.persistence.state_store import StateStore
 
 QUERIES = [
     ("SELECT ? AS a, ? AS b, ? AS c", (1, 2, 3), {"a", "b", "c"}),

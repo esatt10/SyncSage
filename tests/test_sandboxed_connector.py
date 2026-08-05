@@ -13,13 +13,13 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("wasmtime", reason="wasmtime not installed (pip install 'syncsage[wasm]')")
+pytest.importorskip("wasmtime", reason="wasmtime not installed (pip install 'pheasant-kb[wasm]')")
 
-from syncsage.config.schema import SourceConfig, SourceType  # noqa: E402
-from syncsage.persistence.state_store import StateStore  # noqa: E402
-from syncsage.sandbox.connector import SandboxedConnector  # noqa: E402
-from syncsage.sync.connectors import connector_for_source  # noqa: E402
-from syncsage.testing import ConnectorConformance  # noqa: E402
+from pheasant.config.schema import SourceConfig, SourceType  # noqa: E402
+from pheasant.persistence.state_store import StateStore  # noqa: E402
+from pheasant.sandbox.connector import SandboxedConnector  # noqa: E402
+from pheasant.sync.connectors import connector_for_source  # noqa: E402
+from pheasant.testing import ConnectorConformance  # noqa: E402
 
 
 def _make_source(root: Path) -> SourceConfig:

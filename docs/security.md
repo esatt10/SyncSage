@@ -1,6 +1,6 @@
 # Security
 
-SyncSage indexes local content for agents, so it must be conservative about paths, secrets, and execution.
+pheasant indexes local content for agents, so it must be conservative about paths, secrets, and execution.
 
 ## Required controls
 
@@ -19,11 +19,11 @@ the ones that write config, register sources and trigger syncs — is open to
 anything that can reach the port. That is a deliberate local-first choice,
 and it makes two controls load-bearing:
 
-- **Bind address.** Loopback by default on both paths: `syncsage up`
+- **Bind address.** Loopback by default on both paths: `pheasant up`
   generates `host: 127.0.0.1`, and compose publishes
   `127.0.0.1:8765:8765`. The container itself still binds `0.0.0.0`, because
   binding loopback *inside* a container makes it unreachable from the host —
-  it is the published port that is restricted. Set `SYNCSAGE_BIND=0.0.0.0`
+  it is the published port that is restricted. Set `PHEASANT_BIND=0.0.0.0`
   to expose it, and only behind an authenticating ingress. Note that Docker's
   port publishing writes its own iptables rules, so a host firewall is not a
   substitute for this.
@@ -44,9 +44,9 @@ Treat "who can open :8765" as the real authorization boundary.
 ### Indexing any readable path — the deliberate tradeoff
 
 `security.allow_user_selected_source_paths` defaults to `true`: a source may
-name **any path the SyncSage process can read**, not just one under
+name **any path the pheasant process can read**, not just one under
 `allow_workspace_roots`. This is a deliberate product decision — pointing
-SyncSage at a folder without first editing an allowlist is the whole
+pheasant at a folder without first editing an allowlist is the whole
 quickstart experience — and it means the process's own filesystem access is
 the boundary. Four controls compensate, and they are why the tradeoff is
 tenable:
@@ -61,7 +61,7 @@ tenable:
    `include: ["**/*.json", "**/*.yaml"]` sweeps up live tokens.
 2. **The traversal is bounded** (`sync.limits`) and refuses rather than
    truncates, so a mistaken source is a clear stop, not an OOM.
-3. **The API is not exposed to the network by default** — `syncsage up`
+3. **The API is not exposed to the network by default** — `pheasant up`
    generates `host: 127.0.0.1`, and compose publishes to loopback. Since the
    API is unauthenticated, this is what keeps "can read any path" from
    meaning "anyone on the network can read any path".
@@ -128,7 +128,7 @@ older root-running image will still be owned by root and the new container
 will fail to write to it. Fix it once with:
 
 ```bash
-docker run --rm -v syncsage_syncsage-state:/state alpine chown -R 10001:10001 /state
+docker run --rm -v pheasant_pheasant-state:/state alpine chown -R 10001:10001 /state
 ```
 
 ## Artifact ACLs and principal-aware retrieval (Phase 32)

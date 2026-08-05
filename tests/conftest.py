@@ -1,4 +1,4 @@
-"""Shared acceptance-test fixtures for SyncSage.
+"""Shared acceptance-test fixtures for pheasant.
 
 These tests intentionally exercise public package/CLI/API seams described in
 ``initial_build_prompt.md`` while remaining implementation-neutral enough to run
@@ -18,11 +18,10 @@ from typing import Any
 
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures"
 SAMPLE_WORKSPACE = FIXTURE_ROOT / "sample_workspace"
-CONFIG_TEMPLATE = FIXTURE_ROOT / "configs" / "syncsage.example.yaml"
+CONFIG_TEMPLATE = FIXTURE_ROOT / "configs" / "pheasant.example.yaml"
 
 
 def import_any(module_names: Iterable[str]) -> Any:
@@ -36,7 +35,7 @@ def import_any(module_names: Iterable[str]) -> Any:
             if exc.name and exc.name not in {module_name, module_name.split(".")[0]}:
                 pytest.skip(f"Dependency required by {module_name} is not installed: {exc.name}")
             errors.append(f"{module_name}: {exc}")
-    pytest.skip("SyncSage implementation module is not available yet: " + "; ".join(errors))
+    pytest.skip("pheasant implementation module is not available yet: " + "; ".join(errors))
 
 
 def first_attr(obj: Any, names: Iterable[str]) -> Any | None:
@@ -154,19 +153,19 @@ def config_path(
         vault_path=vault_path.as_posix(),
         exports_path=exports_path.as_posix(),
     )
-    path = tmp_path / "syncsage.yaml"
+    path = tmp_path / "pheasant.yaml"
     path.write_text(rendered, encoding="utf-8")
     return path
 
 
 @pytest.fixture()
 def loaded_config(config_path: Path) -> Any:
-    """Load a SyncSage config through the public loader when available."""
+    """Load a pheasant config through the public loader when available."""
 
-    config_module = import_any(("syncsage.config.loader", "syncsage.config"))
+    config_module = import_any(("pheasant.config.loader", "pheasant.config"))
     loader: Callable[..., Any] = require_attr(
         config_module,
-        ("load_config", "load_syncsage_config", "load", "from_yaml"),
+        ("load_config", "load_pheasant_config", "load", "from_yaml"),
         "config loader",
     )
     return loader(config_path)
@@ -176,7 +175,7 @@ def loaded_config(config_path: Path) -> Any:
 def sync_engine(loaded_config: Any, config_path: Path) -> Any:
     """Construct the public sync/indexing engine for integration tests."""
 
-    sync_module = import_any(("syncsage.sync.engine", "syncsage.sync", "syncsage.ingestion.pipeline", "syncsage.indexing", "syncsage.indexer"))
+    sync_module = import_any(("pheasant.sync.engine", "pheasant.sync", "pheasant.ingestion.pipeline", "pheasant.indexing", "pheasant.indexer"))
     engine_factory = require_attr(
         sync_module,
         ("SyncEngine", "Indexer", "KnowledgeIndexer", "create_sync_engine"),
@@ -197,8 +196,8 @@ def make_vector_engine(tmp_path: Path, vector_provider: str = "numpy") -> Any:
     vector-search acceptance tests and the idempotency spine.
     """
 
-    sync_module = import_any(("syncsage.sync.engine",))
-    schema_module = import_any(("syncsage.config.schema",))
+    sync_module = import_any(("pheasant.sync.engine",))
+    schema_module = import_any(("pheasant.config.schema",))
 
     notes = tmp_path / "vector-workspace" / "notes"
     notes.mkdir(parents=True, exist_ok=True)
@@ -210,9 +209,9 @@ def make_vector_engine(tmp_path: Path, vector_provider: str = "numpy") -> Any:
         "# Kitchen\n\nWash dishes nightly and restock pantry shelves.\n",
         encoding="utf-8",
     )
-    config = schema_module.SyncSageConfig.model_validate(
+    config = schema_module.PheasantConfig.model_validate(
         {
-            "syncsage": {
+            "pheasant": {
                 "name": "vector-acceptance",
                 "state_path": str(tmp_path / "vector-state"),
                 "vault_path": str(tmp_path / "vector-vault"),
@@ -229,7 +228,7 @@ def make_vector_engine(tmp_path: Path, vector_provider: str = "numpy") -> Any:
     return sync_module.SyncEngine(config)
 
 
-def run_sync(engine: Any, source_name: str = "syncsage-repo", mode: str = "full") -> Any:
+def run_sync(engine: Any, source_name: str = "pheasant-repo", mode: str = "full") -> Any:
     """Run a source sync using common public method names."""
 
     sync_method = require_attr(
@@ -261,7 +260,7 @@ def search_context(query: str, loaded_config: Any | None = None, engine: Any | N
         if engine_search is not None:
             return engine_search(query)
 
-    search_module = import_any(("syncsage.search", "syncsage.search.engine", "syncsage.api.tools"))
+    search_module = import_any(("pheasant.search", "pheasant.search.engine", "pheasant.api.tools"))
     search_factory = first_attr(search_module, ("SearchEngine", "ContextSearch", "create_search_engine"))
     if search_factory is not None:
         search_engine = search_factory(loaded_config) if loaded_config is not None else search_factory()
@@ -300,11 +299,11 @@ def item_text(item: Any) -> str:
 
 
 def call_cli(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    """Run the SyncSage CLI via module or console script."""
+    """Run the pheasant CLI via module or console script."""
 
     commands = [
-        [sys.executable, "-m", "syncsage", *args],
-        ["syncsage", *args],
+        [sys.executable, "-m", "pheasant", *args],
+        ["pheasant", *args],
     ]
     last_error: FileNotFoundError | None = None
     for command in commands:
@@ -320,7 +319,7 @@ def call_cli(args: list[str], cwd: Path | None = None) -> subprocess.CompletedPr
         except FileNotFoundError as exc:
             last_error = exc
             continue
-        if "No module named syncsage" in result.stderr:
+        if "No module named pheasant" in result.stderr:
             continue
         return result
-    pytest.skip(f"SyncSage CLI is not available yet: {last_error or 'syncsage module not importable'}")
+    pytest.skip(f"pheasant CLI is not available yet: {last_error or 'pheasant module not importable'}")

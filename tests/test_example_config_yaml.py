@@ -1,6 +1,6 @@
 """Guard: the shipped example config must be valid under *real* PyYAML.
 
-The container smoke test bakes ``syncsage.example.yaml`` into the image and
+The container smoke test bakes ``pheasant.example.yaml`` into the image and
 parses it with the installed PyYAML (a hard dependency, ``PyYAML>=6.0``). The
 rest of the test suite, however, resolves the repo-root ``yaml.py`` *shim* — a
 deliberately lenient, dependency-light YAML subset — so a strict-YAML error in
@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-EXAMPLE_CONFIG = REPO / "syncsage.example.yaml"
+EXAMPLE_CONFIG = REPO / "pheasant.example.yaml"
 
 # Parse a YAML file with whatever ``yaml`` the interpreter imports, printing a
 # stable marker we can distinguish from a genuine parse error.
@@ -71,7 +71,7 @@ def test_example_config_parses_under_real_pyyaml() -> None:
     if result.returncode == 3 or "NO_PYYAML" in result.stdout:
         pytest.skip("real PyYAML not installed (dependency-light shim env)")
     assert result.returncode == 0, (
-        "syncsage.example.yaml failed to parse under real PyYAML "
+        "pheasant.example.yaml failed to parse under real PyYAML "
         "(this is exactly what the container smoke test does):\n" + result.stderr
     )
     assert "PARSE_OK" in result.stdout

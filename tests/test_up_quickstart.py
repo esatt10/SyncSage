@@ -1,10 +1,10 @@
-"""Product Framework Step 30.1 — ``syncsage up`` personal quickstart.
+"""Product Framework Step 30.1 — ``pheasant up`` personal quickstart.
 
 Acceptance (see docs/ROADMAP_CONTEXT_KNOWLEDGE_MGMT.md §2b):
 
-1. In a fixture workspace, ``syncsage up --no-serve`` writes a config that
+1. In a fixture workspace, ``pheasant up --no-serve`` writes a config that
    ``load_config`` round-trips, indexes > 0 artifacts, and creates state
-   under ``./.syncsage/state``.
+   under ``./.pheasant/state``.
 2. A second run reuses the config byte-identically and re-indexes nothing
    (the idempotency spine, extended to the bootstrap path).
 3. Source-type detection: ``.obsidian/`` → obsidian_vault, ``.git/`` →
@@ -21,10 +21,10 @@ from pathlib import Path
 import pytest
 import yaml
 
-from syncsage.cli import main
-from syncsage.config.loader import load_config
-from syncsage.config.schema import SourceType
-from syncsage.quickstart import detect_source_type, ensure_up_config, render_up_config
+from pheasant.cli import main
+from pheasant.config.loader import load_config
+from pheasant.config.schema import SourceType
+from pheasant.quickstart import detect_source_type, ensure_up_config, render_up_config
 
 SAMPLE_WORKSPACE = Path(__file__).resolve().parent / "fixtures" / "sample_workspace"
 
@@ -63,18 +63,18 @@ def test_up_generates_config_indexes_and_lands_state_locally(
     assert rc == 0
     output = capsys.readouterr().out
 
-    config_path = tmp_path / "syncsage.yaml"
+    config_path = tmp_path / "pheasant.yaml"
     assert config_path.exists()
     cfg = load_config(config_path)
-    assert cfg.syncsage.name == "my-notes"
+    assert cfg.pheasant.name == "my-notes"
     assert len(cfg.sources) == 1
     assert cfg.sources[0].type is SourceType.document_folder
     assert cfg.sources[0].path == workspace
-    assert cfg.syncsage.state_path == tmp_path / ".syncsage" / "state"
+    assert cfg.pheasant.state_path == tmp_path / ".pheasant" / "state"
 
     indexed, _ = _sync_counts(output)
     assert indexed > 0
-    assert (tmp_path / ".syncsage" / "state" / "syncsage.db").exists()
+    assert (tmp_path / ".pheasant" / "state" / "pheasant.db").exists()
 
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert "synapse" not in raw or not raw["synapse"].get("router_url")
@@ -85,7 +85,7 @@ def test_up_rerun_is_idempotent(
 ) -> None:
     assert main(["up", str(workspace), "--no-serve"]) == 0
     capsys.readouterr()
-    config_path = tmp_path / "syncsage.yaml"
+    config_path = tmp_path / "pheasant.yaml"
     first_bytes = config_path.read_bytes()
 
     assert main(["up", str(workspace), "--no-serve"]) == 0
@@ -103,7 +103,7 @@ def test_up_never_rewrites_a_user_edited_config(
 ) -> None:
     assert main(["up", str(workspace), "--no-serve"]) == 0
     capsys.readouterr()
-    config_path = tmp_path / "syncsage.yaml"
+    config_path = tmp_path / "pheasant.yaml"
     marker = "# user edit — must survive re-runs\n"
     config_path.write_text(marker + config_path.read_text(encoding="utf-8"), encoding="utf-8")
 
@@ -121,8 +121,8 @@ def test_up_detects_obsidian_vault_end_to_end(
 
     rc = main(["up", str(vault), "--no-serve", "--port", "9999"])
     assert rc == 0
-    cfg = load_config(tmp_path / "syncsage.yaml")
-    assert cfg.syncsage.name == "second-brain"
+    cfg = load_config(tmp_path / "pheasant.yaml")
+    assert cfg.pheasant.name == "second-brain"
     assert cfg.sources[0].type is SourceType.obsidian_vault
     assert cfg.server.port == 9999
     indexed, _ = _sync_counts(capsys.readouterr().out)
@@ -137,7 +137,7 @@ def test_up_rejects_missing_directory(tmp_path: Path, monkeypatch: pytest.Monkey
 def test_render_up_config_is_deterministic(tmp_path: Path) -> None:
     target = tmp_path / "ws"
     target.mkdir()
-    config_path = tmp_path / "syncsage.yaml"
+    config_path = tmp_path / "pheasant.yaml"
     once = render_up_config(target, config_path)
     twice = render_up_config(target, config_path)
     assert once == twice

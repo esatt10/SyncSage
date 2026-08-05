@@ -3,7 +3,7 @@
 ## Health checks fail
 
 - Confirm the container is running and port `8765` is exposed.
-- Check `SYNCSAGE_CONFIG` points to `/config/syncsage.yaml`.
+- Check `PHEASANT_CONFIG` points to `/config/pheasant.yaml`.
 - Confirm `/state` is writable.
 
 ## Image pull fails
@@ -34,18 +34,18 @@ Validate, then repair or re-sync. There is no `rebuild` command — use `repair`
 everything for a source):
 
 ```bash
-syncsage validate syncsage.yaml
-syncsage repair --config syncsage.yaml
-syncsage sync --config syncsage.yaml --source <source> --mode repair
-syncsage sync --config syncsage.yaml --source <source> --mode full
-syncsage sync --config syncsage.yaml --all --mode full
+pheasant validate pheasant.yaml
+pheasant repair --config pheasant.yaml
+pheasant sync --config pheasant.yaml --source <source> --mode repair
+pheasant sync --config pheasant.yaml --source <source> --mode full
+pheasant sync --config pheasant.yaml --all --mode full
 ```
 
 `validate_only` mode checks readability without writing anything, which is handy
 for diagnosing a source before a heavier rebuild:
 
 ```bash
-syncsage sync --config syncsage.yaml --source <source> --mode validate_only
+pheasant sync --config pheasant.yaml --source <source> --mode validate_only
 ```
 
 ## Images are not indexed
@@ -76,7 +76,7 @@ syncsage sync --config syncsage.yaml --source <source> --mode validate_only
   `base_url` is reachable.
 - For air-gapped or test runs, set `provider: stub` (deterministic, offline).
 - If `vector_store.provider: lancedb` errors, install the extra
-  (`pip install 'syncsage[vector]'`) or switch to `provider: numpy`.
+  (`pip install 'pheasant-kb[vector]'`) or switch to `provider: numpy`.
 - See [Vector self-search](how-to/vector-search.md).
 
 ## Router connection or contract publish fails
@@ -95,4 +95,4 @@ syncsage sync --config syncsage.yaml --source <source> --mode validate_only
 
 ## Multiple instances conflict
 
-Do not point multiple independent SyncSage containers at the same writable `/state` volume. Use one namespace/PVC per instance.
+Do not point multiple independent pheasant containers at the same writable `/state` volume. Use one namespace/PVC per instance.

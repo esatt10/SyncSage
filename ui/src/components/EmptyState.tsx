@@ -39,7 +39,7 @@ export function EmptyState({
             <div className="step__body">
               <div className="step__title">Add a source from here</div>
               <p className="muted small" style={{ margin: "0 0 8px" }}>
-                Paste a path or URL and SyncSage detects the rest.
+                Paste a path or URL and pheasant detects the rest.
               </p>
               <button className="btn btn--primary" onClick={() => setAdding(true)}>
                 Add a source
@@ -54,10 +54,10 @@ export function EmptyState({
               <p className="muted small" style={{ margin: "0 0 8px" }}>
                 Detects, configures, indexes and serves — any target, one line.
               </p>
-              <CopyLine command="syncsage up ~/notes https://github.com/you/project" />
+              <CopyLine command="pheasant up ~/notes https://github.com/you/project" />
               <p className="muted small" style={{ margin: "8px 0 0" }}>
                 Run it in a container instead with{" "}
-                <code>syncsage host ~/notes</code>, which writes a compose file and
+                <code>pheasant host ~/notes</code>, which writes a compose file and
                 brings the stack up.
               </p>
             </div>

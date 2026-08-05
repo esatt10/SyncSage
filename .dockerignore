@@ -13,5 +13,5 @@ build
 *.egg-info
 .env
 .env.*
-.syncsage
-syncsage.yaml
+.pheasant
+pheasant.yaml

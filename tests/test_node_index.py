@@ -8,11 +8,11 @@ index changes speed and nothing else.
 
 from __future__ import annotations
 
-from syncsage.config.loader import load_config
-from syncsage.graph.simple import SimpleMultiDiGraph
-from syncsage.search.graph_search import search_graph
-from syncsage.search.node_index import NodeIndex
-from syncsage.sync.engine import SyncEngine
+from pheasant.config.loader import load_config
+from pheasant.graph.simple import SimpleMultiDiGraph
+from pheasant.search.graph_search import search_graph
+from pheasant.search.node_index import NodeIndex
+from pheasant.sync.engine import SyncEngine
 from tests.conftest import CONFIG_TEMPLATE
 
 
@@ -53,7 +53,7 @@ def _render_config(tmp_path, workspace):
         vault_path=(base / "vault").as_posix(),
         exports_path=(base / "exports").as_posix(),
     )
-    config_file = base / "syncsage.yaml"
+    config_file = base / "pheasant.yaml"
     config_file.write_text(rendered, encoding="utf-8")
     return config_file
 
@@ -62,7 +62,7 @@ def test_indexed_results_are_a_ranked_subset_of_scanning(tmp_path, workspace_cop
     """The contract the index actually offers.
 
     Candidates come from token/prefix matching, where the scan used arbitrary
-    substrings — so ``sync`` still finds ``syncsage`` (prefix) but no longer
+    substrings — so ``sync`` still finds ``pheasant`` (prefix) but no longer
     finds ``resync`` (infix). That makes indexed results a **subset** of
     scanned ones, never a superset: the index must not invent a hit. Among the
     hits both paths agree on, the ranking must be identical, because ranking
@@ -147,7 +147,7 @@ def test_a_real_sync_leaves_the_index_usable(tmp_path, workspace_copy) -> None:
 
     engine = SyncEngine(load_config(_render_config(tmp_path, workspace_copy)))
     try:
-        engine.sync_source("syncsage-repo", "full")
+        engine.sync_source("pheasant-repo", "full")
         assert engine.node_index.count() > 0, "sync did not populate the node index"
         candidates = engine.node_index.candidates(["sync"])
         assert candidates, "an indexed term returned no candidates"
@@ -162,7 +162,7 @@ def test_index_is_disposable(tmp_path, workspace_copy) -> None:
 
     engine = SyncEngine(load_config(_render_config(tmp_path, workspace_copy)))
     try:
-        engine.sync_source("syncsage-repo", "full")
+        engine.sync_source("pheasant-repo", "full")
         with_index = search_graph(engine.graph_builder.graph, "sync", node_index=engine.node_index)
         assert with_index, "indexed search found nothing to begin with"
 

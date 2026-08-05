@@ -1,6 +1,6 @@
 # How to enable vector self-search
 
-By default SyncSage searches over `text` (SQLite FTS5 + BM25) and `graph`. You
+By default pheasant searches over `text` (SQLite FTS5 + BM25) and `graph`. You
 can additionally enable **semantic / vector search**: chunks are embedded at
 sync time, and search gains a `vector` mode plus vector candidates inside
 `hybrid`.
@@ -31,7 +31,7 @@ search:
 
 !!! note "The only sanctioned network call (besides captioning)"
     The `openai-spec` embedder runs in the indexing path, so embedding is the
-    one network call SyncSage makes at sync time (alongside optional
+    one network call pheasant makes at sync time (alongside optional
     captioning/transcription). The `stub` provider keeps the offline path
     network-free.
 
@@ -47,7 +47,7 @@ search:
 | Backend | When |
 |---|---|
 | `numpy` | Always available (no extra dependency). Fine for small/medium regions. |
-| `lancedb` | Faster at scale. Requires the `[vector]` extra: `pip install 'syncsage[vector]'`. |
+| `lancedb` | Faster at scale. Requires the `[vector]` extra: `pip install 'pheasant-kb[vector]'`. |
 
 If you select `lancedb` without installing the extra, fall back to `numpy` or
 install it. `PUT /search/embeddings` refuses a backend whose dependency is
@@ -111,7 +111,7 @@ curl -X POST http://localhost:8765/search \
 
 ## The fleet-pinned model
 
-When SyncSage is a Synapse region, its embedding space must match the rest of
+When pheasant is a Synapse region, its embedding space must match the rest of
 the fleet so the router can compare contracts. The embedder uses the **same
 wire format** the subjective-retrieval router's embedding provider uses, so a
 fleet can **pin one model** (one `model` + `dimensions`) across both repos and

@@ -20,7 +20,7 @@ def _export_notes(loaded_config: object, sync_engine: object, vault_path: Path) 
             return exporter()
 
     export_module = import_any(
-        ("syncsage.obsidian", "syncsage.export.obsidian", "syncsage.api.tools")
+        ("pheasant.obsidian", "pheasant.export.obsidian", "pheasant.api.tools")
     )
     exporter = require_attr(
         export_module,
@@ -40,7 +40,7 @@ def test_obsidian_export_updates_notes_in_place(
 ) -> None:
     """Repeated exports should update Markdown notes without duplicating them."""
 
-    run_sync(sync_engine, source_name="syncsage-repo", mode="full")
+    run_sync(sync_engine, source_name="pheasant-repo", mode="full")
 
     _export_notes(loaded_config, sync_engine, vault_path)
     first_notes = sorted(
@@ -73,7 +73,7 @@ def test_obsidian_preview_and_graph_driven_navigation(
     """Preview should not write files; export should create graph-navigation links."""
 
     loaded_config.obsidian.create_chunk_notes = True
-    run_sync(sync_engine, source_name="syncsage-repo", mode="full")
+    run_sync(sync_engine, source_name="pheasant-repo", mode="full")
 
     preview = sync_engine.export_obsidian_notes(
         vault_path=vault_path,
@@ -92,7 +92,7 @@ def test_obsidian_preview_and_graph_driven_navigation(
     )
 
     root = vault_path / loaded_config.obsidian.note_root
-    source_note = root / "Sources" / "syncsage-repo.md"
+    source_note = root / "Sources" / "pheasant-repo.md"
     file_note = root / "Files" / "README.md.md"
     chunk_notes = sorted((root / "Chunks").glob("*.md"))
 

@@ -13,10 +13,10 @@ import json
 import sys
 import threading
 
-from syncsage.graph.exporter import cytoscape, node_link
-from syncsage.graph.simple import SimpleMultiDiGraph
-from syncsage.persistence.graph_store import GraphStore
-from syncsage.search.graph_search import search_graph
+from pheasant.graph.exporter import cytoscape, node_link
+from pheasant.graph.simple import SimpleMultiDiGraph
+from pheasant.persistence.graph_store import GraphStore
+from pheasant.search.graph_search import search_graph
 
 READ_ROUNDS = 40
 

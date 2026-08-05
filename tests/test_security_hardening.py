@@ -30,13 +30,13 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from syncsage.api.app import create_app
-from syncsage.config.schema import SyncSageConfig
-from syncsage.persistence.backup import _safe_extract
-from syncsage.search.hybrid import MAX_RESULTS_CEILING
-from syncsage.security.path_policy import PathPolicyError, resolve_config_write_target
-from syncsage.sync.connectors import is_fetchable_url, require_fetchable_url
-from syncsage.targets import TargetError, validate_clone_url
+from pheasant.api.app import create_app
+from pheasant.config.schema import PheasantConfig
+from pheasant.persistence.backup import _safe_extract
+from pheasant.search.hybrid import MAX_RESULTS_CEILING
+from pheasant.security.path_policy import PathPolicyError, resolve_config_write_target
+from pheasant.sync.connectors import is_fetchable_url, require_fetchable_url
+from pheasant.targets import TargetError, validate_clone_url
 
 NOTE = "# Alpha\nthe quick brown widget service runs on port 9000\n"
 
@@ -46,14 +46,14 @@ def workspace(tmp_path: Path) -> Path:
     (tmp_path / "ws" / "notes").mkdir(parents=True)
     (tmp_path / "ws" / "notes" / "a.md").write_text(NOTE, encoding="utf-8")
     (tmp_path / "state").mkdir()
-    (tmp_path / "syncsage.yaml").write_text("syncsage:\n  name: sec\n", encoding="utf-8")
+    (tmp_path / "pheasant.yaml").write_text("pheasant:\n  name: sec\n", encoding="utf-8")
     return tmp_path
 
 
-def _build(workspace: Path, **security: object) -> tuple[SyncSageConfig, TestClient]:
-    config = SyncSageConfig.model_validate(
+def _build(workspace: Path, **security: object) -> tuple[PheasantConfig, TestClient]:
+    config = PheasantConfig.model_validate(
         {
-            "syncsage": {
+            "pheasant": {
                 "name": "sec",
                 "workspace_root": str(workspace / "ws"),
                 "state_path": str(workspace / "state"),
@@ -64,7 +64,7 @@ def _build(workspace: Path, **security: object) -> tuple[SyncSageConfig, TestCli
             "sources": [],
         }
     )
-    client = TestClient(create_app(config, config_path=str(workspace / "syncsage.yaml")))
+    client = TestClient(create_app(config, config_path=str(workspace / "pheasant.yaml")))
     return config, client
 
 
@@ -133,7 +133,7 @@ def test_promote_still_writes_the_servers_own_config(workspace: Path) -> None:
 
     assert response.status_code == 200
     assert response.json()["wrote_config"] is True
-    assert "n1" in (workspace / "syncsage.yaml").read_text(encoding="utf-8")
+    assert "n1" in (workspace / "pheasant.yaml").read_text(encoding="utf-8")
 
 
 def test_promote_still_writes_under_an_allowed_root(workspace: Path) -> None:
@@ -151,8 +151,8 @@ def test_promote_still_writes_under_an_allowed_root(workspace: Path) -> None:
 
 
 def test_resolve_config_write_target_defaults_to_the_server_config(tmp_path: Path) -> None:
-    server = tmp_path / "syncsage.yaml"
-    server.write_text("syncsage: {}\n", encoding="utf-8")
+    server = tmp_path / "pheasant.yaml"
+    server.write_text("pheasant: {}\n", encoding="utf-8")
 
     assert resolve_config_write_target(None, server_config_path=server) == server.resolve()
     assert resolve_config_write_target("", server_config_path=server) == server.resolve()
@@ -165,11 +165,11 @@ def test_mcp_promote_refuses_a_path_outside_allowed_roots(
 ) -> None:
     """The MCP facade carries the same guard as HTTP — agents are callers too."""
 
-    from syncsage.mcp_server.tools import SyncSageTools
+    from pheasant.mcp_server.tools import PheasantTools
 
-    monkeypatch.setenv("SYNCSAGE_CONFIG", str(workspace / "syncsage.yaml"))
+    monkeypatch.setenv("PHEASANT_CONFIG", str(workspace / "pheasant.yaml"))
     config, _client = _build(workspace)
-    tools = SyncSageTools(config)
+    tools = PheasantTools(config)
     tools.register_source(
         config.knowledge_base_id,
         "n1",
@@ -263,9 +263,9 @@ def test_cors_admits_the_configured_ui_origin(workspace: Path) -> None:
 def test_cors_wildcard_remains_available_as_an_explicit_opt_in(workspace: Path) -> None:
     """Deployments behind their own authenticating ingress can still opt in."""
 
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         {
-            "syncsage": {
+            "pheasant": {
                 "name": "sec",
                 "workspace_root": str(workspace / "ws"),
                 "state_path": str(workspace / "state"),
@@ -276,7 +276,7 @@ def test_cors_wildcard_remains_available_as_an_explicit_opt_in(workspace: Path) 
             "sources": [],
         }
     )
-    client = TestClient(create_app(config, config_path=str(workspace / "syncsage.yaml")))
+    client = TestClient(create_app(config, config_path=str(workspace / "pheasant.yaml")))
 
     response = client.get("/overview", headers={"Origin": "https://anywhere.example"})
 
@@ -399,7 +399,7 @@ def test_real_clone_urls_still_pass(url: str) -> None:
 
 
 def test_git_env_pins_transports_and_never_prompts() -> None:
-    from syncsage.targets import _git_env
+    from pheasant.targets import _git_env
 
     env = _git_env()
     pairs = {

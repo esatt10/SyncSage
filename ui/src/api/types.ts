@@ -1,4 +1,4 @@
-// Shapes returned by the SyncSage HTTP API. Graph node/edge payloads are
+// Shapes returned by the pheasant HTTP API. Graph node/edge payloads are
 // intentionally open (Record) because enrichment attaches type-specific fields.
 
 export interface GraphNode {

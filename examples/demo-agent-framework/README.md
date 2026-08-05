@@ -1,6 +1,6 @@
 # Demo: microsoft/agent-framework with OpenAI embeddings + agentic chat
 
-A complete, runnable demo of the parts of SyncSage that are off by default:
+A complete, runnable demo of the parts of pheasant that are off by default:
 semantic indexing through OpenAI embeddings, and answer summation by the
 LangGraph agent loop instead of a single-pass call.
 
@@ -11,7 +11,7 @@ LangGraph agent loop instead of a single-pass call.
 | Answers | single pass, or extractive with no model | **nano-tier chat model, `workflow: agentic`** |
 | Content | this repo | **microsoft/agent-framework**, read-only |
 | Image extras | `[mcp]` | `[mcp,agent]` (adds langgraph) |
-| State | `syncsage-state` volume | separate `syncsage-demo-state` volume |
+| State | `pheasant-state` volume | separate `pheasant-demo-state` volume |
 
 ## 1. Set two values
 
@@ -50,7 +50,7 @@ unchanged file never reaches the embedder.
 Watch it land:
 
 ```bash
-docker compose logs -f syncsage
+docker compose logs -f pheasant
 curl -s http://127.0.0.1:8765/search/embeddings | python -m json.tool
 ```
 
@@ -93,10 +93,10 @@ session from the UI's "Connect model" dialog without touching the config.
   from unchanged bytes are identical.
 - **`workflow: agentic` is deliberate, not `auto`.** If the `[agent]` extra is
   missing, this fails loudly in the logs instead of quietly downgrading to a
-  single-pass answer. `SYNCSAGE_EXTRAS=mcp,agent` in `.env` is what puts
+  single-pass answer. `PHEASANT_EXTRAS=mcp,agent` in `.env` is what puts
   langgraph in the image.
 - **Bigger corpora:** switch `search.vector_store.provider` to `lancedb` and add
-  `vector` to `SYNCSAGE_EXTRAS`. `numpy` is the zero-dependency default and is
+  `vector` to `PHEASANT_EXTRAS`. `numpy` is the zero-dependency default and is
   fine for one repo.
 - **Ports and containers are shared** with the default stack (same compose
   project), so bringing this up replaces a running default stack. The state

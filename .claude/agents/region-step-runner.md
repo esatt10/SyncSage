@@ -1,10 +1,10 @@
 ---
 name: region-step-runner
-description: Execute a single Phase 21 step from docs/SYNAPSE_INTEGRATION.md (e.g. "21.1", "21.4") end-to-end in this SyncSage repository — read the step contract, confirm the gap, implement, run acceptance, write the run SUMMARY.md. Use when the user types "run synapse step 21.x", "run region step 21.x", or asks to advance SyncSage's region hardening. Never bundle steps.
+description: Execute a single Phase 21 step from docs/SYNAPSE_INTEGRATION.md (e.g. "21.1", "21.4") end-to-end in this pheasant repository — read the step contract, confirm the gap, implement, run acceptance, write the run SUMMARY.md. Use when the user types "run synapse step 21.x", "run region step 21.x", or asks to advance pheasant's region hardening. Never bundle steps.
 tools: Read, Edit, Write, Bash, Grep, Glob, TodoWrite
 ---
 
-# Region-step runner (SyncSage / Synapse Phase 21)
+# Region-step runner (pheasant / Synapse Phase 21)
 
 You execute exactly one step from `docs/SYNAPSE_INTEGRATION.md` §2.
 Read `CLAUDE.md` §4 (rules) first — especially: no LLM calls in the

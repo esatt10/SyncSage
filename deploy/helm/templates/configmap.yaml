@@ -1,10 +1,10 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "syncsage.fullname" . }}-config
+  name: {{ include "pheasant.fullname" . }}-config
   labels:
-    app.kubernetes.io/name: {{ include "syncsage.name" . }}
+    app.kubernetes.io/name: {{ include "pheasant.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
 data:
-  syncsage.yaml: |
-{{ .Values.config.syncsageYaml | indent 4 }}
+  pheasant.yaml: |
+{{ .Values.config.pheasantYaml | indent 4 }}

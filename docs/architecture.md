@@ -1,10 +1,10 @@
 # Architecture
 
-SyncSage is a Docker-first MCP server with an admin API, source registry, sync engine, parsing pipeline, graph/search stores, and optional Obsidian export.
+pheasant is a Docker-first MCP server with an admin API, source registry, sync engine, parsing pipeline, graph/search stores, and optional Obsidian export.
 
 ## Runtime flow
 
-1. Load `/config/syncsage.yaml`.
+1. Load `/config/pheasant.yaml`.
 2. Validate workspace roots, source paths, include/exclude rules, and storage paths.
 3. Register enabled sources in the local source registry.
 4. Run startup validation and repair missing graph/search state.
@@ -38,5 +38,5 @@ SyncSage is a Docker-first MCP server with an admin API, source registry, sync e
 - Keep v0.1 local-first and inspectable.
 - Use deterministic parsing, stable IDs, and content hashes for idempotency.
 - Do not execute code from indexed repositories.
-- Keep Obsidian optional; SyncSage must work without it.
-- Prefer one isolated state volume per SyncSage instance.
+- Keep Obsidian optional; pheasant must work without it.
+- Prefer one isolated state volume per pheasant instance.
