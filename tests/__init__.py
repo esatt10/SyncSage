@@ -1,1 +1,1 @@
-"""SyncSage acceptance test package."""
+"""pheasant acceptance test package."""

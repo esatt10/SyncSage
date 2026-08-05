@@ -1,34 +1,34 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: syncsage
-  namespace: syncsage
+  name: pheasant
+  namespace: pheasant
   labels:
-    app.kubernetes.io/name: syncsage
+    app.kubernetes.io/name: pheasant
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: syncsage
+      app.kubernetes.io/name: pheasant
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: syncsage
+        app.kubernetes.io/name: pheasant
     spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
         fsGroup: 10001
       containers:
-        - name: syncsage
-          image: ghcr.io/esatt10/syncsage:0.7.0
+        - name: pheasant
+          image: ghcr.io/esatt10/pheasant:0.7.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 8765
           env:
-            - name: SYNCSAGE_CONFIG
-              value: /config/syncsage.yaml
+            - name: PHEASANT_CONFIG
+              value: /config/pheasant.yaml
           volumeMounts:
             - name: config
               mountPath: /config
@@ -43,7 +43,7 @@ spec:
             - name: exports
               mountPath: /exports
           # Probe budgets are sized for a BUSY process, not just a dead one.
-          # SyncSage answers from one Python process: a heavy agentic question
+          # pheasant answers from one Python process: a heavy agentic question
           # or a large graph walk holds the GIL for stretches, and /health —
           # which returns a constant dict — still has to wait its turn behind
           # that work. With the old budget (5s timeout, 3 failures, 30s period)
@@ -90,13 +90,13 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: syncsage-config
+            name: pheasant-config
         - name: state
           persistentVolumeClaim:
-            claimName: syncsage-state
+            claimName: pheasant-state
         - name: vault
           persistentVolumeClaim:
-            claimName: syncsage-vault
+            claimName: pheasant-vault
         - name: workspace
           emptyDir: {}
         - name: exports

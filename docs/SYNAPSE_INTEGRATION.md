@@ -1,7 +1,7 @@
-# SyncSage as a Synapse region
+# pheasant as a Synapse region
 
 !!! abstract "For consumers — start here"
-    SyncSage can act as a **region** in a **Synapse** fleet: it publishes a
+    pheasant can act as a **region** in a **Synapse** fleet: it publishes a
     bounded **semantic contract** describing what it knows, and a Synapse
     router uses that contract to route global, cross-region queries to it.
 
@@ -9,7 +9,7 @@
       [Attach to a Synapse fleet](how-to/attach-to-synapse.md). That's all most
       consumers need.
     - **Standalone is the default.** Every Synapse setting is off unless you opt
-      in via the `synapse:` config block; a router-less SyncSage is unchanged.
+      in via the `synapse:` config block; a router-less pheasant is unchanged.
     - **The global search experience** (routing, fan-out, merge, cross-region
       "white matter") lives on the router —
       [subjective-retrieval](https://github.com/esatt10/subjective-retrieval).
@@ -47,9 +47,9 @@ term appearing once in 400 files describes the corpus.
 Rule 6 note: the contract schema remains canonical in subjective-retrieval and
 nothing under `contracts/` was hand-edited.
 
-## Internal spec — SyncSage as a Brain Region
+## Internal spec — pheasant as a Brain Region
 
-**Status:** authoritative SyncSage-side spec (2026-06-10). The system-wide
+**Status:** authoritative pheasant-side spec (2026-06-10). The system-wide
 design lives in the **subjective-retrieval** repository:
 `docs/SYNAPSE_ARCHITECTURE.md` (architecture) and
 `docs/SYNAPSE_FRAMEWORK.md` (execution plan, phases 20–26). This document
@@ -58,12 +58,12 @@ cross-repo contract obligations.
 
 ---
 
-## 1. SyncSage's role in Synapse
+## 1. pheasant's role in Synapse
 
 Synapse is a hyperfast federated knowledge-base system. In its brain
 metaphor:
 
-- **SyncSage instances are the regions**: each container owns one
+- **pheasant instances are the regions**: each container owns one
   specialized knowledge base — sync engine, SQLite/FTS5 state, knowledge
   graph, self-search, MCP/HTTP surfaces. Sizes range from single-digit MB
   to multi-TB. Regions are fully self-contained and deploy standalone.
@@ -86,7 +86,7 @@ Two integration invariants:
    vendored files.
 2. **No Python dependency between the repos.** The boundary is the
    contract JSON + HTTP. A region must never import subjective-retrieval;
-   the router never imports syncsage. Regions must keep working with no
+   the router never imports pheasant. Regions must keep working with no
    router configured (all Synapse behavior is a no-op when
    `synapse.router_url` is unset).
 
@@ -94,16 +94,16 @@ Two integration invariants:
 
 ## 2. Phase 21 — region hardening (executes in this repo)
 
-These steps fix the gaps found in the 2026-06-10 audit and make a SyncSage
+These steps fix the gaps found in the 2026-06-10 audit and make a pheasant
 container a production-grade region. One step per agent session; each run
 writes `runs/<ts>-synapse-<step>/SUMMARY.md` (create `runs/` +
 gitignore it). Steps marked **[x-repo]** require matched work in
-subjective-retrieval via its `syncsage-coordinator` skill — identical
+subjective-retrieval via its `pheasant-coordinator` skill — identical
 branch name in both repos, both test suites green before either push.
 
 ### Step 21.1 — Real watcher + scheduler
 
-**Gap:** `src/syncsage/sync/watcher.py` and `sync/scheduler.py` are stubs;
+**Gap:** `src/pheasant/sync/watcher.py` and `sync/scheduler.py` are stubs;
 no live incremental sync despite `sync.watcher.*` / `sync.scheduler.*`
 config keys existing in `config/schema.py`.
 
@@ -113,7 +113,7 @@ batch, then call `SyncEngine.sync_source(name, mode="incremental")`.
 Implement `SchedulerService` as a daemon-thread interval loop
 (`sync.scheduler.interval_seconds`) calling `sync_all("incremental")` as
 the fallback for non-filesystem sources. Both started/stopped by
-`syncsage start`; both no-ops when disabled in config.
+`pheasant start`; both no-ops when disabled in config.
 
 **Acceptance:** integration test: touch a file in a watched fixture
 source → only that artifact re-indexes within debounce + 2 s (assert via
@@ -152,7 +152,7 @@ migrates exactly once (second startup is a no-op).
 first *sync* rather than at engine construction — acquiring at construction
 would break the documented docker-exec MCP-stdio workflow (a second,
 read-mostly engine process against the state dir of a running server). Any
-writer (one-shot `syncsage sync`, startup sync, watcher, scheduler, HTTP
+writer (one-shot `pheasant sync`, startup sync, watcher, scheduler, HTTP
 `/sync`) acquires the lease and holds it (heartbeating) until `close()`;
 all 21.2 acceptance criteria hold unchanged. In-process writers are
 additionally serialized by an engine-internal lock, closing the 21.1
@@ -199,7 +199,7 @@ recorded).
 **Gap:** `search.embeddings` / `search.vector_store` config exists with
 zero code paths; self-search is FTS + graph only.
 
-**Does:** new `src/syncsage/search/vector_store.py`: `VectorStore`
+**Does:** new `src/pheasant/search/vector_store.py`: `VectorStore`
 protocol with a `lancedb` default backend (optional extra
 `[vector]`) and a deterministic **stub embedder** for offline tests.
 Embeddings are computed at sync time per chunk through an OpenAI-spec
@@ -223,7 +223,7 @@ re-embed, keyed on `text_hash`); test suite stays fully offline.
 `NumpyVectorStore` (always available; flat fsync'd `index.json` of
 base64-float32 vectors under `<state>/vectors/<kb_id>/`; the offline test
 backend) and `LanceDBVectorStore` (production default, lazy import with a
-`pip install 'syncsage[vector]'` hint). Idempotency bookkeeping is
+`pip install 'pheasant-kb[vector]'` hint). Idempotency bookkeeping is
 content-addressed: chunk ids embed the chunk `text_hash`, so "already
 embedded?" is exactly store membership — `VectorIndexer` embeds only
 missing ids and prunes ids absent from the `chunks` table at sync end
@@ -242,7 +242,7 @@ backend + stub must work without `[vector]`).
 **Gap:** no sync-completion signal (`sync_events` is write-only); no
 contract; the router has nothing to route on.
 
-**Does:** new `src/syncsage/synapse/` package:
+**Does:** new `src/pheasant/synapse/` package:
 - `publisher.py`: on every `sync.completed`, derive the semantic contract —
   signature from 21.4 chunk vectors (streaming mean, covariance diagonal,
   seeded mini-batch k-means m ≤ 32), vocabulary from graph concept nodes
@@ -251,7 +251,7 @@ contract; the router has nothing to route on.
   Validate against the vendored JSON Schema, write
   `/state/contract.latest.json` (tmp+rename), serve via
   `GET /contract` (FastAPI) and MCP resource
-  `syncsage://knowledge-bases/{kb_id}/contract`.
+  `pheasant://knowledge-bases/{kb_id}/contract`.
 - `events.py`: append-only NDJSON event log `/state/events/YYYY-MM-DD.ndjson`
   (`sync.started|completed|failed`, `source.changed`); when
   `synapse.router_url` is set, POST `sync.completed` to
@@ -269,7 +269,7 @@ except the local contract file + `GET /contract`.
 `synapse.publish: bool`), `tests/test_contract_publisher.py`,
 `tests/test_contract_parity.py`.
 
-**Implementation note (2026-06-14, landed):** new `src/syncsage/synapse/`
+**Implementation note (2026-06-14, landed):** new `src/pheasant/synapse/`
 package (region-side; not the sibling's `synapse/`). The contract is built **by
 hand** to the vendored `contracts/semantic_contract.v1.schema.json` — no import
 of subjective-retrieval. Verified byte-for-byte against the sibling's canonical
@@ -313,7 +313,7 @@ all produce output that feeds back into the sibling's `SemanticContract.seal()`
   21.5 hook (`contract.latest.json` write + NDJSON `sync.completed` event +
   router webhook) is gated by it, so a router-less standalone region is
   byte-for-byte unchanged. `GET /contract` (FastAPI) and the MCP resource
-  `syncsage://knowledge-bases/{kb_id}/contract` (+ `get_contract` tool) serve
+  `pheasant://knowledge-bases/{kb_id}/contract` (+ `get_contract` tool) serve
   the on-disk contract (404 / `{"status":"unpublished"}` before first publish).
 - **Webhook:** when `synapse.router_url` is set, the engine POSTs the
   `sync.completed` event with the inline `contract` to
@@ -331,7 +331,7 @@ and concepts are un-normalized.
 **Does:** *(session A — persistence)* zstd-compressed timestamped
 snapshots `graphs/<kb>/graph.<ts>.json.zst` on the configured interval;
 retention deletes oldest snapshots beyond `max_state_size_gb`;
-`syncsage backup <out.tar.zst>` / `syncsage restore <in>` covering
+`pheasant backup <out.tar.zst>` / `pheasant restore <in>` covering
 SQLite (via `VACUUM INTO`), graphs, contract, events.
 *(session B — graph)* cross-source edge pass: python imports / markdown
 links whose targets resolve into a *different* source produce
@@ -376,14 +376,14 @@ not modified.
   the SQLite db, or `contract.latest.json`, and always keeps at least the newest
   snapshot even if it alone exceeds the cap. `max_state_size_gb` is now typed
   `float` so small-cap tests can use sub-GB values.
-- **Backup format.** `syncsage backup <out.tar.zst>` (new
+- **Backup format.** `pheasant backup <out.tar.zst>` (new
   `persistence/backup.py`) writes a zstd-compressed tar of the durable state:
-  `syncsage.db` taken via **`VACUUM INTO` a temp file** (a consistent snapshot
+  `pheasant.db` taken via **`VACUUM INTO` a temp file** (a consistent snapshot
   under WAL — never a raw copy of the live db; manifests live in the db since
   21.2 so they ride along), plus `graphs/`, `events/`, `vectors/`, any legacy
   `manifests/` dir, and `contract.latest.json` when present. The live state dir
   is read-only during backup.
-- **Restore safety.** `syncsage restore <in.tar.zst>` decompresses + extracts
+- **Restore safety.** `pheasant restore <in.tar.zst>` decompresses + extracts
   into a sibling temp dir (with path-traversal/absolute-member guards), runs
   `PRAGMA integrity_check` on the restored db, and only then swaps it in. It
   **refuses a non-empty target** (non-zero exit, clear message) unless `--force`;
@@ -453,7 +453,7 @@ normalization that keeps id derivation deterministic.
 - **Standalone unchanged.** The pass is fully local, additive, and
   router-independent; idempotency (`tests/test_sync_idempotency.py`) stays green.
 
-**Phase 21 exit criterion:** a single SyncSage container survives
+**Phase 21 exit criterion:** a single pheasant container survives
 kill-mid-sync, live-watches its sources, answers vector+hybrid
 self-search offline-testably, publishes a schema-valid contract on every
 sync, can be backed up and restored byte-faithfully — with the standalone
@@ -467,13 +467,13 @@ sync, can be backed up and restored byte-faithfully — with the standalone
 |---|---|
 | Vendored JSON Schema | `contracts/semantic_contract.v<N>.schema.json` (do not edit; re-vendor from subjective-retrieval) |
 | Golden fixtures | `contracts/fixtures/*.json` — byte-identical with the other repo (`tests/test_contract_parity.py`) |
-| Publisher | `src/syncsage/synapse/publisher.py` (Step 21.5) |
+| Publisher | `src/pheasant/synapse/publisher.py` (Step 21.5) |
 | Serving | `GET /contract` + MCP resource |
 | Push | `POST <router>/v1/synapse/events` on `sync.completed` |
 | Embedding space | The region publishes its own `embedding_space` (model/dim) in the contract; since 2026-07-11 the router routes **heterogeneous fleets** by partitioning per space, so regions with different models/dims coexist. Only when the router opts into the `synapse.embedding_space` pin must `search.embeddings.model` equal it (HTTP 409 otherwise) |
-| Signing (optional, Step 24.4) | `synapse.signing_key_ref` → `src/syncsage/synapse/signing.py` Ed25519-signs `integrity.signature`; router rejects (HTTP 403) under `require_signed` |
+| Signing (optional, Step 24.4) | `synapse.signing_key_ref` → `src/pheasant/synapse/signing.py` Ed25519-signs `integrity.signature`; router rejects (HTTP 403) under `require_signed` |
 
-### Heterogeneous embedding spaces (2026-07-11, [x-repo] — router-side; SyncSage docs-only)
+### Heterogeneous embedding spaces (2026-07-11, [x-repo] — router-side; pheasant docs-only)
 
 The fleet no longer requires all regions to share one embedding model/dim.
 The router (subjective-retrieval, ADR 2026-07-11 in its `docs/DECISIONS.md`)
@@ -485,7 +485,7 @@ query are excluded with `embedding_space_unresolved` in the routing report.
 Cross-space math remains forbidden — white-matter edges are confirmed within
 one space only.
 
-**Region-side impact: none.** SyncSage already embeds with its own configured
+**Region-side impact: none.** pheasant already embeds with its own configured
 model (`search.embeddings`) and publishes its own `embedding_space` in the
 contract; the **wire format is unchanged** (no schema bump, no re-vendor,
 `tests/test_contract_parity.py` green). Operators may now mix regions on
@@ -503,12 +503,12 @@ authenticity/integrity beyond the `content_hash`:
   (`env://NAME` or a bare env-var name). The referenced value is the base64 of a
   32-byte raw Ed25519 private seed — the plaintext key never lands in YAML or on
   disk. **Unset (default) → unsigned** (`integrity.signature: null`); a
-  **standalone, router-less SyncSage is entirely unchanged**.
+  **standalone, router-less pheasant is entirely unchanged**.
 - **What gets signed:** the *exact same canonical body bytes* the
   `integrity.content_hash` covers (body with `integrity` excluded,
   `sort_keys=True`, compact separators, `ensure_ascii=False`). The signature
   lives outside the hashed body, so signing never perturbs the content hash.
-  `src/syncsage/synapse/signing.py` (`sign_body`/`signing_bytes`) is the
+  `src/pheasant/synapse/signing.py` (`sign_body`/`signing_bytes`) is the
   region-side codec; it is byte-compatible with the router's
   `SemanticContract.verify_signature`, guarded by the cross-repo signing-parity
   fixture `contracts/fixtures/signed-demo-region.v1.contract.json` (+ PARITY).
@@ -518,7 +518,7 @@ authenticity/integrity beyond the `content_hash`:
   the **contract wire format / vendored JSON Schema are unchanged** — no
   schema-version bump, no re-vendor.
 - **Optional dependency:** the `cryptography` import is gated behind the new
-  `[a2a]` extra (`pip install 'syncsage[a2a]'`). A region without
+  `[a2a]` extra (`pip install 'pheasant-kb[a2a]'`). A region without
   `signing_key_ref` needs no crypto dep; the offline suite passes without it.
 
 ### Step 25.4 session A — multi-modal: image ingest (2026-06-21, [x-repo])
@@ -531,7 +531,7 @@ artifact's text and flows through the normal chunk → embed → graph path like
 any other document. **Image only this session — audio (transcribe-then-index)
 is session B.**
 
-- **Captioner abstraction:** `src/syncsage/ingestion/captioner.py`.
+- **Captioner abstraction:** `src/pheasant/ingestion/captioner.py`.
   `StubCaptioner` is the **default + offline** path (deterministic caption from
   the file name + a blake2b digest of the image bytes, so the same image always
   captions identically and different images differ; tests use it, no network /
@@ -572,10 +572,10 @@ captioning, same architecture §8 principle (project into the *one* fleet-pinned
 text embedding space; modality-native audio vectors stay region-local, out of
 scope). The transcript becomes the artifact's text and flows through the normal
 chunk → embed → graph path. The transcriber and captioner share a tiny additive
-helper `src/syncsage/ingestion/_modal.py` (`sidecar_text` + `stub_fingerprint`)
+helper `src/pheasant/ingestion/_modal.py` (`sidecar_text` + `stub_fingerprint`)
 so they stay in lock-step; session A's observable behavior is unchanged.
 
-- **Transcriber abstraction:** `src/syncsage/ingestion/transcriber.py`.
+- **Transcriber abstraction:** `src/pheasant/ingestion/transcriber.py`.
   `StubTranscriber` is the **default + offline** path (deterministic transcript
   from the file name + a blake2b digest of the audio bytes — same file always
   transcribes identically, different audio differs; tests use it, **no network /
@@ -619,15 +619,15 @@ A region remains the existing container (`Dockerfile`, port 8765, PVC on
 
 - **Compose** (Synapse Step 25.1, **landed 2026-06-20** in the router repo):
   the `docker compose --profile synapse` topology runs 1 router + 3 demo
-  syncsage regions, each with `synapse.publish: true` +
-  `synapse.router_url` → the router. **No SyncSage code change** was needed:
+  pheasant regions, each with `synapse.publish: true` +
+  `synapse.router_url` → the router. **No pheasant code change** was needed:
   the region image is built unmodified from this repo's `Dockerfile` (sibling
-  build context `../SyncSage`, or `SYNCSAGE_IMAGE` pinned tag), and the three
+  build context `../pheasant`, or `PHEASANT_IMAGE` pinned tag), and the three
   fleet-demo region configs + fixture workspaces are **vendored on the router
   side** (`subjective-retrieval/deploy/synapse-demo/`) and mounted into the
-  container at `/config/syncsage.yaml` + `/workspace`. Regions sync on startup
+  container at `/config/pheasant.yaml` + `/workspace`. Regions sync on startup
   (21.1) and publish their contract over the 21.5 webhook; the router's
-  file-backed registry fills over HTTP (no shared volume). Standalone SyncSage
+  file-backed registry fills over HTTP (no shared volume). Standalone pheasant
   is unchanged — drop `synapse.publish`/`router_url` and the region is
   router-less again. See `subjective-retrieval/docs/DEPLOY.md` §11.
 - **Kubernetes** (Synapse Step 25.2, **landed 2026-06-20** in the router
@@ -636,7 +636,7 @@ A region remains the existing container (`Dockerfile`, port 8765, PVC on
   router (`Deployment` + HPA + `Service`) plus a values-driven `regions:`
   list where **each entry becomes one `StatefulSet` + a `/state` PVC
   (`volumeClaimTemplate`, so each region owns its own volume — independent
-  scale-up) + a headless `Service` + a `ConfigMap`**. **No SyncSage code
+  scale-up) + a headless `Service` + a `ConfigMap`**. **No pheasant code
   change** was needed: the region pod spec in the chart **mirrors this
   repo's `deploy/kubernetes/` manifests** (port 8765, `/health`+`/ready`
   probes, `/state`+`/config`+`/vault`+`/workspace`+`/exports` mounts,
@@ -644,7 +644,7 @@ A region remains the existing container (`Dockerfile`, port 8765, PVC on
   baseline; the chart vendors that shape on the router side (chart values),
   the same boundary as the 25.1 compose configs. Regions publish their
   contract to the router webhook (21.5) over the headless Service DNS name;
-  standalone SyncSage is unchanged. The live `helm template | kubeconform`
+  standalone pheasant is unchanged. The live `helm template | kubeconform`
   + kind smoke is a runbook in `subjective-retrieval/docs/DEPLOY.md` §12
   (the router-repo build env had no helm binary).
 - Auth: regions accept a bearer token (`security` settings) minted by the
@@ -665,7 +665,7 @@ toolchain now available in this environment; 34.6-34.7 were benchmarked and
 correctly concluded NO-GO rather than built — see each step's entry below
 and its `runs/2026-08-03-synapse-34.N/SUMMARY.md` for the full numbers.
 
-**Why now:** concept extraction — SyncSage's biggest indexing cost — was
+**Why now:** concept extraction — pheasant's biggest indexing cost — was
 already retired 2026-08-03 (see the Decision entry above this section; sync
 1.5h → 2m53s). Any WASM initiative has to be judged against what's left, not
 against that already-solved problem. Reading the actual hot paths (not
@@ -708,7 +708,7 @@ knowledge base — matches the Synapse fleet model (one region = one container,
 replicated externally by the router); does not conflict with `sync/locks.py`'s
 `EngineLease` (still exactly one writer process per `/state` dir). The sandbox
 and both hot-loop accelerations for 34.5a run **inside the existing
-`sync/worker.py` child-process indexing worker** — the seam SyncSage already
+`sync/worker.py` child-process indexing worker** — the seam pheasant already
 uses to isolate CPU-heavy indexing from request-serving under the GIL. The
 `_scan_edges` acceleration (34.5b) is the one piece on the **query** path — it
 runs in the main API server process instead, with its own `wasmtime` `Store`,
@@ -759,8 +759,8 @@ connector-shaped behavior.
 
 **Does:** a reference sandboxed connector exercising the harness's capability
 surface (file listing/reading via the host-mediated path, `host_fetch`);
-`tests/fixtures/syncsage-connector-example/` is the canonical third-party
-shape to match. Extend `src/syncsage/testing.py`'s `ConnectorConformance` so a
+`tests/fixtures/pheasant-connector-example/` is the canonical third-party
+shape to match. Extend `src/pheasant/testing.py`'s `ConnectorConformance` so a
 sandboxed connector is held to the identical
 deterministic/idempotent/incremental contract as native connectors.
 
@@ -926,5 +926,5 @@ child-process isolation (`sync/worker.py`) plus the new sandbox actually
 contains the failure. Manual check at 34.5: confirm p50/p95 query latency for
 a query that triggers `_relationship_hits` improves measurably with the WASM
 path enabled vs. disabled on the benchmark fixture, and that
-`syncsage sync --mode incremental` on a one-file change shows a lower fixed-
+`pheasant sync --mode incremental` on a one-file change shows a lower fixed-
 cost floor with 34.5a enabled on a multi-source corpus.

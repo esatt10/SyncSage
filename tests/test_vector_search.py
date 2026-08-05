@@ -18,8 +18,8 @@ from tests.conftest import make_vector_engine, run_sync
 
 
 def _search(engine: Any, query: str, mode: str, source_name: str | None = None) -> dict:
-    from syncsage.search.hybrid import HybridSearch
-    from syncsage.search.sqlite_store import SearchStore
+    from pheasant.search.hybrid import HybridSearch
+    from pheasant.search.sqlite_store import SearchStore
 
     searcher = HybridSearch(SearchStore(engine.state), vector=engine.vector_searcher())
     return searcher.search_context(
@@ -111,7 +111,7 @@ def test_disabled_embeddings_change_nothing(
 ) -> None:
     """Default config: no vector dir, no embedder, search modes as before."""
 
-    run_sync(sync_engine, source_name="syncsage-repo", mode="full")
+    run_sync(sync_engine, source_name="pheasant-repo", mode="full")
     assert sync_engine.vectors is None
     assert sync_engine.vector_searcher() is None
     assert not (state_path / "vectors").exists()
@@ -127,7 +127,7 @@ def test_disabled_embeddings_change_nothing(
 
 
 def test_stub_embedder_is_deterministic_and_synonym_aligned() -> None:
-    from syncsage.search.vector_store import StubEmbedder
+    from pheasant.search.vector_store import StubEmbedder
 
     first = StubEmbedder(dim=32)
     second = StubEmbedder(dim=32)
@@ -148,7 +148,7 @@ def test_stub_embedder_is_deterministic_and_synonym_aligned() -> None:
 def test_openai_spec_embedder_wire_format(monkeypatch: pytest.MonkeyPatch) -> None:
     """Offline conformance with the OpenAI embeddings HTTP shape (x-repo pin)."""
 
-    from syncsage.search.vector_store import OpenAISpecEmbedder
+    from pheasant.search.vector_store import OpenAISpecEmbedder
 
     captured: dict[str, Any] = {}
 
@@ -175,12 +175,12 @@ def test_openai_spec_embedder_wire_format(monkeypatch: pytest.MonkeyPatch) -> No
             {"data": [{"index": i, "embedding": [float(i), 1.0]} for i in reversed(range(count))]}
         )
 
-    monkeypatch.setattr("syncsage.search.vector_store.urlopen", fake_urlopen)
-    monkeypatch.setenv("SYNCSAGE_TEST_EMBED_KEY", "sekrit")
+    monkeypatch.setattr("pheasant.search.vector_store.urlopen", fake_urlopen)
+    monkeypatch.setenv("PHEASANT_TEST_EMBED_KEY", "sekrit")
     embedder = OpenAISpecEmbedder(
         "http://localhost:9/v1/",
         "fleet-pinned-model",
-        api_key_env="SYNCSAGE_TEST_EMBED_KEY",
+        api_key_env="PHEASANT_TEST_EMBED_KEY",
         dimensions=2,
         batch_size=8,
     )
@@ -200,12 +200,12 @@ def test_openai_spec_embedder_wire_format(monkeypatch: pytest.MonkeyPatch) -> No
 def store_backend(request: pytest.FixtureRequest, tmp_path: Path) -> Any:
     if request.param == "lancedb":
         pytest.importorskip(
-            "lancedb", reason="lancedb not installed (pip install 'syncsage[vector]')"
+            "lancedb", reason="lancedb not installed (pip install 'pheasant-kb[vector]')"
         )
-        from syncsage.search.vector_store import LanceDBVectorStore
+        from pheasant.search.vector_store import LanceDBVectorStore
 
         return LanceDBVectorStore(tmp_path / "vectors")
-    from syncsage.search.vector_store import NumpyVectorStore
+    from pheasant.search.vector_store import NumpyVectorStore
 
     return NumpyVectorStore(tmp_path / "vectors")
 
@@ -242,7 +242,9 @@ def test_vector_store_roundtrip(store_backend: Any) -> None:
 
 
 def test_engine_embeds_with_lancedb_backend(tmp_path: Path) -> None:
-    pytest.importorskip("lancedb", reason="lancedb not installed (pip install 'syncsage[vector]')")
+    pytest.importorskip(
+        "lancedb", reason="lancedb not installed (pip install 'pheasant-kb[vector]')"
+    )
     engine = make_vector_engine(tmp_path, vector_provider="lancedb")
     run_sync(engine, source_name="notes", mode="full")
     assert engine.vectors.store.count() >= 2
@@ -264,7 +266,7 @@ def test_numpy_store_caches_the_decoded_matrix(tmp_path: Path) -> None:
     already uses, so it is correctness-equivalent to the uncached version
     and only rebuilds when the underlying file actually changes.
     """
-    from syncsage.search.vector_store import NumpyVectorStore
+    from pheasant.search.vector_store import NumpyVectorStore
 
     store = NumpyVectorStore(tmp_path / "vectors")
     store.upsert(
@@ -309,7 +311,7 @@ def test_numpy_store_concurrent_search_is_thread_safe(tmp_path: Path) -> None:
     """Many threads racing to build the cache must not corrupt or crash."""
     import threading
 
-    from syncsage.search.vector_store import NumpyVectorStore
+    from pheasant.search.vector_store import NumpyVectorStore
 
     store = NumpyVectorStore(tmp_path / "vectors")
     # One-hot vectors: orthogonal, so cosine similarity to the query is
@@ -354,7 +356,7 @@ def test_numpy_store_defers_disk_writes_until_flush(tmp_path: Path) -> None:
     second source into an already-large shared index: over 100GB written
     for a ~150MB final file. Writes must now stay in memory until an
     explicit `flush()` (or the self-throttled interval elapses)."""
-    from syncsage.search.vector_store import NumpyVectorStore
+    from pheasant.search.vector_store import NumpyVectorStore
 
     store = NumpyVectorStore(tmp_path / "vectors", flush_interval_seconds=999)
     path = store.path
@@ -384,7 +386,7 @@ def test_numpy_store_flush_is_durable_for_a_fresh_instance(tmp_path: Path) -> No
     """A second `NumpyVectorStore` pointed at the same directory — the
     shape of a later process reading what an earlier sync wrote — must see
     exactly what was flushed, nothing more and nothing less."""
-    from syncsage.search.vector_store import NumpyVectorStore
+    from pheasant.search.vector_store import NumpyVectorStore
 
     directory = tmp_path / "vectors"
     writer = NumpyVectorStore(directory, flush_interval_seconds=999)
@@ -405,7 +407,7 @@ def test_numpy_store_flush_throttle_matches_checkpoint_pattern(tmp_path: Path) -
     shape as `SyncEngine._maybe_checkpoint` — a short configured interval
     is still respected as a *minimum*, not bypassed, once at least one
     save has actually happened."""
-    from syncsage.search.vector_store import NumpyVectorStore
+    from pheasant.search.vector_store import NumpyVectorStore
 
     store = NumpyVectorStore(tmp_path / "vectors", flush_interval_seconds=999)
     store.upsert(["c1"], [[1.0]], [{"source_id": "s1"}])

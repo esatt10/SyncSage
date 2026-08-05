@@ -1,12 +1,12 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: syncsage-default
-  namespace: syncsage
+  name: pheasant-default
+  namespace: pheasant
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: syncsage
+      app.kubernetes.io/name: pheasant
   policyTypes:
     - Ingress
     - Egress

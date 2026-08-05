@@ -29,7 +29,7 @@ except ModuleNotFoundError:
         stable_semver_tuple,
     )
 
-BOT_COMMENT_MARKER = "<!-- syncsage-release-version-selection -->"
+BOT_COMMENT_MARKER = "<!-- pheasant-release-version-selection -->"
 STATUS_CONTEXT = "Release version selection"
 BUMP_ORDER = ("major", "minor", "patch")
 DEFAULT_BUMP = "patch"
@@ -392,7 +392,7 @@ def main(argv: list[str] | None = None) -> int:
     pr_gate.add_argument("--event-path", required=True)
     pr_gate.add_argument("--repo", required=True)
     pr_gate.add_argument("--owner", required=True)
-    pr_gate.add_argument("--package", default="syncsage")
+    pr_gate.add_argument("--package", default="pheasant")
     pr_gate.add_argument("--token", required=True)
     pr_gate.add_argument("--api-url", default="https://api.github.com")
 
@@ -400,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
     merged.add_argument("--repo", required=True)
     merged.add_argument("--sha", required=True)
     merged.add_argument("--owner", required=True)
-    merged.add_argument("--package", default="syncsage")
+    merged.add_argument("--package", default="pheasant")
     merged.add_argument("--token", required=True)
     merged.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     merged.add_argument("--api-url", default="https://api.github.com")

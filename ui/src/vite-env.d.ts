@@ -21,7 +21,7 @@ declare module "react-cytoscapejs" {
 }
 
 interface ImportMetaEnv {
-  readonly VITE_SYNCSAGE_API_BASE?: string;
+  readonly VITE_PHEASANT_API_BASE?: string;
 }
 
 interface ImportMeta {

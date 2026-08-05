@@ -14,17 +14,17 @@ from typing import Any
 
 import pytest
 
-from syncsage.config.loader import load_config
-from syncsage.mcp_server.tools import SyncSageTools
-from syncsage.security import idp as idp_module
-from syncsage.security.idp import (
+from pheasant.config.loader import load_config
+from pheasant.mcp_server.tools import PheasantTools
+from pheasant.security import idp as idp_module
+from pheasant.security.idp import (
     fetch_scim_groups,
     fresh_idp_groups,
     idp_status,
     run_idp_maintenance,
     run_idp_sync,
 )
-from syncsage.sync import connector_registry
+from pheasant.sync import connector_registry
 from tests.test_acl_enforcement import AclTestConnector
 
 NOW = datetime(2026, 7, 18, 12, 0, 0, tzinfo=UTC)
@@ -61,9 +61,9 @@ def _fake_scim(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 def _config(tmp_path: Path, *, idp_enabled: bool = True, staleness_minutes: int = 60) -> Any:
-    config_path = tmp_path / "syncsage.yaml"
+    config_path = tmp_path / "pheasant.yaml"
     config_path.write_text(
-        f"""syncsage:
+        f"""pheasant:
   name: idp-test
   state_path: {tmp_path / "state"}
   vault_path: {tmp_path / "vault"}
@@ -94,14 +94,14 @@ sources:
 def synced_tools(tmp_path: Path):
     connector_registry.reset_connector_registry()
     connector_registry.register_connector_class("acltest", AclTestConnector)
-    tools = SyncSageTools(_config(tmp_path))
+    tools = PheasantTools(_config(tmp_path))
     tools.sync_source("idp-test", "docs", "incremental")
     yield tools
     tools.engine.close()
     connector_registry.reset_connector_registry()
 
 
-def _titles(tools: SyncSageTools, **kwargs: Any) -> set[str]:
+def _titles(tools: PheasantTools, **kwargs: Any) -> set[str]:
     payload = tools.search_context(
         "idp-test", "project handbook", mode="text", max_results=10, **kwargs
     )
@@ -120,9 +120,9 @@ def test_sync_is_idempotent_but_heartbeat_bumps(
 ) -> None:
     _fake_scim(monkeypatch)
     config = _config(tmp_path)
-    from syncsage.persistence.state_store import StateStore
+    from pheasant.persistence.state_store import StateStore
 
-    state = StateStore(tmp_path / "state" / "syncsage.db")
+    state = StateStore(tmp_path / "state" / "pheasant.db")
     state.migrate()
     state.migrate()  # idempotent second migrate
     try:
@@ -137,7 +137,7 @@ def test_sync_is_idempotent_but_heartbeat_bumps(
         state.close()
 
 
-def test_idp_grant_works_fresh_and_fails_closed_when_stale(synced_tools: SyncSageTools) -> None:
+def test_idp_grant_works_fresh_and_fails_closed_when_stale(synced_tools: PheasantTools) -> None:
     state = synced_tools.engine.state
     # Fresh mapping: alice is in eng per the IdP -> she sees the eng runbook.
     state.replace_idp_groups({"alice": ["eng"]}, datetime.now(UTC).isoformat())
@@ -156,10 +156,10 @@ def test_idp_grant_works_fresh_and_fails_closed_when_stale(synced_tools: SyncSag
 
 
 def test_fresh_idp_groups_disabled_or_never_synced_grants_nothing(tmp_path: Path) -> None:
-    from syncsage.persistence.state_store import StateStore
+    from pheasant.persistence.state_store import StateStore
 
     config = _config(tmp_path, idp_enabled=False)
-    state = StateStore(tmp_path / "state" / "syncsage.db")
+    state = StateStore(tmp_path / "state" / "pheasant.db")
     state.migrate()
     try:
         assert fresh_idp_groups(state, "user:alice", config.security.idp) == set()
@@ -178,9 +178,9 @@ def test_maintenance_due_logic_and_error_resilience(
 ) -> None:
     _fake_scim(monkeypatch)
     config = _config(tmp_path)
-    from syncsage.persistence.state_store import StateStore
+    from pheasant.persistence.state_store import StateStore
 
-    state = StateStore(tmp_path / "state" / "syncsage.db")
+    state = StateStore(tmp_path / "state" / "pheasant.db")
     state.migrate()
     try:
         report = run_idp_maintenance(config, state, now=NOW)
@@ -203,13 +203,13 @@ def test_maintenance_due_logic_and_error_resilience(
 
 def test_http_idp_sync_and_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
-    from syncsage.api.app import create_app
+    from pheasant.api.app import create_app
 
     _fake_scim(monkeypatch)
     connector_registry.reset_connector_registry()
     connector_registry.register_connector_class("acltest", AclTestConnector)
     config = _config(tmp_path)
-    app = create_app(config, config_path=str(tmp_path / "syncsage.yaml"))
+    app = create_app(config, config_path=str(tmp_path / "pheasant.yaml"))
     client = fastapi_testclient.TestClient(app)
     try:
         before = client.get("/security/idp/status").json()
@@ -224,10 +224,10 @@ def test_http_idp_sync_and_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
 
 def test_status_reports_disabled(tmp_path: Path) -> None:
-    from syncsage.persistence.state_store import StateStore
+    from pheasant.persistence.state_store import StateStore
 
     config = _config(tmp_path, idp_enabled=False)
-    state = StateStore(tmp_path / "state" / "syncsage.db")
+    state = StateStore(tmp_path / "state" / "pheasant.db")
     state.migrate()
     try:
         status = idp_status(config, state)

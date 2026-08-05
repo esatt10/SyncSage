@@ -7,9 +7,9 @@ Acceptance:
    connector plugin name.
 2. A glob or ``--split`` over a folder-of-folders yields one source per
    child directory, with de-duplicated names.
-3. ``syncsage up a b c`` writes one config with all three sources, indexes
+3. ``pheasant up a b c`` writes one config with all three sources, indexes
    them, and re-running it re-indexes nothing (idempotency spine).
-4. ``syncsage host`` generates a compose file plus a container-view config
+4. ``pheasant host`` generates a compose file plus a container-view config
    whose paths are remapped into the image — without needing Docker.
 5. The UI's ``/sources/quick-add`` is the same resolution path over HTTP.
 """
@@ -26,11 +26,11 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from syncsage.api.app import create_app
-from syncsage.cli import main
-from syncsage.config.loader import load_config
-from syncsage.deployment.host import render_compose
-from syncsage.targets import (
+from pheasant.api.app import create_app
+from pheasant.cli import main
+from pheasant.config.loader import load_config
+from pheasant.deployment.host import render_compose
+from pheasant.targets import (
     ResolvedTarget,
     TargetError,
     expand_specs,
@@ -44,7 +44,7 @@ SAMPLE_WORKSPACE = Path(__file__).resolve().parent / "fixtures" / "sample_worksp
 
 @pytest.fixture()
 def roots(tmp_path: Path) -> tuple[Path, Path]:
-    return tmp_path / ".syncsage" / "sources", tmp_path / ".syncsage" / "external"
+    return tmp_path / ".pheasant" / "sources", tmp_path / ".pheasant" / "external"
 
 
 def _sync_counts(output: str) -> list[tuple[int, int]]:
@@ -198,7 +198,7 @@ def test_up_indexes_multiple_targets_and_is_idempotent(
     assert main(["up", str(notes), str(clients / "*"), "--no-serve"]) == 0
     output = capsys.readouterr().out
 
-    config_path = tmp_path / "syncsage.yaml"
+    config_path = tmp_path / "pheasant.yaml"
     cfg = load_config(config_path)
     assert [s.name for s in cfg.sources] == ["notes", "acme", "globex"]
     assert cfg.sources[1].type.value == "markdown_folder"
@@ -228,7 +228,7 @@ def test_up_splits_a_parent_directory_into_one_source_each(
 
     assert main(["up", str(parent), "--split", "--no-serve"]) == 0
     capsys.readouterr()
-    cfg = load_config(tmp_path / "syncsage.yaml")
+    cfg = load_config(tmp_path / "pheasant.yaml")
     assert [s.name for s in cfg.sources] == ["alpha", "beta"]
 
 
@@ -241,7 +241,7 @@ def test_up_rejects_a_target_that_does_not_exist(
 
 def test_generated_multi_source_config_round_trips_through_yaml(tmp_path: Path, roots) -> None:
     """Globs and URLs in a generated config must survive the YAML round trip."""
-    from syncsage.quickstart import render_up_config
+    from pheasant.quickstart import render_up_config
 
     notes = tmp_path / "notes"
     notes.mkdir()
@@ -252,7 +252,7 @@ def test_generated_multi_source_config_round_trips_through_yaml(tmp_path: Path, 
         clone_root=clone_root,
         workspace=workspace,
     )
-    config_path = tmp_path / "syncsage.yaml"
+    config_path = tmp_path / "pheasant.yaml"
 
     text = render_up_config(targets, config_path)
     assert text == render_up_config(targets, config_path), "rendering is deterministic"
@@ -276,37 +276,37 @@ def test_host_generates_compose_and_container_config_without_docker(
 
     args = argparse.Namespace(
         path=[str(notes)],
-        config="syncsage.yaml",
+        config="pheasant.yaml",
         name=None,
         port=9100,
         ui_port=9200,
         profile="quickstart",
         split=False,
-        output="docker-compose.syncsage.yml",
+        output="docker-compose.pheasant.yml",
         image=None,
         ui_image=None,
         no_ui=False,
         print_only=True,
     )
-    from syncsage.deployment.host import host_stack
+    from pheasant.deployment.host import host_stack
 
     assert host_stack(args) == 0
     capsys.readouterr()
 
-    compose = yaml.safe_load((tmp_path / "docker-compose.syncsage.yml").read_text(encoding="utf-8"))
+    compose = yaml.safe_load((tmp_path / "docker-compose.pheasant.yml").read_text(encoding="utf-8"))
     services = compose["services"]
-    assert services["syncsage"]["ports"] == ["9100:8765"]
-    assert services["syncsage-ui"]["ports"] == ["9200:80"]
+    assert services["pheasant"]["ports"] == ["9100:8765"]
+    assert services["pheasant-ui"]["ports"] == ["9200:80"]
     # The local source is mounted read-only at a stable container path.
-    assert any(v.endswith("/sources/notes:ro") for v in services["syncsage"]["volumes"])
+    assert any(v.endswith("/sources/notes:ro") for v in services["pheasant"]["volumes"])
     # State survives `docker compose down`.
-    assert any(v.endswith(":/state") for v in services["syncsage"]["volumes"])
+    assert any(v.endswith(":/state") for v in services["pheasant"]["volumes"])
 
     container_config = yaml.safe_load(
-        (tmp_path / "syncsage.container.yaml").read_text(encoding="utf-8")
+        (tmp_path / "pheasant.container.yaml").read_text(encoding="utf-8")
     )
     assert container_config["sources"][0]["path"] == "/sources/notes"
-    assert container_config["syncsage"]["state_path"] == "/state"
+    assert container_config["pheasant"]["state_path"] == "/state"
     assert "/sources/notes" in container_config["security"]["allow_workspace_roots"]
 
 
@@ -317,34 +317,34 @@ def test_host_pins_the_ui_image_and_builds_it_from_a_checkout(tmp_path: Path) ->
     upgraded stack keeps serving a months-old bundle; and a source checkout can
     be ahead of any published tag, so it gets a build context too.
     """
-    from syncsage.deployment.host import DEFAULT_UI_IMAGE, local_ui_context
-    from syncsage.version import __version__
+    from pheasant.deployment.host import DEFAULT_UI_IMAGE, local_ui_context
+    from pheasant.version import __version__
 
-    assert DEFAULT_UI_IMAGE == f"ghcr.io/esatt10/syncsage-ui:{__version__}"
+    assert DEFAULT_UI_IMAGE == f"ghcr.io/esatt10/pheasant-ui:{__version__}"
 
     target = ResolvedTarget(
         name="notes", type="markdown_folder", path=str(tmp_path / "notes"), description="d"
     )
     kwargs = {
         "config_path": tmp_path / "c.yaml",
-        "state_dir": tmp_path / ".syncsage",
+        "state_dir": tmp_path / ".pheasant",
         "port": 8765,
         "ui_port": 8080,
     }
 
-    ui = yaml.safe_load(render_compose([target], **kwargs))["services"]["syncsage-ui"]
+    ui = yaml.safe_load(render_compose([target], **kwargs))["services"]["pheasant-ui"]
     assert ui["image"] == DEFAULT_UI_IMAGE
     assert "build" not in ui, "no build stanza without a checkout to build from"
 
     built = yaml.safe_load(render_compose([target], ui_build_context="/repo/ui", **kwargs))
-    assert built["services"]["syncsage-ui"]["build"] == {"context": "/repo/ui"}
+    assert built["services"]["pheasant-ui"]["build"] == {"context": "/repo/ui"}
 
     # An explicit --ui-image is a deliberate choice of a published bundle.
     pinned = yaml.safe_load(
         render_compose([target], ui_image="my/ui:1.0", ui_build_context="/repo/ui", **kwargs)
     )
-    assert pinned["services"]["syncsage-ui"]["image"] == "my/ui:1.0"
-    assert "build" not in pinned["services"]["syncsage-ui"]
+    assert pinned["services"]["pheasant-ui"]["image"] == "my/ui:1.0"
+    assert "build" not in pinned["services"]["pheasant-ui"]
 
     # This repo IS a checkout, so the fallback resolves to its ui/ directory.
     assert local_ui_context() == str(Path(__file__).resolve().parents[1] / "ui")
@@ -358,13 +358,13 @@ def test_host_can_omit_the_ui_sidecar(tmp_path: Path) -> None:
         render_compose(
             [target],
             config_path=tmp_path / "c.yaml",
-            state_dir=tmp_path / ".syncsage",
+            state_dir=tmp_path / ".pheasant",
             port=8765,
             ui_port=8080,
             include_ui=False,
         )
     )
-    assert set(compose["services"]) == {"syncsage"}
+    assert set(compose["services"]) == {"pheasant"}
 
 
 # --------------------------------------------------------------------- HTTP
@@ -560,4 +560,4 @@ def test_mcp_info_exposes_the_tool_surface(loaded_config) -> None:
 
     names = {tool["name"] for tool in info["tools"]}
     assert {"search_context", "sync_source", "get_graph_neighbors"} <= names
-    assert info["stdio_command"][:2] == ["syncsage", "mcp"]
+    assert info["stdio_command"][:2] == ["pheasant", "mcp"]

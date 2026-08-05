@@ -1,31 +1,31 @@
 # Quickstart: stand up a knowledge base in 10 minutes
 
-By the end of this tutorial you will have a running standalone SyncSage instance
+By the end of this tutorial you will have a running standalone pheasant instance
 that has indexed a folder of files and that you can query over HTTP and MCP. No
 fleet, no API keys, no model downloads — everything here runs offline.
 
 ## Prerequisites
 
 - Python 3.11+ (or Docker, if you prefer the container path below)
-- A clone of this repository, or the `syncsage` package installed:
+- A clone of this repository, or the `pheasant` package installed:
 
 ```bash
 pip install -e ".[dev,mcp]"
 ```
 
-This installs the `syncsage` CLI. Confirm it:
+This installs the `pheasant` CLI. Confirm it:
 
 ```bash
-syncsage --help
+pheasant --help
 ```
 
 ??? note "Prefer Docker?"
     Every command below has a container equivalent. The fastest path is:
 
     ```bash
-    syncsage init --profile quickstart --output syncsage.yaml
-    syncsage compose-env syncsage.yaml --output .syncsage/compose.env
-    docker compose --env-file .syncsage/compose.env up -d
+    pheasant init --profile quickstart --output pheasant.yaml
+    pheasant compose-env pheasant.yaml --output .pheasant/compose.env
+    docker compose --env-file .pheasant/compose.env up -d
     ```
 
     Then jump to [step 5 (health check)](#5-health-check). See
@@ -34,16 +34,16 @@ syncsage --help
 ## 1. Generate a starter config
 
 ```bash
-syncsage init --profile quickstart --output syncsage.yaml
+pheasant init --profile quickstart --output pheasant.yaml
 ```
 
 Expected output:
 
 ```text
-Wrote syncsage.yaml (profile: quickstart)
+Wrote pheasant.yaml (profile: quickstart)
 ```
 
-This writes a `syncsage.yaml` pre-populated from the `quickstart` profile (local
+This writes a `pheasant.yaml` pre-populated from the `quickstart` profile (local
 defaults, API + MCP enabled). Open it — you'll see `sources:`, `search:`,
 `sync:`, and an `obsidian:` block.
 
@@ -57,7 +57,7 @@ printf '# Project Atlas\n\nAtlas is the billing service. Owner: payments team.\n
 printf 'def charge(amount):\n    """Charge a customer."""\n    return amount\n'   > ./kb-demo/billing.py
 ```
 
-Edit the `sources:` list in `syncsage.yaml` so it contains a single
+Edit the `sources:` list in `pheasant.yaml` so it contains a single
 `markdown_folder`/`repository`-style source pointing at `./kb-demo`. A minimal
 source entry looks like this:
 
@@ -80,7 +80,7 @@ sources:
 ```
 
 !!! note "Paths are validated against an allowlist"
-    SyncSage only reads paths under its configured workspace roots
+    pheasant only reads paths under its configured workspace roots
     (`security.allow_workspace_roots`). In a local run, point `path` at a folder
     you own. In Docker, mount it under `/workspace`. See
     [Configure sources](../how-to/sources.md).
@@ -88,19 +88,19 @@ sources:
 ## 3. Validate the config
 
 ```bash
-syncsage validate syncsage.yaml
+pheasant validate pheasant.yaml
 ```
 
 Expected output (a passing run ends without errors):
 
 ```text
-Config valid: syncsage.yaml
+Config valid: pheasant.yaml
 ```
 
 Then check the runtime environment (paths writable, sources reachable):
 
 ```bash
-syncsage doctor --config syncsage.yaml
+pheasant doctor --config pheasant.yaml
 ```
 
 `doctor` prints a checklist of environment checks. If a path can't be read, fix
@@ -109,7 +109,7 @@ the `path` or your `security.allow_workspace_roots` and re-run.
 ## 4. Sync (index the source)
 
 ```bash
-syncsage sync --config syncsage.yaml --source kb-demo --mode incremental
+pheasant sync --config pheasant.yaml --source kb-demo --mode incremental
 ```
 
 Expected output (counts will vary with your files):
@@ -138,7 +138,7 @@ Sync kb-demo (incremental): 0 artifacts, 0 chunks indexed, 2 skipped
 Start the server (HTTP API + MCP on `:8765`):
 
 ```bash
-syncsage start --config syncsage.yaml
+pheasant start --config pheasant.yaml
 ```
 
 In another terminal:
@@ -161,7 +161,7 @@ Expected:
 ## 6. Search it
 
 Search runs over the **HTTP API** (`POST /search`) or **MCP**
-(`search_context`). There is no `syncsage search` CLI subcommand — search is a
+(`search_context`). There is no `pheasant search` CLI subcommand — search is a
 runtime operation against the running server.
 
 ```bash
@@ -192,10 +192,10 @@ For agents, connect over MCP and call `search_context` instead — see
 
 You're done when all of these are true:
 
-- [x] `syncsage validate syncsage.yaml` exits without errors.
-- [x] `syncsage doctor` reports a writable `/state` (or local state path) and a
+- [x] `pheasant validate pheasant.yaml` exits without errors.
+- [x] `pheasant doctor` reports a writable `/state` (or local state path) and a
       reachable source.
-- [x] `syncsage sync ... --source kb-demo` reports artifacts/chunks indexed.
+- [x] `pheasant sync ... --source kb-demo` reports artifacts/chunks indexed.
 - [x] Re-running the same sync reports artifacts **skipped** (idempotency).
 - [x] `GET /health` returns `{"status": "ok"}` and `GET /ready` returns ready.
 - [x] `POST /search` returns at least one result for a query you know is in your

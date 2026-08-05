@@ -4,18 +4,18 @@ MCP is the primary agent interface. Tool responses should be compact, ranked, an
 
 ## Server transports
 
-SyncSage exposes MCP through the official Python MCP SDK when the `mcp` extra is installed. The Docker image includes this runtime.
+pheasant exposes MCP through the official Python MCP SDK when the `mcp` extra is installed. The Docker image includes this runtime.
 
 ```bash
-syncsage mcp --config /config/syncsage.yaml --transport stdio
+pheasant mcp --config /config/pheasant.yaml --transport stdio
 ```
 
-For VS Code, keep SyncSage running with Docker Compose and let VS Code start the MCP protocol process inside that container:
+For VS Code, keep pheasant running with Docker Compose and let VS Code start the MCP protocol process inside that container:
 
 ```bash
-syncsage compose-env syncsage.yaml --output .syncsage/compose.env
-docker compose --env-file .syncsage/compose.env up -d
-docker exec -i syncsage python -m syncsage mcp --config /config/syncsage.yaml --transport stdio
+pheasant compose-env pheasant.yaml --output .pheasant/compose.env
+docker compose --env-file .pheasant/compose.env up -d
+docker exec -i pheasant python -m pheasant mcp --config /config/pheasant.yaml --transport stdio
 ```
 
 The command is intended to be owned by the MCP client, so it waits on stdio. Do not add Docker's `-d` detach flag to the MCP stdio command.
@@ -29,10 +29,10 @@ mkdir -p .vscode
 cp examples/vscode/mcp.json .vscode/mcp.json
 ```
 
-Or generate it from the SyncSage CLI:
+Or generate it from the pheasant CLI:
 
 ```bash
-syncsage client-config vscode --output .vscode/mcp.json
+pheasant client-config vscode --output .vscode/mcp.json
 ```
 
 The committed template contains no host-specific paths. `.vscode/mcp.json` is ignored because users often customize container names, images, volumes, or local environment values.
@@ -64,20 +64,20 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 ## Resources
 
 ```text
-syncsage://knowledge-bases
-syncsage://knowledge-bases/{kb_id}/sources
-syncsage://knowledge-bases/{kb_id}/graph
-syncsage://knowledge-bases/{kb_id}/sources/{source_id}/manifest
-syncsage://knowledge-bases/{kb_id}/sources/{source_id}/repo-map
-syncsage://knowledge-bases/{kb_id}/sources/{source_id}/history
-syncsage://knowledge-bases/{kb_id}/sync-history
-syncsage://knowledge-bases/{kb_id}/graph-slices/{node_id}
-syncsage://knowledge-bases/{kb_id}/nodes/{node_id}
+pheasant://knowledge-bases
+pheasant://knowledge-bases/{kb_id}/sources
+pheasant://knowledge-bases/{kb_id}/graph
+pheasant://knowledge-bases/{kb_id}/sources/{source_id}/manifest
+pheasant://knowledge-bases/{kb_id}/sources/{source_id}/repo-map
+pheasant://knowledge-bases/{kb_id}/sources/{source_id}/history
+pheasant://knowledge-bases/{kb_id}/sync-history
+pheasant://knowledge-bases/{kb_id}/graph-slices/{node_id}
+pheasant://knowledge-bases/{kb_id}/nodes/{node_id}
 ```
 
 ## Prompts
 
-### `use_syncsage_for_coding_task`
+### `use_pheasant_for_coding_task`
 
 1. Call `get_relevant_files` with the user's task.
 2. Inspect returned files/chunks.
@@ -87,6 +87,6 @@ syncsage://knowledge-bases/{kb_id}/nodes/{node_id}
 6. Call `sync_source` with `mode=incremental`.
 7. Check `get_sync_status` before the next task.
 
-### `use_syncsage_for_document_research`
+### `use_pheasant_for_document_research`
 
 Use `search_context` first, prefer chunks with explicit provenance, avoid claims beyond retrieved evidence, and call `get_graph_neighbors` for related material.

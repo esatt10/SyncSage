@@ -1,4 +1,5 @@
 import type { GraphLink, GraphNode } from "../api/types";
+import type { Theme } from "../hooks/useTheme";
 
 // Cytoscape's exported stylesheet type name varies across @types versions, so we
 // keep the stylesheet array loosely typed and let Cytoscape validate at runtime.
@@ -12,31 +13,31 @@ type CyStylesheet = Record<string, unknown>;
  * type is still readable as colour at a glance on either theme.
  */
 export const NODE_COLORS: Record<string, string> = {
-  knowledge_base: "#8a6100",
-  source: "#1f6f8b",
-  repository: "#1f6f8b",
-  directory: "#4a8fa8",
-  file: "#2f6f4f",
-  document: "#2f6f4f",
-  markdown_note: "#3d8a63",
-  chunk: "#7b6cc4",
-  symbol: "#b5651d",
-  entity: "#b3475c",
-  concept: "#8a4fb0",
-  external_reference: "#7a766e",
+  knowledge_base: "#8a6a2a",
+  source: "#4a6a70",
+  repository: "#4a6a70",
+  directory: "#6f8b8e",
+  file: "#5f6b45",
+  document: "#5f6b45",
+  markdown_note: "#7d8d5c",
+  chunk: "#6e6480",
+  symbol: "#a06b3f",
+  entity: "#9a5a58",
+  concept: "#7c5d84",
+  external_reference: "#7c776b",
 };
 
 export const EDGE_COLORS: Record<string, string> = {
-  contains: "#9d998f",
-  indexes: "#7d8dae",
-  has_chunk: "#8d80b8",
-  mentions: "#b57f96",
-  derived_from: "#9d998f",
-  imports: "#c08a4e",
-  calls: "#b87742",
-  references: "#5d97a6",
-  similar_to: "#a684bd",
-  links_to: "#6892b2",
+  contains: "#9e998c",
+  indexes: "#7f8b9e",
+  has_chunk: "#8b81a6",
+  mentions: "#a8808f",
+  derived_from: "#9e998c",
+  imports: "#b98f5c",
+  calls: "#b07a4a",
+  references: "#5f8b93",
+  similar_to: "#9b86ad",
+  links_to: "#6b8a9e",
 };
 
 export const ALL_EDGE_TYPES = Object.keys(EDGE_COLORS);
@@ -94,8 +95,34 @@ const NODE_SIZES: Record<string, number> = {
 };
 
 export function colorForNode(type?: string): string {
-  return (type && NODE_COLORS[type]) || "#7a766e";
+  return (type && NODE_COLORS[type]) || "#7c776b";
 }
+
+/**
+ * Canvas colours resolved per theme.
+ *
+ * Cytoscape draws to a `<canvas>` and never resolves CSS custom properties, so
+ * anything handed to it has to be a concrete value — `var(--graph-label, …)`
+ * silently used its light-theme fallback in dark mode.
+ */
+const CANVAS_COLORS = {
+  light: {
+    node: "#7c776b",
+    edge: "#a9a49a",
+    label: "#4b463d",
+    labelBackground: "#ffffff",
+    outline: "#1f1c17",
+    accent: "#5f6b45",
+  },
+  dark: {
+    node: "#7c776b",
+    edge: "#4a453c",
+    label: "#bcb4a6",
+    labelBackground: "#191713",
+    outline: "#ece7dd",
+    accent: "#a9b485",
+  },
+} as const;
 
 export function shapeForNodeType(type?: string): string {
   return (type && NODE_TYPE_SHAPES[type]) || "ellipse";
@@ -180,7 +207,8 @@ function shorten(label: string): string {
   return `…${label.slice(label.length - 25)}`;
 }
 
-export function buildStylesheet(): CyStylesheet[] {
+export function buildStylesheet(theme: Theme = "light"): CyStylesheet[] {
+  const canvas = CANVAS_COLORS[theme];
   const nodeColorRules: CyStylesheet[] = Object.entries(NODE_COLORS).map(([type, color]) => ({
     selector: `node[ntype = "${type}"]`,
     style: { "background-color": color, "border-color": color },
@@ -193,20 +221,20 @@ export function buildStylesheet(): CyStylesheet[] {
     {
       selector: "node",
       style: {
-        "background-color": "#7a766e",
+        "background-color": canvas.node,
         "background-opacity": 0.92,
         shape: "data(shape)",
         "border-width": 0,
         label: "data(label)",
         // Read against the canvas, not against the node — labels sit below.
-        color: "var(--graph-label, #4a4741)",
+        color: canvas.label,
         "font-size": 9.5,
         "font-weight": 500,
         "text-valign": "bottom",
         "text-margin-y": 5,
         "text-wrap": "ellipsis",
         "text-max-width": "110px",
-        "text-background-color": "#ffffff",
+        "text-background-color": canvas.labelBackground,
         "text-background-opacity": 0,
         width: "data(size)",
         height: "data(size)",
@@ -228,8 +256,8 @@ export function buildStylesheet(): CyStylesheet[] {
       selector: "edge",
       style: {
         width: 1.1,
-        "line-color": "#a9a59c",
-        "target-arrow-color": "#a9a59c",
+        "line-color": canvas.edge,
+        "target-arrow-color": canvas.edge,
         "target-arrow-shape": "triangle",
         "arrow-scale": 0.6,
         "curve-style": "bezier",
@@ -242,7 +270,7 @@ export function buildStylesheet(): CyStylesheet[] {
       selector: "node.selected",
       style: {
         "border-width": 3,
-        "border-color": "#1c1b19",
+        "border-color": canvas.outline,
         "border-opacity": 0.85,
         "background-opacity": 1,
         "z-index": 20,
@@ -253,7 +281,7 @@ export function buildStylesheet(): CyStylesheet[] {
       selector: "node.cited",
       style: {
         "border-width": 3,
-        "border-color": "#2f6f4f",
+        "border-color": canvas.accent,
         "background-opacity": 1,
         "z-index": 15,
       },
@@ -265,7 +293,7 @@ export function buildStylesheet(): CyStylesheet[] {
       selector: "node.ring-0",
       style: {
         "border-width": 3,
-        "border-color": "#1c1b19",
+        "border-color": canvas.outline,
         "border-opacity": 0.55,
         "font-size": 12,
         "font-weight": 700,
@@ -281,7 +309,7 @@ export function buildStylesheet(): CyStylesheet[] {
     { selector: ".faded", style: { opacity: 0.18 } },
     {
       selector: "node.focus",
-      style: { "border-width": 2, "border-color": "#2f6f4f", "z-index": 10 },
+      style: { "border-width": 2, "border-color": canvas.accent, "z-index": 10 },
     },
     { selector: "edge.focus", style: { opacity: 0.9, width: 1.6 } },
   ];

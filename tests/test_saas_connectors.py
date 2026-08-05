@@ -16,18 +16,18 @@ from typing import Any
 
 import pytest
 
-from syncsage.config.loader import load_config
-from syncsage.config.schema import PluginSourceType, SourceConfig
-from syncsage.connectors.confluence import ConfluenceConnector
-from syncsage.connectors.gdrive import GDriveConnector
-from syncsage.connectors.imap import ImapConnector
-from syncsage.connectors.slack import SlackConnector
-from syncsage.persistence.paths import StatePaths
-from syncsage.persistence.state_store import StateStore
-from syncsage.sync import connector_registry
-from syncsage.sync.connectors import ItemNotModified
-from syncsage.sync.engine import SyncEngine
-from syncsage.testing import ConnectorConformance
+from pheasant.config.loader import load_config
+from pheasant.config.schema import PluginSourceType, SourceConfig
+from pheasant.connectors.confluence import ConfluenceConnector
+from pheasant.connectors.gdrive import GDriveConnector
+from pheasant.connectors.imap import ImapConnector
+from pheasant.connectors.slack import SlackConnector
+from pheasant.persistence.paths import StatePaths
+from pheasant.persistence.state_store import StateStore
+from pheasant.sync import connector_registry
+from pheasant.sync.connectors import ItemNotModified
+from pheasant.sync.engine import SyncEngine
+from pheasant.testing import ConnectorConformance
 
 
 def _source(type_name: str, **overrides) -> SourceConfig:
@@ -60,9 +60,9 @@ def _engine_sync_twice(
     connector_registry.reset_connector_registry()
     connector_registry.register_connector_class(type_name, connector_class)
     try:
-        config_path = tmp_path / "syncsage.yaml"
+        config_path = tmp_path / "pheasant.yaml"
         config_path.write_text(
-            f"""syncsage:
+            f"""pheasant:
   name: {type_name}-test
   state_path: {tmp_path / "state-dir"}
   vault_path: {tmp_path / "vault"}
@@ -102,13 +102,13 @@ def test_pyproject_declares_all_first_party_connectors() -> None:
 
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject.open("rb") as fh:
-        eps = tomllib.load(fh)["project"]["entry-points"]["syncsage.connectors"]
+        eps = tomllib.load(fh)["project"]["entry-points"]["pheasant.connectors"]
     assert eps == {
-        "notion": "syncsage.connectors.notion:NotionConnector",
-        "gdrive": "syncsage.connectors.gdrive:GDriveConnector",
-        "slack": "syncsage.connectors.slack:SlackConnector",
-        "confluence": "syncsage.connectors.confluence:ConfluenceConnector",
-        "imap": "syncsage.connectors.imap:ImapConnector",
+        "notion": "pheasant.connectors.notion:NotionConnector",
+        "gdrive": "pheasant.connectors.gdrive:GDriveConnector",
+        "slack": "pheasant.connectors.slack:SlackConnector",
+        "confluence": "pheasant.connectors.confluence:ConfluenceConnector",
+        "imap": "pheasant.connectors.imap:ImapConnector",
     }
 
 
@@ -158,7 +158,7 @@ def fake_gdrive(monkeypatch: pytest.MonkeyPatch) -> list[str]:
                 return body
         raise AssertionError(f"unexpected Drive URL: {url}")
 
-    monkeypatch.setattr("syncsage.connectors.gdrive._gdrive_request", fake)
+    monkeypatch.setattr("pheasant.connectors.gdrive._gdrive_request", fake)
     monkeypatch.setenv("GDRIVE_TOKEN", "gdrive-token")
     return calls
 
@@ -234,7 +234,7 @@ def fake_slack(monkeypatch: pytest.MonkeyPatch) -> list[str]:
             return json.loads(json.dumps(SLACK_HISTORY))
         raise AssertionError(f"unexpected Slack URL: {url}")
 
-    monkeypatch.setattr("syncsage.connectors.slack._slack_request", fake)
+    monkeypatch.setattr("pheasant.connectors.slack._slack_request", fake)
     monkeypatch.setenv("SLACK_TOKEN", "xoxb-test")
     return calls
 
@@ -307,7 +307,7 @@ def fake_confluence(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         calls.append(url)
         return json.loads(json.dumps(CONFLUENCE_PAGES))
 
-    monkeypatch.setattr("syncsage.connectors.confluence._confluence_request", fake)
+    monkeypatch.setattr("pheasant.connectors.confluence._confluence_request", fake)
     monkeypatch.setenv("CONFLUENCE_TOKEN", "conf-token")
     return calls
 
@@ -402,7 +402,7 @@ class FakeIMAP:
 @pytest.fixture()
 def fake_imap(monkeypatch: pytest.MonkeyPatch) -> FakeIMAP:
     fake = FakeIMAP()
-    monkeypatch.setattr("syncsage.connectors.imap._imap_connect", lambda h, p, t: fake)
+    monkeypatch.setattr("pheasant.connectors.imap._imap_connect", lambda h, p, t: fake)
     monkeypatch.setenv("IMAP_CREDENTIALS", "bot:hunter2")
     return fake
 

@@ -1,6 +1,6 @@
 """Guardrails for pointing a source at anything the operator can read.
 
-SyncSage deliberately allows a source to name any readable path, so the
+pheasant deliberately allows a source to name any readable path, so the
 traversal itself has to be bounded and the index has to stay free of
 credentials. These tests pin that bargain:
 
@@ -21,10 +21,10 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from syncsage.api.app import create_app
-from syncsage.config.schema import SECRET_EXCLUDES, SourceConfig, SourceType, SyncSageConfig
-from syncsage.ingestion.walk import WalkBudget, should_prune_directory, walk_source
-from syncsage.sync.engine import SyncEngine
+from pheasant.api.app import create_app
+from pheasant.config.schema import SECRET_EXCLUDES, PheasantConfig, SourceConfig, SourceType
+from pheasant.ingestion.walk import WalkBudget, should_prune_directory, walk_source
+from pheasant.sync.engine import SyncEngine
 
 SECRETS = {
     ".ssh/id_rsa": "SECRETKEY_aaa111",
@@ -68,9 +68,9 @@ def home(tmp_path: Path) -> Path:
     return root
 
 
-def _config(tmp_path: Path, root: Path, **overrides) -> SyncSageConfig:
+def _config(tmp_path: Path, root: Path, **overrides) -> PheasantConfig:
     payload = {
-        "syncsage": {
+        "pheasant": {
             "name": "limits",
             "workspace_root": str(root),
             "state_path": str(tmp_path / "state"),
@@ -80,13 +80,13 @@ def _config(tmp_path: Path, root: Path, **overrides) -> SyncSageConfig:
         "sources": [],
     }
     payload.update(overrides)
-    return SyncSageConfig.model_validate(payload)
+    return PheasantConfig.model_validate(payload)
 
 
-def _client(config: SyncSageConfig, tmp_path: Path) -> TestClient:
-    path = tmp_path / "syncsage.yaml"
+def _client(config: PheasantConfig, tmp_path: Path) -> TestClient:
+    path = tmp_path / "pheasant.yaml"
     if not path.exists():
-        path.write_text("syncsage:\n  name: limits\n", encoding="utf-8")
+        path.write_text("pheasant:\n  name: limits\n", encoding="utf-8")
     return TestClient(create_app(config, config_path=str(path)))
 
 
@@ -431,12 +431,12 @@ def test_quickstart_config_binds_loopback(tmp_path: Path) -> None:
 
     import yaml
 
-    from syncsage.quickstart import render_up_config
+    from pheasant.quickstart import render_up_config
 
     notes = tmp_path / "notes"
     notes.mkdir()
     (notes / "a.md").write_text("# a", encoding="utf-8")
 
-    rendered = yaml.safe_load(render_up_config(notes, tmp_path / "syncsage.yaml"))
+    rendered = yaml.safe_load(render_up_config(notes, tmp_path / "pheasant.yaml"))
 
     assert rendered["server"]["host"] == "127.0.0.1"

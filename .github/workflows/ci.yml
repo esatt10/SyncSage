@@ -103,18 +103,18 @@ jobs:
 
       - name: Validate Docker Compose config
         run: |
-          python -m syncsage compose-env syncsage.example.yaml --output .syncsage/compose.env
-          docker compose --env-file .syncsage/compose.env config --quiet
+          python -m pheasant compose-env pheasant.example.yaml --output .pheasant/compose.env
+          docker compose --env-file .pheasant/compose.env config --quiet
 
       - name: Build image for validation
         uses: docker/build-push-action@v6
         with:
           context: .
           load: true
-          tags: syncsage:ci
+          tags: pheasant:ci
 
       - name: Smoke test built image
         run: |
-          docker run --rm syncsage:ci python -m syncsage --help
-          docker run --rm syncsage:ci python -m syncsage validate /config/syncsage.yaml --no-require-paths
-          docker run --rm syncsage:ci python -c "from syncsage.api.app import create_app; print(create_app(config_path='/config/syncsage.yaml').title)"
+          docker run --rm pheasant:ci python -m pheasant --help
+          docker run --rm pheasant:ci python -m pheasant validate /config/pheasant.yaml --no-require-paths
+          docker run --rm pheasant:ci python -c "from pheasant.api.app import create_app; print(create_app(config_path='/config/pheasant.yaml').title)"

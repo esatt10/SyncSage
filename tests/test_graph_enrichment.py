@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from syncsage.mcp_server.tools import SyncSageTools
+from pheasant.mcp_server.tools import PheasantTools
 from tests.conftest import result_items, run_sync
 
 
@@ -11,13 +11,13 @@ def test_full_sync_creates_enriched_graph_nodes_and_edges(
     loaded_config: object,
     sync_engine: object,
 ) -> None:
-    readme = workspace_copy / "syncsage-repo" / "README.md"
+    readme = workspace_copy / "pheasant-repo" / "README.md"
     readme.write_text(
         readme.read_text(encoding="utf-8")
-        + "\nSee [API docs](https://example.com/syncsage/api) and [@syncsage-paper].\n",
+        + "\nSee [API docs](https://example.com/pheasant/api) and [@pheasant-paper].\n",
         encoding="utf-8",
     )
-    (workspace_copy / "syncsage-repo" / "syncsage" / "cross_file.py").write_text(
+    (workspace_copy / "pheasant-repo" / "pheasant" / "cross_file.py").write_text(
         "import json\n\n"
         "HEALTH_PATH = '/health'\n\n"
         "class SearchAgent:\n"
@@ -26,7 +26,7 @@ def test_full_sync_creates_enriched_graph_nodes_and_edges(
         encoding="utf-8",
     )
 
-    run_sync(sync_engine, source_name="syncsage-repo", mode="full")
+    run_sync(sync_engine, source_name="pheasant-repo", mode="full")
     graph = sync_engine.graph_builder.graph
     node_types = {node["type"] for node in graph.to_node_link()["nodes"]}
     edge_types = {edge["type"] for edge in graph.to_node_link()["links"]}
@@ -37,7 +37,7 @@ def test_full_sync_creates_enriched_graph_nodes_and_edges(
     assert {"directory", "symbol", "entity", "external_reference"} <= node_types
     assert "concept" not in node_types
     assert any(
-        node["type"] == "directory" and node.get("relative_path") == "syncsage"
+        node["type"] == "directory" and node.get("relative_path") == "pheasant"
         for node in graph.to_node_link()["nodes"]
     )
     expected_edges = {
@@ -61,11 +61,11 @@ def test_graph_neighbors_honor_depth_and_edge_filters(
     loaded_config: object,
     sync_engine: object,
 ) -> None:
-    run_sync(sync_engine, source_name="syncsage-repo", mode="full")
-    tools = SyncSageTools(loaded_config)
+    run_sync(sync_engine, source_name="pheasant-repo", mode="full")
+    tools = PheasantTools(loaded_config)
     result = tools.get_graph_neighbors(
         loaded_config.knowledge_base_id,
-        "file:syncsage-repo:syncsage/sync_engine.py:branch=none",
+        "file:pheasant-repo:pheasant/sync_engine.py:branch=none",
         depth=2,
         edge_types=["mentions", "derived_from"],
     )
@@ -90,7 +90,7 @@ def test_graph_neighbors_honor_depth_and_edge_filters(
 def test_graph_terms_improve_cross_file_search(
     sync_engine: object,
 ) -> None:
-    run_sync(sync_engine, source_name="syncsage-repo", mode="full")
+    run_sync(sync_engine, source_name="pheasant-repo", mode="full")
 
     search_result = sync_engine.search_context("SyncEngine HEALTH_PATH", max_results=5)
     paths = {
@@ -99,8 +99,8 @@ def test_graph_terms_improve_cross_file_search(
         if isinstance(item, dict)
     }
 
-    assert "syncsage/sync_engine.py" in paths
-    assert "syncsage/api.py" in paths
+    assert "pheasant/sync_engine.py" in paths
+    assert "pheasant/api.py" in paths
 
 
 def test_similarity_index_matches_all_pairs_exactly() -> None:
@@ -114,7 +114,7 @@ def test_similarity_index_matches_all_pairs_exactly() -> None:
 
     import random
 
-    from syncsage.graph.enrichment import SemanticSimilarityPass
+    from pheasant.graph.enrichment import SemanticSimilarityPass
 
     def all_pairs(artifacts):
         edges = []
@@ -151,7 +151,7 @@ def test_similarity_index_matches_all_pairs_exactly() -> None:
 def test_similarity_can_be_limited_to_what_changed() -> None:
     """An incremental sync only needs pairs touching a rewritten artifact."""
 
-    from syncsage.graph.enrichment import SemanticSimilarityPass
+    from pheasant.graph.enrichment import SemanticSimilarityPass
 
     artifacts = [
         ("a", {"concept_terms": ["alpha", "beta", "gamma"]}),

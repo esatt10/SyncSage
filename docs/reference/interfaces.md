@@ -1,6 +1,6 @@
 # Interface matrix
 
-SyncSage exposes the same capabilities across several surfaces: the **CLI**, the
+pheasant exposes the same capabilities across several surfaces: the **CLI**, the
 **HTTP API**, the **web UI**, and **MCP** (for agents). This page maps each
 capability area to the concrete command, route, or tool on each surface so you
 can pick whichever fits your workflow.
@@ -11,13 +11,13 @@ Legend: — means "not offered on this surface"; use one of the others.
 
 | Capability | CLI | HTTP | Web UI | MCP |
 |---|---|---|---|---|
-| Generate starter config | `syncsage init --profile <p>` | — | — | — |
-| Validate config | `syncsage validate <file>` | — | Config editor (diff preview) | — |
-| Show resolved config | `syncsage config show --effective` | `GET /config`, `GET /config/effective` | Config editor | — |
+| Generate starter config | `pheasant init --profile <p>` | — | — | — |
+| Validate config | `pheasant validate <file>` | — | Config editor (diff preview) | — |
+| Show resolved config | `pheasant config show --effective` | `GET /config`, `GET /config/effective` | Config editor | — |
 | Edit config | (edit YAML) | `PUT /config` | Config editor (form + raw YAML) | — |
-| Environment doctor | `syncsage doctor` | `GET /health`, `GET /ready` | — | — |
-| Generate compose env | `syncsage compose-env <file>` | — | — | — |
-| Generate VS Code MCP config | `syncsage client-config vscode` | — | — | — |
+| Environment doctor | `pheasant doctor` | `GET /health`, `GET /ready` | — | — |
+| Generate compose env | `pheasant compose-env <file>` | — | — | — |
+| Generate VS Code MCP config | `pheasant client-config vscode` | — | — | — |
 
 ## Exploration (sources & sync)
 
@@ -25,16 +25,16 @@ Legend: — means "not offered on this surface"; use one of the others.
 |---|---|---|---|---|
 | List knowledge bases | — | `GET /knowledge-bases` | — | `list_knowledge_bases` |
 | List sources | — | `GET /sources` | Sources page | `list_sources` |
-| Set up from one target (path/URL/glob) | `syncsage up <target>…` | `POST /sources/quick-add` | Sources → **+ Add source** | — |
+| Set up from one target (path/URL/glob) | `pheasant up <target>…` | `POST /sources/quick-add` | Sources → **+ Add source** | — |
 | List registerable source types (built-in + plugins) | — | `GET /sources/types` | Sources → Advanced… (type picker) | — |
 | Register a source (full schema) | (edit YAML) | `POST /sources` | Sources → **Advanced…** | `register_source` |
 | Update a source | (edit YAML) | `PUT /sources/{id}` | Sources → edit | — |
 | Disable a source | (edit YAML) | `POST /sources/{id}/disable` | Sources page | `disable_source` |
 | Remove a source | (edit YAML) | `DELETE /sources/{id}` | Sources page | `remove_source` |
 | Promote runtime source to config | — | `POST /sources/{id}/promote` | Sources → promote | `promote_runtime_source_to_config` |
-| Sync one source | `syncsage sync --source <name>` | `POST /sync/{id}` | Source manager | `sync_source` |
-| Sync all sources | `syncsage sync --all` | `POST /sync` | Source manager | `sync_all` |
-| Repair state | `syncsage repair`, `syncsage sync --mode repair` | `POST /sync` (mode) | — | — |
+| Sync one source | `pheasant sync --source <name>` | `POST /sync/{id}` | Source manager | `sync_source` |
+| Sync all sources | `pheasant sync --all` | `POST /sync` | Source manager | `sync_all` |
+| Repair state | `pheasant repair`, `pheasant sync --mode repair` | `POST /sync` (mode) | — | — |
 | Sync status | — | `GET /sync/status` | Source manager | `get_sync_status` |
 | Sync history | — | `GET /sources/{id}/history` | — | `get_sync_history` |
 
@@ -60,7 +60,7 @@ Legend: — means "not offered on this surface"; use one of the others.
 |---|---|---|---|---|
 | Inspect embeddings status + coverage | — | `GET /search/embeddings` | Settings → Semantic search | — |
 | Enable / configure embeddings | (edit YAML) | `PUT /search/embeddings` | Settings → Semantic search | — |
-| Embed already-indexed content | `syncsage sync --mode full` | `POST /search/embeddings/reindex` | **Build missing vectors** | — |
+| Embed already-indexed content | `pheasant sync --mode full` | `POST /search/embeddings/reindex` | **Build missing vectors** | — |
 
 ## Visualization
 
@@ -88,12 +88,12 @@ Routing, fan-out, merge, and global cross-region search live on the **router**
 
 | Capability | CLI |
 |---|---|
-| Host a configured container (+ UI) for targets | `syncsage host <target>…` |
-| Start HTTP API + MCP | `syncsage start` |
-| Serve (container entrypoint) | `syncsage serve` |
-| Standalone MCP server | `syncsage mcp --transport stdio\|streamable-http\|sse` |
-| Backup state | `syncsage backup <out>` |
-| Restore state | `syncsage restore <in> [--force]` |
+| Host a configured container (+ UI) for targets | `pheasant host <target>…` |
+| Start HTTP API + MCP | `pheasant start` |
+| Serve (container entrypoint) | `pheasant serve` |
+| Standalone MCP server | `pheasant mcp --transport stdio\|streamable-http\|sse` |
+| Backup state | `pheasant backup <out>` |
+| Restore state | `pheasant restore <in> [--force]` |
 
 See [HTTP API](http-api.md) for the full route list and
 [MCP tools & resources](../mcp_tools.md) for the full tool/resource list.

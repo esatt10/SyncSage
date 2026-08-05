@@ -1,6 +1,6 @@
 # Agentic Workflows
 
-SyncSage is designed to keep agent context precise and fresh without loading whole repositories or document collections into prompts.
+pheasant is designed to keep agent context precise and fresh without loading whole repositories or document collections into prompts.
 
 ## Coding workflow
 

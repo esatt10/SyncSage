@@ -14,18 +14,18 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from syncsage.api.app import create_app
-from syncsage.config.schema import (
+from pheasant.api.app import create_app
+from pheasant.config.schema import (
     ChunkingSettings,
+    PheasantConfig,
+    PheasantSettings,
     SourceConfig,
     SourceConnectorSettings,
     SourceSyncSettings,
     SourceType,
-    SyncSageConfig,
-    SyncSageSettings,
 )
-from syncsage.mcp_server.tools import SyncSageTools
-from syncsage.sync.engine import SyncEngine
+from pheasant.mcp_server.tools import PheasantTools
+from pheasant.sync.engine import SyncEngine
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
@@ -141,7 +141,7 @@ def _base_url(server: ThreadingHTTPServer) -> str:
     return f"http://127.0.0.1:{server.server_address[1]}"
 
 
-def _web_config(tmp_path: Path, urls: list[str]) -> SyncSageConfig:
+def _web_config(tmp_path: Path, urls: list[str]) -> PheasantConfig:
     return _config(
         tmp_path,
         SourceConfig(
@@ -377,7 +377,7 @@ def test_s3_second_sync_lists_but_reads_zero_objects(
             },
         }
     )
-    monkeypatch.setattr("syncsage.sync.connectors._boto3_client", lambda: client)
+    monkeypatch.setattr("pheasant.sync.connectors._boto3_client", lambda: client)
     config = _config(
         tmp_path,
         SourceConfig(
@@ -427,7 +427,7 @@ def test_validate_only_does_not_write_index_state(tmp_path: Path, workspace_copy
         SourceConfig(
             name="sample-repo",
             type=SourceType.repository,
-            path=workspace_copy / "syncsage-repo",
+            path=workspace_copy / "pheasant-repo",
             sync=SourceSyncSettings(on_startup=False),
         ),
     )
@@ -536,15 +536,15 @@ def test_web_collection_connector_syncs_and_exposes_checkpoint(
     assert checkpoint["high_watermark"]["item_count"] == 1
 
     api_status = TestClient(create_app(config)).get("/sync/status").json()
-    mcp_status = SyncSageTools(config).get_sync_status(config.knowledge_base_id)
+    mcp_status = PheasantTools(config).get_sync_status(config.knowledge_base_id)
 
     assert api_status["checkpoints"][0]["source_id"] == "web-docs"
     assert mcp_status["checkpoints"][0]["source_id"] == "web-docs"
 
 
-def _config(tmp_path: Path, source: SourceConfig) -> SyncSageConfig:
-    return SyncSageConfig(
-        syncsage=SyncSageSettings(
+def _config(tmp_path: Path, source: SourceConfig) -> PheasantConfig:
+    return PheasantConfig(
+        pheasant=PheasantSettings(
             name="connector-tests",
             state_path=tmp_path / "state",
             vault_path=tmp_path / "vault",

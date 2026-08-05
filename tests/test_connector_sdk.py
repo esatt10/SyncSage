@@ -19,15 +19,15 @@ from pathlib import Path
 
 import pytest
 
-from syncsage.config.loader import load_config
-from syncsage.config.schema import PluginSourceType, SourceType
-from syncsage.persistence.paths import StatePaths
-from syncsage.persistence.state_store import StateStore
-from syncsage.sync import connector_registry
-from syncsage.sync.connectors import ConnectorUnavailable, connector_for_source
-from syncsage.sync.engine import SyncEngine
+from pheasant.config.loader import load_config
+from pheasant.config.schema import PluginSourceType, SourceType
+from pheasant.persistence.paths import StatePaths
+from pheasant.persistence.state_store import StateStore
+from pheasant.sync import connector_registry
+from pheasant.sync.connectors import ConnectorUnavailable, connector_for_source
+from pheasant.sync.engine import SyncEngine
 
-EXAMPLE_PKG = Path(__file__).resolve().parent / "fixtures" / "syncsage-connector-example"
+EXAMPLE_PKG = Path(__file__).resolve().parent / "fixtures" / "pheasant-connector-example"
 
 
 @pytest.fixture(autouse=True)
@@ -41,7 +41,7 @@ def clean_registry():
 def example_connector_class():
     sys.path.insert(0, str(EXAMPLE_PKG))
     try:
-        from syncsage_connector_example import StaticDirConnector
+        from pheasant_connector_example import StaticDirConnector
 
         yield StaticDirConnector
     finally:
@@ -50,10 +50,10 @@ def example_connector_class():
 
 def _write_config(tmp_path: Path, source_type: str, content_dir: Path) -> Path:
     # Hand-rendered in the inline-first-key list style both PyYAML and the
-    # dependency-light yaml shim parse (same shape `syncsage up` generates).
-    config_path = tmp_path / "syncsage.yaml"
+    # dependency-light yaml shim parse (same shape `pheasant up` generates).
+    config_path = tmp_path / "pheasant.yaml"
     config_path.write_text(
-        f"""syncsage:
+        f"""pheasant:
   name: sdk-test
   state_path: {tmp_path / "state"}
   vault_path: {tmp_path / "vault"}
@@ -120,7 +120,7 @@ def test_entry_point_registration_resolves(
 ) -> None:
     ep = EntryPoint(
         name="staticdir",
-        value="syncsage_connector_example:StaticDirConnector",
+        value="pheasant_connector_example:StaticDirConnector",
         group=connector_registry.ENTRY_POINT_GROUP,
     )
     monkeypatch.setattr(

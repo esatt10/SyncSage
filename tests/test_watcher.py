@@ -7,9 +7,9 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from syncsage.config.loader import load_config
-from syncsage.sync.engine import SyncEngine
-from syncsage.sync.watcher import WatcherService
+from pheasant.config.loader import load_config
+from pheasant.sync.engine import SyncEngine
+from pheasant.sync.watcher import WatcherService
 
 POLL_TIMEOUT_S = 5.0
 
@@ -35,10 +35,10 @@ def test_watcher_reindexes_only_the_touched_artifact(
     cfg.sync.watcher.debounce_ms = 200
     cfg.sync.watcher.batch_window_ms = 1000
     engine = SyncEngine(cfg)
-    engine.sync_source("syncsage-repo", "full")
+    engine.sync_source("pheasant-repo", "full")
     before = {
         relative: dict(entry)
-        for relative, entry in engine.manifests.load("syncsage-repo")["artifacts"].items()
+        for relative, entry in engine.manifests.load("pheasant-repo")["artifacts"].items()
     }
     assert "README.md" in before
     assert len(before) >= 2, "fixture repo should contain more than one artifact"
@@ -48,14 +48,14 @@ def test_watcher_reindexes_only_the_touched_artifact(
     watcher.start()
     assert watcher.running
     try:
-        target = workspace_copy / "syncsage-repo" / "README.md"
+        target = workspace_copy / "pheasant-repo" / "README.md"
         target.write_text(
             target.read_text(encoding="utf-8") + "\n\nWatcher acceptance edit.\n",
             encoding="utf-8",
         )
 
         def touched_artifact_reindexed() -> bool:
-            artifacts = engine.manifests.load("syncsage-repo")["artifacts"]
+            artifacts = engine.manifests.load("pheasant-repo")["artifacts"]
             entry = artifacts.get("README.md") or {}
             return bool(entry.get("sha256")) and entry["sha256"] != before["README.md"]["sha256"]
 
@@ -63,7 +63,7 @@ def test_watcher_reindexes_only_the_touched_artifact(
         assert _wait_for(touched_artifact_reindexed, timeout=0.2 + 2.0), (
             "touched artifact was not re-indexed within debounce + 2 s"
         )
-        after = engine.manifests.load("syncsage-repo")["artifacts"]
+        after = engine.manifests.load("pheasant-repo")["artifacts"]
         assert set(after) == set(before)
         for relative, entry in after.items():
             if relative == "README.md":

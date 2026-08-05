@@ -1,6 +1,6 @@
 # Multi-modal ingest: index images and audio (offline)
 
-SyncSage can ingest **images** and **audio** alongside text. It does this by
+pheasant can ingest **images** and **audio** alongside text. It does this by
 turning each non-text file into searchable text:
 
 - **Images** (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`) are **captioned**.
@@ -21,13 +21,13 @@ copy-pasteable.
        exercise the pipeline; the same file always yields the same text.
     2. **Authored sidecar (recommended for real content):** drop a
        `<file>.caption.txt` or `<file>.transcript.txt` next to the media file.
-       SyncSage uses its contents **verbatim**, and the sidecar wins over both
+       pheasant uses its contents **verbatim**, and the sidecar wins over both
        the stub and any network captioner. This is the offline way to get
        accurate text without calling a model.
 
 ## 1. Add a media folder to your config
 
-Start from the [quickstart](quickstart.md) `syncsage.yaml`. Create a folder with
+Start from the [quickstart](quickstart.md) `pheasant.yaml`. Create a folder with
 one image and one audio file:
 
 ```bash
@@ -90,7 +90,7 @@ The sidecar filename is the media filename **plus** the suffix:
 ## 3. Sync
 
 ```bash
-syncsage sync --config syncsage.yaml --source kb-demo --mode incremental
+pheasant sync --config pheasant.yaml --source kb-demo --mode incremental
 ```
 
 Expected output (counts vary):
@@ -109,7 +109,7 @@ is the caption / transcript.
     file (or its sidecar) and it is re-processed.
 
 ```bash
-syncsage sync --config syncsage.yaml --source kb-demo --mode incremental
+pheasant sync --config pheasant.yaml --source kb-demo --mode incremental
 ```
 
 ```text
@@ -121,7 +121,7 @@ Sync kb-demo (incremental): 0 artifacts, 0 chunks indexed, 4 skipped
 Start the server and search for content that only lives in the media files:
 
 ```bash
-syncsage start --config syncsage.yaml &
+pheasant start --config pheasant.yaml &
 curl -X POST http://localhost:8765/search \
   -H "content-type: application/json" \
   -d '{"query": "payments gateway diagram", "mode": "hybrid", "max_results": 5}'

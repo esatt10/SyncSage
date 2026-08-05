@@ -20,9 +20,9 @@ from typing import Any
 import jsonschema
 import pytest
 
-from syncsage.config.schema import SyncSageConfig
-from syncsage.synapse.publisher import CONTRACT_FILENAME, ContractPublisher, contract_path
-from syncsage.sync.engine import SyncEngine
+from pheasant.config.schema import PheasantConfig
+from pheasant.synapse.publisher import CONTRACT_FILENAME, ContractPublisher, contract_path
+from pheasant.sync.engine import SyncEngine
 from tests.conftest import make_vector_engine, run_sync
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -44,7 +44,7 @@ def _publish_engine(tmp_path: Path, *, embeddings: bool = True, **synapse: Any) 
     for key, value in synapse.items():
         setattr(engine.config.synapse, key, value)
     # Rebuild the webhook so an injected router_url takes effect.
-    from syncsage.synapse.events import RouterWebhook
+    from pheasant.synapse.events import RouterWebhook
 
     engine.router_webhook = RouterWebhook(
         engine.config.synapse.router_url,
@@ -62,9 +62,9 @@ def _no_embed_engine(tmp_path: Path) -> SyncEngine:
     (notes / "kitchen.md").write_text(
         "# Kitchen\n\nWash dishes nightly and restock pantry shelves.\n", encoding="utf-8"
     )
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         {
-            "syncsage": {
+            "pheasant": {
                 "name": "no-embed-region",
                 "state_path": str(tmp_path / "state"),
                 "vault_path": str(tmp_path / "vault"),
@@ -86,7 +86,7 @@ def test_published_contract_validates_against_vendored_schema(tmp_path: Path) ->
     engine = _publish_engine(tmp_path)
     run_sync(engine, source_name="notes", mode="full")
 
-    path = contract_path(engine.config.syncsage.state_path)
+    path = contract_path(engine.config.pheasant.state_path)
     assert path.name == CONTRACT_FILENAME
     assert path.exists()
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -110,8 +110,8 @@ def test_published_contract_validates_against_vendored_schema(tmp_path: Path) ->
 def test_content_hash_seals_the_body(tmp_path: Path) -> None:
     engine = _publish_engine(tmp_path)
     run_sync(engine, source_name="notes", mode="full")
-    payload = json.loads(contract_path(engine.config.syncsage.state_path).read_text("utf-8"))
-    from syncsage.synapse.publisher import _content_hash
+    payload = json.loads(contract_path(engine.config.pheasant.state_path).read_text("utf-8"))
+    from pheasant.synapse.publisher import _content_hash
 
     body = {k: v for k, v in payload.items() if k != "integrity"}
     assert payload["integrity"]["content_hash"] == _content_hash(body)
@@ -124,7 +124,7 @@ def test_no_vector_fallback_emits_degenerate_signature(tmp_path: Path) -> None:
     assert engine.vectors is None
     run_sync(engine, source_name="notes", mode="full")
 
-    payload = json.loads(contract_path(engine.config.syncsage.state_path).read_text("utf-8"))
+    payload = json.loads(contract_path(engine.config.pheasant.state_path).read_text("utf-8"))
     jsonschema.validate(payload, SCHEMA)
     assert payload["signature"]["sample_count"] == 0
     assert payload["signature"]["cluster_centroids"] == []
@@ -230,7 +230,7 @@ def test_router_down_does_not_fail_the_sync(tmp_path: Path) -> None:
     result = run_sync(engine, source_name="notes", mode="full")
     assert result.status == "healthy"
     # Contract still published locally despite the router being unreachable.
-    assert contract_path(engine.config.syncsage.state_path).exists()
+    assert contract_path(engine.config.pheasant.state_path).exists()
 
 
 def test_no_webhook_when_router_unset(tmp_path: Path, router_server) -> None:
@@ -254,7 +254,7 @@ def test_sync_completed_event_appended_to_ndjson(tmp_path: Path) -> None:
     assert completed[0]["source_id"] == "notes"
     assert completed[0]["kb_id"] == "vector-acceptance"
     # Daily file naming.
-    files = list((Path(engine.config.syncsage.state_path) / "events").glob("*.ndjson"))
+    files = list((Path(engine.config.pheasant.state_path) / "events").glob("*.ndjson"))
     assert files and files[0].name.endswith(".ndjson")
 
 
@@ -267,7 +267,7 @@ def test_standalone_no_publish_no_contract_no_events(tmp_path: Path) -> None:
     engine = make_vector_engine(tmp_path)  # synapse.publish defaults to False
     assert engine.config.synapse.publish is False
     run_sync(engine, source_name="notes", mode="full")
-    assert not contract_path(engine.config.syncsage.state_path).exists()
+    assert not contract_path(engine.config.pheasant.state_path).exists()
     # No sync.completed events emitted to the stream when publishing is off...
     events = engine.events.read_all()
     assert all(e["type"] != "sync.completed" for e in events)
@@ -281,7 +281,7 @@ def test_standalone_no_publish_no_contract_no_events(tmp_path: Path) -> None:
 def test_http_get_contract_404_before_and_200_after(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
 
-    from syncsage.api.app import create_app
+    from pheasant.api.app import create_app
 
     engine = _publish_engine(tmp_path)
     app = create_app(config=engine.config)
@@ -303,9 +303,9 @@ def test_mcp_tool_returns_contract(tmp_path: Path) -> None:
     engine = _publish_engine(tmp_path)
     run_sync(engine, source_name="notes", mode="full")
 
-    from syncsage.mcp_server.tools import SyncSageTools
+    from pheasant.mcp_server.tools import PheasantTools
 
-    tools = SyncSageTools(engine.config)
+    tools = PheasantTools(engine.config)
     payload = tools.get_contract(engine.config.knowledge_base_id)
     jsonschema.validate(payload, SCHEMA)
     assert payload["kb_id"] == "vector-acceptance"
@@ -313,8 +313,8 @@ def test_mcp_tool_returns_contract(tmp_path: Path) -> None:
 
 def test_mcp_tool_unpublished_before_sync(tmp_path: Path) -> None:
     engine = _publish_engine(tmp_path)
-    from syncsage.mcp_server.tools import SyncSageTools
+    from pheasant.mcp_server.tools import PheasantTools
 
-    tools = SyncSageTools(engine.config)
+    tools = PheasantTools(engine.config)
     payload = tools.get_contract(engine.config.knowledge_base_id)
     assert payload["status"] == "unpublished"

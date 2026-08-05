@@ -89,7 +89,7 @@ export function ConfigPage() {
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = "syncsage.adjusted.yaml";
+      link.download = "pheasant.adjusted.yaml";
       document.body.appendChild(link);
       link.click();
       link.remove();
@@ -164,7 +164,7 @@ export function ConfigPage() {
         </button>
         <span>
           <button className="btn btn--primary" onClick={saveToServer} disabled={save.isPending}>
-            {save.isPending ? "Saving…" : "Save to SyncSage"}
+            {save.isPending ? "Saving…" : "Save to pheasant"}
           </button>
         </span>
       </div>
@@ -173,12 +173,12 @@ export function ConfigPage() {
       {saveError && <p className="error">{saveError}</p>}
       {exported && (
         <p className="notice">
-          Adjusted YAML exported. Replace your mounted config and restart SyncSage to apply it.
+          Adjusted YAML exported. Replace your mounted config and restart pheasant to apply it.
         </p>
       )}
       {saved && (
         <p className="notice">
-          Config written to the server. Restart SyncSage to apply the new configuration.
+          Config written to the server. Restart pheasant to apply the new configuration.
         </p>
       )}
 

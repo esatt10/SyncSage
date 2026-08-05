@@ -3,6 +3,7 @@ import CytoscapeComponent from "react-cytoscapejs";
 import type { Core } from "cytoscape";
 import type { GraphLink, GraphNode } from "../api/types";
 import { buildStylesheet, type ShapeAlgorithm, toElements } from "./graphStyles";
+import { useAppliedTheme } from "../hooks/useTheme";
 
 interface GraphCanvasProps {
   nodes: GraphNode[];
@@ -46,7 +47,8 @@ export function GraphCanvas({
     () => toElements(nodes, links, shapeAlgorithm, depths),
     [nodes, links, shapeAlgorithm, depths],
   );
-  const stylesheet = useMemo(() => buildStylesheet(), []);
+  const theme = useAppliedTheme();
+  const stylesheet = useMemo(() => buildStylesheet(theme), [theme]);
   const layout = useMemo(
     () => layoutOptions(layoutName, spacing, elements.length),
     [layoutName, spacing, elements.length],

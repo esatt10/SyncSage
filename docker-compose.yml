@@ -1,42 +1,42 @@
 services:
-  syncsage:
+  pheasant:
     build:
       context: .
-    image: ${SYNCSAGE_IMAGE:-ghcr.io/esatt10/syncsage:0.7.0}
-    container_name: syncsage
+    image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.7.0}
+    container_name: pheasant
     restart: unless-stopped
     ports:
       # Published to loopback only. The API is unauthenticated and can be
       # pointed at any path mounted into the container, so a bare "8765:8765"
       # would expose it to every host on the network — and Docker's own
       # iptables rules bypass most host firewalls, so this is not something
-      # the machine's firewall would have caught. Set SYNCSAGE_BIND=0.0.0.0
+      # the machine's firewall would have caught. Set PHEASANT_BIND=0.0.0.0
       # only behind an authenticating ingress.
-      - "${SYNCSAGE_BIND:-127.0.0.1}:8765:8765"
+      - "${PHEASANT_BIND:-127.0.0.1}:8765:8765"
     environment:
-      SYNCSAGE_CONFIG: /config/syncsage.yaml
+      PHEASANT_CONFIG: /config/pheasant.yaml
     volumes:
-      - ${SYNCSAGE_CONFIG_PATH:-./syncsage.example.yaml}:/config/syncsage.yaml:ro
+      - ${PHEASANT_CONFIG_PATH:-./pheasant.example.yaml}:/config/pheasant.yaml:ro
       # The example config's only source is `path: /workspace`, so whatever is
       # mounted here IS the demo corpus. It defaults to the repository root —
       # mounting an empty ./workspace instead indexes nothing, and the UI then
       # shows a single knowledge-base node with no graph around it.
-      - ${SYNCSAGE_WORKSPACE_PATH:-.}:/workspace:ro
-      # Local files that live OUTSIDE ./workspace: point SYNCSAGE_DATA_PATH at
+      - ${PHEASANT_WORKSPACE_PATH:-.}:/workspace:ro
+      # Local files that live OUTSIDE ./workspace: point PHEASANT_DATA_PATH at
       # any host directory and it appears in the container at /data (an allowed
       # source root). This is how you index files that aren't a subdirectory of
       # the workspace. Add more mounts here (or in docker-compose.override.yml)
       # the same way, then add each container path to security.allow_workspace_roots.
-      - ${SYNCSAGE_DATA_PATH:-./data}:/data:ro
-      - ${SYNCSAGE_VAULT_PATH:-./vault}:/vault
-      - syncsage-state:/state
-      - syncsage-exports:/exports
+      - ${PHEASANT_DATA_PATH:-./data}:/data:ro
+      - ${PHEASANT_VAULT_PATH:-./vault}:/vault
+      - pheasant-state:/state
+      - pheasant-exports:/exports
     # Sized for a busy process, not just a dead one. /health returns a constant
-    # dict, but SyncSage answers from a single Python process: while a heavy
+    # dict, but pheasant answers from a single Python process: while a heavy
     # agentic question or a graph walk holds the GIL, even that trivial handler
     # waits its turn. A tight budget here does not detect a problem, it invents
     # one — the container flips to unhealthy under exactly the load it is
-    # meant to be serving, which is what gates `syncsage-ui` below.
+    # meant to be serving, which is what gates `pheasant-ui` below.
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health || exit 1"]
       interval: 60s
@@ -45,28 +45,28 @@ services:
       start_period: 30s
 
   # Optional web UI at http://localhost:8080. A separate workload that serves the
-  # static React bundle and proxies /api/* to the syncsage service above.
+  # static React bundle and proxies /api/* to the pheasant service above.
   #
   #   docker compose up -d --build        # build this checkout's UI and run it
-  #   docker compose up -d --build syncsage-ui   # rebuild just the UI
-  #   docker compose up -d syncsage       # headless: API + MCP only, no UI
+  #   docker compose up -d --build pheasant-ui   # rebuild just the UI
+  #   docker compose up -d pheasant       # headless: API + MCP only, no UI
   #
   # Always pass --build when you want the CURRENT ui/ sources: with an `image:`
   # tag already present locally, Compose reuses it and your UI changes appear to
   # do nothing. See docs/how-to/run-the-ui.md.
-  syncsage-ui:
+  pheasant-ui:
     build:
       context: ./ui
-    image: ${SYNCSAGE_UI_IMAGE:-ghcr.io/esatt10/syncsage-ui:0.7.0}
-    container_name: syncsage-ui
+    image: ${PHEASANT_UI_IMAGE:-ghcr.io/esatt10/pheasant-ui:0.7.0}
+    container_name: pheasant-ui
     restart: unless-stopped
     ports:
       # Loopback by default, for the same reason as the API above.
-      - "${SYNCSAGE_BIND:-127.0.0.1}:${SYNCSAGE_UI_PORT:-8080}:80"
+      - "${PHEASANT_BIND:-127.0.0.1}:${PHEASANT_UI_PORT:-8080}:80"
     depends_on:
-      syncsage:
+      pheasant:
         condition: service_healthy
 
 volumes:
-  syncsage-state:
-  syncsage-exports:
+  pheasant-state:
+  pheasant-exports:

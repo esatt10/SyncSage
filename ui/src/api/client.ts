@@ -20,18 +20,18 @@ import type {
   WorkflowCatalog,
 } from "./types";
 
-// In dev, requests go to `/api/*` which Vite proxies to the SyncSage container.
-// When the bundle is served by SyncSage itself, the API is same-origin (root).
+// In dev, requests go to `/api/*` which Vite proxies to the pheasant container.
+// When the bundle is served by pheasant itself, the API is same-origin (root).
 const API_BASE =
-  import.meta.env.VITE_SYNCSAGE_API_BASE ?? (import.meta.env.DEV ? "/api" : "");
+  import.meta.env.VITE_PHEASANT_API_BASE ?? (import.meta.env.DEV ? "/api" : "");
 
 function numericEnv(value: unknown, fallback: number): number {
   const parsed = Number(value ?? fallback);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
-const GRAPH_NODE_LIMIT = numericEnv(import.meta.env.VITE_SYNCSAGE_GRAPH_NODE_LIMIT, 1200);
-const GRAPH_LINK_LIMIT = numericEnv(import.meta.env.VITE_SYNCSAGE_GRAPH_LINK_LIMIT, 3600);
+const GRAPH_NODE_LIMIT = numericEnv(import.meta.env.VITE_PHEASANT_GRAPH_NODE_LIMIT, 1200);
+const GRAPH_LINK_LIMIT = numericEnv(import.meta.env.VITE_PHEASANT_GRAPH_LINK_LIMIT, 3600);
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {

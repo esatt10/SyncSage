@@ -17,18 +17,18 @@ from typing import Any
 
 import pytest
 
-pytest.importorskip("wasmtime", reason="wasmtime not installed (pip install 'syncsage[wasm]')")
+pytest.importorskip("wasmtime", reason="wasmtime not installed (pip install 'pheasant-kb[wasm]')")
 
-from syncsage.config.schema import SyncSageConfig  # noqa: E402
-from syncsage.graph.simple import SimpleMultiDiGraph  # noqa: E402
-from syncsage.search.graph_search import search_graph  # noqa: E402
-from syncsage.sync.engine import SyncEngine  # noqa: E402
+from pheasant.config.schema import PheasantConfig  # noqa: E402
+from pheasant.graph.simple import SimpleMultiDiGraph  # noqa: E402
+from pheasant.search.graph_search import search_graph  # noqa: E402
+from pheasant.sync.engine import SyncEngine  # noqa: E402
 
 
 def _make_engine(tmp_path: Path, sources: list[dict[str, Any]], *, wasm: bool) -> SyncEngine:
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         {
-            "syncsage": {
+            "pheasant": {
                 "name": "wasm-accel-acceptance",
                 "state_path": str(tmp_path / "state"),
                 "vault_path": str(tmp_path / "vault"),
@@ -91,14 +91,14 @@ def test_cross_source_resolution_flag_produces_identical_edges(tmp_path: Path) -
 def test_cross_source_resolution_falls_back_to_python_on_wasm_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import syncsage.sandbox.accel as accel_module
+    import pheasant.sandbox.accel as accel_module
 
     def _boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("simulated WASM failure")
 
     monkeypatch.setattr(accel_module, "resolve_cross_source_edges_wasm", _boom)
     # graph/builder.py imports this name at call time via
-    # `from syncsage.sandbox.accel import resolve_cross_source_edges_wasm`,
+    # `from pheasant.sandbox.accel import resolve_cross_source_edges_wasm`,
     # so patch it there too (the name has already been bound at that point
     # for any prior import, but the deferred `from ... import` in
     # GraphBuilder._resolve_cross_source_edges re-resolves it fresh from
@@ -140,7 +140,7 @@ def test_search_graph_wasm_flag_produces_identical_results() -> None:
 
 
 def test_search_graph_falls_back_to_python_on_wasm_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    import syncsage.sandbox.accel as accel_module
+    import pheasant.sandbox.accel as accel_module
 
     def _boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("simulated WASM failure")
@@ -159,6 +159,6 @@ def test_search_graph_falls_back_to_python_on_wasm_failure(monkeypatch: pytest.M
 
 
 def test_config_defaults_leave_wasm_acceleration_off() -> None:
-    config = SyncSageConfig.model_validate({"syncsage": {"name": "defaults-check"}})
+    config = PheasantConfig.model_validate({"pheasant": {"name": "defaults-check"}})
     assert config.graph.wasm_cross_source_resolution is False
     assert config.search.wasm_relationship_search is False

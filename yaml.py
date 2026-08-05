@@ -1,6 +1,6 @@
-"""Tiny YAML subset used in SyncSage's dependency-light test environment.
+"""Tiny YAML subset used in pheasant's dependency-light test environment.
 
-It supports the simple mappings/lists/scalars used by SyncSage examples. In a
+It supports the simple mappings/lists/scalars used by pheasant examples. In a
 normal install PyYAML satisfies the same imports with broader YAML support.
 """
 from __future__ import annotations

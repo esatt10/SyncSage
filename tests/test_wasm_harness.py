@@ -12,9 +12,9 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("wasmtime", reason="wasmtime not installed (pip install 'syncsage[wasm]')")
+pytest.importorskip("wasmtime", reason="wasmtime not installed (pip install 'pheasant-kb[wasm]')")
 
-from syncsage.sandbox.wasm_runtime import (  # noqa: E402
+from pheasant.sandbox.wasm_runtime import (  # noqa: E402
     HostCapabilities,
     SandboxFuelExhausted,
     SandboxLimits,
@@ -67,7 +67,7 @@ def test_host_fetch_denied_for_a_host_outside_the_allowlist() -> None:
 
 
 def test_sandbox_requires_the_wasm_extra(monkeypatch: pytest.MonkeyPatch) -> None:
-    from syncsage.sandbox import wasm_runtime
+    from pheasant.sandbox import wasm_runtime
 
     monkeypatch.setattr(wasm_runtime, "wasmtime", None)
     with pytest.raises(wasm_runtime.WasmRuntimeUnavailable):

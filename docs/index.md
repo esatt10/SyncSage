@@ -1,12 +1,12 @@
-# SyncSage
+# pheasant
 
-SyncSage is a **Docker-first, local-first MCP context server**. It turns your
+pheasant is a **Docker-first, local-first MCP context server**. It turns your
 sources — git repositories, folders, single files, Obsidian vaults, web
 collections, and experimental API/S3 sources — into a queryable **knowledge
 graph** with hybrid self-search, for both agents and humans.
 
 !!! tip "Part of the Synapse Suite"
-    SyncSage is the **region** component of **Synapse**, a federated
+    pheasant is the **region** component of **Synapse**, a federated
     knowledge-base platform. New here, or want the whole-system view? Start at
     the suite front door:
     **[The Synapse Suite →](https://esatt10.github.io/subjective-retrieval/)**
@@ -14,7 +14,7 @@ graph** with hybrid self-search, for both agents and humans.
     router site). This site is the region/KB half.
 
 It runs perfectly well **standalone**: point it at some sources, sync, and query
-over MCP or HTTP. It also has a **second role**: each SyncSage container can act
+over MCP or HTTP. It also has a **second role**: each pheasant container can act
 as a federated **"brain region"** inside a **Synapse** fleet.
 
 ## Two roles, one container
@@ -41,7 +41,7 @@ as a federated **"brain region"** inside a **Synapse** fleet.
 
 !!! tip "Standalone behavior is sacred"
     Every Synapse feature is **off by default**. With no `synapse:` block set,
-    SyncSage behaves exactly like a router-less knowledge base. You never have
+    pheasant behaves exactly like a router-less knowledge base. You never have
     to join a fleet to get full value.
 
 ## Pick your path
@@ -60,7 +60,7 @@ as a federated **"brain region"** inside a **Synapse** fleet.
 
 ## The persistence split
 
-SyncSage keeps three clearly separated directories. Understanding the split
+pheasant keeps three clearly separated directories. Understanding the split
 makes operations (backups, restores, mounts) predictable:
 
 | Directory | Contents | Treat as |
@@ -75,7 +75,7 @@ See [Architecture](architecture.md) for the full component map and runtime flow.
 
 Synapse is a two-repo system:
 
-- **SyncSage** (this repo) is a **region** — a self-contained knowledge base
+- **pheasant** (this repo) is a **region** — a self-contained knowledge base
   with its own sync engine, graph, and self-search. It publishes a semantic
   contract and answers fan-out queries.
 - **[subjective-retrieval](https://github.com/esatt10/subjective-retrieval)** is
@@ -84,7 +84,7 @@ Synapse is a two-repo system:
   cross-region relationships ("white matter").
 
 The boundary between them is **contract JSON over HTTP** — there is no Python
-dependency between the repos, and a router-less SyncSage keeps working unchanged.
+dependency between the repos, and a router-less pheasant keeps working unchanged.
 For the global, cross-region search experience, see the
 [subjective-retrieval documentation site](https://github.com/esatt10/subjective-retrieval).
 
@@ -97,7 +97,7 @@ For the global, cross-region search experience, see the
 - **Multi-modal ingest**: image captioning and audio transcription, both with a
   deterministic offline stub default — see the
   [multi-modal tutorial](tutorials/multimodal.md).
-- **Backup & restore** of region state (`syncsage backup` / `syncsage restore`)
+- **Backup & restore** of region state (`pheasant backup` / `pheasant restore`)
   plus zstd graph snapshots with retention.
 - **Synapse region wiring**: contract publisher, NDJSON event stream + router
   webhook, and optional Ed25519 contract signing.

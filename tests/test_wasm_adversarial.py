@@ -17,9 +17,9 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("wasmtime", reason="wasmtime not installed (pip install 'syncsage[wasm]')")
+pytest.importorskip("wasmtime", reason="wasmtime not installed (pip install 'pheasant-kb[wasm]')")
 
-from syncsage.sandbox.wasm_runtime import (  # noqa: E402
+from pheasant.sandbox.wasm_runtime import (  # noqa: E402
     HostCapabilities,
     SandboxCapabilityDenied,
     SandboxFuelExhausted,

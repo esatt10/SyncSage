@@ -1,4 +1,4 @@
-# CLAUDE.md — SyncSage
+# CLAUDE.md — pheasant
 
 Primary context hand-off for any Claude agent working on this repository.
 Read it first; it is intentionally dense. Anything not here should be
@@ -8,7 +8,7 @@ derivable from the code, `docs/`, or a single grep.
 
 ## 1. What this project is
 
-**SyncSage** is a Docker-first, local-first **MCP context server** that
+**pheasant** is a Docker-first, local-first **MCP context server** that
 turns configured sources (git repositories, folders, single files,
 Obsidian vaults, web collections, experimental API/S3) into a queryable
 **knowledge graph** with hybrid self-search, for agents and humans.
@@ -28,12 +28,12 @@ Design pillars (do not violate):
   `/exports` (regenerable payloads). State dirs are **user data**:
   migrations must be one-shot, idempotent, and preserve originals.
 
-### 1.1 SyncSage's second role: a Synapse brain region
+### 1.1 pheasant's second role: a Synapse brain region
 
-Since 2026-06-10, SyncSage is also the **region** component of
+Since 2026-06-10, pheasant is also the **region** component of
 **Synapse** — a federated knowledge-base system whose router (the
 "nervous system") lives in the sibling **subjective-retrieval** repo.
-Each SyncSage container publishes a **semantic contract** derived from
+Each pheasant container publishes a **semantic contract** derived from
 its own content; the router scores contracts to decide which regions to
 query and fans out to each region's self-search. Read
 `docs/SYNAPSE_INTEGRATION.md` before doing any Synapse-related work here.
@@ -41,21 +41,21 @@ Two iron rules: (1) the contract schema is canonical in
 subjective-retrieval — this repo only vendors the exported JSON Schema +
 fixtures under `contracts/`; (2) **no Python dependency between the
 repos** — the boundary is contract JSON + HTTP, and a router-less
-SyncSage must keep working unchanged.
+pheasant must keep working unchanged.
 
 ---
 
 ## 2. Repository layout
 
 ```
-SyncSage/
+pheasant/
 ├── CLAUDE.md                  ← you are here
 ├── README.md
 ├── pyproject.toml             ← extras: [mcp], [dev]; (Phase 21.4 adds [vector]);
 │                                core deps include numpy + zstandard (21.6A snapshots/backup)
-├── syncsage.example.yaml      ← reference config (all sections)
-├── Dockerfile                 ← python:3.12-slim, port 8765, /config/syncsage.yaml
-├── docker-compose.yml         ← syncsage + optional syncsage-ui sidecar
+├── pheasant.example.yaml      ← reference config (all sections)
+├── Dockerfile                 ← python:3.12-slim, port 8765, /config/pheasant.yaml
+├── docker-compose.yml         ← pheasant + optional pheasant-ui sidecar
 ├── deploy/                    ← kubernetes/ manifests, helm/ skeleton
 ├── docs/
 │   ├── architecture.md        ← component overview
@@ -66,7 +66,7 @@ SyncSage/
 │   └── SYNAPSE_INTEGRATION.md ← region-side Synapse spec + Phase 21 plan
 ├── agent/                     ← legacy role prompts from the initial build
 │                                (superseded for Synapse work by this file)
-├── src/syncsage/
+├── src/pheasant/
 │   ├── cli.py                 ← Typer CLI: init/start/serve/validate/doctor/
 │   │                            sync/repair/mcp/client-config/compose-env/config
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
@@ -84,7 +84,7 @@ SyncSage/
 │   ├── persistence/           ← state_store.py (SQLite SCHEMA), graph_store.py,
 │   │                            manifest.py, paths.py
 │   ├── registry/              ← source + knowledge-base registries
-│   ├── mcp_server/            ← server.py (FastMCP), tools.py (SyncSageTools),
+│   ├── mcp_server/            ← server.py (FastMCP), tools.py (PheasantTools),
 │   │                            resources.py, prompts.py, contracts.py
 │   ├── api/app.py             ← FastAPI: /health /ready /sources /sync /search
 │   │                            /graph /relevant-files /files /nodes /repos
@@ -98,7 +98,7 @@ SyncSage/
                                  workspace: notes, docs, mock repo)
 ```
 
-Key entities: **knowledge base** (`kb_id` = `syncsage.name`) → **sources**
+Key entities: **knowledge base** (`kb_id` = `pheasant.name`) → **sources**
 → **artifacts** (stable ID `file:{source}:{relpath}:branch={b}`) →
 **chunks** (+ FTS5) and graph nodes (**symbol/entity/concept/
 external_reference**) with edges (contains/indexes/has_chunk/mentions/
@@ -114,18 +114,18 @@ pip install -e ".[dev,mcp]"
 pytest -q                                  # full suite, offline by design
 ruff check src tests && ruff format --check src tests
 
-syncsage up [PATH] [--no-serve]            # zero-config quickstart: detect
+pheasant up [PATH] [--no-serve]            # zero-config quickstart: detect
                                            #   (.obsidian/.git/folder) → generate
                                            #   config → index → serve (Step 30.1)
-syncsage init --profile quickstart         # generate starter syncsage.yaml
-syncsage validate && syncsage doctor       # config + environment checks
-syncsage start                             # HTTP API + MCP on :8765
-syncsage sync --source <name> --mode incremental|full|validate_only|repair
-syncsage mcp --transport stdio             # standalone MCP server
-syncsage client-config claude-code|cursor|vscode   # emit MCP client config
+pheasant init --profile quickstart         # generate starter pheasant.yaml
+pheasant validate && pheasant doctor       # config + environment checks
+pheasant start                             # HTTP API + MCP on :8765
+pheasant sync --source <name> --mode incremental|full|validate_only|repair
+pheasant mcp --transport stdio             # standalone MCP server
+pheasant client-config claude-code|cursor|vscode   # emit MCP client config
                                            #   (agents: --mode local|docker-exec|
                                            #    docker-run; Step 30.5)
-syncsage config show                       # resolved config after profile+YAML+--set
+pheasant config show                       # resolved config after profile+YAML+--set
 docker compose up                          # container + optional UI sidecar
 ```
 
@@ -151,13 +151,13 @@ docker compose up                          # container + optional UI sidecar
    contract JSON + HTTP (see §1.1). Never hand-edit vendored files under
    `contracts/`.
 7. **Standalone mode is sacred.** Every change must leave a router-less
-   SyncSage fully functional; Synapse features no-op when
+   pheasant fully functional; Synapse features no-op when
    `synapse.router_url` is unset.
 8. **MCP tool surface is public API.** Renaming/removing tools in
    `mcp_server/tools.py` breaks deployed agents — additive evolution only,
    deprecate before remove.
 9. **Cross-repo work** (anything marked [x-repo] in
-   `docs/SYNAPSE_INTEGRATION.md`) follows the `syncsage-coordinator`
+   `docs/SYNAPSE_INTEGRATION.md`) follows the `pheasant-coordinator`
    skill in the subjective-retrieval repo: identical branch names in both
    repos, contract fixture parity (sha256), both test suites green before
    either push.
@@ -177,8 +177,8 @@ The publisher now **optionally signs** the contract's `integrity.signature`
 (Ed25519) when `synapse.signing_key_ref` is set (a secret *reference* —
 `env://NAME` or a bare env var name — resolving to a base64 32-byte Ed25519
 seed; the plaintext key never lands in config or on disk). Unset → unsigned,
-`integrity.signature: null`, and a **standalone SyncSage is unchanged**. New
-`src/syncsage/synapse/signing.py` (`sign_body`/`signing_bytes`/`content_hash`/
+`integrity.signature: null`, and a **standalone pheasant is unchanged**. New
+`src/pheasant/synapse/signing.py` (`sign_body`/`signing_bytes`/`content_hash`/
 `resolve_signing_key_ref`/`public_key_b64`); the `cryptography` import is gated
 behind the new optional **`[a2a]` extra** (a region without `signing_key_ref`
 needs no crypto dep; offline tests `importorskip("cryptography")`). The
@@ -197,7 +197,7 @@ A region ingests images (`.png/.jpg/.jpeg/.webp/.gif`) by **captioning** them
 into indexable text that flows through the normal chunk→embed→graph path
 (architecture §8: project into the *one* fleet-pinned text space; CLIP-style
 modality-native vectors stay region-local, out of scope). New
-`src/syncsage/ingestion/captioner.py`: `StubCaptioner` (deterministic, offline,
+`src/pheasant/ingestion/captioner.py`: `StubCaptioner` (deterministic, offline,
 **default** — caption = template over file name + blake2b digest of bytes; an
 authored `<image>.caption.txt` sidecar wins) + `OpenAISpecVisionCaptioner`
 (gated — OpenAI-spec `chat/completions` with an `image_url` part). Captioning is
@@ -221,13 +221,13 @@ COMPLETES Step 25.4 and Phase 25.** A region ingests audio
 (`.wav/.mp3/.m4a/.flac/.ogg`) by **transcribing** it into indexable text that
 flows through the normal chunk→embed→graph path — the audio twin of session A's
 image captioning (architecture §8: project into the *one* fleet-pinned text
-space). New `src/syncsage/ingestion/transcriber.py`: `StubTranscriber`
+space). New `src/pheasant/ingestion/transcriber.py`: `StubTranscriber`
 (deterministic, offline, **default** — transcript = template over file name +
 blake2b digest of bytes; an authored `<audio>.transcript.txt` sidecar wins;
 **no network / no audio decoder / no ASR model / no audio library**) +
 `OpenAISpecTranscriber` (gated — OpenAI-spec `POST {base_url}/audio/transcriptions`
 stdlib-urllib multipart upload, transcript from response `text`). A tiny additive
-helper `src/syncsage/ingestion/_modal.py` (`sidecar_text` + `stub_fingerprint`)
+helper `src/pheasant/ingestion/_modal.py` (`sidecar_text` + `stub_fingerprint`)
 now backs both the captioner and the transcriber (session A behavior unchanged).
 Config `ingestion.transcriber.{provider,model,base_url,api_key_env}`
 (`stub`|`openai-spec`, default `whisper-1`); the transcriber is **only built
@@ -248,7 +248,7 @@ Markdown file per record (`schema_version: 1`, deterministic
 `mem-<instant>-<blake2b8>` ids, append-only, `<scope>/` dirs) into a new
 built-in `SourceType.memory` filesystem source; indexing is the normal
 deterministic pipeline (no second path, no LLM). Write surfaces
-(additive): MCP `memory_write` (`SyncSageTools` + server tool) and
+(additive): MCP `memory_write` (`PheasantTools` + server tool) and
 `POST/GET /memory` — `sync=true` default → read-your-writes via ordinary
 `search_context`; recall IS search. Publisher advertises `"memory"` in
 `capabilities.modalities` (25.4 precedent — wire format unchanged, parity
@@ -271,7 +271,7 @@ Deterministic in `now`, idempotent second pass.
 `tests/test_memory_region.py` (15 total).
 
 **Step 33.4 (memory-recall benchmark) landed here 2026-07-16 — Phase 33
-complete.** `memory/benchmark.py` (`python -m syncsage.memory.benchmark`):
+complete.** `memory/benchmark.py` (`python -m pheasant.memory.benchmark`):
 LongMemEval-style, deterministic, offline, through the real
 `memory_write`→index→`search_context` path. Recorded: recall@5 **1.000**,
 update_accuracy **1.000**, stale_leak **0.000**, abstention **1.000**
@@ -304,7 +304,7 @@ normalization rules, fail-closed). Suite: **253 passed** (+5). Router-side
 32.3 + deferred 32.4/32.5 live in SR (`PRODUCT_FRAMEWORK.md` §3d).
 
 **Step 32.4 (external-IdP group sync + staleness SLA) landed here 2026-07-18
-[x-repo] — completes the SyncSage side of Phase 32.** The 32.2 config-mapped
+[x-repo] — completes the pheasant side of Phase 32.** The 32.2 config-mapped
 `security.groups` stays the deterministic core; `security/idp.py` adds a
 *synced* principal→groups mapping from a SCIM 2.0 `/Groups` directory
 (`fetch_scim_groups` — paginated ListResponse, token from
@@ -332,19 +332,19 @@ audit) lands in SR the same day — **Phase 32 complete**.
 
 **Steps 31.3–31.7 (GDrive/Slack/Confluence/IMAP + certification) landed
 here 2026-07-16 — Phase 31 complete.** Four more first-party SDK plugins in
-`src/syncsage/connectors/` (entry points in pyproject; zero new deps —
+`src/pheasant/connectors/` (entry points in pyproject; zero new deps —
 stdlib urllib/imaplib, bs4 already core): version-proxy sha256 pre-read
 skips, per-item incremental cursors (imap = exact UID high-watermark, a
 second sync lists nothing), deterministic rendering, `connector.api_key_env`
 secrets, Phase-32 ACL capture. 31.7: certified-connectors table + recipe in
 `docs/reference/connector-sdk.md`; the example package now ships the
-certification test (`tests/fixtures/syncsage-connector-example/tests/`),
+certification test (`tests/fixtures/pheasant-connector-example/tests/`),
 fixture suites excluded via pytest `norecursedirs`.
 `tests/test_saas_connectors.py` (34). Suite: **248 passed** (+34).
 
 **Step 31.2 (Notion connector) landed here 2026-07-16.** First-party SDK
-plugin dogfooding 31.1: `src/syncsage/connectors/notion.py` under the
-`syncsage.connectors` entry-point group in this repo's own `pyproject.toml`
+plugin dogfooding 31.1: `src/pheasant/connectors/notion.py` under the
+`pheasant.connectors` entry-point group in this repo's own `pyproject.toml`
 (config `type: notion`, zero new dispatch code). Paginated `POST /v1/search`
 listing; block tree → deterministic Markdown (nested to depth 3, no LLM);
 `item.sha256` = `(page_id, last_edited_time)` proxy → pre-read skip;
@@ -358,16 +358,16 @@ guard. Suite: **214 passed** (+12).
 
 **Step 31.1 (Connector SDK) landed here 2026-07-15.** Third-party connector
 plugins resolve by `sources[].type` name via `importlib.metadata` entry
-points (group `syncsage.connectors`, `sync/connector_registry.py`) or
+points (group `pheasant.connectors`, `sync/connector_registry.py`) or
 programmatic `register_connector_class`; unknown config type strings load
 as `PluginSourceType` (a `str` with a `.value` property — existing
 `source.type.value` call sites untouched, no workspace anchoring) and
 resolve at dispatch (`connector_for_source` falls through to the registry
 after the hardcoded built-ins, so the zero-plugin path is byte-identical;
 missing plugin → error naming type + installed plugins). Public quality
-bar: `syncsage.testing.ConnectorConformance` (subclass + one
+bar: `pheasant.testing.ConnectorConformance` (subclass + one
 `make_connector` factory) — FilesystemConnector passes the same harness.
-Canonical third-party shape: `tests/fixtures/syncsage-connector-example/`
+Canonical third-party shape: `tests/fixtures/pheasant-connector-example/`
 (`StaticDirConnector`), engine-e2e + idempotent second sync in
 `tests/test_connector_sdk.py`. Docs: `docs/reference/connector-sdk.md`.
 Suite: **183 passed** (+19). Steps 31.2–31.6 (Notion/GDrive/Slack/
@@ -441,7 +441,7 @@ tracks; mono-container-per-KB architecture is unchanged. Steps 34.1-34.7, one
 per session, `runs/<ts>-synapse-34.N/SUMMARY.md` each.
 
 **Step 34.1 (host harness) landed here 2026-08-03.** New
-`src/syncsage/sandbox/wasm_runtime.py`: `WasmSandbox` wraps one `wasmtime`
+`src/pheasant/sandbox/wasm_runtime.py`: `WasmSandbox` wraps one `wasmtime`
 guest instance — deterministic fuel metering (`Config.consume_fuel` +
 `Store.set_fuel`, not a wall-clock timeout), a per-instance linear-memory cap
 (`Store.set_limits`), and a capability-scoped `host_fetch_len`/
@@ -463,7 +463,7 @@ an allowlisted host and is denied otherwise, gated-import guarantee holds.
 Suite: **516 passed, 7 skipped** (+6).
 
 **Step 34.2 (reference sandboxed connector) landed here 2026-08-03.** New
-`src/syncsage/sandbox/connector.py`: `SandboxedConnector` ports
+`src/pheasant/sandbox/connector.py`: `SandboxedConnector` ports
 `StaticDirConnector`'s shape — lists/reads `*.txt` files host-side (guarded
 by `security/path_policy.resolve_under`, reused not duplicated) and runs
 each file's bytes through a bundled WASM guest's `normalize()` export
@@ -480,7 +480,7 @@ judged too easy to get subtly wrong without a way to validate it; the guest
 still processes real untrusted per-item bytes under the fuel/memory cap,
 which is the actual threat-model target (Confluence's in-process
 BeautifulSoup parse of untrusted remote XHTML is the named example) — full
-rationale in the run summary. `syncsage.testing.ConnectorConformance`
+rationale in the run summary. `pheasant.testing.ConnectorConformance`
 needed **no code changes** — it was already connector-agnostic, so the
 sandboxed connector gets the identical bar for free via a new subclass.
 `tests/test_sandboxed_connector.py` (9 tests, +9). Suite: **525 passed, 7
@@ -501,7 +501,7 @@ asserted **never invoked** (no secret leak) and the guest's result buffer
 staying all-zero (no partial write). New fixtures:
 `tests/fixtures/wasm/{wasi_env_leak,host_fetch_ssrf}.wat`. Suite: **530
 passed, 7 skipped** (+5). **Scope note:** the plan's broader manual
-end-to-end check (malicious connector wired into a live `syncsage sync`,
+end-to-end check (malicious connector wired into a live `pheasant sync`,
 confirming the parent API server keeps serving via `sync/worker.py`'s
 pre-existing child-process isolation) is left as a documented follow-up —
 34.3's own acceptance is fully covered by the automated suite, and that
@@ -510,11 +510,11 @@ This **closes the sandboxing arc (34.1-34.3)**. Next: Step 34.4 (benchmark
 spike — no production code expected, numbers only).
 
 **Live validation against the real demo-agent-framework corpus, 2026-08-04.**
-Rebuilt `examples/demo-agent-framework/` with `SYNCSAGE_EXTRAS=mcp,agent,
+Rebuilt `examples/demo-agent-framework/` with `PHEASANT_EXTRAS=mcp,agent,
 wasm` and both 34.5 flags on, ran a real full sync (2,132 files → 22,683
 nodes / 54,406 edges). Found and fixed a real bug in the process: `graph:`
 config sections were silently discarded entirely —
-`SyncSageConfig.model_validate`'s constructor call was missing
+`PheasantConfig.model_validate`'s constructor call was missing
 `graph=build(GraphSettings, data.get("graph"))`, so `concept_min_documents`
 was ALSO never configurable via YAML, not just the new WASM flag; no test
 caught it because none exercised the `graph:` section. Fixed in
@@ -553,7 +553,7 @@ the real port.
 
 **Step 34.4 completed here 2026-08-03 (for (a)/(b) — (c)/(d) deferred per
 the plan's own priority order).** `runs/2026-08-03-synapse-34.4/wasm_bench/`
-(a spike-only Rust crate, not shipped under `src/syncsage`) ports
+(a spike-only Rust crate, not shipped under `src/pheasant`) ports
 `resolve_cross_source_edges`'s `python_import` path and the full
 `_scan_edges` scoring logic to `wasm32-unknown-unknown`. Every one of 12
 tested scale points asserts the WASM output is byte-for-byte identical to
@@ -587,7 +587,7 @@ compile) with `wasmtime`'s AOT module serialization: a fresh `Config`+
 `subprocess.run`, one call per process lifetime, no second call to
 amortize an in-process compile against) loads a precompiled artifact in
 under 1ms vs. ~103ms to JIT-compile from raw `.wasm` bytes. New
-`src/syncsage/sandbox/accel/`: a production Rust crate
+`src/pheasant/sandbox/accel/`: a production Rust crate
 (vendored compiled `accel.wasm`, 112KB) + `loader.py` (process-wide
 singleton, machine-local `.cwasm` cache under the OS temp dir — deliberately
 **not** under any KB's `/state`, since the compiled binary is
@@ -669,7 +669,7 @@ response cycle, so a first index that takes minutes outlives what a
 browser tab or reverse proxy holds a connection open for — even though the
 sync went on to succeed server-side, the client only ever saw a timeout.
 Fixed with a new `wait: bool` field on all three endpoints (default
-`true` — the original blocking contract, still what `syncsage up`/CLI
+`true` — the original blocking contract, still what `pheasant up`/CLI
 callers and the existing `test_quick_add_registers_and_syncs_a_pasted_path`
 test get). `wait: false` hands the sync to a background thread (the same
 `sync/worker.py` subprocess `_index` already used, not a new path) and

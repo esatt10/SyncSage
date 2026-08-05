@@ -2,16 +2,16 @@
 
 Every question — from the UI's chat panel, from `POST /assistant/chat`, or
 from the MCP tool `ask_knowledge_base` — is answered by a **workflow**. A
-workflow turns a question into a grounded answer using SyncSage's own search;
+workflow turns a question into a grounded answer using pheasant's own search;
 which one runs is configuration, and writing your own is a registration
 rather than a fork.
 
-SyncSage ships three.
+pheasant ships three.
 
 | Workflow | What it does | Needs |
 |---|---|---|
-| `knowledge-summary` | The agentic graph pinned to summarising: reads more files, less of each, and answers with what things are and how they fit together. Pick it to orient yourself in an unfamiliar corpus. | `pip install 'syncsage[agent]'` |
-| `agentic` | The same [LangGraph](https://langchain-ai.github.io/langgraph/) state graph, reading each question for itself — as a knowledge summary or a procedural how-to — then planning sub-queries, retrieving across every search mode, walking the knowledge graph, grading its own evidence, looping when it is thin, and verifying its citations. | `pip install 'syncsage[agent]'` |
+| `knowledge-summary` | The agentic graph pinned to summarising: reads more files, less of each, and answers with what things are and how they fit together. Pick it to orient yourself in an unfamiliar corpus. | `pip install 'pheasant-kb[agent]'` |
+| `agentic` | The same [LangGraph](https://langchain-ai.github.io/langgraph/) state graph, reading each question for itself — as a knowledge summary or a procedural how-to — then planning sub-queries, retrieving across every search mode, walking the knowledge graph, grading its own evidence, looping when it is thin, and verifying its citations. | `pip install 'pheasant-kb[agent]'` |
 | `simple` | One retrieval pass, one model call. Predictable and fast. | nothing |
 
 ```yaml
@@ -159,7 +159,7 @@ behavior without editing config.
 A workflow implements exactly one method:
 
 ```python
-from syncsage.assistant.workflows import WorkflowRequest, WorkflowResult, WorkflowStep
+from pheasant.assistant.workflows import WorkflowRequest, WorkflowResult, WorkflowStep
 
 class CitationsOnlyWorkflow:
     name = "citations-only"
@@ -176,12 +176,12 @@ class CitationsOnlyWorkflow:
 ```
 
 `llm` may be `None` — a workflow **must** still return something useful in
-that case. SyncSage is expected to work air-gapped, and the retrieval half of
+that case. pheasant is expected to work air-gapped, and the retrieval half of
 an answer needs no model.
 
 ### The retriever
 
-`retriever` is a `SyncSageRetriever`: the whole search surface, framework
+`retriever` is a `PheasantRetriever`: the whole search surface, framework
 agnostic, so a workflow written for LangGraph and one written for anything
 else use the same toolbelt.
 
@@ -203,7 +203,7 @@ a custom workflow inherits principal filtering without doing anything.
 Programmatically, for an embedding application or a test:
 
 ```python
-from syncsage.assistant.workflows import register_workflow
+from pheasant.assistant.workflows import register_workflow
 register_workflow("citations-only", CitationsOnlyWorkflow)
 ```
 
@@ -211,7 +211,7 @@ Or ship it in a package, exactly like the
 [Connector SDK](../reference/connector-sdk.md):
 
 ```toml
-[project.entry-points."syncsage.agent_workflows"]
+[project.entry-points."pheasant.agent_workflows"]
 citations-only = "my_pkg.flows:CitationsOnlyWorkflow"
 ```
 
@@ -231,7 +231,7 @@ You do not have to rewrite the agentic graph to change part of it. Its nodes
 are a plain dict, and `AgenticWorkflow` takes overrides:
 
 ```python
-from syncsage.assistant.workflows.agentic import AgenticWorkflow
+from pheasant.assistant.workflows.agentic import AgenticWorkflow
 
 def my_grade(state, ctx):
     return {"sufficient": len(state.get("passages", [])) >= 3}

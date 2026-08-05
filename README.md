@@ -1,16 +1,16 @@
-# SyncSage
+# pheasant
 
-SyncSage is a local-first MCP context server that turns project sources into a queryable knowledge graph for agents and humans. It syncs configured repositories, folders, files, Obsidian vaults, web collections, and experimental API/S3 sources; enriches them into graph relationships; exposes retrieval and lifecycle operations through MCP and HTTP; and can project the result into a navigable Obsidian vault.
+pheasant is a local-first MCP context server that turns project sources into a queryable knowledge graph for agents and humans. It syncs configured repositories, folders, files, Obsidian vaults, web collections, and experimental API/S3 sources; enriches them into graph relationships; exposes retrieval and lifecycle operations through MCP and HTTP; and can project the result into a navigable Obsidian vault.
 
 The project is still an active prototype, but the current architecture is intentionally shaped around production concerns: connector boundaries, idempotent sync, persistent checkpoints, graph-derived search, runtime source lifecycle management, and inspectable configuration.
 
-> **Part of the [Synapse Suite](https://esatt10.github.io/subjective-retrieval/):** SyncSage is the *region* component of **Synapse** — a hyperfast federated knowledge-base system in which each SyncSage container is a self-searching "brain region" that publishes a **semantic contract**, and the [subjective-retrieval](https://github.com/esatt10/subjective-retrieval) router (the "nervous system") routes global queries across regions. The **suite front door** (whole-system view) is the [Synapse Suite site](https://esatt10.github.io/subjective-retrieval/); this repo is the region/KB half. Attaching to a fleet is opt-in and standalone-safe — see the consumer guide [Attach to a Synapse fleet](docs/how-to/attach-to-synapse.md). Region-side spec: `docs/SYNAPSE_INTEGRATION.md`; system design lives in the subjective-retrieval repo (`docs/SYNAPSE_ARCHITECTURE.md`).
+> **Part of the [Synapse Suite](https://esatt10.github.io/subjective-retrieval/):** pheasant is the *region* component of **Synapse** — a hyperfast federated knowledge-base system in which each pheasant container is a self-searching "brain region" that publishes a **semantic contract**, and the [subjective-retrieval](https://github.com/esatt10/subjective-retrieval) router (the "nervous system") routes global queries across regions. The **suite front door** (whole-system view) is the [Synapse Suite site](https://esatt10.github.io/subjective-retrieval/); this repo is the region/KB half. Attaching to a fleet is opt-in and standalone-safe — see the consumer guide [Attach to a Synapse fleet](docs/how-to/attach-to-synapse.md). Region-side spec: `docs/SYNAPSE_INTEGRATION.md`; system design lives in the subjective-retrieval repo (`docs/SYNAPSE_ARCHITECTURE.md`).
 
 > **📖 Documentation site:** Full consumer docs (tutorials, how-to guides, reference, explanation) are published as a [MkDocs Material](https://www.mkdocs.org/) site — see the [Documentation](#documentation) section below. Build locally with `pip install -e ".[docs]" && mkdocs build --strict`.
 
-> **Multi-modal ingest:** SyncSage indexes **images** (`.png/.jpg/.jpeg/.webp/.gif`, captioned) and **audio** (`.wav/.mp3/.m4a/.flac/.ogg`, transcribed) alongside text. Both ship with a deterministic **offline stub** by default (no API keys, no model downloads) and support authored `.caption.txt`/`.transcript.txt` sidecars. See [Multi-modal ingest](docs/how-to/multimodal-ingest.md).
+> **Multi-modal ingest:** pheasant indexes **images** (`.png/.jpg/.jpeg/.webp/.gif`, captioned) and **audio** (`.wav/.mp3/.m4a/.flac/.ogg`, transcribed) alongside text. Both ship with a deterministic **offline stub** by default (no API keys, no model downloads) and support authored `.caption.txt`/`.transcript.txt` sidecars. See [Multi-modal ingest](docs/how-to/multimodal-ingest.md).
 
-## What SyncSage Does
+## What pheasant Does
 
 - Ingests local and connector-backed sources through a `SourceConnector` abstraction.
 - Maintains SQLite search state, source manifests, connector checkpoints, graph snapshots, and audit history under `/state`.
@@ -47,29 +47,29 @@ Core components:
 
 ## Quick Start
 
-**One line, any target.** `syncsage up` detects what you point it at — a folder,
+**One line, any target.** `pheasant up` detects what you point it at — a folder,
 an Obsidian vault, a git repo (local or a URL it clones), a docs site, an S3
 bucket, or a connector — writes a config, indexes it, and serves the API + MCP:
 
 ```bash
-syncsage up ~/notes                                   # a folder
-syncsage up https://github.com/you/project            # cloned, then indexed
-syncsage up ~/notes https://docs.example.com/guide    # several at once
-syncsage up '~/clients/*'                             # one source per subfolder
-syncsage up ~/projects --split                        # same, without the glob
+pheasant up ~/notes                                   # a folder
+pheasant up https://github.com/you/project            # cloned, then indexed
+pheasant up ~/notes https://docs.example.com/guide    # several at once
+pheasant up '~/clients/*'                             # one source per subfolder
+pheasant up ~/projects --split                        # same, without the glob
 ```
 
-An existing `syncsage.yaml` is never overwritten, and re-running re-indexes
+An existing `pheasant.yaml` is never overwritten, and re-running re-indexes
 nothing that has not changed.
 
-**One line to host it.** `syncsage host` does the same detection, then writes a
+**One line to host it.** `pheasant host` does the same detection, then writes a
 compose file (mounting each local source read-only at `/sources/<name>`) and
 brings the stack up:
 
 ```bash
-syncsage host ~/notes                    # config + compose + docker compose up -d
-syncsage host ~/notes --print-only       # write the compose file, run it yourself
-syncsage host ~/notes --no-ui --port 9000
+pheasant host ~/notes                    # config + compose + docker compose up -d
+pheasant host ~/notes --print-only       # write the compose file, run it yourself
+pheasant host ~/notes --no-ui --port 9000
 ```
 
 Open <http://localhost:8080> for the web UI, or <http://localhost:8765> for the
@@ -81,25 +81,25 @@ API and MCP endpoint. Trouble getting the UI up, or seeing a stale one? →
 Generate a starter config:
 
 ```bash
-syncsage init --profile quickstart --output syncsage.yaml
+pheasant init --profile quickstart --output pheasant.yaml
 ```
 
 Inspect the resolved config after profile/YAML/override layering:
 
 ```bash
-syncsage config show --effective --profile quickstart --config syncsage.yaml
+pheasant config show --effective --profile quickstart --config pheasant.yaml
 ```
 
 Validate paths and runtime readiness:
 
 ```bash
-syncsage doctor --profile quickstart --config syncsage.yaml
+pheasant doctor --profile quickstart --config pheasant.yaml
 ```
 
 Run locally:
 
 ```bash
-syncsage start --profile quickstart --config syncsage.yaml
+pheasant start --profile quickstart --config pheasant.yaml
 ```
 
 Or run through Docker Compose (`--build` keeps the UI sidecar current; set
@@ -107,8 +107,8 @@ Or run through Docker Compose (`--build` keeps the UI sidecar current; set
 mounts an empty `./workspace` and nothing gets indexed):
 
 ```bash
-syncsage compose-env syncsage.yaml --output .syncsage/compose.env
-docker compose --env-file .syncsage/compose.env up -d --build
+pheasant compose-env pheasant.yaml --output .pheasant/compose.env
+docker compose --env-file .pheasant/compose.env up -d --build
 ```
 
 Health checks:
@@ -118,11 +118,11 @@ curl http://localhost:8765/health
 curl http://localhost:8765/ready
 ```
 
-Local `syncsage.yaml`, `.syncsage/compose.env`, `.vscode/mcp.json`, state, and vault output are ignored by git.
+Local `pheasant.yaml`, `.pheasant/compose.env`, `.vscode/mcp.json`, state, and vault output are ignored by git.
 
 ## Configuration Model
 
-SyncSage resolves config in this order:
+pheasant resolves config in this order:
 
 ```text
 base defaults + profile + user YAML + CLI/env overrides
@@ -138,10 +138,10 @@ Built-in profiles:
 Common commands:
 
 ```bash
-syncsage init --profile dev --output syncsage.yaml
-syncsage config show --effective --profile dev --config syncsage.yaml --set server.port=9001
-syncsage validate syncsage.yaml
-syncsage doctor --profile dev --config syncsage.yaml
+pheasant init --profile dev --output pheasant.yaml
+pheasant config show --effective --profile dev --config pheasant.yaml --set server.port=9001
+pheasant validate pheasant.yaml
+pheasant doctor --profile dev --config pheasant.yaml
 ```
 
 See [docs/configuration.md](docs/configuration.md).
@@ -173,13 +173,13 @@ Sync modes:
 Run sync:
 
 ```bash
-syncsage sync --config syncsage.yaml --source syncsage-repo --mode incremental
-syncsage sync --config syncsage.yaml --all --mode full
+pheasant sync --config pheasant.yaml --source pheasant-repo --mode incremental
+pheasant sync --config pheasant.yaml --all --mode full
 ```
 
 ## Knowledge Graph and Search
 
-SyncSage stores a directed multi-graph. Core nodes include:
+pheasant stores a directed multi-graph. Core nodes include:
 
 - `knowledge_base`, `source`, `file`, `document`, `markdown_note`, `chunk`
 - `symbol`, `entity`, `concept`, `external_reference`
@@ -197,7 +197,7 @@ Enrichment passes extract:
 
 Search spans the whole knowledge graph. Four modes are available: `text` (SQLite full-text over chunk content and paths), `graph` (matches node labels, types and attribute values plus relationship types/endpoints), `vector` (embedding similarity — opt-in, see [Vector self-search](docs/how-to/vector-search.md)), and `hybrid` (the default — merges and re-ranks every available signal, de-duplicating by node). This surfaces concepts, symbols, entities and references that never appear verbatim in chunk text, and helps relate files even when no single chunk contains every query term. Both the retrieval mode and the result count are adjustable. Graph traversal honors depth and optional edge filters.
 
-**Asking, not just searching.** `POST /assistant/chat`, the MCP tool `ask_knowledge_base`, and the UI's chat pane all run the same *agent workflow* over that search surface: retrieve, cite the passages, surface graph facts around them, then have a model write the answer from those passages alone. The default workflow (with `pip install 'syncsage[agent]'`) is a LangGraph state graph that plans sub-queries, fans out across modes, walks the graph for material lexical search missed, grades its own evidence and loops when it is thin, then verifies its citations. It is fully customizable, and third-party workflows register under the `syncsage.agent_workflows` entry-point group — see [Customize the answering workflow](docs/how-to/agent-workflows.md). **No LLM ever runs during indexing**; with no provider reachable, answers degrade to extractive (top passages, citations and facts intact) rather than failing.
+**Asking, not just searching.** `POST /assistant/chat`, the MCP tool `ask_knowledge_base`, and the UI's chat pane all run the same *agent workflow* over that search surface: retrieve, cite the passages, surface graph facts around them, then have a model write the answer from those passages alone. The default workflow (with `pip install 'pheasant-kb[agent]'`) is a LangGraph state graph that plans sub-queries, fans out across modes, walks the graph for material lexical search missed, grades its own evidence and loops when it is thin, then verifies its citations. It is fully customizable, and third-party workflows register under the `pheasant.agent_workflows` entry-point group — see [Customize the answering workflow](docs/how-to/agent-workflows.md). **No LLM ever runs during indexing**; with no provider reachable, answers degrade to extractive (top passages, citations and facts intact) rather than failing.
 
 See [docs/graph_model.md](docs/graph_model.md).
 
@@ -206,13 +206,13 @@ See [docs/graph_model.md](docs/graph_model.md).
 Start MCP over stdio inside the running container:
 
 ```bash
-docker exec -i syncsage python -m syncsage mcp --config /config/syncsage.yaml --transport stdio
+docker exec -i pheasant python -m pheasant mcp --config /config/pheasant.yaml --transport stdio
 ```
 
 Generate VS Code MCP config:
 
 ```bash
-syncsage client-config vscode --output .vscode/mcp.json
+pheasant client-config vscode --output .vscode/mcp.json
 ```
 
 Primary MCP tools:
@@ -247,7 +247,7 @@ See [docs/mcp_tools.md](docs/mcp_tools.md) and [docs/mcp_client.md](docs/mcp_cli
 
 ## Obsidian Projection
 
-SyncSage can export a human-readable vault projection under `/vault/SyncSage` by default.
+pheasant can export a human-readable vault projection under `/vault/pheasant` by default.
 
 Preview without writing:
 
@@ -266,7 +266,7 @@ curl -X POST http://localhost:8765/obsidian/export
 Generated layout:
 
 ```text
-SyncSage/
+pheasant/
   Index.md
   Sources/
   Concepts/
@@ -303,7 +303,7 @@ Full list: [docs/reference/http-api.md](docs/reference/http-api.md).
 ## Web UI
 
 A light React front end lives in [`ui/`](ui). It is a separate workload that
-talks to the SyncSage HTTP API, so the indexing container is unchanged: a
+talks to the pheasant HTTP API, so the indexing container is unchanged: a
 three-pane workspace with sources on the left, chat in the middle, and the
 knowledge graph on the right. Asking a question outlines the cited nodes on the
 canvas and lists the graph facts behind the answer, so the reasoning and the
@@ -316,7 +316,7 @@ workflow picker with its tuning options, semantic-search configuration with
 coverage and a rebuild that never re-reads a source file, an MCP connection
 panel, and a configuration editor (form + raw YAML + diff preview). What a
 given deployment can offer is read from the server rather than baked into the
-bundle. Routes are defined in `src/syncsage/api/app.py`.
+bundle. Routes are defined in `src/pheasant/api/app.py`.
 
 ### Running it
 
@@ -326,21 +326,21 @@ instructions, including how to be sure you are looking at the *current* bundle:
 
 ```bash
 # 1. Containers, one line — API on :8765, UI on :8080
-syncsage host ~/notes
+pheasant host ~/notes
 
 # 2. This repo's reference stack — always pass --build, or Compose reuses
 #    the UI image it built the first time and your changes never appear
 docker compose up -d --build            # UI on :8080, API on :8765
 
-# 3. No Docker: build the bundle once and SyncSage serves it on its own port
+# 3. No Docker: build the bundle once and pheasant serves it on its own port
 cd ui && npm ci && npm run build && cd ..
-syncsage start --config syncsage.yaml   # UI + API on :8765
+pheasant start --config pheasant.yaml   # UI + API on :8765
 
-# 4. Developing the UI itself: hot reload against a running SyncSage
+# 4. Developing the UI itself: hot reload against a running pheasant
 cd ui && npm install && npm run dev     # dev server on http://localhost:5173
 ```
 
-The UI and SyncSage images are published from the same commit under the same
+The UI and pheasant images are published from the same commit under the same
 version tag, so upgrading one upgrades the other. See
 [ui/README.md](ui/README.md) for build variables and design notes.
 
@@ -410,8 +410,8 @@ It is published to GitHub Pages by `.github/workflows/docs.yml` on pushes to `ma
 - [Obsidian integration](docs/obsidian_integration.md)
 - [Security](docs/security.md)
 - [Troubleshooting](docs/troubleshooting.md)
-- [SyncSage as a Synapse region](docs/SYNAPSE_INTEGRATION.md)
+- [pheasant as a Synapse region](docs/SYNAPSE_INTEGRATION.md)
 
 ## License
 
-SyncSage is licensed under Apache-2.0. See [LICENSE](LICENSE).
+pheasant is licensed under Apache-2.0. See [LICENSE](LICENSE).

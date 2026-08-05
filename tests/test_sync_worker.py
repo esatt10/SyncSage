@@ -3,7 +3,7 @@
 The GIL made this an architectural problem rather than a tuning one: while a
 sync ran in the serving process, request threads barely got scheduled (a model
 call measured 0.57s idle and 107s during a sync). The fix is to stop sharing
-an interpreter — the server spawns `python -m syncsage sync` and adopts the
+an interpreter — the server spawns `python -m pheasant sync` and adopts the
 graph it produces.
 """
 
@@ -12,9 +12,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from syncsage.config.loader import load_config
-from syncsage.sync.engine import SyncEngine
-from syncsage.sync.worker import WorkerBackedEngine, run_sync
+from pheasant.config.loader import load_config
+from pheasant.sync.engine import SyncEngine
+from pheasant.sync.worker import WorkerBackedEngine, run_sync
 from tests.conftest import CONFIG_TEMPLATE
 
 
@@ -28,7 +28,7 @@ def _render_config(tmp_path: Path, name: str, workspace: Path) -> Path:
         vault_path=(base / "vault").as_posix(),
         exports_path=(base / "exports").as_posix(),
     )
-    config_file = base / "syncsage.yaml"
+    config_file = base / "pheasant.yaml"
     config_file.write_text(rendered, encoding="utf-8")
     return config_file
 
@@ -36,12 +36,12 @@ def _render_config(tmp_path: Path, name: str, workspace: Path) -> Path:
 def test_worker_indexes_and_reports(tmp_path, workspace_copy) -> None:
     config_file = _render_config(tmp_path, "worker", workspace_copy)
 
-    report = run_sync(config_file, "syncsage-repo", "full")
+    report = run_sync(config_file, "pheasant-repo", "full")
 
     assert report["status"] == "ok", report
     assert report["results"], "the worker reported no results"
     result = report["results"][0]
-    assert result["source_id"] == "syncsage-repo"
+    assert result["source_id"] == "pheasant-repo"
     assert result["indexed_artifacts"] > 0
     assert result["graph_nodes"] > 0
 
@@ -55,7 +55,7 @@ def test_the_serving_process_adopts_what_the_worker_built(tmp_path, workspace_co
         assert engine.graph_builder.graph.number_of_nodes() <= 1, "expected an empty graph"
 
         worker = WorkerBackedEngine(engine, config_file)
-        result = worker.sync_source("syncsage-repo", "full")
+        result = worker.sync_source("pheasant-repo", "full")
 
         assert result.indexed_artifacts > 0
         # The parent's in-memory graph now holds what the child produced.
@@ -85,7 +85,7 @@ def test_a_failing_worker_is_reported_not_raised(tmp_path, workspace_copy) -> No
 def test_report_parsing_ignores_noise_on_stdout() -> None:
     """A stray log line must not turn a good sync into a failed one."""
 
-    from syncsage.sync.worker import _parse_report
+    from pheasant.sync.worker import _parse_report
 
     payload = {"status": "ok", "results": [{"source_id": "x", "indexed_artifacts": 3}]}
     stdout = "loading config\nsome warning\n" + json.dumps(payload) + "\n"

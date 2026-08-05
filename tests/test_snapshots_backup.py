@@ -1,7 +1,7 @@
 """Acceptance tests for Synapse step 21.6 session A.
 
 Compressed timestamped graph snapshots + retention honoring
-``max_state_size_gb`` + ``syncsage backup`` / ``restore`` round-trip safety.
+``max_state_size_gb`` + ``pheasant backup`` / ``restore`` round-trip safety.
 Everything here is offline and deterministic.
 """
 
@@ -12,16 +12,16 @@ from pathlib import Path
 
 import pytest
 
-from syncsage.config.loader import load_config
-from syncsage.config.schema import SyncSageConfig
-from syncsage.graph.simple import SimpleMultiDiGraph
-from syncsage.persistence.backup import create_backup, restore_backup
-from syncsage.persistence.graph_store import GraphStore
-from syncsage.sync.engine import SyncEngine
+from pheasant.config.loader import load_config
+from pheasant.config.schema import PheasantConfig
+from pheasant.graph.simple import SimpleMultiDiGraph
+from pheasant.persistence.backup import create_backup, restore_backup
+from pheasant.persistence.graph_store import GraphStore
+from pheasant.sync.engine import SyncEngine
 from tests.conftest import run_sync
 
 
-def _build_state(config_path: Path) -> SyncSageConfig:
+def _build_state(config_path: Path) -> PheasantConfig:
     cfg = load_config(config_path)
     engine = SyncEngine(cfg)
     try:
@@ -125,7 +125,7 @@ def test_snapshot_interval_respected(config_path: Path, monkeypatch: pytest.Monk
 
     # Drive snapshot timestamps deterministically.
     clock = {"now": "2026-06-18T01:00:00Z"}
-    monkeypatch.setattr("syncsage.sync.engine.utc_now", lambda: clock["now"])
+    monkeypatch.setattr("pheasant.sync.engine.utc_now", lambda: clock["now"])
 
     try:
         run_sync(engine, source_name="architecture-notes", mode="full")
@@ -159,7 +159,7 @@ def test_snapshots_disabled_writes_none(config_path: Path) -> None:
 # --- backup / restore round-trip ---------------------------------------------
 
 
-def _engine_counts(cfg: SyncSageConfig) -> tuple[int, int]:
+def _engine_counts(cfg: PheasantConfig) -> tuple[int, int]:
     engine = SyncEngine(cfg)
     try:
         return (
@@ -170,7 +170,7 @@ def _engine_counts(cfg: SyncSageConfig) -> tuple[int, int]:
         engine.close()
 
 
-def _fts_hits(cfg: SyncSageConfig, query: str) -> list:
+def _fts_hits(cfg: PheasantConfig, query: str) -> list:
     engine = SyncEngine(cfg)
     try:
         result = engine.search_context(query, max_results=10)
@@ -192,15 +192,15 @@ def test_backup_restore_round_trip(config_path: Path, tmp_path: Path) -> None:
     create_backup(cfg.state_path, archive, sqlite_path=cfg.storage.sqlite_path)
     assert archive.exists()
     # Original state dir must be untouched by backup.
-    assert (cfg.state_path / "syncsage.db").exists()
+    assert (cfg.state_path / "pheasant.db").exists()
 
     # Restore into a fresh state dir and rebind config to it.
     fresh_state = tmp_path / "restored-state"
     restore_backup(archive, fresh_state)
 
     restored_cfg = load_config(config_path)
-    restored_cfg.syncsage.state_path = fresh_state
-    restored_cfg.storage.sqlite_path = fresh_state / "syncsage.db"
+    restored_cfg.pheasant.state_path = fresh_state
+    restored_cfg.storage.sqlite_path = fresh_state / "pheasant.db"
     restored_cfg.storage.graph_path = fresh_state / "graphs"
     restored_cfg.storage.manifest_path = fresh_state / "manifests"
 
@@ -211,7 +211,7 @@ def test_backup_restore_round_trip(config_path: Path, tmp_path: Path) -> None:
     assert [h.get("chunk_id") for h in restored_hits] == [h.get("chunk_id") for h in original_hits]
 
     # integrity_check on the restored db.
-    conn = sqlite3.connect(fresh_state / "syncsage.db")
+    conn = sqlite3.connect(fresh_state / "pheasant.db")
     try:
         row = conn.execute("PRAGMA integrity_check").fetchone()
     finally:
@@ -248,7 +248,7 @@ def test_restore_force_swaps_cleanly_and_preserves_original(
     (target / "old-marker.txt").write_text("old", encoding="utf-8")
 
     restore_backup(archive, target, force=True, now="2026-06-18T05:00:00Z")
-    assert (target / "syncsage.db").exists()
+    assert (target / "pheasant.db").exists()
     assert not (target / "old-marker.txt").exists()
     # The old directory is preserved aside, never deleted.
     preserved = list(tmp_path.glob("occupied-state.replaced-*"))

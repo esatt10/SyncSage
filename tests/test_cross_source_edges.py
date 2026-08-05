@@ -12,18 +12,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from syncsage.config.schema import SyncSageConfig
-from syncsage.graph.enrichment import (
+from pheasant.config.schema import PheasantConfig
+from pheasant.graph.enrichment import (
     _normalize_concept,
     _singularize_word,
 )
-from syncsage.sync.engine import SyncEngine
+from pheasant.sync.engine import SyncEngine
 
 
 def _make_engine(tmp_path: Path, sources: list[dict[str, Any]]) -> SyncEngine:
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         {
-            "syncsage": {
+            "pheasant": {
                 "name": "cross-source-acceptance",
                 "state_path": str(tmp_path / "state"),
                 "vault_path": str(tmp_path / "vault"),
@@ -211,7 +211,7 @@ def test_imports_resolve_to_files_inside_the_same_source() -> None:
     zero file->file import edges. On the 2,132-file demo corpus that was 1,871
     `imports` edges every one of which ended at a name.
     """
-    from syncsage.graph.enrichment import resolve_cross_source_edges
+    from pheasant.graph.enrichment import resolve_cross_source_edges
 
     nodes = [
         (
@@ -249,7 +249,7 @@ def test_imports_resolve_to_files_inside_the_same_source() -> None:
 
 
 def test_internal_resolution_is_idempotent_and_skips_self_imports() -> None:
-    from syncsage.graph.enrichment import resolve_cross_source_edges
+    from pheasant.graph.enrichment import resolve_cross_source_edges
 
     nodes = [
         (
@@ -289,7 +289,7 @@ def test_markdown_checkboxes_are_not_citations() -> None:
     nodes. Harmless while facts were buried under concepts; visible the moment
     the panel started surfacing what documents reference.
     """
-    from syncsage.graph.enrichment import _citation_candidates
+    from pheasant.graph.enrichment import _citation_candidates
 
     text = (
         "- [x] shipped\n- [ ] pending\n## [Unreleased]\n"
@@ -300,7 +300,7 @@ def test_markdown_checkboxes_are_not_citations() -> None:
 
 
 def test_citation_extraction_is_deterministic_and_deduped() -> None:
-    from syncsage.graph.enrichment import _citation_candidates
+    from pheasant.graph.enrichment import _citation_candidates
 
     text = "[Alpha] then [alpha] then [Beta] then [Alpha]"
     first = _citation_candidates(text)
@@ -315,7 +315,7 @@ def test_reference_label_does_not_crash_on_urlparse_edge_cases() -> None:
     does for other malformed input — `_reference_label` is cosmetic only
     (node identity comes from `_node_id`), so it must fail open to the raw
     value rather than take the whole sync down."""
-    from syncsage.graph.enrichment import _reference_label
+    from pheasant.graph.enrichment import _reference_label
 
     assert _reference_label("//[unterminated-bracket") == "//[unterminated-bracket"
     assert _reference_label("//user:pa[ss@host") == "//user:pa[ss@host"

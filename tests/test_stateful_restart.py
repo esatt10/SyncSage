@@ -11,9 +11,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from syncsage.config.loader import load_config
-from syncsage.sync.engine import SyncEngine
-from syncsage.sync.fingerprint import (
+from pheasant.config.loader import load_config
+from pheasant.sync.engine import SyncEngine
+from pheasant.sync.fingerprint import (
     EMBEDDING_SCOPE,
     SOURCE_SCOPE,
     embedding_change,
@@ -33,7 +33,7 @@ def _render_config(tmp_path: Path, name: str, workspace: Path) -> Path:
         vault_path=(base / "vault").as_posix(),
         exports_path=(base / "exports").as_posix(),
     )
-    config_file = base / "syncsage.yaml"
+    config_file = base / "pheasant.yaml"
     config_file.write_text(rendered, encoding="utf-8")
     return config_file
 
@@ -81,20 +81,20 @@ def test_changing_what_a_source_indexes_forces_a_full_pass(tmp_path, workspace_c
     config_file = _render_config(tmp_path, "fp", workspace_copy)
     engine = _engine(config_file)
     try:
-        engine.sync_source("syncsage-repo", "full")
-        source = engine._source("syncsage-repo")
-        stored = engine.state.get_fingerprint(SOURCE_SCOPE.format(name="syncsage-repo"))
+        engine.sync_source("pheasant-repo", "full")
+        source = engine._source("pheasant-repo")
+        stored = engine.state.get_fingerprint(SOURCE_SCOPE.format(name="pheasant-repo"))
         assert stored == source_fingerprint(engine.config.effective_source(source))
 
         # An unrelated edit must NOT invalidate anything.
         engine.config.assistant.model = "some-other-model"
-        assert engine.sync_source("syncsage-repo", "incremental").indexed_artifacts == 0
+        assert engine.sync_source("pheasant-repo", "incremental").indexed_artifacts == 0
 
         # A chunking change must.
         source.chunking.max_chars = int(source.chunking.max_chars) // 2
-        result = engine.sync_source("syncsage-repo", "incremental")
+        result = engine.sync_source("pheasant-repo", "incremental")
         assert result.indexed_artifacts > 0, "re-chunking did not re-index"
-        assert engine.state.get_fingerprint(SOURCE_SCOPE.format(name="syncsage-repo")) != stored
+        assert engine.state.get_fingerprint(SOURCE_SCOPE.format(name="pheasant-repo")) != stored
     finally:
         engine.close()
 
@@ -111,7 +111,7 @@ def test_graph_and_manifest_are_checkpointed_mid_sync(tmp_path, workspace_copy) 
     engine = _engine(config_file)
     try:
         engine.config.storage.graph_checkpoint_seconds = 0  # checkpoint only on demand
-        engine.sync_source("syncsage-repo", "full")
+        engine.sync_source("pheasant-repo", "full")
         graph_path = engine.graph_store.graph_path(engine.config.knowledge_base_id)
         saved = _read_graph(graph_path)
         assert len(saved["nodes"]) == engine.graph_builder.graph.number_of_nodes()
@@ -119,14 +119,14 @@ def test_graph_and_manifest_are_checkpointed_mid_sync(tmp_path, workspace_copy) 
         # Work happening after the last save, then a shutdown.
         engine.graph_builder.upsert_node("late:node", "concept", "late", {})
         engine._graph_dirty = True
-        manifest = {"source_id": "syncsage-repo", "artifacts": {"late.md": {"sha256": "a" * 64}}}
-        assert engine.checkpoint_graph("syncsage-repo", manifest) is True
+        manifest = {"source_id": "pheasant-repo", "artifacts": {"late.md": {"sha256": "a" * 64}}}
+        assert engine.checkpoint_graph("pheasant-repo", manifest) is True
 
         reloaded = _read_graph(graph_path)
         assert any(node.get("id") == "late:node" for node in reloaded["nodes"])
-        assert "late.md" in engine.manifests.load("syncsage-repo").get("artifacts", {})
+        assert "late.md" in engine.manifests.load("pheasant-repo").get("artifacts", {})
         # Nothing dirty: a second checkpoint writes nothing.
-        assert engine.checkpoint_graph("syncsage-repo", manifest) is False
+        assert engine.checkpoint_graph("pheasant-repo", manifest) is False
     finally:
         engine.close()
 
@@ -138,7 +138,7 @@ def test_repair_heals_a_graph_gap_without_re_reading_everything(tmp_path, worksp
     engine = _engine(config_file)
     graph_path = engine.graph_store.graph_path(engine.config.knowledge_base_id)
     try:
-        indexed = engine.sync_source("syncsage-repo", "full").indexed_artifacts
+        indexed = engine.sync_source("pheasant-repo", "full").indexed_artifacts
         assert indexed > 0
     finally:
         engine.close()
@@ -150,11 +150,11 @@ def test_repair_heals_a_graph_gap_without_re_reading_everything(tmp_path, worksp
     recovered = _engine(config_file)
     try:
         assert recovered.graph_builder.graph.number_of_nodes() <= 1
-        assert recovered._graph_gap("syncsage-repo") is True
+        assert recovered._graph_gap("pheasant-repo") is True
         recovered.startup()
         # Every artifact SQLite knows about is back on the graph...
-        assert recovered._graph_gap("syncsage-repo") is False
-        rows = recovered.state.rows("SELECT id FROM artifacts WHERE source_id='syncsage-repo'")
+        assert recovered._graph_gap("pheasant-repo") is False
+        rows = recovered.state.rows("SELECT id FROM artifacts WHERE source_id='pheasant-repo'")
         for row in rows:
             assert recovered.graph_builder.graph.has_node(str(row["id"]))
     finally:
@@ -186,12 +186,12 @@ def test_embedding_dimension_change_re_embeds_without_re_reading(tmp_path, works
         engine.config.search.embeddings.provider = "stub"
         engine.config.search.embeddings.dimensions = 8
         engine.config.search.vector_store.provider = "numpy"
-        from syncsage.search.vector_store import vector_indexer_from_config
+        from pheasant.search.vector_store import vector_indexer_from_config
 
         engine.vectors = vector_indexer_from_config(engine.config)
         assert engine.vectors is not None
 
-        engine.sync_source("syncsage-repo", "full")
+        engine.sync_source("pheasant-repo", "full")
         first = engine.reconcile_embeddings()
         assert first["change"] == "introduced"
         assert engine.state.get_fingerprint(EMBEDDING_SCOPE) == embedding_fingerprint(engine.config)

@@ -15,11 +15,11 @@ from typing import Any
 
 import pytest
 
-from syncsage.config.schema import SyncSageConfig
-from syncsage.ingestion.captioner import StubCaptioner, build_captioner
-from syncsage.search.hybrid import HybridSearch
-from syncsage.search.sqlite_store import SearchStore
-from syncsage.sync.engine import SyncEngine
+from pheasant.config.schema import PheasantConfig
+from pheasant.ingestion.captioner import StubCaptioner, build_captioner
+from pheasant.search.hybrid import HybridSearch
+from pheasant.search.sqlite_store import SearchStore
+from pheasant.sync.engine import SyncEngine
 
 FIXTURE_IMAGE = Path(__file__).parent / "fixtures" / "sample_workspace" / "images" / "diagram.png"
 FIXTURE_SIDECAR = FIXTURE_IMAGE.with_name(FIXTURE_IMAGE.name + ".caption.txt")
@@ -41,9 +41,9 @@ def _make_image_engine(tmp_path: Path, *, with_embeddings: bool = False) -> Sync
             "embeddings": {"enabled": True, "provider": "stub", "dimensions": 64},
             "vector_store": {"provider": "numpy"},
         }
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         {
-            "syncsage": {
+            "pheasant": {
                 "name": "image-acceptance",
                 "state_path": str(tmp_path / "state"),
                 "vault_path": str(tmp_path / "vault"),
@@ -89,7 +89,7 @@ def test_stub_captioner_is_deterministic_and_sidecar_wins() -> None:
 
 
 def test_build_captioner_provider_selection() -> None:
-    from syncsage.config.schema import CaptionerSettings
+    from pheasant.config.schema import CaptionerSettings
 
     assert isinstance(build_captioner(CaptionerSettings(provider="stub")), StubCaptioner)
     with pytest.raises(ValueError, match="Unsupported"):
@@ -133,9 +133,9 @@ def test_text_only_region_builds_no_captioner(tmp_path: Path) -> None:
     notes = tmp_path / "workspace" / "notes"
     notes.mkdir(parents=True, exist_ok=True)
     (notes / "a.md").write_text("# Notes\n\nplain text only.\n", encoding="utf-8")
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         {
-            "syncsage": {
+            "pheasant": {
                 "name": "text-only",
                 "state_path": str(tmp_path / "state"),
                 "vault_path": str(tmp_path / "vault"),
@@ -157,7 +157,7 @@ def test_text_only_region_builds_no_captioner(tmp_path: Path) -> None:
 def test_contract_modalities_include_image_when_image_source_present(tmp_path: Path) -> None:
     engine = _make_image_engine(tmp_path)
     engine.sync_source("images", mode="full")
-    from syncsage.synapse.publisher import ContractPublisher
+    from pheasant.synapse.publisher import ContractPublisher
 
     publisher = ContractPublisher(engine.config, engine.state)
     contract = publisher.build(generated_at="2026-06-21T00:00:00Z")
@@ -169,9 +169,9 @@ def test_contract_modalities_omit_image_for_text_region(tmp_path: Path) -> None:
     notes = tmp_path / "workspace" / "notes"
     notes.mkdir(parents=True, exist_ok=True)
     (notes / "a.md").write_text("# Notes\n\nplain text only.\n", encoding="utf-8")
-    config = SyncSageConfig.model_validate(
+    config = PheasantConfig.model_validate(
         {
-            "syncsage": {
+            "pheasant": {
                 "name": "text-only",
                 "state_path": str(tmp_path / "state"),
                 "vault_path": str(tmp_path / "vault"),
@@ -183,7 +183,7 @@ def test_contract_modalities_omit_image_for_text_region(tmp_path: Path) -> None:
     )
     engine = SyncEngine(config)
     engine.sync_source("notes", mode="full")
-    from syncsage.synapse.publisher import ContractPublisher
+    from pheasant.synapse.publisher import ContractPublisher
 
     contract = ContractPublisher(config, engine.state).build(generated_at="2026-06-21T00:00:00Z")
     assert "image" not in contract["capabilities"]["modalities"]

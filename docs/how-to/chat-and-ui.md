@@ -1,14 +1,14 @@
 # Ask your knowledge base (the web UI)
 
-The SyncSage UI is a three-pane workspace: **Sources** on the left,
+The pheasant UI is a three-pane workspace: **Sources** on the left,
 **Chat** in the middle, **Knowledge** (graph / facts / node) on the right.
-You ask a question in prose; SyncSage answers from your own indexed content,
+You ask a question in prose; pheasant answers from your own indexed content,
 cites the passages it used, and lights up the corresponding nodes on the
 knowledge graph.
 
-Start it with `syncsage host <target>` (containers, UI included on `:8080`),
+Start it with `pheasant host <target>` (containers, UI included on `:8080`),
 `docker compose up -d --build` from a clone, or by building `ui/dist` and
-letting `syncsage start` serve it on `:8765`. Full step-by-step for each —
+letting `pheasant start` serve it on `:8765`. Full step-by-step for each —
 and what to do when the UI will not come up or looks stale — is in
 [Run the web UI](run-the-ui.md).
 
@@ -60,7 +60,7 @@ Gemini**. There are two ways to supply a key.
 ### Server environment (operator)
 
 Set the provider's key on the container and leave `assistant.provider` at
-`auto`; SyncSage picks the first provider whose variable is populated, in the
+`auto`; pheasant picks the first provider whose variable is populated, in the
 order Anthropic → OpenAI → Gemini.
 
 ```yaml
@@ -70,7 +70,7 @@ assistant:
 ```
 
 ```bash
-docker run -e ANTHROPIC_API_KEY=sk-ant-… ghcr.io/esatt10/syncsage
+docker run -e ANTHROPIC_API_KEY=sk-ant-… ghcr.io/esatt10/pheasant
 ```
 
 The key is read from the environment at request time. It is never copied into
@@ -81,7 +81,7 @@ config, state, or logs.
 Click **Connect model**, pick a provider, and paste a key. What happens to it:
 
 - it is sent once and held in the **server process's memory only**, behind an
-  opaque session token — never written to `syncsage.yaml`, never to `/state`,
+  opaque session token — never written to `pheasant.yaml`, never to `/state`,
   never logged;
 - the browser stores only the token, and only in `sessionStorage`, so it dies
   with the tab;
@@ -136,7 +136,7 @@ same knowledge base backs both surfaces — the chat panel and an MCP client are
 two front doors onto one index.
 
 ```bash
-syncsage client-config claude-code -c syncsage.yaml -o .mcp.json
+pheasant client-config claude-code -c pheasant.yaml -o .mcp.json
 ```
 
 ---
@@ -183,7 +183,7 @@ schema and the HTTP API can express is reachable from it.
 
 - **Sources → + Add source** takes a path, URL, glob or connector name and
   infers the rest (`POST /sources/quick-add`, the same inference
-  `syncsage up` uses).
+  `pheasant up` uses).
 - **Sources → Advanced…** exposes the full source schema: include/exclude
   globs, folder depth, chunking, repository branch policy, sync triggers,
   URLs, and connector settings. The type picker is populated from

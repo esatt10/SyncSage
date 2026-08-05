@@ -23,12 +23,12 @@ from pathlib import Path
 import yaml
 from fastapi.testclient import TestClient
 
-from syncsage.api.app import create_app
-from syncsage.config.loader import load_config
+from pheasant.api.app import create_app
+from pheasant.config.loader import load_config
 
 
 def _app(config, workspace: Path, config_path: Path | None = None):
-    config.syncsage.workspace_root = workspace
+    config.pheasant.workspace_root = workspace
     app = create_app(config=config, config_path=config_path)
     app.state.engine.sync_source("architecture-notes", "full")
     return app
@@ -128,9 +128,9 @@ def test_reindex_without_embeddings_enabled_is_a_4xx(loaded_config, workspace_co
 def test_persisting_preserves_the_rest_of_the_config_file(
     loaded_config, workspace_copy: Path, tmp_path: Path
 ) -> None:
-    config_path = tmp_path / "syncsage.yaml"
+    config_path = tmp_path / "pheasant.yaml"
     config_path.write_text(
-        "syncsage:\n"
+        "pheasant:\n"
         "  name: keepme\n"
         "search:\n"
         "  default_mode: hybrid\n"
@@ -162,7 +162,7 @@ def test_persisting_preserves_the_rest_of_the_config_file(
     assert raw["search"]["embeddings"]["enabled"] is True
     assert raw["search"]["embeddings"]["model"] == "my-embed"
     # Everything else survives.
-    assert raw["syncsage"]["name"] == "keepme"
+    assert raw["pheasant"]["name"] == "keepme"
     assert raw["obsidian"]["note_root"] == "MyNotes"
     assert raw["search"]["default_mode"] == "hybrid"
     assert [s["name"] for s in raw["sources"]] == ["notes"]
@@ -206,7 +206,7 @@ def test_an_uninstalled_vector_store_is_refused_up_front(
     app = _app(loaded_config, workspace_copy)
     client = TestClient(app)
     monkeypatch.setattr(
-        "syncsage.search.vector_store.vector_store_available",
+        "pheasant.search.vector_store.vector_store_available",
         lambda provider: provider == "numpy",
     )
 
@@ -237,20 +237,20 @@ def test_a_store_that_fails_on_first_touch_reports_inactive_not_500(
 
     broken = ModuleNotFoundError(
         "search.vector_store.provider='lancedb' requires the optional extra: "
-        "pip install 'syncsage[vector]'"
+        "pip install 'pheasant-kb[vector]'"
     )
 
     def explode(self) -> int:
         raise broken
 
-    monkeypatch.setattr("syncsage.search.vector_store.NumpyVectorStore.count", explode)
+    monkeypatch.setattr("pheasant.search.vector_store.NumpyVectorStore.count", explode)
 
     response = client.put(
         "/search/embeddings",
         json={"enabled": True, "provider": "stub", "store_provider": "numpy"},
     )
     assert response.status_code == 400
-    assert "syncsage[vector]" in response.json()["detail"]
+    assert "pheasant-kb[vector]" in response.json()["detail"]
 
     status = client.get("/search/embeddings").json()
     assert status["active"] is False, "a store that cannot be touched is not active"
@@ -272,4 +272,4 @@ def test_status_marks_which_vector_stores_are_installed(
     by_id = {entry["id"]: entry for entry in stores}
     assert by_id["numpy"]["available"] is True, "numpy needs no optional extra"
     assert set(by_id) == {"numpy", "lancedb"}
-    assert by_id["lancedb"]["hint"] and "syncsage[vector]" in by_id["lancedb"]["hint"]
+    assert by_id["lancedb"]["hint"] and "pheasant-kb[vector]" in by_id["lancedb"]["hint"]

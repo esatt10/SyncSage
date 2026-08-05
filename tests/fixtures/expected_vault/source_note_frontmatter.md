@@ -1,4 +1,4 @@
 ---
-syncsage_type: source
-source_name: syncsage-repo
+pheasant_type: source
+source_name: pheasant-repo
 ---

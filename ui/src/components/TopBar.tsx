@@ -5,6 +5,7 @@ import { api } from "../api/client";
 import { HealthBadge } from "./HealthBadge";
 import { McpDialog } from "./McpDialog";
 import { useTheme } from "../hooks/useTheme";
+import { PheasantMark } from "./PheasantMark";
 
 export function TopBar() {
   const [theme, toggleTheme] = useTheme();
@@ -25,9 +26,9 @@ export function TopBar() {
     <header className="topbar">
       <div className="topbar__brand">
         <span className="topbar__logo" aria-hidden>
-          S
+          <PheasantMark size={17} />
         </span>
-        SyncSage
+        pheasant
         {overview.data ? <span className="topbar__kb">{overview.data.name}</span> : null}
       </div>
 

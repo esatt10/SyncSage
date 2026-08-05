@@ -1,13 +1,13 @@
 # How to configure sources
 
-Sources are the inputs SyncSage indexes. They live under `sources:` in your
-`syncsage.yaml` and can also be registered at runtime over MCP
+Sources are the inputs pheasant indexes. They live under `sources:` in your
+`pheasant.yaml` and can also be registered at runtime over MCP
 (`register_source`) and later promoted to durable config
 (`promote_runtime_source_to_config`).
 
 Three routes reach the same place, so pick whichever fits:
 
-- **One command / one field.** `syncsage up <target>` — or **+ Add source**
+- **One command / one field.** `pheasant up <target>` — or **+ Add source**
   in the UI, or `POST /sources/quick-add` — takes a path, a git URL, a glob
   or a connector name, detects what it is, names it, registers it and syncs
   it. Nothing else to fill in. In the UI, registration is immediate and the
@@ -16,7 +16,7 @@ Three routes reach the same place, so pick whichever fits:
   right away instead of holding the connection open for however long a
   large source's first clone + index takes; watch it land on the Sources
   page, which shows a live "syncing" state per source until it finishes.
-  `syncsage up`/CLI calls still block by default (`wait: true`), matching
+  `pheasant up`/CLI calls still block by default (`wait: true`), matching
   the shell's own expectation of a command that returns when it's done.
 - **The form.** **Sources → Advanced…** in the UI exposes every field on this
   page, with the type list read from `GET /sources/types` so installed
@@ -108,17 +108,17 @@ sources:
   (`**/*.wav`) builds the transcriber. See
   [Multi-modal ingest](multimodal-ingest.md).
 
-The reference `syncsage.example.yaml` ships a thorough `exclude` list (`.git`,
+The reference `pheasant.example.yaml` ships a thorough `exclude` list (`.git`,
 `node_modules`, `dist`, `build`, virtualenvs, state/vault/exports) — copy it as
 a baseline.
 
 ## Sync modes
 
-Run a sync with `syncsage sync`:
+Run a sync with `pheasant sync`:
 
 ```bash
-syncsage sync --config syncsage.yaml --source my-repo --mode incremental
-syncsage sync --config syncsage.yaml --all --mode full
+pheasant sync --config pheasant.yaml --source my-repo --mode incremental
+pheasant sync --config pheasant.yaml --all --mode full
 ```
 
 | Mode | Behavior |
@@ -126,7 +126,7 @@ syncsage sync --config syncsage.yaml --all --mode full
 | `incremental` | Uses connector checkpoints + content hashes to skip unchanged artifacts. The default. |
 | `full` | Rebuilds artifact, chunk, graph, manifest, and checkpoint state for a source. |
 | `validate_only` | Checks connector health and readability without writing index artifacts or manifests. |
-| `repair` | Rebuilds missing or invalid state from manifests and database rows. (Also available as `syncsage repair`.) |
+| `repair` | Rebuilds missing or invalid state from manifests and database rows. (Also available as `pheasant repair`.) |
 
 Indexing is **idempotent**: re-syncing unchanged content produces the same state
 (content `sha256` + stable IDs), so a no-op sync skips everything.
@@ -146,9 +146,9 @@ automatic syncing:
 ## Validate before you run
 
 ```bash
-syncsage validate syncsage.yaml      # config shape + allowlist + paths
-syncsage doctor --config syncsage.yaml   # runtime environment checks
-syncsage config show --effective --config syncsage.yaml   # resolved config
+pheasant validate pheasant.yaml      # config shape + allowlist + paths
+pheasant doctor --config pheasant.yaml   # runtime environment checks
+pheasant config show --effective --config pheasant.yaml   # resolved config
 ```
 
 See the full key-by-key reference in [Configuration](../configuration.md).

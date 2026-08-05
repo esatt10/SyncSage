@@ -7,8 +7,8 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from syncsage.config.loader import load_config
-from syncsage.sync.scheduler import SchedulerService
+from pheasant.config.loader import load_config
+from pheasant.sync.scheduler import SchedulerService
 
 POLL_TIMEOUT_S = 5.0
 

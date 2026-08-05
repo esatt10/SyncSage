@@ -69,7 +69,7 @@ export function WorkflowPanel({
       {!data.agent_extra_installed ? (
         <div className="banner banner--warn" style={{ marginBottom: 0 }}>
           The agentic workflow needs the agent extra:{" "}
-          <code>pip install 'syncsage[agent]'</code>. Until then every question runs the
+          <code>pip install 'pheasant-kb[agent]'</code>. Until then every question runs the
           single-pass workflow.
         </div>
       ) : null}
@@ -85,7 +85,7 @@ export function WorkflowPanel({
       <p className="muted small" style={{ margin: 0 }}>
         Selected here it applies to your next question only. To make it the default set{" "}
         <code>assistant.workflow: {effective}</code> in Settings → Raw YAML. To ship your
-        own, register it under the <code>syncsage.agent_workflows</code> entry-point group.
+        own, register it under the <code>pheasant.agent_workflows</code> entry-point group.
       </p>
 
       <button className="btn btn--small btn--ghost" onClick={() => setShowOptions((v) => !v)}>

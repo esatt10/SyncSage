@@ -1,17 +1,17 @@
 # Obsidian Integration
 
-Obsidian is an optional human-readable projection layer. SyncSage does not require the Obsidian app or plugins at runtime.
+Obsidian is an optional human-readable projection layer. pheasant does not require the Obsidian app or plugins at runtime.
 
 ## Connect Obsidian
 
 1. Pick a host folder for the managed vault, for example `./vault` in the repository or another folder outside the repo.
-2. Set `deployment.compose.vault_path` in `syncsage.yaml` to that host folder.
-3. Keep `syncsage.vault_path: /vault` and `obsidian.note_root: SyncSage` in `syncsage.yaml`.
-4. Start SyncSage:
+2. Set `deployment.compose.vault_path` in `pheasant.yaml` to that host folder.
+3. Keep `pheasant.vault_path: /vault` and `obsidian.note_root: pheasant` in `pheasant.yaml`.
+4. Start pheasant:
 
    ```bash
-   syncsage compose-env syncsage.yaml --output .syncsage/compose.env
-   docker compose --env-file .syncsage/compose.env up -d
+   pheasant compose-env pheasant.yaml --output .pheasant/compose.env
+   docker compose --env-file .pheasant/compose.env up -d
    ```
 
 5. In Obsidian desktop, open the host folder from `deployment.compose.vault_path` as a vault.
@@ -31,12 +31,12 @@ Obsidian is an optional human-readable projection layer. SyncSage does not requi
      -d '{"preview": true, "template_profile": "engineering"}'
    ```
 
-SyncSage owns the generated `SyncSage/` folder inside the vault. User-authored notes can live outside that folder. If you also want SyncSage to index an existing Obsidian vault, mount that vault under `/workspace` and add it as an `obsidian_vault` source; do not point that source at the generated `/vault/SyncSage` output unless you intentionally want to index generated notes.
+pheasant owns the generated `pheasant/` folder inside the vault. User-authored notes can live outside that folder. If you also want pheasant to index an existing Obsidian vault, mount that vault under `/workspace` and add it as an `obsidian_vault` source; do not point that source at the generated `/vault/pheasant` output unless you intentionally want to index generated notes.
 
 ## Default vault layout
 
 ```text
-/vault/SyncSage/
+/vault/pheasant/
   Index.md
   Sources/
   Files/
@@ -72,7 +72,7 @@ Preview mode returns `planned_count`, `changed_count`, and `changed_files` witho
 
 ## Frontmatter
 
-Generated notes should include `syncsage: true`, `node_id`, `source_id`, `source_type`, `relative_path`, `content_hash`, `last_indexed_at`, branch/commit when available, and SyncSage tags.
+Generated notes should include `pheasant: true`, `node_id`, `source_id`, `source_type`, `relative_path`, `content_hash`, `last_indexed_at`, branch/commit when available, and pheasant tags.
 
 ## Git friendliness
 

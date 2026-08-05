@@ -38,7 +38,7 @@ export function McpDialog({ onClose }: { onClose: () => void }) {
 
             <div className="section">
               <h3 className="section__title">Add to Claude Code or Cursor</h3>
-              <CopyLine command={`syncsage client-config claude-code -c ${info.data.config_path} -o .mcp.json`} />
+              <CopyLine command={`pheasant client-config claude-code -c ${info.data.config_path} -o .mcp.json`} />
               {info.data.streamable_http_url ? (
                 <>
                   <p className="muted small" style={{ margin: "10px 0 6px" }}>

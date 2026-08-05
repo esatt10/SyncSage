@@ -1,8 +1,8 @@
-# SyncSage Web UI
+# pheasant Web UI
 
-A React + Vite front end for SyncSage: a three-pane research workspace over
+A React + Vite front end for pheasant: a three-pane research workspace over
 your indexed knowledge base. It is a **separate workload** — it builds to a
-static bundle and talks to the SyncSage container purely over its HTTP API, so
+static bundle and talks to the pheasant container purely over its HTTP API, so
 the indexing container is unchanged (see
 [`docs/ui_recommendation.md`](../docs/ui_recommendation.md)).
 
@@ -33,10 +33,10 @@ the indexing container is unchanged (see
   sub-queries, searches every mode, walks the graph, grades its own evidence
   and retries when it is thin, then verifies its citations — with the trace
   shown under the answer. Custom workflows registered under the
-  `syncsage.agent_workflows` entry-point group appear here too:
+  `pheasant.agent_workflows` entry-point group appear here too:
   [Customize the answering workflow](../docs/how-to/agent-workflows.md).
 - **Sources** — one field takes a path, URL, glob or connector name and
-  SyncSage detects the rest; selecting a source scopes both chat and graph to
+  pheasant detects the rest; selecting a source scopes both chat and graph to
   it. **Advanced…** exposes the whole source schema — include/exclude globs,
   depth, chunking, branch policy, sync triggers, connector settings — with the
   type list read from the server, so installed connector plugins (Notion,
@@ -67,7 +67,7 @@ the indexing container is unchanged (see
   in at all — a source stores the *name* of an environment variable.
 - **Parity with the API.** Every control is a call the server already exposes;
   the UI adds no capability of its own. If something is configurable in
-  `syncsage.yaml` it should be reachable here, and what a deployment can offer
+  `pheasant.yaml` it should be reachable here, and what a deployment can offer
   (source types, vector backends, workflows) is read from the server rather
   than hardcoded in this bundle — an installed plugin shows up without a
   rebuild.
@@ -80,10 +80,10 @@ npm install
 npm run dev        # http://localhost:5173, proxying /api -> :8765
 ```
 
-Point the proxy elsewhere with `SYNCSAGE_API_BASE`:
+Point the proxy elsewhere with `PHEASANT_API_BASE`:
 
 ```bash
-SYNCSAGE_API_BASE=http://localhost:9000 npm run dev
+PHEASANT_API_BASE=http://localhost:9000 npm run dev
 ```
 
 ## Build
@@ -96,9 +96,9 @@ npm run preview    # serve the production build locally
 
 | Build variable | Default | Purpose |
 |---|---|---|
-| `VITE_SYNCSAGE_API_BASE` | `/api` in dev, same-origin in prod | Where the API lives. |
-| `VITE_SYNCSAGE_GRAPH_NODE_LIMIT` | `1200` | Node budget per graph request. |
-| `VITE_SYNCSAGE_GRAPH_LINK_LIMIT` | `3600` | Link budget per graph request. |
+| `VITE_PHEASANT_API_BASE` | `/api` in dev, same-origin in prod | Where the API lives. |
+| `VITE_PHEASANT_GRAPH_NODE_LIMIT` | `1200` | Node budget per graph request. |
+| `VITE_PHEASANT_GRAPH_LINK_LIMIT` | `3600` | Link budget per graph request. |
 
 The bounded preview keeps large indexes from blocking the browser; node
 expansion still fetches focused graph slices on demand.
@@ -109,18 +109,18 @@ Step-by-step for all of these, plus how to avoid serving a stale bundle:
 [Run the web UI](../docs/how-to/run-the-ui.md).
 
 - **Sidecar (default):** `docker compose up -d --build` — or
-  `syncsage host <target>` — builds this image and serves it behind nginx,
-  proxying `/api/*` to the SyncSage container, on `http://localhost:8080`.
+  `pheasant host <target>` — builds this image and serves it behind nginx,
+  proxying `/api/*` to the pheasant container, on `http://localhost:8080`.
   Pass `--build` whenever the UI source changed: Compose reuses an existing
   local image for the tag otherwise, so edits appear to do nothing.
-- **Served by SyncSage:** `npm run build` and the API mounts `dist/`
+- **Served by pheasant:** `npm run build` and the API mounts `dist/`
   automatically at its own port (`http://localhost:8765`), or point
-  `SYNCSAGE_UI_DIST` at a bundle elsewhere. Mounted only when
+  `PHEASANT_UI_DIST` at a bundle elsewhere. Mounted only when
   `server.ui.enabled` is true and the directory exists. Build this one *without*
-  `VITE_SYNCSAGE_API_BASE` so the bundle calls the API same-origin rather than
+  `VITE_PHEASANT_API_BASE` so the bundle calls the API same-origin rather than
   through `/api`.
-- **Published image:** `ghcr.io/esatt10/syncsage-ui:<syncsage version>` — built
-  from the same commit as the SyncSage image and tagged with the same version,
+- **Published image:** `ghcr.io/esatt10/pheasant-ui:<pheasant version>` — built
+  from the same commit as the pheasant image and tagged with the same version,
   so the pair always match.
 
 ## Backend routes used

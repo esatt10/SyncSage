@@ -168,7 +168,7 @@ export function SourcesPage() {
               </button>
             </header>
             <p className="muted small">
-              Add this to your syncsage.yaml to make the source durable across restarts.
+              Add this to your pheasant.yaml to make the source durable across restarts.
             </p>
             <pre className="content-block">{patch}</pre>
           </div>

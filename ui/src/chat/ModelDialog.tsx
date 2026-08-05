@@ -65,7 +65,7 @@ export function ModelDialog({ status, sessionId, onSession, onClose }: ModelDial
         </header>
 
         <p className="muted small" style={{ marginTop: 0 }}>
-          SyncSage answers from your own index either way. A model turns the retrieved
+          pheasant answers from your own index either way. A model turns the retrieved
           passages into a written answer — retrieval, citations and graph facts work
           without one.
         </p>

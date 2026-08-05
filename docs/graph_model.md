@@ -1,12 +1,12 @@
 # Graph Model
 
-SyncSage uses a directed multi-graph model, compatible with `networkx.MultiDiGraph`, so multiple relationship types can connect the same pair of nodes.
+pheasant uses a directed multi-graph model, compatible with `networkx.MultiDiGraph`, so multiple relationship types can connect the same pair of nodes.
 
 ## Node types
 
 | Type | Purpose |
 |---|---|
-| `knowledge_base` | Root graph node for one SyncSage instance/config domain. |
+| `knowledge_base` | Root graph node for one pheasant instance/config domain. |
 | `source` | Configured source root. |
 | `repository`, `branch`, `commit` | Git-aware repository context. |
 | `directory`, `file`, `document`, `markdown_note` | Indexed filesystem artifacts. |
@@ -41,11 +41,11 @@ Stable IDs must include source identity and enough path/hash/context to support 
 Examples:
 
 ```text
-source:local-syncsage:syncsage-codebase
-file:syncsage-codebase:src/syncsage/main.py:branch=main
-chunk:syncsage-codebase:src/syncsage/main.py:sha256=abc123:chunk=0004
-symbol:syncsage-codebase:src/syncsage/main.py:SyncSageServer.start
-commit:syncsage-codebase:6f2a9c1
+source:local-pheasant:pheasant-codebase
+file:pheasant-codebase:src/pheasant/main.py:branch=main
+chunk:pheasant-codebase:src/pheasant/main.py:sha256=abc123:chunk=0004
+symbol:pheasant-codebase:src/pheasant/main.py:PheasantServer.start
+commit:pheasant-codebase:6f2a9c1
 ```
 
 ## Required provenance
@@ -54,7 +54,7 @@ Nodes and search results should record source ID, knowledge base ID, relative pa
 
 ## Enrichment passes
 
-SyncSage runs deterministic enrichment during sync:
+pheasant runs deterministic enrichment during sync:
 
 - Code pass: extracts Python imports, classes, functions, constants, and call targets.
 - Markdown/document pass: extracts headings, links, wiki links, URLs, citations, concepts, and named mentions.
