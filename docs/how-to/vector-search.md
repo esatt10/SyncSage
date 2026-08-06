@@ -20,9 +20,15 @@ search:
     model: text-embedding-3-small
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY    # env var NAME; the key never lands in config
-    dimensions: 256
     batch_size: 64
 ```
+
+`dimensions` is left out here on purpose — unset (the default) means the
+`dimensions` field is simply omitted from the embedding request, so the
+provider returns `text-embedding-3-small`'s own native size (1536).
+Switching `model` therefore changes the vector width automatically, with
+no second edit. Set `dimensions` explicitly only to shrink vectors for
+storage or to pin an exact size across a Synapse fleet (§ below).
 
 | Provider | Behavior |
 |---|---|
@@ -117,5 +123,7 @@ wire format** the pheasant-flock router's embedding provider uses, so a
 fleet can **pin one model** (one `model` + `dimensions`) across both repos and
 every region. Mismatched embedding spaces are rejected at the router. If you
 plan to join a fleet, agree on the embedding model first and set the same
-`model`/`dimensions` everywhere. See
+`model`/`dimensions` everywhere — for a fleet, set `dimensions` **explicitly**
+on every region rather than leaving it unset, so the pin doesn't depend on
+every region's provider agreeing on the same native default. See
 [Attach to a Synapse fleet](attach-to-synapse.md).

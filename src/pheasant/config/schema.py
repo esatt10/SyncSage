@@ -281,6 +281,15 @@ class EmbeddingsSettings(ModelMixin):
     wire format the pheasant-flock router uses) or ``stub``
     (deterministic, offline). The API key is read from the environment
     variable named by ``api_key_env`` and never stored in config/state.
+
+    ``dimensions`` is unset (``None``) by default: the ``dimensions``
+    parameter is simply omitted from the embedding request, so the
+    provider returns the model's own native size (1536 for
+    ``text-embedding-3-small``, 3072 for ``text-embedding-3-large``, ...) —
+    changing ``model`` therefore changes the vector width without a second
+    edit. Set an explicit number only to shrink vectors for storage
+    (OpenAI's ``-3`` models support Matryoshka truncation) or to pin an
+    exact size across a Synapse fleet.
     """
 
     enabled: bool = False
@@ -288,7 +297,7 @@ class EmbeddingsSettings(ModelMixin):
     model: str = "text-embedding-3-small"
     base_url: str = "https://api.openai.com/v1"
     api_key_env: str = "OPENAI_API_KEY"
-    dimensions: int = 256
+    dimensions: int | None = None
     batch_size: int = 64
 
 
