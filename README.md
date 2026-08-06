@@ -82,7 +82,14 @@ API and MCP endpoint. Trouble getting the UI up, or seeing a stale one? →
 
 ### The longer way
 
-Generate a starter config:
+Prefer to be walked through every option instead of hand-editing YAML?
+Run the **[guided config wizard](docs/how-to/config-wizard.md)** with
+your coding agent of choice (Claude Code, Copilot, Codex, Gemini CLI) —
+it explains each setting, tracks your progress so you never lose your
+place, and ends with a ready-to-run `pheasant.yaml` + `.env` + startup
+commands.
+
+Or generate a starter config yourself:
 
 ```bash
 pheasant init --profile quickstart --output pheasant.yaml
@@ -398,7 +405,7 @@ It is published to GitHub Pages by `.github/workflows/docs.yml` on pushes to `ma
 
 - [Documentation home](docs/index.md)
 - Tutorials: [10-minute quickstart](docs/tutorials/quickstart.md) · [Multi-modal ingest](docs/tutorials/multimodal.md)
-- How-to: [Run the web UI](docs/how-to/run-the-ui.md) · [Ask your knowledge base](docs/how-to/chat-and-ui.md) · [Customize the answering workflow](docs/how-to/agent-workflows.md) · [Configure sources](docs/how-to/sources.md) · [Vector self-search](docs/how-to/vector-search.md) · [Attach to a Synapse fleet](docs/how-to/attach-to-synapse.md) · [Backup & restore](docs/how-to/backup-restore.md)
+- How-to: [Build your config with the guided wizard](docs/how-to/config-wizard.md) · [Run the web UI](docs/how-to/run-the-ui.md) · [Ask your knowledge base](docs/how-to/chat-and-ui.md) · [Customize the answering workflow](docs/how-to/agent-workflows.md) · [Configure sources](docs/how-to/sources.md) · [Vector self-search](docs/how-to/vector-search.md) · [Attach to a Synapse fleet](docs/how-to/attach-to-synapse.md) · [Backup & restore](docs/how-to/backup-restore.md)
 
 **Reference & explanation**
 

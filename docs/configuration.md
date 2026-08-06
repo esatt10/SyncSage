@@ -34,11 +34,22 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 | `server` | API/MCP/UI network bindings and feature toggles. | Yes |
 | `storage` | Database/graph/manifests locations and state limits. | Yes |
 | `search` | Retrieval modes and ranking behavior. | Yes |
+| `ingestion` | Image captioning + audio transcription for multi-modal sources. | Optional |
 | `sync` | Watcher, git polling, schedule, idempotency, and concurrency behavior. | Yes |
+| `graph` | Knowledge-graph density (concept-node threshold, WASM acceleration). | Optional |
 | `obsidian` | Export controls for notes/canvas/frontmatter/backlinks/tags. | Optional |
-| `security` | Path allowlisting and source-read protections. | Strongly recommended |
+| `security` | Path allowlisting, source-read protections, and ACL enforcement. | Strongly recommended |
+| `synapse` | Federation into a Synapse fleet (contract publishing, signing). | Optional, standalone-safe |
+| `memory` | Agent-memory consolidation policy (TTL decay, supersede archiving). | Optional |
 | `assistant` | Grounded chat over the index (the UI's chat layer). Query-time only. | Optional |
 | `sources` | All indexed repositories/folders/files/URLs. | Yes |
+
+> **Note:** this table's row order follows `PheasantConfig`'s field order in
+> `src/pheasant/config/schema.py`, not necessarily the order sections appear
+> below. `tests/test_config_wizard_freshness.py` fails CI if a new top-level
+> or nested settings block lands in that file without a matching mention
+> here and in `agent/config_wizard_prompt.md` — see
+> [the config wizard how-to](how-to/config-wizard.md).
 
 ---
 
@@ -144,6 +155,32 @@ just a networking detail — see [security.md](security.md#trust-model-for-the-h
 | `ranking.prefer_recent_commits` | bool | `true` (example) | Boost content tied to recent commits. |
 | `ranking.graph_neighbor_boost` | bool | `true` (example) | Boost graph-adjacent matches. |
 | `ranking.max_results_default` | integer | `10` | Default result count cap. |
+| `wasm_relationship_search` | bool | `false` | Run `graph_search._scan_edges` through the vendored WASM accelerator (Synapse 34.5b) instead of pure Python. Needs the `[wasm]` extra; falls back to pure Python on any failure or if the extra is missing — never a correctness dependency. A consistent, growing win (2-8x at 34.4's benchmark scale) on the relationship-search query path. |
+
+---
+
+## `ingestion` (multi-modal: image captioning + audio transcription)
+
+Only takes effect for a source whose `include` globs admit an image or
+audio extension — a text-only region builds neither captioner nor
+transcriber and stays byte-identical to a pre-25.4 config. Captions/
+transcripts flow through the normal chunk → embed → graph path like any
+other text; an authored sidecar (`<image>.caption.txt` /
+`<audio>.transcript.txt`) always wins over the model.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `captioner.provider` | string | `stub` | `stub` (deterministic, offline, default — caption = template over file name + digest of bytes) or `openai-spec` (vision-capable chat model, `POST {base_url}/chat/completions` with an `image_url` part). |
+| `captioner.model` | string | `gpt-4o-mini` | Vision model name (only used by `openai-spec`). |
+| `captioner.base_url` | string | `https://api.openai.com/v1` | OpenAI-spec endpoint base. |
+| `captioner.api_key_env` | string | `OPENAI_API_KEY` | Env var name holding the key; the key itself never lands in config. |
+| `captioner.prompt` | string | `Describe this image in one concise sentence for search indexing.` | Prompt sent with each image. |
+| `transcriber.provider` | string | `stub` | `stub` (deterministic, offline, default — no audio library, no network) or `openai-spec` (`POST {base_url}/audio/transcriptions`, multipart upload). |
+| `transcriber.model` | string | `whisper-1` | Speech-to-text model name (only used by `openai-spec`). |
+| `transcriber.base_url` | string | `https://api.openai.com/v1` | OpenAI-spec endpoint base. |
+| `transcriber.api_key_env` | string | `OPENAI_API_KEY` | Env var name holding the key. |
+
+See [Multi-modal ingest](how-to/multimodal-ingest.md).
 
 ---
 
@@ -256,6 +293,15 @@ standing behavior of a scheduled one.
 
 ---
 
+## `graph` (knowledge-graph density)
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `concept_min_documents` | integer | `2` | Distinct documents that must share a term before it becomes a `concept` node. A concept exists to link the documents that share it; one mentioned by a single document is pure weight — measured on a real corpus, 74.2% of concept nodes were single-document and concepts made up 87.2% of a bloated graph. Set to `1` to keep every term as a node (pre-2026-08 behavior). Nothing becomes unfindable at higher values: the term stays on `concept_terms`/`artifact_terms` and in searchable text either way. |
+| `wasm_cross_source_resolution` | bool | `false` | Run `resolve_cross_source_edges` (import/link resolution across sources) through the vendored WASM accelerator (Synapse 34.5a) instead of pure Python. Needs the `[wasm]` extra; falls back to pure Python on any failure or if the extra is missing. Conditional win per the 34.4 benchmark — loses to Python below roughly 1,300-2,500 edges, wins modestly above it; opt in for large/growing multi-source graphs, leave off for small ones. |
+
+---
+
 ## `obsidian` (output options)
 
 | Key | Type | Default / Example | Notes |
@@ -289,6 +335,51 @@ standing behavior of a scheduled one.
 | `deny_path_traversal` | bool | `true` | Block `..` traversal and unsafe resolution. |
 | `allow_user_selected_source_paths` | bool | `true` | Let a source name any readable path, not just one under `allow_workspace_roots`. This is what makes "point it at anything" work; see the security notes on what compensates for it. |
 | `default_exclude_secrets` | bool | `true` | **Always** union `SECRET_EXCLUDES` into every filesystem source's excludes. Unlike the rest of `DEFAULT_EXCLUDES`, supplying your own `exclude` list does not drop these. |
+| `acl_enforced` | bool | `false` | Master toggle for principal-aware retrieval (Step 32.x). `false` = every pre-32 deployment stays byte-identical. When `true`, `search_context` filters candidates against each artifact's captured ACL before merge/return. |
+| `default_visibility` | string | `public` | How an un-ACL'd artifact (no connector-captured ACL, e.g. a plain filesystem source) is treated once `acl_enforced` is on: `public` keeps it searchable by anyone, `private` requires an authenticated principal. |
+| `groups` | map[str, list[str]] | `{}` | Config-mapped `principal -> [group, ...]` identities, unioned with any IdP-synced groups at query time. |
+| `idp.enabled` | bool | `false` | Turn on SCIM 2.0 group-directory sync (Step 32.4). Disabled by default — `groups` above still works with zero env vars. |
+| `idp.provider` | string | `scim` | Directory protocol. |
+| `idp.base_url` | string | `""` | SCIM `/Groups` listing endpoint base. |
+| `idp.api_key_env` | string | `IDP_TOKEN` | Env var holding the bearer token; never stored in config. |
+| `idp.sync_interval_minutes` | integer | `60` | How often the scheduler beat (or `POST /security/idp/sync`) refreshes the mapping. |
+| `idp.staleness_max_minutes` | integer | `1440` | SLA: a mapping older than this **fails closed** (grants nothing) until the next successful sync. |
+
+---
+
+## `synapse` (federation into a Synapse fleet, optional)
+
+Standalone-safe by construction: every router-facing behavior no-ops with
+the defaults below, so a region that never sets `router_url` behaves
+exactly like a router-less pheasant. Read
+[Attach to a Synapse fleet](how-to/attach-to-synapse.md) before enabling.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `publish` | bool | `false` | Gate contract publication + the NDJSON sync-event stream. |
+| `router_url` | string \| null | `null` | Synapse router base URL, e.g. `http://synapse-router:8000`. When set, each successful sync POSTs `sync.completed` (with the inline contract) to `<router_url>/v1/synapse/events` — failures are logged, never raised. |
+| `fleet_id` | string \| null | `null` | Fleet label stamped into the published contract. |
+| `endpoint` | string \| null | `null` | This region's reachable base URL, e.g. `http://my-region:8765` (the router pulls `GET /contract` from here). |
+| `webhook_timeout_seconds` | float | `5.0` | Timeout for the router-webhook POST. |
+| `signing_key_ref` | string \| null | `null` | Secret *reference* — `env://NAME` or a bare env-var name — resolving to a base64 32-byte Ed25519 seed (Step 24.4). Unset (default): `integrity.signature` stays `null` and nothing changes. The plaintext key never lands in config or on disk. |
+
+---
+
+## `memory` (agent-memory consolidation, optional)
+
+Governs the built-in `memory` source type (Step 33.x): agents write
+records via MCP `memory_write` / `POST /memory`, which land as append-only
+frontmatter Markdown files indexed by the ordinary pipeline — recall is
+just search. This block only controls **consolidation** (archiving), not
+whether the memory source itself is registered. See
+[Agent memory](how-to/agent-memory.md).
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `consolidation_enabled` | bool | `true` | Archive superseded records (an explicit correction) and per-scope TTL-expired records on the scheduler beat or via `memory_consolidate` / `POST /memory/consolidate`. Archiving renames `<id>.md` → `<id>.md.archived` in place — bytes preserved, never deleted — then a full re-sync prunes it from the index. |
+| `session_ttl_days` | integer \| null | `null` | TTL for `session`-scoped records. `null` = never expires by age. |
+| `user_ttl_days` | integer \| null | `null` | TTL for `user`-scoped records. |
+| `org_ttl_days` | integer \| null | `null` | TTL for `org`-scoped records. |
 
 ---
 
