@@ -610,11 +610,32 @@ class LanceDBVectorStore:
 
 
 class VectorIndexer:
-    """Embed-on-sync helper: embeds only chunk ids missing from the store."""
+    """Embed-on-sync helper: embeds only chunk ids missing from the store.
 
-    def __init__(self, embedder: Embedder, store: VectorStore):
+    New/changed chunks are queued across files rather than embedded one file
+    at a time. The sync loop calls `index_artifact` once per file, and most
+    files in a real corpus carry far fewer chunks than an embedder's own
+    `batch_size` (64) — embedding immediately, per file, turned a sync into
+    one HTTP round-trip to the embedding provider *per file* instead of
+    packing many files' chunks into one request. On a few-hundred-file repo
+    that was the difference between a handful of embedding calls and
+    hundreds, entirely serial on the sync's only thread. Queued chunks are
+    flushed automatically once `queue_size` accumulates (so a large source
+    still embeds in bounded batches, and a crash mid-sync loses at most one
+    batch's progress) and explicitly by `flush()`, which the caller
+    (`SyncEngine`) already calls at the end of every sync.
+    """
+
+    def __init__(self, embedder: Embedder, store: VectorStore, queue_size: int | None = None):
         self.embedder = embedder
         self.store = store
+        # Default to the embedder's own batch size: `embed()` already
+        # sub-batches internally at that size, so queuing exactly that many
+        # pending chunks before flushing yields one HTTP call per flush
+        # rather than a request smaller than what the provider was
+        # configured to accept in one round-trip.
+        self.queue_size = int(queue_size or getattr(embedder, "batch_size", 64) or 64)
+        self._pending: list[dict[str, Any]] = []
 
     def index_artifact(
         self,
@@ -622,12 +643,14 @@ class VectorIndexer:
         artifact_id: str,
         chunk_rows: list[dict[str, Any]],
     ) -> int:
-        """Embed + upsert new/changed chunks; returns how many were embedded.
+        """Queue new/changed chunks for embedding; returns how many were queued.
 
         Chunk ids are content-addressed (``sha256={text_hash}`` is part of
         the id), so store membership doubles as the text_hash bookkeeping:
-        an unchanged chunk keeps its id and is skipped without any
-        embedder call.
+        an unchanged chunk keeps its id and is skipped without ever
+        reaching the embedder. Queued chunks are not yet in the store —
+        callers that need durability before returning (as opposed to by the
+        end of the sync) should call `flush()`.
         """
 
         ids = [str(chunk["id"]) for chunk in chunk_rows]
@@ -635,23 +658,47 @@ class VectorIndexer:
         pending = [chunk for chunk in chunk_rows if str(chunk["id"]) not in existing]
         if not pending:
             return 0
-        vectors = self.embedder.embed([str(chunk["text"]) for chunk in pending])
-        self.store.upsert(
-            [str(chunk["id"]) for chunk in pending],
-            vectors,
-            [
+        for chunk in pending:
+            self._pending.append(
                 {
+                    "id": str(chunk["id"]),
+                    "text": str(chunk["text"]),
                     "source_id": source_id,
                     "artifact_id": artifact_id,
                     "text_hash": chunk.get("text_hash"),
                 }
-                for chunk in pending
-            ],
-        )
+            )
+        if len(self._pending) >= self.queue_size:
+            self.flush_pending()
         return len(pending)
 
+    def flush_pending(self) -> None:
+        """Embed and upsert everything queued so far, across every file
+        `index_artifact` has touched since the last flush."""
+        if not self._pending:
+            return
+        batch, self._pending = self._pending, []
+        vectors = self.embedder.embed([item["text"] for item in batch])
+        self.store.upsert(
+            [item["id"] for item in batch],
+            vectors,
+            [
+                {
+                    "source_id": item["source_id"],
+                    "artifact_id": item["artifact_id"],
+                    "text_hash": item["text_hash"],
+                }
+                for item in batch
+            ],
+        )
+
     def prune_source(self, source_id: str, live_chunk_ids: set[str]) -> int:
-        """Delete vectors for chunks (or whole artifacts) no longer indexed."""
+        """Delete vectors for chunks (or whole artifacts) no longer indexed.
+
+        Only considers chunks already *in the store* — a chunk still sitting
+        in the pending queue (not yet embedded) is never mistaken for stale,
+        since it cannot be a member of `store.source_chunk_ids` yet.
+        """
 
         stale = sorted(self.store.source_chunk_ids(source_id) - set(live_chunk_ids))
         if not stale:
@@ -659,10 +706,11 @@ class VectorIndexer:
         return self.store.delete(chunk_ids=stale)
 
     def flush(self) -> None:
-        """Force any writes the store buffered to disk now. The caller
-        (`SyncEngine`) MUST call this at the end of a sync, alongside its
-        own final graph save — see `NumpyVectorStore`'s docstring for why
-        this exists."""
+        """Embed anything still queued, then force the store's writes to
+        disk now. The caller (`SyncEngine`) MUST call this at the end of a
+        sync, alongside its own final graph save — see `NumpyVectorStore`'s
+        docstring for why the disk-flush half exists."""
+        self.flush_pending()
         self.store.flush()
 
 
