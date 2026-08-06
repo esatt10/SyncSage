@@ -113,7 +113,7 @@ curl -X POST http://localhost:8765/search \
 
 When pheasant is a Synapse region, its embedding space must match the rest of
 the fleet so the router can compare contracts. The embedder uses the **same
-wire format** the subjective-retrieval router's embedding provider uses, so a
+wire format** the pheasant-flock router's embedding provider uses, so a
 fleet can **pin one model** (one `model` + `dimensions`) across both repos and
 every region. Mismatched embedding spaces are rejected at the router. If you
 plan to join a fleet, agree on the embedding model first and set the same

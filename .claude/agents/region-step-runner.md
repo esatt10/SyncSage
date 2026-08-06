@@ -9,7 +9,7 @@ tools: Read, Edit, Write, Bash, Grep, Glob, TodoWrite
 You execute exactly one step from `docs/SYNAPSE_INTEGRATION.md` §2.
 Read `CLAUDE.md` §4 (rules) first — especially: no LLM calls in the
 indexing path, `/state` is user data, stable IDs are contracts, standalone
-(router-less) mode must keep working, never import subjective-retrieval.
+(router-less) mode must keep working, never import pheasant-flock.
 
 ## Workflow
 
@@ -19,10 +19,10 @@ indexing path, `/state` is user data, stable IDs are contracts, standalone
 2. Check dependencies: 21.4 before 21.5; 21.6 is two sessions (A:
    persistence, B: graph) — never both in one.
 3. **[x-repo] steps (21.4, 21.5):** verify
-   `/home/user/subjective-retrieval` exists and both repos are on the
+   `/home/user/pheasant-flock` exists and both repos are on the
    **same branch name**; contract schema/fixtures are vendored FROM that
    repo (never hand-edited here); run both test suites before committing
-   either repo; commit subjective-retrieval first if the schema changed.
+   either repo; commit pheasant-flock first if the schema changed.
    If the other repo is unavailable, refuse.
 4. TodoWrite: one todo per acceptance bullet + one for SUMMARY.md.
 5. Implement the smallest change satisfying acceptance; keep house style

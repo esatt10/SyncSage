@@ -1,11 +1,11 @@
 """Synapse Step 20.1 — vendored semantic-contract parity gate.
 
-The contract schema is canonical in the subjective-retrieval repository;
+The contract schema is canonical in the pheasant-flock repository;
 this repo only vendors the exported JSON Schema + golden fixture under
 ``contracts/``. These tests fail loudly when the vendored copies drift
 from the recorded parity hashes (or from the sibling repo's bytes when it
 is checked out alongside). Never fix a failure by editing the vendored
-files — re-vendor from subjective-retrieval via its contract-author skill.
+files — re-vendor from pheasant-flock via its contract-author skill.
 """
 
 from __future__ import annotations
@@ -75,10 +75,10 @@ def test_fixture_is_a_valid_v1_contract() -> None:
     )
 
 
-def test_parity_with_sibling_subjective_retrieval_when_present() -> None:
-    sibling = REPO.parent / "subjective-retrieval"
+def test_parity_with_sibling_pheasant_flock_when_present() -> None:
+    sibling = REPO.parent / "pheasant-flock"
     if not sibling.is_dir():
-        pytest.skip("subjective-retrieval repo not checked out alongside")
+        pytest.skip("pheasant-flock repo not checked out alongside")
     assert (
         sibling / "contracts/semantic_contract.v1.schema.json"
     ).read_bytes() == SCHEMA.read_bytes()

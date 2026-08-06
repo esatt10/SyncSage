@@ -3,7 +3,7 @@
 The harness runs the real write→index→search path; the thresholds below are
 the regression gate for the two retrieval fixes it flushed out (FTS5
 implicit-AND on natural-language questions, inverted bm25→relevance
-mapping). Full-size numbers are recorded in the SR repo's
+mapping). Full-size numbers are recorded in the Flock repo's
 ``docs/RESULTS.md`` §9d; reproduce with ``python -m pheasant.memory.benchmark``.
 """
 

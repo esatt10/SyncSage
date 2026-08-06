@@ -3,7 +3,7 @@
 This package is the pheasant *region* half of the Synapse boundary. It is
 deliberately self-contained:
 
-- It never imports ``subjective-retrieval`` (the router lives in the sibling
+- It never imports ``pheasant_flock`` (the router lives in the sibling
   repo; the boundary is contract JSON + HTTP — see ``CLAUDE.md`` §1.1).
 - The semantic contract is built by hand to match the vendored JSON Schema
   ``contracts/semantic_contract.v1.schema.json`` exactly, including the

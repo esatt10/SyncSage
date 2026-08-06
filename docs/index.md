@@ -9,8 +9,8 @@ graph** with hybrid self-search, for both agents and humans.
     pheasant is the **region** component of **Synapse**, a federated
     knowledge-base platform. New here, or want the whole-system view? Start at
     the suite front door:
-    **[The Synapse Suite →](https://esatt10.github.io/subjective-retrieval/)**
-    (the [subjective-retrieval](https://github.com/esatt10/subjective-retrieval)
+    **[The Synapse Suite →](https://esatt10.github.io/pheasant-flock/)**
+    (the [pheasant-flock](https://github.com/esatt10/pheasant-flock)
     router site). This site is the region/KB half.
 
 It runs perfectly well **standalone**: point it at some sources, sync, and query
@@ -78,7 +78,7 @@ Synapse is a two-repo system:
 - **pheasant** (this repo) is a **region** — a self-contained knowledge base
   with its own sync engine, graph, and self-search. It publishes a semantic
   contract and answers fan-out queries.
-- **[subjective-retrieval](https://github.com/esatt10/subjective-retrieval)** is
+- **[pheasant-flock](https://github.com/esatt10/pheasant-flock)** is
   the **router** — the "nervous system" that scores contracts, routes global
   queries across regions, merges and re-ranks the answers, and discovers
   cross-region relationships ("white matter").
@@ -86,7 +86,7 @@ Synapse is a two-repo system:
 The boundary between them is **contract JSON over HTTP** — there is no Python
 dependency between the repos, and a router-less pheasant keeps working unchanged.
 For the global, cross-region search experience, see the
-[subjective-retrieval documentation site](https://github.com/esatt10/subjective-retrieval).
+[pheasant-flock documentation site](https://github.com/esatt10/pheasant-flock).
 
 ## What's shipped
 

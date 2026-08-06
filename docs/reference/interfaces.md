@@ -81,7 +81,7 @@ Legend: — means "not offered on this surface"; use one of the others.
 | Push event to router | (automatic webhook to `<router_url>/v1/synapse/events`) | — | — | — |
 
 Routing, fan-out, merge, and global cross-region search live on the **router**
-(subjective-retrieval), not on the region. See
+(pheasant-flock), not on the region. See
 [Attach to a Synapse fleet](../how-to/attach-to-synapse.md).
 
 ## Server & MCP lifecycle

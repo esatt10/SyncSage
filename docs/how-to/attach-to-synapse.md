@@ -14,7 +14,7 @@ that contract to route global, cross-region queries to it.
 
 ```text
                   ┌──────────────────────────┐
-   global query → │  Synapse router          │  (subjective-retrieval repo)
+   global query → │  Synapse router          │  (pheasant-flock repo)
                   │  scores contracts,       │
                   │  routes + fans out       │
                   └───────────┬──────────────┘
@@ -126,7 +126,7 @@ config), so the contract wire format is unchanged.
 
 Routing, fan-out, merge, and the global search experience live on the **router**
 side. Once your region is publishing and reachable, head to the
-[subjective-retrieval documentation site](https://github.com/esatt10/subjective-retrieval)
+[pheasant-flock documentation site](https://github.com/esatt10/pheasant-flock)
 to register the region and run global queries across the fleet.
 
 ## Verifying the attach

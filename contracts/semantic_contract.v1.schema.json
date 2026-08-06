@@ -236,7 +236,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/esatt10/subjective-retrieval/contracts/semantic_contract.v1.schema.json",
+  "$id": "https://github.com/esatt10/pheasant-flock/contracts/semantic_contract.v1.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Versioned projection of a region's content, sized for router RAM.\n\n``schema_version`` is stamped by the canonical writer\n(:func:`write_contract`); readers go through :func:`load_contract`\nwhich applies the repo-wide v0 fallback (warn + treat as v0).",
   "properties": {

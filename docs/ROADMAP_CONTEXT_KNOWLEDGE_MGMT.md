@@ -3,7 +3,7 @@
 **Status:** companion document (2026-07-14). The **canonical roadmap** —
 landscape survey, gap analysis, positioning, and the full Phase 30–36 plan —
 lives in the sibling repo:
-`subjective-retrieval/docs/ROADMAP_CONTEXT_KNOWLEDGE_MGMT.md` (ADR 2026-07-14
+`pheasant-flock/docs/ROADMAP_CONTEXT_KNOWLEDGE_MGMT.md` (ADR 2026-07-14
 in `…/docs/DECISIONS.md`). This file records only what lands **in this repo**
 and the invariants each phase must respect here. Cross-repo rules are
 unchanged: contract JSON + HTTP only, identical branch names, fixture parity,
@@ -41,14 +41,14 @@ limitations. They stay inviolate through every phase below.
 | **31 — Connector SDK + connectors** | 31.1 entry-point connector SDK (checkpoint API, manifest integration, idempotency harness — the four pillars enforced by contract); 31.2–31.6 Notion, Google Drive, Slack, Confluence/Jira, IMAP/email — each with incremental cursors and **ACL-capture fields reserved** for Phase 32; 31.7 conformance suite + template | No LLM in path; `tests/test_sync_idempotency.py` grows per connector; recorded-fixture offline tests |
 | **32 — Permission-aware federation** [x-repo] | 32.1 per-artifact ACL metadata at ingest (SQLite alongside chunks; stable-ID grammar unchanged); 32.2 principal-context filtering in self-search *before* scoring/return; 32.4 ACL/group sync loop with a documented staleness SLA; 32.6 leak-test suite (permanent gate) | Contracts stay ACL-free (Tier-1 untouched); defaults off — a standalone/ACL-less region is byte-identical to today |
 | **33 — Agent memory as a region** | 33.1 memory region type: `memory_write` MCP tool + HTTP append of schema-versioned memory records flowing through the normal chunk→embed→graph path; 33.2 temporal validity (asserted-at/superseded-at) + consolidation/decay on the 21.1 scheduler | Content arrives via API but indexing stays deterministic; one-shot idempotent state migrations for the new artifact |
-| **34 — Subjective relevance** | No region code change expected (SR-side UX + calibration); regions may expose feedback capture hooks in the UI | — |
-| **35 — Open contract spec + adapters** [x-repo] | Schema re-vendor **only if** SR bumps the wire format (bilateral law + PARITY.json); A2A alignment if the region grows its own card | Never hand-edit `contracts/`; vendored-fixture parity |
+| **34 — Subjective relevance** | No region code change expected (Flock-side UX + calibration); regions may expose feedback capture hooks in the UI | — |
+| **35 — Open contract spec + adapters** [x-repo] | Schema re-vendor **only if** Flock bumps the wire format (bilateral law + PARITY.json); A2A alignment if the region grows its own card | Never hand-edit `contracts/`; vendored-fixture parity |
 | **36 — Enterprise ops** | Fleet observability hooks (region health/sync metrics), backup/restore drill participation (21.6 snapshots already ship) | `/state` is user data — migrations preserve originals |
 
 ## 2b. Phase 30 — region-side step contracts (execution started 2026-07-15)
 
 Canonical contracts live in
-`subjective-retrieval/docs/PRODUCT_FRAMEWORK.md` §2; this section mirrors
+`pheasant-flock/docs/PRODUCT_FRAMEWORK.md` §2; this section mirrors
 only the steps that land **here**.
 
 ### Step 30.1 — `pheasant up` personal quickstart — **landed 2026-07-15**
@@ -71,7 +71,7 @@ mode untouched).
 ### Step 30.3 — published images — **landed 2026-07-15 (defaults alignment)**
 
 This repo's half pre-existed: `.github/workflows/container.yml` publishes
-`ghcr.io/<owner>/pheasant:<semver>` on every merged release. The SR side
+`ghcr.io/<owner>/pheasant:<semver>` on every merged release. The Flock side
 aligned its Helm/compose/docs defaults to the published-image path (its
 `docs/PRODUCT_FRAMEWORK.md` §2 has the full contract). No change here.
 
@@ -86,13 +86,13 @@ attach command); docker modes reuse the VS Code arg vectors. Guide:
 `docs/how-to/attach-to-coding-agent.md`. MCP tool surface unchanged
 (additive-only rule respected). Acceptance: agent-config cases in
 `tests/test_mcp_client_config.py`. External MCP registry/directory
-listings deferred (release-channel work, tracked in the SR framework doc).
+listings deferred (release-channel work, tracked in the Flock framework doc).
 
 **Phase 30 is complete (2026-07-15).**
 
 ## 2c. Phase 31 — region-side step contracts (execution started 2026-07-15)
 
-Canonical contracts: `subjective-retrieval/docs/PRODUCT_FRAMEWORK.md` §3.
+Canonical contracts: `pheasant-flock/docs/PRODUCT_FRAMEWORK.md` §3.
 
 ### Step 31.1 — Connector SDK — **landed 2026-07-15**
 
@@ -140,7 +140,7 @@ edit re-indexes exactly one page), conformance pass, entry-point guard.
 
 ### Steps 31.3–31.7 — GDrive, Slack, Confluence, IMAP + certification — **landed 2026-07-16 (Phase 31 complete)**
 
-All four ride the 31.2 pattern (full contracts: SR `PRODUCT_FRAMEWORK.md`
+All four ride the 31.2 pattern (full contracts: Flock `PRODUCT_FRAMEWORK.md`
 §3): entry-point SDK plugins in `src/pheasant/connectors/`, one
 monkeypatch-friendly network touchpoint each (stdlib urllib / imaplib —
 zero new deps), deterministic rendering, version-proxy `item.sha256`,
@@ -162,7 +162,7 @@ guard. Suite: **248 passed**.
 
 ## 2d. Phase 33 — region-side step contracts (execution started 2026-07-16)
 
-Canonical contracts: `subjective-retrieval/docs/PRODUCT_FRAMEWORK.md` §3c.
+Canonical contracts: `pheasant-flock/docs/PRODUCT_FRAMEWORK.md` §3c.
 
 ### Step 33.1 — Memory region type + write path — **landed 2026-07-16**
 
@@ -183,7 +183,7 @@ actionable error. The contract publisher advertises `"memory"` in
 data, no schema bump, parity green). Acceptance:
 `tests/test_memory_region.py` (store determinism/round-trip/validation,
 MCP write→search e2e + zero-work re-write, HTTP round-trip + 400s,
-publisher capability). 33.3/33.4 (routing + benchmark) land in SR.
+publisher capability). 33.3/33.4 (routing + benchmark) land in Flock.
 
 ### Step 33.2 — Temporal validity + consolidation — **landed 2026-07-16**
 
@@ -214,7 +214,7 @@ categories: single-hop recall, multi-session interference, knowledge
 updates (supersedes + consolidation), abstention. Recorded (30 facts /
 120 distractors / 10 updates / 10 abstain, k=5): **recall@5 1.000,
 update_accuracy 1.000, stale_leak 0.000, abstention 1.000** — canonical
-numbers + methodology in SR `docs/RESULTS.md` §9d. **The bench exposed
+numbers + methodology in Flock `docs/RESULTS.md` §9d. **The bench exposed
 and drove two real self-search fixes** (`search/sqlite_store.py`): NL
 questions no longer zero out on FTS5 implicit-AND (MATCH is now an OR of
 sanitized tokens ranked by BM25), and the bm25→relevance mapping is now
@@ -226,7 +226,7 @@ NL-question ranking regression + generator determinism).
 
 The enterprise track runs **30 → 31 → 32 → 36** and is region-heavy; the
 personal track runs **30 → 33** and is also region-heavy. Expect this repo to
-carry most of the roadmap's implementation weight, with the SR repo carrying
+carry most of the roadmap's implementation weight, with the Flock repo carrying
 routing/identity/spec/eval work. Each phase gets per-step contracts (in the
 style of `docs/SYNAPSE_INTEGRATION.md` §2) when scheduled; sessions stay
 scoped to one step, with run summaries per the framework conventions.
@@ -234,6 +234,6 @@ scoped to one step, with run summaries per the framework conventions.
 ## 4. Pointers
 
 - Canonical roadmap + landscape sources:
-  `subjective-retrieval/docs/ROADMAP_CONTEXT_KNOWLEDGE_MGMT.md`
+  `pheasant-flock/docs/ROADMAP_CONTEXT_KNOWLEDGE_MGMT.md`
 - Region-side Synapse spec: `docs/SYNAPSE_INTEGRATION.md`
 - Design pillars + rules: `CLAUDE.md` §1, §4

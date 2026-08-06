@@ -47,7 +47,7 @@ jobs:
 
   deploy:
     # Only deploy from main; PRs just build to validate (parity with the
-    # subjective-retrieval docs workflow).
+    # pheasant-flock docs workflow).
     if: github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest

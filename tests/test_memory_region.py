@@ -1,6 +1,6 @@
 """Product Framework Step 33.1 — agent memory as a region.
 
-Acceptance (SR docs/PRODUCT_FRAMEWORK.md §3c): store determinism +
+Acceptance (Flock docs/PRODUCT_FRAMEWORK.md §3c): store determinism +
 append-only idempotency; engine e2e write → sync → searchable with a
 zero-work second sync; MCP facade read-your-writes + actionable
 no-source error; HTTP POST/GET round-trip + 400 without a memory source;

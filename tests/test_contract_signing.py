@@ -7,7 +7,7 @@ Offline + deterministic test keypair. Two halves:
 2. The vendored ``signed-demo-region`` fixture — produced by *this* signing
    path — verifies under a plain ``cryptography`` check over the same canonical
    body bytes the router uses, and a tampered copy fails. This is the pheasant
-   side of the cross-repo signing-parity guarantee (the SR side asserts the
+   side of the cross-repo signing-parity guarantee (the Flock side asserts the
    sibling router's ``verify_signature`` accepts the same fixture).
 """
 
@@ -37,7 +37,7 @@ SIGNED_FIXTURE = REPO_ROOT / "contracts" / "fixtures" / "signed-demo-region.v1.c
 
 TEST_SEED = bytes(range(32))
 TEST_KEY_B64 = base64.b64encode(TEST_SEED).decode("ascii")
-# Public key matching TEST_SEED (used by the SR router trust store too).
+# Public key matching TEST_SEED (used by the Flock router trust store too).
 TEST_PUBKEY_B64 = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
 
 
