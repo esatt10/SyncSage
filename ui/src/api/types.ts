@@ -299,7 +299,8 @@ export interface EmbeddingsStatus {
   base_url: string;
   api_key_env: string;
   api_key_present: boolean;
-  dimensions: number;
+  /** `null` = unset, the provider applies the model's own native size. */
+  dimensions: number | null;
   batch_size: number;
   store_provider: string;
   store_path: string;

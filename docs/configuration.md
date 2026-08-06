@@ -147,7 +147,7 @@ just a networking detail — see [security.md](security.md#trust-model-for-the-h
 | `embeddings.model` | string | `text-embedding-3-small` | Embedding model name (must match the Synapse fleet pin when federated). |
 | `embeddings.base_url` | string | `https://api.openai.com/v1` | OpenAI-spec endpoint base; `POST {base_url}/embeddings`. |
 | `embeddings.api_key_env` | string | `OPENAI_API_KEY` | Name of the env var holding the API key (key never lands in config/state). |
-| `embeddings.dimensions` | integer | `256` | Requested embedding dimensionality (sent as `dimensions` when set). |
+| `embeddings.dimensions` | integer \| null | `null` | Unset by default — the `dimensions` request field is simply omitted, so the provider returns the model's own native size (e.g. 1536 for `text-embedding-3-small`, 3072 for `text-embedding-3-large`). Set an explicit number only to shrink vectors for storage (OpenAI's `-3` models support this) or to pin an exact size across a Synapse fleet. |
 | `embeddings.batch_size` | integer | `64` | Texts per embedding HTTP request. |
 | `vector_store.provider` | string | `lancedb` | `lancedb` (optional `[vector]` extra) or `numpy` (always-available flat file). |
 | `vector_store.path` | absolute path | `<state>/vectors` | Vector index root; vectors live under `<path>/<kb_id>/`. Created only when embeddings are enabled. |

@@ -71,7 +71,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 if TYPE_CHECKING:
-    from pheasant.config.schema import PheasantConfig
+    from pheasant.config.schema import EmbeddingsSettings, PheasantConfig
     from pheasant.persistence.state_store import StateStore
     from pheasant.search.vector_store import VectorStore
 
@@ -85,6 +85,21 @@ MAX_CONTRACT_BYTES = 256 * 1024
 MINHASH_PERMS = 128
 KMEANS_SAMPLE_CAP = 16_384
 KMEANS_MAX_ITERS = 25
+
+# Native output width of well-known OpenAI-spec models, used only as a
+# fallback when `search.embeddings.dimensions` is unset (the default —
+# meaning "use the model's own size") AND nothing has been embedded onto
+# disk yet for `_resolved_dimension` to read the true width from. Once a
+# sync has embedded at least one chunk, the on-disk width wins and this
+# table stops mattering for that region.
+_KNOWN_MODEL_DIMENSIONS = {
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "text-embedding-ada-002": 1536,
+}
+# StubEmbedder's own built-in default (see search/vector_store.py) — the
+# last-resort fallback for a model this table doesn't recognize.
+DEFAULT_STUB_DIMENSION = 64
 
 
 def contract_path(state_path: str | Path) -> Path:
@@ -328,15 +343,40 @@ class ContractPublisher:
 
     def _embedding_space(self) -> dict[str, Any]:
         settings = self.config.search.embeddings
-        if settings.enabled:
-            model_id = settings.model
-            dim = int(settings.dimensions)
-        else:
-            # No embed-on-sync: report the configured-but-disabled model so the
-            # fleet pin is still legible, with a degenerate zero signature.
-            model_id = settings.model
-            dim = int(settings.dimensions)
-        return {"model_id": model_id, "dim": dim, "normalized": True}
+        # enabled or not, report the configured model so the fleet pin is
+        # legible even with a degenerate zero signature (disabled case).
+        return {
+            "model_id": settings.model,
+            "dim": self._resolved_dimension(settings),
+            "normalized": True,
+        }
+
+    def _resolved_dimension(self, settings: EmbeddingsSettings) -> int:
+        """The vector width to publish. The schema's ``EmbeddingSpace.dim``
+        is a required positive integer, but ``settings.dimensions`` is
+        ``None`` by default (Synapse 21.4) so the provider applies the
+        model's own native size instead of a guessed constant. Resolve a
+        real number in priority order:
+
+        1. An explicit ``settings.dimensions`` override — honored as-is.
+        2. The width already on disk, straight from a real embedded vector —
+           ground truth once anything has been synced.
+        3. A small registry of known OpenAI-spec model native sizes, for a
+           contract built before the first sync has embedded anything.
+        4. The stub embedder's own default width, as a last resort for an
+           unrecognized model — self-corrects the moment #2 applies.
+        """
+        if settings.dimensions:
+            return int(settings.dimensions)
+        all_vectors = getattr(self.vector_store, "all_vectors", None)
+        if callable(all_vectors):
+            try:
+                sample = all_vectors()
+            except Exception:
+                sample = None
+            if sample:
+                return len(sample[0][1])
+        return _KNOWN_MODEL_DIMENSIONS.get(settings.model, DEFAULT_STUB_DIMENSION)
 
     def _capabilities(self) -> dict[str, Any]:
         vector_on = self.config.search.embeddings.enabled
