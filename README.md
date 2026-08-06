@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="ui/public/pheasant.png" alt="" width="320">
+</p>
+
 # pheasant
 
 pheasant is a local-first MCP context server that turns project sources into a queryable knowledge graph for agents and humans. It syncs configured repositories, folders, files, Obsidian vaults, web collections, and experimental API/S3 sources; enriches them into graph relationships; exposes retrieval and lifecycle operations through MCP and HTTP; and can project the result into a navigable Obsidian vault.
