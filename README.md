@@ -62,6 +62,10 @@ pheasant up ~/projects --split                        # same, without the glob
 An existing `pheasant.yaml` is never overwritten, and re-running re-indexes
 nothing that has not changed.
 
+A private GitHub repo needs `GITHUB_TOKEN` (or `GH_TOKEN`) set — see
+`.env.example` — or the clone fails with an authentication error; a public
+repo needs nothing.
+
 **One line to host it.** `pheasant host` does the same detection, then writes a
 compose file (mounting each local source read-only at `/sources/<name>`) and
 brings the stack up:

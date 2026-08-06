@@ -21,6 +21,7 @@ never learns a new trick.
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import shutil
@@ -386,7 +387,37 @@ def resolve_targets(
     return targets
 
 
-def _git_env() -> dict[str, str]:
+#: Checked in this order because GITHUB_TOKEN is the name most users already
+#: have set (GitHub Actions' own ambient token, and the name this project's
+#: own .env.example documents); GH_TOKEN is the ``gh`` CLI's name, checked
+#: second so an environment with both prefers the more explicit one.
+GITHUB_TOKEN_ENV_CANDIDATES = ("GITHUB_TOKEN", "GH_TOKEN")
+
+
+def _github_token() -> str | None:
+    for name in GITHUB_TOKEN_ENV_CANDIDATES:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return None
+
+
+def _is_github_https_url(url: str) -> bool:
+    """True for an HTTP(S) github.com remote — never for SSH/scp-like forms.
+
+    SSH already carries its own auth (a deploy key or agent), so a token
+    would be both useless and, if ever wired to the wrong transport, a way
+    to leak it somewhere unintended. Only HTTP(S) is subject to
+    ``http.extraHeader``.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.netloc.split("@")[-1].split(":")[0].lower()
+    return host == "github.com"
+
+
+def _git_env(clone_url: str | None = None) -> dict[str, str]:
     """Environment for the git subprocesses this module runs.
 
     Two things a clone must not do unattended: block on a credential prompt
@@ -395,20 +426,38 @@ def _git_env() -> dict[str, str]:
     per-protocol allowances pins the set to the ones ``validate_clone_url``
     already accepts, so a hostile URL that slipped past parsing still has no
     helper to reach.
+
+    When ``clone_url`` is an HTTPS github.com remote and a ``GITHUB_TOKEN``/
+    ``GH_TOKEN`` is set, a Basic-auth header is injected via
+    ``http.https://github.com/.extraheader`` — the same mechanism GitHub
+    Actions' own checkout action uses — so a private repository can be
+    cloned/fetched without a browser or a stored git credential. The token
+    reaches git only through ``GIT_CONFIG_KEY_N``/``GIT_CONFIG_VALUE_N`` env
+    vars, never through argv (invisible to a `ps`/Task Manager listing that
+    the plain URL-embedded ``https://<token>@github.com/...`` form is not)
+    and never through the URL string itself (git's own failure messages
+    quote the URL back verbatim, which would otherwise leak the token into
+    a raised ``TargetError`` — and, via the quick-add API, into an
+    unauthenticated caller's error response). Scoped to github.com
+    specifically, not a blanket credential helper, so the token is never
+    sent to an unrelated remote even if one is cloned in the same process.
     """
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env.setdefault("GIT_ASKPASS", "")
-    env["GIT_CONFIG_COUNT"] = "5"
-    for index, (key, value) in enumerate(
-        (
-            ("protocol.allow", "never"),
-            ("protocol.https.allow", "always"),
-            ("protocol.http.allow", "always"),
-            ("protocol.ssh.allow", "always"),
-            ("protocol.git.allow", "always"),
-        )
-    ):
+    configs = [
+        ("protocol.allow", "never"),
+        ("protocol.https.allow", "always"),
+        ("protocol.http.allow", "always"),
+        ("protocol.ssh.allow", "always"),
+        ("protocol.git.allow", "always"),
+    ]
+    token = _github_token() if clone_url and _is_github_https_url(clone_url) else None
+    if token:
+        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        configs.append(("http.https://github.com/.extraheader", f"AUTHORIZATION: basic {basic}"))
+    env["GIT_CONFIG_COUNT"] = str(len(configs))
+    for index, (key, value) in enumerate(configs):
         env[f"GIT_CONFIG_KEY_{index}"] = key
         env[f"GIT_CONFIG_VALUE_{index}"] = value
     return env
@@ -435,7 +484,7 @@ def fetch_target(target: ResolvedTarget) -> str | None:
             ["git", "-C", str(destination), "fetch", "--all", "--quiet"],
             check=False,
             capture_output=True,
-            env=_git_env(),
+            env=_git_env(clone_url),
         )
         return f"{target.name}: reusing existing clone at {destination}"
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -444,7 +493,7 @@ def fetch_target(target: ResolvedTarget) -> str | None:
         ["git", "clone", "--quiet", "--", clone_url, str(destination)],
         capture_output=True,
         text=True,
-        env=_git_env(),
+        env=_git_env(clone_url),
     )
     if result.returncode != 0:
         raise TargetError(

@@ -80,6 +80,144 @@ def test_non_git_urls_are_not_clones(url: str) -> None:
     assert is_git_url(url) is False
 
 
+# --------------------------------------------------------------- GitHub token
+
+
+def test_git_env_injects_a_github_token_for_https_github_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pheasant.targets import _git_env
+
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret123")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+
+    env = _git_env("https://github.com/owner/private-repo.git")
+    pairs = {
+        env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+        for i in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+    header = pairs["http.https://github.com/.extraheader"]
+    assert header.startswith("AUTHORIZATION: basic ")
+    import base64
+
+    decoded = base64.b64decode(header.removeprefix("AUTHORIZATION: basic ")).decode()
+    assert decoded == "x-access-token:ghp_secret123"
+    # The raw token itself never appears verbatim anywhere in the env dict
+    # (only its base64-of-"x-access-token:<token>" form) -- nothing here is
+    # ever placed on a subprocess argv list, so it cannot appear in a `ps`
+    # listing or leak into git's own error text either.
+    assert "ghp_secret123" not in header
+
+
+def test_git_env_prefers_github_token_over_gh_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pheasant.targets import _git_env
+
+    monkeypatch.setenv("GITHUB_TOKEN", "primary-token")
+    monkeypatch.setenv("GH_TOKEN", "fallback-token")
+    env = _git_env("https://github.com/owner/repo")
+    pairs = {
+        env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+        for i in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+    import base64
+
+    decoded = base64.b64decode(
+        pairs["http.https://github.com/.extraheader"].removeprefix("AUTHORIZATION: basic ")
+    ).decode()
+    assert decoded == "x-access-token:primary-token"
+
+
+def test_git_env_falls_back_to_gh_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pheasant.targets import _git_env
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "gh-cli-token")
+    env = _git_env("https://github.com/owner/repo")
+    pairs = {
+        env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+        for i in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+    assert "http.https://github.com/.extraheader" in pairs
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://gitlab.com/owner/repo.git",  # different host -- token must not leak here
+        "git@github.com:owner/repo.git",  # SSH already carries its own auth
+        "ssh://git@github.com/owner/repo.git",
+    ],
+)
+def test_git_env_never_injects_a_token_for_non_https_github_urls(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    from pheasant.targets import _git_env
+
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret123")
+    env = _git_env(url)
+    pairs = {
+        env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+        for i in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+    assert "http.https://github.com/.extraheader" not in pairs
+
+
+def test_git_env_with_no_token_set_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pheasant.targets import _git_env
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    env = _git_env("https://github.com/owner/repo.git")
+    pairs = {
+        env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+        for i in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+    assert "http.https://github.com/.extraheader" not in pairs
+
+
+def test_fetch_target_passes_the_clone_url_through_to_git_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Wiring regression guard: a token configured in the environment must
+    actually reach the `git clone` subprocess, not just `_git_env` in
+    isolation."""
+    from pheasant.targets import ResolvedTarget, fetch_target
+
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret123")
+    monkeypatch.setattr("pheasant.targets.shutil.which", lambda _name: "/usr/bin/git")
+
+    captured: dict = {}
+
+    class FakeResult:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        return FakeResult()
+
+    monkeypatch.setattr("pheasant.targets.subprocess.run", fake_run)
+
+    target = ResolvedTarget(
+        name="private-repo",
+        type="repository",
+        path=str(tmp_path / "private-repo"),
+        description="test",
+        clone_url="https://github.com/owner/private-repo.git",
+    )
+    fetch_target(target)
+
+    pairs = {
+        captured["env"][f"GIT_CONFIG_KEY_{i}"]: captured["env"][f"GIT_CONFIG_VALUE_{i}"]
+        for i in range(int(captured["env"]["GIT_CONFIG_COUNT"]))
+    }
+    assert "http.https://github.com/.extraheader" in pairs
+    # The token must never appear as an argv element (visible in a `ps`/Task
+    # Manager listing) -- only via the env-var-based git config mechanism.
+    assert not any("ghp_secret123" in str(part) for part in captured["cmd"])
+
+
 def test_local_shapes_are_classified(tmp_path: Path, roots) -> None:
     clone_root, workspace = roots
     vault = tmp_path / "vault"
