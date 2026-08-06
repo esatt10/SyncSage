@@ -251,6 +251,16 @@ def _write_container_config(source: Path, destination: Path, targets: list) -> N
             "workspace_root": CONTAINER_SOURCE_ROOT,
         }
     )
+    # The host-side config pins server.host to 127.0.0.1 (quickstart/dev
+    # profiles) so an uncontainerized `pheasant start` never answers on the
+    # LAN. That value would be wrong here: it is compose, not the process
+    # itself, that restricts container access to the host's loopback via the
+    # `ports:` mapping. Left uncorrected, uvicorn binds loopback *inside* the
+    # container, which is unreachable from the pheasant-ui sidecar over the
+    # compose network (nginx's proxy_pass gets connection refused -> 502)
+    # even though the pheasant container's own healthcheck still passes,
+    # since that curls itself over the same loopback.
+    data.setdefault("server", {})["host"] = "0.0.0.0"
     security = data.setdefault("security", {})
     security["allow_workspace_roots"] = [
         CONTAINER_SOURCE_ROOT,

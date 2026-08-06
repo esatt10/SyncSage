@@ -308,6 +308,16 @@ def test_host_generates_compose_and_container_config_without_docker(
     assert container_config["sources"][0]["path"] == "/sources/notes"
     assert container_config["pheasant"]["state_path"] == "/state"
     assert "/sources/notes" in container_config["security"]["allow_workspace_roots"]
+    # Regression: the host-side pheasant.yaml pins server.host to 127.0.0.1
+    # (quickstart profile) so bare `pheasant start` never answers on the LAN.
+    # The *container* config must not inherit that -- uvicorn binding
+    # loopback inside the container makes it unreachable from the
+    # pheasant-ui sidecar over the compose network (502 from nginx), even
+    # though the pheasant container's own healthcheck still passes because
+    # it curls itself over that same loopback.
+    host_config = yaml.safe_load((tmp_path / "pheasant.yaml").read_text(encoding="utf-8"))
+    assert host_config["server"]["host"] == "127.0.0.1"
+    assert container_config["server"]["host"] == "0.0.0.0"
 
 
 def test_host_pins_the_ui_image_and_builds_it_from_a_checkout(tmp_path: Path) -> None:
