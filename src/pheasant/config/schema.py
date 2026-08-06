@@ -361,17 +361,62 @@ class TranscriberSettings(ModelMixin):
 
 
 @dataclass
+class ExtractorSettings(ModelMixin):
+    """Document text extractor for PDF/DOCX (and optionally HTML) ingestion.
+
+    Before this existed, ``.pdf`` and ``.docx`` were *accepted* by the
+    ingestion pipeline and then produced no text at all: the artifact was
+    discovered, hashed and given a graph node, but ``read_text`` returned
+    ``""``, so it contributed zero chunks and was unfindable by content.
+
+    Unlike the captioner/transcriber, no provider here makes a network call or
+    uses a model — the text is already in the file — so every option is fully
+    offline and deterministic.
+
+    ``provider``:
+
+    - ``auto`` (default) — ``pymupdf``/``python-docx`` when importable (both
+      already core deps), falling back to the pure-stdlib builtin. Never
+      raises into a sync.
+    - ``native`` — prefer the third-party libraries (best fidelity on PDFs
+      with CID/Type0 fonts or complex layout).
+    - ``builtin`` — standard library only: ``zlib`` + content-stream scanning
+      for PDF, ``zipfile`` + ``xml.etree`` for DOCX. No third-party imports.
+    - ``sandboxed`` — the builtin PDF tokenizer inside the Phase-34 WASM
+      sandbox (fuel + memory cap, zero host capabilities). For regions
+      ingesting PDFs from untrusted connector sources; needs the ``[wasm]``
+      extra and raises with a hint if it is missing rather than silently
+      running unsandboxed.
+
+    ``html_text`` strips markup from ``.html``/``.htm``/``.xhtml`` so their
+    prose indexes instead of their tags. It defaults to **false** because
+    those extensions have always been indexed as raw markup: turning it on
+    changes the indexed text (and therefore chunk boundaries) of an existing
+    knowledge base, so it is an explicit operator choice rather than a
+    surprise on upgrade.
+
+    A sidecar ``<file>.extract.txt`` always wins, providing authored text with
+    no extractor at all (mirrors the caption/transcript sidecars).
+    """
+
+    provider: str = "auto"
+    html_text: bool = False
+
+
+@dataclass
 class IngestionSettings(ModelMixin):
     """Ingestion-path enrichment knobs. Standalone-safe defaults.
 
-    ``captioner`` only takes effect for sources that include image files and
-    ``transcriber`` only for sources that include audio files; a text-only
-    region never builds either (and the default ``stub`` providers need no
-    extra dependency anyway).
+    ``captioner`` only takes effect for sources that include image files,
+    ``transcriber`` only for sources that include audio files, and
+    ``extractor`` only for sources that include PDF/DOCX files (or when
+    ``extractor.html_text`` is on); a text-only region never builds any of
+    them (and the defaults need no extra dependency anyway).
     """
 
     captioner: CaptionerSettings = field(default_factory=CaptionerSettings)
     transcriber: TranscriberSettings = field(default_factory=TranscriberSettings)
+    extractor: ExtractorSettings = field(default_factory=ExtractorSettings)
 
 
 @dataclass
@@ -736,6 +781,8 @@ class PheasantConfig(ModelMixin):
                     raw["captioner"] = build(CaptionerSettings, raw["captioner"])
                 if "transcriber" in raw and isinstance(raw["transcriber"], dict):
                     raw["transcriber"] = build(TranscriberSettings, raw["transcriber"])
+                if "extractor" in raw and isinstance(raw["extractor"], dict):
+                    raw["extractor"] = build(ExtractorSettings, raw["extractor"])
             if dc is SyncSettings:
                 if "watcher" in raw and isinstance(raw["watcher"], dict):
                     raw["watcher"] = build(WatcherSettings, raw["watcher"])

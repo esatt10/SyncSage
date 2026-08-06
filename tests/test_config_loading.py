@@ -116,3 +116,70 @@ def test_graph_section_of_the_yaml_is_actually_applied() -> None:
     )
     assert config.graph.concept_min_documents == 5
     assert config.graph.wasm_cross_source_resolution is True
+
+
+def test_example_config_has_no_duplicate_top_level_keys() -> None:
+    """`pheasant.example.yaml` must not define the same top-level key twice.
+
+    Regression test for a real defect in the shipped reference config: it had
+    **two** `sync:` blocks. YAML keeps the last occurrence, so the entire
+    documented `sync.limits` guardrail block — the one whose own comments
+    describe stopping "I accidentally indexed my home directory" — was
+    silently discarded, with no error from any parser and no test catching it.
+    A duplicate key here is always a bug: it means a section the file appears
+    to document has no effect.
+    """
+    import re
+
+    example = Path(__file__).resolve().parents[1] / "pheasant.example.yaml"
+    keys = re.findall(r"^([a-z_]+):", example.read_text(encoding="utf-8"), flags=re.M)
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    assert not duplicates, f"duplicate top-level keys in pheasant.example.yaml: {duplicates}"
+
+
+def test_example_config_still_declares_the_sync_guardrails() -> None:
+    """The guardrails must survive as *loaded* config, not just as text."""
+    import yaml
+
+    example = Path(__file__).resolve().parents[1] / "pheasant.example.yaml"
+    data = yaml.safe_load(example.read_text(encoding="utf-8"))
+    limits = (data.get("sync") or {}).get("limits") or {}
+    assert limits.get("max_files")
+    assert limits.get("max_file_size_mb")
+    assert limits.get("follow_symlinks") is False
+
+
+def test_example_config_declares_the_document_extractor() -> None:
+    import yaml
+
+    example = Path(__file__).resolve().parents[1] / "pheasant.example.yaml"
+    data = yaml.safe_load(example.read_text(encoding="utf-8"))
+    extractor = (data.get("ingestion") or {}).get("extractor") or {}
+    assert extractor.get("provider") == "auto"
+    assert extractor.get("html_text") is False
+
+
+def test_yaml_shim_strips_trailing_comments_like_pyyaml() -> None:
+    """The dependency-light YAML shim must drop trailing `# ...` comments.
+
+    Regression test: it stripped whole-line comments but not trailing ones, so
+    every annotated value in `pheasant.example.yaml` parsed with the comment
+    glued on — `max_files: 50000  # ...` became a *string*, and
+    `follow_symlinks: false  # ...` became a non-empty (therefore **truthy**)
+    string, silently inverting a safety default wherever this shim stands in
+    for PyYAML.
+    """
+    import yaml
+
+    parsed = yaml.safe_load(
+        "limits:\n"
+        "  max_files: 50000        # matching files\n"
+        "  follow_symlinks: false  # links escape or loop\n"
+        "  label: red#1\n"
+        '  quoted: "has # inside"\n'
+    )
+    limits = parsed["limits"]
+    assert limits["max_files"] == 50000
+    assert limits["follow_symlinks"] is False
+    assert limits["label"] == "red#1"  # '#' without leading space is literal
+    assert limits["quoted"] == "has # inside"  # '#' inside quotes is literal

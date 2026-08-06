@@ -759,6 +759,114 @@ been caught by the pre-existing test suite alone.
 
 ---
 
+## Document text extraction (PDF/DOCX/HTML), 2026-08-06
+
+Not Phase-scoped — closing a gap found by asking pheasant about its own
+codebase. **`.pdf`/`.docx` were accepted by the ingestion pipeline and then
+silently produced no text**: `parse_file`/`parse_connector_payload` admitted
+both, `artifact_type` labelled them `document`, and `read_text` /
+`read_text_bytes` hard-returned `""` — so a PDF got an artifact row, a sha256
+and a graph node while contributing **zero chunks**. Findable by path,
+invisible by content (verified live: a real text PDF → 0 chars). Two things the
+original report missed: **`pymupdf>=1.24` and `python-docx>=1.1` were already
+*core* deps in `pyproject.toml`, imported nowhere** — every deployment was
+carrying both wheels for nothing; and **HTML/XML is a second, milder gap** —
+`.html`/`.xml` sit in `TEXT_EXTENSIONS` and index as *raw markup* (tags,
+`<script>`, CSS as prose). `.pptx/.xlsx/.doc/.rtf/.epub` are in no extension
+set at all — never accepted, so not a broken promise and out of scope.
+
+New `src/pheasant/ingestion/extractor.py` follows the 25.4 captioner/
+transcriber shape exactly (Protocol + provider selection + authored
+`<file>.extract.txt` sidecar wins + built **only** when a source's `include`
+globs admit `.pdf`/`.docx` + `_modal.py` helper reuse), so this is the third
+instance of one pattern, not a new one. It differs in a way that is strictly
+*better*: captioning/transcription need a model to invent text that isn't in
+the bytes, document extraction doesn't — so **every provider is offline and
+deterministic** and rule 1 holds by construction, with no network path to gate.
+Providers: `auto` (default — `pymupdf`/`python-docx`, else builtin, keeping
+whichever yields text; never raises into a sync), `native`, `builtin`
+(**stdlib only** — `zlib` + PDF content-stream operator scan; `zipfile` +
+`xml.etree` over `word/document.xml`, which is not a fidelity compromise since
+that IS where DOCX text lives), and `sandboxed`. `ingestion.extractor.
+{provider, html_text}`; `html_text` defaults **false** because `.html`/`.xml`
+have always indexed as raw markup and stripping changes existing chunk
+boundaries. Publisher advertises `"document"` in `capabilities.modalities`
+(25.4 precedent — **wire format unchanged**, parity green). Idempotent: the
+engine's pre-read sha256 skip never re-extracts an unchanged document.
+**Flock reuse:** its `corpus/loaders/local_files.py` `_read_pdf` (pdfminer) +
+`_read_html` contributed the *shape* — lazy per-format import, graceful
+degradation, never raise — not the code (pheasant ships pymupdf, and nothing
+was imported across the repo boundary).
+
+**WASM — my initial prediction was wrong, and the measurement says so.** I
+expected acceleration to be a NO-GO by analogy to 34.6 (WASM chunking, which
+lost to a ~115 µs fixed instance cost). It does not transfer. With the module
+AOT-precompiled (34.4 Finding #1), `sandboxed` beats the pure-Python `builtin`
+at every size above ~1 KB: **0.50x at 100 lines, 0.30x at 8,000** (129 ms →
+38 ms), and the tokenizer alone is **11.4x** (91.8 ms → 8.0 ms on a 585 KB
+stream); fixed cost per guest call 0.22 ms, crossover ~30-50 lines. Why 34.6's
+logic didn't carry: what matters is **work per call**, not calls per sync —
+chunking's 35-219 µs is the same order as the overhead, PDF tokenizing's
+1.5-130 ms is 7-600x it. So the sandbox is **not a tax**, and `builtin` vs
+`sandboxed` is purely a fidelity/isolation choice. `native` stays the default
+regardless: it does full page layout analysis and handles encrypted PDFs,
+LZW/CCITT and Type0/CID CMaps that the tokenizer does not. AOT cache
+re-verified for this path (JIT 52.8 ms → **0.87 ms**), distinct `extract-`
+cache prefix so the trusted accelerator and untrusted-input path never share an
+artifact.
+
+Sandboxing is the right framing because 34.2's docstring already named the
+target ("Confluence's in-process BeautifulSoup parse of untrusted remote
+XHTML") and PDF is its sharper form: connector PDFs (Drive/Slack/Confluence/
+IMAP) are attacker-influenced bytes parsed with the sync worker's ambient
+authority — every connector token in `os.environ`, writable `/state`, egress.
+New `pdf_scan_text` export on the **existing** vendored Rust crate (re-vendored
+`accel.wasm`, 112→120 KB; the toolchain reproduces the old binary
+byte-identically, sha `f664fa78…`, before any edit) + `ingestion/
+extractor_sandbox.py` running it under a fuel cap, memory cap and an **empty
+`Linker`** (zero host imports, asserted). Three honest limits, all in the
+module docstring: **partial sandbox** (host still inflates via `zlib`, bounded
+against bombs; the guest runs the tokenizer, which is where hostile bytes drive
+unbounded loops — deliberate split, 34.2-style recorded deviation); **PDF only**
+(DOCX/HTML keep memory-safe Python parsers); and it **fails loudly** — missing
+`wasmtime` under `provider: sandboxed` raises with a pip hint rather than
+silently extracting unsandboxed, inverting 34.5's fallback policy on purpose
+because this is a security property, not a performance path (per-*file*
+failures still never abort a sync). A sandbox cannot catch a **wrong answer**,
+so `pdf_scan_text` is asserted byte-identical to `scan_pdf_content_stream` per
+stream, per document, and over 120 randomized adversarial streams. The port's
+real hazard, caught by deriving tables from CPython rather than assuming:
+**65 byte values above 0x7F satisfy Python's `chr(b).isalpha()`** — an
+`is_ascii_alphabetic()` port would silently drop text (same class as 34.5's
+`str.lstrip("./")` catch); cp1252's five undefined bytes are transcribed too.
+
+**Two pre-existing bugs found and fixed** (both surfaced by touching the
+reference config, both verified before fixing, both regression-tested):
+(1) **`pheasant.example.yaml` had two top-level `sync:` keys** — YAML keeps the
+last, so the whole documented `sync.limits` guardrail block (the "I accidentally
+indexed my home directory" protection) was **silently discarded**; proven with
+real PyYAML, then merged. (2) **`yaml.py` never stripped trailing comments** —
+it skips whole-line ones only, so in the dependency-light environment
+`max_files: 50000  # ...` parsed as a *string* and `follow_symlinks: false # ...`
+became a **truthy** string, inverting a safety default; fixed with quote-aware
+stripping matching PyYAML. Note this shim shadows real PyYAML from the repo
+root, which is also why `mkdocs` must build with `-f` from outside the checkout.
+
+`pheasant.example.yaml` gained its **first `ingestion:` block** (captioner/
+transcriber were never in it either) and `docs/configuration.md` its first
+`## ingestion` section, closing pre-existing 25.4 doc drift. New
+`docs/how-to/document-ingest.md` (in the nav). Acceptance:
+`tests/test_document_extraction.py` (30) + 4 config tests —
+**mutation-tested, not trusted**: disabling `extractor_from_config` fails 5
+tests across every acceptance path, and search precision was checked directly
+(each marker query returns exactly its one document; a nonsense query returns
+`[]`) so the assertions aren't vacuous. Suite: **592 passed / 18 skipped**
+(baseline 521/24; the skip drop is `wasmtime` un-skipping 6 module-level
+guards — 34 genuinely new tests). Full detail:
+`runs/2026-08-06-pdf-extraction/SUMMARY.md`.
+
+---
+
 ## 6. Pointers
 
 - **Region-side Synapse spec:** `docs/SYNAPSE_INTEGRATION.md`

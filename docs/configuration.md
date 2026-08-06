@@ -35,6 +35,7 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 | `storage` | Database/graph/manifests locations and state limits. | Yes |
 | `search` | Retrieval modes and ranking behavior. | Yes |
 | `sync` | Watcher, git polling, schedule, idempotency, and concurrency behavior. | Yes |
+| `ingestion` | Turning binary/markup files (PDF/DOCX, images, audio) into indexable text. | Optional |
 | `obsidian` | Export controls for notes/canvas/frontmatter/backlinks/tags. | Optional |
 | `security` | Path allowlisting and source-read protections. | Strongly recommended |
 | `assistant` | Grounded chat over the index (the UI's chat layer). Query-time only. | Optional |
@@ -253,6 +254,101 @@ standing behavior of a scheduled one.
 | `full` | Rebuilds artifact, chunk, graph, manifest, and checkpoint state for the selected source. |
 | `validate_only` | Checks connector health and source readability without writing index artifacts or manifests. |
 | `repair` | Rebuilds only missing or invalid artifact/chunk state detected from manifests and database rows. |
+
+---
+
+## `ingestion` (binary/markup files → indexable text)
+
+Some files carry text that cannot be reached by decoding the bytes: a PDF
+stores it in compressed content streams, a DOCX in zipped XML, an image or an
+audio file not at all. This section configures the handlers that turn those
+into text, which then flows through the **normal** chunk → embed → graph path
+like any other document.
+
+Every handler is **opt-in by file extension**. A source whose `include` globs
+admit only code/markdown/config builds none of them, and behaves exactly as it
+would if this section did not exist.
+
+| Handler | Extensions | Built when `include` admits | Network? |
+|---|---|---|---|
+| `extractor` | `.pdf` `.docx` (+ `.html` `.htm` `.xhtml` when `html_text`) | a document extension | **never** |
+| `captioner` | `.png` `.jpg` `.jpeg` `.webp` `.gif` | an image extension | only if `provider: openai-spec` |
+| `transcriber` | `.wav` `.mp3` `.m4a` `.flac` `.ogg` | an audio extension | only if `provider: openai-spec` |
+
+### `ingestion.extractor` (PDF/DOCX text)
+
+Without an extractor, `.pdf` and `.docx` are **accepted and then silently
+produce no text**: the artifact is discovered, hashed, typed `document` and
+given a graph node, but contributes **zero chunks** — findable by its path,
+invisible by its content. Configuring the extractor is what makes the contents
+searchable.
+
+Unlike the captioner/transcriber, no provider here uses a model or makes a
+network call — the text is already in the file — so every option is fully
+offline and deterministic.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `provider` | `auto` | `auto` \| `native` \| `builtin` \| `sandboxed` (see below) |
+| `html_text` | `false` | Strip markup from HTML/XHTML so prose indexes instead of tags |
+
+**Providers**
+
+| Provider | PDF path | DOCX path | Notes |
+|---|---|---|---|
+| `auto` | `pymupdf`, else builtin | `python-docx`, else builtin | Default. Keeps whichever yields text; never raises into a sync. |
+| `native` | `pymupdf` | `python-docx` | Best fidelity: CID/Type0 fonts, custom encodings, complex layout. Both libraries are already core dependencies. |
+| `builtin` | `zlib` + content-stream scan | `zipfile` + `xml.etree` | **Standard library only.** No third-party imports at all. |
+| `sandboxed` | builtin tokenizer inside the WASM sandbox | same as `builtin` | Fuel + memory cap, zero host capabilities. Needs `pip install 'pheasant-kb[wasm]'`. |
+
+**Authored sidecars.** If `<file>.extract.txt` sits next to a document, its
+contents are used **verbatim** and no extractor runs — the offline way to give
+an image-only scanned PDF real searchable text (mirrors the `.caption.txt` /
+`.transcript.txt` sidecars).
+
+**Why `html_text` defaults to off.** `.html` and `.xml` have always been
+indexed as *raw markup* (tags, `<script>`, CSS included). Stripping them is an
+improvement, but it changes the indexed text and therefore chunk boundaries of
+an existing knowledge base, so it is an explicit opt-in rather than a surprise
+on upgrade.
+
+**When to choose `sandboxed`.** PDF is a classic hostile-input parser target,
+and PDFs arriving from connectors (Google Drive, Slack, Confluence, IMAP) are
+not authored by you. In-process, that parse runs with the sync worker's ambient
+authority — every configured connector's API token in the environment, a
+writable `/state`, network egress. `sandboxed` runs the tokenizer under a fuel
+cap, a linear-memory cap, and **no host capabilities at all**. It is *not* a
+fallback-on-failure path: if `wasmtime` is missing it raises with an actionable
+hint rather than quietly extracting unsandboxed, because an operator who asked
+for isolation must not silently get none.
+
+Fidelity trade-off: `sandboxed` and `builtin` handle uncompressed and
+FlateDecode streams with single-byte font encodings — the large majority of
+real text PDFs — but do not decrypt encrypted PDFs, decode LZW/CCITT streams,
+or resolve Type0/CID font CMaps. `native`/`auto` handle those. Pick
+`sandboxed` when the *input* is untrusted; pick `auto` when it is yours.
+
+```yaml
+ingestion:
+  extractor:
+    provider: auto
+    html_text: false
+```
+
+### `ingestion.captioner` / `ingestion.transcriber`
+
+See [Multi-modal ingest](how-to/multimodal-ingest.md) for the full walkthrough.
+
+| Key | Default (captioner) | Default (transcriber) |
+|---|---|---|
+| `provider` | `stub` | `stub` |
+| `model` | `gpt-4o-mini` | `whisper-1` |
+| `base_url` | `https://api.openai.com/v1` | `https://api.openai.com/v1` |
+| `api_key_env` | `OPENAI_API_KEY` | `OPENAI_API_KEY` |
+| `prompt` | (caption instruction) | — |
+
+`api_key_env` is the **name** of an environment variable; the key itself never
+lands in config or on disk.
 
 ---
 

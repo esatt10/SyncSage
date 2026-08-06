@@ -12,6 +12,7 @@ from typing import Literal
 from pheasant.config.schema import FILESYSTEM_SOURCE_TYPES, PheasantConfig, SourceConfig
 from pheasant.graph.builder import GraphBuilder
 from pheasant.ingestion.captioner import captioner_from_config
+from pheasant.ingestion.extractor import extractor_from_config
 from pheasant.ingestion.pipeline import git_state, parse_connector_payload, utc_now
 from pheasant.ingestion.transcriber import transcriber_from_config
 from pheasant.ingestion.walk import (
@@ -118,6 +119,12 @@ class SyncEngine:
         # source's include globs admit audio extensions — same opt-in,
         # zero-network-when-absent contract as the image captioner above.
         self.transcriber = transcriber_from_config(config)
+        # Document text extraction (PDF/DOCX, optionally HTML): None unless a
+        # source's include globs admit a document extension (or html_text is
+        # on), so a text-only region behaves exactly as it did when .pdf/.docx
+        # were accepted and then silently produced no text. Fully offline and
+        # deterministic — no model, no network on any provider.
+        self.extractor = extractor_from_config(config)
         # Synapse 21.5: contract publisher + NDJSON event stream. The event
         # log is always written (local, useful standalone); contract
         # publication + the router webhook are gated by synapse.publish /
@@ -545,6 +552,7 @@ class SyncEngine:
                     git_metadata,
                     captioner=self.captioner,
                     transcriber=self.transcriber,
+                    extractor=self.extractor,
                 )
                 if parsed is None:
                     continue

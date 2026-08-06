@@ -612,6 +612,31 @@ so they stay in lock-step; session A's observable behavior is unchanged.
   sidecar (a few bytes, no real decoder). Router-filter test on the Flock side
   (`tests/synapse/test_router.py::test_modality_audio_routes_only_to_audio_capable_regions`).
 
+### Decision note 2026-08-06 — `"document"` modality (PDF/DOCX extraction)
+
+Document text extraction (`src/pheasant/ingestion/extractor.py`) closed a gap
+where `.pdf`/`.docx` were accepted by the pipeline and then produced no text at
+all — see the 2026-08-06 entry in `CLAUDE.md` and
+`runs/2026-08-06-pdf-extraction/SUMMARY.md`. The only Synapse-visible
+consequence is one more entry in an existing contract field:
+
+- The 21.5 publisher's `_capabilities()` appends `"document"` to
+  `capabilities.modalities` when a source's `include` globs admit `.pdf` or
+  `.docx`, so a router's `--modality document` filter (22.1) routes document
+  questions only to regions that can actually read them.
+- **`modalities` is existing contract data — the wire format / vendored JSON
+  Schema are UNCHANGED** (no schema bump, no re-vendor, parity test green).
+  This follows the 25.4 image/audio and 33.1 memory precedents exactly, so it
+  carries **no `[x-repo]` obligation**: the router needs no change to honor it,
+  because `--modality` already filters on whatever strings a contract declares.
+- Extraction adds **no network call** to the indexing path — unlike the
+  captioner/transcriber, every provider is offline and deterministic, so the
+  rule-1 determinism guarantee is unaffected and there is nothing new to gate.
+- Regions ingesting PDFs from untrusted connector sources can set
+  `ingestion.extractor.provider: sandboxed` to run the PDF tokenizer inside the
+  Phase-34 WASM sandbox (fuel + memory cap, zero host capabilities). This is a
+  region-local hardening choice with no contract or routing impact.
+
 ## 4. Deployment notes
 
 A region remains the existing container (`Dockerfile`, port 8765, PVC on

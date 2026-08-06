@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import logging
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -13,15 +14,20 @@ from pheasant.config.schema import SourceConfig
 from pheasant.ingestion.chunking import TextChunk, chunk_text
 from pheasant.ingestion.content_types import (
     AUDIO_EXTENSIONS,
+    DOCUMENT_EXTENSIONS,
     IMAGE_EXTENSIONS,
     TEXT_EXTENSIONS,
     artifact_type,
 )
+from pheasant.ingestion.extractor import EXTRACT_SIDECAR_SUFFIX, HTML_EXTENSIONS
 
 if TYPE_CHECKING:
     from pheasant.ingestion.captioner import Captioner
+    from pheasant.ingestion.extractor import DocumentExtractor
     from pheasant.ingestion.transcriber import Transcriber
     from pheasant.sync.connectors import ConnectorItem, ConnectorPayload
+
+logger = logging.getLogger(__name__)
 
 CAPTION_SIDECAR_SUFFIX = ".caption.txt"
 TRANSCRIPT_SIDECAR_SUFFIX = ".transcript.txt"
@@ -116,18 +122,65 @@ def git_state(root: Path) -> tuple[str | None, str | None, bool]:
         return None, None, False
 
 
-def read_text(path: Path) -> str:
+def read_text(path: Path, extractor: DocumentExtractor | None = None) -> str:
+    """Read a file's indexable text.
+
+    ``.pdf``/``.docx`` (and, when the extractor is configured for it, HTML)
+    are binary or markup containers whose text has to be extracted rather
+    than decoded. With no extractor these return ``""`` — the long-standing
+    behavior, kept so a region with no document source is unchanged.
+    """
     suffix = path.suffix.lower()
-    if suffix in {".pdf", ".docx"}:
-        return ""
+    if suffix in DOCUMENT_EXTENSIONS or (extractor is not None and suffix in HTML_EXTENSIONS):
+        if extractor is None:
+            return ""
+        return extract_to_text(extractor, path.read_bytes(), path.name, _extract_sidecar(path))
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
-def read_text_bytes(content: bytes, relative_path: str) -> str:
+def read_text_bytes(
+    content: bytes, relative_path: str, extractor: DocumentExtractor | None = None
+) -> str:
+    """Decode connector payload bytes to indexable text (see :func:`read_text`)."""
     suffix = Path(relative_path).suffix.lower()
-    if suffix in {".pdf", ".docx"}:
-        return ""
+    if suffix in DOCUMENT_EXTENSIONS or (extractor is not None and suffix in HTML_EXTENSIONS):
+        if extractor is None:
+            return ""
+        return extract_to_text(extractor, content, relative_path, None)
     return content.decode("utf-8", errors="ignore")
+
+
+def _extract_sidecar(path: Path) -> bytes | None:
+    return _sidecar_for_path(path, EXTRACT_SIDECAR_SUFFIX)
+
+
+def extract_to_text(
+    extractor: DocumentExtractor | None,
+    content: bytes,
+    relative_path: str,
+    sidecar: bytes | None,
+) -> str:
+    """Extract document bytes into indexable text.
+
+    Mirrors :func:`caption_to_text` / :func:`transcribe_to_text`, including the
+    duck-typed ``sidecar=`` tolerance, so all three modality handlers stay in
+    lock-step. Extraction never raises into the sync: a document that cannot
+    be read contributes no text, exactly as before this path existed.
+    """
+
+    if extractor is None:
+        return ""
+    try:
+        try:
+            return extractor.extract(content, relative_path, sidecar=sidecar)  # type: ignore[call-arg]
+        except TypeError:
+            # An extractor without the optional ``sidecar`` kwarg (duck-typed).
+            return extractor.extract(content, relative_path)
+    except Exception as exc:
+        # A malformed document must never abort a whole sync — it just
+        # contributes no text, which is the pre-extraction behavior anyway.
+        logger.warning("document extraction failed for %s: %s", relative_path, exc)
+        return ""
 
 
 def chunks_for_source(source: SourceConfig, text: str) -> list[TextChunk]:
@@ -206,9 +259,10 @@ def parse_file(
     git_metadata: tuple[str | None, str | None, bool] | None = None,
     captioner: Captioner | None = None,
     transcriber: Transcriber | None = None,
+    extractor: DocumentExtractor | None = None,
 ) -> ParsedArtifact | None:
     suffix = path.suffix.lower()
-    if suffix not in TEXT_EXTENSIONS | {".pdf", ".docx"} | IMAGE_EXTENSIONS | AUDIO_EXTENSIONS:
+    if suffix not in TEXT_EXTENSIONS | DOCUMENT_EXTENSIONS | IMAGE_EXTENSIONS | AUDIO_EXTENSIONS:
         return None
     root = source.path if source.path.is_dir() else source.path.parent
     relative = path.relative_to(root).as_posix()
@@ -230,7 +284,7 @@ def parse_file(
             _sidecar_for_path(path, TRANSCRIPT_SIDECAR_SUFFIX),
         )
     else:
-        text = read_text(path)
+        text = read_text(path, extractor)
     chunks = chunks_for_source(source, text)
     stat = path.stat()
     artifact_id = f"file:{source.name}:{relative}:branch={branch or 'none'}"
@@ -260,13 +314,14 @@ def parse_connector_payload(
     git_metadata: tuple[str | None, str | None, bool] | None = None,
     captioner: Captioner | None = None,
     transcriber: Transcriber | None = None,
+    extractor: DocumentExtractor | None = None,
 ) -> ParsedArtifact | None:
     suffix = Path(item.relative_path).suffix.lower()
     mime_type = payload.mime_type or item.mime_type
     is_image = suffix in IMAGE_EXTENSIONS
     is_audio = suffix in AUDIO_EXTENSIONS
     if (
-        suffix not in TEXT_EXTENSIONS | {".pdf", ".docx"}
+        suffix not in TEXT_EXTENSIONS | DOCUMENT_EXTENSIONS
         and not is_image
         and not is_audio
         and not _is_text_like(mime_type)
@@ -294,8 +349,17 @@ def parse_connector_payload(
             item.relative_path,
             _sidecar_for_payload(payload, TRANSCRIPT_SIDECAR_SUFFIX),
         )
+    elif suffix in DOCUMENT_EXTENSIONS or (extractor is not None and suffix in HTML_EXTENSIONS):
+        # Connector-backed documents get the same sidecar courtesy as local
+        # ones when the payload carries a filesystem path.
+        text = extract_to_text(
+            extractor,
+            payload.content,
+            item.relative_path,
+            _sidecar_for_payload(payload, EXTRACT_SIDECAR_SUFFIX),
+        )
     else:
-        text = read_text_bytes(payload.content, item.relative_path)
+        text = read_text_bytes(payload.content, item.relative_path, extractor)
     chunks = chunks_for_source(source, text)
     artifact_id = f"file:{source.name}:{item.relative_path}:branch={branch or 'none'}"
     return ParsedArtifact(
