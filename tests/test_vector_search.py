@@ -61,11 +61,103 @@ def test_vector_and_hybrid_surface_lexically_absent_synonym(tmp_path: Path) -> N
     assert any("vehicles.md" in path for path in _result_paths(hybrid))
 
 
+def test_hybrid_degrades_when_the_vector_arm_raises(tmp_path: Path) -> None:
+    """A broken embedding provider (bad/missing key, network) must not take
+    down text and graph results that already succeeded.
+
+    Regression: ``HybridSearch.search_context`` ran its three arms in a
+    ``ThreadPoolExecutor`` and called ``future.result()`` unguarded, so one
+    arm's exception (e.g. ``urllib.error.HTTPError: 401`` from an
+    OpenAI-spec embedder with no valid API key) propagated out of the whole
+    hybrid search — and from there out of the assistant chat workflow,
+    surfacing to the UI as a raw "401 Unauthorized" instead of an answer
+    built from the arms that were actually healthy.
+    """
+    from pheasant.search.hybrid import HybridSearch
+    from pheasant.search.sqlite_store import SearchStore
+
+    engine = make_vector_engine(tmp_path)
+    run_sync(engine, source_name="notes", mode="full")
+
+    class ExplodingVector:
+        def search(self, *args: Any, **kwargs: Any) -> list[dict]:
+            raise RuntimeError("simulated embedding provider failure (e.g. 401)")
+
+    searcher = HybridSearch(SearchStore(engine.state), vector=ExplodingVector())
+    # "automobile" (not the planted synonym "car") is literal text in
+    # vehicles.md, so the text arm has a real hit to degrade to.
+    payload = searcher.search_context(
+        engine.config.knowledge_base_id, "automobile", mode="hybrid", max_results=5
+    )
+    # The vector arm degraded to empty rather than raising; text/graph still
+    # answered, so hybrid mode returns a real (if reduced) result set.
+    assert payload["counts"]["vector"] == 0
+    assert payload["results"]
+    assert "vehicles.md" in _result_paths(payload)[0]
+
+
 def test_vector_mode_respects_source_filter(tmp_path: Path) -> None:
     engine = make_vector_engine(tmp_path)
     run_sync(engine, source_name="notes", mode="full")
     payload = _search(engine, "car", "vector", source_name="no-such-source")
     assert payload["results"] == []
+
+
+def test_index_artifact_batches_across_files_instead_of_one_call_per_file(
+    tmp_path: Path,
+) -> None:
+    """The slow-indexing complaint this fixes: most files carry far fewer
+    chunks than an embedder's batch size, so embedding immediately inside
+    the per-file sync loop made one HTTP round-trip per file. Chunks must
+    now queue across files and flush in `queue_size` groups instead.
+    """
+    from pheasant.search.vector_store import NumpyVectorStore, StubEmbedder, VectorIndexer
+
+    embedder = StubEmbedder(dim=16)
+    indexer = VectorIndexer(embedder, NumpyVectorStore(tmp_path / "vectors"), queue_size=10)
+
+    # 25 "files" of 1 chunk each -- the old per-file-call design would have
+    # made 25 embedder calls; batched at queue_size=10 this is 2 full
+    # flushes during the loop (20 chunks) plus a final explicit flush for
+    # the 5-chunk remainder.
+    for i in range(25):
+        queued = indexer.index_artifact(
+            "notes",
+            f"artifact-{i}",
+            [
+                {
+                    "id": f"chunk:notes:file{i}.md:sha256=hash{i}:chunk=0000",
+                    "text": f"file {i} says something about topic {i}",
+                    "text_hash": f"hash{i}",
+                }
+            ],
+        )
+        assert queued == 1
+
+    assert embedder.calls == 2, "two full queue_size=10 batches should have auto-flushed"
+    assert embedder.texts_embedded == 20, "the 5-chunk remainder is still only queued"
+    assert indexer.store.count() == 20
+
+    indexer.flush()  # SyncEngine always calls this at the end of a sync
+    assert embedder.calls == 3
+    assert embedder.texts_embedded == 25
+    assert indexer.store.count() == 25
+
+    # A second call with the identical chunk ids is a no-op: nothing queued,
+    # nothing embedded, nothing to flush.
+    requeued = indexer.index_artifact(
+        "notes",
+        "artifact-0",
+        [
+            {
+                "id": "chunk:notes:file0.md:sha256=hash0:chunk=0000",
+                "text": "file 0 says something about topic 0",
+                "text_hash": "hash0",
+            }
+        ],
+    )
+    assert requeued == 0
+    assert embedder.calls == 3
 
 
 def test_changed_chunk_reembeds_only_that_chunk(tmp_path: Path) -> None:

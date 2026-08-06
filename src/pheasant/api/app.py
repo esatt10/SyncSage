@@ -1688,6 +1688,12 @@ def create_app(
                     str(artifact["id"]),
                     [dict(chunk) for chunk in chunks],
                 )
+            # index_artifact queues rather than embeds immediately (batches
+            # across artifacts so this loop isn't one embedder call per
+            # artifact) — flush before reading the count, or a remainder
+            # smaller than the queue threshold would be silently unembedded
+            # and undercounted.
+            engine.vectors.flush()
             vector_count = int(engine.vectors.store.count())
         except (ModuleNotFoundError, ValueError) as exc:
             # A missing optional extra or a mismatched embedding space is a

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -7,6 +8,8 @@ from pheasant.graph.simple import SimpleMultiDiGraph
 from pheasant.search.graph_search import search_graph
 from pheasant.search.sqlite_store import SearchStore
 from pheasant.search.vector_store import VectorSearcher
+
+logger = logging.getLogger(__name__)
 
 VALID_MODES = {"hybrid", "text", "graph", "vector"}
 
@@ -95,12 +98,31 @@ class HybridSearch:
             )
 
         if len(jobs) == 1:
+            # A single explicitly-requested arm (mode="text"/"graph"/"vector")
+            # has nothing to fall back to, so a failure here still raises —
+            # the caller asked for exactly this arm and silently returning
+            # nothing would be a worse answer than an error.
             name, job = next(iter(jobs.items()))
             collected = {name: job()}
         else:
+            # In "hybrid" mode the arms are independent and their failure
+            # modes are not equivalent: text/graph read the local SQLite
+            # store, but vector calls a remote embedding provider (network,
+            # auth, quota). One arm's outage — e.g. a misconfigured or
+            # expired embedding API key — must not take down text and graph
+            # results that were already fetched successfully; it degrades
+            # hybrid to whatever arms are actually healthy instead of
+            # crashing the whole search (and, upstream, the assistant chat
+            # request that depends on it).
             with ThreadPoolExecutor(max_workers=len(jobs) or 1) as pool:
                 futures = {name: pool.submit(job) for name, job in jobs.items()}
-                collected = {name: future.result() for name, future in futures.items()}
+                collected = {}
+                for name, future in futures.items():
+                    try:
+                        collected[name] = future.result()
+                    except Exception:
+                        logger.warning("hybrid search: %r arm failed, degrading", name, exc_info=True)
+                        collected[name] = []
         text_results = collected.get("text", [])
         graph_results = collected.get("graph", [])
         vector_results = collected.get("vector", [])
