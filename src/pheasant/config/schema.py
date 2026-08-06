@@ -278,7 +278,7 @@ class EmbeddingsSettings(ModelMixin):
     """Optional embed-on-sync provider (Synapse 21.4). Off by default.
 
     ``provider`` is ``openai-spec`` (POST {base_url}/embeddings, the same
-    wire format the subjective-retrieval router uses) or ``stub``
+    wire format the pheasant-flock router uses) or ``stub``
     (deterministic, offline). The API key is read from the environment
     variable named by ``api_key_env`` and never stored in config/state.
     """

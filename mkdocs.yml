@@ -2,8 +2,8 @@ site_name: pheasant
 site_description: >-
   A Docker-first, local-first MCP context server that turns your sources into a
   queryable knowledge graph — and attaches to a Synapse fleet as a federated region.
-site_url: https://esatt10.github.io/pheasant/
-repo_url: https://github.com/esatt10/pheasant
+site_url: https://esatt10.github.io/pheasant-kb/
+repo_url: https://github.com/esatt10/pheasant-kb
 repo_name: esatt10/pheasant
 edit_uri: edit/main/docs/
 

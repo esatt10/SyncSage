@@ -35,7 +35,7 @@ Embedders
 ``OpenAISpecEmbedder`` speaks the standard OpenAI embeddings HTTP shape
 (``POST {base_url}/embeddings`` with ``{"model": ..., "input": [...]}``,
 response ``data[i].embedding``) — the same wire format the
-subjective-retrieval router's embedding provider uses, so a Synapse fleet
+pheasant-flock router's embedding provider uses, so a Synapse fleet
 can pin one model for both repos. ``StubEmbedder`` is the deterministic
 offline path: each lowercase token hashes (blake2b) to a fixed unit
 direction and a text embeds to the normalized sum of its token

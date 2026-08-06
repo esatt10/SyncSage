@@ -32,16 +32,26 @@ Design pillars (do not violate):
 
 Since 2026-06-10, pheasant is also the **region** component of
 **Synapse** — a federated knowledge-base system whose router (the
-"nervous system") lives in the sibling **subjective-retrieval** repo.
+"nervous system") lives in the sibling **pheasant-flock** repo.
 Each pheasant container publishes a **semantic contract** derived from
 its own content; the router scores contracts to decide which regions to
 query and fans out to each region's self-search. Read
 `docs/SYNAPSE_INTEGRATION.md` before doing any Synapse-related work here.
 Two iron rules: (1) the contract schema is canonical in
-subjective-retrieval — this repo only vendors the exported JSON Schema +
+pheasant-flock — this repo only vendors the exported JSON Schema +
 fixtures under `contracts/`; (2) **no Python dependency between the
 repos** — the boundary is contract JSON + HTTP, and a router-less
 pheasant must keep working unchanged.
+
+> **The router repo was renamed 2026-08-06**: `subjective-retrieval` →
+> **pheasant-flock** (import root `pheasant_flock`, CLI `pflock`). Nothing in
+> this repo's own code changed — only references to the sibling. That rename
+> *did* move the vendored contract bytes for the first time: the schema's
+> `$id` carries the router's repo URL, so `contracts/semantic_contract.v1.schema.json`
+> and `contracts/PARITY.json` were re-vendored. **The wire format is
+> unchanged** — contract instances never embed `$id`, so both fixtures stayed
+> byte-identical and the signed one still verifies. The sibling checkout the
+> parity test looks for is now `../pheasant-flock`.
 
 ---
 
@@ -147,7 +157,7 @@ docker compose up                          # container + optional UI sidecar
    must stay green; any sync change adds cases there.
 5. **Keep house style:** Typer CLI, dataclass config schema, ruff
    format+lint, pytest, Python ≥ 3.11, type hints.
-6. **Never import subjective-retrieval.** The Synapse boundary is
+6. **Never import pheasant-flock.** The Synapse boundary is
    contract JSON + HTTP (see §1.1). Never hand-edit vendored files under
    `contracts/`.
 7. **Standalone mode is sacred.** Every change must leave a router-less
@@ -158,7 +168,7 @@ docker compose up                          # container + optional UI sidecar
    deprecate before remove.
 9. **Cross-repo work** (anything marked [x-repo] in
    `docs/SYNAPSE_INTEGRATION.md`) follows the `pheasant-coordinator`
-   skill in the subjective-retrieval repo: identical branch names in both
+   skill in the pheasant-flock repo: identical branch names in both
    repos, contract fixture parity (sha256), both test suites green before
    either push.
 10. **Scope each session to one Phase-21 step** (or one bugfix). Write
@@ -169,7 +179,7 @@ docker compose up                          # container + optional UI sidecar
 ## 5. Current Synapse work queue (Phase 21 — region hardening)
 
 **Phase 21 region hardening is complete (2026-06-18).** Remaining Synapse work
-lives in the sibling subjective-retrieval repo (Phase 22 finish — Step 22.5 —
+lives in the sibling pheasant-flock repo (Phase 22 finish — Step 22.5 —
 plus Phases 23–26).
 
 **Step 24.4 (A2A + Ed25519-signed contracts) landed here 2026-06-20 [x-repo].**
@@ -186,7 +196,7 @@ signature covers byte-identical canonical body bytes to `_content_hash`, so the
 router's `SemanticContract.verify_signature` accepts it — **out-of-band public
 key** decision: the router carries the kb_id→pubkey trust store in *its* config,
 so the contract wire format / vendored schema are **unchanged** (no re-vendor;
-schema export asserted byte-identical in SR). A new vendored
+schema export asserted byte-identical in Flock). A new vendored
 `contracts/fixtures/signed-demo-region.v1.contract.json` (+ PARITY.json sha256
 both repos) is the cross-repo signing-parity guard
 (`tests/test_contract_signing.py` + `tests/test_contract_parity.py`). Suite:
@@ -253,7 +263,7 @@ deterministic pipeline (no second path, no LLM). Write surfaces
 `search_context`; recall IS search. Publisher advertises `"memory"` in
 `capabilities.modalities` (25.4 precedent — wire format unchanged, parity
 green). Acceptance: `tests/test_memory_region.py`. Docs:
-`docs/how-to/agent-memory.md`, contracts in SR `PRODUCT_FRAMEWORK.md` §3c.
+`docs/how-to/agent-memory.md`, contracts in Flock `PRODUCT_FRAMEWORK.md` §3c.
 
 **Step 33.2 (memory validity + consolidation) landed here 2026-07-16.**
 Supersedes chains resolve across scopes (`list_records(current_only=True)`
@@ -275,7 +285,7 @@ complete.** `memory/benchmark.py` (`python -m pheasant.memory.benchmark`):
 LongMemEval-style, deterministic, offline, through the real
 `memory_write`→index→`search_context` path. Recorded: recall@5 **1.000**,
 update_accuracy **1.000**, stale_leak **0.000**, abstention **1.000**
-(30/120/10/10, k=5; canonical numbers in SR `docs/RESULTS.md` §9d). The
+(30/120/10/10, k=5; canonical numbers in Flock `docs/RESULTS.md` §9d). The
 bench exposed + drove **two self-search fixes** in
 `search/sqlite_store.py`: (1) NL questions zeroed out on FTS5
 implicit-AND → MATCH is now an OR of sanitized `_query_tokens` ranked by
@@ -301,7 +311,7 @@ IdP sync loop = 32.4). Threaded through MCP `search_context` + HTTP
 `tests/test_acl_enforcement.py` (adversarial cross-user, anonymous
 public-only, group via param + config, enforcement-off parity,
 normalization rules, fail-closed). Suite: **253 passed** (+5). Router-side
-32.3 + deferred 32.4/32.5 live in SR (`PRODUCT_FRAMEWORK.md` §3d).
+32.3 + deferred 32.4/32.5 live in Flock (`PRODUCT_FRAMEWORK.md` §3d).
 
 **Step 32.4 (external-IdP group sync + staleness SLA) landed here 2026-07-18
 [x-repo] — completes the pheasant side of Phase 32.** The 32.2 config-mapped
@@ -328,7 +338,7 @@ Acceptance: `tests/test_idp_sync.py` (7 — paginated fetch, idempotent
 re-sync + heartbeat, fresh-grant vs stale-fail-closed e2e, maintenance due
 logic + error resilience, HTTP round-trip, disabled no-ops). Suite:
 **260 passed / 2 skipped** (+7). Router-side 32.5 (OIDC bearer→principal +
-audit) lands in SR the same day — **Phase 32 complete**.
+audit) lands in Flock the same day — **Phase 32 complete**.
 
 **Steps 31.3–31.7 (GDrive/Slack/Confluence/IMAP + certification) landed
 here 2026-07-16 — Phase 31 complete.** Four more first-party SDK plugins in
@@ -371,7 +381,7 @@ Canonical third-party shape: `tests/fixtures/pheasant-connector-example/`
 (`StaticDirConnector`), engine-e2e + idempotent second sync in
 `tests/test_connector_sdk.py`. Docs: `docs/reference/connector-sdk.md`.
 Suite: **183 passed** (+19). Steps 31.2–31.6 (Notion/GDrive/Slack/
-Confluence/IMAP) build on this, one per session; contracts in the SR
+Confluence/IMAP) build on this, one per session; contracts in the Flock
 repo's `docs/PRODUCT_FRAMEWORK.md` §3.
 
 **Retrieval + graph overhaul landed 2026-08-03.** Driven by a concrete
@@ -753,7 +763,7 @@ been caught by the pre-existing test suite alone.
 
 - **Region-side Synapse spec:** `docs/SYNAPSE_INTEGRATION.md`
 - **System architecture + framework (other repo):**
-  `subjective-retrieval/docs/SYNAPSE_ARCHITECTURE.md`,
+  `pheasant-flock/docs/SYNAPSE_ARCHITECTURE.md`,
   `…/docs/SYNAPSE_FRAMEWORK.md`, ADR 2026-06-10 in `…/docs/DECISIONS.md`
 - **Graph taxonomy:** `docs/graph_model.md` · **Config:** `docs/configuration.md`
 - **MCP:** `docs/mcp_tools.md`, `docs/mcp_client.md`

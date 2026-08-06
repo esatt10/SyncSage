@@ -1,6 +1,6 @@
 """Product Framework Step 31.1 — connector SDK (registry + plugin types).
 
-Acceptance (SR docs/PRODUCT_FRAMEWORK.md §3):
+Acceptance (Flock docs/PRODUCT_FRAMEWORK.md §3):
 
 - registry resolution via programmatic registration AND entry points;
 - an unknown ``sources[].type`` string survives config load as a

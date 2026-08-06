@@ -135,7 +135,7 @@ The repo's `docker-compose.yml` is the reference stack: pheasant plus the
 pheasant container).
 
 ```bash
-git clone https://github.com/esatt10/pheasant && cd pheasant
+git clone https://github.com/esatt10/pheasant-kb && cd pheasant
 docker compose up -d --build
 ```
 
@@ -285,4 +285,4 @@ legend, which doubles as the type filter.
 More: [Troubleshooting](../troubleshooting.md) ·
 [Deployment](../deployment.md) ·
 [Ask your knowledge base](chat-and-ui.md) ·
-[UI source and design notes](https://github.com/esatt10/pheasant/tree/main/ui)
+[UI source and design notes](https://github.com/esatt10/pheasant-kb/tree/main/ui)

@@ -12,7 +12,7 @@
       in via the `synapse:` config block; a router-less pheasant is unchanged.
     - **The global search experience** (routing, fan-out, merge, cross-region
       "white matter") lives on the router —
-      [subjective-retrieval](https://github.com/esatt10/subjective-retrieval).
+      [pheasant-flock](https://github.com/esatt10/pheasant-flock).
 
     Everything **below this box is the internal, contributor-facing spec**: the
     region-side contract obligations and the Phase-21 region-hardening step
@@ -44,13 +44,13 @@ different sizes. Ordering by *document* frequency rather than raw count is
 deliberate: a term repeated 400 times in one file describes that file, while a
 term appearing once in 400 files describes the corpus.
 
-Rule 6 note: the contract schema remains canonical in subjective-retrieval and
+Rule 6 note: the contract schema remains canonical in pheasant-flock and
 nothing under `contracts/` was hand-edited.
 
 ## Internal spec — pheasant as a Brain Region
 
 **Status:** authoritative pheasant-side spec (2026-06-10). The system-wide
-design lives in the **subjective-retrieval** repository:
+design lives in the **pheasant-flock** repository:
 `docs/SYNAPSE_ARCHITECTURE.md` (architecture) and
 `docs/SYNAPSE_FRAMEWORK.md` (execution plan, phases 20–26). This document
 mirrors **Phase 21 — region hardening**, which executes *here*, plus the
@@ -67,7 +67,7 @@ metaphor:
   specialized knowledge base — sync engine, SQLite/FTS5 state, knowledge
   graph, self-search, MCP/HTTP surfaces. Sizes range from single-digit MB
   to multi-TB. Regions are fully self-contained and deploy standalone.
-- **Subjective-retrieval is the nervous system**: a router that decides
+- **Pheasant Flock is the nervous system**: a router that decides
   *which regions to ask* by scoring each region's published **semantic
   contract**, fans the query out to the chosen regions' self-search, and
   merges/re-ranks the answers.
@@ -79,13 +79,13 @@ metaphor:
 
 Two integration invariants:
 
-1. **The contract schema is owned by subjective-retrieval.** Its Pydantic
+1. **The contract schema is owned by pheasant-flock.** Its Pydantic
    model is canonical; this repo vendors only the exported JSON Schema
    under `contracts/` plus golden fixtures, with a CI parity test
    (sha256 equality with the other repo's fixtures). Never hand-edit the
    vendored files.
 2. **No Python dependency between the repos.** The boundary is the
-   contract JSON + HTTP. A region must never import subjective-retrieval;
+   contract JSON + HTTP. A region must never import pheasant-flock;
    the router never imports pheasant. Regions must keep working with no
    router configured (all Synapse behavior is a no-op when
    `synapse.router_url` is unset).
@@ -98,7 +98,7 @@ These steps fix the gaps found in the 2026-06-10 audit and make a pheasant
 container a production-grade region. One step per agent session; each run
 writes `runs/<ts>-synapse-<step>/SUMMARY.md` (create `runs/` +
 gitignore it). Steps marked **[x-repo]** require matched work in
-subjective-retrieval via its `pheasant-coordinator` skill — identical
+pheasant-flock via its `pheasant-coordinator` skill — identical
 branch name in both repos, both test suites green before either push.
 
 ### Step 21.1 — Real watcher + scheduler
@@ -204,7 +204,7 @@ protocol with a `lancedb` default backend (optional extra
 `[vector]`) and a deterministic **stub embedder** for offline tests.
 Embeddings are computed at sync time per chunk through an OpenAI-spec
 HTTP embedding endpoint (`search.embeddings.base_url` / `model` /
-`api_key_env`) — the same provider surface subjective-retrieval uses, so
+`api_key_env`) — the same provider surface pheasant-flock uses, so
 a fleet pins one model for both. `HybridSearch` gains
 `mode="vector"` candidates merged into `hybrid`. Capabilities reported by
 the contract publisher gain `returns_vectors: true`,
@@ -232,7 +232,7 @@ missing ids and prunes ids absent from the `chunks` table at sync end
 to fixed unit directions with a small synonym canonicalization table so
 hybrid-vs-text acceptance runs offline. The **[x-repo]** obligation was
 satisfied by wire conformance, not code: `OpenAISpecEmbedder` speaks the
-standard OpenAI embeddings HTTP shape the subjective-retrieval provider
+standard OpenAI embeddings HTTP shape the pheasant-flock provider
 layer uses, so a fleet pins one model for both repos; no sibling-repo
 change was needed. `numpy` was promoted to a core dependency (the numpy
 backend + stub must work without `[vector]`).
@@ -272,7 +272,7 @@ except the local contract file + `GET /contract`.
 **Implementation note (2026-06-14, landed):** new `src/pheasant/synapse/`
 package (region-side; not the sibling's `synapse/`). The contract is built **by
 hand** to the vendored `contracts/semantic_contract.v1.schema.json` — no import
-of subjective-retrieval. Verified byte-for-byte against the sibling's canonical
+of pheasant-flock. Verified byte-for-byte against the sibling's canonical
 model: the fp16-base64 vector codec, the u64-base64 + blake2b MinHash, the
 `sha256:`-prefixed canonical-JSON `integrity.content_hash`
 (`sort_keys`/compact-separators/`integrity`-excluded), and the file
@@ -465,7 +465,7 @@ sync, can be backed up and restored byte-faithfully — with the standalone
 
 | Obligation | Where |
 |---|---|
-| Vendored JSON Schema | `contracts/semantic_contract.v<N>.schema.json` (do not edit; re-vendor from subjective-retrieval) |
+| Vendored JSON Schema | `contracts/semantic_contract.v<N>.schema.json` (do not edit; re-vendor from pheasant-flock) |
 | Golden fixtures | `contracts/fixtures/*.json` — byte-identical with the other repo (`tests/test_contract_parity.py`) |
 | Publisher | `src/pheasant/synapse/publisher.py` (Step 21.5) |
 | Serving | `GET /contract` + MCP resource |
@@ -476,7 +476,7 @@ sync, can be backed up and restored byte-faithfully — with the standalone
 ### Heterogeneous embedding spaces (2026-07-11, [x-repo] — router-side; pheasant docs-only)
 
 The fleet no longer requires all regions to share one embedding model/dim.
-The router (subjective-retrieval, ADR 2026-07-11 in its `docs/DECISIONS.md`)
+The router (pheasant-flock, ADR 2026-07-11 in its `docs/DECISIONS.md`)
 now **partitions** registered contracts by `embedding_space
 (model_id, dim, normalized)` and scores each partition with a query vector in
 that space (per-space query embedders under its `synapse.spaces` config, or
@@ -554,14 +554,14 @@ is session B.**
   — the same zero-work guarantee the embedder gets (21.4).
 - **Modalities wiring (contract):** the 21.5 publisher's `_capabilities()`
   appends `"image"` to `capabilities.modalities` when an image source is
-  configured. The router (subjective-retrieval) already filters by
+  configured. The router (pheasant-flock) already filters by
   `--modality image` *before* scoring (22.1), so an image query routes only to
   image-capable regions. **`modalities` is existing contract data — the wire
   format / vendored JSON Schema are UNCHANGED** (no schema bump, no re-vendor,
   parity test green).
 - **Tests:** `tests/test_image_ingestion.py` (caption searchable; artifact
   typed `image`; zero re-caption on unchanged re-sync; text-only region builds
-  no captioner; contract advertises `image`). Router-filter test on the SR side
+  no captioner; contract advertises `image`). Router-filter test on the Flock side
   (`tests/synapse/test_router.py::test_modality_image_routes_only_to_image_capable_regions`).
 
 ### Step 25.4 session B — multi-modal: audio ingest (2026-06-21, [x-repo]) — COMPLETES Step 25.4 + Phase 25
@@ -600,7 +600,7 @@ so they stay in lock-step; session A's observable behavior is unchanged.
   guarantee the embedder (21.4) and image captioner (25.4A) get.
 - **Modalities wiring (contract):** the 21.5 publisher's `_capabilities()`
   appends `"audio"` to `capabilities.modalities` when an audio source is
-  configured. The router (subjective-retrieval) already filters by
+  configured. The router (pheasant-flock) already filters by
   `--modality audio` *before* scoring (22.1), so an audio query routes only to
   audio-capable regions. **`modalities` is existing contract data — the wire
   format / vendored JSON Schema are UNCHANGED** (no schema bump, no re-vendor,
@@ -609,7 +609,7 @@ so they stay in lock-step; session A's observable behavior is unchanged.
   typed `audio`; zero re-transcribe on unchanged re-sync; text-only region builds
   no transcriber; contract advertises `audio`); fixture
   `tests/fixtures/sample_workspace/audio/briefing.wav` + `.transcript.txt`
-  sidecar (a few bytes, no real decoder). Router-filter test on the SR side
+  sidecar (a few bytes, no real decoder). Router-filter test on the Flock side
   (`tests/synapse/test_router.py::test_modality_audio_routes_only_to_audio_capable_regions`).
 
 ## 4. Deployment notes
@@ -624,15 +624,15 @@ A region remains the existing container (`Dockerfile`, port 8765, PVC on
   the region image is built unmodified from this repo's `Dockerfile` (sibling
   build context `../pheasant`, or `PHEASANT_IMAGE` pinned tag), and the three
   fleet-demo region configs + fixture workspaces are **vendored on the router
-  side** (`subjective-retrieval/deploy/synapse-demo/`) and mounted into the
+  side** (`pheasant-flock/deploy/synapse-demo/`) and mounted into the
   container at `/config/pheasant.yaml` + `/workspace`. Regions sync on startup
   (21.1) and publish their contract over the 21.5 webhook; the router's
   file-backed registry fills over HTTP (no shared volume). Standalone pheasant
   is unchanged — drop `synapse.publish`/`router_url` and the region is
-  router-less again. See `subjective-retrieval/docs/DEPLOY.md` §11.
+  router-less again. See `pheasant-flock/docs/DEPLOY.md` §11.
 - **Kubernetes** (Synapse Step 25.2, **landed 2026-06-20** in the router
   repo): the router repo's sibling Helm chart
-  `subjective-retrieval/deploy/helm/synapse/` renders the whole fleet — one
+  `pheasant-flock/deploy/helm/synapse/` renders the whole fleet — one
   router (`Deployment` + HPA + `Service`) plus a values-driven `regions:`
   list where **each entry becomes one `StatefulSet` + a `/state` PVC
   (`volumeClaimTemplate`, so each region owns its own volume — independent
@@ -645,7 +645,7 @@ A region remains the existing container (`Dockerfile`, port 8765, PVC on
   the same boundary as the 25.1 compose configs. Regions publish their
   contract to the router webhook (21.5) over the headless Service DNS name;
   standalone pheasant is unchanged. The live `helm template | kubeconform`
-  + kind smoke is a runbook in `subjective-retrieval/docs/DEPLOY.md` §12
+  + kind smoke is a runbook in `pheasant-flock/docs/DEPLOY.md` §12
   (the router-repo build env had no helm binary).
 - Auth: regions accept a bearer token (`security` settings) minted by the
   router's tenancy layer; local/demo fleets may run open.
@@ -655,7 +655,7 @@ A region remains the existing container (`Dockerfile`, port 8765, PVC on
 ## 5. Phase 34 — WASM sandboxing & selective acceleration (executes in this repo)
 
 **Status:** complete (2026-08-03). Not Synapse-contract work — no wire-format
-impact, no `[x-repo]` obligation, no coordination with subjective-retrieval
+impact, no `[x-repo]` obligation, no coordination with pheasant-flock
 required. Included here per the existing convention of tracking phased
 region-hardening-style work in this document. One step per agent session;
 each run writes `runs/<ts>-synapse-34.N/SUMMARY.md`. Outcome summary: 34.1-34.3

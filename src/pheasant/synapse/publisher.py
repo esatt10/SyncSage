@@ -3,7 +3,7 @@
 After a successful indexing sync, a region derives a **semantic contract** —
 a bounded JSON projection of its own content — and writes it to
 ``<state>/contract.latest.json`` (durable tmp + fsync + rename). The router
-(subjective-retrieval) scores these contracts at Tier 1 to decide which
+(pheasant-flock) scores these contracts at Tier 1 to decide which
 regions to query; it never reads region internals at routing time.
 
 Wire format
@@ -101,7 +101,7 @@ def load_contract_text(state_path: str | Path) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Wire-format codecs — must match subjective-retrieval/synapse/contract.py
+# Wire-format codecs — must match pheasant_flock/synapse/contract.py
 # ---------------------------------------------------------------------------
 
 

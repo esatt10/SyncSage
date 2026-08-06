@@ -46,7 +46,7 @@ chunks with file-level provenance.
 ## Fleet-wide access (many knowledge bases)
 
 One region = one KB. To let an agent search **across a fleet** of regions,
-attach the Synapse router's MCP host instead — `sr-mcp` from the
-subjective-retrieval package exposes `synapse_search` / `synapse_route` /
+attach the Synapse router's MCP host instead — `pflock-mcp` from the
+pheasant-flock package exposes `synapse_search` / `synapse_route` /
 `synapse_list_kbs` over the whole fleet. See the router-side guide:
-[MCP how-to](https://esatt10.github.io/subjective-retrieval/how-to/mcp/).
+[MCP how-to](https://esatt10.github.io/pheasant-flock/how-to/mcp/).

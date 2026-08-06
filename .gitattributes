@@ -6,7 +6,7 @@
 #
 #   * contracts/ carries the vendored Synapse contract schema and fixtures,
 #     whose sha256 must match contracts/PARITY.json byte-for-byte in BOTH this
-#     repo and subjective-retrieval (CLAUDE.md rule 9). On a Windows checkout
+#     repo and pheasant-flock (CLAUDE.md rule 9). On a Windows checkout
 #     the schema hashed 856ccba6... instead of 3a7a8a06... and
 #     tests/test_contract_parity.py failed for every Windows contributor while
 #     passing in CI — a false failure that is easy to dismiss as flakiness and

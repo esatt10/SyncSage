@@ -8,7 +8,7 @@ with ``integrity`` excluded, ``sort_keys=True``, compact separators,
 ``SemanticContract.verify_signature`` (which signs ``signing_bytes()``, the
 identical serialization) accepts it. This byte-level agreement is the
 cross-repo crypto contract; it is guarded by ``tests/test_contract_parity.py``
-on this side and the parity test in subjective-retrieval.
+on this side and the parity test in pheasant-flock.
 
 Key handling
 ------------
