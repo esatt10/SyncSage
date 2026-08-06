@@ -83,8 +83,7 @@ from pheasant.ingestion.extractor import (
     DocumentExtractor,
     _format_for,
     _tidy,
-    extract_docx_text_builtin,
-    extract_html_text,
+    extract_builtin,
     iter_pdf_content_streams,
 )
 from pheasant.sandbox.wasm_runtime import (
@@ -233,12 +232,20 @@ def extract_pdf_text_sandboxed(content: bytes) -> str:
 class SandboxedExtractor:
     """PDF extraction with the tokenizer under a WASM fuel/memory cap.
 
-    Only PDF is sandboxed. DOCX (``zipfile`` + ``xml.etree``) and HTML
-    (BeautifulSoup) keep their pure-Python paths, delegated to ``fallback``:
-    both are memory-safe Python parsers over bounded input, so wrapping them
-    would add per-file cost for no threat-model gain. Claiming a blanket
-    "sandboxed extraction" while only PDF is capped would be the kind of
-    overstatement this repo's run summaries exist to prevent.
+    **Only PDF is sandboxed.** Every other format keeps its pure-Python
+    reader: DOCX/PPTX/XLSX/EPUB are ``zipfile`` + ``xml.etree``, RTF is a
+    string tokenizer, HTML is BeautifulSoup, and legacy DOC is this project's
+    own bounded binary reader. All are memory-safe Python over bounded input,
+    so wrapping them would add per-file cost for no threat-model gain.
+
+    Claiming a blanket "sandboxed extraction" while only PDF is capped would be
+    the kind of overstatement this repo's run summaries exist to prevent. The
+    honest ranking of remaining exposure: ``.doc`` is the next most
+    attacker-facing format here, since it is the only one where this project
+    does its own offset arithmetic on untrusted binary structures — but in
+    Python that arithmetic is bounds-checked, so the failure mode is a raised
+    exception or a bounded allocation, not memory corruption. That is why it
+    gets explicit caps (:mod:`pheasant.ingestion.msdoc`) rather than a guest.
     """
 
     def __init__(self, fallback: DocumentExtractor | None = None, model: str = "sandboxed"):
@@ -257,11 +264,7 @@ class SandboxedExtractor:
         kind = _format_for(relative_path)
         if kind == "pdf":
             return extract_pdf_text_sandboxed(content)
-        if kind == "docx":
-            return extract_docx_text_builtin(content)
-        if kind == "html":
-            return extract_html_text(content)
-        return ""
+        return extract_builtin(kind, content)
 
 
 def reset_for_tests() -> None:

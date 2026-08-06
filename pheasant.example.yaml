@@ -140,9 +140,10 @@ sync:
 # section. Only the captioner and transcriber can make network calls, and both
 # default to a deterministic offline stub.
 ingestion:
-  # PDF/DOCX text extraction. Without it, a .pdf is discovered and hashed but
-  # contributes ZERO chunks — findable by path, invisible by content.
-  # Built only when a source's `include` admits **/*.pdf or **/*.docx.
+  # Document text extraction: .pdf .docx .doc .pptx .xlsx .rtf .epub
+  # Without it a document is discovered and hashed but contributes ZERO
+  # chunks — findable by path, invisible by content.
+  # Built only when a source's `include` admits one of those extensions.
   # Every provider is fully offline and deterministic (no model, no network).
   extractor:
     provider: auto        # "auto" (pymupdf/python-docx, falling back to the

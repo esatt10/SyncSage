@@ -1,7 +1,20 @@
-# How to ingest PDFs and Word documents
+# How to ingest documents (PDF, Office, RTF, EPUB)
 
-pheasant indexes `.pdf` and `.docx` by **extracting** their text, which then
-flows through the normal chunk → embed → graph path like any other document.
+pheasant indexes documents by **extracting** their text, which then flows
+through the normal chunk → embed → graph path like any other file.
+
+| Format | Extension | Worth knowing |
+|---|---|---|
+| PDF | `.pdf` | The only format with a sandboxed option (see below) |
+| Word | `.docx` `.doc` | `.doc` is the legacy binary format; Word 97-2003 |
+| PowerPoint | `.pptx` | **Speaker notes are indexed**, not just slide text |
+| Excel | `.xlsx` | Sheet names + cell values, one row per line |
+| RTF | `.rtf` | Must carry the `{\rtf` signature to be read |
+| EPUB | `.epub` | Read in **spine order**, not filename order |
+
+Not supported: `.pages`, `.numbers`, `.key`, `.odt`/`.ods`/`.odp`, and
+pre-Word-97 `.doc`. Those extensions are not accepted at all, so they are
+skipped rather than indexed empty.
 
 ## The symptom this fixes
 
@@ -34,8 +47,13 @@ sources:
     type: document_folder
     path: /workspace/handbooks
     include:
-      - "**/*.pdf"      # builds the extractor
+      - "**/*.pdf"      # any one of these builds the extractor
       - "**/*.docx"
+      - "**/*.doc"
+      - "**/*.pptx"
+      - "**/*.xlsx"
+      - "**/*.rtf"
+      - "**/*.epub"
 ```
 
 That is enough — `provider: auto` is the default. To be explicit:
@@ -148,8 +166,17 @@ actually read them. This is existing contract data — no wire-format change.
 `document extraction failed`. An image-only scan genuinely has no text — use an
 `.extract.txt` sidecar.
 
-**Text comes out garbled.** Likely a Type0/CID font under `builtin` or
-`sandboxed`. Switch to `auto`/`native`.
+**Text comes out garbled.** For a PDF, likely a Type0/CID font under `builtin`
+or `sandboxed` — switch to `auto`/`native`. For a `.doc`, the file may predate
+Word 97, whose layout this deliberately refuses rather than misreading into
+confident nonsense (check the logs for `pre-Word-97 FIB layout`).
+
+**A `.pptx` seems to be missing text.** Text inside embedded charts, SmartArt
+and images is not in the slide's `<a:t>` runs and is not extracted. Speaker
+notes *are*.
+
+**An `.xlsx` shows formulas' results, not the formulas.** That is deliberate —
+the cached value is what a reader of the spreadsheet sees.
 
 **`provider: sandboxed` raises `WasmRuntimeUnavailable`.** Install the extra:
 `pip install 'pheasant-kb[wasm]'`. This is intentional, not a bug.

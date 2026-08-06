@@ -271,17 +271,28 @@ would if this section did not exist.
 
 | Handler | Extensions | Built when `include` admits | Network? |
 |---|---|---|---|
-| `extractor` | `.pdf` `.docx` (+ `.html` `.htm` `.xhtml` when `html_text`) | a document extension | **never** |
+| `extractor` | `.pdf` `.docx` `.pptx` `.xlsx` `.doc` `.rtf` `.epub` (+ `.html` `.htm` `.xhtml` when `html_text`) | any of those | **never** |
 | `captioner` | `.png` `.jpg` `.jpeg` `.webp` `.gif` | an image extension | only if `provider: openai-spec` |
 | `transcriber` | `.wav` `.mp3` `.m4a` `.flac` `.ogg` | an audio extension | only if `provider: openai-spec` |
 
-### `ingestion.extractor` (PDF/DOCX text)
+### `ingestion.extractor` (document text)
 
-Without an extractor, `.pdf` and `.docx` are **accepted and then silently
-produce no text**: the artifact is discovered, hashed, typed `document` and
-given a graph node, but contributes **zero chunks** — findable by its path,
-invisible by its content. Configuring the extractor is what makes the contents
-searchable.
+Without an extractor, a document is **accepted and then silently produces no
+text**: the artifact is discovered, hashed, typed `document` and given a graph
+node, but contributes **zero chunks** — findable by its path, invisible by its
+content. Configuring the extractor is what makes the contents searchable.
+
+Seven formats are handled:
+
+| Format | Extension | How the text is reached | Notes |
+|---|---|---|---|
+| PDF | `.pdf` | content streams (`zlib` + operator scan) or pymupdf | Only format with a sandboxed option |
+| Word (OOXML) | `.docx` | `word/document.xml` | Includes tables |
+| Word (legacy) | `.doc` | OLE2 compound file → FIB → piece table | Word 97-2003; pre-97 layouts are refused, not guessed |
+| PowerPoint | `.pptx` | `<a:t>` runs per slide, in slide order | **Speaker notes are indexed too** |
+| Excel | `.xlsx` | sheets + `sharedStrings`, tab-separated rows | Sheet names included |
+| RTF | `.rtf` | control-word tokenizer | Requires the `{\rtf` signature |
+| EPUB | `.epub` | OPF **spine** order → XHTML → text | Spine, not filename order |
 
 Unlike the captioner/transcriber, no provider here uses a model or makes a
 network call — the text is already in the file — so every option is fully
@@ -300,6 +311,16 @@ offline and deterministic.
 | `native` | `pymupdf` | `python-docx` | Best fidelity: CID/Type0 fonts, custom encodings, complex layout. Both libraries are already core dependencies. |
 | `builtin` | `zlib` + content-stream scan | `zipfile` + `xml.etree` | **Standard library only.** No third-party imports at all. |
 | `sandboxed` | builtin tokenizer inside the WASM sandbox | same as `builtin` | Fuel + memory cap, zero host capabilities. Needs `pip install 'pheasant-kb[wasm]'`. |
+
+`native` also reads **EPUB** through pymupdf, which lays the book out and walks
+it in reading order — a genuine upgrade over the builtin spine walk.
+
+For **PPTX, XLSX, RTF and legacy DOC**, `native` and `builtin` are the *same
+code path*. No third-party reader for those formats exists in this project's
+dependency tree (`python-docx` handles only OOXML Word; `pymupdf` does not open
+them), and the builtin readers are complete for them — in the OOXML and EPUB
+formats the XML *is* the text, and RTF is a text format by definition. Listing
+`native` as an upgrade there would be a pretend distinction.
 
 **Authored sidecars.** If `<file>.extract.txt` sits next to a document, its
 contents are used **verbatim** and no extractor runs — the offline way to give

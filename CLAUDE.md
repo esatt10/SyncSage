@@ -865,6 +865,80 @@ tests across every acceptance path, and search precision was checked directly
 guards — 34 genuinely new tests). Full detail:
 `runs/2026-08-06-pdf-extraction/SUMMARY.md`.
 
+### Five more formats, 2026-08-06 — `.pptx/.xlsx/.doc/.rtf/.epub`
+
+The first pass ruled these out as "in no extension set, so not a broken
+promise". Asked to include them, they now extract too. `DOCUMENT_EXTENSIONS`
+grows to **seven** formats, and `EXTRACTED_EXTENSIONS` in `extractor.py` is
+asserted **set-equal** to it — the accept-list and the extractor-build gate
+drifting apart is precisely how the original bug would come back one format at
+a time (a source carrying only `.pptx` would accept the files and build no
+extractor → zero chunks). `extract_builtin(kind, content)` is now the single
+format→reader map that all four providers share.
+
+New `ingestion/office.py` (PPTX/XLSX/EPUB/RTF) + `ingestion/msdoc.py` (legacy
+binary DOC), both **pure stdlib**. Notable behaviors, each chosen over an
+easier wrong one: PPTX walks `<a:p>` paragraphs (not a flat `<a:t>` sweep, which
+runs bullets together) and **indexes speaker notes**, located via each slide's
+own `_rels` rather than assuming `notesSlideN`↔`slideN`; XLSX resolves
+`sharedStrings` and maps sheet names through `workbook.xml.rels`, emitting
+tab-separated rows; EPUB reads in **OPF spine order** (filename order scrambles
+most real books — guard test with deliberately anti-alphabetical names); RTF
+skips ignorable destinations (`\fonttbl`/`\colortbl`/`\stylesheet`/`\info`,
+whose `\'hh` escapes would otherwise decode into mojibake) and honours
+`\ucN` so `\uN` fallback characters don't double every non-ASCII char. Every
+element match is on **local name**, not a hard-coded namespace URI. `native`
+now reads EPUB via pymupdf (a real upgrade — MuPDF walks reading order); for
+PPTX/XLSX/RTF/DOC `native` is honestly the *same code path* as `builtin`, since
+no third-party reader for them exists in the dep tree and the builtin readers
+are complete.
+
+**`.doc` is the one that needed real work.** It is an OLE2 Compound File
+(a small FAT filesystem) whose text is not contiguous: the `WordDocument`
+stream holds character data and a **piece table** in `0Table`/`1Table` says
+which byte ranges form the document and whether each piece is single-byte
+cp1252 or UTF-16. So `msdoc.py` implements a CFB reader (header/DIFAT/FAT/
+miniFAT/directory) plus a FIB walk — `fcClx` is pair index 33 of `FibRgFcLcb`,
+reached by *walking* `csw`/`cslw`/`cbRgFcLcb` since the FIB is variable-length,
+not by a hard-coded offset. Pre-Word-97 layouts are **refused** (`cbRgFcLcb <
+34`) rather than read at index 33 anyway, which would yield confident garbage.
+Field ranges are handled: text between `0x13`/`0x14` is the field *instruction*
+(`HYPERLINK "http://…"`) and is dropped, `0x14`/`0x15` is the *result* and is
+kept — skipping that distinction is why naive extractors emit link machinery
+mid-sentence. Bounded throughout (visited-set chain walks so a cyclic FAT
+terminates, caps on stream/piece/text size); Python's bounds-checked slicing
+means hostile offsets raise rather than corrupt, which is also why `.doc`
+doesn't get a WASM guest — it's the most attacker-facing format here, but the
+failure mode is already an exception, not memory corruption.
+
+**LibreOffice Writer/Calc/Impress were installed to generate the fixtures**, so
+all five are **producer-generated, not hand-authored** — decisive for `.doc`,
+where a hand-crafted CFB would only prove the reader agrees with its own
+author's reading of the spec. The container layer is additionally cross-checked
+byte-for-byte against **olefile** (an independent implementation, deliberately
+*not* a dependency — `importorskip`). Two branches the fixtures can't reach are
+unit-tested with the reason recorded: **compressed cp1252 pieces** (LibreOffice
+always writes UTF-16; real Word prefers compressed, and that path has the
+unusual `fc // 2`) and field-instruction ranges.
+
+**Two real bugs caught during development, both by markers deliberately planted
+in the fixtures.** (1) The `.doc` control-code drop set included `0x28/0x3C/
+0x3E` on the mistaken belief they were Word markers — they are printable ASCII
+`(`, `<`, `>`, so **every** extracted document silently lost its parentheses
+and angle brackets. Now `_DROP` carries an assertion that every entry is below
+`0x20`, plus a regression test. (2) A non-RTF file named `.rtf` decoded its raw
+bytes as latin-1 prose; RTF has no structural gate of its own, so the `{\rtf`
+signature is now required — mojibake in the index is worse than no text,
+because it is unfindable *and* pollutes scoring.
+
+Acceptance: `tests/test_office_extraction.py` (54). Mutation-tested: narrowing
+`source_includes_documents` back to PDF+DOCX fails **10** tests; stubbing
+`extract_builtin`'s pptx/doc arms fails **6**. Search precision checked
+directly (a nonsense query returns `[]`). Suite: **646 passed / 18 skipped**
+(+54). Docs: `configuration.md` §ingestion.extractor (seven-format table),
+`how-to/document-ingest.md` (retitled, per-format gotchas). Router side needs
+nothing new — `"document"` already covers all seven.
+
 ---
 
 ## 6. Pointers

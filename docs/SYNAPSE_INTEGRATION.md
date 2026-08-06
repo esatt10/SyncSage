@@ -621,9 +621,15 @@ all — see the 2026-08-06 entry in `CLAUDE.md` and
 consequence is one more entry in an existing contract field:
 
 - The 21.5 publisher's `_capabilities()` appends `"document"` to
-  `capabilities.modalities` when a source's `include` globs admit `.pdf` or
-  `.docx`, so a router's `--modality document` filter (22.1) routes document
-  questions only to regions that can actually read them.
+  `capabilities.modalities` when a source's `include` globs admit any of the
+  **seven** extractable document extensions — `.pdf`, `.docx`, `.doc`,
+  `.pptx`, `.xlsx`, `.rtf`, `.epub` — so a router's `--modality document`
+  filter (22.1) routes document questions only to regions that can actually
+  read them. One modality covers all seven deliberately: from the router's
+  point of view "can this region read a document?" is the routable question,
+  and a per-format modality (`"pptx"`, `"epub"`, …) would push format
+  dispatch into the fleet contract for no routing benefit. A region that gains
+  a format therefore needs **no** contract or router change.
 - **`modalities` is existing contract data — the wire format / vendored JSON
   Schema are UNCHANGED** (no schema bump, no re-vendor, parity test green).
   This follows the 25.4 image/audio and 33.1 memory precedents exactly, so it

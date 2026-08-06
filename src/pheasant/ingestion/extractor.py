@@ -1,4 +1,9 @@
-"""Document text extraction for PDF/DOCX/HTML ingestion.
+"""Document text extraction for PDF/DOCX/PPTX/XLSX/DOC/RTF/EPUB/HTML ingestion.
+
+This module owns PDF, DOCX and HTML and the provider/config surface for all
+formats; :mod:`pheasant.ingestion.office` adds PPTX, XLSX, EPUB and RTF, and
+:mod:`pheasant.ingestion.msdoc` the legacy binary DOC. ``extract_builtin`` is
+the one place formats map to readers.
 
 A ``.pdf`` or ``.docx`` file carries plenty of indexable text, but none of it
 is reachable with :meth:`pathlib.Path.read_text`. Before this module the
@@ -85,7 +90,28 @@ EXTRACT_SIDECAR_SUFFIX = ".extract.txt"
 
 PDF_EXTENSIONS = {".pdf"}
 DOCX_EXTENSIONS = {".docx"}
+PPTX_EXTENSIONS = {".pptx"}
+XLSX_EXTENSIONS = {".xlsx"}
+DOC_EXTENSIONS = {".doc"}
+RTF_EXTENSIONS = {".rtf"}
+EPUB_EXTENSIONS = {".epub"}
 HTML_EXTENSIONS = {".html", ".htm", ".xhtml"}
+
+# Every extension this module can turn into text, HTML aside (HTML is opt-in;
+# see `extractable_extensions`). Kept as one set so `source_includes_documents`
+# and `content_types.DOCUMENT_EXTENSIONS` cannot drift apart: if a format is
+# accepted by the pipeline but missing from here, no extractor gets built for a
+# source that only carries that format, and the file indexes with zero
+# chunks — exactly the failure this module exists to remove.
+EXTRACTED_EXTENSIONS = (
+    PDF_EXTENSIONS
+    | DOCX_EXTENSIONS
+    | PPTX_EXTENSIONS
+    | XLSX_EXTENSIONS
+    | DOC_EXTENSIONS
+    | RTF_EXTENSIONS
+    | EPUB_EXTENSIONS
+)
 
 # Guard against a pathological input exhausting host memory. A single
 # inflated content stream is capped, and so is the total extracted text: a
@@ -444,15 +470,58 @@ def _tidy(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+_FORMAT_BY_EXTENSION: dict[str, str] = {
+    **dict.fromkeys(PDF_EXTENSIONS, "pdf"),
+    **dict.fromkeys(DOCX_EXTENSIONS, "docx"),
+    **dict.fromkeys(PPTX_EXTENSIONS, "pptx"),
+    **dict.fromkeys(XLSX_EXTENSIONS, "xlsx"),
+    **dict.fromkeys(DOC_EXTENSIONS, "doc"),
+    **dict.fromkeys(RTF_EXTENSIONS, "rtf"),
+    **dict.fromkeys(EPUB_EXTENSIONS, "epub"),
+    **dict.fromkeys(HTML_EXTENSIONS, "html"),
+}
+
+
 def _format_for(relative_path: str) -> str | None:
-    suffix = Path(relative_path).suffix.lower()
-    if suffix in PDF_EXTENSIONS:
-        return "pdf"
-    if suffix in DOCX_EXTENSIONS:
-        return "docx"
-    if suffix in HTML_EXTENSIONS:
-        return "html"
-    return None
+    return _FORMAT_BY_EXTENSION.get(Path(relative_path).suffix.lower())
+
+
+def extract_builtin(kind: str | None, content: bytes) -> str:
+    """Standard-library-only extraction for one already-resolved format.
+
+    The single place formats map to readers, so a new format cannot be wired
+    into one provider and silently forgotten in another. PPTX/XLSX/EPUB/RTF
+    live in :mod:`pheasant.ingestion.office` and legacy DOC in
+    :mod:`pheasant.ingestion.msdoc`; imports are local so a text-only region
+    never loads any of them.
+    """
+    if kind == "pdf":
+        return extract_pdf_text_builtin(content)
+    if kind == "docx":
+        return extract_docx_text_builtin(content)
+    if kind == "html":
+        return extract_html_text(content)
+    if kind == "pptx":
+        from pheasant.ingestion.office import extract_pptx_text
+
+        return _tidy(extract_pptx_text(content))
+    if kind == "xlsx":
+        from pheasant.ingestion.office import extract_xlsx_text
+
+        return _tidy(extract_xlsx_text(content))
+    if kind == "epub":
+        from pheasant.ingestion.office import extract_epub_text
+
+        return _tidy(extract_epub_text(content))
+    if kind == "rtf":
+        from pheasant.ingestion.office import extract_rtf_text
+
+        return _tidy(extract_rtf_text(content))
+    if kind == "doc":
+        from pheasant.ingestion.msdoc import extract_doc_text
+
+        return _tidy(extract_doc_text(content))
+    return ""
 
 
 class BuiltinExtractor:
@@ -467,14 +536,7 @@ class BuiltinExtractor:
         if authored is not None:
             return authored
         self.calls += 1
-        kind = _format_for(relative_path)
-        if kind == "pdf":
-            return extract_pdf_text_builtin(content)
-        if kind == "docx":
-            return extract_docx_text_builtin(content)
-        if kind == "html":
-            return extract_html_text(content)
-        return ""
+        return extract_builtin(_format_for(relative_path), content)
 
 
 class NativeExtractor:
@@ -501,9 +563,15 @@ class NativeExtractor:
             return self._extract_pdf(content, relative_path)
         if kind == "docx":
             return self._extract_docx(content, relative_path)
-        if kind == "html":
-            return extract_html_text(content)
-        return ""
+        if kind == "epub":
+            return self._extract_epub(content, relative_path)
+        # PPTX, XLSX, RTF and legacy DOC have no third-party reader in this
+        # project's dependency tree (`python-docx` is OOXML-word-only,
+        # `pymupdf` does not open them), and the builtin readers are complete
+        # for them — the OOXML/EPUB text *is* the XML, and RTF is a text
+        # format. So "native" is honestly the same code path here rather than
+        # a pretend upgrade.
+        return extract_builtin(kind, content)
 
     def _extract_pdf(self, content: bytes, relative_path: str) -> str:
         try:
@@ -523,6 +591,30 @@ class NativeExtractor:
             # builtin, which may still recover the uncompressed streams.
             logger.warning("pymupdf failed on %s (%s); using builtin", relative_path, exc)
             return extract_pdf_text_builtin(content)
+
+    def _extract_epub(self, content: bytes, relative_path: str) -> str:
+        """EPUB via pymupdf, which reads it natively (not just PDF).
+
+        A genuine upgrade over the builtin reader rather than a rename: MuPDF
+        lays the book out and walks it in reading order, so it recovers text
+        from packages whose spine or manifest the builtin path cannot follow.
+        Falls back to the builtin reader on any failure.
+        """
+        try:
+            import pymupdf  # type: ignore[import-not-found]
+        except ModuleNotFoundError:
+            try:
+                import fitz as pymupdf  # type: ignore[import-not-found,no-redef]
+            except ModuleNotFoundError:
+                return extract_builtin("epub", content)
+        try:
+            with pymupdf.open(stream=content, filetype="epub") as document:
+                pages = [page.get_text() or "" for page in document]
+            text = _tidy("\n\n".join(pages))
+            return text or extract_builtin("epub", content)
+        except Exception as exc:
+            logger.warning("pymupdf failed on %s (%s); using builtin", relative_path, exc)
+            return extract_builtin("epub", content)
 
     def _extract_docx(self, content: bytes, relative_path: str) -> str:
         import io
@@ -606,21 +698,27 @@ def extractable_extensions(settings: ExtractorSettings | None = None) -> set[str
     deployments. Gating it behind ``html_text`` keeps the default byte-identical
     and makes the improvement an explicit operator choice.
     """
-    extensions = set(PDF_EXTENSIONS) | set(DOCX_EXTENSIONS)
+    extensions = set(EXTRACTED_EXTENSIONS)
     if settings is not None and getattr(settings, "html_text", False):
         extensions |= set(HTML_EXTENSIONS)
     return extensions
 
 
 def source_includes_documents(source: Any) -> bool:
-    """True when a source's ``include`` globs admit a PDF or DOCX extension.
+    """True when a source's ``include`` globs admit any extractable document.
 
     Document extraction is opt-in exactly like images/audio: the default
     ``include`` list is code/markdown/config only, so a region grows document
-    capability only when an operator adds e.g. ``**/*.pdf``.
+    capability only when an operator adds e.g. ``**/*.pdf`` or ``**/*.pptx``.
+
+    This must cover **every** extension in ``EXTRACTED_EXTENSIONS``. A format
+    the pipeline accepts but this predicate misses would build no extractor for
+    a source carrying only that format, so its files would index with zero
+    chunks — the original bug, reintroduced one format at a time. A test
+    asserts the two sets agree.
     """
     includes = list(getattr(source, "include", None) or [])
-    admitted = tuple(PDF_EXTENSIONS | DOCX_EXTENSIONS)
+    admitted = tuple(EXTRACTED_EXTENSIONS)
     return any(pattern.lower().endswith(admitted) for pattern in includes)
 
 
