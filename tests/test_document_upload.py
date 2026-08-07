@@ -1,0 +1,218 @@
+"""Uploading documents through the UI.
+
+Acceptance:
+
+1. An upload becomes a **real source** — the same connector → chunk → graph
+   pipeline as everything else, searchable afterwards. There is no second
+   ingestion path to keep in step.
+2. Untrusted filenames cannot escape the upload directory, collide, or produce
+   a path that is unusable on another platform.
+3. A second upload into the same source adds to it rather than replacing it.
+4. One bad file does not lose the good ones it was dropped with.
+"""
+
+from __future__ import annotations
+
+import io
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from pheasant.api.app import create_app
+from pheasant.api.uploads import safe_filename, store_upload, unique_path, upload_root
+
+
+def _file(name: str, body: bytes = b"# Title\n\nSome indexable prose.\n"):
+    return ("files", (name, io.BytesIO(body), "text/markdown"))
+
+
+# ------------------------------------------------------------ filename safety
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("notes.md", "notes.md"),
+        # Only the basename survives — a traversal cannot escape the directory.
+        ("../../etc/passwd", "passwd"),
+        ("..\\..\\windows\\system32\\evil.dll", "evil.dll"),
+        ("/absolute/path/report.pdf", "report.pdf"),
+        # A leading dot would create .env / .git, which the exclude list would
+        # then silently skip anyway.
+        (".env", "env"),
+        ("  spaced  .md", "spaced  .md"),
+        # Windows-illegal characters are replaced, not the whole name.
+        ("re<port>:v2?.md", "re_port_v2_.md"),
+        ("tab\tseparated.md", "tab_separated.md"),
+        ("", "upload"),
+        ("///", "upload"),
+    ],
+)
+def test_filenames_are_reduced_to_one_safe_component(raw: str, expected: str) -> None:
+    assert safe_filename(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "\u00dcbersicht.pdf",
+        "\u4f1a\u8b70\u30e1\u30e2.md",
+        "notes-caf\u00e9.md",
+        "\u03a9-report.txt",
+    ],
+)
+def test_non_ascii_filenames_are_kept(name: str) -> None:
+    """An allowlist of [A-Za-z0-9._-] would mangle every non-English name.
+
+    It turned "\u00dcbersicht.pdf" into "_bersicht.pdf" and "\u4f1a\u8b70\u30e1\u30e2.md" into
+    "___.md", while defending against nothing the denylist does not.
+    """
+    import unicodedata
+
+    assert safe_filename(name) == unicodedata.normalize("NFC", name)
+
+
+def test_visually_identical_names_normalise_to_one_file() -> None:
+    """NFD (e + combining acute) must not become a different file from NFC \u00e9."""
+    nfd = "cafe\u0301.md"
+    nfc = "caf\u00e9.md"
+    assert nfd != nfc
+    assert safe_filename(nfd) == safe_filename(nfc)
+
+
+def test_the_length_cap_counts_bytes_not_characters() -> None:
+    """Filesystem limits are in bytes, and one emoji is four of them."""
+    name = safe_filename("\U0001f986" * 200 + ".md")
+    assert len(name.encode("utf-8")) <= 180
+    assert name.endswith(".md")
+
+
+def test_windows_reserved_device_names_are_renamed() -> None:
+    """`con.txt` is not creatable on Windows; a state dir must stay portable."""
+    assert safe_filename("con.txt") == "con_file.txt"
+    assert safe_filename("LPT1") == "LPT1_file"
+
+
+def test_a_very_long_name_is_truncated_but_keeps_its_extension() -> None:
+    name = safe_filename("x" * 400 + ".md")
+    assert len(name) <= 180
+    assert name.endswith(".md")
+
+
+def test_uploading_the_same_name_twice_does_not_overwrite(tmp_path: Path) -> None:
+    (tmp_path / "notes.md").write_text("first", encoding="utf-8")
+    assert unique_path(tmp_path, "notes.md").name == "notes-2.md"
+
+
+def test_a_file_over_the_limit_is_refused_before_it_is_written(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="over the"):
+        store_upload(tmp_path, "big.md", b"x" * 2048, max_bytes=1024)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_empty_file_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="empty"):
+        store_upload(tmp_path, "nothing.md", b"")
+
+
+def test_upload_root_is_created_under_state(tmp_path: Path) -> None:
+    root = upload_root(tmp_path, "my uploads")
+    assert root.is_dir()
+    assert root.parent.name == "uploads"
+    assert root.parent.parent == tmp_path
+
+
+# ------------------------------------------------------------------ the route
+
+
+def test_uploaded_documents_become_a_searchable_source(loaded_config, config_path: Path) -> None:
+    client = TestClient(create_app(config=loaded_config, config_path=config_path))
+
+    response = client.post(
+        "/sources/upload",
+        files=[_file("quarterly.md", b"# Quarterly\n\nThe kestrel migration finished.\n")],
+        data={"source_name": "uploads", "sync_now": "true", "wait": "true"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["stored"][0]["filename"] == "quarterly.md"
+    assert body["source_name"] == "uploads"
+
+    # It is a real source, listed like any other.
+    names = {source["name"] for source in client.get("/sources").json()}
+    assert "uploads" in names
+
+    # And it went through the ordinary pipeline, so it is searchable.
+    hits = client.post("/search", json={"query": "kestrel migration", "mode": "text"}).json()
+    assert "kestrel" in str(hits).lower()
+
+
+def test_a_second_upload_adds_to_the_same_source(loaded_config, config_path: Path) -> None:
+    client = TestClient(create_app(config=loaded_config, config_path=config_path))
+    data = {"source_name": "uploads", "sync_now": "false", "wait": "true"}
+
+    client.post("/sources/upload", files=[_file("one.md")], data=data)
+    second = client.post("/sources/upload", files=[_file("two.md")], data=data)
+
+    directory = Path(second.json()["path"])
+    assert {p.name for p in directory.iterdir()} == {"one.md", "two.md"}
+    # Still one source, not two.
+    assert sum(1 for s in client.get("/sources").json() if s["name"] == "uploads") == 1
+
+
+def test_one_rejected_file_does_not_lose_the_rest(loaded_config, config_path: Path) -> None:
+    loaded_config.sync.limits.max_file_size_mb = 1
+    client = TestClient(create_app(config=loaded_config, config_path=config_path))
+
+    response = client.post(
+        "/sources/upload",
+        files=[
+            _file("good.md", b"# Good\n\nReadable prose.\n"),
+            _file("huge.md", b"x" * (2 * 1024 * 1024)),
+        ],
+        data={"source_name": "uploads", "sync_now": "false", "wait": "true"},
+    )
+
+    body = response.json()
+    assert [item["filename"] for item in body["stored"]] == ["good.md"]
+    assert body["rejected"][0]["filename"] == "huge.md"
+
+
+def test_an_upload_with_no_usable_files_is_a_400(loaded_config, config_path: Path) -> None:
+    client = TestClient(create_app(config=loaded_config, config_path=config_path))
+    response = client.post(
+        "/sources/upload",
+        files=[_file("empty.md", b"")],
+        data={"source_name": "uploads", "sync_now": "false", "wait": "true"},
+    )
+    assert response.status_code == 400
+
+
+def test_upload_with_wait_false_returns_a_job_to_follow(loaded_config, config_path: Path) -> None:
+    client = TestClient(create_app(config=loaded_config, config_path=config_path))
+    response = client.post(
+        "/sources/upload",
+        files=[_file("async.md")],
+        data={"source_name": "uploads", "sync_now": "true", "wait": "false"},
+    )
+    body = response.json()
+    assert body["syncing"] is True
+    assert body["job_id"]
+    assert client.get(f"/jobs/{body['job_id']}").status_code == 200
+
+
+def test_a_traversing_filename_lands_inside_the_upload_directory(
+    loaded_config, config_path: Path
+) -> None:
+    client = TestClient(create_app(config=loaded_config, config_path=config_path))
+    response = client.post(
+        "/sources/upload",
+        files=[_file("../../escaped.md")],
+        data={"source_name": "uploads", "sync_now": "false", "wait": "true"},
+    )
+    body = response.json()
+    stored = Path(body["stored"][0]["path"]).resolve()
+    assert stored.parent == Path(body["path"]).resolve()
+    assert stored.name == "escaped.md"

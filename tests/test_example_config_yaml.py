@@ -51,11 +51,7 @@ def _parse_with_real_pyyaml(yaml_path: Path) -> subprocess.CompletedProcess:
     """
     env = dict(os.environ)
     if env.get("PYTHONPATH"):
-        parts = [
-            p
-            for p in env["PYTHONPATH"].split(os.pathsep)
-            if p and Path(p).resolve() != REPO
-        ]
+        parts = [p for p in env["PYTHONPATH"].split(os.pathsep) if p and Path(p).resolve() != REPO]
         env["PYTHONPATH"] = os.pathsep.join(parts)
     return subprocess.run(
         [sys.executable, "-c", _PARSE_SNIPPET, str(yaml_path)],
@@ -93,3 +89,74 @@ def test_real_pyyaml_guard_would_catch_the_regression(tmp_path: Path) -> None:
         "the real-PyYAML guard did not reject a misindented mapping; "
         "the regression check is not actually biting"
     )
+
+
+# ---------------------------------------------------------------------------
+# Every config pheasant *writes* must be readable by the dependency-light YAML
+# shim, not just by PyYAML.
+#
+# Found in a live run, not by this suite: `yaml` in the test environment
+# resolves to PyYAML, so a round-trip test that just calls `yaml.safe_load`
+# proves nothing about the shim. These load it by path.
+# ---------------------------------------------------------------------------
+
+
+def _shim():
+    """Import the repo-root `yaml.py` shim explicitly, whatever `yaml` resolves to."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "yaml.py"
+    spec = importlib.util.spec_from_file_location("pheasant_yaml_shim", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_pheasant_up_writes_a_config_the_shim_can_read(tmp_path: Path) -> None:
+    """Regression: PyYAML writes block sequences at the *parent's* indent, the
+    shim requires +2, and every config `pheasant up` ever wrote blew up with
+    `AttributeError: 'dict' object has no attribute 'append'`."""
+    from pheasant.cli import main
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "a.md").write_text("# A\n\nProse.\n", encoding="utf-8")
+    config_path = tmp_path / "pheasant.yaml"
+    assert main(["up", str(corpus), "-c", str(config_path), "--no-serve"]) == 0
+
+    data = _shim().safe_load(config_path.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+    assert data["sources"][0]["name"] == "corpus"
+    assert isinstance(data["security"]["allow_workspace_roots"], list)
+
+
+def test_pheasant_setup_writes_a_config_the_shim_can_read(tmp_path: Path) -> None:
+    from pheasant.cli import main
+
+    config_path = tmp_path / "pheasant.yaml"
+    assert main(["setup", "--accept-defaults", "-o", str(config_path)]) == 0
+
+    data = _shim().safe_load(config_path.read_text(encoding="utf-8"))
+    # A nested list inside a nested mapping — the exact shape that broke.
+    assert data["assistant"]["retrieval"]["retrieval_modes"] == ["text", "vector"]
+
+
+def test_a_list_item_containing_a_colon_survives_the_shim() -> None:
+    """Unquoted, the shim splits `- http://localhost:5173` into a mapping —
+    silently wrong data on the setting that decides which browser origins may
+    drive an unauthenticated API."""
+    from pheasant.config.loader import dump_config_yaml
+
+    payload = {"server": {"api": {"cors_origins": ["http://localhost:5173"]}}}
+    parsed = _shim().safe_load(dump_config_yaml(payload))
+    assert parsed["server"]["api"]["cors_origins"] == ["http://localhost:5173"]
+
+
+def test_the_dumper_output_is_also_valid_for_pyyaml() -> None:
+    """Fixing the shim must not break the reader almost everyone actually uses."""
+    import yaml as real_yaml
+
+    from pheasant.config.loader import dump_config_yaml
+
+    payload = {"a": {"b": ["x:y", "z"], "c": 1}, "d": True}
+    assert real_yaml.safe_load(dump_config_yaml(payload)) == payload

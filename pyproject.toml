@@ -19,6 +19,11 @@ dependencies = [
   # package. Keep the runtime and our httpx-based test tooling on the same
   # supported Starlette API until FastAPI itself supports that major version.
   "starlette<1",
+  # Multipart form parsing, for POST /sources/upload. FastAPI needs it to
+  # accept an UploadFile at all, and it otherwise only arrives transitively
+  # through the optional [mcp] extra — so a core API route would 500 on a
+  # core-only install.
+  "python-multipart>=0.0.9",
   "uvicorn[standard]>=0.30",
   "pydantic>=2.7",
   "PyYAML>=6.0",

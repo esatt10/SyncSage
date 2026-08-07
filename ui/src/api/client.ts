@@ -19,6 +19,19 @@ import type {
   SyncResult,
   WorkflowCatalog,
 } from "./types";
+import type {
+  ConfigSection,
+  ConfigSectionResult,
+  GraphDiagnostics,
+  GraphPath,
+  HostPathReport,
+  JobRecord,
+  KnowledgeBaseInfo,
+  KnowledgeBaseUpdate,
+  RetrievalResponse,
+  RetrievalSettings,
+  UploadResponse,
+} from "./types";
 
 // In dev, requests go to `/api/*` which Vite proxies to the pheasant container.
 // When the bundle is served by pheasant itself, the API is same-origin (root).
@@ -307,6 +320,65 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(body),
     }),
+
+  // Uploads — documents dropped into the browser become a real source.
+  // Not `request()`: that sets a JSON content-type, and a multipart body
+  // needs the browser to set its own boundary header.
+  uploadDocuments: async (files: File[], sourceName = "uploads"): Promise<UploadResponse> => {
+    const form = new FormData();
+    for (const file of files) form.append("files", file, file.name);
+    form.append("source_name", sourceName);
+    form.append("sync_now", "true");
+    form.append("wait", "false");
+    const response = await fetch(`${API_BASE}/sources/upload`, { method: "POST", body: form });
+    if (!response.ok) {
+      let detail = `${response.status} ${response.statusText}`;
+      try {
+        const body = await response.json();
+        if (body?.detail) detail = String(body.detail);
+      } catch {
+        /* no JSON body */
+      }
+      throw new Error(detail);
+    }
+    return (await response.json()) as UploadResponse;
+  },
+
+  // Host paths — "can pheasant see this, and if not, exactly how do I fix it".
+  hostPath: (path: string) => request<HostPathReport>(`/fs/host-path${qs({ path })}`),
+
+  // Jobs
+  jobs: (activeOnly = false) =>
+    request<{ jobs: JobRecord[]; active_count: number }>(`/jobs${qs({ active: activeOnly })}`),
+  job: (jobId: string) => request<JobRecord>(`/jobs/${encodeURIComponent(jobId)}`),
+
+  // Retrieval tuning
+  retrieval: () => request<RetrievalResponse>("/assistant/retrieval"),
+  updateRetrieval: (body: Partial<RetrievalSettings> & { persist?: boolean }) =>
+    request<RetrievalResponse & { changed: string[]; wrote_config: boolean }>(
+      "/assistant/retrieval",
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
+
+  // Live config sections + knowledge-base identity
+  configSections: () => request<{ sections: ConfigSection[] }>("/config/sections"),
+  patchConfigSection: (section: string, values: Record<string, unknown>, persist = true) =>
+    request<ConfigSectionResult>(`/config/section/${encodeURIComponent(section)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ values, persist }),
+    }),
+  knowledgeBase: () => request<KnowledgeBaseInfo>("/knowledge-base"),
+  updateKnowledgeBase: (body: { name?: string; description?: string; persist?: boolean }) =>
+    request<KnowledgeBaseUpdate>("/knowledge-base", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+
+  // Graph diagnostics + path finding (the full-screen workspace)
+  graphDiagnostics: (top = 20) =>
+    request<GraphDiagnostics>(`/graph/diagnostics${qs({ top })}`),
+  graphPath: (source: string, target: string, maxDepth = 8) =>
+    request<GraphPath>(`/graph/path${qs({ source, target, max_depth: maxDepth })}`),
 };
 
 export { API_BASE };

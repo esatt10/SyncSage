@@ -187,11 +187,21 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         include_graph_neighbors: bool = True,
         principal: str | None = None,
         principal_groups: list[str] | None = None,
+        source_name: str | None = None,
+        exclude_sources: list[str] | None = None,
+        node_types: list[str] | None = None,
+        min_score: float | None = None,
     ) -> dict:
         """Search indexed context and return compact results with provenance.
 
         principal/principal_groups scope results to what that caller may see
         when security.acl_enforced is on (Step 32.2); ignored otherwise.
+
+        source_name/exclude_sources/node_types/min_score are retrieval
+        criteria you can set per call instead of relying on how the region
+        was configured. Call describe_retrieval to see what this region
+        offers, and preview_retrieval to compare criteria against the
+        standing configuration before committing to them.
         """
 
         return tools.search_context(
@@ -203,6 +213,54 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             include_graph_neighbors,
             principal=principal,
             principal_groups=principal_groups,
+            source_name=source_name,
+            exclude_sources=exclude_sources,
+            node_types=node_types,
+            min_score=min_score,
+        )
+
+    @mcp.tool()
+    def describe_retrieval(knowledge_base: str) -> dict:
+        """Report how this knowledge base retrieves, and what you can override.
+
+        Returns the standing configuration (default mode, result count,
+        retrieval rounds and depth), which search modes actually work here
+        (semantic search is only offered when a vector index exists), the
+        sources present, and the criteria each retrieval tool accepts per
+        call. Call this before guessing at parameters for an unfamiliar
+        region.
+        """
+
+        return tools.describe_retrieval(knowledge_base)
+
+    @mcp.tool()
+    def preview_retrieval(  # noqa: PLR0913 - mirrors search_context's criteria
+        knowledge_base: str,
+        query: str,
+        mode: str = "hybrid",
+        max_results: int = 10,
+        source_name: str | None = None,
+        exclude_sources: list[str] | None = None,
+        node_types: list[str] | None = None,
+        min_score: float | None = None,
+    ) -> dict:
+        """Try retrieval criteria and see how they differ from the configuration.
+
+        Runs the given criteria and the region's configured retrieval over the
+        same query, then reports both result sets and the delta (added,
+        dropped, kept). Use it to test a setting against real content before
+        anyone writes it into pheasant.yaml. Read-only — nothing is persisted.
+        """
+
+        return tools.preview_retrieval(
+            knowledge_base,
+            query,
+            mode=mode,
+            max_results=max_results,
+            source_name=source_name,
+            exclude_sources=exclude_sources,
+            node_types=node_types,
+            min_score=min_score,
         )
 
     @mcp.tool()

@@ -56,9 +56,54 @@ def render_init_config(profile: str = "quickstart") -> str:
         f"# Available profiles: {', '.join(profile_names())}\n"
         "# Add sources under the sources: list when ready.\n"
     )
-    rendered = yaml.safe_dump(data, sort_keys=False)
+    rendered = dump_config_yaml(data)
     rendered = rendered.replace("sources:\n\n", "sources: []\n")
     return header + rendered
+
+
+def dump_config_yaml(data: dict[str, Any]) -> str:
+    """Dump a config mapping so **both** YAML readers can load it back.
+
+    pheasant ships a dependency-light YAML shim (``yaml.py`` at the repo root)
+    for installs without PyYAML, and it is stricter than PyYAML in two ways
+    that a plain ``yaml.safe_dump`` walks straight into:
+
+    1. **Sequences must be indented under their key.** PyYAML writes
+
+       .. code-block:: yaml
+
+           retrieval_modes:
+           - text
+
+       with the dash at the *parent's* indent; the shim requires ``+2`` and
+       fails with ``AttributeError: 'dict' object has no attribute 'append'``.
+       Every config ``pheasant up`` has ever written was unreadable by the
+       shim for exactly this reason — found by round-tripping a real generated
+       config through it rather than through whichever ``yaml`` the tests
+       happened to import.
+
+    2. **A list item containing ``:`` must be quoted**, or the shim splits it
+       into a mapping — which silently turned every entry of
+       ``cors_origins`` into ``{"http": "//localhost:5173"}``. Wrong data, no
+       error, on the setting that decides which browser origins may drive an
+       unauthenticated API.
+
+    Both are fixed here, once, for every path that writes config YAML.
+    """
+    if not hasattr(yaml, "SafeDumper"):  # the shim: its own dumper is correct
+        return yaml.safe_dump(data, sort_keys=False)
+
+    class _IndentingDumper(yaml.SafeDumper):
+        def increase_indent(self, flow=False, indentless=False):  # noqa: ARG002
+            # `indentless=True` is what un-indents block sequences.
+            return super().increase_indent(flow, False)
+
+    def _represent_str(dumper, value):
+        style = '"' if ":" in value else None
+        return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
+
+    _IndentingDumper.add_representer(str, _represent_str)
+    return yaml.dump(data, Dumper=_IndentingDumper, sort_keys=False, default_flow_style=False)
 
 
 def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:

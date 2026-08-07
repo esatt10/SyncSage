@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { Overview } from "../api/types";
 import { QuickAdd } from "./QuickAdd";
 import { CopyLine } from "./CopyLine";
+import { UploadDrop } from "./UploadDrop";
 
 /**
  * What you see when nothing is indexed.
@@ -50,6 +51,18 @@ export function EmptyState({
           <div className="step">
             <span className="step__n">2</span>
             <div className="step__body">
+              <div className="step__title">…or just drop some files in</div>
+              <p className="muted small" style={{ margin: "0 0 8px" }}>
+                No path to type, no directory to mount. Uploaded documents become a
+                normal source and are indexed exactly like any other.
+              </p>
+              <UploadDrop onUploaded={onAdded} />
+            </div>
+          </div>
+
+          <div className="step">
+            <span className="step__n">3</span>
+            <div className="step__body">
               <div className="step__title">…or do it in one command</div>
               <p className="muted small" style={{ margin: "0 0 8px" }}>
                 Detects, configures, indexes and serves — any target, one line.
@@ -65,13 +78,16 @@ export function EmptyState({
 
           {hasSources ? (
             <div className="step">
-              <span className="step__n">3</span>
+              <span className="step__n">4</span>
               <div className="step__body">
                 <div className="step__title">Check your mounts</div>
                 <p className="muted small" style={{ margin: 0 }}>
                   Configured sources: {overview.sources.map((s) => s.path).join(", ")}. If
                   you are running in Docker, each of these must be mounted into the
                   container — an unmounted path indexes zero files without erroring.
+                  Run <code>pheasant mount &lt;host-path&gt;</code> to write the bind
+                  mount, or paste the path into "Add a source" and pheasant will tell
+                  you the exact line to add.
                 </p>
               </div>
             </div>

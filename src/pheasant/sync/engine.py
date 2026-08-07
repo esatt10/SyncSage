@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -47,6 +48,37 @@ logger = logging.getLogger(__name__)
 
 SyncMode = Literal["incremental", "full", "validate_only", "repair"]
 SYNC_MODES = {"incremental", "full", "validate_only", "repair"}
+
+#: ``(phase, current, total, detail)`` — everything a progress bar needs.
+#: ``total`` is None until the connector has finished listing, because it is
+#: not known before then and a made-up denominator is worse than none.
+ProgressHook = Callable[[str, int, int | None, str], None]
+
+
+def _progress_reporter(hook: ProgressHook | None, source_name: str):
+    """Wrap a progress hook so it can never fail the sync that calls it.
+
+    This fires from inside the per-artifact loop. A caller's bad callback —
+    a closed queue, an evicted job, a typo — must cost a log line, not an
+    index. Returns a no-op when there is no hook, so the un-instrumented path
+    stays exactly as cheap as it was.
+    """
+
+    if hook is None:
+        return lambda *_args, **_kwargs: None
+
+    def report(
+        phase: str,
+        current: int = 0,
+        total: int | None = None,
+        detail: str = "",
+    ) -> None:
+        try:
+            hook(phase, current, total, detail)
+        except Exception:  # pragma: no cover - progress is never load-bearing
+            logger.debug("progress hook failed for %s", source_name, exc_info=True)
+
+    return report
 
 
 def _restore_iso_ts(filename_ts: str) -> str:
@@ -394,9 +426,16 @@ class SyncEngine:
         *,
         max_depth: int | None = None,
         full_scan: bool = False,
+        on_progress: ProgressHook | None = None,
     ) -> list[SyncResult]:
         return [
-            self.sync_source(source.name, mode, max_depth=max_depth, full_scan=full_scan)
+            self.sync_source(
+                source.name,
+                mode,
+                max_depth=max_depth,
+                full_scan=full_scan,
+                on_progress=on_progress,
+            )
             for source in self.config.sources
             if source.enabled
         ]
@@ -408,6 +447,7 @@ class SyncEngine:
         *,
         max_depth: int | None = None,
         full_scan: bool = False,
+        on_progress: ProgressHook | None = None,
     ) -> SyncResult:
         """Sync one source.
 
@@ -416,7 +456,14 @@ class SyncEngine:
         explicit "yes, index all of it" switch. Neither is persisted to the
         source config, so a one-off wide sync cannot silently become the
         standing behavior of a scheduled one.
+
+        ``on_progress`` is called as the pass advances so a caller can show
+        real progress rather than a spinner. It is best-effort in the strongest
+        sense: it rides the per-artifact yield point that already exists, and
+        an exception raised inside it can never fail the sync (see
+        :func:`_report_progress`).
         """
+        report = _progress_reporter(on_progress, source_name)
         if mode not in SYNC_MODES:
             raise ValueError(f"Unsupported sync mode: {mode}")
         source = self.config.effective_source(
@@ -492,6 +539,7 @@ class SyncEngine:
                         ),
                     },
                 )
+            report("listing", 0, None, f"listing {source.name}")
             try:
                 items = connector.list_items()
             except SyncBudgetExceeded as exc:
@@ -525,7 +573,10 @@ class SyncEngine:
             embedded_chunks = 0
             changed_ids: set[str] = set()
             git_metadata = git_state(source.path) if source.type.value == "repository" else None
-            for item in items:
+            # The denominator only exists now — listing is what produced it.
+            total_items = len(items)
+            report("indexing", 0, total_items, f"{total_items} item(s) to consider")
+            for position, item in enumerate(items, start=1):
                 previous = artifacts.get(item.relative_path)
                 if self._can_skip_before_read(mode, previous, item):
                     skipped += 1
@@ -622,6 +673,9 @@ class SyncEngine:
                 }
                 indexed += 1
                 changed_ids.add(parsed.id)
+                # Rides the existing per-artifact yield point rather than
+                # adding a second one: progress costs no extra traversal.
+                report("indexing", position, total_items, parsed.relative_path)
                 # Let anything waiting on the API get a turn before the next
                 # file. Without this a long index makes the UI unusable.
                 serve_yield()
@@ -650,6 +704,11 @@ class SyncEngine:
             # similarity pair and re-scan every edge on each beat, which is
             # what pinned a container's CPU while indexing nothing.
             if indexed or mode == "full":
+                # Global enrichment is proportional to the whole graph, not to
+                # what changed, so on a large index this is where a sync
+                # "stops" from the outside. Naming the phase is the difference
+                # between "still working" and "hung".
+                report("enriching", total_items, total_items, "linking the graph")
                 self.graph_builder.add_similarity_edges(
                     source.name,
                     # A full pass rebuilt this source from scratch, so every
@@ -679,6 +738,7 @@ class SyncEngine:
                         pruned["removed"],
                         pruned["restored"],
                     )
+            report("saving", total_items, total_items, "writing the graph and index")
             manifest["last_indexed_at"] = utc_now()
             manifest["connector"] = {"type": connector.connector_type}
             self.manifests.save(source.name, manifest)
