@@ -544,3 +544,102 @@ def test_guest_declares_no_imports_so_it_has_no_ambient_capabilities() -> None:
     store = wasmtime.Store(engine)
     store.set_fuel(sandbox.SANDBOX_FUEL)
     linker.instantiate(store, module)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# The runtime-registered source. Found by validating against a real
+# producer-generated PDF through the HTTP API rather than through SyncEngine
+# directly — the two disagreed, and the API path was the broken one.
+
+
+def _api_client(tmp_path: Path, fixture: Path, pattern: str):
+    """An app whose config has **no sources**, mirroring a real deployment
+    before anyone adds one."""
+    import shutil
+
+    from fastapi.testclient import TestClient
+
+    from pheasant.api.app import create_app
+
+    workspace = tmp_path / "workspace" / "docs"
+    workspace.mkdir(parents=True, exist_ok=True)
+    shutil.copy(fixture, workspace / fixture.name)
+    # Deliberately NOT copying the authored `.caption.txt`/`.transcript.txt`
+    # sidecar: a sidecar supplies text whether or not a handler was built, so
+    # a test that copied it would pass with the fix reverted. The stub
+    # captioner/transcriber is deterministic and offline, so the handler itself
+    # is what has to run here.
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "runtime-source",
+                "state_path": str(tmp_path / "state"),
+                "vault_path": str(tmp_path / "vault"),
+                "workspace_root": str(tmp_path / "workspace"),
+                "exports_path": str(tmp_path / "exports"),
+            },
+            "sources": [],
+        }
+    )
+    client = TestClient(create_app(config))
+    response = client.post(
+        "/sources",
+        json={
+            "name": "docs",
+            "type": "document_folder",
+            "path": str(workspace),
+            "include": [pattern],
+            "sync_now": True,
+            "wait": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+    return client
+
+
+def test_a_pdf_source_registered_at_runtime_still_extracts_text(tmp_path: Path) -> None:
+    """The regression this exists for.
+
+    ``extractor_from_config`` runs once in ``SyncEngine.__init__`` and asks
+    whether *any configured* source admits a document extension. A source added
+    through ``POST /sources`` — the UI's add-source flow, and how most sources
+    actually arrive — did not exist when the engine was built, so no extractor
+    was constructed and its PDFs were indexed with **no text at all**: the exact
+    silent-empty-content failure this module exists to fix, on the path most
+    people use. Indexing the same file via ``SyncEngine`` directly worked, which
+    is why the unit tests never saw it.
+    """
+    client = _api_client(tmp_path, HANDBOOK, "**/*.pdf")
+    assert client.get("/overview").json()["chunk_count"] > 0
+
+    hits = client.post("/search", json={"query": "handbook", "mode": "text"}).json()
+    assert hits["results"], "the document's content must be searchable, not just its path"
+
+
+def test_an_image_source_registered_at_runtime_is_still_captioned(tmp_path: Path) -> None:
+    """Same constructor-time check, same gap — but a milder symptom, and the
+    assertion has to be chosen to see it.
+
+    Unlike a document, an image never went *empty*: `caption_to_text` falls back
+    to a filename-derived caption ("Image diagram.") when no captioner was
+    built, so chunk count alone stays positive either way and would pass with
+    the fix reverted. What is actually lost is the captioner's own output, so
+    that is what this asserts — the stub's content fingerprint, which the
+    fallback has no way to produce.
+    """
+    client = _api_client(
+        tmp_path, Path("tests/fixtures/sample_workspace/images/diagram.png"), "**/*.png"
+    )
+    hits = client.post("/search", json={"query": "diagram", "mode": "text"}).json()["results"]
+    text = " ".join(chunk.get("text_preview", "") for hit in hits for chunk in hit.get("chunks", []))
+    assert "fingerprint" in text, f"captioner did not run; got the filename fallback: {text!r}"
+
+
+def test_an_audio_source_registered_at_runtime_is_still_transcribed(tmp_path: Path) -> None:
+    """And the transcriber, with the same filename-fallback caveat as above."""
+    client = _api_client(
+        tmp_path, Path("tests/fixtures/sample_workspace/audio/briefing.wav"), "**/*.wav"
+    )
+    hits = client.post("/search", json={"query": "briefing", "mode": "text"}).json()["results"]
+    text = " ".join(chunk.get("text_preview", "") for hit in hits for chunk in hit.get("chunks", []))
+    assert "fingerprint" in text, f"transcriber did not run; got the fallback: {text!r}"

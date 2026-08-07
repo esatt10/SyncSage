@@ -201,14 +201,19 @@ def config_has_image_source(config: Any) -> bool:
     return any(source_includes_images(source) for source in getattr(config, "sources", []))
 
 
-def captioner_from_config(config: Any) -> Captioner | None:
+def captioner_from_config(config: Any, *, source: Any = None) -> Captioner | None:
     """Build the image captioner, or ``None`` when no image source is configured.
 
     Returning ``None`` keeps a text-only region byte-identical to pre-25.4
     behavior (no captioner, no possibility of a network call).
+
+    Pass ``source`` to ask about one source rather than the whole config —
+    what a source registered *after* the engine was built needs, since the
+    config the engine was constructed from never mentioned it.
     """
 
-    if not config_has_image_source(config):
+    wanted = source_includes_images(source) if source is not None else config_has_image_source(config)
+    if not wanted:
         return None
     try:
         return build_captioner(config.ingestion.captioner)

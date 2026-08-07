@@ -7,14 +7,14 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from pheasant.config.schema import FILESYSTEM_SOURCE_TYPES, PheasantConfig, SourceConfig
 from pheasant.graph.builder import GraphBuilder
-from pheasant.ingestion.captioner import captioner_from_config
-from pheasant.ingestion.extractor import extractor_from_config
+from pheasant.ingestion.captioner import captioner_from_config, source_includes_images
+from pheasant.ingestion.extractor import extractor_from_config, source_includes_documents
 from pheasant.ingestion.pipeline import git_state, parse_connector_payload, utc_now
-from pheasant.ingestion.transcriber import transcriber_from_config
+from pheasant.ingestion.transcriber import source_includes_audio, transcriber_from_config
 from pheasant.ingestion.walk import (
     SyncBudgetExceeded,
     WalkBudget,
@@ -408,6 +408,31 @@ class SyncEngine:
             if source.enabled
         ]
 
+    def _ensure_modal_handlers(self, source: Any) -> None:
+        """Build the caption/transcribe/extract handlers this source needs.
+
+        The three are built once in ``__init__`` from whether *any* configured
+        source admits their extensions. That misses the source registered at
+        **runtime** — `POST /sources`, `POST /sources/quick-add`, the UI's
+        add-source flow — which is how most sources actually arrive: the engine
+        was constructed before that source existed, so no handler was built,
+        and its documents were indexed with **no text at all**. Exactly the
+        silent-empty-content failure document extraction exists to fix, on the
+        path most people use.
+
+        Topping the handlers up here, where the source is known, also makes the
+        test more precise than the constructor's: it asks whether *this* source
+        needs a handler rather than whether any source does. Idempotent, and it
+        never discards a handler that already exists — a second sync of an
+        unchanged source does no work here.
+        """
+        if self.extractor is None and source_includes_documents(source):
+            self.extractor = extractor_from_config(self.config, source=source)
+        if self.captioner is None and source_includes_images(source):
+            self.captioner = captioner_from_config(self.config, source=source)
+        if self.transcriber is None and source_includes_audio(source):
+            self.transcriber = transcriber_from_config(self.config, source=source)
+
     def sync_source(
         self,
         source_name: str,
@@ -429,6 +454,7 @@ class SyncEngine:
         source = self.config.effective_source(
             self._source(source_name), max_depth=max_depth, full_scan=full_scan
         )
+        self._ensure_modal_handlers(source)
         # A container restart must never re-index by itself, but a config edit
         # that changes what the content pipeline produces must. Compare what
         # this source was last indexed with against what it is configured with

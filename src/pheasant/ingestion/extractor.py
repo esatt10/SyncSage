@@ -726,18 +726,25 @@ def config_has_document_source(config: Any) -> bool:
     return any(source_includes_documents(source) for source in getattr(config, "sources", []))
 
 
-def extractor_from_config(config: Any) -> DocumentExtractor | None:
+def extractor_from_config(config: Any, *, source: Any = None) -> DocumentExtractor | None:
     """Build the document extractor, or ``None`` when no document source exists.
 
     Returning ``None`` keeps a text-only region byte-identical to its
     pre-extraction behavior: no extractor is constructed and
     ``read_text``/``read_text_bytes`` behave exactly as before.
+
+    Pass ``source`` to ask about one source rather than the whole config. That
+    is what a source registered *after* the engine was built needs — the config
+    the engine was constructed from never mentioned it.
     """
     settings = getattr(getattr(config, "ingestion", None), "extractor", None)
     if settings is None:
         return None
     html_on = bool(getattr(settings, "html_text", False))
-    if not config_has_document_source(config) and not html_on:
+    wanted = (
+        source_includes_documents(source) if source is not None else config_has_document_source(config)
+    )
+    if not wanted and not html_on:
         return None
     try:
         return build_extractor(settings)
