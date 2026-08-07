@@ -222,11 +222,21 @@ this is a summary, not a replacement):
   the shipped UI calls it cross-origin), and `ui` (whether to serve the
   web UI at all — skip for a headless/MCP-only deployment).
 - **`ingestion`**: only worth discussing if their sources (§6) include
-  images or audio; if so, ask about `captioner` (images) and/or
-  `transcriber` (audio) separately — each independently defaults to
-  `stub` (free, offline, deterministic but not semantically meaningful)
-  versus `openai-spec` (a real vision/speech model, costs an API call
-  per file at index time). If they said "just markdown notes" or "just a
+  documents, images or audio; if so, ask about `extractor` (documents),
+  `captioner` (images) and/or `transcriber` (audio) separately.
+  `captioner`/`transcriber` each independently default to `stub` (free,
+  offline, deterministic but not semantically meaningful) versus
+  `openai-spec` (a real vision/speech model, costs an API call per file
+  at index time). `extractor` is different in kind: it makes no network
+  call under any provider (the text is already inside the file), so the
+  only question is fidelity vs isolation — `auto` (default, uses
+  `pymupdf`/`python-docx`, best fidelity) versus `sandboxed` (PDF
+  tokenizer inside the WASM sandbox, needs the `[wasm]` extra), which is
+  worth recommending when the PDFs arrive from a connector rather than
+  from the user. Say plainly that **without an extractor a `.pdf`/
+  `.docx`/`.pptx`/`.xlsx`/`.doc`/`.rtf`/`.epub` file is indexed by path
+  but contributes no searchable text**, so this is not an optional nicety
+  for a document corpus. If they said "just markdown notes" or "just a
   code repo", tell them this section doesn't apply and move on without
   asking anything.
 - **`sync`**: `watcher` (live file-change reindexing — leave on unless
@@ -247,10 +257,6 @@ this is a summary, not a replacement):
   it, ask provider (`openai-spec` vs `stub` — `stub` is deterministic/
   offline/free but not semantically meaningful, only useful for testing
   the pipeline) and which env var will hold the key.
-- **`ingestion`**: only worth discussing if their sources (§6) include
-  images or audio. If they said "just markdown notes" or "just a code
-  repo", tell them this section doesn't apply and move on without
-  asking anything.
 - **`security`**: always ask about `allow_workspace_roots` /
   `allow_user_selected_source_paths` in real terms — "pheasant can be
   pointed at any readable path on this machine; do you want to restrict
@@ -303,7 +309,18 @@ This is the point of the whole exercise, so slow down here. Loop:
 7. Ask about `chunking` only if the default (`semantic`, 4000/400 chars)
    seems wrong for the content type (e.g. large PDFs might want
    `heading_or_page`, per the `pheasant-docs` example source).
-8. Write the finished source block into `pheasant.yaml`'s `sources:`
+8. Ask about `taxonomy` **only if they described this source as
+   structured documentation** — a book, a standard, a contract, a set of
+   procedures, anything with Parts/Chapters/Articles/`§ 12.3`/`1.2.3`
+   numbering. Enabling it (`taxonomy.enabled: true`, off by default,
+   per-source) extracts that outline so a result says *which section*
+   matched and a chunk is a section rather than a fixed-size window.
+   Say why it's per-source rather than global: numbered lines are
+   genuinely ambiguous — `1. Introduction` in a standard is a section,
+   `1. Buy milk` in a note is a list item — so turning it on is the
+   user asserting "this corpus really is structured". For a code repo or
+   a personal notes vault, don't ask; take the default.
+9. Write the finished source block into `pheasant.yaml`'s `sources:`
    list, update progress, loop back to step 1.
 
 Config-validate as you go where practical: after each source, mentally
