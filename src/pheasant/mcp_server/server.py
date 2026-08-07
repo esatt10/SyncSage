@@ -57,8 +57,16 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         enabled: bool = True,
         include: list[str] | None = None,
         exclude: list[str] | None = None,
+        taxonomy: bool = False,
     ) -> dict:
-        """Register a source path after allowlisted path validation."""
+        """Register a source path after allowlisted path validation.
+
+        Set ``taxonomy`` for structured documentation (books, procedures,
+        legal documents): each artifact's outline — Chapter / Article /
+        Section / § / 1.2.3 / (a) — is then extracted on every sync, chunks
+        are cut and labelled per section, and `heading` graph nodes are
+        emitted. Off by default.
+        """
 
         return tools.register_source(
             knowledge_base=knowledge_base,
@@ -69,6 +77,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             enabled=enabled,
             include=include,
             exclude=exclude,
+            taxonomy=taxonomy,
         )
 
     @mcp.tool()
@@ -187,6 +196,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         include_graph_neighbors: bool = True,
         principal: str | None = None,
         principal_groups: list[str] | None = None,
+        section: str | None = None,
         source_name: str | None = None,
         exclude_sources: list[str] | None = None,
         node_types: list[str] | None = None,
@@ -196,6 +206,11 @@ def create_mcp_server(config: PheasantConfig) -> Any:
 
         principal/principal_groups scope results to what that caller may see
         when security.acl_enforced is on (Step 32.2); ignored otherwise.
+
+        section restricts results to one part of a document's extracted
+        taxonomy, matched against the breadcrumb — "§ 12.3", "Article IV" or a
+        section's wording all work, and naming a parent returns everything
+        nested under it. Only meaningful for sources with taxonomy enabled.
 
         source_name/exclude_sources/node_types/min_score are retrieval
         criteria you can set per call instead of relying on how the region
@@ -213,6 +228,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             include_graph_neighbors,
             principal=principal,
             principal_groups=principal_groups,
+            section=section,
             source_name=source_name,
             exclude_sources=exclude_sources,
             node_types=node_types,

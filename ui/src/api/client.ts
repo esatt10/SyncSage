@@ -17,6 +17,7 @@ import type {
   SourceTypeCatalog,
   SourceWritePayload,
   SyncResult,
+  TaxonomyResponse,
   WorkflowCatalog,
 } from "./types";
 import type {
@@ -135,6 +136,14 @@ export const api = {
     request<Record<string, unknown>>(`/files/summary${qs({ path, source_name: sourceName })}`),
   nodeContent: (nodeId: string) =>
     request<{ node_id: string; content: string | null }>(`/nodes/content${qs({ node_id: nodeId })}`),
+
+  /**
+   * The extracted outline of each document in a source with taxonomy on.
+   * Read from the emitted `heading` nodes, so it reflects what was indexed
+   * rather than re-parsing the file.
+   */
+  taxonomy: (options: { source?: string; path?: string } = {}) =>
+    request<TaxonomyResponse>(`/taxonomy${qs({ source: options.source, path: options.path })}`),
 
   // Sources
   sources: () => request<SourceRecord[]>("/sources"),

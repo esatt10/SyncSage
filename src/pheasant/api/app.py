@@ -103,6 +103,9 @@ class SearchRequest(BaseModel):
     mode: str = "hybrid"
     max_results: int = 10
     source_name: str | None = None
+    # Restrict to one part of a document's extracted taxonomy, matched against
+    # the heading breadcrumb. Only meaningful for sources with taxonomy on.
+    section: str | None = None
 
 
 class MemoryWriteRequest(BaseModel):
@@ -149,6 +152,11 @@ class RegisterSourceRequest(BaseModel):
     chunking: dict | None = None
     sync: dict | None = None
     connector: dict | None = None
+    # Structural taxonomy extraction (chapters/sections/§ codes). The toggle
+    # belongs at registration because it is a property of the *source* — "this
+    # corpus is structured documentation" — not of the instance. Omitted or
+    # `{"enabled": false}` leaves the source byte-identical to pre-taxonomy.
+    taxonomy: dict | None = None
     urls: list[str] | None = None
     sync_now: bool = False
     sync_mode: str = "incremental"
@@ -167,6 +175,7 @@ class UpdateSourceRequest(BaseModel):
     max_depth: int | None = None
     include: list[str] | None = None
     exclude: list[str] | None = None
+    taxonomy: dict | None = None
     repo: dict | None = None
     chunking: dict | None = None
     sync: dict | None = None
@@ -264,6 +273,9 @@ class QuickAddRequest(BaseModel):
     target: str
     name: str | None = None
     split: bool = False
+    #: Extract a structural taxonomy (chapters/sections/§ codes) from this
+    #: source's documents. Off by default, matching the per-source config.
+    taxonomy: bool = False
     sync_now: bool = True
     sync_mode: str = "incremental"
     # See SyncRequest.wait — default True keeps the existing, tested
@@ -1526,6 +1538,7 @@ def create_app(
             principal=req.principal,
             principal_groups=req.principal_groups,
             security=config.security,
+            section=req.section,
         )
 
     @app.post("/relevant-files")
@@ -1545,6 +1558,7 @@ def create_app(
             principal=req.principal,
             principal_groups=req.principal_groups,
             security=config.security,
+            section=req.section,
         )
         seen = set()
         files = []
@@ -1645,6 +1659,94 @@ def create_app(
         )
         content = rows[0]["content"] if rows else None
         return {"node_id": node_id, "content": content}
+
+    @app.get("/taxonomy")
+    def taxonomy(
+        source: str | None = None,
+        path: str | None = None,
+        max_nodes: int = 2000,
+    ) -> dict:
+        """The structural outline of taxonomy-enabled documents.
+
+        Reads the `heading` nodes the sync emitted (it does not re-parse), so
+        the tree served here is exactly what the graph and the chunks'
+        `heading_path` agree on. Nests by the `level` each heading carries,
+        which is the same nesting the graph's `contains` edges encode —
+        rebuilt here rather than traversed so one document's outline is one
+        response, in document order.
+
+        `path` filters to a single document; `source` to one source. A source
+        with taxonomy disabled simply has no heading nodes, so it returns an
+        empty tree rather than an error.
+        """
+        from pheasant.ingestion.taxonomy import (
+            Ordinal,
+            SectionHeading,
+            reconcile_issues,
+            taxonomy_tree,
+        )
+
+        graph_obj = engine.graph_builder.graph
+        by_document: dict[str, list[SectionHeading]] = {}
+        seen = 0
+        for _node_id, data in graph_obj.node_map().items():
+            if data.get("type") != "heading":
+                continue
+            if source and data.get("source_id") != source:
+                continue
+            relative = str(data.get("relative_path") or "")
+            if path and relative != path:
+                continue
+            seen += 1
+            if seen > max(1, max_nodes):
+                break
+            parts = tuple(int(p) for p in (data.get("ordinal_parts") or []))
+            ordinal = (
+                Ordinal(
+                    parts=parts,
+                    series=str(data.get("ordinal_series") or ""),
+                    raw=str(data.get("number") or ""),
+                    relative=bool(data.get("ordinal_relative")),
+                    suffix=str(data.get("ordinal_suffix") or ""),
+                )
+                if parts
+                else None
+            )
+            by_document.setdefault(relative, []).append(
+                SectionHeading(
+                    line=int(data.get("start_line") or 0),
+                    level=int(data.get("level") or 1),
+                    number=data.get("number"),
+                    title=str(data.get("title") or ""),
+                    kind=str(data.get("kind") or ""),
+                    path=str(data.get("heading_path") or ""),
+                    pattern_level=int(data.get("pattern_level") or 0),
+                    ordinal=ordinal,
+                )
+            )
+
+        documents = []
+        for relative in sorted(by_document):
+            headings = sorted(by_document[relative], key=lambda h: h.line)
+            issues = reconcile_issues(headings)
+            documents.append(
+                {
+                    "relative_path": relative,
+                    "heading_count": len(headings),
+                    "tree": taxonomy_tree(headings),
+                    # Gaps / duplicates / out-of-order numbering. For contracts
+                    # and procedures "is anything missing?" is the question
+                    # people actually ask of a document, and once ordinals are
+                    # parsed it is nearly free to answer.
+                    "issues": issues,
+                }
+            )
+        return {
+            "documents": documents,
+            "heading_count": sum(d["heading_count"] for d in documents),
+            "issue_count": sum(len(d["issues"]) for d in documents),
+            "truncated": seen > max(1, max_nodes),
+        }
 
     @app.get("/graph")
     def graph(
@@ -2686,6 +2788,8 @@ def create_app(
         created: list[dict] = []
         for target in targets:
             payload = target.to_source_dict()
+            if req.taxonomy:
+                payload["taxonomy"] = {"enabled": True}
             if target.local:
                 try:
                     payload["path"] = str(_resolve_source_path(payload["path"], config))

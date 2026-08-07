@@ -9,8 +9,35 @@ import json
 from typing import Any
 
 
+def _strip_comment(text: str) -> str:
+    """Drop a trailing ``# ...`` comment, ignoring ``#`` inside quotes.
+
+    ``safe_load`` already skips whole-line comments, but never trailing ones,
+    so every annotated value in ``pheasant.example.yaml`` used to round-trip
+    with its comment glued on: ``max_files`` came back as the *string*
+    ``"50000        # matching files, ..."`` instead of the int ``50000``, and
+    — worse — ``follow_symlinks: false  # ...`` became a non-empty string,
+    which is **truthy**, silently inverting a safety default under this parser.
+    PyYAML strips these, so not stripping them made the two parsers disagree
+    about the shipped reference config.
+
+    A ``#`` only starts a comment when it follows whitespace (or opens the
+    value), matching PyYAML: ``red#1`` stays ``red#1``.
+    """
+    quote: str | None = None
+    for i, ch in enumerate(text):
+        if quote is not None:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" and (i == 0 or text[i - 1] in " \t"):
+            return text[:i]
+    return text
+
+
 def _scalar(text: str) -> Any:
-    text = text.strip()
+    text = _strip_comment(text).strip()
     if text in {"", "null", "~"}: return None if text in {"null", "~"} else ""
     if text in {"true", "True"}: return True
     if text in {"false", "False"}: return False

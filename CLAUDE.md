@@ -902,6 +902,417 @@ been caught by the pre-existing test suite alone.
 
 ---
 
+## Document text extraction (PDF/DOCX/HTML), 2026-08-06
+
+Not Phase-scoped — closing a gap found by asking pheasant about its own
+codebase. **`.pdf`/`.docx` were accepted by the ingestion pipeline and then
+silently produced no text**: `parse_file`/`parse_connector_payload` admitted
+both, `artifact_type` labelled them `document`, and `read_text` /
+`read_text_bytes` hard-returned `""` — so a PDF got an artifact row, a sha256
+and a graph node while contributing **zero chunks**. Findable by path,
+invisible by content (verified live: a real text PDF → 0 chars). Two things the
+original report missed: **`pymupdf>=1.24` and `python-docx>=1.1` were already
+*core* deps in `pyproject.toml`, imported nowhere** — every deployment was
+carrying both wheels for nothing; and **HTML/XML is a second, milder gap** —
+`.html`/`.xml` sit in `TEXT_EXTENSIONS` and index as *raw markup* (tags,
+`<script>`, CSS as prose). `.pptx/.xlsx/.doc/.rtf/.epub` are in no extension
+set at all — never accepted, so not a broken promise and out of scope.
+
+New `src/pheasant/ingestion/extractor.py` follows the 25.4 captioner/
+transcriber shape exactly (Protocol + provider selection + authored
+`<file>.extract.txt` sidecar wins + built **only** when a source's `include`
+globs admit `.pdf`/`.docx` + `_modal.py` helper reuse), so this is the third
+instance of one pattern, not a new one. It differs in a way that is strictly
+*better*: captioning/transcription need a model to invent text that isn't in
+the bytes, document extraction doesn't — so **every provider is offline and
+deterministic** and rule 1 holds by construction, with no network path to gate.
+Providers: `auto` (default — `pymupdf`/`python-docx`, else builtin, keeping
+whichever yields text; never raises into a sync), `native`, `builtin`
+(**stdlib only** — `zlib` + PDF content-stream operator scan; `zipfile` +
+`xml.etree` over `word/document.xml`, which is not a fidelity compromise since
+that IS where DOCX text lives), and `sandboxed`. `ingestion.extractor.
+{provider, html_text}`; `html_text` defaults **false** because `.html`/`.xml`
+have always indexed as raw markup and stripping changes existing chunk
+boundaries. Publisher advertises `"document"` in `capabilities.modalities`
+(25.4 precedent — **wire format unchanged**, parity green). Idempotent: the
+engine's pre-read sha256 skip never re-extracts an unchanged document.
+**Flock reuse:** its `corpus/loaders/local_files.py` `_read_pdf` (pdfminer) +
+`_read_html` contributed the *shape* — lazy per-format import, graceful
+degradation, never raise — not the code (pheasant ships pymupdf, and nothing
+was imported across the repo boundary).
+
+**WASM — my initial prediction was wrong, and the measurement says so.** I
+expected acceleration to be a NO-GO by analogy to 34.6 (WASM chunking, which
+lost to a ~115 µs fixed instance cost). It does not transfer. With the module
+AOT-precompiled (34.4 Finding #1), `sandboxed` beats the pure-Python `builtin`
+at every size above ~1 KB: **0.50x at 100 lines, 0.30x at 8,000** (129 ms →
+38 ms), and the tokenizer alone is **11.4x** (91.8 ms → 8.0 ms on a 585 KB
+stream); fixed cost per guest call 0.22 ms, crossover ~30-50 lines. Why 34.6's
+logic didn't carry: what matters is **work per call**, not calls per sync —
+chunking's 35-219 µs is the same order as the overhead, PDF tokenizing's
+1.5-130 ms is 7-600x it. So the sandbox is **not a tax**, and `builtin` vs
+`sandboxed` is purely a fidelity/isolation choice. `native` stays the default
+regardless: it does full page layout analysis and handles encrypted PDFs,
+LZW/CCITT and Type0/CID CMaps that the tokenizer does not. AOT cache
+re-verified for this path (JIT 52.8 ms → **0.87 ms**), distinct `extract-`
+cache prefix so the trusted accelerator and untrusted-input path never share an
+artifact.
+
+Sandboxing is the right framing because 34.2's docstring already named the
+target ("Confluence's in-process BeautifulSoup parse of untrusted remote
+XHTML") and PDF is its sharper form: connector PDFs (Drive/Slack/Confluence/
+IMAP) are attacker-influenced bytes parsed with the sync worker's ambient
+authority — every connector token in `os.environ`, writable `/state`, egress.
+New `pdf_scan_text` export on the **existing** vendored Rust crate (re-vendored
+`accel.wasm`, 112→120 KB; the toolchain reproduces the old binary
+byte-identically, sha `f664fa78…`, before any edit) + `ingestion/
+extractor_sandbox.py` running it under a fuel cap, memory cap and an **empty
+`Linker`** (zero host imports, asserted). Three honest limits, all in the
+module docstring: **partial sandbox** (host still inflates via `zlib`, bounded
+against bombs; the guest runs the tokenizer, which is where hostile bytes drive
+unbounded loops — deliberate split, 34.2-style recorded deviation); **PDF only**
+(DOCX/HTML keep memory-safe Python parsers); and it **fails loudly** — missing
+`wasmtime` under `provider: sandboxed` raises with a pip hint rather than
+silently extracting unsandboxed, inverting 34.5's fallback policy on purpose
+because this is a security property, not a performance path (per-*file*
+failures still never abort a sync). A sandbox cannot catch a **wrong answer**,
+so `pdf_scan_text` is asserted byte-identical to `scan_pdf_content_stream` per
+stream, per document, and over 120 randomized adversarial streams. The port's
+real hazard, caught by deriving tables from CPython rather than assuming:
+**65 byte values above 0x7F satisfy Python's `chr(b).isalpha()`** — an
+`is_ascii_alphabetic()` port would silently drop text (same class as 34.5's
+`str.lstrip("./")` catch); cp1252's five undefined bytes are transcribed too.
+
+**Two pre-existing bugs found and fixed** (both surfaced by touching the
+reference config, both verified before fixing, both regression-tested):
+(1) **`pheasant.example.yaml` had two top-level `sync:` keys** — YAML keeps the
+last, so the whole documented `sync.limits` guardrail block (the "I accidentally
+indexed my home directory" protection) was **silently discarded**; proven with
+real PyYAML, then merged. (2) **`yaml.py` never stripped trailing comments** —
+it skips whole-line ones only, so in the dependency-light environment
+`max_files: 50000  # ...` parsed as a *string* and `follow_symlinks: false # ...`
+became a **truthy** string, inverting a safety default; fixed with quote-aware
+stripping matching PyYAML. Note this shim shadows real PyYAML from the repo
+root, which is also why `mkdocs` must build with `-f` from outside the checkout.
+
+`pheasant.example.yaml` gained its **first `ingestion:` block** (captioner/
+transcriber were never in it either) and `docs/configuration.md` its first
+`## ingestion` section, closing pre-existing 25.4 doc drift. New
+`docs/how-to/document-ingest.md` (in the nav). Acceptance:
+`tests/test_document_extraction.py` (30) + 4 config tests —
+**mutation-tested, not trusted**: disabling `extractor_from_config` fails 5
+tests across every acceptance path, and search precision was checked directly
+(each marker query returns exactly its one document; a nonsense query returns
+`[]`) so the assertions aren't vacuous. Suite: **592 passed / 18 skipped**
+(baseline 521/24; the skip drop is `wasmtime` un-skipping 6 module-level
+guards — 34 genuinely new tests). Full detail:
+`runs/2026-08-06-pdf-extraction/SUMMARY.md`.
+
+### Five more formats, 2026-08-06 — `.pptx/.xlsx/.doc/.rtf/.epub`
+
+The first pass ruled these out as "in no extension set, so not a broken
+promise". Asked to include them, they now extract too. `DOCUMENT_EXTENSIONS`
+grows to **seven** formats, and `EXTRACTED_EXTENSIONS` in `extractor.py` is
+asserted **set-equal** to it — the accept-list and the extractor-build gate
+drifting apart is precisely how the original bug would come back one format at
+a time (a source carrying only `.pptx` would accept the files and build no
+extractor → zero chunks). `extract_builtin(kind, content)` is now the single
+format→reader map that all four providers share.
+
+New `ingestion/office.py` (PPTX/XLSX/EPUB/RTF) + `ingestion/msdoc.py` (legacy
+binary DOC), both **pure stdlib**. Notable behaviors, each chosen over an
+easier wrong one: PPTX walks `<a:p>` paragraphs (not a flat `<a:t>` sweep, which
+runs bullets together) and **indexes speaker notes**, located via each slide's
+own `_rels` rather than assuming `notesSlideN`↔`slideN`; XLSX resolves
+`sharedStrings` and maps sheet names through `workbook.xml.rels`, emitting
+tab-separated rows; EPUB reads in **OPF spine order** (filename order scrambles
+most real books — guard test with deliberately anti-alphabetical names); RTF
+skips ignorable destinations (`\fonttbl`/`\colortbl`/`\stylesheet`/`\info`,
+whose `\'hh` escapes would otherwise decode into mojibake) and honours
+`\ucN` so `\uN` fallback characters don't double every non-ASCII char. Every
+element match is on **local name**, not a hard-coded namespace URI. `native`
+now reads EPUB via pymupdf (a real upgrade — MuPDF walks reading order); for
+PPTX/XLSX/RTF/DOC `native` is honestly the *same code path* as `builtin`, since
+no third-party reader for them exists in the dep tree and the builtin readers
+are complete.
+
+**`.doc` is the one that needed real work.** It is an OLE2 Compound File
+(a small FAT filesystem) whose text is not contiguous: the `WordDocument`
+stream holds character data and a **piece table** in `0Table`/`1Table` says
+which byte ranges form the document and whether each piece is single-byte
+cp1252 or UTF-16. So `msdoc.py` implements a CFB reader (header/DIFAT/FAT/
+miniFAT/directory) plus a FIB walk — `fcClx` is pair index 33 of `FibRgFcLcb`,
+reached by *walking* `csw`/`cslw`/`cbRgFcLcb` since the FIB is variable-length,
+not by a hard-coded offset. Pre-Word-97 layouts are **refused** (`cbRgFcLcb <
+34`) rather than read at index 33 anyway, which would yield confident garbage.
+Field ranges are handled: text between `0x13`/`0x14` is the field *instruction*
+(`HYPERLINK "http://…"`) and is dropped, `0x14`/`0x15` is the *result* and is
+kept — skipping that distinction is why naive extractors emit link machinery
+mid-sentence. Bounded throughout (visited-set chain walks so a cyclic FAT
+terminates, caps on stream/piece/text size); Python's bounds-checked slicing
+means hostile offsets raise rather than corrupt, which is also why `.doc`
+doesn't get a WASM guest — it's the most attacker-facing format here, but the
+failure mode is already an exception, not memory corruption.
+
+**LibreOffice Writer/Calc/Impress were installed to generate the fixtures**, so
+all five are **producer-generated, not hand-authored** — decisive for `.doc`,
+where a hand-crafted CFB would only prove the reader agrees with its own
+author's reading of the spec. The container layer is additionally cross-checked
+byte-for-byte against **olefile** (an independent implementation, deliberately
+*not* a dependency — `importorskip`). Two branches the fixtures can't reach are
+unit-tested with the reason recorded: **compressed cp1252 pieces** (LibreOffice
+always writes UTF-16; real Word prefers compressed, and that path has the
+unusual `fc // 2`) and field-instruction ranges.
+
+**Two real bugs caught during development, both by markers deliberately planted
+in the fixtures.** (1) The `.doc` control-code drop set included `0x28/0x3C/
+0x3E` on the mistaken belief they were Word markers — they are printable ASCII
+`(`, `<`, `>`, so **every** extracted document silently lost its parentheses
+and angle brackets. Now `_DROP` carries an assertion that every entry is below
+`0x20`, plus a regression test. (2) A non-RTF file named `.rtf` decoded its raw
+bytes as latin-1 prose; RTF has no structural gate of its own, so the `{\rtf`
+signature is now required — mojibake in the index is worse than no text,
+because it is unfindable *and* pollutes scoring.
+
+Acceptance: `tests/test_office_extraction.py` (54). Mutation-tested: narrowing
+`source_includes_documents` back to PDF+DOCX fails **10** tests; stubbing
+`extract_builtin`'s pptx/doc arms fails **6**. Search precision checked
+directly (a nonsense query returns `[]`). Suite: **646 passed / 18 skipped**
+(+54). Docs: `configuration.md` §ingestion.extractor (seven-format table),
+`how-to/document-ingest.md` (retitled, per-format gotchas). Router side needs
+nothing new — `"document"` already covers all seven.
+
+---
+
+## Structural taxonomy extraction, 2026-08-06 — chapters, sections, § codes
+
+Asked for, for "documents and books and other highly structured documentation
+like procedures, and legal documents": extract a taxonomy by chapter / section /
+code, **toggleable on source registration**. It turned out to be three dormant
+pieces that were already specified, not a new subsystem:
+
+1. **`TextChunk.heading_path` was never populated.** It is a field, a `chunks`
+   column, *and* a `chunks_fts` column at **BM25 weight 2.0 — double the body
+   text**. `chunks_for_source` simply never passed one, so it was `NULL` for
+   every chunk ever indexed (verified: 0 of 3 on a real sync).
+2. **`heading` node type and `has_heading` edge type are documented in
+   `docs/graph_model.md`** (lines 13/24) and `grep` found **zero** emissions
+   anywhere in the code.
+3. **The one heading detector that existed was dead code.** `enrichment.py:218`
+   regexes Markdown headings into `_add_concept`, which returns early since the
+   2026-08-03 concept retirement — it runs the regex and discards the result.
+
+New `src/pheasant/ingestion/taxonomy.py`: rule-based, deterministic, offline
+(no model, no network — rule 1 by construction). Six rules, each with its own
+natural depth so a document may **mix conventions** and still nest —
+`ARTICLE IV` → `4.1` → `(a)` works, as does `# Title` → `1. Scope`: `markdown`
+(1-6), `keyword` (PART/TITLE/BOOK/DIVISION/SCHEDULE/APPENDIX/ANNEX/EXHIBIT=1,
+CHAPTER/SUBPART=2, ARTICLE/SECTION/RULE=3, CLAUSE/STEP/PARAGRAPH=4), `code`
+(`§ 12.3`), `numbered` (`1.2.3`), `lettered` (`(a)`/`(iv)`), `caps`. Nesting is
+a stack walk; `number` is kept separate from `title` so a section is findable by
+its **citation**. A **bare citation takes its caption from the next line**
+(`ARTICLE IV\nTerm and Termination` → `Article IV Term and Termination`) —
+without it, standard legal drafting loses the words a searcher would actually
+use.
+
+**Chunks are cut at section boundaries** (`split_on_sections`, on by default
+once taxonomy is on). This was a deliberate change of mind mid-build: labelling
+alone is nearly decorative, because a whole contract fits in one 4000-char chunk
+and gets one `heading_path` (its first heading), and a chunk straddling three
+sections is labelled with only the first — *misleading*, not merely coarse. Now
+one chunk is one section, subdivided only when a section exceeds
+`chunking.max_chars` (all pieces sharing the path), with absolute line numbers
+and a single ascending index run so chunk IDs stay stable.
+
+**Heading node IDs key on the section breadcrumb, hashed — deliberately not on
+the line number.** A line-numbered ID churns the whole graph on any edit:
+inserting one paragraph shifts every heading below it, dropping and re-creating
+sections that did not change. Asserted by a test that inserts a line and
+compares ID sets. Accepted trade-off: two byte-identical breadcrumbs in one
+document collapse to one node.
+
+**Search now says which section matched.** `heading_path` was already selected
+by the search SQL and dropped when the result dict was built; it is now on the
+result, its `chunks[]` entry and `provenance` — added **only when non-empty**, so
+a corpus without taxonomy returns the exact payload it did before.
+
+**Toggle lives at source registration**, matching the request: per-source
+`sources[].taxonomy.{enabled,max_depth,detect,graph_nodes,split_on_sections}`
+(default **off**), threaded through `POST /sources` + `PATCH` (dict, exactly like
+`chunking`/`sync`/`connector`), `POST /sources/quick-add` (plain bool, it is the
+one-field surface) and MCP `register_source(taxonomy=True)` (additive optional
+param — rule 8). New `GET /taxonomy?source=&path=` renders the outline per
+document as a nested tree, read from the emitted `heading` nodes rather than
+re-parsing.
+
+**Off by default and per-source for a stated reason**, not caution: the
+numbering rules are genuinely ambiguous on prose — `1. Introduction` in a
+standard is a section, `1. Buy milk` in a note is a list item, and nothing in
+the line distinguishes them. Length/punctuation filters (≤120 chars, ≤10 words
+chosen against real headings, no mid-sentence punctuation) catch the long cases;
+short list items still match. Enabling per source is how the operator says "this
+corpus really is structured". Two further limits documented rather than hidden:
+a document mixing two **independent** numbering series can mis-parent one under
+the other (`§ 12.3` under `ARTICLE IV`) — the breadcrumb still carries the right
+citation so search is unaffected, only the parent link is wrong; and `caps` is
+the noisiest rule, first to drop from `detect`.
+
+`docs/graph_model.md` now records that `heading`/`has_heading` went **unemitted
+from the initial build until 2026-08-06**, so a graph written earlier contains
+none — that matters for anyone reading the taxonomy as a contract (rule 3).
+Docs: `configuration.md` §`sources[].taxonomy`, new
+`docs/how-to/structured-documents.md` (in the nav), first per-source `taxonomy:`
+block in `pheasant.example.yaml`. Acceptance: `tests/test_taxonomy.py` (40) —
+**mutation-tested**: disabling detection fails 12, dropping the graph nodes 5,
+re-dropping `heading_path` from search results 1, turning off section splitting
+4. Suite: **686 passed / 18 skipped** (+40). No wire-format change (the Synapse
+contract is untouched; parity green), no new dependency.
+
+### Ordinal detection + reconciliation, 2026-08-06
+
+The follow-up the entry above listed as not-done, and it **removes the
+documented mis-parenting limitation**. `parse_ordinal` turns a heading's own
+number into a comparable `Ordinal` — decimal paths (`4.2.1` → `(4,2,1)`), roman
+numerals (`IV` → `(4,)`), letters, inserted-section suffixes (`§ 12A`),
+parenthesised sub-items — and `_reconcile` then decides parentage from the
+**number** rather than the pattern depth, in three passes: prefix match →
+compatibility walk → level nesting.
+
+What that buys, each asserted: `4.1` attaches to `ARTICLE IV` because `IV`
+parses to `(4,)` — **the document's two spellings of "four" are recognised as
+one number**; `§ 12.3` refuses `ARTICLE IV` (`(4,)` is not a prefix of
+`(12,3)`) and climbs to the unnumbered title, which is the bug that was
+previously documented as permanent; `§ 12A` is a **sibling** of `§ 12`, since
+inserting a section is not nesting one; and a numbering that **resumes after an
+interruption** rejoins its own parent, which the ancestor walk alone cannot do
+(that last case is what makes the prefix pass load-bearing — see below).
+`SectionHeading.level` is now the reconciled depth and `pattern_level` keeps the
+rule's natural depth, which is what `max_depth` filters on.
+
+`reconcile_issues` is the second half: gaps (with the `missing` numbers),
+duplicates and out-of-order numbering, grouped per parent and series. For a
+contract or a procedure "is anything missing?" is the question people actually
+ask, and it is nearly free once ordinals are parsed. Only gaps *between observed
+siblings* are reported — a series starting at 3 is an excerpt, not a defect —
+and a suffixed insert never creates one. Surfaced per document in
+`GET /taxonomy` (`issues`, `issue_count`); `heading` nodes persist
+`ordinal_parts`/`ordinal_series`/`ordinal_suffix` so a section is queryable by
+citation.
+
+**Two bugs and one piece of dead code found by testing, all mine:**
+(1) `(c)` parsed as **roman 100** instead of letter 3 — seven letters are also
+roman numerals. Resolved by convention rather than guesswork: multi-character
+roman is a numeral; a lone `c`/`d`/`l`/`m` is a letter (no roman sub-list starts
+at 100) while a lone `i`/`v`/`x` is a numeral. Both `(a)(b)(c)(d)` and
+`(i)(ii)(iii)(iv)` now count 1,2,3,4 with zero spurious issues. The residual
+ambiguity (a letter list reaching `(i)`) is bounded because lettered ordinals
+are `relative` and never decide hierarchy. (2) The sibling test compared an
+ancestor's **reconciled** level against the candidate's **pattern** level —
+different scales — so `(b)` looked deeper than its sibling `(a)` and nested
+inside it. Caught by a duplicate-`(b)` case. (3) **Mutation testing proved
+`_series_compatible` inert**: forcing it to always return True changed no test,
+because the compatibility walk does not check series and re-made the identical
+attachment — and that attachment was *correct* (`SECTION 4.1` genuinely is
+within `CHAPTER 4`). Removed rather than kept with a docstring claiming a
+protection it never provided; what actually keeps `CHAPTER 4` and `ARTICLE 4`
+apart is that neither has a prefix for the other to match. Mutation testing also
+showed the prefix pass was uncovered, which is what prompted the
+resumes-after-interruption test.
+
+Acceptance: 24 more tests in `tests/test_taxonomy.py` (64 total). Suite:
+**710 passed / 18 skipped**. Docs updated to describe reconciliation and to
+**delete the mis-parenting limitation** rather than leave a stale warning.
+
+### Finishing the taxonomy/ordinal work, 2026-08-07
+
+Closes the five items the previous run summary listed as not done. Only
+**taxonomy on the Synapse contract** stays out, on the original reasoning: the
+outline is region-local retrieval structure, not routing signal, so publishing it
+would be a wire-format change for no routing gain.
+
+**`(i)` now reads as 9 when it follows `(h)`.** `_disambiguate_lettered`
+re-reads a one-character sub-item label using the run it sits in: both readings
+are computed and whichever *continues* the previous item wins — `(h)(i)` is 8,9;
+`(iv)(v)` is 4,5; `(u)(v)` is 21,22 (which the old per-character convention
+always got wrong); and `(b)` then `(i)` continues neither, so a nested list still
+opens at roman 1. `parse_ordinal` on an isolated heading is unchanged.
+
+**A numbering series is identified by its number, not by where it landed.**
+`reconcile_issues` grouped by resolved parent, so an unnumbered heading between
+`§ 12.2` and `§ 12.4` re-parented the tail and hid the gap. Now a non-empty
+prefix identifies the series wherever its members sit; **top-level** numbering
+has no prefix so it stays grouped by parent, which is what keeps a per-part
+restart legal. Writing that rule exposed that `PART I` **did not actually parent
+its sections** (verified pre-existing): both numbers are "one", neither a prefix
+of the other, so the conflicting-series rule flattened the section out of its
+Part. `_contains_a_fresh_series` fixes it on a principle — `PART`/`BOOK`/`TITLE`/
+`DIVISION` and the `SCHEDULE`/`APPENDIX`/`ANNEX`/`EXHIBIT` family are
+**containers**, existing to hold a numbering they do not participate in, so they
+may parent a *different* series but never their own. `CHAPTER 4` still does not
+contain `ARTICLE 4`.
+
+**Retrieval can be restricted to one section.** `section` on `POST /search` and
+MCP `search_context(section=...)`, substring against the breadcrumb so `§ 12.3`,
+`Article IV` or a section's wording all reach it and naming a parent returns the
+subtree. Pushed into **SQL** for the text arm, because post-filtering a
+globally-ranked page can return nothing from a narrow section while its chunks
+sit just past the cut; the vector arm is filtered in Python, with
+`section_needle`/`section_matches` holding the one normalization rule so the two
+cannot drift. Graph hits are dropped under the filter — a `heading` node has a
+label but no breadcrumb, so matching it would return an Article's node and not
+its subsections', inconsistent with chunks. `/search?section=` selects content;
+`GET /taxonomy` browses the outline.
+
+**UI** (untouched by taxonomy until now, including the registration toggle the
+original request actually asked for): the Advanced source form gained the toggle
+plus the two sub-switches that change indexing; citation chips name the section a
+passage came from (needed `heading_path` on `Passage` and on **both** citation
+builders — the model already saw the heading in its prompt, only the UI could
+not); and the Sources page gained an outline panel over `GET /taxonomy` with the
+numbering defects above it. `tsc` caught that `SourceWritePayload` had no
+`taxonomy` field, so the form would have posted a key the client type refused.
+
+**Live validation on a producer-generated PDF found two bugs.**
+`tests/fixtures/structured/agreement.pdf` (authored as HTML, converted by
+LibreOffice, source kept beside it) has real PDF line layout and real kerning —
+what text authored in a test file cannot imitate.
+
+1. **A mid-sentence line became a heading, and a parent.** The extractor renders
+   "of" as "o f", PDF text arrives pre-broken into layout lines, and one began
+   `Section o f this Agreement unless stated otherwise.` The keyword pattern is
+   case-insensitive, so its single-letter ordinal alternative read `o` as ordinal
+   15 — and the invented heading then **re-parented genuine sections**. Fixed by
+   `_plausible_citation` (a letter-only citation is capitalised in every real
+   document — `PART A`, `ANNEX B`, `ARTICLE IV` — and prose words are not) plus
+   running the keyword branch through the same prose filter every other rule
+   already used; it had **none**, only a length check. That second half looked
+   inert until tested — it is what catches `Part 1 of the agreement shall be
+   construed as follows…`, where the ordinal is a perfectly good `1`.
+2. **Runtime-registered sources extracted nothing at all.** The same PDF gave 19
+   chunks via `SyncEngine` and **0 through the HTTP API**.
+   `extractor_from_config` runs once in `SyncEngine.__init__` and asks whether
+   *any configured* source admits a document extension — a source added via
+   `POST /sources` (the UI's add-source flow, and how most sources actually
+   arrive) did not exist yet, so no extractor was built and its PDFs indexed with
+   **no text at all**: the exact silent-empty-content failure this PR exists to
+   fix, on the path most people use. `_ensure_modal_handlers(source)` tops the
+   handlers up in `sync_source` where the source is known, which is also more
+   precise than the constructor's check. The captioner/transcriber share that
+   check and had the same gap with a milder symptom — `caption_to_text` falls
+   back to a filename caption, so images were never *empty*, which meant the
+   obvious `chunk_count > 0` assertion passed with the fix reverted; those tests
+   assert the stub's content **fingerprint** instead. Mutation testing found
+   that; the first two versions of those tests were worthless and looked fine.
+
+Acceptance: `tests/test_taxonomy.py` 64 → **91**, `tests/test_document_extraction.py`
+30 → **33**. Suite **746 passed / 18 skipped**. Every change mutation-tested;
+**two mutants survived and were acted on** rather than filed — no test ran a
+sectioned *hybrid* search (one added), and the keyword prose filter was inert
+until the numeric-citation case was written. Full detail:
+`runs/2026-08-07-taxonomy-finish/SUMMARY.md`.
+
+---
+
 ## 6. Pointers
 
 - **Region-side Synapse spec:** `docs/SYNAPSE_INTEGRATION.md`

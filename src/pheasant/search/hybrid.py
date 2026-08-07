@@ -6,7 +6,7 @@ from typing import Any
 
 from pheasant.graph.simple import SimpleMultiDiGraph
 from pheasant.search.graph_search import search_graph
-from pheasant.search.sqlite_store import SearchStore
+from pheasant.search.sqlite_store import SearchStore, section_matches, section_needle
 from pheasant.search.vector_store import VectorSearcher
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,7 @@ class HybridSearch:
         principal: str | None = None,
         principal_groups: list[str] | None = None,
         security: Any = None,
+        section: str | None = None,
     ) -> dict:
         mode = mode if mode in VALID_MODES else "hybrid"
         # Clamped, not just floored: `max_results` arrives straight off an
@@ -63,7 +64,11 @@ class HybridSearch:
         # security.acl_enforced. Candidates are over-fetched, filtered
         # against artifact ACLs *before* the merge/return, then truncated.
         enforced = bool(security is not None and getattr(security, "acl_enforced", False))
-        fetch_n = max_results * 3 if enforced else max_results
+        # A section filter narrows hard, so the arms that can only be filtered
+        # after the fact (graph, which has no breadcrumb at all) need room to
+        # find in-section hits — same over-fetch reasoning as the ACL pass.
+        sectioned = bool(section_needle(section))
+        fetch_n = max_results * 3 if (enforced or sectioned) else max_results
 
         text_results: list[dict[str, Any]] = []
         graph_results: list[dict[str, Any]] = []
@@ -79,7 +84,7 @@ class HybridSearch:
         jobs: dict[str, Any] = {}
         if mode in {"hybrid", "text"}:
             jobs["text"] = lambda: self.store.search(
-                query, source_name=source_name, max_results=fetch_n
+                query, source_name=source_name, max_results=fetch_n, section=section
             )
         # Graph search needs the live graph; callers that don't supply one
         # (e.g. CLI/MCP search_context) transparently fall back to text search.
@@ -128,6 +133,15 @@ class HybridSearch:
         text_results = collected.get("text", [])
         graph_results = collected.get("graph", [])
         vector_results = collected.get("vector", [])
+
+        if sectioned:
+            # The text arm was already narrowed in SQL; the vector arm carries a
+            # breadcrumb and is filtered here. Graph hits are dropped outright:
+            # a symbol or entity node is not part of any document section, so it
+            # cannot satisfy a claim about one (the same conservative call the
+            # ACL pass makes for nodes with no artifact row).
+            vector_results = [r for r in vector_results if section_matches(r.get("heading_path"), section)]
+            graph_results = [r for r in graph_results if section_matches(r.get("heading_path"), section)]
 
         if enforced:
             from pheasant.security.acl import expand_principal, is_allowed

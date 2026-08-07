@@ -47,23 +47,6 @@ server:
     enabled: true
     graph_visualization: true
 
-sync:
-  # Guardrails on how much one filesystem source may pull in. A source may
-  # point at any readable path, so "I accidentally indexed my home directory"
-  # is a realistic mistake — these turn it into a refusal with an actionable
-  # message instead of a process that eats memory until it dies. Checked
-  # during traversal, before any file is read.
-  #
-  # Run `pheasant scan` to see what a source would index before syncing it.
-  # A source over budget indexes NOTHING (a partial index would be
-  # non-deterministic); narrow it with max_depth / include / exclude, raise
-  # these numbers, or sync once with --full-scan.
-  limits:
-    max_files: 50000        # matching files, after include/exclude
-    max_file_size_mb: 25    # skip any single file larger than this
-    max_total_mb: 4096      # total matched content
-    follow_symlinks: false  # home dirs are full of links that escape or loop
-
 storage:
   graph_format: node_link_json
   # Synapse 21.6A: zstd-compressed timestamped graph snapshots written after a
@@ -113,6 +96,21 @@ search:
     max_results_default: 10
 
 sync:
+  # Guardrails on how much one filesystem source may pull in. A source may
+  # point at any readable path, so "I accidentally indexed my home directory"
+  # is a realistic mistake — these turn it into a refusal with an actionable
+  # message instead of a process that eats memory until it dies. Checked
+  # during traversal, before any file is read.
+  #
+  # Run `pheasant scan` to see what a source would index before syncing it.
+  # A source over budget indexes NOTHING (a partial index would be
+  # non-deterministic); narrow it with max_depth / include / exclude, raise
+  # these numbers, or sync once with --full-scan.
+  limits:
+    max_files: 50000        # matching files, after include/exclude
+    max_file_size_mb: 25    # skip any single file larger than this
+    max_total_mb: 4096      # total matched content
+    follow_symlinks: false  # home dirs are full of links that escape or loop
   startup:
     full_validation: true
     repair_missing_indexes: true
@@ -138,6 +136,42 @@ sync:
     max_parallel_sources: 4
     max_parallel_files: 8
     lock_timeout_seconds: 120
+
+# Turning binary/markup files into indexable text. Every handler here is
+# opt-in by file extension: a source whose `include` globs admit only code and
+# markdown builds none of them, and behaves exactly as it would without this
+# section. Only the captioner and transcriber can make network calls, and both
+# default to a deterministic offline stub.
+ingestion:
+  # Document text extraction: .pdf .docx .doc .pptx .xlsx .rtf .epub
+  # Without it a document is discovered and hashed but contributes ZERO
+  # chunks — findable by path, invisible by content.
+  # Built only when a source's `include` admits one of those extensions.
+  # Every provider is fully offline and deterministic (no model, no network).
+  extractor:
+    provider: auto        # "auto" (pymupdf/python-docx, falling back to the
+                          #   pure-stdlib reader) | "native" | "builtin"
+                          #   (stdlib only) | "sandboxed" (PDF tokenizer inside
+                          #   the WASM fuel/memory cap with zero host
+                          #   capabilities — for untrusted connector PDFs;
+                          #   needs pip install 'pheasant-kb[wasm]')
+    html_text: false      # strip markup from .html/.htm/.xhtml so their prose
+                          #   indexes instead of their tags. OFF by default:
+                          #   those extensions have always indexed as raw
+                          #   markup, so enabling it changes existing chunk
+                          #   boundaries and is an explicit choice.
+  # Image captioning — built only when `include` admits an image extension.
+  captioner:
+    provider: stub        # "stub" (deterministic, offline) | "openai-spec"
+    model: gpt-4o-mini
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY   # env var NAME; the key never lands in config
+  # Audio transcription — built only when `include` admits an audio extension.
+  transcriber:
+    provider: stub        # "stub" (deterministic, offline) | "openai-spec"
+    model: whisper-1
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
 
 obsidian:
   enabled: true
@@ -331,6 +365,28 @@ sources:
       strategy: heading_or_page
       max_chars: 5000
       overlap_chars: 500
+    # Structural taxonomy extraction, for books / procedures / standards /
+    # contracts: detect the outline the document already declares (Chapter,
+    # Article, Section, § 12.3, 1.2.3, (a)) and use it as retrieval structure.
+    # Chunks become sections labelled with their breadcrumb (`heading_path`,
+    # which FTS weights at 2.0 — double the body text), `heading` graph nodes
+    # + `has_heading` edges are emitted, and GET /taxonomy renders the tree.
+    #
+    # OFF by default and deliberately per-source: `1. Introduction` in a
+    # standard is a section while `1. Buy milk` in a note is a list item, and
+    # nothing in the line tells them apart. Enabling it is how you say "this
+    # source really is structured documentation". It changes this source's FTS
+    # content and chunk boundaries, so re-sync with --mode full after turning
+    # it on. Set it at registration (POST /sources, quick-add, MCP) too.
+    taxonomy:
+      enabled: false
+      max_depth: 6          # deepest heading level kept (1-6)
+      detect: []            # [] = all rules; narrow with any of:
+                            #   markdown | keyword | code | numbered
+                            #   | lettered | caps   (caps is the noisiest)
+      graph_nodes: true     # emit `heading` nodes + `has_heading` edges
+      split_on_sections: true   # one chunk per section (still split when a
+                            #   section exceeds chunking.max_chars)
     sync:
       on_startup: true
       on_file_change: debounce

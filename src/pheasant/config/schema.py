@@ -370,17 +370,62 @@ class TranscriberSettings(ModelMixin):
 
 
 @dataclass
+class ExtractorSettings(ModelMixin):
+    """Document text extractor for PDF/DOCX (and optionally HTML) ingestion.
+
+    Before this existed, ``.pdf`` and ``.docx`` were *accepted* by the
+    ingestion pipeline and then produced no text at all: the artifact was
+    discovered, hashed and given a graph node, but ``read_text`` returned
+    ``""``, so it contributed zero chunks and was unfindable by content.
+
+    Unlike the captioner/transcriber, no provider here makes a network call or
+    uses a model — the text is already in the file — so every option is fully
+    offline and deterministic.
+
+    ``provider``:
+
+    - ``auto`` (default) — ``pymupdf``/``python-docx`` when importable (both
+      already core deps), falling back to the pure-stdlib builtin. Never
+      raises into a sync.
+    - ``native`` — prefer the third-party libraries (best fidelity on PDFs
+      with CID/Type0 fonts or complex layout).
+    - ``builtin`` — standard library only: ``zlib`` + content-stream scanning
+      for PDF, ``zipfile`` + ``xml.etree`` for DOCX. No third-party imports.
+    - ``sandboxed`` — the builtin PDF tokenizer inside the Phase-34 WASM
+      sandbox (fuel + memory cap, zero host capabilities). For regions
+      ingesting PDFs from untrusted connector sources; needs the ``[wasm]``
+      extra and raises with a hint if it is missing rather than silently
+      running unsandboxed.
+
+    ``html_text`` strips markup from ``.html``/``.htm``/``.xhtml`` so their
+    prose indexes instead of their tags. It defaults to **false** because
+    those extensions have always been indexed as raw markup: turning it on
+    changes the indexed text (and therefore chunk boundaries) of an existing
+    knowledge base, so it is an explicit operator choice rather than a
+    surprise on upgrade.
+
+    A sidecar ``<file>.extract.txt`` always wins, providing authored text with
+    no extractor at all (mirrors the caption/transcript sidecars).
+    """
+
+    provider: str = "auto"
+    html_text: bool = False
+
+
+@dataclass
 class IngestionSettings(ModelMixin):
     """Ingestion-path enrichment knobs. Standalone-safe defaults.
 
-    ``captioner`` only takes effect for sources that include image files and
-    ``transcriber`` only for sources that include audio files; a text-only
-    region never builds either (and the default ``stub`` providers need no
-    extra dependency anyway).
+    ``captioner`` only takes effect for sources that include image files,
+    ``transcriber`` only for sources that include audio files, and
+    ``extractor`` only for sources that include PDF/DOCX files (or when
+    ``extractor.html_text`` is on); a text-only region never builds any of
+    them (and the defaults need no extra dependency anyway).
     """
 
     captioner: CaptionerSettings = field(default_factory=CaptionerSettings)
     transcriber: TranscriberSettings = field(default_factory=TranscriberSettings)
+    extractor: ExtractorSettings = field(default_factory=ExtractorSettings)
 
 
 @dataclass
@@ -709,6 +754,58 @@ class SourceConnectorSettings(ModelMixin):
 
 
 @dataclass
+class TaxonomySettings(ModelMixin):
+    """Structural taxonomy extraction for one source (books, procedures, legal).
+
+    Highly structured documents carry their own outline — Part / Chapter /
+    Article / Section / § / 1.2.3 / (a). With this on, that outline is
+    detected per artifact and used three ways: each chunk is labelled with the
+    section it falls inside (``chunks.heading_path``, which ``chunks_fts``
+    already weights at 2.0 — double the body text), `heading` graph nodes and
+    `has_heading` edges are emitted so the taxonomy is traversable, and
+    ``GET /taxonomy`` can render the tree.
+
+    Detection is rule-based, deterministic and offline — no model, no network.
+
+    ``enabled`` defaults to **false**, and is a *per-source* switch rather than
+    a global one, because the numbering rules are genuinely ambiguous on
+    ordinary prose: ``1. Introduction`` in a standards document is a section,
+    ``1. Buy milk`` in a note is a list item, and nothing in the line tells
+    them apart. Turning it on per source is how the operator says "this
+    source really is structured". Enabling it also changes what the FTS index
+    holds for that source, so it wants a deliberate re-sync.
+
+    ``detect`` narrows the rule set when a corpus only uses some conventions;
+    an empty list means all rules. Valid names: ``markdown``, ``keyword``
+    (Chapter/Article/Section/...), ``code`` (``§``), ``numbered``
+    (``1.2.3``), ``lettered`` (``(a)``/``(iv)``), ``caps`` (ALL-CAPS lines —
+    the noisiest, and the first one to drop if a corpus shouts).
+    """
+
+    enabled: bool = False
+    max_depth: int = 6
+    detect: list[str] = field(default_factory=list)
+    #: Emit `heading` graph nodes + `has_heading` edges. Chunk labelling is
+    #: independent of this: a source can populate `heading_path` for search
+    #: without growing the graph.
+    graph_nodes: bool = True
+    #: Cut chunks at section boundaries so one chunk is one section (still
+    #: subdivided when a section exceeds ``chunking.max_chars``).
+    #:
+    #: On by default *within* an enabled taxonomy, because it is what makes
+    #: the feature useful rather than decorative. Without it a whole contract
+    #: that fits in one 4000-char chunk gets a single ``heading_path`` — its
+    #: first heading — and a chunk spanning several sections is labelled with
+    #: only the section its first line falls in, which is actively
+    #: misleading. With it, "what does § 12.3 say" retrieves § 12.3.
+    #:
+    #: It does change chunk boundaries for the source, but enabling taxonomy
+    #: is already a deliberate re-index; set it false to keep the existing
+    #: boundaries and accept coarser labels.
+    split_on_sections: bool = True
+
+
+@dataclass
 class SourceConfig(ModelMixin):
     name: str
     type: SourceType | PluginSourceType
@@ -732,6 +829,7 @@ class SourceConfig(ModelMixin):
     chunking: ChunkingSettings = field(default_factory=ChunkingSettings)
     sync: SourceSyncSettings = field(default_factory=SourceSyncSettings)
     connector: SourceConnectorSettings = field(default_factory=SourceConnectorSettings)
+    taxonomy: TaxonomySettings = field(default_factory=TaxonomySettings)
     urls: list[str] = field(default_factory=list)
     #: Per-source override of ``sync.limits``. ``None`` inherits the global
     #: block; set it to widen or tighten one source without touching others.
@@ -797,6 +895,8 @@ class PheasantConfig(ModelMixin):
                     raw["captioner"] = build(CaptionerSettings, raw["captioner"])
                 if "transcriber" in raw and isinstance(raw["transcriber"], dict):
                     raw["transcriber"] = build(TranscriberSettings, raw["transcriber"])
+                if "extractor" in raw and isinstance(raw["extractor"], dict):
+                    raw["extractor"] = build(ExtractorSettings, raw["extractor"])
             if dc is SyncSettings:
                 if "watcher" in raw and isinstance(raw["watcher"], dict):
                     raw["watcher"] = build(WatcherSettings, raw["watcher"])
@@ -846,6 +946,8 @@ class PheasantConfig(ModelMixin):
                 raw["sync"] = build(SourceSyncSettings, raw["sync"])
             if "connector" in raw:
                 raw["connector"] = build(SourceConnectorSettings, raw["connector"])
+            if "taxonomy" in raw:
+                raw["taxonomy"] = build(TaxonomySettings, raw["taxonomy"])
             if raw.get("limits") is not None:
                 raw["limits"] = build(SyncLimitsSettings, raw["limits"])
             _coerce_scalar_fields(SourceConfig, raw)

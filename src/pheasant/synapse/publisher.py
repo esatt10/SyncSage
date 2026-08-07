@@ -407,6 +407,14 @@ class ContractPublisher:
 
         if memory_source(self.config) is not None:
             modalities.append("memory")
+        # Document extraction: advertise "document" when a source is configured
+        # to ingest PDF/DOCX, so the router's `--modality document` filter
+        # routes document questions to regions that can actually read them.
+        # Existing wire data — no schema bump (the 25.4 image/audio precedent).
+        from pheasant.ingestion.extractor import config_has_document_source
+
+        if config_has_document_source(self.config):
+            modalities.append("document")
         return {
             "search_modes": search_modes,
             "granularities": ["summaries", "chunks", "graph"],

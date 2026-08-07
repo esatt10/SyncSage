@@ -374,3 +374,305 @@ pub extern "C" fn scan_edges(input_ptr: *const u8, input_len: usize, out_len_ptr
     }
     ptr
 }
+
+// ---- PDF content-stream text scanner ---------------------------------------
+//
+// A faithful port of `pheasant.ingestion.extractor.scan_pdf_content_stream`.
+// Unlike the two accelerators above, this one exists for **isolation, not
+// speed**: PDF bytes reaching a region from a connector (a Drive file, a Slack
+// upload, an IMAP attachment) are attacker-controllable, and a content-stream
+// tokenizer is exactly the unbounded-loop, index-arithmetic-heavy code that
+// wants a hard resource ceiling around it. Run through `WasmSandbox` it gets a
+// fuel cap, a linear-memory cap, and zero host capabilities — no ambient env,
+// filesystem, or network to reach even if the parse is subverted. See
+// `pheasant/ingestion/extractor_sandbox.py` for the host side.
+//
+// Byte-for-byte parity with the Python reference is a hard requirement
+// (`tests/test_document_extraction.py` asserts it on every build), which is
+// why the three character-class tables and the cp1252 mapping below are
+// transcribed from CPython's own answers rather than approximated with
+// `is_ascii_alphabetic()` and friends: 65 byte values above 0x7F satisfy
+// Python's `chr(b).isalpha()`, so an ASCII-only test would tokenize
+// high-byte operands differently and silently drop text.
+
+const ALPHA_MASK: [u64; 4] = [
+    0x0000000000000000,
+    0x07fffffe07fffffe,
+    0x0420040000000000,
+    0xff7fffffff7fffff,
+];
+const ALNUM_MASK: [u64; 4] = [
+    0x03ff000000000000,
+    0x07fffffe07fffffe,
+    0x762c040000000000,
+    0xff7fffffff7fffff,
+];
+const SPACE_MASK: [u64; 4] = [
+    0x00000001f0003e00,
+    0x0000000000000000,
+    0x0000000100000020,
+    0x0000000000000000,
+];
+
+// cp1252 code points for bytes 0x80..=0x9F (the only range where cp1252 and
+// latin-1 disagree); 0xFFFD marks the five byte values cp1252 leaves
+// undefined, matching Python's `errors="replace"`.
+const CP1252_HIGH: [u32; 32] = [
+    0x20AC, 0xFFFD, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039,
+    0x0152, 0xFFFD, 0x017D, 0xFFFD, 0xFFFD, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0xFFFD, 0x017E, 0x0178,
+];
+
+#[inline]
+fn in_mask(mask: &[u64; 4], b: u8) -> bool {
+    (mask[(b >> 6) as usize] >> (b & 63)) & 1 == 1
+}
+
+fn decode_pdf_literal(raw: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0usize;
+    while i < raw.len() {
+        let byte = raw[i];
+        if byte != 0x5C {
+            out.push(byte);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= raw.len() {
+            break;
+        }
+        let nxt = raw[i];
+        match nxt {
+            b'n' => {
+                out.push(10);
+                i += 1;
+            }
+            b'r' => {
+                out.push(13);
+                i += 1;
+            }
+            b't' => {
+                out.push(9);
+                i += 1;
+            }
+            b'b' => {
+                out.push(8);
+                i += 1;
+            }
+            b'f' => {
+                out.push(12);
+                i += 1;
+            }
+            b'(' => {
+                out.push(40);
+                i += 1;
+            }
+            b')' => {
+                out.push(41);
+                i += 1;
+            }
+            b'\\' => {
+                out.push(92);
+                i += 1;
+            }
+            0x30..=0x37 => {
+                let mut value: u32 = 0;
+                let mut digits = 0;
+                while i < raw.len() && digits < 3 && (0x30..=0x37).contains(&raw[i]) {
+                    value = value * 8 + (raw[i] - 0x30) as u32;
+                    i += 1;
+                    digits += 1;
+                }
+                out.push((value & 0xFF) as u8);
+            }
+            10 | 13 => {
+                // Line continuation: emits nothing.
+                let was_cr = nxt == 13;
+                i += 1;
+                if was_cr && i < raw.len() && raw[i] == 10 {
+                    i += 1;
+                }
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn decode_pdf_text_bytes(raw: &[u8]) -> String {
+    if raw.len() >= 2 && ((raw[0] == 0xFE && raw[1] == 0xFF) || (raw[0] == 0xFF && raw[1] == 0xFE)) {
+        let big = raw[0] == 0xFE;
+        let units: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|c| {
+                if big {
+                    u16::from_be_bytes([c[0], c[1]])
+                } else {
+                    u16::from_le_bytes([c[0], c[1]])
+                }
+            })
+            .collect();
+        // `filter_map(Result::ok)` drops unpaired surrogates, matching
+        // Python's `errors="ignore"`.
+        return char::decode_utf16(units).filter_map(|r| r.ok()).collect();
+    }
+    let mut out = String::with_capacity(raw.len());
+    for &b in raw {
+        let cp = if b < 0x80 {
+            b as u32
+        } else if b < 0xA0 {
+            CP1252_HIGH[(b - 0x80) as usize]
+        } else {
+            b as u32
+        };
+        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+    }
+    out
+}
+
+fn scan_pdf_content_stream(stream: &[u8]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    let n = stream.len();
+    let mut i = 0usize;
+
+    while i < n {
+        let byte = stream[i];
+        if byte == 0x28 {
+            // '(' literal string, honouring balanced parens and escapes.
+            let mut depth: i32 = 1;
+            i += 1;
+            let start = i;
+            while i < n && depth != 0 {
+                if stream[i] == 0x5C {
+                    i += 2;
+                    continue;
+                }
+                if stream[i] == 0x28 {
+                    depth += 1;
+                } else if stream[i] == 0x29 {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            let literal = &stream[start.min(n)..i.min(n)];
+            let decoded = decode_pdf_text_bytes(&decode_pdf_literal(literal));
+            i += 1;
+            pending.push(decoded);
+        } else if byte == 0x3C && i + 1 < n && stream[i + 1] != 0x3C {
+            // '<' hex string
+            match stream[i + 1..].iter().position(|&c| c == b'>') {
+                None => break,
+                Some(offset) => {
+                    let end = i + 1 + offset;
+                    let mut digits: Vec<u8> = stream[i + 1..end]
+                        .iter()
+                        .copied()
+                        .filter(|&c| !in_mask(&SPACE_MASK, c))
+                        .collect();
+                    if digits.len() % 2 == 1 {
+                        digits.push(b'0');
+                    }
+                    let mut bytes: Vec<u8> = Vec::with_capacity(digits.len() / 2);
+                    let mut ok = true;
+                    for pair in digits.chunks(2) {
+                        match (hex_val(pair[0]), hex_val(pair[1])) {
+                            (Some(hi), Some(lo)) => bytes.push(hi * 16 + lo),
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        pending.push(decode_pdf_text_bytes(&bytes));
+                    }
+                    i = end + 1;
+                }
+            }
+        } else if byte == 0x25 {
+            // '%' comment runs to end of line.
+            while i < n && stream[i] != 10 && stream[i] != 13 {
+                i += 1;
+            }
+        } else if in_mask(&ALPHA_MASK, byte) || byte == 0x27 || byte == 0x22 {
+            let start = i;
+            while i < n
+                && (in_mask(&ALNUM_MASK, stream[i])
+                    || stream[i] == 0x2A
+                    || stream[i] == 0x27
+                    || stream[i] == 0x22)
+            {
+                i += 1;
+            }
+            let op = &stream[start..i];
+            if op == b"Tj" || op == b"'" || op == b"\"" {
+                if !pending.is_empty() {
+                    out.push(pending.concat());
+                    pending.clear();
+                }
+                if op == b"'" || op == b"\"" {
+                    out.push(String::new());
+                }
+            } else if op == b"TJ" {
+                if !pending.is_empty() {
+                    out.push(pending.concat());
+                    pending.clear();
+                }
+            } else if op == b"Td" || op == b"TD" || op == b"T*" || op == b"ET" {
+                // flush_line()
+                if !pending.is_empty() {
+                    out.push(pending.concat());
+                    pending.clear();
+                } else if !out.is_empty() && !out[out.len() - 1].is_empty() {
+                    out.push(String::new());
+                }
+            } else {
+                pending.clear();
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    if !pending.is_empty() {
+        out.push(pending.concat());
+    }
+    out.join("\n")
+}
+
+#[inline]
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Scan one inflated PDF content stream, returning UTF-8 text bytes.
+#[no_mangle]
+pub extern "C" fn pdf_scan_text(
+    input_ptr: *const u8,
+    input_len: usize,
+    out_len_ptr: *mut u32,
+) -> *const u8 {
+    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    let bytes = scan_pdf_content_stream(input).into_bytes();
+    let len = bytes.len() as u32;
+    let boxed = bytes.into_boxed_slice();
+    let ptr = boxed.as_ptr();
+    forget(boxed);
+    unsafe {
+        *out_len_ptr = len;
+    }
+    ptr
+}

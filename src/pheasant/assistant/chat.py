@@ -288,6 +288,13 @@ def _snippet(result: dict, limit: int = 900) -> str:
     return str(result.get("summary") or result.get("label") or "").strip()[:limit]
 
 
+def _section_of(result: dict) -> dict:
+    """``{"heading_path": …}`` when the hit knows its section, else ``{}``."""
+    provenance = result.get("provenance") or {}
+    heading_path = str(result.get("heading_path") or provenance.get("heading_path") or "").strip()
+    return {"heading_path": heading_path} if heading_path else {}
+
+
 def _title(result: dict) -> str:
     return str(
         result.get("title")
@@ -321,6 +328,9 @@ def build_citations(results: list[dict], limit: int) -> list[dict]:
                 "type": result.get("type"),
                 "score": result.get("score"),
                 "snippet": _snippet(result),
+                # Only when the source extracts a taxonomy, so a corpus
+                # without one returns the payload it always did.
+                **_section_of(result),
                 "used": False,
             }
         )
@@ -356,6 +366,7 @@ def passages_to_citations(passages: list, limit: int) -> list[dict]:
                 # How this passage was found — direct hit in some search mode,
                 # or reached by walking the graph out of one.
                 "retrieved_by": passage.mode,
+                **({"heading_path": passage.heading_path} if passage.heading_path else {}),
                 "used": False,
             }
         )

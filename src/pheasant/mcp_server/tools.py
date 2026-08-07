@@ -114,6 +114,7 @@ class PheasantTools:
         enabled: bool = True,
         include: list[str] | None = None,
         exclude: list[str] | None = None,
+        taxonomy: bool = False,
         actor: str = "mcp",
         transport: str = "mcp",
         client_id: str | None = None,
@@ -144,6 +145,12 @@ class PheasantTools:
             source.include = include
         if exclude is not None:
             source.exclude = exclude
+        if taxonomy:
+            # Structural taxonomy extraction (chapters/sections/§ codes) for
+            # books, procedures and legal documents. Additive optional
+            # parameter: an agent that never passes it registers exactly the
+            # source it did before (rule 8 — additive evolution only).
+            source.taxonomy.enabled = True
         SourceRegistry(self.config, self.state).register_source(source)
         self.config.sources = [
             existing for existing in self.config.sources if existing.name != source.name
@@ -421,6 +428,7 @@ class PheasantTools:
         include_graph_neighbors: bool = True,
         principal: str | None = None,
         principal_groups: list[str] | None = None,
+        section: str | None = None,
         source_name: str | None = None,
         exclude_sources: list[str] | None = None,
         node_types: list[str] | None = None,
@@ -428,11 +436,17 @@ class PheasantTools:
     ) -> dict:
         """Retrieve passages for a query.
 
-        The last four parameters are **retrieval criteria** an agent can set
-        per call rather than having them fixed in config: scope to one source
-        or away from noisy ones, keep only certain node types, and floor the
-        score. All are optional and default to the pre-existing behavior, so
-        an existing caller is unaffected (CLAUDE.md §4 rule 8: additive only).
+        The last five parameters are **retrieval criteria** an agent can set
+        per call rather than having them fixed in config: restrict to one
+        section of a document's taxonomy, scope to one source or away from
+        noisy ones, keep only certain node types, and floor the score. All are
+        optional and default to the pre-existing behavior, so an existing
+        caller is unaffected (CLAUDE.md §4 rule 8: additive only).
+
+        ``section`` matches the heading breadcrumb, so "§ 12.3", "Article IV"
+        or a section's wording all reach it and naming a parent returns
+        everything nested under it. Only meaningful for sources with taxonomy
+        extraction enabled.
         """
         self._require_knowledge_base(knowledge_base)
         # Over-fetch when a filter will drop rows, so `max_results` still
@@ -450,6 +464,7 @@ class PheasantTools:
             principal=principal,
             principal_groups=principal_groups,
             security=self.config.security,
+            section=section,
         )
         if filtering:
             payload = dict(payload)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any
 
@@ -165,8 +166,95 @@ class GraphBuilder:
                 },
             )
             self.upsert_edge(artifact.id, chunk_id, "has_chunk", {"source_id": source.name})
+        self.add_headings(source, artifact)
         self.apply_enrichment(enrichment)
         return enrichment
+
+    def add_headings(self, source: SourceConfig, artifact: ParsedArtifact) -> int:
+        """Emit the artifact's structural outline as `heading` nodes.
+
+        `heading` and `has_heading` are both **documented** in
+        `docs/graph_model.md` ("Retrieval and document structure units" /
+        "Hierarchy and indexing relationships") and were never emitted
+        anywhere — this connects them. Nothing happens unless the source
+        enables `taxonomy` (and `taxonomy.graph_nodes`), so a graph without
+        the feature is byte-identical to before.
+
+        Two edge types, both existing: the artifact `has_heading` each of its
+        sections, and a section `contains` its subsections — the same edge the
+        directory/file hierarchy uses, so the taxonomy is walkable by the
+        graph traversal that already knows how to follow `contains` (see
+        `api/app.py:HIERARCHY_EDGE_TYPES`).
+        """
+        headings = getattr(artifact, "headings", None)
+        if not headings:
+            return 0
+        if not getattr(getattr(source, "taxonomy", None), "graph_nodes", True):
+            return 0
+
+        # Stack of (level, node_id) so a subsection is parented to the section
+        # that encloses it rather than to the artifact.
+        stack: list[tuple[int, str]] = []
+        emitted = 0
+        for heading in headings:
+            # Keyed on the section's *breadcrumb*, hashed — deliberately not on
+            # its line number. A line-numbered ID churns the whole graph on any
+            # edit: inserting one paragraph shifts every heading below it, so
+            # every section downstream would be dropped and re-created despite
+            # nothing about it changing. The breadcrumb is the section's
+            # identity ("Article IV > 4.2 Termination" is that section wherever
+            # it sits), and hashing keeps the ID bounded when a deep path runs
+            # to hundreds of characters. Matches the `chunk:` ID's existing use
+            # of a content hash in the context field.
+            #
+            # Trade-off, accepted: two sections with a byte-identical breadcrumb
+            # in one document collapse to one node. That needs a document to
+            # repeat the same caption under the same parent, and when it happens
+            # the two really are the same section by name — whereas edit churn
+            # would be constant.
+            digest = hashlib.sha256(heading.path.encode("utf-8")).hexdigest()[:16]
+            heading_id = f"heading:{source.name}:{artifact.relative_path}:sha256={digest}"
+            self.upsert_node(
+                heading_id,
+                "heading",
+                heading.label,
+                {
+                    "source_id": source.name,
+                    "artifact_id": artifact.id,
+                    "level": heading.level,
+                    "pattern_level": heading.pattern_level,
+                    "number": heading.number,
+                    "title": heading.title,
+                    "kind": heading.kind,
+                    "heading_path": heading.path,
+                    "start_line": heading.line,
+                    "relative_path": artifact.relative_path,
+                    # The parsed ordinal, persisted so a reader can query by
+                    # citation ("§ 12.3" -> parts [12, 3]) and so the taxonomy
+                    # endpoint can re-derive sequence issues without reparsing
+                    # the document.
+                    "ordinal_parts": list(heading.ordinal.parts) if heading.ordinal else [],
+                    "ordinal_series": heading.ordinal.series if heading.ordinal else None,
+                    "ordinal_suffix": heading.ordinal.suffix if heading.ordinal else "",
+                    "ordinal_relative": bool(heading.ordinal.relative)
+                    if heading.ordinal
+                    else False,
+                },
+            )
+            while stack and stack[-1][0] >= heading.level:
+                stack.pop()
+            parent = stack[-1][1] if stack else None
+            if parent is None:
+                self.upsert_edge(artifact.id, heading_id, "has_heading", {"source_id": source.name})
+            else:
+                self.upsert_edge(parent, heading_id, "contains", {"source_id": source.name})
+                # Also link the artifact to every section, not just the roots,
+                # so "which sections does this document have?" is one hop
+                # rather than a full descent.
+                self.upsert_edge(artifact.id, heading_id, "has_heading", {"source_id": source.name})
+            stack.append((heading.level, heading_id))
+            emitted += 1
+        return emitted
 
     def enrich_artifact(
         self,

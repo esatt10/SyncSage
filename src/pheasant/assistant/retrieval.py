@@ -63,6 +63,11 @@ class Passage:
     score: float
     snippet: str
     mode: str
+    # The section this evidence sits in, for sources that extract a taxonomy.
+    # The answering prompt already labels each block with it; carrying it here
+    # is what lets a citation say *which section* answered rather than only
+    # which file.
+    heading_path: str | None = None
     raw: dict = field(default_factory=dict, repr=False)
 
     def key(self) -> str:
@@ -530,6 +535,7 @@ class PheasantRetriever:
             score=float(item.get("score") or 0.0),
             snippet=snippet[:900],
             mode=mode,
+            heading_path=(item.get("heading_path") or provenance.get("heading_path")) or None,
             raw=item,
         )
 

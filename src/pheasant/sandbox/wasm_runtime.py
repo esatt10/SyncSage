@@ -141,6 +141,21 @@ def _trap_exception_map() -> dict[str, type[SandboxError]]:
     return _TRAP_EXCEPTIONS
 
 
+def translate_trap(trap: Any, export_name: str) -> SandboxError:
+    """Map a ``wasmtime.Trap`` onto this module's typed exceptions.
+
+    Shared by :meth:`WasmSandbox.call` and any other host that instantiates a
+    guest directly (e.g. the sandboxed document extractor, which reuses a
+    precompiled module and so cannot go through ``WasmSandbox``). Keeping one
+    mapping means fuel exhaustion and memory-cap overruns surface as the same
+    typed failure whichever host path ran the guest.
+    """
+    code = getattr(trap, "trap_code", None)
+    name = code.name if code is not None else None
+    exc_type = _trap_exception_map().get(name, SandboxTrapped)
+    return exc_type(f"{export_name!r} trapped ({name or 'unknown'}): {trap}")
+
+
 class WasmSandbox:
     """One guest module, instantiated under fuel + memory limits.
 
@@ -237,10 +252,7 @@ class WasmSandbox:
         try:
             return func(self._store, *args)
         except wasmtime.Trap as trap:
-            code = trap.trap_code
-            name = code.name if code is not None else None
-            exc_type = _trap_exception_map().get(name, SandboxTrapped)
-            raise exc_type(f"{export_name!r} trapped ({name or 'unknown'}): {trap}") from trap
+            raise translate_trap(trap, export_name) from trap
 
     def read_memory(self, offset: int, length: int) -> bytes:
         exports = self._instance.exports(self._store)
