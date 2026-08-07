@@ -696,6 +696,58 @@ class SourceConnectorSettings(ModelMixin):
 
 
 @dataclass
+class TaxonomySettings(ModelMixin):
+    """Structural taxonomy extraction for one source (books, procedures, legal).
+
+    Highly structured documents carry their own outline — Part / Chapter /
+    Article / Section / § / 1.2.3 / (a). With this on, that outline is
+    detected per artifact and used three ways: each chunk is labelled with the
+    section it falls inside (``chunks.heading_path``, which ``chunks_fts``
+    already weights at 2.0 — double the body text), `heading` graph nodes and
+    `has_heading` edges are emitted so the taxonomy is traversable, and
+    ``GET /taxonomy`` can render the tree.
+
+    Detection is rule-based, deterministic and offline — no model, no network.
+
+    ``enabled`` defaults to **false**, and is a *per-source* switch rather than
+    a global one, because the numbering rules are genuinely ambiguous on
+    ordinary prose: ``1. Introduction`` in a standards document is a section,
+    ``1. Buy milk`` in a note is a list item, and nothing in the line tells
+    them apart. Turning it on per source is how the operator says "this
+    source really is structured". Enabling it also changes what the FTS index
+    holds for that source, so it wants a deliberate re-sync.
+
+    ``detect`` narrows the rule set when a corpus only uses some conventions;
+    an empty list means all rules. Valid names: ``markdown``, ``keyword``
+    (Chapter/Article/Section/...), ``code`` (``§``), ``numbered``
+    (``1.2.3``), ``lettered`` (``(a)``/``(iv)``), ``caps`` (ALL-CAPS lines —
+    the noisiest, and the first one to drop if a corpus shouts).
+    """
+
+    enabled: bool = False
+    max_depth: int = 6
+    detect: list[str] = field(default_factory=list)
+    #: Emit `heading` graph nodes + `has_heading` edges. Chunk labelling is
+    #: independent of this: a source can populate `heading_path` for search
+    #: without growing the graph.
+    graph_nodes: bool = True
+    #: Cut chunks at section boundaries so one chunk is one section (still
+    #: subdivided when a section exceeds ``chunking.max_chars``).
+    #:
+    #: On by default *within* an enabled taxonomy, because it is what makes
+    #: the feature useful rather than decorative. Without it a whole contract
+    #: that fits in one 4000-char chunk gets a single ``heading_path`` — its
+    #: first heading — and a chunk spanning several sections is labelled with
+    #: only the section its first line falls in, which is actively
+    #: misleading. With it, "what does § 12.3 say" retrieves § 12.3.
+    #:
+    #: It does change chunk boundaries for the source, but enabling taxonomy
+    #: is already a deliberate re-index; set it false to keep the existing
+    #: boundaries and accept coarser labels.
+    split_on_sections: bool = True
+
+
+@dataclass
 class SourceConfig(ModelMixin):
     name: str
     type: SourceType | PluginSourceType
@@ -719,6 +771,7 @@ class SourceConfig(ModelMixin):
     chunking: ChunkingSettings = field(default_factory=ChunkingSettings)
     sync: SourceSyncSettings = field(default_factory=SourceSyncSettings)
     connector: SourceConnectorSettings = field(default_factory=SourceConnectorSettings)
+    taxonomy: TaxonomySettings = field(default_factory=TaxonomySettings)
     urls: list[str] = field(default_factory=list)
     #: Per-source override of ``sync.limits``. ``None`` inherits the global
     #: block; set it to widen or tighten one source without touching others.
@@ -832,6 +885,8 @@ class PheasantConfig(ModelMixin):
                 raw["sync"] = build(SourceSyncSettings, raw["sync"])
             if "connector" in raw:
                 raw["connector"] = build(SourceConnectorSettings, raw["connector"])
+            if "taxonomy" in raw:
+                raw["taxonomy"] = build(TaxonomySettings, raw["taxonomy"])
             if raw.get("limits") is not None:
                 raw["limits"] = build(SyncLimitsSettings, raw["limits"])
             _coerce_scalar_fields(SourceConfig, raw)

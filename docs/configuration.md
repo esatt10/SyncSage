@@ -39,7 +39,7 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 | `obsidian` | Export controls for notes/canvas/frontmatter/backlinks/tags. | Optional |
 | `security` | Path allowlisting and source-read protections. | Strongly recommended |
 | `assistant` | Grounded chat over the index (the UI's chat layer). Query-time only. | Optional |
-| `sources` | All indexed repositories/folders/files/URLs. | Yes |
+| `sources` | All indexed repositories/folders/files/URLs (incl. per-source `taxonomy`). | Yes |
 
 ---
 
@@ -524,6 +524,55 @@ Each source item supports:
 | `on_file_change` | bool/string | `debounce` | File-change trigger behavior. |
 | `on_git_commit` | bool | `true` | React to git commits for this source. |
 | `interval_seconds` | int/null | `null` | Source-specific scheduled sync interval. |
+
+### `sources[].taxonomy`
+
+Structural taxonomy extraction for **books, procedures and legal documents** —
+the outline the document already declares (Part / Chapter / Article / Section /
+`§ 12.3` / `1.2.3` / `(a)`), turned into retrieval structure.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | Master switch. Set it when registering the source. |
+| `max_depth` | int | `6` | Deepest heading level to keep (clamped 1-6). |
+| `detect` | list | `[]` (all) | Narrow the rule set: `markdown`, `keyword`, `code`, `numbered`, `lettered`, `caps`. |
+| `graph_nodes` | bool | `true` | Emit `heading` nodes + `has_heading` edges. |
+| `split_on_sections` | bool | `true` | Cut chunks at section boundaries so one chunk is one section. |
+
+With it on, three things happen on every sync:
+
+1. **Chunks are cut and labelled per section.** Each chunk carries its
+   breadcrumb in `chunks.heading_path`, which `chunks_fts` indexes at BM25
+   weight 2.0 — double the body text. A search hit then reports *which
+   section* matched (`heading_path` on the result), not just which file.
+2. **`heading` graph nodes and `has_heading` edges are emitted**, with a
+   section `contains` its subsections — so the taxonomy is a traversable tree
+   using the same `contains` edge the directory hierarchy uses.
+3. **`GET /taxonomy`** renders the outline per document.
+
+```yaml
+sources:
+  - name: contracts
+    type: document_folder
+    path: /workspace/contracts
+    include: ["**/*.pdf", "**/*.docx"]
+    taxonomy:
+      enabled: true
+```
+
+**Why it is off by default, and per source rather than global.** The numbering
+rules are genuinely ambiguous on prose: `1. Introduction` in a standards
+document is a section, `1. Buy milk` in a note is a list item, and nothing in
+the line distinguishes them. Length and punctuation filters reduce the
+confusion but cannot remove it. Enabling it per source is how you say "this
+corpus really is structured documentation". It also changes what the FTS index
+holds for that source, so it wants a deliberate `--mode full` re-sync.
+
+**Known limitation.** Nesting is by level, so a document that mixes two
+*independent* numbering series can parent one under the other — an `ARTICLE IV`
+whose siblings are `§ 12.3` will show `§ 12.3` nested beneath it. The
+breadcrumb still carries the correct citation, so lookup and search are
+unaffected; only the parent link is wrong.
 
 ### `sources[].connector`
 

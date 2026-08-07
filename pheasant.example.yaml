@@ -362,6 +362,28 @@ sources:
       strategy: heading_or_page
       max_chars: 5000
       overlap_chars: 500
+    # Structural taxonomy extraction, for books / procedures / standards /
+    # contracts: detect the outline the document already declares (Chapter,
+    # Article, Section, § 12.3, 1.2.3, (a)) and use it as retrieval structure.
+    # Chunks become sections labelled with their breadcrumb (`heading_path`,
+    # which FTS weights at 2.0 — double the body text), `heading` graph nodes
+    # + `has_heading` edges are emitted, and GET /taxonomy renders the tree.
+    #
+    # OFF by default and deliberately per-source: `1. Introduction` in a
+    # standard is a section while `1. Buy milk` in a note is a list item, and
+    # nothing in the line tells them apart. Enabling it is how you say "this
+    # source really is structured documentation". It changes this source's FTS
+    # content and chunk boundaries, so re-sync with --mode full after turning
+    # it on. Set it at registration (POST /sources, quick-add, MCP) too.
+    taxonomy:
+      enabled: false
+      max_depth: 6          # deepest heading level kept (1-6)
+      detect: []            # [] = all rules; narrow with any of:
+                            #   markdown | keyword | code | numbered
+                            #   | lettered | caps   (caps is the noisiest)
+      graph_nodes: true     # emit `heading` nodes + `has_heading` edges
+      split_on_sections: true   # one chunk per section (still split when a
+                            #   section exceeds chunking.max_chars)
     sync:
       on_startup: true
       on_file_change: debounce

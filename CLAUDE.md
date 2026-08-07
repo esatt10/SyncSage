@@ -941,6 +941,92 @@ nothing new — `"document"` already covers all seven.
 
 ---
 
+## Structural taxonomy extraction, 2026-08-06 — chapters, sections, § codes
+
+Asked for, for "documents and books and other highly structured documentation
+like procedures, and legal documents": extract a taxonomy by chapter / section /
+code, **toggleable on source registration**. It turned out to be three dormant
+pieces that were already specified, not a new subsystem:
+
+1. **`TextChunk.heading_path` was never populated.** It is a field, a `chunks`
+   column, *and* a `chunks_fts` column at **BM25 weight 2.0 — double the body
+   text**. `chunks_for_source` simply never passed one, so it was `NULL` for
+   every chunk ever indexed (verified: 0 of 3 on a real sync).
+2. **`heading` node type and `has_heading` edge type are documented in
+   `docs/graph_model.md`** (lines 13/24) and `grep` found **zero** emissions
+   anywhere in the code.
+3. **The one heading detector that existed was dead code.** `enrichment.py:218`
+   regexes Markdown headings into `_add_concept`, which returns early since the
+   2026-08-03 concept retirement — it runs the regex and discards the result.
+
+New `src/pheasant/ingestion/taxonomy.py`: rule-based, deterministic, offline
+(no model, no network — rule 1 by construction). Six rules, each with its own
+natural depth so a document may **mix conventions** and still nest —
+`ARTICLE IV` → `4.1` → `(a)` works, as does `# Title` → `1. Scope`: `markdown`
+(1-6), `keyword` (PART/TITLE/BOOK/DIVISION/SCHEDULE/APPENDIX/ANNEX/EXHIBIT=1,
+CHAPTER/SUBPART=2, ARTICLE/SECTION/RULE=3, CLAUSE/STEP/PARAGRAPH=4), `code`
+(`§ 12.3`), `numbered` (`1.2.3`), `lettered` (`(a)`/`(iv)`), `caps`. Nesting is
+a stack walk; `number` is kept separate from `title` so a section is findable by
+its **citation**. A **bare citation takes its caption from the next line**
+(`ARTICLE IV\nTerm and Termination` → `Article IV Term and Termination`) —
+without it, standard legal drafting loses the words a searcher would actually
+use.
+
+**Chunks are cut at section boundaries** (`split_on_sections`, on by default
+once taxonomy is on). This was a deliberate change of mind mid-build: labelling
+alone is nearly decorative, because a whole contract fits in one 4000-char chunk
+and gets one `heading_path` (its first heading), and a chunk straddling three
+sections is labelled with only the first — *misleading*, not merely coarse. Now
+one chunk is one section, subdivided only when a section exceeds
+`chunking.max_chars` (all pieces sharing the path), with absolute line numbers
+and a single ascending index run so chunk IDs stay stable.
+
+**Heading node IDs key on the section breadcrumb, hashed — deliberately not on
+the line number.** A line-numbered ID churns the whole graph on any edit:
+inserting one paragraph shifts every heading below it, dropping and re-creating
+sections that did not change. Asserted by a test that inserts a line and
+compares ID sets. Accepted trade-off: two byte-identical breadcrumbs in one
+document collapse to one node.
+
+**Search now says which section matched.** `heading_path` was already selected
+by the search SQL and dropped when the result dict was built; it is now on the
+result, its `chunks[]` entry and `provenance` — added **only when non-empty**, so
+a corpus without taxonomy returns the exact payload it did before.
+
+**Toggle lives at source registration**, matching the request: per-source
+`sources[].taxonomy.{enabled,max_depth,detect,graph_nodes,split_on_sections}`
+(default **off**), threaded through `POST /sources` + `PATCH` (dict, exactly like
+`chunking`/`sync`/`connector`), `POST /sources/quick-add` (plain bool, it is the
+one-field surface) and MCP `register_source(taxonomy=True)` (additive optional
+param — rule 8). New `GET /taxonomy?source=&path=` renders the outline per
+document as a nested tree, read from the emitted `heading` nodes rather than
+re-parsing.
+
+**Off by default and per-source for a stated reason**, not caution: the
+numbering rules are genuinely ambiguous on prose — `1. Introduction` in a
+standard is a section, `1. Buy milk` in a note is a list item, and nothing in
+the line distinguishes them. Length/punctuation filters (≤120 chars, ≤10 words
+chosen against real headings, no mid-sentence punctuation) catch the long cases;
+short list items still match. Enabling per source is how the operator says "this
+corpus really is structured". Two further limits documented rather than hidden:
+a document mixing two **independent** numbering series can mis-parent one under
+the other (`§ 12.3` under `ARTICLE IV`) — the breadcrumb still carries the right
+citation so search is unaffected, only the parent link is wrong; and `caps` is
+the noisiest rule, first to drop from `detect`.
+
+`docs/graph_model.md` now records that `heading`/`has_heading` went **unemitted
+from the initial build until 2026-08-06**, so a graph written earlier contains
+none — that matters for anyone reading the taxonomy as a contract (rule 3).
+Docs: `configuration.md` §`sources[].taxonomy`, new
+`docs/how-to/structured-documents.md` (in the nav), first per-source `taxonomy:`
+block in `pheasant.example.yaml`. Acceptance: `tests/test_taxonomy.py` (40) —
+**mutation-tested**: disabling detection fails 12, dropping the graph nodes 5,
+re-dropping `heading_path` from search results 1, turning off section splitting
+4. Suite: **686 passed / 18 skipped** (+40). No wire-format change (the Synapse
+contract is untouched; parity green), no new dependency.
+
+---
+
 ## 6. Pointers
 
 - **Region-side Synapse spec:** `docs/SYNAPSE_INTEGRATION.md`

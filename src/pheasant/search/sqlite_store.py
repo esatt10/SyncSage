@@ -122,7 +122,27 @@ class SearchStore:
 
 
 def _row_result(row, rank: int, score: float, reason: str) -> dict:
-    return {
+    # The section this chunk sits in, when the source extracts a taxonomy.
+    # The SQL has always selected `heading_path`; it reached Python and was
+    # dropped here, so a hit could never say *which* section matched. Added
+    # only when non-empty, so a corpus without taxonomy returns the exact
+    # payload it did before.
+    heading_path = _row_value(row, "heading_path")
+    chunk_detail = {
+        "chunk_id": row["chunk_id"],
+        "start_line": row["start_line"],
+        "end_line": row["end_line"],
+        "text_preview": (row["text"] or "")[:500],
+    }
+    provenance = {
+        "source_id": row["source_id"],
+        "path": row["absolute_path"],
+        "relative_path": row["relative_path"],
+    }
+    if heading_path:
+        chunk_detail["heading_path"] = heading_path
+        provenance["heading_path"] = heading_path
+    result = {
         "rank": rank,
         "node_id": row["artifact_id"],
         "chunk_id": row["chunk_id"],
@@ -133,20 +153,20 @@ def _row_result(row, rank: int, score: float, reason: str) -> dict:
         "score": score,
         "reason": reason,
         "summary": (row["text"] or "")[:240],
-        "chunks": [
-            {
-                "chunk_id": row["chunk_id"],
-                "start_line": row["start_line"],
-                "end_line": row["end_line"],
-                "text_preview": (row["text"] or "")[:500],
-            }
-        ],
-        "provenance": {
-            "source_id": row["source_id"],
-            "path": row["absolute_path"],
-            "relative_path": row["relative_path"],
-        },
+        "chunks": [chunk_detail],
+        "provenance": provenance,
     }
+    if heading_path:
+        result["heading_path"] = heading_path
+    return result
+
+
+def _row_value(row, key: str):
+    """Read an optional column, tolerating a row that lacks it."""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return None
 
 
 # Words that carry no retrieval signal but wreck BM25 when they survive into

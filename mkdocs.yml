@@ -73,6 +73,7 @@ nav:
       - Agent memory: how-to/agent-memory.md
       - Configure sources: how-to/sources.md
       - Ingest PDFs & Word documents: how-to/document-ingest.md
+      - Extract a taxonomy from structured documents: how-to/structured-documents.md
       - Multi-modal ingest: how-to/multimodal-ingest.md
       - Vector self-search: how-to/vector-search.md
       - Attach to a Synapse fleet: how-to/attach-to-synapse.md

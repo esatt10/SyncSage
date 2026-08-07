@@ -10,7 +10,7 @@ pheasant uses a directed multi-graph model, compatible with `networkx.MultiDiGra
 | `source` | Configured source root. |
 | `repository`, `branch`, `commit` | Git-aware repository context. |
 | `directory`, `file`, `document`, `markdown_note` | Indexed filesystem artifacts. |
-| `heading`, `chunk` | Retrieval and document structure units. |
+| `heading`, `chunk` | Retrieval and document structure units. `heading` carries a document's structural outline (chapter/section/§ code) and is emitted when a source sets `taxonomy.enabled` — **note it went unemitted from the initial build until 2026-08-06**, so a graph written before then contains none. Attributes: `level`, `number`, `title`, `kind`, `heading_path`, `start_line`. |
 | `symbol` | Code symbols, constants, and call targets extracted from language-aware passes. |
 | `entity` | Named systems, products, people, or CamelCase/Title Case mentions. |
 | ~~`concept`~~ | **Retired 2026-08-03.** Concept extraction produced 87.2% of a 162k-node graph and 98.6% of its edges while contributing nothing measurable: the retrieval expansion path never fired, the facts panel filled every slot with terms like "limit" and "request info", and the similarity pass it fed emitted zero edges. See `graph.enrichment._add_concept`. |
@@ -21,7 +21,7 @@ pheasant uses a directed multi-graph model, compatible with `networkx.MultiDiGra
 
 | Type | Purpose |
 |---|---|
-| `contains`, `indexes`, `has_chunk`, `has_heading` | Hierarchy and indexing relationships. |
+| `contains`, `indexes`, `has_chunk`, `has_heading` | Hierarchy and indexing relationships. `has_heading` links an artifact to every section it contains; a section `contains` its subsections. Both were documented but unemitted until 2026-08-06. |
 | `mentions`, `derived_from` | Artifact-to-entity/symbol links and reverse provenance. |
 | `imports`, `calls` | Repository/code relationships. |
 | `references` | Markdown links, URLs, wiki links, citations, and other external references. |
@@ -44,6 +44,7 @@ Examples:
 source:local-pheasant:pheasant-codebase
 file:pheasant-codebase:src/pheasant/main.py:branch=main
 chunk:pheasant-codebase:src/pheasant/main.py:sha256=abc123:chunk=0004
+heading:contracts:msa.pdf:sha256=1f4b2c9d0e7a3b58
 symbol:pheasant-codebase:src/pheasant/main.py:PheasantServer.start
 commit:pheasant-codebase:6f2a9c1
 ```

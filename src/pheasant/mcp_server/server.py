@@ -57,8 +57,16 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         enabled: bool = True,
         include: list[str] | None = None,
         exclude: list[str] | None = None,
+        taxonomy: bool = False,
     ) -> dict:
-        """Register a source path after allowlisted path validation."""
+        """Register a source path after allowlisted path validation.
+
+        Set ``taxonomy`` for structured documentation (books, procedures,
+        legal documents): each artifact's outline — Chapter / Article /
+        Section / § / 1.2.3 / (a) — is then extracted on every sync, chunks
+        are cut and labelled per section, and `heading` graph nodes are
+        emitted. Off by default.
+        """
 
         return tools.register_source(
             knowledge_base=knowledge_base,
@@ -69,6 +77,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             enabled=enabled,
             include=include,
             exclude=exclude,
+            taxonomy=taxonomy,
         )
 
     @mcp.tool()

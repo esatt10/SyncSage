@@ -49,6 +49,7 @@ class PheasantTools:
         enabled: bool = True,
         include: list[str] | None = None,
         exclude: list[str] | None = None,
+        taxonomy: bool = False,
         actor: str = "mcp",
         transport: str = "mcp",
         client_id: str | None = None,
@@ -79,6 +80,12 @@ class PheasantTools:
             source.include = include
         if exclude is not None:
             source.exclude = exclude
+        if taxonomy:
+            # Structural taxonomy extraction (chapters/sections/§ codes) for
+            # books, procedures and legal documents. Additive optional
+            # parameter: an agent that never passes it registers exactly the
+            # source it did before (rule 8 — additive evolution only).
+            source.taxonomy.enabled = True
         SourceRegistry(self.config, self.state).register_source(source)
         self.config.sources = [
             existing for existing in self.config.sources if existing.name != source.name

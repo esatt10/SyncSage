@@ -5,7 +5,7 @@ import hashlib
 import logging
 import subprocess
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,6 +20,11 @@ from pheasant.ingestion.content_types import (
     artifact_type,
 )
 from pheasant.ingestion.extractor import EXTRACT_SIDECAR_SUFFIX, HTML_EXTENSIONS
+from pheasant.ingestion.taxonomy import (
+    SectionHeading,
+    heading_path_for_line,
+    headings_for_source,
+)
 
 if TYPE_CHECKING:
     from pheasant.ingestion.captioner import Captioner
@@ -47,6 +52,11 @@ class ParsedArtifact:
     git_branch: str | None
     git_commit: str | None
     chunks: list[TextChunk]
+    #: Structural outline detected for this artifact, in document order.
+    #: Empty unless the source enables `taxonomy` — see
+    #: `pheasant.ingestion.taxonomy`. The graph builder turns these into
+    #: `heading` nodes; `chunks[*].heading_path` is derived from them.
+    headings: list[SectionHeading] = field(default_factory=list)
 
 
 def utc_now() -> str:
@@ -183,12 +193,31 @@ def extract_to_text(
         return ""
 
 
-def chunks_for_source(source: SourceConfig, text: str) -> list[TextChunk]:
+def chunks_for_source(
+    source: SourceConfig,
+    text: str,
+    headings: list[SectionHeading] | None = None,
+) -> list[TextChunk]:
+    """Chunk ``text``, labelling each chunk with the section it falls inside.
+
+    ``heading_path`` has existed on :class:`TextChunk`, in the ``chunks``
+    table and in ``chunks_fts`` (at BM25 weight 2.0) since long before this
+    function could produce one — it was ``NULL`` for every chunk ever
+    indexed. Passing ``headings`` fills it.
+
+    With ``taxonomy.split_on_sections`` (the default once taxonomy is on),
+    chunks are cut at section boundaries so one chunk is one section; see
+    :func:`_section_aligned_chunks` for why that matters. Otherwise the
+    original boundaries are kept and each chunk is merely *labelled* with the
+    section its first line falls in.
+    """
     if not text:
         return []
+    if headings and _split_on_sections(source) and source.chunking.enabled:
+        return _section_aligned_chunks(source, text, headings)
     if not source.chunking.enabled:
         lines = text.splitlines()
-        return [
+        chunks = [
             TextChunk(
                 index=0,
                 text=text,
@@ -196,7 +225,73 @@ def chunks_for_source(source: SourceConfig, text: str) -> list[TextChunk]:
                 end_line=len(lines) or 1,
             )
         ]
-    return chunk_text(text, source.chunking.max_chars, source.chunking.overlap_chars)
+    else:
+        chunks = chunk_text(text, source.chunking.max_chars, source.chunking.overlap_chars)
+    if not headings:
+        return chunks
+    return [
+        replace(chunk, heading_path=heading_path_for_line(headings, chunk.start_line))
+        for chunk in chunks
+    ]
+
+
+def _split_on_sections(source: SourceConfig) -> bool:
+    return bool(getattr(getattr(source, "taxonomy", None), "split_on_sections", False))
+
+
+def _section_aligned_chunks(
+    source: SourceConfig,
+    text: str,
+    headings: list[SectionHeading],
+) -> list[TextChunk]:
+    """One chunk per section, subdivided only when a section is oversized.
+
+    This is what turns the taxonomy from a label into a retrieval unit. With
+    the default 4000-char chunking, a whole contract lands in a single chunk,
+    so labelling alone gives it one ``heading_path`` (its first heading) and
+    tells a searcher nothing; worse, a chunk that straddles three sections is
+    labelled with only the first, which is misleading rather than merely
+    coarse. Cutting on the boundaries the document itself declares makes
+    "what does § 12.3 say" retrieve § 12.3.
+
+    ``chunking.max_chars`` is still respected: a section longer than the limit
+    is split into several chunks that all share its ``heading_path``, so one
+    enormous section cannot produce one enormous chunk.
+
+    Line numbers stay absolute (offset back onto the original text) so
+    provenance keeps pointing at the real file, and chunk indices stay a
+    single ascending run so ``chunk:{...}:chunk={index}`` IDs remain stable.
+    """
+    lines = text.splitlines()
+    total = len(lines)
+    spans: list[tuple[int, int, str | None]] = []
+    first = headings[0].line
+    if first > 1:
+        # Front matter before the first heading is still content.
+        spans.append((1, first, None))
+    for position, heading in enumerate(headings):
+        end = headings[position + 1].line if position + 1 < len(headings) else total + 1
+        if end > heading.line:
+            spans.append((heading.line, end, heading.path))
+
+    out: list[TextChunk] = []
+    index = 0
+    for start, end, path in spans:
+        segment = "\n".join(lines[start - 1 : end - 1])
+        if not segment.strip():
+            continue
+        for chunk in chunk_text(segment, source.chunking.max_chars, source.chunking.overlap_chars):
+            out.append(
+                replace(
+                    chunk,
+                    index=index,
+                    start_line=start - 1 + chunk.start_line,
+                    end_line=start - 1 + chunk.end_line,
+                    heading_path=path,
+                )
+            )
+            index += 1
+    return out
 
 
 def _sidecar_for_path(path: Path, suffix: str = CAPTION_SIDECAR_SUFFIX) -> bytes | None:
@@ -285,7 +380,8 @@ def parse_file(
         )
     else:
         text = read_text(path, extractor)
-    chunks = chunks_for_source(source, text)
+    headings = headings_for_source(source, text)
+    chunks = chunks_for_source(source, text, headings)
     stat = path.stat()
     artifact_id = f"file:{source.name}:{relative}:branch={branch or 'none'}"
     return ParsedArtifact(
@@ -304,6 +400,7 @@ def parse_file(
         git_branch=branch,
         git_commit=commit,
         chunks=chunks,
+        headings=headings,
     )
 
 
@@ -360,7 +457,8 @@ def parse_connector_payload(
         )
     else:
         text = read_text_bytes(payload.content, item.relative_path, extractor)
-    chunks = chunks_for_source(source, text)
+    headings = headings_for_source(source, text)
+    chunks = chunks_for_source(source, text, headings)
     artifact_id = f"file:{source.name}:{item.relative_path}:branch={branch or 'none'}"
     return ParsedArtifact(
         id=artifact_id,
@@ -375,6 +473,7 @@ def parse_connector_payload(
         git_branch=branch,
         git_commit=commit,
         chunks=chunks,
+        headings=headings,
     )
 
 
