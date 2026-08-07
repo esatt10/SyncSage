@@ -373,7 +373,7 @@ time):
 | `search.vector_store.provider: lancedb` (default when embeddings on) | `vector` |
 | `assistant.workflow: agentic` (or `auto` and they want the agent graph guaranteed) | `agent` |
 | `synapse.signing_key_ref` set | `a2a` |
-| any `connector.runtime: sandboxed` source, or `graph.wasm_cross_source_resolution`/`search.wasm_relationship_search: true` | `wasm` |
+| any `connector.runtime: sandboxed` source, `ingestion.extractor.provider: sandboxed`, or `graph.wasm_cross_source_resolution`/`search.wasm_relationship_search: true` | `wasm` |
 
 `dev` is only needed for running pheasant's own test suite — omit it
 from a user's runtime install unless they say they're developing
