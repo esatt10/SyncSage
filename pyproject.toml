@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 # ``pheasant`` is taken on PyPI by an unrelated project; the import root and the
 # console script are still ``pheasant``.
 name = "pheasant-kb"
-version = "0.8.3"
+version = "0.8.4"
 description = "Docker-first MCP knowledge graph indexer and agentic retrieval layer"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,6 +14,16 @@ license = { file = "LICENSE" }
 authors = [{ name = "pheasant contributors" }]
 dependencies = [
   "fastapi>=0.111",
+  # FastAPI's lower-bound-only Starlette dependency can otherwise resolve to
+  # the incompatible 1.x line, whose TestClient uses the separate httpx2
+  # package. Keep the runtime and our httpx-based test tooling on the same
+  # supported Starlette API until FastAPI itself supports that major version.
+  "starlette<1",
+  # Multipart form parsing, for POST /sources/upload. FastAPI needs it to
+  # accept an UploadFile at all, and it otherwise only arrives transitively
+  # through the optional [mcp] extra — so a core API route would 500 on a
+  # core-only install.
+  "python-multipart>=0.0.9",
   "uvicorn[standard]>=0.30",
   "pydantic>=2.7",
   "PyYAML>=6.0",
@@ -46,7 +56,13 @@ agent = ["langgraph>=0.2", "langchain-core>=0.3"]
 wasm = ["wasmtime>=20"]
 # Documentation site (MkDocs Material). Build with: mkdocs build --strict
 docs = ["mkdocs-material>=9.5"]
-dev = ["pytest>=8.2", "pytest-asyncio>=0.23", "httpx>=0.27", "ruff>=0.5"]
+dev = [
+  "pytest>=8.2",
+  "pytest-asyncio>=0.23",
+  "httpx>=0.27,<1",
+  "jsonschema>=4.22",
+  "ruff>=0.5",
+]
 
 [project.entry-points."pheasant.connectors"]
 notion = "pheasant.connectors.notion:NotionConnector"

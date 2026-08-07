@@ -4,6 +4,12 @@
 .ruff_cache
 .tmp
 .venv
+.venv-dev
+# The UI build stage runs `npm ci` itself. Shipping the host's node_modules
+# would be slow and wrong (native deps built for the wrong platform), and a
+# stale ui/dist would be copied over the freshly built one.
+ui/node_modules
+ui/dist
 __pycache__
 *.py[cod]
 *.pyo

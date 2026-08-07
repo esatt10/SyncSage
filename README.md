@@ -87,11 +87,17 @@ API and MCP endpoint. Trouble getting the UI up, or seeing a stale one? →
 ### The longer way
 
 Prefer to be walked through every option instead of hand-editing YAML?
-Run the **[guided config wizard](docs/how-to/config-wizard.md)** with
-your coding agent of choice (Claude Code, Copilot, Codex, Gemini CLI) —
-it explains each setting, tracks your progress so you never lose your
-place, and ends with a ready-to-run `pheasant.yaml` + `.env` + startup
-commands.
+
+```bash
+pheasant setup            # sectioned interview; Enter accepts every default
+pheasant setup --advanced # ask about every option
+```
+
+It explains each area before asking about it, reads its defaults off the live
+schema so they are never stale, checkpoints your answers if you interrupt it,
+and ends with a ready-to-run `pheasant.yaml`, a `0600` `.env` for any secrets
+(only the env-var *name* ever reaches the YAML), and the startup commands for
+your deployment target. See **[Set pheasant up](docs/how-to/setup.md)**.
 
 Or generate a starter config yourself:
 
@@ -409,7 +415,7 @@ It is published to GitHub Pages by `.github/workflows/docs.yml` on pushes to `ma
 
 - [Documentation home](docs/index.md)
 - Tutorials: [10-minute quickstart](docs/tutorials/quickstart.md) · [Multi-modal ingest](docs/tutorials/multimodal.md)
-- How-to: [Build your config with the guided wizard](docs/how-to/config-wizard.md) · [Run the web UI](docs/how-to/run-the-ui.md) · [Ask your knowledge base](docs/how-to/chat-and-ui.md) · [Customize the answering workflow](docs/how-to/agent-workflows.md) · [Configure sources](docs/how-to/sources.md) · [Vector self-search](docs/how-to/vector-search.md) · [Attach to a Synapse fleet](docs/how-to/attach-to-synapse.md) · [Backup & restore](docs/how-to/backup-restore.md)
+- How-to: [Set pheasant up](docs/how-to/setup.md) · [Run the web UI](docs/how-to/run-the-ui.md) · [Ask your knowledge base](docs/how-to/chat-and-ui.md) · [Customize the answering workflow](docs/how-to/agent-workflows.md) · [Configure sources](docs/how-to/sources.md) · [Vector self-search](docs/how-to/vector-search.md) · [Attach to a Synapse fleet](docs/how-to/attach-to-synapse.md) · [Backup & restore](docs/how-to/backup-restore.md)
 
 **Reference & explanation**
 

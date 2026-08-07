@@ -79,6 +79,8 @@ export interface SourceRecord {
   syncing?: boolean;
   /** Error from the most recent *background* sync, cleared by the next one. Independent of `last_status`. */
   sync_error?: string | null;
+  /** The running job behind `syncing`, with its phase and counter. */
+  job?: JobRecord | null;
   [key: string]: unknown;
 }
 
@@ -404,4 +406,168 @@ export interface TaxonomyResponse {
   heading_count: number;
   issue_count: number;
   truncated: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Background jobs — what the jobs tray renders.
+// ---------------------------------------------------------------------------
+
+export interface JobProgress {
+  phase: string;
+  current: number;
+  /** null until the work knows its own size (a sync, until listing finishes). */
+  total: number | null;
+  detail: string;
+  /** 0..1, or null when `total` is unknown — render indeterminate, not 0%. */
+  fraction: number | null;
+}
+
+export interface JobRecord {
+  id: string;
+  kind: string;
+  label: string;
+  targets: string[];
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  progress: JobProgress;
+  started_at: string;
+  finished_at: string | null;
+  error: string | null;
+  result: Record<string, unknown> | null;
+  log: string[];
+  active: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Uploads and host paths.
+// ---------------------------------------------------------------------------
+
+export interface UploadResponse {
+  status: string;
+  source_name: string;
+  path: string;
+  stored: { filename: string; path: string; size_bytes: number }[];
+  rejected: { filename: string; error: string }[];
+  syncing: boolean;
+  job_id: string | null;
+}
+
+export interface MountRemedy {
+  host_path: string;
+  container_path: string;
+  compose_volume: string;
+  docker_run_flag: string;
+  config_patch: Record<string, unknown>;
+  cli: string;
+}
+
+export interface HostPathReport {
+  /** native = not containerised; visible = mounted; not_mounted = needs a bind mount. */
+  status: "native" | "visible" | "not_mounted" | "unknown";
+  host_path: string;
+  container_path: string | null;
+  exists: boolean;
+  remedy: MountRemedy | null;
+  in_container: boolean;
+  allowed: boolean;
+  policy_error?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Retrieval tuning.
+// ---------------------------------------------------------------------------
+
+export interface RetrievalSettings {
+  max_rounds: number | null;
+  per_query_results: number | null;
+  max_context_passages: number | null;
+  retrieval_modes: string[] | null;
+  expand_graph: boolean | null;
+  expand_depth: number | null;
+  expand_per_node: number | null;
+  grade_evidence: boolean | null;
+  verify_citations: boolean | null;
+  max_facts: number | null;
+}
+
+export interface RetrievalResponse {
+  retrieval: RetrievalSettings;
+  /** What actually reaches the workflow once workflow_options is layered on. */
+  effective: Record<string, unknown>;
+  workflow_options: Record<string, unknown>;
+  defaults: Record<string, unknown>;
+  field_help: Record<string, string>;
+}
+
+// ---------------------------------------------------------------------------
+// Live config sections + knowledge-base identity.
+// ---------------------------------------------------------------------------
+
+export interface ConfigSection {
+  id: string;
+  values: Record<string, unknown>;
+  /** false means the file is updated but the running process keeps the old value. */
+  live_applicable: boolean;
+}
+
+export interface ConfigSectionResult {
+  status: string;
+  section: string;
+  applied: boolean;
+  restart_required: boolean;
+  wrote_config: boolean;
+  values: Record<string, unknown>;
+}
+
+export interface KnowledgeBaseInfo {
+  id: string;
+  name: string;
+  description: string;
+  environment: string;
+  version: string;
+  state_path: string;
+  config_path: string;
+}
+
+export interface KnowledgeBaseUpdate extends KnowledgeBaseInfo {
+  status: string;
+  changed: string[];
+  wrote_config: boolean;
+  restart_required: boolean;
+  /** Present only when the name changed: renaming orphans the indexed graph. */
+  rename: {
+    previous: string;
+    current: string;
+    reindex_required: boolean;
+    detail: string;
+  } | null;
+}
+
+// ---------------------------------------------------------------------------
+// Graph diagnostics.
+// ---------------------------------------------------------------------------
+
+export interface GraphHub {
+  node_id: string;
+  degree: number;
+  label: string | null;
+  type: string | null;
+}
+
+export interface GraphDiagnostics {
+  total_nodes: number;
+  total_links: number;
+  node_types: Record<string, number>;
+  edge_types: Record<string, number>;
+  orphan_count: number;
+  orphan_sample: string[];
+  density: number;
+  hubs: GraphHub[];
+}
+
+export interface GraphPath {
+  source: string;
+  target: string;
+  found: boolean;
+  hops: number | null;
+  path: (GraphNode & { node_id: string })[];
 }

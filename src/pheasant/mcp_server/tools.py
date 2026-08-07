@@ -8,6 +8,7 @@ from pathlib import Path
 
 import yaml
 
+from pheasant.config.loader import dump_config_yaml
 from pheasant.config.schema import PheasantConfig, SourceConfig, SourceType
 from pheasant.ingestion.pipeline import utc_now
 from pheasant.obsidian.exporter import ObsidianExporter
@@ -19,6 +20,70 @@ from pheasant.search.hybrid import HybridSearch
 from pheasant.search.sqlite_store import SearchStore
 from pheasant.security.path_policy import resolve_config_write_target, resolve_under
 from pheasant.sync.engine import SyncEngine
+
+
+def apply_retrieval_criteria(
+    results: list[dict],
+    *,
+    exclude_sources: list[str] | None = None,
+    node_types: list[str] | None = None,
+    min_score: float | None = None,
+) -> list[dict]:
+    """Filter search hits by caller-supplied criteria. Order is preserved.
+
+    Ranking is not recomputed: these are *post-filters* over an already-ranked
+    list, so a criterion can only ever remove rows. Re-scoring here would make
+    the same query answer differently depending on which filters were passed,
+    which is exactly the surprise a retrieval-tuning surface must not have.
+    """
+    excluded = {str(name) for name in (exclude_sources or [])}
+    wanted_types = {str(name) for name in (node_types or [])}
+    kept: list[dict] = []
+    for item in results:
+        if excluded and _source_of(item) in excluded:
+            continue
+        if wanted_types and str(item.get("type") or "") not in wanted_types:
+            continue
+        if min_score is not None:
+            try:
+                if float(item.get("score") or 0.0) < min_score:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        kept.append(item)
+    return kept
+
+
+def _source_of(item: dict) -> str:
+    """The source a search hit came from.
+
+    Hits do **not** carry a top-level ``source_id`` — it lives under
+    ``provenance``, alongside the path. Reading the wrong key here meant
+    ``exclude_sources`` matched nothing and silently returned unfiltered
+    results, which is worse than refusing the filter outright. Both shapes are
+    accepted so a caller passing already-flattened rows still works.
+    """
+    provenance = item.get("provenance")
+    if isinstance(provenance, dict) and provenance.get("source_id"):
+        return str(provenance["source_id"])
+    return str(item.get("source_id") or item.get("source") or "")
+
+
+def _preview_rows(results: list[dict]) -> list[dict]:
+    """Compact hits for a preview: enough to judge relevance, not the corpus."""
+    rows = []
+    for item in results:
+        rows.append(
+            {
+                "id": item.get("id") or item.get("node_id"),
+                "path": item.get("relative_path") or item.get("path"),
+                "source_id": _source_of(item) or None,
+                "type": item.get("type"),
+                "score": item.get("score"),
+                "preview": (str(item.get("text") or item.get("summary") or ""))[:200],
+            }
+        )
+    return rows
 
 
 class PheasantTools:
@@ -186,7 +251,7 @@ class PheasantTools:
         self._require_knowledge_base(knowledge_base)
         source = self._source_config(source_name)
         source_payload = source.model_dump(mode="json")
-        yaml_patch = yaml.safe_dump({"sources": [source_payload]}, sort_keys=False)
+        yaml_patch = dump_config_yaml({"sources": [source_payload]})
         wrote = False
         if write:
             if not config_path:
@@ -211,7 +276,7 @@ class PheasantTools:
                 item for item in data.get("sources", []) or [] if item.get("name") != source.name
             ]
             data["sources"] = [*existing, source_payload]
-            path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+            path.write_text(dump_config_yaml(data), encoding="utf-8")
             wrote = True
         self._audit(
             source_name,
@@ -364,19 +429,187 @@ class PheasantTools:
         principal: str | None = None,
         principal_groups: list[str] | None = None,
         section: str | None = None,
+        source_name: str | None = None,
+        exclude_sources: list[str] | None = None,
+        node_types: list[str] | None = None,
+        min_score: float | None = None,
     ) -> dict:
+        """Retrieve passages for a query.
+
+        The last five parameters are **retrieval criteria** an agent can set
+        per call rather than having them fixed in config: restrict to one
+        section of a document's taxonomy, scope to one source or away from
+        noisy ones, keep only certain node types, and floor the score. All are
+        optional and default to the pre-existing behavior, so an existing
+        caller is unaffected (CLAUDE.md §4 rule 8: additive only).
+
+        ``section`` matches the heading breadcrumb, so "§ 12.3", "Article IV"
+        or a section's wording all reach it and naming a parent returns
+        everything nested under it. Only meaningful for sources with taxonomy
+        extraction enabled.
+        """
         self._require_knowledge_base(knowledge_base)
-        return self.searcher.search_context(
+        # Over-fetch when a filter will drop rows, so `max_results` still
+        # means "give me this many" rather than "look at this many and give me
+        # whatever survives" — the latter silently returns short answers.
+        filtering = bool(exclude_sources or node_types or min_score is not None)
+        fetch = max_results * 4 if filtering else max_results
+        payload = self.searcher.search_context(
             knowledge_base or self.config.knowledge_base_id,
             query,
             mode,
-            max_results,
+            fetch,
+            source_name,
             graph=self.engine.graph_builder.graph,
             principal=principal,
             principal_groups=principal_groups,
             security=self.config.security,
             section=section,
         )
+        if filtering:
+            payload = dict(payload)
+            payload["results"] = apply_retrieval_criteria(
+                payload.get("results") or [],
+                exclude_sources=exclude_sources,
+                node_types=node_types,
+                min_score=min_score,
+            )[:max_results]
+            payload["criteria"] = {
+                "source_name": source_name,
+                "exclude_sources": exclude_sources,
+                "node_types": node_types,
+                "min_score": min_score,
+            }
+        return payload
+
+    def describe_retrieval(self, knowledge_base: str) -> dict:
+        """What this region's retrieval is configured to do, and what is tunable.
+
+        An agent pointed at an unfamiliar region cannot otherwise tell whether
+        semantic search exists, how many rounds the answering loop runs, or
+        which sources are even present — so it either guesses or asks for
+        everything. This returns the standing configuration, the criteria that
+        may be overridden per call, and what the region can actually do
+        (a vector mode is not offered when no vector index is built).
+        """
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.api.app import RETRIEVAL_FIELD_HELP
+
+        settings = self.config.assistant.retrieval
+        has_vectors = self.engine.vectors is not None
+        modes = ["text", "graph", "hybrid"] + (["vector"] if has_vectors else [])
+        rows = self.state.rows("SELECT DISTINCT source_id FROM artifacts ORDER BY source_id")
+        return {
+            "knowledge_base": knowledge_base or self.config.knowledge_base_id,
+            "default_mode": self.config.search.default_mode,
+            "max_results_default": self.config.search.max_results_default,
+            "available_modes": modes,
+            "vector_index": {
+                "enabled": self.config.search.embeddings.enabled,
+                "built": has_vectors,
+                "provider": self.config.search.embeddings.provider,
+            },
+            "sources": [str(row["source_id"]) for row in rows],
+            "retrieval": settings.model_dump(mode="json"),
+            "workflow": self.config.assistant.workflow,
+            "workflow_options": dict(self.config.assistant.workflow_options or {}),
+            "tunable_per_call": {
+                "search_context": [
+                    "mode",
+                    "max_results",
+                    "source_name",
+                    "exclude_sources",
+                    "node_types",
+                    "min_score",
+                ],
+                "ask_knowledge_base": ["workflow", "mode", "max_results", "options"],
+            },
+            "field_help": RETRIEVAL_FIELD_HELP,
+        }
+
+    def preview_retrieval(
+        self,
+        knowledge_base: str,
+        query: str,
+        mode: str = "hybrid",
+        max_results: int = 10,
+        source_name: str | None = None,
+        exclude_sources: list[str] | None = None,
+        node_types: list[str] | None = None,
+        min_score: float | None = None,
+    ) -> dict:
+        """Run retrieval criteria and report how they differ from the config.
+
+        The point is to make a configuration **testable before it is
+        committed**: the same criteria that would go into
+        ``assistant.retrieval`` / ``search.default_mode`` can be tried here,
+        against the region's own content, and compared with what the standing
+        configuration returns for the same query. Returns both result sets in
+        compact form plus the delta — what the criteria added, dropped and
+        kept — so an agent can decide rather than guess.
+
+        Read-only: nothing is persisted and the live config is untouched.
+        """
+        self._require_knowledge_base(knowledge_base)
+        kb = knowledge_base or self.config.knowledge_base_id
+
+        baseline = self.searcher.search_context(
+            kb,
+            query,
+            self.config.search.default_mode,
+            self.config.search.max_results_default,
+            graph=self.engine.graph_builder.graph,
+            security=self.config.security,
+        )
+        candidate = self.search_context(
+            kb,
+            query,
+            mode,
+            max_results,
+            source_name=source_name,
+            exclude_sources=exclude_sources,
+            node_types=node_types,
+            min_score=min_score,
+        )
+
+        def keys(payload: dict) -> list[str]:
+            out = []
+            for item in payload.get("results") or []:
+                out.append(str(item.get("id") or item.get("node_id") or item.get("path") or ""))
+            return [key for key in out if key]
+
+        baseline_keys = keys(baseline)
+        candidate_keys = keys(candidate)
+        baseline_set, candidate_set = set(baseline_keys), set(candidate_keys)
+        return {
+            "query": query,
+            "criteria": {
+                "mode": mode,
+                "max_results": max_results,
+                "source_name": source_name,
+                "exclude_sources": exclude_sources,
+                "node_types": node_types,
+                "min_score": min_score,
+            },
+            "configured": {
+                "mode": self.config.search.default_mode,
+                "max_results": self.config.search.max_results_default,
+            },
+            "results": _preview_rows(candidate.get("results") or []),
+            "baseline_results": _preview_rows(baseline.get("results") or []),
+            "delta": {
+                "added": [key for key in candidate_keys if key not in baseline_set],
+                "dropped": [key for key in baseline_keys if key not in candidate_set],
+                "kept": [key for key in candidate_keys if key in baseline_set],
+                "result_count": len(candidate_keys),
+                "baseline_count": len(baseline_keys),
+            },
+            "persisted": False,
+            "how_to_apply": (
+                "PUT /assistant/retrieval, or set search.default_mode / "
+                "assistant.retrieval in pheasant.yaml (`pheasant setup --advanced`)."
+            ),
+        }
 
     def ask_knowledge_base(
         self,

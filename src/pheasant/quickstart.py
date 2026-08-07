@@ -28,7 +28,7 @@ except ImportError:  # PyYAML
         return ":" in text or text[:1] in tuple("*&!%@`[{|>-?#,'\"") or text != text.strip()
 
 
-from pheasant.config.loader import deep_merge
+from pheasant.config.loader import deep_merge, dump_config_yaml
 from pheasant.config.profiles import profile_data
 from pheasant.config.schema import PheasantConfig, SourceType
 
@@ -213,7 +213,7 @@ def render_up_config(
         header_lines.append(f"#   {entry.name}: {entry.type} <- {entry.path}")
     header_lines.append("# Edit freely — `pheasant up` never overwrites an existing config.")
     header = "\n".join(header_lines) + "\n"
-    return header + yaml.safe_dump(_scrub(data), sort_keys=False) + sources_block
+    return header + dump_config_yaml(_scrub(data)) + sources_block
 
 
 def ensure_up_config(
@@ -224,17 +224,101 @@ def ensure_up_config(
     port: int = 8765,
     profile: str = "quickstart",
 ) -> bool:
-    """Write the generated config unless one already exists.
+    """Write the generated config, or add missing targets to an existing one.
 
-    Returns True when a new config was written, False when an existing
-    file was left untouched (the reuse path).
+    Returns True when a new config was written, False otherwise. Any targets
+    appended to an existing config are reported through :func:`added_sources`
+    on the last call, so the CLI can say what it did.
+
+    An existing config is never *rewritten* — settings the user edited are
+    left exactly as they are, and re-running ``pheasant up`` with the same
+    targets leaves the file byte-identical. But a target that is **not** in
+    the config yet is appended, because "reusing the existing config" used to
+    mean a flat `pheasant up ~/new-notes -c pheasant.yaml` silently indexed
+    nothing and reported success — including straight after `pheasant setup`,
+    whose own closing advice is to run exactly that.
     """
     config_path = Path(config_path)
-    if config_path.exists():
-        return False
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(
-        render_up_config(target, config_path, name=name, port=port, profile=profile),
-        encoding="utf-8",
-    )
-    return True
+    if not config_path.exists():
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            render_up_config(target, config_path, name=name, port=port, profile=profile),
+            encoding="utf-8",
+        )
+        _LAST_ADDED.clear()
+        return True
+    _LAST_ADDED.clear()
+    _LAST_ADDED.extend(_append_missing_sources(target, config_path))
+    return False
+
+
+#: Names appended by the most recent :func:`ensure_up_config` call. Module
+#: state rather than a changed return type: three call sites and two tests
+#: already treat the bool as "was it created", and that answer is still right.
+_LAST_ADDED: list[str] = []
+
+
+def added_sources() -> list[str]:
+    """Source names the last ``ensure_up_config`` appended to an existing config."""
+    return list(_LAST_ADDED)
+
+
+def _append_missing_sources(target: Any, config_path: Path) -> list[str]:
+    """Add any target not already configured. Returns the names added.
+
+    Matching is by **resolved path**, not by name: the same directory reached
+    through a symlink or a relative path is the same source, and adding it
+    twice under two names would index it twice.
+    """
+    targets = target if isinstance(target, list) else [target]
+    if not targets or not hasattr(targets[0], "to_source_dict"):
+        # Called with a bare path (the pre-target-resolution shape used by
+        # `render_up_config`); nothing to merge.
+        return []
+    try:
+        existing = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return []
+    if not isinstance(existing, dict):
+        return []
+
+    sources = [s for s in (existing.get("sources") or []) if isinstance(s, dict)]
+    known_paths = {_resolved(s.get("path")) for s in sources}
+    known_names = {str(s.get("name")) for s in sources}
+
+    added: list[str] = []
+    for entry in targets:
+        payload = entry.to_source_dict()
+        if _resolved(payload.get("path")) in known_paths:
+            continue
+        name = payload["name"]
+        if name in known_names:
+            name = f"{name}-{len(sources) + 1}"
+            payload["name"] = name
+        sources.append(payload)
+        known_paths.add(_resolved(payload.get("path")))
+        known_names.add(name)
+        added.append(name)
+    if not added:
+        # Byte-identical: re-running with the same targets must not rewrite.
+        return []
+
+    security = existing.setdefault("security", {})
+    roots = list(security.get("allow_workspace_roots") or [])
+    for entry in targets:
+        if getattr(entry, "local", False) and str(entry.path) not in roots:
+            roots.append(str(entry.path))
+    if roots:
+        security["allow_workspace_roots"] = roots
+
+    existing.pop("sources", None)
+    rendered = dump_config_yaml(existing) + _render_sources_block(sources)
+    config_path.write_text(rendered, encoding="utf-8")
+    return added
+
+
+def _resolved(path: Any) -> str:
+    try:
+        return str(Path(str(path)).expanduser().resolve())
+    except (OSError, ValueError):
+        return str(path)

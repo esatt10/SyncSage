@@ -1,6 +1,8 @@
 import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
+import { CopyLine } from "./CopyLine";
+import { UploadDrop } from "./UploadDrop";
 
 const EXAMPLES = [
   { label: "A folder", value: "/workspace/notes" },
@@ -34,6 +36,20 @@ export function QuickAdd({ onClose, onAdded }: { onClose: () => void; onAdded: (
     mutationFn: () => api.quickAdd({ target: target.trim(), split, sync_now: true, wait: false }),
     onSuccess: onAdded,
   });
+
+  // Check a filesystem-looking target against the container's mount table
+  // *before* the user submits it. The failure this prevents is the single most
+  // common first-run one: a real host path that simply is not mounted, which
+  // otherwise surfaces as "path does not exist" — true, and useless.
+  const looksLikePath = /^([a-zA-Z]:[\\/]|[\\/~])/.test(target.trim());
+  const hostPath = useQuery({
+    queryKey: ["host-path", target.trim()],
+    queryFn: () => api.hostPath(target.trim()),
+    enabled: looksLikePath && target.trim().length > 2,
+    retry: false,
+    staleTime: 30_000,
+  });
+  const remedy = hostPath.data?.status === "not_mounted" ? hostPath.data.remedy : null;
 
   return (
     <div className="modal-scrim" onClick={onClose}>
@@ -92,6 +108,46 @@ export function QuickAdd({ onClose, onAdded }: { onClose: () => void; onAdded: (
             progress shows up on the Sources page (and the "Syncing…" indicator at the
             top of every page until it finishes).
           </p>
+
+          {remedy ? (
+            <div className="banner banner--warn" style={{ marginBottom: 0 }}>
+              <strong>That path is not visible inside this container.</strong>
+              <p className="small" style={{ margin: "6px 0" }}>
+                It exists on your machine, but pheasant runs in a container and only
+                sees what is mounted into it. Add the mount, restart, and this path
+                becomes <code>{remedy.container_path}</code>:
+              </p>
+              <CopyLine command={remedy.cli} />
+              <p className="muted small" style={{ margin: "6px 0 0" }}>
+                That writes the bind mount into <code>docker-compose.override.yml</code>{" "}
+                and allow-lists the path. By hand, the compose volume is{" "}
+                <code>{remedy.compose_volume}</code>. Or skip mounting entirely and
+                upload the files below.
+              </p>
+            </div>
+          ) : null}
+
+          {hostPath.data?.status === "visible" &&
+          hostPath.data.container_path !== hostPath.data.host_path ? (
+            <div className="banner" style={{ marginBottom: 0 }}>
+              That path is mounted here as <code>{hostPath.data.container_path}</code> —
+              pheasant will index it from there.
+            </div>
+          ) : null}
+
+          <details className="upload-fallback">
+            <summary>…or upload files instead</summary>
+            <p className="muted small" style={{ margin: "8px 0" }}>
+              No path, no mount. The files become a normal source and are indexed the
+              same way.
+            </p>
+            <UploadDrop
+              onUploaded={() => {
+                onAdded();
+                onClose();
+              }}
+            />
+          </details>
 
           <div className="banner banner--warn" style={{ marginBottom: 0 }}>
             Search and chat may respond more slowly while a new source is syncing,

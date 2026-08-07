@@ -25,6 +25,7 @@ import json
 import logging
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -42,12 +43,18 @@ def run_sync(
     timeout: float = DEFAULT_TIMEOUT_S,
     full_scan: bool = False,
     depth: int | None = None,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Index in a child process and return its report.
 
     The report mirrors :class:`~pheasant.sync.engine.SyncResult` fields when
     the child succeeds. A non-zero exit is reported, not raised: a failed sync
     must not take down the process that is still serving queries.
+
+    With ``on_progress`` the child is run with ``--progress`` and its stdout is
+    **streamed** rather than buffered, so the parent sees each NDJSON progress
+    line as it is written. Without it, nothing changes: the child is not asked
+    for progress and the output is simply collected.
     """
 
     command = [
@@ -69,25 +76,21 @@ def run_sync(
         command += ["--full-scan"]
     if depth is not None:
         command += ["--depth", str(depth)]
+    if on_progress is not None:
+        command += ["--progress"]
 
     logger.info("Starting sync worker: %s", " ".join(command[3:]))
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        returncode, stdout, stderr = _run_streaming(command, timeout, on_progress)
     except subprocess.TimeoutExpired:
         logger.error("Sync worker timed out after %.0fs", timeout)
         return {"status": "timeout", "source_id": source_name, "results": []}
 
-    if completed.returncode != 0:
+    if returncode != 0:
         # stderr carries the child's traceback; surface the tail, which is the
         # part that says what actually went wrong.
-        tail = (completed.stderr or "").strip().splitlines()[-5:]
-        logger.error("Sync worker failed (exit %s): %s", completed.returncode, " / ".join(tail))
+        tail = (stderr or "").strip().splitlines()[-5:]
+        logger.error("Sync worker failed (exit %s): %s", returncode, " / ".join(tail))
         return {
             "status": "failed",
             "source_id": source_name,
@@ -95,7 +98,67 @@ def run_sync(
             "results": [],
         }
 
-    return _parse_report(completed.stdout, source_name)
+    return _parse_report(stdout, source_name)
+
+
+def _run_streaming(
+    command: list[str],
+    timeout: float,
+    on_progress: Callable[[dict[str, Any]], None] | None,
+) -> tuple[int, str, str]:
+    """Run the child, forwarding progress lines as they arrive.
+
+    Without a progress callback this is ``subprocess.run`` and behaves exactly
+    as it always did. With one, stdout is read line by line — the only way to
+    see progress *during* a multi-minute sync rather than after it — while
+    stderr stays fully buffered, because it is only read on failure and
+    draining two pipes by hand is how you deadlock on a full one.
+    """
+    if on_progress is None:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout, check=False
+        )
+        return completed.returncode, completed.stdout, completed.stderr
+
+    import json as _json
+
+    from pheasant.cli import PROGRESS_MARKER
+
+    collected: list[str] = []
+    with subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    ) as process:
+        assert process.stdout is not None
+        for line in process.stdout:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            payload = None
+            if line.startswith("{"):
+                try:
+                    payload = _json.loads(line)
+                except _json.JSONDecodeError:
+                    payload = None
+            if isinstance(payload, dict) and payload.get("marker") == PROGRESS_MARKER:
+                try:
+                    on_progress(payload)
+                except Exception:  # pragma: no cover - never fail a sync for this
+                    logger.debug("progress forwarding failed", exc_info=True)
+                continue
+            # Not progress — keep it for _parse_report, which looks for the
+            # final JSON report among whatever the child printed.
+            collected.append(line)
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            raise
+        stderr = process.stderr.read() if process.stderr else ""
+    return process.returncode, "\n".join(collected), stderr
 
 
 class WorkerBackedEngine:
@@ -164,10 +227,18 @@ class WorkerBackedEngine:
         *,
         max_depth: int | None = None,
         full_scan: bool = False,
+        on_progress: Any = None,
     ) -> Any:
         if not self._can_delegate():
+            # In-process fallback: the engine's hook takes four positional
+            # arguments, the worker's takes one dict. Adapt rather than make
+            # callers care which path they landed on.
             return self._engine.sync_source(
-                source_name, mode, max_depth=max_depth, full_scan=full_scan
+                source_name,
+                mode,
+                max_depth=max_depth,
+                full_scan=full_scan,
+                on_progress=_as_engine_hook(on_progress),
             )
         report = run_sync(
             self._config_path,
@@ -175,6 +246,7 @@ class WorkerBackedEngine:
             mode,
             depth=max_depth,
             full_scan=full_scan,
+            on_progress=on_progress,
         )
         results = self._adopt(report)
         return results[0] if results else self._empty(source_name, report)
@@ -185,10 +257,23 @@ class WorkerBackedEngine:
         *,
         max_depth: int | None = None,
         full_scan: bool = False,
+        on_progress: Any = None,
     ) -> list[Any]:
         if not self._can_delegate():
-            return self._engine.sync_all(mode, max_depth=max_depth, full_scan=full_scan)
-        report = run_sync(self._config_path, None, mode, depth=max_depth, full_scan=full_scan)
+            return self._engine.sync_all(
+                mode,
+                max_depth=max_depth,
+                full_scan=full_scan,
+                on_progress=_as_engine_hook(on_progress),
+            )
+        report = run_sync(
+            self._config_path,
+            None,
+            mode,
+            depth=max_depth,
+            full_scan=full_scan,
+            on_progress=on_progress,
+        )
         return self._adopt(report)
 
     def startup(self) -> list[Any]:
@@ -244,6 +329,22 @@ class WorkerBackedEngine:
             status=str(report.get("status") or "unknown"),
             details={"error": report.get("error")} if report.get("error") else {},
         )
+
+
+def _as_engine_hook(on_progress: Callable[[dict[str, Any]], None] | None):
+    """Adapt the worker's dict-shaped callback to the engine's positional one.
+
+    The two differ because they cross different boundaries: the worker's
+    arrives as parsed NDJSON from a child process, the engine's is a plain
+    call inside one. Callers should not have to know which path ran.
+    """
+    if on_progress is None:
+        return None
+
+    def hook(phase: str, current: int, total: int | None, detail: str) -> None:
+        on_progress({"phase": phase, "current": current, "total": total, "detail": detail})
+
+    return hook
 
 
 def _parse_report(stdout: str, source_name: str | None) -> dict[str, Any]:

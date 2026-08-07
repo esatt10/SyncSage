@@ -127,8 +127,14 @@ ruff check src tests && ruff format --check src tests
 pheasant up [PATH] [--no-serve]            # zero-config quickstart: detect
                                            #   (.obsidian/.git/folder) → generate
                                            #   config → index → serve (Step 30.1)
+pheasant setup [--advanced|--accept-defaults|--answers F]  # interactive,
+                                           #   sectioned wizard → pheasant.yaml
+                                           #   + a 0600 .env + startup commands
+pheasant mount <host-path> [--at /data/x]  # bind-mount a host dir into the
+                                           #   container + allow-list it
 pheasant init --profile quickstart         # generate starter pheasant.yaml
 pheasant validate && pheasant doctor       # config + environment checks
+pheasant sync --progress                   # NDJSON progress lines on stdout
 pheasant start                             # HTTP API + MCP on :8765
 pheasant sync --source <name> --mode incremental|full|validate_only|repair
 pheasant mcp --transport stdio             # standalone MCP server
@@ -173,16 +179,17 @@ docker compose up                          # container + optional UI sidecar
    either push.
 10. **Scope each session to one Phase-21 step** (or one bugfix). Write
     `runs/<ts>-synapse-<step>/SUMMARY.md` per the framework conventions.
-11. **Config-schema changes owe the wizard an update.** Adding, renaming,
-    or changing the default of any field in
-    `src/pheasant/config/schema.py`, adding an env var, a
-    `pyproject.toml` extra, or a `sources[].type`/connector needs a
-    matching update to `docs/configuration.md` and
-    `agent/config_wizard_prompt.md` (the guided onboarding Q&A — see
-    `docs/how-to/config-wizard.md`). Use the
-    `.claude/skills/config-surface-sync` skill for the checklist;
-    `tests/test_config_wizard_freshness.py` fails CI on the mechanical
-    part (a section mentioned nowhere) but not on prose accuracy.
+11. **Config-schema changes owe the config surface an update.** Adding a
+    *top-level* section to `src/pheasant/config/schema.py` needs three
+    things: a mention in `docs/configuration.md`, a `Section` (or a
+    question) covering it in `src/pheasant/setup_wizard.py`, and an entry
+    in `LIVE_APPLICABLE_SECTIONS` (`api/app.py`) saying whether a running
+    server can pick the change up. `tests/test_config_surface_freshness.py`
+    fails CI on all three — mechanically (a section named nowhere), not on
+    prose accuracy. **Individual field defaults need no second edit:**
+    `pheasant setup` reads them off the live dataclasses via
+    `schema_default()`, which is what replaced the prose wizard and its
+    rot-detector.
 
 ---
 
@@ -672,6 +679,132 @@ selective acceleration) is complete**: 34.1-34.3 shipped (sandboxing),
 34.4 shipped (benchmark data + the toolchain), 34.5 shipped (both
 accelerated hot loops, production-wired, opt-in), 34.6-34.7 evaluated and
 correctly not built.
+
+---
+
+## Setup simplification, 2026-08-07 — the agentic config wizard removed
+
+The 2026-08-06 "startup overhaul" (#42) tried to solve onboarding by handing it
+to a coding agent: a 449-line prose operating procedure
+(`agent/config_wizard_prompt.md`) plus four per-tool adapters (Claude, Codex,
+Gemini, VS Code) that each said "read that file and follow it", guarded by a CI
+freshness test to stop the prose rotting against the schema. **All of it is
+deleted.** It was non-deterministic (same answers, different YAML, depending on
+which agent ran it), unreachable without an agent, duplicated the schema in
+prose — and the hard parts of setup were never the questions.
+
+What replaced it, feature by feature:
+
+**`pheasant setup` — a real interactive wizard** (`src/pheasant/setup_wizard.py`).
+Deterministic, offline, no LLM. Fifteen sections, each explaining its area
+before asking; every question carries a working default so Enter-through is a
+supported path. **Every default is read off the live dataclasses**
+(`schema_default()` walks a default `PheasantConfig`), so a changed default
+cannot go stale here — that property is what let the old rot-detector die.
+Secrets go to a `0600` `.env`, merged not clobbered, `.gitignore` checked and
+fixed; only the env-var *name* ever reaches YAML, and a variable already set in
+the environment is not asked about. `--advanced` / `--accept-defaults` /
+`--answers FILE`; `Ctrl-C` checkpoints to `.pheasant-setup.json` (secrets
+deliberately excluded). The old freshness test is replaced by
+`tests/test_config_surface_freshness.py`, which checks live code — every
+top-level section reachable from the wizard, documented, and declared in
+`LIVE_APPLICABLE_SECTIONS`.
+
+**Documents uploaded through the UI** (`POST /sources/upload`,
+`api/uploads.py`, `ui/src/components/UploadDrop.tsx`). Files land under
+`/state/uploads/<name>/`, registered as an ordinary `document_folder` source —
+same connector→chunk→graph pipeline, **no second ingestion path**. The module
+owns only filename safety. One bug caught by its own tests: the first
+implementation used an allowlist (`[A-Za-z0-9._ -]`) which mangles every
+non-English filename (`Übersicht.pdf` → `_bersicht.pdf`, `会議メモ.md` → `___.md`)
+while defending against nothing a denylist does not; and the length cap counted
+characters, not the bytes filesystems actually limit.
+
+**Any local directory, not just a container subdirectory**
+(`deployment/mounts.py`, `GET /fs/host-path`, `pheasant mount`). Parses the
+container's own `/proc/self/mountinfo` (octal-escape decoding included) and
+answers the real question — "you typed a path I cannot see" — with the compose
+volume, the `docker run` flag *and* the `allow_workspace_roots` entry, because
+a mount without the allow-list entry is a half-fix. `pheasant mount` writes
+both, merging into any existing override file. A Windows path is matched
+against **all four** shapes Docker Desktop has used for a drive
+(`/c/…`, `/host_mnt/c/…`, `/run/desktop/mnt/host/c/…`, drive-less), because
+picking one silently tells half of Windows their mounted directory is not
+mounted.
+
+**Retrieval tuning as typed config** (`assistant.retrieval` /
+`RetrievalSettings`). These knobs existed only as untyped `workflow_options`
+keys documented in a workflow module's `DEFAULTS`. Precedence is deliberately
+**low** — merged *under* `workflow_options`, itself under per-request
+`options` — so an existing config is completely unaffected; a `None` field is
+not merged at all. `GET`/`PUT /assistant/retrieval` + a Settings panel.
+
+**One universal image.** Multi-stage `Dockerfile`: a node stage builds
+`ui/dist`, the runtime installs **all** extras by default
+(`mcp,agent,vector,wasm,a2a` — the old `mcp`-only default meant a valid
+`pheasant.yaml` could fail at runtime in the published image) and serves API +
+MCP + UI on one port. `docker-entrypoint.sh` generates a config via
+`pheasant setup --accept-defaults` when `/config` is empty, so
+`docker run -v $PWD:/workspace ghcr.io/esatt10/pheasant` works with no config
+at all. `docker-compose.yml` is one service; the UI sidecar moved behind a
+`--profile ui`.
+
+**Editing the live knowledge base** (`GET /config/sections`,
+`PATCH /config/section/{section}`, `GET`/`PUT /knowledge-base`). One section at
+a time, validated against the *whole* config (sections are not independent),
+hot-applied where safe and reported **honestly** where not (`applied` vs
+`restart_required`) — a UI that says "saved" for a value the process is still
+ignoring has lied. A KB rename is allowed but reports the full re-index it
+implies rather than silently orphaning the graph (rule 3: `kb_id` is the graph
+root and every stable-ID prefix).
+
+**Background job progress** (`src/pheasant/jobs.py`, `/jobs`, `/jobs/stream`,
+`ui/src/components/JobsTray.tsx`). Replaces the `syncing_sources`/
+`sync_outcomes` dicts, whose only vocabulary was a boolean held for however
+many minutes a first index took — indistinguishable from a hang.
+`SyncEngine.sync_source(on_progress=…)` rides the *existing* per-artifact
+`serve_yield()` point (no new traversal); `pheasant sync --progress` emits
+throttled NDJSON; `sync/worker.py` switched `subprocess.run` → `Popen` line
+streaming so the parent sees movement *during* the sync. A marker key
+distinguishes progress lines from the final JSON report on the same stdout.
+**Bug caught by a hanging test:** the SSE handler was a sync generator blocking
+on `queue.get(timeout=…)` — Starlette runs those in a threadpool it cannot
+interrupt, so every disconnected browser would have leaked a thread forever. It
+is an async generator polling a queue now, and `JobRegistry.stream()` was
+replaced by a non-blocking `drain()` so the pattern cannot be reintroduced.
+
+**Full-screen graph workspace** (`/graph` route, `GraphPage.tsx`,
+`GET /graph/diagnostics`, `GET /graph/path`). Hubs by degree, orphan count,
+edge/node histograms, density — and a shortest-path finder, the one question a
+canvas structurally cannot answer because two nodes six hops apart are never on
+screen together. Bidirectional BFS over edges treated as **undirected**
+(relatedness is not about which way an import points), bounded by depth and
+visit budget. Diagnostics use the copy-free `iter_edges()`/`node_map()`
+lock-held iterators.
+
+**MCP retrieval criteria** (additive only, rule 8). `search_context` gains
+`source_name`/`exclude_sources`/`node_types`/`min_score`, over-fetching so
+`max_results` still means what it says; filters are pure post-filters that never
+re-rank. Two new tools: `describe_retrieval` (what this region is configured to
+do and what is tunable — `vector` is not advertised without a built index) and
+`preview_retrieval` (run criteria, report the delta against the standing
+config, persist nothing), so an agent can test a configuration before anyone
+writes it into YAML.
+
+`python-multipart` became a core dependency — FastAPI needs it for `UploadFile`
+and it previously arrived only through the optional `[mcp]` extra, so a core
+install would have 500'd on a core route.
+
+Suite: **646 passed, 25 skipped** (+120). `tsc -b && vite build` clean.
+
+**Known pre-existing flake, not introduced here:**
+`test_memory_write_is_searchable_immediately_and_resync_is_zero_work` asserts a
+re-written identical memory record is deduplicated, which only holds if both
+writes land in the same second — `MemoryStore.append` embeds a
+second-granularity timestamp in the record id. Passes in isolation and on
+repeated full runs; left alone because fixing it means deciding whether
+"identical assertion a second later" is a new record, which is a memory-semantics
+call, not a setup one.
 
 ---
 
@@ -1187,9 +1320,8 @@ until the numeric-citation case was written. Full detail:
   `pheasant-flock/docs/SYNAPSE_ARCHITECTURE.md`,
   `…/docs/SYNAPSE_FRAMEWORK.md`, ADR 2026-06-10 in `…/docs/DECISIONS.md`
 - **Graph taxonomy:** `docs/graph_model.md` · **Config:** `docs/configuration.md`
-- **Guided config wizard (any coding agent):** `agent/config_wizard_prompt.md`
-  · invocation per tool + what it produces: `docs/how-to/config-wizard.md`
-  · keep-it-current checklist: `.claude/skills/config-surface-sync`
+- **Setup (all three routes):** `docs/how-to/setup.md` · the interactive
+  wizard is `src/pheasant/setup_wizard.py` (`pheasant setup`)
 - **MCP:** `docs/mcp_tools.md`, `docs/mcp_client.md`
 - **Deployment:** `docs/deployment.md`, `deploy/kubernetes/`
 

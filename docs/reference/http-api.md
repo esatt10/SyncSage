@@ -29,9 +29,10 @@ See [Attach to a Synapse fleet](../how-to/attach-to-synapse.md).
 |---|---|---|
 | GET | `/knowledge-bases` | List knowledge bases. |
 | GET | `/overview` | One call for a UI cold start: knowledge base, sources, node counts, whether anything is indexed. Each source in `sources[]` carries live `syncing`/`sync_error` (see Sync below). |
-| GET | `/sources` | List configured + runtime sources. Each entry carries `syncing: bool` (a background sync — `wait: false` — is running now) and `sync_error: string \| null` (error from the most recent *background* sync, independent of `last_status`). |
+| GET | `/sources` | List configured + runtime sources. Each entry carries `syncing: bool` (a background sync — `wait: false` — is running now) and `sync_error: string \| null` (error from the most recent *background* sync, independent of `last_status`), plus `job` — the running job behind `syncing`, with its phase and counter (see Jobs below). |
 | GET | `/sources/types` | Registerable source types — built-ins plus installed connector plugins — each with a `path_role` of `required` or `unused`. |
 | POST | `/sources/quick-add` | One-field setup: a path, URL, glob or connector name is detected, named, registered and (by default) synced. Same inference as `pheasant up`. `sync_now` (default `true`) gates syncing at all; `wait` (default `true`) gates whether the response blocks on it — see Sync below. `wait: false` returns `sync_results: []` and `syncing: [names]` immediately; poll `GET /sources` for progress. |
+| POST | `/sources/upload` | **multipart.** Upload documents; they land under `/state/uploads/<name>/`, which is registered as an ordinary `document_folder` source and indexed through the normal pipeline — no second ingestion path. Fields: `files` (repeatable), `source_name` (default `uploads`), `sync_now`, `wait`. A second upload into the same name adds to it. One over-sized or empty file is reported in `rejected[]` without losing the rest. |
 | POST | `/sources` | Register a runtime source (full schema). Accepts plugin types; a plugin source needs no local path. Same `sync_now`/`wait` fields as quick-add. |
 | PUT | `/sources/{source_id}` | Update a source. |
 | POST | `/sources/{source_id}/disable` | Disable a source. |
@@ -66,6 +67,17 @@ registered by quick-add/`POST /sources` and never written to YAML is
 still valid here, resolved through the same state-registry fallback
 `SyncEngine._source` uses.
 
+## Jobs (background work)
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/jobs` | Every job, newest first; running ones sort ahead of finished. `?active=true` for running only. |
+| GET | `/jobs/{job_id}` | One job: phase, counter, log tail, terminal outcome. |
+| GET | `/jobs/stream` | Server-sent events, one per job update, primed with current state on connect. |
+
+Every source row (`/sources`, `/overview`) also carries `syncing`, `sync_error`
+and `job` — the live job behind the boolean, with its phase and counter.
+
 ## Search & retrieval
 
 | Method | Path | Purpose |
@@ -88,6 +100,13 @@ still valid here, resolved through the same state-registry fallback
 
 See [Ask your knowledge base](../how-to/chat-and-ui.md) and
 [Customize the answering workflow](../how-to/agent-workflows.md).
+
+## Retrieval tuning
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/assistant/retrieval` | The typed `assistant.retrieval` settings, what is *effective* once `workflow_options` is layered on, and one line of help per knob. |
+| PUT | `/assistant/retrieval` | Change one or more knobs. Omitted fields are left alone. Query-time only, so it applies to the next question — no restart, no re-index. |
 
 ## Semantic search (embeddings)
 
@@ -114,12 +133,19 @@ See [Vector self-search](../how-to/vector-search.md).
 | GET | `/graph/neighbors` | Neighbors of a node (depth + edge filters). |
 | GET | `/graph/export/node-link-json` | Export graph as node-link JSON. |
 | GET | `/graph/export/cytoscape-json` | Export graph as Cytoscape JSON. |
+| GET | `/graph/diagnostics` | Structural health: node/edge type histograms, hubs by degree, orphan count, density. Walks the whole graph — do not poll it. |
+| GET | `/graph/path` | Shortest path between two nodes (`source`, `target`, `max_depth`). Edges are followed in **both** directions: relatedness is not a question about which way an import points. |
 
 ## Filesystem & config
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/fs/list` | List filesystem entries under allowlisted roots (for the directory picker). |
+| GET | `/fs/host-path` | Can pheasant see this host path? Answers `native` / `visible` / `not_mounted` / `unknown`, and for `not_mounted` returns the exact remedy — compose volume, `docker run` flag, and the `allow_workspace_roots` entry it also needs. |
+| GET | `/config/sections` | Every config section with whether the running process can pick a change up. |
+| PATCH | `/config/section/{section}` | Validate, persist and (where safe) hot-apply **one** section. Reports `applied` vs `restart_required` honestly rather than saying "saved" for a value the process is still ignoring. |
+| GET | `/knowledge-base` | This knowledge base's identity and paths. |
+| PUT | `/knowledge-base` | Edit name/description. A **rename** changes `kb_id` — the graph root node and every stable artifact id — so it reports the full re-index it implies instead of silently orphaning the graph. |
 | GET | `/config` | Current config. |
 | GET | `/config/effective` | Resolved config after profile + YAML + overrides. |
 | PUT | `/config` | Update config. |

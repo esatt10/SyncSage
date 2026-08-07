@@ -118,6 +118,200 @@ def _engine(config_path: Path):
     return SyncEngine(cfg, paths, state)
 
 
+#: Progress lines carry this marker so the parent can tell them apart from the
+#: final report (which is also JSON on stdout) without guessing at shape.
+PROGRESS_MARKER = "pheasant.progress"
+
+
+def _progress_emitter():
+    """A progress hook that writes one NDJSON line per update to stdout.
+
+    This is the wire between the indexing child process and the server's job
+    registry (:mod:`pheasant.jobs`). Flushed per line: the whole point is that
+    the parent sees movement *while* the sync runs, and Python buffers stdout
+    when it is a pipe, which is exactly the case here.
+
+    Throttled by design — a progress line per file over 50,000 files is 50,000
+    writes the sync pays for and nobody reads. Updates are emitted on phase
+    changes, then at most every 25 items or once a second.
+    """
+    import time as _time
+
+    last = {"emitted": 0.0, "current": 0, "phase": ""}
+
+    def emit(phase: str, current: int, total: int | None, detail: str) -> None:
+        now = _time.monotonic()
+        changed_phase = phase != last["phase"]
+        if not changed_phase and current - last["current"] < 25 and now - last["emitted"] < 1.0:
+            return
+        last.update({"emitted": now, "current": current, "phase": phase})
+        line = json.dumps(
+            {
+                "marker": PROGRESS_MARKER,
+                "phase": phase,
+                "current": current,
+                "total": total,
+                "detail": detail,
+            }
+        )
+        print(line, flush=True)
+
+    return emit
+
+
+def _run_setup(args) -> int:
+    """Drive :mod:`pheasant.setup_wizard` and write everything it produced.
+
+    Kept out of ``main`` because it is the only subcommand with real
+    control flow, and because the tests drive it through here rather than
+    through ``input()``.
+    """
+    from pheasant.setup_wizard import (
+        PROGRESS_FILENAME,
+        Wizard,
+        ensure_gitignored,
+        load_progress,
+        render_config_yaml,
+        save_progress,
+        startup_commands,
+        write_env_file,
+    )
+
+    output = Path(args.output)
+    if output.exists() and not args.force:
+        print(f"ERROR: {output} already exists. Use --force to overwrite.", file=sys.stderr)
+        return 1
+
+    preset: dict = {}
+    if args.answers:
+        preset = json.loads(Path(args.answers).read_text(encoding="utf-8"))
+    progress_path = output.parent / PROGRESS_FILENAME
+    resumed_answers, resumed_sources = load_progress(progress_path)
+    # An explicit --answers file beats a stale resume file: the user just said
+    # what they want, and silently preferring yesterday's half-run would be a
+    # surprising way to ignore them.
+    merged = {**resumed_answers, **preset}
+
+    wizard = Wizard(
+        advanced=args.advanced,
+        accept_defaults=args.accept_defaults,
+        preset=merged,
+    )
+    wizard.sources = resumed_sources
+    try:
+        wizard.run()
+    except KeyboardInterrupt:
+        save_progress(progress_path, wizard)
+        print(f"\nStopped. Answers so far saved to {progress_path} — re-run to resume.")
+        return 130
+
+    try:
+        data = wizard.config_dict()
+    except (ValueError, TypeError) as exc:
+        save_progress(progress_path, wizard)
+        print(f"ERROR: those answers do not make a valid config: {exc}", file=sys.stderr)
+        return 1
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(render_config_yaml(data), encoding="utf-8")
+    print(f"\nWrote {output}")
+
+    secrets = wizard.env_values()
+    if secrets:
+        env_path = Path(args.env_output)
+        report = write_env_file(env_path, secrets)
+        changed = report["added"] + report["updated"]
+        print(f"Wrote {env_path} (mode 0600): {', '.join(changed)}")
+        note = ensure_gitignored(env_path)
+        if note:
+            print(note)
+    else:
+        print("No secrets entered — nothing written to .env.")
+
+    progress_path.unlink(missing_ok=True)
+    port = int(data.get("server", {}).get("port") or 8765)
+    print("\nNext:")
+    for line in startup_commands(output, args.target, port):
+        print(f"  {line}")
+    if not data.get("sources"):
+        print("\nNo sources yet. Add one with:")
+        print(f"  pheasant up <folder-or-url> -c {output}")
+    return 0
+
+
+def _run_mount(args) -> int:
+    """Write a bind mount for a host directory, and allow-list it in config.
+
+    Both halves matter: a mount alone makes the path visible but still
+    unregisterable, and an allow-list entry alone points at nothing.
+    """
+    import yaml
+
+    from pheasant.config.loader import dump_config_yaml
+    from pheasant.deployment.mounts import render_compose_override, suggested_container_path
+
+    host = str(Path(args.path).expanduser())
+    container = args.at or suggested_container_path(host)
+    override = Path(args.output)
+    existing = override.read_text(encoding="utf-8") if override.exists() else None
+    try:
+        rendered = render_compose_override(
+            {host: container}, service=args.service, existing=existing
+        )
+    except (ValueError, yaml.YAMLError) as exc:
+        print(f"ERROR: cannot update {override}: {exc}", file=sys.stderr)
+        return 1
+
+    config_path = Path(args.config)
+    config_note = None
+    config_text = None
+    if config_path.exists():
+        try:
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as exc:
+            print(f"ERROR: cannot read {config_path}: {exc}", file=sys.stderr)
+            return 1
+        if not isinstance(data, dict):
+            print(f"ERROR: {config_path} is not a pheasant config mapping", file=sys.stderr)
+            return 1
+        security = data.setdefault("security", {})
+        roots = list(security.get("allow_workspace_roots") or [])
+        if container not in roots:
+            # Keep the defaults: replacing the field wholesale with one entry
+            # would lock the user out of /workspace and /vault.
+            if not roots:
+                from pheasant.config.schema import SecuritySettings
+
+                roots = [str(p) for p in SecuritySettings().allow_workspace_roots]
+            roots.append(container)
+            security["allow_workspace_roots"] = roots
+            config_text = dump_config_yaml(data)
+            config_note = f"allow_workspace_roots += {container}"
+        else:
+            config_note = f"{container} is already allow-listed"
+
+    if args.print_only:
+        print(f"# {override}")
+        print(rendered, end="")
+        if config_text:
+            print(f"\n# {config_path} ({config_note})")
+            print(config_text, end="")
+        return 0
+
+    override.write_text(rendered, encoding="utf-8")
+    print(f"Wrote {override}: {host} -> {container} (read-only)")
+    if config_text:
+        config_path.write_text(config_text, encoding="utf-8")
+        print(f"Updated {config_path}: {config_note}")
+    elif config_note:
+        print(config_note)
+    else:
+        print(f"No {config_path} found — add {container} to security.allow_workspace_roots.")
+    print("\nApply it with:  docker compose up -d")
+    print(f"Then index it:  pheasant up {container} -c {config_path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="pheasant",
@@ -172,6 +366,52 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="write the compose file but do not run docker compose",
     )
+    setup_p = sub.add_parser(
+        "setup",
+        help="interactive, sectioned wizard: explains every option, writes "
+        "pheasant.yaml + a 0600 .env, prints the startup commands",
+    )
+    setup_p.add_argument("--output", "-o", default="pheasant.yaml")
+    setup_p.add_argument("--env-output", default=".env")
+    setup_p.add_argument(
+        "--advanced",
+        action="store_true",
+        help="ask about every option, not just the ones that usually matter",
+    )
+    setup_p.add_argument(
+        "--accept-defaults",
+        action="store_true",
+        help="ask nothing; write a config of defaults (scriptable)",
+    )
+    setup_p.add_argument(
+        "--answers",
+        help="JSON file of {dotted.config.key: value} to answer non-interactively",
+    )
+    setup_p.add_argument(
+        "--target",
+        choices=("local", "docker", "compose"),
+        default="local",
+        help="which startup commands to print at the end",
+    )
+    setup_p.add_argument("--force", action="store_true", help="overwrite an existing config")
+    mount_p = sub.add_parser(
+        "mount",
+        help="make a host directory visible inside the container: write the "
+        "bind mount into docker-compose.override.yml and allow-list it",
+    )
+    mount_p.add_argument("path", help="host directory to mount")
+    mount_p.add_argument(
+        "--at",
+        help=f"container path to mount it at [default: {'/data'}/<dirname>]",
+    )
+    mount_p.add_argument("--config", "-c", default="pheasant.yaml")
+    mount_p.add_argument("--service", default="pheasant")
+    mount_p.add_argument("--output", "-o", default="docker-compose.override.yml")
+    mount_p.add_argument(
+        "--print-only",
+        action="store_true",
+        help="show what would be written, change nothing",
+    )
     start_p = sub.add_parser("start")
     start_p.add_argument("--config", "-c", default="pheasant.yaml")
     start_p.add_argument("--profile", default="quickstart")
@@ -214,6 +454,12 @@ def main(argv: list[str] | None = None) -> int:
         "--json",
         action="store_true",
         help="emit the result as one JSON object (how the server's sync worker reports back)",
+    )
+    sync_p.add_argument(
+        "--progress",
+        action="store_true",
+        help="stream NDJSON progress lines on stdout as the sync advances "
+        "(how the server's sync worker drives the jobs tray)",
     )
     scan_p = sub.add_parser(
         "scan",
@@ -298,7 +544,16 @@ def main(argv: list[str] | None = None) -> int:
             for target in targets:
                 print(f"  + {target.name} ({target.type}) <- {target.path}")
         else:
-            print(f"Reusing existing {config_path} (never overwritten)")
+            from pheasant.quickstart import added_sources
+
+            added = added_sources()
+            if added:
+                print(f"Added to existing {config_path} (your settings are untouched)")
+                for target in targets:
+                    if target.name in added:
+                        print(f"  + {target.name} ({target.type}) <- {target.path}")
+            else:
+                print(f"Reusing existing {config_path} — every target is already configured")
         engine = _engine(config_path)
         try:
             results = engine.sync_all(args.mode)
@@ -325,6 +580,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"API + MCP:   http://{cfg.server.host}:{cfg.server.port}")
         _serve_app(cfg, str(config_path))
         return 0
+    if args.command == "setup":
+        return _run_setup(args)
+    if args.command == "mount":
+        return _run_mount(args)
     if args.command == "host":
         from pheasant.deployment.host import host_stack
         from pheasant.targets import TargetError
@@ -414,6 +673,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "sync":
         from pheasant.sync.locks import EngineLeaseError
 
+        on_progress = _progress_emitter() if getattr(args, "progress", False) else None
         engine = _engine(Path(args.config))
         try:
             # This process owns the CPU cost of indexing, so it also owns
@@ -423,7 +683,12 @@ def main(argv: list[str] | None = None) -> int:
             # process.
             engine.ensure_node_index()
             results = (
-                engine.sync_all(args.mode, max_depth=args.depth, full_scan=args.full_scan)
+                engine.sync_all(
+                    args.mode,
+                    max_depth=args.depth,
+                    full_scan=args.full_scan,
+                    on_progress=on_progress,
+                )
                 if args.all or not args.source
                 else [
                     engine.sync_source(
@@ -431,6 +696,7 @@ def main(argv: list[str] | None = None) -> int:
                         args.mode,
                         max_depth=args.depth,
                         full_scan=args.full_scan,
+                        on_progress=on_progress,
                     )
                 ]
             )

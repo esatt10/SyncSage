@@ -752,6 +752,12 @@ def answer_question(
     # any other workflow's block is skipped, and flat keys still work.
     configured_options = dict(getattr(settings, "workflow_options", None) or {})
     merged_options = {"max_facts": int(getattr(settings, "max_facts", 12) or 12)}
+    # Typed retrieval criteria (`assistant.retrieval`) sit UNDER
+    # `workflow_options`, so a config that already tuned the untyped dict is
+    # unchanged by their arrival — the block only fills in keys nobody set.
+    retrieval = getattr(settings, "retrieval", None)
+    if retrieval is not None and hasattr(retrieval, "as_options"):
+        merged_options.update(retrieval.as_options())
     nested_for_workflow: dict = {}
     for key, value in configured_options.items():
         if isinstance(value, dict) and (key in _known_workflow_names() or key == name):

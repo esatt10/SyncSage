@@ -26,7 +26,9 @@ def _source_names(config: object) -> set[str]:
     return names
 
 
-def test_config_loads_example_yaml_with_expected_sources(loaded_config: object, state_path: Path, vault_path: Path) -> None:
+def test_config_loads_example_yaml_with_expected_sources(
+    loaded_config: object, state_path: Path, vault_path: Path
+) -> None:
     """The rendered example config should load and preserve configured paths/sources."""
 
     assert _source_names(loaded_config) == {
@@ -35,7 +37,9 @@ def test_config_loads_example_yaml_with_expected_sources(loaded_config: object, 
         "product-documents",
     }
 
-    settings = _get(loaded_config, "pheasant") if isinstance(loaded_config, Mapping) else loaded_config
+    settings = (
+        _get(loaded_config, "pheasant") if isinstance(loaded_config, Mapping) else loaded_config
+    )
     state_value = str(_get(settings, "state_path"))
     vault_value = str(_get(settings, "vault_path"))
     assert str(state_path) in state_value
@@ -52,7 +56,9 @@ def test_config_validation_reports_missing_source_path(tmp_path: Path, config_pa
     )
 
     config_module = import_any(("pheasant.config.loader", "pheasant.config"))
-    loader = require_attr(config_module, ("load_config", "load_pheasant_config", "load", "from_yaml"), "config loader")
+    loader = require_attr(
+        config_module, ("load_config", "load_pheasant_config", "load", "from_yaml"), "config loader"
+    )
     try:
         loaded = loader(bad_config)
     except Exception as exc:  # noqa: BLE001 - acceptance test checks user-facing validation text.
@@ -60,10 +66,12 @@ def test_config_validation_reports_missing_source_path(tmp_path: Path, config_pa
         assert "missing-repo" in message or "does not exist" in message or "not found" in message
         return
 
-    validator = first_attr(config_module, ("validate_config", "validate", "validate_paths", "validate_source_paths")) or first_attr(
-        loaded, ("validate", "validate_paths")
+    validator = first_attr(
+        config_module, ("validate_config", "validate", "validate_paths", "validate_source_paths")
+    ) or first_attr(loaded, ("validate", "validate_paths"))
+    assert validator is not None, (
+        "Config loader must validate paths or expose an explicit validator."
     )
-    assert validator is not None, "Config loader must validate paths or expose an explicit validator."
     try:
         validation_result = validator(loaded, require_exists=True)
     except TypeError:

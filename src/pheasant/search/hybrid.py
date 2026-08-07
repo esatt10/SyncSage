@@ -126,7 +126,9 @@ class HybridSearch:
                     try:
                         collected[name] = future.result()
                     except Exception:
-                        logger.warning("hybrid search: %r arm failed, degrading", name, exc_info=True)
+                        logger.warning(
+                            "hybrid search: %r arm failed, degrading", name, exc_info=True
+                        )
                         collected[name] = []
         text_results = collected.get("text", [])
         graph_results = collected.get("graph", [])
