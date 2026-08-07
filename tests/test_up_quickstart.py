@@ -143,3 +143,63 @@ def test_render_up_config_is_deterministic(tmp_path: Path) -> None:
     assert once == twice
     assert ensure_up_config(target, config_path) is True
     assert ensure_up_config(target, config_path) is False
+
+
+def test_up_adds_a_new_target_to_an_existing_config(tmp_path: Path) -> None:
+    """Regression, found in a live run: `pheasant setup` writes a config with
+    no sources and tells you to add one with `pheasant up <folder> -c
+    <config>`. That silently indexed nothing — `up` treated any existing
+    config as "reuse", so the target was dropped and the command reported
+    success. A target that is not configured yet is appended."""
+    from pheasant.cli import main
+    from pheasant.config.loader import load_config
+
+    config_path = tmp_path / "pheasant.yaml"
+    assert main(["setup", "--accept-defaults", "-o", str(config_path)]) == 0
+    assert load_config(config_path).sources == []
+
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "a.md").write_text("# A\n\nSome prose.\n", encoding="utf-8")
+
+    assert main(["up", str(notes), "-c", str(config_path), "--no-serve"]) == 0
+
+    cfg = load_config(config_path)
+    assert [s.name for s in cfg.sources] == ["notes"]
+    assert str(notes) in {str(p) for p in cfg.security.allow_workspace_roots}
+
+
+def test_up_leaves_an_existing_config_byte_identical_when_nothing_is_new(
+    tmp_path: Path,
+) -> None:
+    """The other half of the contract: your edits are never rewritten."""
+    from pheasant.cli import main
+
+    config_path = tmp_path / "pheasant.yaml"
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "a.md").write_text("# A\n\nSome prose.\n", encoding="utf-8")
+
+    main(["up", str(notes), "-c", str(config_path), "--no-serve"])
+    before = config_path.read_bytes()
+    main(["up", str(notes), "-c", str(config_path), "--no-serve"])
+    assert config_path.read_bytes() == before
+
+
+def test_up_does_not_add_the_same_directory_twice_under_two_names(
+    tmp_path: Path,
+) -> None:
+    """Matching is by resolved path: the same directory reached two ways is
+    one source, not two indexes of the same content."""
+    from pheasant.cli import main
+    from pheasant.config.loader import load_config
+
+    config_path = tmp_path / "pheasant.yaml"
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "a.md").write_text("# A\n\nSome prose.\n", encoding="utf-8")
+
+    main(["up", str(notes), "-c", str(config_path), "--no-serve"])
+    main(["up", str(notes) + "/", "-c", str(config_path), "--no-serve"])
+
+    assert len(load_config(config_path).sources) == 1

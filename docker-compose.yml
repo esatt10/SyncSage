@@ -1,3 +1,15 @@
+# One service. The pheasant image serves the API, the MCP server and the web
+# UI from the same container on the same port, so there is nothing to wire up
+# between them — no sidecar, no nginx, no second published port, no CORS origin
+# to get right.
+#
+#   docker compose up -d              # everything, at http://localhost:8765
+#   docker compose up -d --build      # rebuild from this checkout
+#
+# The optional `pheasant-ui` sidecar below is for deployments that want to
+# serve or cache the static bundle separately; it is off unless you ask for it:
+#
+#   docker compose --profile ui up -d
 services:
   pheasant:
     build:
@@ -12,21 +24,22 @@ services:
       # iptables rules bypass most host firewalls, so this is not something
       # the machine's firewall would have caught. Set PHEASANT_BIND=0.0.0.0
       # only behind an authenticating ingress.
-      - "${PHEASANT_BIND:-127.0.0.1}:8765:8765"
+      - "${PHEASANT_BIND:-127.0.0.1}:${PHEASANT_PORT:-8765}:8765"
     environment:
       PHEASANT_CONFIG: /config/pheasant.yaml
     volumes:
-      - ${PHEASANT_CONFIG_PATH:-./pheasant.example.yaml}:/config/pheasant.yaml:ro
-      # The example config's only source is `path: /workspace`, so whatever is
-      # mounted here IS the demo corpus. It defaults to the repository root —
-      # mounting an empty ./workspace instead indexes nothing, and the UI then
-      # shows a single knowledge-base node with no graph around it.
+      # No config file? Leave this commented out and the entrypoint generates
+      # one on first boot from the same defaults `pheasant setup` uses.
+      # - ${PHEASANT_CONFIG_PATH:-./pheasant.yaml}:/config/pheasant.yaml:ro
+      - pheasant-config:/config
+      # Whatever is mounted here is the corpus. Defaults to the repository
+      # root; point it anywhere with PHEASANT_WORKSPACE_PATH.
       - ${PHEASANT_WORKSPACE_PATH:-.}:/workspace:ro
-      # Local files that live OUTSIDE ./workspace: point PHEASANT_DATA_PATH at
-      # any host directory and it appears in the container at /data (an allowed
-      # source root). This is how you index files that aren't a subdirectory of
-      # the workspace. Add more mounts here (or in docker-compose.override.yml)
-      # the same way, then add each container path to security.allow_workspace_roots.
+      # Local files that live OUTSIDE the workspace: point PHEASANT_DATA_PATH
+      # at any host directory and it appears in the container at /data (an
+      # allowed source root). `pheasant mount <hostpath>` writes further
+      # mounts into docker-compose.override.yml for you, and the UI tells you
+      # the exact line to add when you paste a path it cannot see.
       - ${PHEASANT_DATA_PATH:-./data}:/data:ro
       - ${PHEASANT_VAULT_PATH:-./vault}:/vault
       - pheasant-state:/state
@@ -36,7 +49,7 @@ services:
     # agentic question or a graph walk holds the GIL, even that trivial handler
     # waits its turn. A tight budget here does not detect a problem, it invents
     # one — the container flips to unhealthy under exactly the load it is
-    # meant to be serving, which is what gates `pheasant-ui` below.
+    # meant to be serving.
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health || exit 1"]
       interval: 60s
@@ -44,24 +57,18 @@ services:
       retries: 5
       start_period: 30s
 
-  # Optional web UI at http://localhost:8080. A separate workload that serves the
-  # static React bundle and proxies /api/* to the pheasant service above.
-  #
-  #   docker compose up -d --build        # build this checkout's UI and run it
-  #   docker compose up -d --build pheasant-ui   # rebuild just the UI
-  #   docker compose up -d pheasant       # headless: API + MCP only, no UI
-  #
-  # Always pass --build when you want the CURRENT ui/ sources: with an `image:`
-  # tag already present locally, Compose reuses it and your UI changes appear to
-  # do nothing. See docs/how-to/run-the-ui.md.
+  # Optional: the static bundle served by its own nginx, proxying /api/* to the
+  # service above. The main image already serves the UI, so this exists only
+  # for deployments that want the front end scaled or cached independently.
+  # Enable with: docker compose --profile ui up -d
   pheasant-ui:
+    profiles: ["ui"]
     build:
       context: ./ui
     image: ${PHEASANT_UI_IMAGE:-ghcr.io/esatt10/pheasant-ui:0.8.3}
     container_name: pheasant-ui
     restart: unless-stopped
     ports:
-      # Loopback by default, for the same reason as the API above.
       - "${PHEASANT_BIND:-127.0.0.1}:${PHEASANT_UI_PORT:-8080}:80"
     depends_on:
       pheasant:
@@ -70,3 +77,4 @@ services:
 volumes:
   pheasant-state:
   pheasant-exports:
+  pheasant-config:

@@ -46,10 +46,11 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 
 > **Note:** this table's row order follows `PheasantConfig`'s field order in
 > `src/pheasant/config/schema.py`, not necessarily the order sections appear
-> below. `tests/test_config_wizard_freshness.py` fails CI if a new top-level
-> or nested settings block lands in that file without a matching mention
-> here and in `agent/config_wizard_prompt.md` — see
-> [the config wizard how-to](how-to/config-wizard.md).
+> below. `tests/test_config_surface_freshness.py` fails CI if a new top-level
+> settings block lands in that file without a mention here and without being
+> reachable from `pheasant setup` — see [Set pheasant up](how-to/setup.md).
+> You rarely need to write any of this by hand: `pheasant setup` asks about
+> every section, and the web UI's Settings page edits most of them live.
 
 ---
 
@@ -410,6 +411,51 @@ default and works fully offline.
 | `max_facts` | int | `12` | Graph facts surfaced per answer, collected round-robin across the cited sources. |
 | `workflow` | str | `auto` | Which agent workflow answers a question: `auto` \| `knowledge-summary` \| `agentic` \| `simple` \| any registered plugin name. `auto` = `agentic` when the `[agent]` extra is installed *and* a model is reachable, else `simple`. An unknown or failing workflow degrades to `simple` with the reason attached to the answer. |
 | `workflow_options` | dict | `{}` | Per-workflow tuning, keyed by workflow name, merged over that workflow's defaults. Callers may override any key per request. |
+| `retrieval` | block | see below | Typed retrieval criteria — the same knobs, with names, validation and a UI. |
+
+### `assistant.retrieval` — how hard to look before answering
+
+These knobs already existed as untyped keys inside `workflow_options`,
+documented only in a workflow module's `DEFAULTS` dict. This block is their
+typed home, which is what makes them validated, editable from the UI
+(Settings → Retrieval tuning), and readable by an agent over MCP
+(`describe_retrieval`).
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `max_rounds` | int \| null | `2` | plan → retrieve → grade turns before answering with what is in hand. `1` disables the re-plan loop. |
+| `per_query_results` | int \| null | `6` | Passages fetched per query per search mode. |
+| `max_context_passages` | int \| null | `10` | Total passages offered to the answering step. |
+| `retrieval_modes` | list \| null | `["text", "vector"]` | Modes to fan out over. `vector` is dropped automatically when no vector index is built, so leaving it on is safe. |
+| `expand_graph` | bool \| null | `true` | Walk the graph out of the best hits, reaching documents that share no vocabulary with the question. |
+| `expand_depth` | int \| null | `1` | Hops to walk when expanding. |
+| `expand_per_node` | int \| null | `3` | Neighbours taken per expanded node. |
+| `grade_evidence` | bool \| null | `true` | Ask the model to grade its own evidence before answering. |
+| `verify_citations` | bool \| null | `true` | Drop `[n]` markers that do not resolve to a real citation. |
+| `max_facts` | int \| null | `12` | Graph facts surfaced alongside the answer. |
+
+**Precedence is deliberately low.** Values merge in this order, later winning:
+
+```
+workflow DEFAULTS  <  assistant.retrieval  <  assistant.workflow_options  <  per-request options
+```
+
+So a config that already tuned `workflow_options` is completely unaffected by
+this block's arrival, and an agent overriding a criterion for one call still
+wins over both. A field left `null` is **not merged at all** — the workflow's
+own default applies — which is what keeps this additive rather than a second
+source of truth for values it does not care about.
+
+Editable live: `GET`/`PUT /assistant/retrieval`. Retrieval is query-time only,
+so a change applies to the next question with no restart and no re-index.
+
+```yaml
+assistant:
+  retrieval:
+    max_rounds: 3
+    max_context_passages: 16
+    retrieval_modes: ["text", "vector", "graph"]
+```
 
 **The key never lands in config.** Both routes are indirections: an
 environment variable *name* here, or a runtime token in the browser. Nothing

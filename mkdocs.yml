@@ -66,7 +66,7 @@ nav:
       - 10-minute quickstart: tutorials/quickstart.md
       - Multi-modal ingest (image + audio): tutorials/multimodal.md
   - How-to guides:
-      - Build your config with the guided wizard: how-to/config-wizard.md
+      - Set pheasant up: how-to/setup.md
       - Run the web UI (Docker Compose & CLI): how-to/run-the-ui.md
       - Ask your knowledge base (web UI): how-to/chat-and-ui.md
       - Customize the answering workflow: how-to/agent-workflows.md
