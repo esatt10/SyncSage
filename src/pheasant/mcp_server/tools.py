@@ -363,6 +363,7 @@ class PheasantTools:
         include_graph_neighbors: bool = True,
         principal: str | None = None,
         principal_groups: list[str] | None = None,
+        section: str | None = None,
     ) -> dict:
         self._require_knowledge_base(knowledge_base)
         return self.searcher.search_context(
@@ -374,6 +375,7 @@ class PheasantTools:
             principal=principal,
             principal_groups=principal_groups,
             security=self.config.security,
+            section=section,
         )
 
     def ask_knowledge_base(

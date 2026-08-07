@@ -1040,3 +1040,473 @@ def test_section_keyword_nests_under_a_chapter_by_ordinal() -> None:
     differing keywords are not a reason to refuse it."""
     headings = detect_headings("CHAPTER 4\nScope\n\nSECTION 4.1\nDetail\n")
     assert _by_number(headings, "Section 4.1").path == "Chapter 4 Scope > Section 4.1 Detail"
+
+
+# ---------------------------------------------------------------------------
+# Ordinal disambiguation from the surrounding run, and series identity across
+# parents — the two items the first ordinal pass recorded as still open.
+
+
+def _lettered_values(text: str) -> list[int]:
+    headings = detect_headings(text, rules=("lettered",))
+    return [h.ordinal.parts[0] for h in headings if h.ordinal]
+
+
+def test_a_letter_list_that_reaches_i_keeps_counting() -> None:
+    """The limitation the character-only reading left behind.
+
+    `i` is both the ninth letter and roman 1. Read alone it is the numeral, so
+    a lettered list counting up to its ninth item used to restart at 1 in the
+    middle. The run says otherwise: 9 follows 8, 1 does not.
+    """
+    assert _lettered_values("\n".join(f"({c}) item" for c in "fghijk")) == [6, 7, 8, 9, 10, 11]
+
+
+def test_a_letter_list_that_reaches_v_keeps_counting() -> None:
+    """Same defect, different character — `(v)` after `(u)` is 22, not 5."""
+    assert _lettered_values("\n".join(f"({c}) item" for c in "tuvw")) == [20, 21, 22, 23]
+
+
+def test_a_roman_sub_list_is_still_roman() -> None:
+    """The reading that must not regress: a run *opening* at `(i)` is roman."""
+    assert _lettered_values("\n".join(f"({r}) item" for r in ["i", "ii", "iii", "iv", "v"])) == [
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+
+
+def test_a_nested_list_opening_at_i_is_roman_not_the_ninth_letter() -> None:
+    """`(b)` then `(i)` continues neither reading (9 and 1 both follow 2 badly),
+    so the convention stands and the nested list opens at roman 1."""
+    assert _lettered_values("(a) x\n(b) y\n(i) sub\n(ii) sub\n(c) z") == [1, 2, 1, 2, 3]
+
+
+def test_a_non_lettered_heading_breaks_the_run() -> None:
+    """A run is consecutive lettered items; a section between them starts a new
+    one, so the `(i)` below opens a list rather than continuing `(h)`."""
+    headings = detect_headings("(h) eighth\n§ 5 Interruption\n(i) opens a new list\n")
+    values = [h.ordinal.parts[0] for h in headings if h.ordinal and h.kind == "lettered"]
+    assert values == [8, 1]
+
+
+def test_parse_ordinal_alone_still_reads_i_as_roman() -> None:
+    """The single-heading reading is unchanged — disambiguation needs a run, and
+    one item in isolation has none."""
+    from pheasant.ingestion.taxonomy import parse_ordinal
+
+    assert parse_ordinal("(i)", "lettered").parts == (1,)
+
+
+def test_a_gap_is_found_when_an_interruption_reparents_the_tail() -> None:
+    """Grouping sequence checks by resolved parent hid this.
+
+    An unnumbered heading between `§ 12.2` and `§ 12.4` re-parents the tail, so
+    the two ends of one series sit under different parents. The series is
+    identified by its numeric prefix, not by where its members landed, so the
+    gap is still reported.
+    """
+    from pheasant.ingestion.taxonomy import reconcile_issues
+
+    headings = detect_headings("§ 12.1 Alpha\n§ 12.2 Beta\nGENERAL PROVISIONS\n§ 12.4 Delta\n")
+    tail = _by_number(headings, "§ 12.4")
+    assert "GENERAL PROVISIONS" in tail.path, "precondition: the tail is re-parented"
+    gaps = [i for i in reconcile_issues(headings) if i["kind"] == "gap"]
+    assert len(gaps) == 1
+    assert gaps[0]["after"] == "§ 12.2" and gaps[0]["at"] == "§ 12.4"
+    assert gaps[0]["missing"] == [3]
+
+
+def test_a_per_part_restart_is_not_a_defect() -> None:
+    """The other half of the same rule, and why top-level series stay grouped by
+    parent: two Parts each numbering their sections from 1 is two series, not
+    one that jumped backwards."""
+    from pheasant.ingestion.taxonomy import reconcile_issues
+
+    headings = detect_headings("PART I\n1. Scope\n2. Terms\nPART II\n1. Duties\n2. Payment\n")
+    assert reconcile_issues(headings) == []
+
+
+def test_a_container_parents_the_numbering_inside_it() -> None:
+    """`PART I` and `1. Scope` are both "one", so the conflicting-series rule
+    used to refuse the attachment and flatten the section out of its Part. A
+    container exists to hold a numbering it does not participate in."""
+    headings = detect_headings("PART I\n1. Scope\n2. Terms\n")
+    assert _by_number(headings, "1").path == "Part I > 1 Scope"
+    assert _by_number(headings, "2").path == "Part I > 2 Terms"
+
+
+def test_a_container_does_not_parent_another_container() -> None:
+    """`PART II` is beside `PART I`, never inside it — the permission is for a
+    *different* series only."""
+    headings = detect_headings("PART I\nFirst\nPART II\nSecond\n")
+    assert _by_number(headings, "Part II").level == _by_number(headings, "Part I").level
+    # Substring-safe: "Part I" is a prefix of "Part II", so test the breadcrumb
+    # separator rather than mere containment.
+    assert PATH_SEPARATOR not in _by_number(headings, "Part II").path
+
+
+def test_a_container_parents_a_chapter_with_an_unrelated_number() -> None:
+    headings = detect_headings("PART I\nOpening\nCHAPTER 2\nDetail\n")
+    assert _by_number(headings, "Chapter 2").path.startswith("Part I")
+
+
+# ---------------------------------------------------------------------------
+# Section-filtered retrieval. The outline is only half the point: "what does
+# § 12.3 say about X" needs to be *askable*, not merely labelled.
+
+
+def _sectioned_client(tmp_path: Path) -> TestClient:
+    """A synced knowledge base holding LEGAL with taxonomy on."""
+    client, workspace = _client(tmp_path)
+    client.post(
+        "/sources",
+        json={
+            "name": "legal",
+            "type": "document_folder",
+            "path": str(workspace),
+            "include": ["**/*.md"],
+            "taxonomy": {"enabled": True},
+            "sync_now": True,
+            "wait": True,
+        },
+    )
+    return client
+
+
+def _search(client: TestClient, query: str, **extra: object) -> list[dict]:
+    body: dict[str, object] = {"query": query, "mode": "text", "max_results": 20}
+    body.update(extra)
+    return client.post("/search", json=body).json()["results"]
+
+
+def test_search_can_be_restricted_to_one_section(tmp_path: Path) -> None:
+    """The question the feature exists to answer, asked directly."""
+    client = _sectioned_client(tmp_path)
+    hits = _search(client, "governed Delaware", section="§ 12.3")
+    assert hits, "expected the Governing Law section to answer"
+    assert all("12.3" in hit["heading_path"] for hit in hits)
+
+
+def test_a_section_filter_excludes_matches_from_other_sections(tmp_path: Path) -> None:
+    """The half that makes it a filter rather than a ranking nudge: a term that
+    genuinely appears elsewhere in the document must not come back."""
+    client = _sectioned_client(tmp_path)
+    unfiltered = _search(client, "terminate breach")
+    assert any("4.2" in hit.get("heading_path", "") for hit in unfiltered), "precondition"
+    assert _search(client, "terminate breach", section="§ 12.3") == []
+
+
+def test_naming_a_parent_section_returns_what_is_nested_under_it(tmp_path: Path) -> None:
+    """Matching the whole breadcrumb, not just its last crumb, is what makes
+    asking for an Article reach its subsections."""
+    client = _sectioned_client(tmp_path)
+    hits = _search(client, "breach insolvency terminate", section="Article IV")
+    assert hits
+    assert all("Article IV" in hit["heading_path"] for hit in hits)
+    # ...and it reached deeper than the Article's own text.
+    assert any(hit["heading_path"].count(">") >= 2 for hit in hits)
+
+
+def test_a_section_that_matches_nothing_returns_no_results_not_an_error(tmp_path: Path) -> None:
+    client = _sectioned_client(tmp_path)
+    response = client.post(
+        "/search", json={"query": "breach", "mode": "text", "section": "§ 99.9 Nonexistent"}
+    )
+    assert response.status_code == 200
+    assert response.json()["results"] == []
+
+
+def test_omitting_the_section_is_unchanged(tmp_path: Path) -> None:
+    """Parity: the filter is additive, so a request without it must return
+    exactly what it returned before the filter existed."""
+    client = _sectioned_client(tmp_path)
+    without = client.post("/search", json={"query": "breach", "mode": "hybrid"}).json()
+    explicit_none = client.post(
+        "/search", json={"query": "breach", "mode": "hybrid", "section": None}
+    ).json()
+    assert without == explicit_none
+    blank = client.post("/search", json={"query": "breach", "mode": "hybrid", "section": "  "}).json()
+    assert without == blank
+
+
+def test_section_matching_is_substring_and_case_insensitive() -> None:
+    from pheasant.search.sqlite_store import section_matches, section_needle
+
+    path = "MASTER SERVICES AGREEMENT > Article IV Term and Termination > § 12.3 Governing Law"
+    assert section_matches(path, "§ 12.3")
+    assert section_matches(path, "article iv")
+    assert section_matches(path, "Governing Law")
+    assert not section_matches(path, "Schedule 1")
+    # No filter requested: everything matches, including a chunk with no
+    # breadcrumb at all, so a corpus without taxonomy is unaffected.
+    assert section_matches(None, None) and section_matches("", "")
+    assert not section_matches(None, "§ 12.3")
+    assert section_needle("  § 12.3 ") == "§ 12.3"
+
+
+def test_mcp_search_context_accepts_a_section(tmp_path: Path) -> None:
+    """Rule 8: additive optional parameter on the public tool surface."""
+    from pheasant.mcp_server.tools import PheasantTools
+
+    engine = _engine(tmp_path, LEGAL, taxonomy={"enabled": True})
+    engine.sync_source("docs")
+    tools = PheasantTools(engine.config)
+    payload = tools.search_context(
+        engine.config.knowledge_base_id, "governed Delaware", mode="text", section="§ 12.3"
+    )
+    assert payload["results"]
+    assert all("12.3" in hit["heading_path"] for hit in payload["results"])
+    # Omitting it is the pre-existing behaviour.
+    plain = tools.search_context(engine.config.knowledge_base_id, "governed Delaware", mode="text")
+    assert len(plain["results"]) >= len(payload["results"])
+
+
+def test_a_section_filter_keeps_graph_hits_out_of_hybrid_results(tmp_path: Path) -> None:
+    """The arms that cannot be narrowed in SQL still have to be narrowed.
+
+    Graph search matches entity / relationship / heading nodes, none of which
+    carry a breadcrumb, so under a section filter they are dropped: a symbol is
+    not *inside* § 12.3, and admitting it would answer a question about one
+    section with content from anywhere. Browsing the outline itself is what
+    ``GET /taxonomy`` is for.
+    """
+    client = _sectioned_client(tmp_path)
+    wide = client.post("/search", json={"query": "governing", "mode": "hybrid"}).json()
+    assert wide["counts"]["graph"] > 0, "precondition: the graph arm answers this query"
+
+    narrowed = client.post(
+        "/search", json={"query": "governing", "mode": "hybrid", "section": "§ 12.3"}
+    ).json()
+    assert narrowed["counts"]["graph"] == 0
+    assert narrowed["results"], "the section's own chunk should still answer"
+    for hit in narrowed["results"]:
+        assert "12.3" in (hit.get("heading_path") or ""), hit
+
+
+# ---------------------------------------------------------------------------
+# What the UI reads. The React surfaces are thin over these payloads, so the
+# payloads are what gets tested here.
+
+
+def test_stored_source_config_carries_the_taxonomy_block(tmp_path: Path) -> None:
+    """The edit form and the "outline" button both read `config_json`.
+
+    If the block were not persisted there, opening a taxonomy-enabled source in
+    the Advanced form would prefill the checkbox as *off* and saving would
+    silently switch the feature off — a data-losing round trip, not a cosmetic
+    gap.
+    """
+    client = _sectioned_client(tmp_path)
+    record = next(s for s in client.get("/sources").json() if s["name"] == "legal")
+    stored = json.loads(record["config_json"])
+    assert stored["taxonomy"]["enabled"] is True
+    # The two sub-toggles the form also offers must survive the round trip.
+    assert stored["taxonomy"]["split_on_sections"] is True
+    assert stored["taxonomy"]["graph_nodes"] is True
+
+
+def test_editing_a_source_can_turn_the_toggle_off_and_on(tmp_path: Path) -> None:
+    client = _sectioned_client(tmp_path)
+    assert client.put("/sources/legal", json={"taxonomy": {"enabled": False}}).status_code == 200
+    off = json.loads(next(s for s in client.get("/sources").json() if s["name"] == "legal")["config_json"])
+    assert off["taxonomy"]["enabled"] is False
+    assert client.put("/sources/legal", json={"taxonomy": {"enabled": True}}).status_code == 200
+    on = json.loads(next(s for s in client.get("/sources").json() if s["name"] == "legal")["config_json"])
+    assert on["taxonomy"]["enabled"] is True
+
+
+def test_citations_name_the_section_they_came_from(tmp_path: Path) -> None:
+    """What the answer's source chips show.
+
+    On a long structured document the file name is nearly no information — every
+    citation carries the same one — so the section is the part that tells a
+    reader where the answer came from.
+    """
+    from pheasant.assistant.chat import build_citations
+
+    engine = _engine(tmp_path, LEGAL, taxonomy={"enabled": True})
+    engine.sync_source("docs")
+    searcher = HybridSearch(SearchStore(engine.state))
+    payload = searcher.search_context(
+        engine.config.knowledge_base_id, "governed Delaware", mode="text"
+    )
+    citations = build_citations(payload["results"], limit=5)
+    assert citations
+    assert any("Governing Law" in (c.get("heading_path") or "") for c in citations), citations
+
+
+def test_citations_omit_the_section_without_taxonomy(tmp_path: Path) -> None:
+    """Parity: a corpus with no taxonomy produces the citation payload it
+    always did, with no empty `heading_path` key added."""
+    from pheasant.assistant.chat import build_citations
+
+    engine = _engine(tmp_path, LEGAL)  # no taxonomy block at all
+    engine.sync_source("docs")
+    searcher = HybridSearch(SearchStore(engine.state))
+    payload = searcher.search_context(
+        engine.config.knowledge_base_id, "governed Delaware", mode="text"
+    )
+    citations = build_citations(payload["results"], limit=5)
+    assert citations
+    assert all("heading_path" not in c for c in citations)
+
+
+def test_passage_citations_carry_the_section_too(tmp_path: Path) -> None:
+    """The workflow-facing citation builder must not drop what the other keeps —
+    the two produce the same shape on purpose."""
+    from pheasant.assistant.chat import passages_to_citations
+    from pheasant.assistant.retrieval import Passage
+
+    passage = Passage(
+        node_id="n1",
+        chunk_id="c1",
+        title="msa.md",
+        relative_path="msa.md",
+        source_id="legal",
+        type="chunk",
+        score=1.0,
+        snippet="…",
+        mode="text",
+        heading_path="MASTER SERVICES AGREEMENT > § 12.3 Governing Law",
+    )
+    assert passages_to_citations([passage], 5)[0]["heading_path"].endswith("Governing Law")
+    plain = Passage(
+        node_id="n2",
+        chunk_id="c2",
+        title="notes.md",
+        relative_path="notes.md",
+        source_id="docs",
+        type="chunk",
+        score=1.0,
+        snippet="…",
+        mode="text",
+    )
+    assert "heading_path" not in passages_to_citations([plain], 5)[0]
+
+
+# ---------------------------------------------------------------------------
+# A real, producer-generated PDF. Everything above works on text authored
+# directly in this file, which cannot reproduce what a PDF extractor actually
+# emits — and the difference found a bug. `agreement.pdf` was written as HTML
+# (kept beside it as `agreement.source.html`) and converted by LibreOffice, so
+# it has real PDF line layout and real kerning.
+
+STRUCTURED = Path(__file__).parent / "fixtures" / "structured"
+AGREEMENT = STRUCTURED / "agreement.pdf"
+
+
+def _agreement_client(tmp_path: Path) -> TestClient:
+    import shutil
+
+    workspace = tmp_path / "workspace" / "contracts"
+    workspace.mkdir(parents=True, exist_ok=True)
+    shutil.copy(AGREEMENT, workspace / "agreement.pdf")
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "agreement",
+                "state_path": str(tmp_path / "state"),
+                "vault_path": str(tmp_path / "vault"),
+                "workspace_root": str(tmp_path / "workspace"),
+                "exports_path": str(tmp_path / "exports"),
+            },
+            "sources": [],
+        }
+    )
+    client = TestClient(create_app(config))
+    assert (
+        client.post(
+            "/sources",
+            json={
+                "name": "contracts",
+                "type": "document_folder",
+                "path": str(workspace),
+                "include": ["**/*.pdf"],
+                "taxonomy": {"enabled": True},
+                "sync_now": True,
+                "wait": True,
+            },
+        ).status_code
+        == 200
+    )
+    return client
+
+
+def test_a_keyword_line_needs_a_real_ordinal_not_a_stray_word() -> None:
+    """The bug the real PDF found, isolated.
+
+    PDF text arrives already broken into layout lines, so a paragraph's
+    continuation can *begin* with "Section" or "Part" — and this extractor
+    renders "of" as "o f", which is ordinary kerning. The keyword pattern is
+    case-insensitive, so its single-letter alternative read that ``o`` as
+    ordinal 15 and invented a heading in the middle of a sentence. Worse, the
+    invented heading became a **parent**, re-parenting genuine sections under
+    it.
+    """
+    assert detect_headings("Section o f this Agreement unless stated otherwise.") == []
+    assert detect_headings("part o f its assets.") == []
+    # A real letter citation is written in capitals, and still works.
+    assert [h.number for h in detect_headings("PART A\nGeneral Provisions\n")] == ["Part A"]
+    assert [h.number for h in detect_headings("ANNEX B\nFee Table\n")] == ["Annex B"]
+
+    # A *numeric* citation opening a prose line is the case the ordinal check
+    # cannot catch — "1" is a perfectly good ordinal — so the keyword branch
+    # also runs the same prose filter every other rule already used. It had
+    # none before: only a line-length check, and this line is short enough.
+    assert detect_headings(
+        "Part 1 of the agreement shall be construed as follows, and the parties agree."
+    ) == []
+
+
+def test_the_real_agreement_outline_is_correct(tmp_path: Path) -> None:
+    """End to end on producer-generated bytes: extract, detect, reconcile, index."""
+    client = _agreement_client(tmp_path)
+    document = client.get("/taxonomy", params={"path": "agreement.pdf"}).json()["documents"]
+    assert document, "no outline extracted from a real PDF"
+
+    labels: list[str] = []
+
+    def walk(nodes: list[dict], depth: int = 0) -> None:
+        for node in nodes:
+            labels.append(f"{depth}:{(node['number'] or '').strip()} {node['title']}".strip())
+            walk(node["children"], depth + 1)
+
+    walk(document[0]["tree"])
+    flat = " | ".join(labels)
+
+    # Containers parent the numbering inside them (depth 1 under the Part), and
+    # each Part's sections restart from 1 without that reading as a defect.
+    assert "0:Part I General Terms" in labels
+    assert "1:Article IV Term and Termination" in labels
+    assert "2:4.1 Initial Term" in labels
+    assert "0:Part II Commercial Terms" in labels
+    assert "1:1 Charges" in labels and "1:2 Expenses" in labels
+    # No invented heading from a mid-sentence "Section o f" / "part o f" line.
+    assert "Part o" not in flat and "Section o" not in flat
+    # Both real gaps are reported, and only those two: the § series skips 12.3,
+    # and the Articles jump I -> IV. Each is a genuine defect in the drafting
+    # this document deliberately imitates, and each is found in a *different*
+    # numbering series, which is what makes them independent evidence.
+    gaps = {(g["series"], g["after"], g["at"], tuple(g["missing"])) for g in document[0]["issues"] if g["kind"] == "gap"}
+    assert gaps == {
+        ("code", "§ 12.2", "§ 12.4", (3,)),
+        ("article", "Article I", "Article IV", (2, 3)),
+    }
+
+
+def test_the_real_agreement_is_searchable_by_section(tmp_path: Path) -> None:
+    """The question the whole feature exists to answer, on real bytes."""
+    client = _agreement_client(tmp_path)
+
+    def sections(query: str, section: str) -> list[str]:
+        body = {"query": query, "mode": "text", "max_results": 20, "section": section}
+        return [h["heading_path"].split(" > ")[-1] for h in client.post("/search", json=body).json()["results"]]
+
+    assert sections("governing law jurisdiction", "§ 12.4") == ["§ 12.4 Governing Law"]
+    # Naming the Article reaches a lettered sub-item nested two levels under it.
+    assert sections("insolvency receiver", "Article IV") == ["(b) Insolvency"]
+    # And a term from another section does not leak into this one.
+    assert sections("insolvency receiver", "§ 12.4") == []

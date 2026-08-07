@@ -108,6 +108,8 @@ export interface SourceWritePayload {
   exclude?: string[];
   repo?: Record<string, unknown>;
   chunking?: Record<string, unknown>;
+  /** Per-source structural taxonomy extraction; off unless enabled here. */
+  taxonomy?: Record<string, unknown>;
   sync?: Record<string, unknown>;
   connector?: Record<string, unknown>;
   urls?: string[];
@@ -236,6 +238,9 @@ export interface Citation {
   score?: number;
   snippet: string;
   used: boolean;
+  /** Breadcrumb of the section this passage came from; absent unless the
+   *  source has taxonomy extraction enabled. */
+  heading_path?: string;
 }
 
 export interface GraphFact {
@@ -359,4 +364,44 @@ export interface QuickAddResponse {
   sync_results: SyncResult[];
   /** Names of sources whose first sync was handed off to a background thread (wait: false). */
   syncing: string[];
+}
+
+/** One node of a document's extracted outline (`GET /taxonomy`). */
+export interface TaxonomyNode {
+  line: number;
+  level: number;
+  number?: string | null;
+  title: string;
+  kind: string;
+  path: string;
+  children: TaxonomyNode[];
+}
+
+/**
+ * A numbering defect found while reconciling a series: a gap, a repeated
+ * number, or one that goes backwards.
+ */
+export interface TaxonomyIssue {
+  kind: "gap" | "duplicate" | "out_of_order";
+  series: string;
+  parent: string;
+  after?: string | null;
+  at?: string | null;
+  line: number;
+  /** Present on `gap` only: the numbers that are missing between the two. */
+  missing?: number[];
+}
+
+export interface TaxonomyDocument {
+  relative_path: string;
+  heading_count: number;
+  tree: TaxonomyNode[];
+  issues: TaxonomyIssue[];
+}
+
+export interface TaxonomyResponse {
+  documents: TaxonomyDocument[];
+  heading_count: number;
+  issue_count: number;
+  truncated: boolean;
 }

@@ -196,11 +196,17 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         include_graph_neighbors: bool = True,
         principal: str | None = None,
         principal_groups: list[str] | None = None,
+        section: str | None = None,
     ) -> dict:
         """Search indexed context and return compact results with provenance.
 
         principal/principal_groups scope results to what that caller may see
         when security.acl_enforced is on (Step 32.2); ignored otherwise.
+
+        section restricts results to one part of a document's extracted
+        taxonomy, matched against the breadcrumb — "§ 12.3", "Article IV" or a
+        section's wording all work, and naming a parent returns everything
+        nested under it. Only meaningful for sources with taxonomy enabled.
         """
 
         return tools.search_context(
@@ -212,6 +218,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             include_graph_neighbors,
             principal=principal,
             principal_groups=principal_groups,
+            section=section,
         )
 
     @mcp.tool()

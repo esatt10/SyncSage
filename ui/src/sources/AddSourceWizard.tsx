@@ -45,6 +45,12 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
   const [chunkStrategy, setChunkStrategy] = useState(String(chunking.strategy ?? "semantic"));
   const [chunkMax, setChunkMax] = useState(String(chunking.max_chars ?? 4000));
   const [chunkOverlap, setChunkOverlap] = useState(String(chunking.overlap_chars ?? 400));
+  // Structural taxonomy: off by default, and per-source on purpose — it is a
+  // claim that this corpus really is structured documentation.
+  const taxonomy = (initial.taxonomy ?? {}) as Record<string, unknown>;
+  const [taxonomyEnabled, setTaxonomyEnabled] = useState(Boolean(taxonomy.enabled ?? false));
+  const [taxonomySplit, setTaxonomySplit] = useState(Boolean(taxonomy.split_on_sections ?? true));
+  const [taxonomyGraphNodes, setTaxonomyGraphNodes] = useState(Boolean(taxonomy.graph_nodes ?? true));
   const [repoBranchPolicy, setRepoBranchPolicy] = useState(String(repo.branch_policy ?? "current"));
   const [repoIncludeUncommitted, setRepoIncludeUncommitted] = useState(
     Boolean(repo.include_uncommitted ?? true),
@@ -146,6 +152,11 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
         strategy: chunkStrategy,
         max_chars: Number(chunkMax),
         overlap_chars: Number(chunkOverlap),
+      },
+      taxonomy: {
+        enabled: taxonomyEnabled,
+        split_on_sections: taxonomySplit,
+        graph_nodes: taxonomyGraphNodes,
       },
       repo: {
         branch_policy: repoBranchPolicy,
@@ -332,6 +343,40 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
                   <input className="text-input" type="number" value={chunkOverlap} onChange={(e) => setChunkOverlap(e.target.value)} />
                 </label>
               </div>
+
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={taxonomyEnabled}
+                  onChange={(e) => setTaxonomyEnabled(e.target.checked)}
+                />
+                Extract a section taxonomy (chapters, articles, § codes)
+              </label>
+              <p className="muted small">
+                For books, standards, procedures and contracts. Results then say which section
+                matched, and the outline is browsable. Leave off for code or ordinary notes —
+                numbered lines there are usually list items, not sections.
+              </p>
+              {taxonomyEnabled ? (
+                <div className="form-grid">
+                  <label className="checkbox">
+                    <input
+                      type="checkbox"
+                      checked={taxonomySplit}
+                      onChange={(e) => setTaxonomySplit(e.target.checked)}
+                    />
+                    Cut chunks at section boundaries
+                  </label>
+                  <label className="checkbox">
+                    <input
+                      type="checkbox"
+                      checked={taxonomyGraphNodes}
+                      onChange={(e) => setTaxonomyGraphNodes(e.target.checked)}
+                    />
+                    Add section nodes to the graph
+                  </label>
+                </div>
+              ) : null}
             </details>
 
             <details className="settings-group">

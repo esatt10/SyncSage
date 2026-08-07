@@ -638,7 +638,14 @@ With it on, three things happen on every sync:
 2. **`heading` graph nodes and `has_heading` edges are emitted**, with a
    section `contains` its subsections — so the taxonomy is a traversable tree
    using the same `contains` edge the directory hierarchy uses.
-3. **`GET /taxonomy`** renders the outline per document.
+3. **`GET /taxonomy`** renders the outline per document, with any numbering
+   defects it found (gaps, duplicates, backwards numbering).
+
+Retrieval can then be **restricted to one section**: `section` on
+`POST /search` and MCP `search_context(section=...)` matches the breadcrumb, so
+`§ 12.3`, `Article IV` or a section's wording all reach it, and naming a parent
+returns everything nested under it. Graph hits are excluded under a section
+filter — a symbol is not inside a document section.
 
 ```yaml
 sources:

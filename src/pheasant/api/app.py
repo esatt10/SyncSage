@@ -100,6 +100,9 @@ class SearchRequest(BaseModel):
     mode: str = "hybrid"
     max_results: int = 10
     source_name: str | None = None
+    # Restrict to one part of a document's extracted taxonomy, matched against
+    # the heading breadcrumb. Only meaningful for sources with taxonomy on.
+    section: str | None = None
 
 
 class MemoryWriteRequest(BaseModel):
@@ -1166,6 +1169,7 @@ def create_app(
             principal=req.principal,
             principal_groups=req.principal_groups,
             security=config.security,
+            section=req.section,
         )
 
     @app.post("/relevant-files")
@@ -1185,6 +1189,7 @@ def create_app(
             principal=req.principal,
             principal_groups=req.principal_groups,
             security=config.security,
+            section=req.section,
         )
         seen = set()
         files = []

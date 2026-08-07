@@ -68,6 +68,21 @@ window that happens to straddle three of them. A section longer than
 `chunking.max_chars` is still subdivided, and all its pieces keep the same
 path.
 
+**You can ask a question of one section.** `section` on `/search` matches the
+breadcrumb, so cite it however you naturally would:
+
+```bash
+curl -X POST localhost:8765/search -H 'content-type: application/json' \
+  -d '{"query": "termination", "section": "§ 12.3"}'
+```
+
+`§ 12.3`, `Article IV` and `Governing Law` all reach
+`… > Article IV Term and Termination > § 12.3 Governing Law` — and naming a
+parent returns everything nested under it, so `"section": "Article IV"` answers
+from its subsections too. Available on MCP `search_context(section=...)` as well.
+Graph hits (symbols, entities) are left out under a section filter: they are not
+inside any document section. Use `GET /taxonomy` to browse the outline itself.
+
 **The outline is browsable.**
 
 ```bash
@@ -95,9 +110,16 @@ document:
 {"kind": "duplicate", "series": "lettered", "after": "(b)", "at": "(b)"}
 ```
 
-`gap`, `duplicate` and `out_of_order`. Only gaps *between observed siblings*
-count — a series starting at 3 is an excerpt, not a defect — and an inserted
-`§ 12A` never creates one.
+`gap`, `duplicate` and `out_of_order`. Only gaps *between observed members of
+one series* count — a series starting at 3 is an excerpt, not a defect — and an
+inserted `§ 12A` never creates one.
+
+A series is identified by its **number**, not by where its sections ended up in
+the tree: `§ 12.1`, `§ 12.2`, `§ 12.4` is one series even if an unnumbered
+heading between them re-parents the tail, which is exactly when the gap is
+easiest to miss. Top-level numbering is the exception — it has no prefix to
+identify it — so it is grouped by parent, which is what makes `PART I` and
+`PART II` each numbering their sections from 1 legal rather than a defect.
 
 ## What is recognised
 
@@ -146,10 +168,12 @@ short list items will be read as sections. This is the reason the feature is
 per-source: enable it where the structure is real.
 
 **Letters that are also roman numerals.** A lone `(c)`/`(d)`/`(l)`/`(m)` is
-read as the letter, a lone `(i)`/`(v)`/`(x)` as the numeral. That gets both
-conventions right within a run — `(a)(b)(c)(d)` and `(i)(ii)(iii)(iv)` both
-count 1,2,3,4 — but misreads a letter list that reaches `(i)`. Lettered ordinals
-never decide hierarchy, so the cost is at most one spurious `issues` entry.
+read as the letter, a lone `(i)`/`(v)`/`(x)` as the numeral. Within a run the
+surrounding items settle it — `(h)` then `(i)` counts 8, 9, and `(iv)` then
+`(v)` counts 4, 5, because whichever reading *continues* the run wins. A run
+that opens at `(i)` is still roman, which is the right default and the one
+remaining ambiguity. Lettered ordinals never decide hierarchy, so the cost is at
+most one spurious `issues` entry.
 
 **`caps` is the noisiest rule.** A document with shouted emphasis will produce
 spurious level-2 sections. Drop it from `detect` if that happens.

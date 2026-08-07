@@ -1,11 +1,27 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { SourceRecord } from "../api/types";
 import { AddSourceWizard } from "../sources/AddSourceWizard";
+import { TaxonomyOutline } from "../sources/TaxonomyOutline";
 import { QuickAdd } from "../components/QuickAdd";
 
 const SYNC_MODES = ["incremental", "full", "validate_only", "repair"];
+
+/**
+ * Whether this source extracts a section taxonomy, read from the stored
+ * config. Only those sources have an outline to show, so the button appears
+ * only for them rather than leading everyone to an empty panel.
+ */
+export function hasTaxonomy(source: SourceRecord): boolean {
+  if (!source.config_json) return false;
+  try {
+    const config = JSON.parse(source.config_json) as { taxonomy?: { enabled?: boolean } };
+    return Boolean(config.taxonomy?.enabled);
+  } catch {
+    return false;
+  }
+}
 
 export function SourcesPage() {
   const queryClient = useQueryClient();
@@ -22,6 +38,7 @@ export function SourcesPage() {
   const [showWizard, setShowWizard] = useState(false);
   const [editingSource, setEditingSource] = useState<SourceRecord | null>(null);
   const [patch, setPatch] = useState<string | null>(null);
+  const [outlineFor, setOutlineFor] = useState<string | null>(null);
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ["sources"] });
@@ -82,7 +99,8 @@ export function SourcesPage() {
         </thead>
         <tbody>
           {sources.data?.map((source: SourceRecord) => (
-            <tr key={source.id} className={source.enabled ? "" : "row--disabled"}>
+            <Fragment key={source.id}>
+            <tr className={source.enabled ? "" : "row--disabled"}>
               <td>{source.name}</td>
               <td>
                 <span className="pill">{source.type}</span>
@@ -111,6 +129,14 @@ export function SourcesPage() {
                 <button className="btn btn--small" onClick={() => setEditingSource(source)}>
                   edit
                 </button>
+                {hasTaxonomy(source) ? (
+                  <button
+                    className="btn btn--small"
+                    onClick={() => setOutlineFor(outlineFor === source.name ? null : source.name)}
+                  >
+                    {outlineFor === source.name ? "hide outline" : "outline"}
+                  </button>
+                ) : null}
                 <button className="btn btn--small" onClick={() => promote.mutate(source.name)}>
                   promote
                 </button>
@@ -125,6 +151,14 @@ export function SourcesPage() {
                 </button>
               </td>
             </tr>
+            {outlineFor === source.name ? (
+              <tr>
+                <td colSpan={5}>
+                  <TaxonomyOutline sourceName={source.name} />
+                </td>
+              </tr>
+            ) : null}
+            </Fragment>
           ))}
           {sources.data?.length === 0 ? (
             <tr>

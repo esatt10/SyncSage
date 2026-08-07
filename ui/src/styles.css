@@ -996,6 +996,18 @@ select.text-input {
   max-width: 220px;
 }
 
+/* The section a cited passage came from, for sources with a taxonomy. Set off
+   from the file name so the chip reads "file · section" at a glance. */
+.source-chip__section {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+  padding-left: 6px;
+  border-left: 1px solid var(--border);
+  color: var(--muted);
+}
+
 .source-chip--unused {
   opacity: 0.55;
 }
@@ -2047,4 +2059,57 @@ select.text-input {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+/* The extracted section outline of a taxonomy-enabled source (Sources page). */
+.taxonomy-outline__doc {
+  margin: 10px 0 14px;
+}
+
+.taxonomy-outline__doc h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+
+.taxonomy-tree {
+  margin: 0;
+  padding-left: 18px;
+  list-style: none;
+  border-left: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.taxonomy-tree li {
+  padding: 1px 0;
+}
+
+.taxonomy-tree__number {
+  display: inline-block;
+  min-width: 62px;
+  margin-right: 6px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.taxonomy-issues {
+  margin: 0 0 8px;
+  padding-left: 18px;
+  list-style: none;
+  font-size: 12.5px;
+}
+
+.taxonomy-issues__kind {
+  display: inline-block;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  background: var(--bg-sunken);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.taxonomy-issues__kind--gap {
+  border-color: var(--accent-border);
+  color: var(--accent-text);
 }

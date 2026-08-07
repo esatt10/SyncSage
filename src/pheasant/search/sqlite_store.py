@@ -61,6 +61,7 @@ class SearchStore:
         query: str,
         source_name: str | None = None,
         max_results: int = 10,
+        section: str | None = None,
     ) -> list[dict]:
         # Natural-language queries ("where does the X service run") must not
         # fall to FTS5's implicit-AND — a single unmatched stopword would
@@ -74,6 +75,13 @@ class SearchStore:
         if source_name:
             where += " AND source_id = ?"
             params.append(source_name)
+        # Restrict to one section of a document's taxonomy. Pushed into SQL
+        # rather than filtered afterwards: a section is a narrow slice, and
+        # post-filtering a globally-ranked page of hits can return nothing from
+        # the requested section while its chunks sit just past the cut.
+        if section_needle(section):
+            where += " AND LOWER(COALESCE(chunks.heading_path, '')) LIKE ?"
+            params.append(f"%{section_needle(section)}%")
         params.append(max_results)
         sql = f"""
         SELECT chunks_fts.chunk_id, chunks_fts.source_id, chunks_fts.artifact_id,
@@ -90,14 +98,20 @@ class SearchStore:
         try:
             rows = self.state.rows(sql, tuple(params))
         except Exception:
+            fallback_where = "(chunks.text LIKE ? OR artifacts.relative_path LIKE ?)"
+            fallback_params: list[object] = [f"%{query}%", f"%{query}%"]
+            if section_needle(section):
+                fallback_where += " AND LOWER(COALESCE(chunks.heading_path, '')) LIKE ?"
+                fallback_params.append(f"%{section_needle(section)}%")
+            fallback_params.append(max_results)
             rows = self.state.rows(
-                """SELECT chunks.id AS chunk_id, chunks.source_id, chunks.artifact_id,
+                f"""SELECT chunks.id AS chunk_id, chunks.source_id, chunks.artifact_id,
                 artifacts.relative_path AS path, chunks.heading_path, chunks.text,
                 chunks.start_line, chunks.end_line, artifacts.path AS absolute_path,
                 artifacts.relative_path, 0.0 AS rank_score
                 FROM chunks JOIN artifacts ON artifacts.id=chunks.artifact_id
-                WHERE chunks.text LIKE ? OR artifacts.relative_path LIKE ? LIMIT ?""",
-                (f"%{query}%", f"%{query}%", max_results),
+                WHERE {fallback_where} LIMIT ?""",
+                tuple(fallback_params),
             )
         # No concept-term expansion pass. It used to top up short result sets
         # from `artifact_terms`, and it was measured dead: it only ran when FTS
@@ -119,6 +133,32 @@ class SearchStore:
             score = (-raw_rank / (1.0 - raw_rank)) if raw_rank < 0 else 1.0
             results.append(_row_result(row, i, score, "SQLite FTS/path match"))
         return results
+
+
+def section_needle(section: str | None) -> str:
+    """The comparable form of a requested section, or ``""`` for no filter.
+
+    Lowercased and stripped, and that is the whole rule — the SQL above matches
+    ``LOWER(heading_path) LIKE '%needle%'`` and :func:`section_matches` does
+    ``needle in heading_path.lower()``, which are the same test. Keeping the
+    normalization in one function is what stops the two from drifting apart.
+    """
+    return (section or "").strip().lower()
+
+
+def section_matches(heading_path: object, section: str | None) -> bool:
+    """Does a hit's breadcrumb sit inside the requested section?
+
+    Substring, not equality, because people cite the section and not the whole
+    path: ``§ 12.3``, ``Article IV`` and ``Termination`` should each reach
+    ``MASTER SERVICES AGREEMENT > Article IV Term and Termination > § 12.3``.
+    Matching the breadcrumb rather than only its last crumb is what makes
+    asking for an Article return everything nested under it.
+    """
+    needle = section_needle(section)
+    if not needle:
+        return True
+    return needle in str(heading_path or "").lower()
 
 
 def _row_result(row, rank: int, score: float, reason: str) -> dict:

@@ -97,7 +97,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -258,10 +258,9 @@ def _lettered_position(inner: str) -> int | None:
       starts at 100. A lone ``i``/``v``/``x`` is a numeral, because those do
       start one.
 
-    The residual ambiguity is a letter list that runs as far as ``(i)`` — read
-    as numeral 1 rather than letter 9. Bounded on purpose: a lettered ordinal is
-    ``relative``, so it never decides hierarchy. The worst case is one spurious
-    entry in :func:`reconcile_issues`, not a mis-nested section.
+    This is the character-only reading, used when there is nothing to compare
+    against. :func:`_disambiguate_lettered` revisits it with the surrounding
+    run, which is what actually resolves a letter list that reaches ``(i)``.
     """
     if not inner:
         return None
@@ -400,6 +399,31 @@ def _plausible_heading(title: str, line_text: str) -> bool:
     return True
 
 
+def _plausible_citation(ordinal: str) -> bool:
+    """Whether a keyword's ordinal is really an ordinal — ``PART A``, not ``Part o``.
+
+    Found on a real producer-generated PDF, not by reading the rules: PDF text
+    is laid out in lines, so a paragraph arrives pre-broken and *any* line can
+    begin with the word "Section" or "Part". One line began ``Section o f this
+    Agreement unless stated otherwise.`` — the extractor had rendered "of" as
+    "o f", which is ordinary PDF kerning — and since the keyword pattern is
+    case-insensitive, its single-letter alternative read ``o`` as ordinal 15.
+    The invented heading then became a *parent*, so it re-parented genuine
+    sections rather than merely adding a spurious one.
+
+    A letter-only citation is written in capitals in every real document
+    (``PART A``, ``Annex B``, ``ARTICLE IV``), and prose words are not, so
+    requiring capitals separates them exactly and costs nothing real. A numeric
+    ordinal is unambiguous and keeps no case rule.
+    """
+    text = ordinal.strip()
+    if not text:
+        return False
+    if any(char.isdigit() for char in text):
+        return True
+    return text.isupper()
+
+
 def _classify(raw_line: str) -> tuple[int, str | None, str, str] | None:
     """``(level, number, title, kind)`` for a heading line, else ``None``."""
     line = raw_line.rstrip()
@@ -411,7 +435,7 @@ def _classify(raw_line: str) -> tuple[int, str | None, str, str] | None:
         return len(match.group(1)), None, match.group(2).strip()[:MAX_TITLE_CHARS], "markdown"
 
     match = _RE_KEYWORD.match(line)
-    if match and len(line) <= MAX_HEADING_LINE_CHARS:
+    if match and _plausible_citation(match.group(2)) and _plausible_heading(match.group(3), line):
         keyword, ordinal, title = match.group(1), match.group(2), match.group(3).strip()
         level = _KEYWORD_LEVELS[keyword.lower()]
         number = f"{keyword.title()} {ordinal}"
@@ -498,7 +522,7 @@ def detect_headings(
     if not enabled:
         return []
 
-    candidates = _scan(text, enabled, max_depth, max_headings)
+    candidates = _disambiguate_lettered(_scan(text, enabled, max_depth, max_headings))
     return _reconcile(candidates)
 
 
@@ -561,6 +585,60 @@ def _scan(
             logger.warning("taxonomy detection hit the %d-heading cap; truncating", max_headings)
             break
     return candidates
+
+
+def _ambiguous_readings(inner: str) -> tuple[int | None, int | None]:
+    """Both readings of a one-character sub-item label: ``(letter, roman)``."""
+    letter = _LETTER_SERIES.index(inner) + 1 if inner in _LETTER_SERIES else None
+    roman = _roman_to_int(inner) if inner.upper() in _ROMAN_VALUES else None
+    return letter, roman
+
+
+def _disambiguate_lettered(candidates: list[_Candidate]) -> list[_Candidate]:
+    """Re-read one-character sub-item labels using the run they sit in.
+
+    Seven letters are also roman numerals, and the character alone cannot say
+    which is meant. :func:`_lettered_position` guesses by convention — a lone
+    ``i``/``v``/``x`` is a numeral — which is right for a sub-list that opens
+    with ``(i)`` and wrong for a letter list that has simply counted up to its
+    ninth item. ``(h)`` then ``(i)`` is 8 then 9, not 8 then 1.
+
+    The run says which. Both readings are computed, and whichever *continues*
+    the previous item in the run wins:
+
+    - ``(h)`` ``(i)``  -> 8, 9: the letter reading continues, so ``i`` is a letter.
+    - ``(iv)`` ``(v)`` -> 4, 5: the roman reading continues, so ``v`` is a numeral.
+    - ``(u)`` ``(v)``  -> 21, 22: letter again — the case the old convention
+      always got wrong, since ``v`` is not the 5th item of anything here.
+    - ``(b)`` ``(i)``  -> neither 9 nor 1 follows 2, so this is a nested list
+      opening at roman 1, and the convention stands.
+
+    A run is a stretch of consecutive lettered candidates; any other heading
+    between them starts a new one. Deterministic and local — one backward look,
+    no lookahead, so the same bytes always resolve the same way.
+    """
+    resolved: list[_Candidate] = []
+    previous: int | None = None  # value of the previous item in the current run
+    for candidate in candidates:
+        if candidate.kind != "lettered" or candidate.ordinal is None:
+            resolved.append(candidate)
+            previous = None  # any other heading breaks the run
+            continue
+        inner = (candidate.number or "").strip("()").lower()
+        letter, roman = _ambiguous_readings(inner) if len(inner) == 1 else (None, None)
+        chosen = candidate.ordinal.parts[0] if candidate.ordinal.parts else None
+        if previous is not None and letter is not None and roman is not None:
+            if letter == previous + 1:
+                chosen = letter
+            elif roman == previous + 1:
+                chosen = roman
+        if chosen is not None and chosen != (candidate.ordinal.parts or (None,))[0]:
+            candidate = replace(
+                candidate, ordinal=replace(candidate.ordinal, parts=(chosen,))
+            )
+        resolved.append(candidate)
+        previous = chosen
+    return resolved
 
 
 def _raw_ordinal(number: str | None, kind: str) -> str | None:
@@ -696,12 +774,49 @@ def _compatible_parent(
             continue
         if ordinal is not None and ordinal.absolute:
             other = ancestor.ordinal
-            if other is not None and other.absolute and not other.is_prefix_of(ordinal):
+            if (
+                other is not None
+                and other.absolute
+                and not other.is_prefix_of(ordinal)
+                and not _contains_a_fresh_series(other, ordinal)
+            ):
                 # A numbered ancestor from a different series or branch cannot
                 # contain us — keep climbing.
                 continue
         return index
     return None
+
+
+#: Keyword series that partition a document rather than enumerate within it.
+#: `PART`/`BOOK`/`TITLE`/`DIVISION` and the `SCHEDULE`/`APPENDIX`/`ANNEX`/
+#: `EXHIBIT` family are the outermost containers, which is why they sit at
+#: pattern level 1.
+_CONTAINER_SERIES = frozenset({"division", "annex"})
+
+
+def _contains_a_fresh_series(ancestor: Ordinal, candidate: Ordinal) -> bool:
+    """May a container hold a numbering that has nothing to do with its own?
+
+    ``PART I`` followed by ``1. Scope`` is the case. Neither number is a prefix
+    of the other — they are both "one" — so the conflicting-series rule above
+    refuses the attachment and the section flattens out of its Part, losing the
+    Part from every ``heading_path`` beneath it.
+
+    That rule is right for two *enumerations* competing for the same spine
+    (``CHAPTER 4`` does not contain ``ARTICLE 4``) and wrong for a *container*:
+    a Part or an Annex exists precisely to hold a section numbering it does not
+    participate in, and that numbering restarts inside each one. So a container
+    may hold a different series — but not its own, since ``PART II`` is beside
+    ``PART I``, never inside it.
+    """
+    return ancestor.series in _CONTAINER_SERIES and candidate.series != ancestor.series
+
+
+def _parent_path(heading: SectionHeading) -> str:
+    """Breadcrumb of the heading above this one, or ``""`` at the top."""
+    if PATH_SEPARATOR not in heading.path:
+        return ""
+    return heading.path.rsplit(PATH_SEPARATOR, 1)[0]
 
 
 def reconcile_issues(headings: list[SectionHeading]) -> list[dict[str, Any]]:
@@ -714,24 +829,44 @@ def reconcile_issues(headings: list[SectionHeading]) -> list[dict[str, Any]]:
     § 12.5, or repeats ``(b)``, is either an extraction failure or a drafting
     defect, and both are worth surfacing rather than silently indexing.
 
-    Only gaps *between observed siblings* are reported. A series that starts at
-    3 is not flagged: an excerpt legitimately begins mid-document, and guessing
-    otherwise would cry wolf on every extract. Suffixed inserts (``§ 12A``)
-    never advance the sequence, since inserting one is precisely how a numbering
-    absorbs a new section without renumbering.
+    Only gaps *between observed members of one series* are reported. A series
+    that starts at 3 is not flagged: an excerpt legitimately begins
+    mid-document, and guessing otherwise would cry wolf on every extract.
+    Suffixed inserts (``§ 12A``) never advance the sequence, since inserting one
+    is precisely how a numbering absorbs a new section without renumbering.
+
+    What counts as "one series" is the subtle part, and it is decided by the
+    **numeric prefix** rather than by the resolved parent:
+
+    - A numbering with a prefix (``§ 12.1``, ``§ 12.2``, ``§ 12.4``) is one
+      series wherever its members land in the tree. Grouping those by resolved
+      parent instead would hide the 12.2 -> 12.4 gap the moment an unnumbered
+      heading interrupted them and re-parented the tail, which is exactly when
+      a reader most wants to be told.
+    - A **top-level** numbering has no prefix to identify it, so it is grouped
+      by parent — which is what makes a per-part restart legal. ``PART I`` with
+      sections 1, 2 followed by ``PART II`` with sections 1, 2 is two series,
+      not one series that jumped backwards, and only the parent distinguishes
+      them.
 
     Deterministic, and read-only over the reconciled headings.
     """
-    groups: dict[tuple[str, str, int], list[SectionHeading]] = {}
+    groups: dict[tuple[str, str, str], list[SectionHeading]] = {}
     for heading in headings:
         ordinal = heading.ordinal
         if ordinal is None or not ordinal.parts:
             continue
-        parent = heading.path.rsplit(PATH_SEPARATOR, 1)[0] if PATH_SEPARATOR in heading.path else ""
-        groups.setdefault((parent, ordinal.series, len(ordinal.parts)), []).append(heading)
+        parent = _parent_path(heading)
+        if ordinal.relative:
+            key = ("rel", ordinal.series, parent)
+        elif ordinal.prefix:
+            key = ("path", ordinal.series, ".".join(str(part) for part in ordinal.prefix))
+        else:
+            key = ("root", ordinal.series, parent)
+        groups.setdefault(key, []).append(heading)
 
     issues: list[dict[str, Any]] = []
-    for (parent, series, _depth), members in sorted(groups.items()):
+    for _key, members in sorted(groups.items()):
         previous: SectionHeading | None = None
         for heading in members:
             assert heading.ordinal is not None
@@ -743,9 +878,12 @@ def reconcile_issues(headings: list[SectionHeading]) -> list[dict[str, Any]]:
             assert previous.ordinal is not None
             before = previous.ordinal.parts[-1]
             current = heading.ordinal.parts[-1]
+            # `parent` is the breadcrumb of the heading the defect was observed
+            # at, not the group's — for a prefix-identified series those can
+            # differ, and where it showed up is the useful half.
             common = {
-                "series": series,
-                "parent": parent,
+                "series": heading.ordinal.series,
+                "parent": _parent_path(heading),
                 "after": previous.number,
                 "at": heading.number,
                 "line": heading.line,

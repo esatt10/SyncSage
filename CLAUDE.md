@@ -1090,6 +1090,94 @@ Acceptance: 24 more tests in `tests/test_taxonomy.py` (64 total). Suite:
 **710 passed / 18 skipped**. Docs updated to describe reconciliation and to
 **delete the mis-parenting limitation** rather than leave a stale warning.
 
+### Finishing the taxonomy/ordinal work, 2026-08-07
+
+Closes the five items the previous run summary listed as not done. Only
+**taxonomy on the Synapse contract** stays out, on the original reasoning: the
+outline is region-local retrieval structure, not routing signal, so publishing it
+would be a wire-format change for no routing gain.
+
+**`(i)` now reads as 9 when it follows `(h)`.** `_disambiguate_lettered`
+re-reads a one-character sub-item label using the run it sits in: both readings
+are computed and whichever *continues* the previous item wins — `(h)(i)` is 8,9;
+`(iv)(v)` is 4,5; `(u)(v)` is 21,22 (which the old per-character convention
+always got wrong); and `(b)` then `(i)` continues neither, so a nested list still
+opens at roman 1. `parse_ordinal` on an isolated heading is unchanged.
+
+**A numbering series is identified by its number, not by where it landed.**
+`reconcile_issues` grouped by resolved parent, so an unnumbered heading between
+`§ 12.2` and `§ 12.4` re-parented the tail and hid the gap. Now a non-empty
+prefix identifies the series wherever its members sit; **top-level** numbering
+has no prefix so it stays grouped by parent, which is what keeps a per-part
+restart legal. Writing that rule exposed that `PART I` **did not actually parent
+its sections** (verified pre-existing): both numbers are "one", neither a prefix
+of the other, so the conflicting-series rule flattened the section out of its
+Part. `_contains_a_fresh_series` fixes it on a principle — `PART`/`BOOK`/`TITLE`/
+`DIVISION` and the `SCHEDULE`/`APPENDIX`/`ANNEX`/`EXHIBIT` family are
+**containers**, existing to hold a numbering they do not participate in, so they
+may parent a *different* series but never their own. `CHAPTER 4` still does not
+contain `ARTICLE 4`.
+
+**Retrieval can be restricted to one section.** `section` on `POST /search` and
+MCP `search_context(section=...)`, substring against the breadcrumb so `§ 12.3`,
+`Article IV` or a section's wording all reach it and naming a parent returns the
+subtree. Pushed into **SQL** for the text arm, because post-filtering a
+globally-ranked page can return nothing from a narrow section while its chunks
+sit just past the cut; the vector arm is filtered in Python, with
+`section_needle`/`section_matches` holding the one normalization rule so the two
+cannot drift. Graph hits are dropped under the filter — a `heading` node has a
+label but no breadcrumb, so matching it would return an Article's node and not
+its subsections', inconsistent with chunks. `/search?section=` selects content;
+`GET /taxonomy` browses the outline.
+
+**UI** (untouched by taxonomy until now, including the registration toggle the
+original request actually asked for): the Advanced source form gained the toggle
+plus the two sub-switches that change indexing; citation chips name the section a
+passage came from (needed `heading_path` on `Passage` and on **both** citation
+builders — the model already saw the heading in its prompt, only the UI could
+not); and the Sources page gained an outline panel over `GET /taxonomy` with the
+numbering defects above it. `tsc` caught that `SourceWritePayload` had no
+`taxonomy` field, so the form would have posted a key the client type refused.
+
+**Live validation on a producer-generated PDF found two bugs.**
+`tests/fixtures/structured/agreement.pdf` (authored as HTML, converted by
+LibreOffice, source kept beside it) has real PDF line layout and real kerning —
+what text authored in a test file cannot imitate.
+
+1. **A mid-sentence line became a heading, and a parent.** The extractor renders
+   "of" as "o f", PDF text arrives pre-broken into layout lines, and one began
+   `Section o f this Agreement unless stated otherwise.` The keyword pattern is
+   case-insensitive, so its single-letter ordinal alternative read `o` as ordinal
+   15 — and the invented heading then **re-parented genuine sections**. Fixed by
+   `_plausible_citation` (a letter-only citation is capitalised in every real
+   document — `PART A`, `ANNEX B`, `ARTICLE IV` — and prose words are not) plus
+   running the keyword branch through the same prose filter every other rule
+   already used; it had **none**, only a length check. That second half looked
+   inert until tested — it is what catches `Part 1 of the agreement shall be
+   construed as follows…`, where the ordinal is a perfectly good `1`.
+2. **Runtime-registered sources extracted nothing at all.** The same PDF gave 19
+   chunks via `SyncEngine` and **0 through the HTTP API**.
+   `extractor_from_config` runs once in `SyncEngine.__init__` and asks whether
+   *any configured* source admits a document extension — a source added via
+   `POST /sources` (the UI's add-source flow, and how most sources actually
+   arrive) did not exist yet, so no extractor was built and its PDFs indexed with
+   **no text at all**: the exact silent-empty-content failure this PR exists to
+   fix, on the path most people use. `_ensure_modal_handlers(source)` tops the
+   handlers up in `sync_source` where the source is known, which is also more
+   precise than the constructor's check. The captioner/transcriber share that
+   check and had the same gap with a milder symptom — `caption_to_text` falls
+   back to a filename caption, so images were never *empty*, which meant the
+   obvious `chunk_count > 0` assertion passed with the fix reverted; those tests
+   assert the stub's content **fingerprint** instead. Mutation testing found
+   that; the first two versions of those tests were worthless and looked fine.
+
+Acceptance: `tests/test_taxonomy.py` 64 → **91**, `tests/test_document_extraction.py`
+30 → **33**. Suite **746 passed / 18 skipped**. Every change mutation-tested;
+**two mutants survived and were acted on** rather than filed — no test ran a
+sectioned *hybrid* search (one added), and the keyword prose filter was inert
+until the numeric-citation case was written. Full detail:
+`runs/2026-08-07-taxonomy-finish/SUMMARY.md`.
+
 ---
 
 ## 6. Pointers
