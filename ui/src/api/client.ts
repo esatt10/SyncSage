@@ -280,7 +280,8 @@ export const api = {
     model?: string;
     base_url?: string;
     api_key_env?: string;
-    dimensions?: number;
+    /** `null` clears the override back to the model's own native size. */
+    dimensions?: number | null;
     batch_size?: number;
     store_provider?: string;
     persist?: boolean;

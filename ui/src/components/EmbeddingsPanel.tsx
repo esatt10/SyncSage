@@ -27,8 +27,12 @@ export function EmbeddingsPanel() {
     if (status.data) setDraft({});
   }, [status.dataUpdatedAt, status.data]);
 
+  // Keyed on presence in `draft`, not `??` — a field the user explicitly
+  // cleared back to "unset" (e.g. dimensions, to fall back to the model's
+  // own default) has a real `null` in draft, which `??` would otherwise
+  // skip past to the server's last value.
   const value = <K extends keyof EmbeddingsStatus>(key: K): EmbeddingsStatus[K] | undefined =>
-    (draft[key] as EmbeddingsStatus[K]) ?? status.data?.[key];
+    (key in draft ? draft[key] : status.data?.[key]) as EmbeddingsStatus[K] | undefined;
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ["embeddings"] });
@@ -189,11 +193,23 @@ export function EmbeddingsPanel() {
             type="number"
             min={16}
             max={4096}
-            value={Number(value("dimensions") ?? 256)}
+            placeholder="model default"
+            value={value("dimensions") ?? ""}
             onChange={(event) =>
-              setDraft((prev) => ({ ...prev, dimensions: Number(event.target.value) }))
+              setDraft((prev) => ({
+                ...prev,
+                // Blank = unset = let the model use its own native size;
+                // do not fall back to a fixed number here, it would defeat
+                // the point of leaving this blank.
+                dimensions: event.target.value === "" ? null : Number(event.target.value),
+              }))
             }
           />
+          <span className="muted small">
+            Leave blank to use {provider?.label ?? "the provider"}&rsquo;s own native size.
+            Only set a number to shrink vectors for storage or to pin an exact size across a
+            Synapse fleet.
+          </span>
         </label>
         <label className="field">
           <span>Batch size</span>

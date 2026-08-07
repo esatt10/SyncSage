@@ -173,6 +173,16 @@ docker compose up                          # container + optional UI sidecar
    either push.
 10. **Scope each session to one Phase-21 step** (or one bugfix). Write
     `runs/<ts>-synapse-<step>/SUMMARY.md` per the framework conventions.
+11. **Config-schema changes owe the wizard an update.** Adding, renaming,
+    or changing the default of any field in
+    `src/pheasant/config/schema.py`, adding an env var, a
+    `pyproject.toml` extra, or a `sources[].type`/connector needs a
+    matching update to `docs/configuration.md` and
+    `agent/config_wizard_prompt.md` (the guided onboarding Q&A — see
+    `docs/how-to/config-wizard.md`). Use the
+    `.claude/skills/config-surface-sync` skill for the checklist;
+    `tests/test_config_wizard_freshness.py` fails CI on the mechanical
+    part (a section mentioned nowhere) but not on prose accuracy.
 
 ---
 
@@ -1089,6 +1099,9 @@ Acceptance: 24 more tests in `tests/test_taxonomy.py` (64 total). Suite:
   `pheasant-flock/docs/SYNAPSE_ARCHITECTURE.md`,
   `…/docs/SYNAPSE_FRAMEWORK.md`, ADR 2026-06-10 in `…/docs/DECISIONS.md`
 - **Graph taxonomy:** `docs/graph_model.md` · **Config:** `docs/configuration.md`
+- **Guided config wizard (any coding agent):** `agent/config_wizard_prompt.md`
+  · invocation per tool + what it produces: `docs/how-to/config-wizard.md`
+  · keep-it-current checklist: `.claude/skills/config-surface-sync`
 - **MCP:** `docs/mcp_tools.md`, `docs/mcp_client.md`
 - **Deployment:** `docs/deployment.md`, `deploy/kubernetes/`
 
