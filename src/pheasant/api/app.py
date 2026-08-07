@@ -6,6 +6,7 @@ import threading
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Annotated
 
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -1223,10 +1224,10 @@ def create_app(
 
     @app.post("/sources/upload")
     async def upload_documents(
-        files: list[UploadFile] = File(...),
-        source_name: str = Form("uploads"),
-        sync_now: bool = Form(True),
-        wait: bool = Form(False),
+        files: Annotated[list[UploadFile], File()],
+        source_name: Annotated[str, Form()] = "uploads",
+        sync_now: Annotated[bool, Form()] = True,
+        wait: Annotated[bool, Form()] = False,
     ) -> dict:
         """Index documents dropped into the UI, with no filesystem setup.
 
