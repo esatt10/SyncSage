@@ -81,7 +81,10 @@ def sync_result_counts(result: Any, engine: Any) -> dict[str, int]:
         result,
         first_attr(result, ("stats", "summary", "counts")),
         first_attr(engine, ("stats", "summary", "counts", "graph_stats", "get_stats")),
-        first_attr(first_attr(engine, ("graph", "store", "index")) or object(), ("stats", "summary", "counts", "get_stats")),
+        first_attr(
+            first_attr(engine, ("graph", "store", "index")) or object(),
+            ("stats", "summary", "counts", "get_stats"),
+        ),
     ]
     normalized: dict[str, int] = {}
     key_aliases = {
@@ -101,8 +104,7 @@ def sync_result_counts(result: Any, engine: Any) -> dict[str, int]:
     missing = sorted(set(key_aliases) - set(normalized))
     if missing:
         pytest.skip(
-            "Sync implementation does not expose stable count statistics yet: "
-            + ", ".join(missing)
+            "Sync implementation does not expose stable count statistics yet: " + ", ".join(missing)
         )
     return normalized
 
@@ -175,7 +177,15 @@ def loaded_config(config_path: Path) -> Any:
 def sync_engine(loaded_config: Any, config_path: Path) -> Any:
     """Construct the public sync/indexing engine for integration tests."""
 
-    sync_module = import_any(("pheasant.sync.engine", "pheasant.sync", "pheasant.ingestion.pipeline", "pheasant.indexing", "pheasant.indexer"))
+    sync_module = import_any(
+        (
+            "pheasant.sync.engine",
+            "pheasant.sync",
+            "pheasant.ingestion.pipeline",
+            "pheasant.indexing",
+            "pheasant.indexer",
+        )
+    )
     engine_factory = require_attr(
         sync_module,
         ("SyncEngine", "Indexer", "KnowledgeIndexer", "create_sync_engine"),
@@ -261,13 +271,19 @@ def search_context(query: str, loaded_config: Any | None = None, engine: Any | N
             return engine_search(query)
 
     search_module = import_any(("pheasant.search", "pheasant.search.engine", "pheasant.api.tools"))
-    search_factory = first_attr(search_module, ("SearchEngine", "ContextSearch", "create_search_engine"))
+    search_factory = first_attr(
+        search_module, ("SearchEngine", "ContextSearch", "create_search_engine")
+    )
     if search_factory is not None:
-        search_engine = search_factory(loaded_config) if loaded_config is not None else search_factory()
+        search_engine = (
+            search_factory(loaded_config) if loaded_config is not None else search_factory()
+        )
         method = require_attr(search_engine, ("search_context", "search", "query"), "search method")
         return method(query)
 
-    search_func = require_attr(search_module, ("search_context", "search"), "search_context function")
+    search_func = require_attr(
+        search_module, ("search_context", "search"), "search_context function"
+    )
     try:
         return search_func(query=query, config=loaded_config)
     except TypeError:
@@ -322,4 +338,6 @@ def call_cli(args: list[str], cwd: Path | None = None) -> subprocess.CompletedPr
         if "No module named pheasant" in result.stderr:
             continue
         return result
-    pytest.skip(f"pheasant CLI is not available yet: {last_error or 'pheasant module not importable'}")
+    pytest.skip(
+        f"pheasant CLI is not available yet: {last_error or 'pheasant module not importable'}"
+    )

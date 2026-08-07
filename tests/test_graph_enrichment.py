@@ -77,14 +77,10 @@ def test_graph_neighbors_honor_depth_and_edge_filters(
     # that replaced it — narrower, and worth traversing.
     assert any(neighbor["depth"] == 2 for neighbor in result["neighbors"])
     bridges = {
-        neighbor["node"].get("type")
-        for neighbor in result["neighbors"]
-        if neighbor["depth"] == 1
+        neighbor["node"].get("type") for neighbor in result["neighbors"] if neighbor["depth"] == 1
     }
     assert bridges <= {"symbol", "entity", "external_reference"}, bridges
-    assert not any(
-        neighbor["node"].get("type") == "concept" for neighbor in result["neighbors"]
-    )
+    assert not any(neighbor["node"].get("type") == "concept" for neighbor in result["neighbors"])
 
 
 def test_graph_terms_improve_cross_file_search(
@@ -94,9 +90,7 @@ def test_graph_terms_improve_cross_file_search(
 
     search_result = sync_engine.search_context("SyncEngine HEALTH_PATH", max_results=5)
     paths = {
-        item["relative_path"]
-        for item in result_items(search_result)
-        if isinstance(item, dict)
+        item["relative_path"] for item in result_items(search_result) if isinstance(item, dict)
     }
 
     assert "pheasant/sync_engine.py" in paths
@@ -160,7 +154,12 @@ def test_similarity_can_be_limited_to_what_changed() -> None:
     ]
     every = SemanticSimilarityPass().run(artifacts)
     assert {(edge.source, edge.target) for edge in every} == {
-        ("a", "b"), ("b", "a"), ("a", "c"), ("c", "a"), ("b", "c"), ("c", "b")
+        ("a", "b"),
+        ("b", "a"),
+        ("a", "c"),
+        ("c", "a"),
+        ("b", "c"),
+        ("c", "b"),
     }
 
     only_a = SemanticSimilarityPass().run(artifacts, changed_ids={"a"})

@@ -1,5 +1,6 @@
 """Sample sync engine fixture used by acceptance tests."""
 
+
 class SyncEngine:
     """Coordinates idempotent indexing for configured sources."""
 

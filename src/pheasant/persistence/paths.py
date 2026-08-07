@@ -20,7 +20,7 @@ class StatePaths:
     exports: Path
 
     @classmethod
-    def from_config(cls, config: PheasantConfig) -> "StatePaths":
+    def from_config(cls, config: PheasantConfig) -> StatePaths:
         state = config.pheasant.state_path
         return cls(
             state=state,
@@ -36,6 +36,16 @@ class StatePaths:
         )
 
     def ensure(self) -> None:
-        for path in [self.state, self.graphs, self.manifests, self.snapshots, self.locks, self.logs, self.cache, self.vault, self.exports]:
+        for path in [
+            self.state,
+            self.graphs,
+            self.manifests,
+            self.snapshots,
+            self.locks,
+            self.logs,
+            self.cache,
+            self.vault,
+            self.exports,
+        ]:
             path.mkdir(parents=True, exist_ok=True)
         self.sqlite.parent.mkdir(parents=True, exist_ok=True)

@@ -16,4 +16,5 @@ def export_obsidian_notes(config: PheasantConfig, vault_path: Path | None = None
     state.migrate()
     return ObsidianExporter(config, state).export()
 
+
 __all__ = ["ObsidianExporter", "export_obsidian_notes"]
