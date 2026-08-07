@@ -489,16 +489,35 @@ def build_sections() -> list[Section]:
         ),
         Section(
             id="ingestion",
-            title="Images and audio",
+            title="Documents, images and audio",
             blurb=(
-                "Images are captioned and audio transcribed into text that flows "
-                "through the ordinary chunk → graph path. Both default to a "
-                "deterministic offline stub, and an authored sidecar "
-                "(<file>.caption.txt / <file>.transcript.txt) always wins. Neither is "
-                "built at all unless a source's include globs admit those extensions."
+                "Text that cannot be reached by decoding the bytes. Documents "
+                "(PDF, DOCX, PPTX, XLSX, DOC, RTF, EPUB) are extracted, images "
+                "captioned and audio transcribed, all into text that flows through "
+                "the ordinary chunk → graph path. An authored sidecar "
+                "(<file>.extract.txt / .caption.txt / .transcript.txt) always wins, "
+                "and none of the three is built unless a source's include globs "
+                "admit those extensions. Without the extractor a document is "
+                "findable by its path and invisible by its content."
             ),
             covers=("ingestion",),
             questions=[
+                Question(
+                    key="ingestion.extractor.provider",
+                    prompt="Document text extraction",
+                    kind="choice",
+                    choices=[
+                        Choice("auto", "Automatic", "pymupdf/python-docx, else stdlib."),
+                        Choice("native", "Third-party readers", "Best fidelity."),
+                        Choice("builtin", "Standard library only", "No third-party imports."),
+                        Choice(
+                            "sandboxed",
+                            "WASM-sandboxed PDF",
+                            "For untrusted PDFs; needs the [wasm] extra.",
+                        ),
+                    ],
+                    advanced=True,
+                ),
                 Question(
                     key="ingestion.captioner.provider",
                     prompt="Image captioner",
