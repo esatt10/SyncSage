@@ -151,11 +151,41 @@ def test_up_adds_a_new_target_to_an_existing_config(tmp_path: Path) -> None:
     <config>`. That silently indexed nothing — `up` treated any existing
     config as "reuse", so the target was dropped and the command reported
     success. A target that is not configured yet is appended."""
+    import json
+
     from pheasant.cli import main
     from pheasant.config.loader import load_config
 
+    # `pheasant.state_path` defaults to the container path `/state` — correct
+    # inside Docker, but not something a test (or a laptop user running
+    # `setup` outside a container, which the wizard's own blurb warns about)
+    # should let `up` try to create. Scope it into tmp_path like any other
+    # non-container run would.
+    answers = tmp_path / "answers.json"
+    answers.write_text(
+        json.dumps(
+            {
+                "pheasant.state_path": str(tmp_path / "state"),
+                "pheasant.vault_path": str(tmp_path / "vault"),
+                "pheasant.exports_path": str(tmp_path / "exports"),
+            }
+        ),
+        encoding="utf-8",
+    )
     config_path = tmp_path / "pheasant.yaml"
-    assert main(["setup", "--accept-defaults", "-o", str(config_path)]) == 0
+    assert (
+        main(
+            [
+                "setup",
+                "--accept-defaults",
+                "--answers",
+                str(answers),
+                "-o",
+                str(config_path),
+            ]
+        )
+        == 0
+    )
     assert load_config(config_path).sources == []
 
     notes = tmp_path / "notes"
