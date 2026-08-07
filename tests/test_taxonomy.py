@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 from pheasant.api.app import create_app
 from pheasant.config.schema import PheasantConfig, TaxonomySettings
 from pheasant.ingestion.taxonomy import (
+    PATH_SEPARATOR,
     RULE_NAMES,
     SectionHeading,
     detect_headings,
@@ -692,3 +693,350 @@ def test_section_heading_as_dict_round_trip() -> None:
         "path": "A > B",
     }
     assert heading.label == "4.1 T"
+
+
+# ---------------------------------------------------------------------------
+# Ordinal detection + reconciliation
+# ---------------------------------------------------------------------------
+
+# A contract carrying two *independent* numbering series (roman Articles with
+# decimal subsections, plus a separate § code series) and deliberate sequence
+# defects: a gap 12.3 -> 12.5 and a duplicated (b).
+ORDINAL_LEGAL = """MASTER SERVICES AGREEMENT
+
+ARTICLE IV
+Term and Termination
+
+4.1 Initial Term
+Commences on the Effective Date.
+
+4.2 Termination for Cause
+Either party may terminate.
+
+(a) Material breach
+Not cured within thirty days.
+
+(b) Insolvency
+Upon any bankruptcy filing.
+
+(b) Change of Control
+On any change of control.
+
+§ 12.3 Governing Law
+Laws of Delaware.
+
+§ 12.5 Notices
+All notices in writing.
+"""
+
+
+def _by_number(headings: list[SectionHeading], number: str) -> SectionHeading:
+    return next(h for h in headings if h.number == number)
+
+
+def test_parse_ordinal_decimal_roman_and_letters() -> None:
+    from pheasant.ingestion.taxonomy import parse_ordinal
+
+    assert parse_ordinal("4.2", "numbered").parts == (4, 2)
+    assert parse_ordinal("1.2.3.4", "numbered").parts == (1, 2, 3, 4)
+    # Roman is near-universal for Articles and Parts.
+    assert parse_ordinal("IV", "keyword", "Article").parts == (4,)
+    assert parse_ordinal("XII", "keyword", "Chapter").parts == (12,)
+    # A lettered sub-item has a position but no absolute path.
+    lettered = parse_ordinal("(c)", "lettered")
+    assert lettered.parts == (3,) and lettered.relative is True
+    assert parse_ordinal("(iv)", "lettered").parts == (4,)
+    # Seven letters are also roman numerals. A lone c/d/l/m is the letter (no
+    # roman sub-list starts at 100); a lone i/v/x is the numeral.
+    assert parse_ordinal("(d)", "lettered").parts == (4,)
+    assert parse_ordinal("(m)", "lettered").parts == (13,)
+    assert parse_ordinal("(i)", "lettered").parts == (1,)
+    assert parse_ordinal("(x)", "lettered").parts == (10,)
+    assert parse_ordinal("(iii)", "lettered").parts == (3,)
+    # An inserted section keeps its root and carries the suffix.
+    inserted = parse_ordinal("12A", "code")
+    assert inserted.parts == (12,) and inserted.suffix == "A"
+    assert parse_ordinal(None, "numbered") is None
+    assert parse_ordinal("not-an-ordinal", "numbered") is None
+
+
+def test_ordinal_series_comes_from_the_keyword() -> None:
+    from pheasant.ingestion.taxonomy import parse_ordinal
+
+    assert parse_ordinal("4", "keyword", "Chapter").series == "chapter"
+    assert parse_ordinal("4", "keyword", "Article").series == "article"
+    # Aliases collapse onto one series.
+    assert (
+        parse_ordinal("1", "keyword", "Part").series
+        == parse_ordinal("1", "keyword", "Title").series
+    )
+
+
+def test_independent_series_no_longer_mis_parents() -> None:
+    """The regression this change exists for.
+
+    Level-only nesting put `§ 12.3` *under* `ARTICLE IV`, because it is deeper
+    by pattern depth. `(4,)` is not a prefix of `(12, 3)`, so the ordinal says
+    they are different series and the § attaches above the Article instead.
+    """
+    headings = detect_headings(ORDINAL_LEGAL)
+    code = _by_number(headings, "§ 12.3")
+    assert code.path == "MASTER SERVICES AGREEMENT > § 12.3 Governing Law"
+    assert "Article" not in code.path
+
+
+def test_decimal_subsections_attach_to_their_roman_article() -> None:
+    """Reconciliation across conventions: `IV` parses to `(4,)`, so `4.1` — whose
+    prefix is `(4,)` — belongs to it. The document's two ways of writing "four"
+    are recognised as the same number."""
+    headings = detect_headings(ORDINAL_LEGAL)
+    assert (
+        _by_number(headings, "4.1").path
+        == "MASTER SERVICES AGREEMENT > Article IV Term and Termination > 4.1 Initial Term"
+    )
+
+
+def test_prefix_chaining_within_one_series() -> None:
+    headings = detect_headings("§ 12 General\n§ 12.3 Governing Law\n§ 12.4 Notices\n")
+    assert _by_number(headings, "§ 12.3").path == "§ 12 General > § 12.3 Governing Law"
+    assert _by_number(headings, "§ 12.4").path == "§ 12 General > § 12.4 Notices"
+
+
+def test_same_number_in_different_series_does_not_parent() -> None:
+    """`CHAPTER 4` and `ARTICLE 4` share a number but not a series."""
+    headings = detect_headings("CHAPTER 4\nScope of Work\n\nARTICLE 4\nPayment Terms\n")
+    article = _by_number(headings, "Article 4")
+    assert "Chapter" not in article.path
+    assert article.level == 1
+
+
+def test_inserted_section_is_a_sibling_not_a_child() -> None:
+    """`§ 12A` is how a numbering absorbs a new section without renumbering, so
+    it sits beside `§ 12` rather than inside it."""
+    headings = detect_headings("§ 12 General\n§ 12A Inserted Provision\n§ 13 Other\n")
+    levels = {h.number: h.level for h in headings}
+    assert levels["§ 12A"] == levels["§ 12"] == levels["§ 13"]
+    assert "§ 12 General >" not in _by_number(headings, "§ 12A").path
+
+
+def test_deep_decimal_chain_reparents_correctly() -> None:
+    headings = detect_headings(
+        "1. Scope\n1.1 Purpose\n1.1.1 Detail\n1.1.2 More\n1.2 Limits\n2. Terms\n"
+    )
+    assert _by_number(headings, "1.1.1").path == "1 Scope > 1.1 Purpose > 1.1.1 Detail"
+    # 1.2 must climb back out of 1.1, not chain off 1.1.2.
+    assert _by_number(headings, "1.2").path == "1 Scope > 1.2 Limits"
+    assert _by_number(headings, "2").level == 1
+
+
+def test_lettered_items_are_siblings_of_each_other() -> None:
+    """Regression for a bug found while building this.
+
+    The sibling test compared an ancestor's *reconciled* level against the
+    candidate's *pattern* level — different scales — so `(b)` looked deeper than
+    its own sibling `(a)` and nested inside it.
+    """
+    headings = detect_headings("4.2 Termination\n(a) First\n(b) Second\n(c) Third\n")
+    lettered = [h for h in headings if h.kind == "lettered"]
+    assert len({h.level for h in lettered}) == 1, [h.path for h in lettered]
+    for heading in lettered:
+        assert heading.path.startswith("4.2 Termination > ")
+        assert heading.path.count(PATH_SEPARATOR) == 1
+
+
+def test_markdown_siblings_stay_siblings() -> None:
+    headings = detect_headings("# H\n\n## 2. Triage\n### 2.1 Sev\n### 2.2 Esc\n## 3. Cont\n")
+    deep = [h for h in headings if h.title.startswith(("2.1", "2.2"))]
+    assert len(deep) == 2
+    assert len({h.level for h in deep}) == 1
+
+
+def test_pattern_level_is_kept_alongside_the_reconciled_level() -> None:
+    headings = detect_headings(ORDINAL_LEGAL)
+    lettered = _by_number(headings, "(a)")
+    assert lettered.pattern_level == 6  # the rule's natural depth
+    assert lettered.level < lettered.pattern_level  # reconciled depth is compressed
+
+
+def test_max_depth_filters_on_the_pattern_level() -> None:
+    """`max_depth` stays a statement about the pattern, not about where the
+    document happened to place it."""
+    shallow = detect_headings(ORDINAL_LEGAL, max_depth=3)
+    assert shallow
+    assert max(h.pattern_level for h in shallow) <= 3
+    assert not any(h.kind == "lettered" for h in shallow)
+
+
+def test_reconciliation_is_deterministic() -> None:
+    first = [h.as_dict() for h in detect_headings(ORDINAL_LEGAL)]
+    second = [h.as_dict() for h in detect_headings(ORDINAL_LEGAL)]
+    assert first == second
+
+
+def test_as_dict_carries_the_ordinal() -> None:
+    payload = _by_number(detect_headings(ORDINAL_LEGAL), "§ 12.3").as_dict()
+    assert payload["ordinal"]["parts"] == [12, 3]
+    assert payload["ordinal"]["series"] == "code"
+    # A heading with no number carries no ordinal key.
+    caps = next(h for h in detect_headings(ORDINAL_LEGAL) if h.kind == "caps")
+    assert "ordinal" not in caps.as_dict()
+
+
+# --- sequence reconciliation -----------------------------------------------
+
+
+def test_gap_in_a_series_is_reported() -> None:
+    from pheasant.ingestion.taxonomy import reconcile_issues
+
+    issues = reconcile_issues(detect_headings("§ 12.3 Governing Law\n§ 12.5 Notices\n"))
+    gap = next(i for i in issues if i["kind"] == "gap")
+    assert gap["missing"] == [4]
+    assert gap["after"] == "§ 12.3" and gap["at"] == "§ 12.5"
+
+
+def test_duplicate_and_out_of_order_are_reported() -> None:
+    from pheasant.ingestion.taxonomy import reconcile_issues
+
+    duplicates = reconcile_issues(detect_headings("4.2 T\n(a) One\n(b) Two\n(b) Two again\n"))
+    assert any(i["kind"] == "duplicate" for i in duplicates)
+
+    unordered = reconcile_issues(detect_headings("1. One\n3. Three\n2. Two\n"))
+    assert any(i["kind"] == "out_of_order" for i in unordered)
+
+
+def test_clean_sequences_report_nothing() -> None:
+    from pheasant.ingestion.taxonomy import reconcile_issues
+
+    assert reconcile_issues(detect_headings("1. One\n2. Two\n3. Three\n")) == []
+    assert reconcile_issues(detect_headings(PROCEDURE)) == []
+
+
+def test_a_series_starting_mid_document_is_not_a_gap() -> None:
+    """An excerpt legitimately begins at 3; guessing otherwise cries wolf on
+    every extract."""
+    from pheasant.ingestion.taxonomy import reconcile_issues
+
+    assert reconcile_issues(detect_headings("3. Third\n4. Fourth\n")) == []
+
+
+def test_inserted_section_does_not_create_a_gap() -> None:
+    from pheasant.ingestion.taxonomy import reconcile_issues
+
+    assert reconcile_issues(detect_headings("§ 12 A\n§ 12A Inserted\n§ 13 B\n")) == []
+
+
+# --- surfaces ---------------------------------------------------------------
+
+
+def test_heading_nodes_persist_the_ordinal(tmp_path: Path) -> None:
+    engine = _engine(tmp_path, ORDINAL_LEGAL, taxonomy={"enabled": True})
+    engine.sync_source("docs", mode="full")
+    nodes = [
+        data
+        for _node_id, data in engine.graph_builder.graph.node_map().items()
+        if data.get("type") == "heading"
+    ]
+    code = next(n for n in nodes if n.get("number") == "§ 12.3")
+    assert code["ordinal_parts"] == [12, 3]
+    assert code["ordinal_series"] == "code"
+    assert code["pattern_level"] == 4
+    # A heading without a number stores an empty ordinal rather than nothing.
+    caps = next(n for n in nodes if n.get("kind") == "caps")
+    assert caps["ordinal_parts"] == []
+
+
+def test_taxonomy_endpoint_reports_issues_and_ordinals(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace" / "legal"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "msa.md").write_text(ORDINAL_LEGAL, encoding="utf-8")
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "taxonomy-ordinals",
+                "state_path": str(tmp_path / "state"),
+                "vault_path": str(tmp_path / "vault"),
+                "workspace_root": str(tmp_path / "workspace"),
+                "exports_path": str(tmp_path / "exports"),
+            },
+            "sources": [],
+        }
+    )
+    client = TestClient(create_app(config))
+    client.post(
+        "/sources",
+        json={
+            "name": "legal",
+            "type": "document_folder",
+            "path": str(workspace),
+            "include": ["**/*.md"],
+            "taxonomy": {"enabled": True},
+            "sync_now": True,
+            "wait": True,
+        },
+    )
+    payload = client.get("/taxonomy").json()
+    assert payload["issue_count"] >= 2
+    document = payload["documents"][0]
+    kinds = {issue["kind"] for issue in document["issues"]}
+    assert "gap" in kinds and "duplicate" in kinds
+
+    # The § series hangs off the document title, not off the Article.
+    def find(nodes: list[dict], number: str) -> dict | None:
+        for node in nodes:
+            if node.get("number") == number:
+                return node
+            hit = find(node["children"], number)
+            if hit:
+                return hit
+        return None
+
+    title = document["tree"][0]
+    assert any(child.get("number") == "§ 12.3" for child in title["children"])
+    code = find(document["tree"], "§ 12.3")
+    assert code is not None and code["ordinal"]["parts"] == [12, 3]
+
+
+def test_reconciled_hierarchy_reaches_the_graph_edges(tmp_path: Path) -> None:
+    """`contains` edges must agree with the ordinals, not with pattern depth."""
+    engine = _engine(tmp_path, ORDINAL_LEGAL, taxonomy={"enabled": True})
+    engine.sync_source("docs", mode="full")
+    graph = engine.graph_builder.graph
+    nodes = graph.node_map()
+    article = next(
+        node_id
+        for node_id, data in nodes.items()
+        if data.get("type") == "heading" and data.get("number") == "Article IV"
+    )
+    descendants = {
+        nodes[target].get("number")
+        for (src, target), edge_map in graph.iter_edges()
+        if src == article
+        for _key, data in edge_map.items()
+        if data.get("type") == "contains"
+    }
+    assert "4.1" in descendants and "4.2" in descendants
+    # The independent § series is NOT a child of the Article.
+    assert "§ 12.3" not in descendants
+
+
+def test_numbering_resumes_across_an_interruption() -> None:
+    """What the prefix match is actually load-bearing for.
+
+    When a shallower heading closes the open chain, the ordinal is the only
+    thing that can put a resumed series back where it belongs. Here ``SCHEDULE
+    9`` closes everything, and ``1.2`` must still rejoin ``1. Alpha`` — the
+    ancestor walk alone cannot, because ``1. Alpha`` is no longer open.
+    """
+    headings = detect_headings(
+        "1. Alpha\nbody\n\n1.1 First\nbody\n\nSCHEDULE 9\nInterruption\n\n1.2 Second\nbody\n"
+    )
+    resumed = _by_number(headings, "1.2")
+    assert resumed.path == "1 Alpha > 1.2 Second"
+    assert "Schedule" not in resumed.path
+
+
+def test_section_keyword_nests_under_a_chapter_by_ordinal() -> None:
+    """`SECTION 4.1` belongs inside `CHAPTER 4`: the prefix says so, and the
+    differing keywords are not a reason to refuse it."""
+    headings = detect_headings("CHAPTER 4\nScope\n\nSECTION 4.1\nDetail\n")
+    assert _by_number(headings, "Section 4.1").path == "Chapter 4 Scope > Section 4.1 Detail"

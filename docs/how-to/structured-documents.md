@@ -83,7 +83,21 @@ curl 'localhost:8765/taxonomy?path=msa.pdf' | jq
 
 **The graph has it too.** `heading` nodes, `has_heading` from the document to
 each section, and `contains` between a section and its subsections — so the
-existing graph traversal walks the outline without knowing anything new.
+existing graph traversal walks the outline without knowing anything new. Each
+node carries its parsed ordinal (`ordinal_parts`, `ordinal_series`), so a
+section is queryable by citation rather than by wording.
+
+**Numbering defects are reported.** `GET /taxonomy` returns an `issues` list per
+document:
+
+```json
+{"kind": "gap", "series": "code", "after": "§ 12.3", "at": "§ 12.5", "missing": [4]}
+{"kind": "duplicate", "series": "lettered", "after": "(b)", "at": "(b)"}
+```
+
+`gap`, `duplicate` and `out_of_order`. Only gaps *between observed siblings*
+count — a series starting at 3 is an excerpt, not a defect — and an inserted
+`§ 12A` never creates one.
 
 ## What is recognised
 
@@ -99,8 +113,12 @@ existing graph traversal walks the outline without knowing anything new.
 | `lettered` | `(a)`, `(iv)` | 6 |
 | `caps` | `ALL CAPS HEADING LINE` | 2 |
 
-A document may mix conventions and still nest: `ARTICLE IV` → `4.1` → `(a)`
-works, and so does `# Title` → `1. Scope`.
+A document may mix conventions and still nest, because the **ordinal** decides
+the parent wherever there is one: `4.1` attaches to `ARTICLE IV` since `IV`
+parses to `(4,)`, while `§ 12.3` refuses that Article — `(4,)` is not a prefix
+of `(12, 3)` — and attaches above it instead. `§ 12A` is a sibling of `§ 12`,
+not a child. A numbering that resumes after an interruption rejoins its own
+parent, which pattern depth alone could not do.
 
 A bare citation takes its caption from the next line, because legal drafting
 splits them:
@@ -127,11 +145,11 @@ them. Length and punctuation filters catch the long, sentence-like cases, but
 short list items will be read as sections. This is the reason the feature is
 per-source: enable it where the structure is real.
 
-**Two independent numbering series can mis-parent.** If a document has
-`ARTICLE IV` and `§ 12.3` as siblings, `§ 12.3` will appear nested under the
-Article, because nesting is by level and `§ 12.3` is deeper than `ARTICLE`.
-The breadcrumb still carries the right citation, so search and lookup are
-correct — only the parent link is wrong.
+**Letters that are also roman numerals.** A lone `(c)`/`(d)`/`(l)`/`(m)` is
+read as the letter, a lone `(i)`/`(v)`/`(x)` as the numeral. That gets both
+conventions right within a run — `(a)(b)(c)(d)` and `(i)(ii)(iii)(iv)` both
+count 1,2,3,4 — but misreads a letter list that reaches `(i)`. Lettered ordinals
+never decide hierarchy, so the cost is at most one spurious `issues` entry.
 
 **`caps` is the noisiest rule.** A document with shouted emphasis will produce
 spurious level-2 sections. Drop it from `detect` if that happens.
@@ -163,5 +181,7 @@ text, so a PDF with no extractable text has no outline either; see
 **Too many spurious sections.** Narrow `detect` — drop `caps` first, then
 `numbered`.
 
-**Sections are nested wrongly.** See the mis-parenting limit above; check
-whether the document mixes two numbering series.
+**Sections are nested wrongly.** Check the `ordinal` on the heading in
+`GET /taxonomy`. Nesting follows the ordinal when there is one, so a wrong
+parent usually means the number was not parsed as expected (an unusual
+separator, or a caption that swallowed the number).

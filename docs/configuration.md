@@ -568,11 +568,29 @@ confusion but cannot remove it. Enabling it per source is how you say "this
 corpus really is structured documentation". It also changes what the FTS index
 holds for that source, so it wants a deliberate `--mode full` re-sync.
 
-**Known limitation.** Nesting is by level, so a document that mixes two
-*independent* numbering series can parent one under the other — an `ARTICLE IV`
-whose siblings are `§ 12.3` will show `§ 12.3` nested beneath it. The
-breadcrumb still carries the correct citation, so lookup and search are
-unaffected; only the parent link is wrong.
+**Ordinal reconciliation.** A heading's own number decides its parent wherever
+it can, so mixed numbering works: `4.2` attaches to whichever heading *is* `4`
+— including a roman `ARTICLE IV`, since `IV` parses to `(4,)` — while `§ 12.3`
+refuses an ancestor whose ordinal is not a prefix of its own and climbs past the
+Article to the unnumbered title above. `§ 12A` is treated as a *sibling* of
+`§ 12`, because inserting a section is not nesting one. Lettered items (`(a)`,
+`(iv)`) are positions among siblings and are placed by nesting only.
+
+Each `heading` node stores its parsed ordinal (`ordinal_parts`,
+`ordinal_series`, `ordinal_suffix`), so a section is queryable by citation.
+
+**Sequence reconciliation.** `GET /taxonomy` also reports numbering defects per
+document in an `issues` list — `gap` (with the `missing` numbers), `duplicate`
+and `out_of_order`. For a contract or a procedure, "is anything missing?" is the
+question people actually ask, and once ordinals are parsed it is nearly free to
+answer. Only gaps *between observed siblings* are reported: a series starting at
+3 is an excerpt, not a defect.
+
+**Residual ambiguity.** Seven letters are also roman numerals. A lone
+`(c)`/`(d)`/`(l)`/`(m)` is read as the letter and a lone `(i)`/`(v)`/`(x)` as
+the numeral, which gets both conventions right in sequence but misreads a letter
+list that runs as far as `(i)`. Bounded on purpose: lettered ordinals never
+decide hierarchy, so the worst case is one spurious `issues` entry.
 
 ### `sources[].connector`
 

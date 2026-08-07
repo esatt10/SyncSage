@@ -1025,6 +1025,61 @@ re-dropping `heading_path` from search results 1, turning off section splitting
 4. Suite: **686 passed / 18 skipped** (+40). No wire-format change (the Synapse
 contract is untouched; parity green), no new dependency.
 
+### Ordinal detection + reconciliation, 2026-08-06
+
+The follow-up the entry above listed as not-done, and it **removes the
+documented mis-parenting limitation**. `parse_ordinal` turns a heading's own
+number into a comparable `Ordinal` — decimal paths (`4.2.1` → `(4,2,1)`), roman
+numerals (`IV` → `(4,)`), letters, inserted-section suffixes (`§ 12A`),
+parenthesised sub-items — and `_reconcile` then decides parentage from the
+**number** rather than the pattern depth, in three passes: prefix match →
+compatibility walk → level nesting.
+
+What that buys, each asserted: `4.1` attaches to `ARTICLE IV` because `IV`
+parses to `(4,)` — **the document's two spellings of "four" are recognised as
+one number**; `§ 12.3` refuses `ARTICLE IV` (`(4,)` is not a prefix of
+`(12,3)`) and climbs to the unnumbered title, which is the bug that was
+previously documented as permanent; `§ 12A` is a **sibling** of `§ 12`, since
+inserting a section is not nesting one; and a numbering that **resumes after an
+interruption** rejoins its own parent, which the ancestor walk alone cannot do
+(that last case is what makes the prefix pass load-bearing — see below).
+`SectionHeading.level` is now the reconciled depth and `pattern_level` keeps the
+rule's natural depth, which is what `max_depth` filters on.
+
+`reconcile_issues` is the second half: gaps (with the `missing` numbers),
+duplicates and out-of-order numbering, grouped per parent and series. For a
+contract or a procedure "is anything missing?" is the question people actually
+ask, and it is nearly free once ordinals are parsed. Only gaps *between observed
+siblings* are reported — a series starting at 3 is an excerpt, not a defect —
+and a suffixed insert never creates one. Surfaced per document in
+`GET /taxonomy` (`issues`, `issue_count`); `heading` nodes persist
+`ordinal_parts`/`ordinal_series`/`ordinal_suffix` so a section is queryable by
+citation.
+
+**Two bugs and one piece of dead code found by testing, all mine:**
+(1) `(c)` parsed as **roman 100** instead of letter 3 — seven letters are also
+roman numerals. Resolved by convention rather than guesswork: multi-character
+roman is a numeral; a lone `c`/`d`/`l`/`m` is a letter (no roman sub-list starts
+at 100) while a lone `i`/`v`/`x` is a numeral. Both `(a)(b)(c)(d)` and
+`(i)(ii)(iii)(iv)` now count 1,2,3,4 with zero spurious issues. The residual
+ambiguity (a letter list reaching `(i)`) is bounded because lettered ordinals
+are `relative` and never decide hierarchy. (2) The sibling test compared an
+ancestor's **reconciled** level against the candidate's **pattern** level —
+different scales — so `(b)` looked deeper than its sibling `(a)` and nested
+inside it. Caught by a duplicate-`(b)` case. (3) **Mutation testing proved
+`_series_compatible` inert**: forcing it to always return True changed no test,
+because the compatibility walk does not check series and re-made the identical
+attachment — and that attachment was *correct* (`SECTION 4.1` genuinely is
+within `CHAPTER 4`). Removed rather than kept with a docstring claiming a
+protection it never provided; what actually keeps `CHAPTER 4` and `ARTICLE 4`
+apart is that neither has a prefix for the other to match. Mutation testing also
+showed the prefix pass was uncovered, which is what prompted the
+resumes-after-interruption test.
+
+Acceptance: 24 more tests in `tests/test_taxonomy.py` (64 total). Suite:
+**710 passed / 18 skipped**. Docs updated to describe reconciliation and to
+**delete the mis-parenting limitation** rather than leave a stale warning.
+
 ---
 
 ## 6. Pointers

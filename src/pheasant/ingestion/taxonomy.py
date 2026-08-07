@@ -66,6 +66,31 @@ CLAUSE / STEP / PARAGRAPH    4
 
 Skipped levels are fine: the stack nests a level-4 heading under a level-2
 one when no level-3 heading intervenes.
+
+Ordinal reconciliation
+----------------------
+Pattern depth alone cannot tell two *independent* numbering series apart: in a
+contract whose Articles are roman and whose cross-references are ``§`` codes,
+``§ 12.3`` is deeper than ``ARTICLE IV`` by pattern and so used to land under
+it. So a heading's **own number** decides its parent wherever it can
+(:func:`parse_ordinal`, :func:`_reconcile`):
+
+- ``4.2`` attaches to whichever heading *is* ``4`` — which also reconciles
+  across conventions, since ``IV`` parses to ``(4,)`` and is therefore a valid
+  parent for ``4.1``. The document's two spellings of "four" are recognised as
+  one number.
+- ``§ 12.3`` refuses an ancestor whose ordinal is not a prefix of its own, so
+  it climbs past ``ARTICLE IV`` to the unnumbered title above.
+- ``(a)`` is *relative* — a position among siblings, no absolute path — so it
+  is placed by nesting only.
+
+``SectionHeading.level`` is the **reconciled** depth (what the tree and the
+graph's ``contains`` edges use); ``pattern_level`` keeps the rule's natural
+depth, which is what ``max_depth`` filters on.
+
+:func:`reconcile_issues` is the other half: once ordinals are parsed, checking
+that a series actually runs 1, 2, 3 is nearly free, and "is anything missing?"
+is the question people ask of a contract or a procedure.
 """
 
 from __future__ import annotations
@@ -120,7 +145,171 @@ _KEYWORD_LEVELS: dict[str, int] = {
     "subsection": 5,
 }
 
+#: Which numbering family a keyword belongs to. Aliases collapse (``PART`` and
+#: ``TITLE`` are one series), which is what lets :func:`reconcile_issues` check
+#: "do the Articles run 1, 2, 3?" without mixing them in with the Schedules.
+#: It is a *label* — it does not gate parentage; see the note above
+#: ``_compatible_parent`` for why that gate was removed.
+_KEYWORD_SERIES: dict[str, str] = {
+    "book": "division",
+    "part": "division",
+    "title": "division",
+    "division": "division",
+    "schedule": "annex",
+    "appendix": "annex",
+    "annex": "annex",
+    "exhibit": "annex",
+    "chapter": "chapter",
+    "subpart": "chapter",
+    "article": "article",
+    "section": "section",
+    "rule": "rule",
+    "regulation": "rule",
+    "clause": "clause",
+    "step": "step",
+    "paragraph": "paragraph",
+    "subsection": "section",
+}
+
+_ROMAN_VALUES = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+_LETTER_SERIES = "abcdefghijklmnopqrstuvwxyz"
+
 _ORDINAL = r"[0-9]+(?:\.[0-9]+)*[A-Za-z]?|[IVXLCDM]+|[A-Z]"
+_RE_DECIMAL_ORDINAL = re.compile(r"^([0-9]+(?:\.[0-9]+)*)([A-Za-z])?$")
+_RE_ROMAN_ORDINAL = re.compile(r"^[IVXLCDM]+$")
+
+
+@dataclass(frozen=True)
+class Ordinal:
+    """A heading's own number, parsed into something comparable.
+
+    ``parts`` is the numeric path: ``4.2`` is ``(4, 2)``, ``IV`` is ``(4,)``,
+    ``§ 12.3`` is ``(12, 3)``. That is what makes hierarchy *derivable* rather
+    than guessed — ``4.2`` belongs under ``4`` because its path says so, and
+    ``§ 12.3`` does not belong under ``ARTICLE IV`` because ``(4,)`` is not a
+    prefix of ``(12, 3)``.
+
+    ``relative`` marks a lettered ordinal (``(a)``, ``(iv)``): it has a
+    position among its siblings but no absolute path, so it can only be placed
+    by nesting, never by prefix.
+
+    ``suffix`` carries an inserted-section letter (``§ 12A``). A suffixed
+    ordinal is a *sibling* of its unsuffixed root, not a child of it — that is
+    what inserting a section into an existing numbering means — so it parents
+    where ``12`` would and never collides with it.
+    """
+
+    parts: tuple[int, ...]
+    series: str
+    raw: str
+    relative: bool = False
+    suffix: str = ""
+
+    @property
+    def absolute(self) -> bool:
+        return bool(self.parts) and not self.relative
+
+    @property
+    def prefix(self) -> tuple[int, ...]:
+        """Numeric path of the section this one sits under, if any.
+
+        A suffixed ordinal shares its root's prefix rather than descending from
+        it: ``§ 12A`` hangs where ``§ 12`` hangs, because inserting a section is
+        not the same as nesting one.
+        """
+        return self.parts[:-1]
+
+    def is_prefix_of(self, other: Ordinal) -> bool:
+        if not (self.absolute and other.absolute) or self.suffix:
+            return False
+        return len(self.parts) < len(other.parts) and other.parts[: len(self.parts)] == self.parts
+
+    def key(self) -> tuple:
+        return (self.parts, self.suffix)
+
+
+def _roman_to_int(text: str) -> int | None:
+    total = 0
+    previous = 0
+    for char in reversed(text.upper()):
+        value = _ROMAN_VALUES.get(char)
+        if value is None:
+            return None
+        total += -value if value < previous else value
+        previous = max(previous, value)
+    return total or None
+
+
+#: Single characters that are both a letter and a roman numeral. `C`, `D`, `L`
+#: and `M` never *start* a sub-list, so a lone one is the letter; `i`, `v` and
+#: `x` plausibly do, so a lone one is the numeral.
+_ROMAN_STARTERS = frozenset("ivx")
+
+
+def _lettered_position(inner: str) -> int | None:
+    """Position of a parenthesised sub-item — ``(c)`` is 3, ``(iv)`` is 4.
+
+    Genuinely ambiguous, because seven letters are also roman numerals: is
+    ``(c)`` the third item or numeral 100? Resolved by two observations about
+    how these lists are actually written:
+
+    - Multiple roman characters (``(ii)``, ``(iv)``) are always a numeral.
+    - A lone ``c``/``d``/``l``/``m`` is a letter, because no roman sub-list
+      starts at 100. A lone ``i``/``v``/``x`` is a numeral, because those do
+      start one.
+
+    The residual ambiguity is a letter list that runs as far as ``(i)`` — read
+    as numeral 1 rather than letter 9. Bounded on purpose: a lettered ordinal is
+    ``relative``, so it never decides hierarchy. The worst case is one spurious
+    entry in :func:`reconcile_issues`, not a mis-nested section.
+    """
+    if not inner:
+        return None
+    if len(inner) > 1 and _RE_ROMAN_ORDINAL.match(inner.upper()):
+        return _roman_to_int(inner)
+    if len(inner) == 1:
+        if inner in _ROMAN_STARTERS:
+            return _roman_to_int(inner)
+        if inner in _LETTER_SERIES:
+            return _LETTER_SERIES.index(inner) + 1
+    return None
+
+
+def parse_ordinal(raw: str | None, kind: str, keyword: str | None = None) -> Ordinal | None:
+    """Parse a heading's number into an :class:`Ordinal`, or ``None``.
+
+    Handles the forms these document classes actually use: decimal paths
+    (``4``, ``4.2.1``), roman numerals (``IV`` — near-universal for Articles
+    and Parts), single letters, inserted-section suffixes (``12A``) and
+    parenthesised sub-items (``(a)``, ``(iv)``).
+    """
+    if not raw:
+        return None
+    series = _KEYWORD_SERIES.get((keyword or "").lower(), kind)
+    text = raw.strip()
+
+    if kind == "lettered":
+        position = _lettered_position(text.strip("()").lower())
+        if position is None:
+            return None
+        # Relative: "(a)" is the first child of whatever encloses it, and
+        # carries no absolute path of its own.
+        return Ordinal(parts=(position,), series="lettered", raw=text, relative=True)
+
+    match = _RE_DECIMAL_ORDINAL.match(text)
+    if match:
+        parts = tuple(int(piece) for piece in match.group(1).split("."))
+        return Ordinal(parts=parts, series=series, raw=text, suffix=(match.group(2) or "").upper())
+
+    if _RE_ROMAN_ORDINAL.match(text.upper()):
+        value = _roman_to_int(text)
+        if value is not None:
+            return Ordinal(parts=(value,), series=series, raw=text)
+
+    if len(text) == 1 and text.lower() in _LETTER_SERIES:
+        return Ordinal(parts=(_LETTER_SERIES.index(text.lower()) + 1,), series=series, raw=text)
+    return None
+
 
 _RE_MARKDOWN = re.compile(r"^(#{1,6})\s+(.+?)\s*#*$")
 _RE_KEYWORD = re.compile(
@@ -154,6 +343,15 @@ class SectionHeading:
     title: str
     kind: str
     path: str
+    #: Depth the *pattern* implies, before ordinal reconciliation. ``level`` is
+    #: the reconciled tree depth (``parent.level + 1``) and is what
+    #: :func:`taxonomy_tree` nests by; ``pattern_level`` is what ``max_depth``
+    #: filters on, so "ignore lettered sub-items" stays a statement about the
+    #: pattern rather than about where the document happened to put it.
+    pattern_level: int = 0
+    #: Parsed number, when the heading has one. Present for keyword, code,
+    #: numbered and lettered headings; ``None`` for Markdown and ALL-CAPS.
+    ordinal: Ordinal | None = None
 
     @property
     def label(self) -> str:
@@ -162,7 +360,7 @@ class SectionHeading:
         return self.number or self.title
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "line": self.line,
             "level": self.level,
             "number": self.number,
@@ -170,6 +368,15 @@ class SectionHeading:
             "kind": self.kind,
             "path": self.path,
         }
+        if self.ordinal is not None:
+            payload["ordinal"] = {
+                "parts": list(self.ordinal.parts),
+                "series": self.ordinal.series,
+                "raw": self.ordinal.raw,
+                "relative": self.ordinal.relative,
+                "suffix": self.ordinal.suffix,
+            }
+        return payload
 
 
 def _plausible_heading(title: str, line_text: str) -> bool:
@@ -291,49 +498,273 @@ def detect_headings(
     if not enabled:
         return []
 
+    candidates = _scan(text, enabled, max_depth, max_headings)
+    return _reconcile(candidates)
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    """A matched heading line, before its place in the tree is decided."""
+
+    line: int
+    pattern_level: int
+    number: str | None
+    title: str
+    kind: str
+    ordinal: Ordinal | None
+
+    @property
+    def label(self) -> str:
+        if self.number and self.title:
+            return f"{self.number} {self.title}"
+        return self.number or self.title
+
+
+def _scan(
+    text: str,
+    enabled: set[str],
+    max_depth: int,
+    max_headings: int,
+) -> list[_Candidate]:
+    """Match heading lines. No hierarchy decisions here — that is `_reconcile`."""
     lines = text.splitlines()
-    headings: list[SectionHeading] = []
-    stack: list[SectionHeading] = []
+    candidates: list[_Candidate] = []
     for index, raw_line in enumerate(lines, start=1):
         classified = _classify(raw_line)
         if classified is None:
             continue
-        level, number, title, kind = classified
+        pattern_level, number, title, kind = classified
         if kind not in enabled:
             continue
         if not title and kind in ("keyword", "code"):
             title = _continuation_title(lines, index)
-        if level > max_depth:
+        # `max_depth` filters on the *pattern's* depth, so "ignore lettered
+        # sub-items" stays a statement about the pattern rather than about
+        # wherever reconciliation ends up putting it.
+        if pattern_level > max_depth:
             continue
         if not (number or title):
             continue
-
-        while stack and stack[-1].level >= level:
-            stack.pop()
-        heading = SectionHeading(
-            line=index,
-            level=level,
-            number=number,
-            title=title,
-            kind=kind,
-            path="",  # filled below, once the label is known
+        keyword = number.split()[0] if (kind == "keyword" and number) else None
+        raw_ordinal = _raw_ordinal(number, kind)
+        candidates.append(
+            _Candidate(
+                line=index,
+                pattern_level=pattern_level,
+                number=number,
+                title=title,
+                kind=kind,
+                ordinal=parse_ordinal(raw_ordinal, kind, keyword),
+            )
         )
-        crumbs = [ancestor.label for ancestor in stack] + [heading.label]
-        path = PATH_SEPARATOR.join(c for c in crumbs if c)[:MAX_PATH_CHARS]
-        heading = SectionHeading(
-            line=index,
-            level=level,
-            number=number,
-            title=title,
-            kind=kind,
-            path=path,
-        )
-        stack.append(heading)
-        headings.append(heading)
-        if len(headings) >= max_headings:
+        if len(candidates) >= max_headings:
             logger.warning("taxonomy detection hit the %d-heading cap; truncating", max_headings)
             break
-    return headings
+    return candidates
+
+
+def _raw_ordinal(number: str | None, kind: str) -> str | None:
+    """The bare ordinal inside a rendered number (``Article IV`` -> ``IV``)."""
+    if not number:
+        return None
+    if kind == "keyword":
+        pieces = number.split(None, 1)
+        return pieces[1] if len(pieces) > 1 else None
+    if kind == "code":
+        return number.lstrip("§ ").strip() or None
+    return number
+
+
+def _reconcile(candidates: list[_Candidate]) -> list[SectionHeading]:
+    """Decide each heading's parent, preferring the **ordinal** over the level.
+
+    Level-only nesting cannot tell two independent numbering series apart. In a
+    contract whose Articles are roman and whose cross-references are ``§``
+    codes, ``§ 12.3`` is deeper than ``ARTICLE IV`` by level and so lands
+    *under* it — wrong, and it was a documented limitation of the first cut.
+
+    An ordinal says where a section belongs, so this resolves parentage in
+    three passes of preference:
+
+    1. **Prefix match.** ``4.2`` goes under whichever heading *is* ``4``. This
+       also reconciles across conventions for free: ``4.1`` lands under
+       ``ARTICLE IV``, because ``IV`` parses to ``(4,)`` and ``(4,)`` is a
+       prefix of ``(4, 1)``. The document's two ways of writing "four" are
+       recognised as the same number.
+    2. **Compatibility walk.** With no prefix match, climb the open ancestors
+       and refuse any whose absolute ordinal is *not* a prefix of ours — that
+       is the conflicting-series case. ``§ 12.3`` therefore skips past
+       ``4.1`` and ``ARTICLE IV`` and attaches to the unnumbered document
+       title above them.
+    3. **Level nesting.** Headings with no ordinal at all (Markdown,
+       ALL-CAPS) and relative ones (``(a)``) nest exactly as before.
+
+    ``level`` on the result is the reconciled depth, so `taxonomy_tree` and the
+    graph's `contains` edges agree with the ordinals.
+    """
+    resolved: list[SectionHeading] = []
+    parents: list[int | None] = []
+    open_chain: list[int] = []  # indices of currently-open ancestors
+
+    for candidate in candidates:
+        parent = _prefix_parent(candidate, resolved)
+        if parent is None:
+            parent = _compatible_parent(candidate, resolved, open_chain)
+
+        level = (resolved[parent].level + 1) if parent is not None else 1
+        crumbs = [resolved[i].label for i in _ancestry(parents, parent)] + [candidate.label]
+        path = PATH_SEPARATOR.join(crumb for crumb in crumbs if crumb)[:MAX_PATH_CHARS]
+
+        resolved.append(
+            SectionHeading(
+                line=candidate.line,
+                level=level,
+                number=candidate.number,
+                title=candidate.title,
+                kind=candidate.kind,
+                path=path,
+                pattern_level=candidate.pattern_level,
+                ordinal=candidate.ordinal,
+            )
+        )
+        index = len(resolved) - 1
+        parents.append(parent)
+        # Reopen the chain down to this heading's parent, then push it.
+        open_chain = _ancestry(parents, parent) + [index]
+    return resolved
+
+
+def _ancestry(parents: list[int | None], index: int | None) -> list[int]:
+    """Indices from the root down to ``index`` inclusive."""
+    chain: list[int] = []
+    cursor = index
+    guard = 0
+    while cursor is not None and guard <= len(parents):
+        chain.append(cursor)
+        cursor = parents[cursor] if cursor < len(parents) else None
+        guard += 1
+    return list(reversed(chain))
+
+
+def _prefix_parent(candidate: _Candidate, resolved: list[SectionHeading]) -> int | None:
+    """Index of the heading whose ordinal is exactly this one's prefix."""
+    ordinal = candidate.ordinal
+    if ordinal is None or not ordinal.absolute:
+        return None
+    prefix = ordinal.prefix
+    if not prefix:
+        return None
+    for index in range(len(resolved) - 1, -1, -1):
+        other = resolved[index].ordinal
+        if other is None or not other.absolute or other.suffix:
+            continue
+        if other.parts == prefix:
+            return index
+    return None
+
+
+# A `_series_compatible` gate used to sit on the match above, refusing a prefix
+# match when the two keywords named different series (`CHAPTER 4` vs
+# `SECTION 4.1`). Mutation testing showed it was **inert**: forcing it to always
+# return True changed no test, because the compatibility walk below does not
+# check series and re-made the identical attachment. It was also arguably wrong
+# — `SECTION 4.1` genuinely *is* within `CHAPTER 4`. Removed rather than kept
+# with a docstring claiming a protection it did not provide.
+#
+# What actually keeps `CHAPTER 4` and `ARTICLE 4` from parenting each other is
+# simpler: both have a single-component ordinal, so neither has a prefix for the
+# other to match.
+
+
+def _compatible_parent(
+    candidate: _Candidate,
+    resolved: list[SectionHeading],
+    open_chain: list[int],
+) -> int | None:
+    """Deepest open ancestor that does not conflict with this ordinal."""
+    ordinal = candidate.ordinal
+    for index in reversed(open_chain):
+        ancestor = resolved[index]
+        # Compare **pattern** depth to pattern depth. Reconciled `level` is a
+        # compressed tree depth (1, 2, 3…) while `pattern_level` is the rule's
+        # natural depth (6 for a lettered item), so mixing the two scales makes
+        # the sibling test meaningless: a lettered `(b)` compared against a
+        # reconciled level of 2 looks *deeper* than its own sibling `(a)` and
+        # nests inside it. Caught by the duplicate-`(b)` case.
+        if ancestor.pattern_level >= candidate.pattern_level:
+            # Same or shallower pattern depth: this is a sibling boundary.
+            continue
+        if ordinal is not None and ordinal.absolute:
+            other = ancestor.ordinal
+            if other is not None and other.absolute and not other.is_prefix_of(ordinal):
+                # A numbered ancestor from a different series or branch cannot
+                # contain us — keep climbing.
+                continue
+        return index
+    return None
+
+
+def reconcile_issues(headings: list[SectionHeading]) -> list[dict[str, Any]]:
+    """Sequence problems in the numbering: gaps, duplicates, out-of-order.
+
+    The second half of reconciliation. Once ordinals are parsed, checking that
+    a numbering series actually runs 1, 2, 3 is nearly free — and for the
+    document classes this feature targets it is the question people ask of a
+    document: *is anything missing?* A contract that jumps from § 12.3 to
+    § 12.5, or repeats ``(b)``, is either an extraction failure or a drafting
+    defect, and both are worth surfacing rather than silently indexing.
+
+    Only gaps *between observed siblings* are reported. A series that starts at
+    3 is not flagged: an excerpt legitimately begins mid-document, and guessing
+    otherwise would cry wolf on every extract. Suffixed inserts (``§ 12A``)
+    never advance the sequence, since inserting one is precisely how a numbering
+    absorbs a new section without renumbering.
+
+    Deterministic, and read-only over the reconciled headings.
+    """
+    groups: dict[tuple[str, str, int], list[SectionHeading]] = {}
+    for heading in headings:
+        ordinal = heading.ordinal
+        if ordinal is None or not ordinal.parts:
+            continue
+        parent = heading.path.rsplit(PATH_SEPARATOR, 1)[0] if PATH_SEPARATOR in heading.path else ""
+        groups.setdefault((parent, ordinal.series, len(ordinal.parts)), []).append(heading)
+
+    issues: list[dict[str, Any]] = []
+    for (parent, series, _depth), members in sorted(groups.items()):
+        previous: SectionHeading | None = None
+        for heading in members:
+            assert heading.ordinal is not None
+            if heading.ordinal.suffix:
+                continue
+            if previous is None:
+                previous = heading
+                continue
+            assert previous.ordinal is not None
+            before = previous.ordinal.parts[-1]
+            current = heading.ordinal.parts[-1]
+            common = {
+                "series": series,
+                "parent": parent,
+                "after": previous.number,
+                "at": heading.number,
+                "line": heading.line,
+            }
+            if current == before:
+                issues.append({"kind": "duplicate", **common})
+            elif current < before:
+                issues.append({"kind": "out_of_order", **common})
+            elif current > before + 1:
+                issues.append(
+                    {
+                        "kind": "gap",
+                        "missing": list(range(before + 1, current)),
+                        **common,
+                    }
+                )
+            if current >= before:
+                previous = heading
+    return issues
 
 
 def heading_path_for_line(headings: list[SectionHeading], line: int) -> str | None:

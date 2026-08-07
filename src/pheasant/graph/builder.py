@@ -222,12 +222,23 @@ class GraphBuilder:
                     "source_id": source.name,
                     "artifact_id": artifact.id,
                     "level": heading.level,
+                    "pattern_level": heading.pattern_level,
                     "number": heading.number,
                     "title": heading.title,
                     "kind": heading.kind,
                     "heading_path": heading.path,
                     "start_line": heading.line,
                     "relative_path": artifact.relative_path,
+                    # The parsed ordinal, persisted so a reader can query by
+                    # citation ("§ 12.3" -> parts [12, 3]) and so the taxonomy
+                    # endpoint can re-derive sequence issues without reparsing
+                    # the document.
+                    "ordinal_parts": list(heading.ordinal.parts) if heading.ordinal else [],
+                    "ordinal_series": heading.ordinal.series if heading.ordinal else None,
+                    "ordinal_suffix": heading.ordinal.suffix if heading.ordinal else "",
+                    "ordinal_relative": bool(heading.ordinal.relative)
+                    if heading.ordinal
+                    else False,
                 },
             )
             while stack and stack[-1][0] >= heading.level:

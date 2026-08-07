@@ -1305,7 +1305,12 @@ def create_app(
         with taxonomy disabled simply has no heading nodes, so it returns an
         empty tree rather than an error.
         """
-        from pheasant.ingestion.taxonomy import SectionHeading, taxonomy_tree
+        from pheasant.ingestion.taxonomy import (
+            Ordinal,
+            SectionHeading,
+            reconcile_issues,
+            taxonomy_tree,
+        )
 
         graph_obj = engine.graph_builder.graph
         by_document: dict[str, list[SectionHeading]] = {}
@@ -1321,6 +1326,18 @@ def create_app(
             seen += 1
             if seen > max(1, max_nodes):
                 break
+            parts = tuple(int(p) for p in (data.get("ordinal_parts") or []))
+            ordinal = (
+                Ordinal(
+                    parts=parts,
+                    series=str(data.get("ordinal_series") or ""),
+                    raw=str(data.get("number") or ""),
+                    relative=bool(data.get("ordinal_relative")),
+                    suffix=str(data.get("ordinal_suffix") or ""),
+                )
+                if parts
+                else None
+            )
             by_document.setdefault(relative, []).append(
                 SectionHeading(
                     line=int(data.get("start_line") or 0),
@@ -1329,22 +1346,31 @@ def create_app(
                     title=str(data.get("title") or ""),
                     kind=str(data.get("kind") or ""),
                     path=str(data.get("heading_path") or ""),
+                    pattern_level=int(data.get("pattern_level") or 0),
+                    ordinal=ordinal,
                 )
             )
 
         documents = []
         for relative in sorted(by_document):
             headings = sorted(by_document[relative], key=lambda h: h.line)
+            issues = reconcile_issues(headings)
             documents.append(
                 {
                     "relative_path": relative,
                     "heading_count": len(headings),
                     "tree": taxonomy_tree(headings),
+                    # Gaps / duplicates / out-of-order numbering. For contracts
+                    # and procedures "is anything missing?" is the question
+                    # people actually ask of a document, and once ordinals are
+                    # parsed it is nearly free to answer.
+                    "issues": issues,
                 }
             )
         return {
             "documents": documents,
             "heading_count": sum(d["heading_count"] for d in documents),
+            "issue_count": sum(len(d["issues"]) for d in documents),
             "truncated": seen > max(1, max_nodes),
         }
 
