@@ -34,8 +34,8 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 | `server` | API/MCP/UI network bindings and feature toggles. | Yes |
 | `storage` | Database/graph/manifests locations and state limits. | Yes |
 | `search` | Retrieval modes and ranking behavior. | Yes |
+| `ingestion` | Turning binary/markup files (documents, images, audio) into indexable text. | Optional |
 | `sync` | Watcher, git polling, schedule, idempotency, and concurrency behavior. | Yes |
-| `ingestion` | Turning binary/markup files (PDF/DOCX, images, audio) into indexable text. | Optional |
 | `graph` | Knowledge-graph density (concept-node threshold, WASM acceleration). | Optional |
 | `obsidian` | Export controls for notes/canvas/frontmatter/backlinks/tags. | Optional |
 | `security` | Path allowlisting, source-read protections, and ACL enforcement. | Strongly recommended |
@@ -406,6 +406,9 @@ See [Multi-modal ingest](how-to/multimodal-ingest.md) for the full walkthrough.
 
 `api_key_env` is the **name** of an environment variable; the key itself never
 lands in config or on disk.
+
+---
+
 ## `graph` (knowledge-graph density)
 
 | Key | Type | Default | Notes |
