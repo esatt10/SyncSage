@@ -598,7 +598,11 @@ def test_sync_source_with_wait_false_returns_immediately_and_settles(
     response = client.post("/sync/pasted-notes-bg2", json={"wait": False})
 
     assert response.status_code == 200
-    assert response.json() == {"status": "syncing", "source_id": "pasted-notes-bg2"}
+    payload = response.json()
+    assert payload["status"] == "syncing"
+    assert payload["source_id"] == "pasted-notes-bg2"
+    # The job id is the handle the UI follows for live progress.
+    assert payload["job_id"]
     settled = _wait_until_not_syncing(client, "pasted-notes-bg2")
     assert settled["sync_error"] is None
 
@@ -626,7 +630,12 @@ def test_sync_source_with_wait_false_does_not_start_a_second_overlapping_sync(
     second = client.post("/sync/pasted-notes-bg4", json={"wait": False})
 
     assert first.json()["status"] == "syncing"
-    assert second.json() == {"status": "already_syncing", "source_id": "pasted-notes-bg4"}
+    assert second.json() == {
+        "status": "already_syncing",
+        # No second job was created — the refusal is the point.
+        "job_id": None,
+        "source_id": "pasted-notes-bg4",
+    }
     settled = _wait_until_not_syncing(client, "pasted-notes-bg4")
     assert settled["sync_error"] is None
 

@@ -515,6 +515,52 @@ class SynapseSettings(ModelMixin):
 
 
 @dataclass
+class RetrievalSettings(ModelMixin):
+    """How hard the answering workflows look before they answer.
+
+    These knobs already existed — as untyped keys inside
+    ``assistant.workflow_options``, documented only in a workflow module's
+    ``DEFAULTS`` dict. That made them invisible to the config surface: not in
+    the schema, not validated, not editable from the UI, and not something an
+    MCP client could ask about. This block is their typed home.
+
+    Precedence is deliberately *low*: these are merged **under**
+    ``assistant.workflow_options``, which is merged under the per-request
+    ``options``. So an existing config that tuned ``workflow_options`` keeps
+    winning, and an agent overriding a criterion for one call still wins over
+    both (see :func:`pheasant.assistant.workflows.resolve_options`).
+
+    A field left at ``None`` is not merged at all — the workflow's own
+    ``DEFAULTS`` apply, which is what makes this block additive rather than a
+    second source of truth for values it does not care about.
+    """
+
+    #: plan → retrieve → grade turns before answering with what is in hand.
+    max_rounds: int | None = 2
+    #: Passages fetched per query per search mode.
+    per_query_results: int | None = 6
+    #: Total passages offered to the synthesis step.
+    max_context_passages: int | None = 10
+    #: Search modes to fan out over. "vector" is dropped automatically when
+    #: no vector index is built, so leaving it on is safe.
+    retrieval_modes: list[str] | None = field(default_factory=lambda: ["text", "vector"])
+    #: Walk the graph out of the best hits for structurally-related material.
+    expand_graph: bool | None = True
+    expand_depth: int | None = 1
+    expand_per_node: int | None = 3
+    #: Ask the model to grade its own evidence before answering.
+    grade_evidence: bool | None = True
+    #: Drop [n] markers that do not resolve to a real citation.
+    verify_citations: bool | None = True
+    #: Graph facts surfaced alongside the answer.
+    max_facts: int | None = 12
+
+    def as_options(self) -> dict[str, Any]:
+        """The subset that is actually set, as workflow-option keys."""
+        return {key: value for key, value in self.model_dump().items() if value is not None}
+
+
+@dataclass
 class AssistantSettings(ModelMixin):
     """Grounded chat over the knowledge graph (query-time only).
 
@@ -549,8 +595,11 @@ class AssistantSettings(ModelMixin):
     # `pheasant.agent_workflows` entry-point group is also valid.
     workflow: str = "auto"
     # Per-workflow knobs, passed through untouched (see the workflow's
-    # DEFAULTS for the keys it honors).
+    # DEFAULTS for the keys it honors). Merged OVER `retrieval` below, so a
+    # config that already tuned these keeps behaving exactly as it did.
     workflow_options: dict[str, Any] = field(default_factory=dict)
+    # Typed retrieval criteria (rounds, depth, breadth). See RetrievalSettings.
+    retrieval: RetrievalSettings = field(default_factory=RetrievalSettings)
 
 
 @dataclass
@@ -740,6 +789,9 @@ class PheasantConfig(ModelMixin):
                     raw["embeddings"] = build(EmbeddingsSettings, raw["embeddings"])
                 if "vector_store" in raw and isinstance(raw["vector_store"], dict):
                     raw["vector_store"] = build(VectorStoreSettings, raw["vector_store"])
+            if dc is AssistantSettings:
+                if "retrieval" in raw and isinstance(raw["retrieval"], dict):
+                    raw["retrieval"] = build(RetrievalSettings, raw["retrieval"])
             if dc is IngestionSettings:
                 if "captioner" in raw and isinstance(raw["captioner"], dict):
                     raw["captioner"] = build(CaptionerSettings, raw["captioner"])

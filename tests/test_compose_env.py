@@ -31,4 +31,3 @@ sources: []
 
     rendered = render_env_file(values)
     assert 'PHEASANT_WORKSPACE_PATH="../workspace with spaces"' in rendered
-

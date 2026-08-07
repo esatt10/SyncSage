@@ -21,7 +21,9 @@ class TextChunk:
         return max(1, len(self.text) // 4)
 
 
-def chunk_text(text: str, max_chars: int = 4000, overlap_chars: int = 400, heading_path: str | None = None) -> list[TextChunk]:
+def chunk_text(
+    text: str, max_chars: int = 4000, overlap_chars: int = 400, heading_path: str | None = None
+) -> list[TextChunk]:
     if not text:
         return []
     lines = text.splitlines()
@@ -41,9 +43,21 @@ def chunk_text(text: str, max_chars: int = 4000, overlap_chars: int = 400, headi
                 end = newline
         chunk = text[start:end].strip()
         if chunk:
-            start_line = next((line for offset, line in reversed(line_offsets) if offset <= start), 1)
-            end_line = next((line for offset, line in reversed(line_offsets) if offset <= end), len(lines) or 1)
-            chunks.append(TextChunk(index=index, text=chunk, start_line=start_line, end_line=end_line, heading_path=heading_path))
+            start_line = next(
+                (line for offset, line in reversed(line_offsets) if offset <= start), 1
+            )
+            end_line = next(
+                (line for offset, line in reversed(line_offsets) if offset <= end), len(lines) or 1
+            )
+            chunks.append(
+                TextChunk(
+                    index=index,
+                    text=chunk,
+                    start_line=start_line,
+                    end_line=end_line,
+                    heading_path=heading_path,
+                )
+            )
             index += 1
         if end >= len(text):
             break

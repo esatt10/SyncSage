@@ -2,7 +2,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
-TEXT_EXTENSIONS = {".py", ".md", ".txt", ".yaml", ".yml", ".toml", ".json", ".html", ".xml", ".css", ".js", ".ts"}
+TEXT_EXTENSIONS = {
+    ".py",
+    ".md",
+    ".txt",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".json",
+    ".html",
+    ".xml",
+    ".css",
+    ".js",
+    ".ts",
+}
 DOCUMENT_EXTENSIONS = {".pdf", ".docx"}
 # Synapse 25.4 (session A): images are ingested by captioning them into text
 # (see pheasant.ingestion.captioner). The caption flows through the normal

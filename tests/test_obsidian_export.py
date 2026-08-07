@@ -60,8 +60,7 @@ def test_obsidian_export_updates_notes_in_place(
     assert second_notes == first_notes
     assert second_contents == first_contents
     assert any(
-        "---" in content and "source" in content.lower()
-        for content in second_contents.values()
+        "---" in content and "source" in content.lower() for content in second_contents.values()
     )
 
 

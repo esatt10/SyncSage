@@ -6,15 +6,17 @@ import threading
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Annotated
 
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from pheasant.assistant.credentials import SessionKeyStore
 from pheasant.config.loader import (
     ConfigError,
+    dump_config_yaml,
     effective_config_dict,
     load_config,
     validate_source_paths,
@@ -24,6 +26,7 @@ from pheasant.config.schema import PheasantConfig, SourceConfig, SourceType
 from pheasant.graph.exporter import cytoscape, node_link
 from pheasant.graph.simple import SimpleMultiDiGraph
 from pheasant.ingestion.pipeline import read_text, utc_now
+from pheasant.jobs import JobRegistry
 from pheasant.obsidian.exporter import ObsidianExporter
 from pheasant.persistence.paths import StatePaths
 from pheasant.persistence.state_store import StateStore
@@ -221,6 +224,40 @@ class AssistantKeyRequest(BaseModel):
     base_url: str | None = None
 
 
+class RetrievalRequest(BaseModel):
+    """Tune the typed retrieval criteria (``assistant.retrieval``).
+
+    Every field is optional and ``None`` means "leave it alone" — a PUT that
+    sets one knob must not silently reset the other nine to their defaults.
+    """
+
+    max_rounds: int | None = None
+    per_query_results: int | None = None
+    max_context_passages: int | None = None
+    retrieval_modes: list[str] | None = None
+    expand_graph: bool | None = None
+    expand_depth: int | None = None
+    expand_per_node: int | None = None
+    grade_evidence: bool | None = None
+    verify_citations: bool | None = None
+    max_facts: int | None = None
+    # Write the change to the config file as well as the live process.
+    persist: bool = True
+
+
+class ConfigSectionRequest(BaseModel):
+    """One config section's new value, plus what to do with it."""
+
+    values: dict
+    persist: bool = True
+
+
+class KnowledgeBaseRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    persist: bool = True
+
+
 class QuickAddRequest(BaseModel):
     """One-field source creation: paste a path or URL and go."""
 
@@ -234,6 +271,46 @@ class QuickAddRequest(BaseModel):
     # false so pasting a large repo's URL never blocks the form (and the
     # reverse proxy in front of it) on however long the first index takes.
     wait: bool = True
+
+
+#: One line per retrieval knob, so a UI (or an agent reading
+#: ``describe_retrieval``) can explain a setting without the caller having to
+#: go and read the workflow module's docstring.
+RETRIEVAL_FIELD_HELP: dict[str, str] = {
+    "max_rounds": "plan → retrieve → grade turns before answering with what is in "
+    "hand. 1 disables the re-plan loop.",
+    "per_query_results": "passages fetched per query per search mode.",
+    "max_context_passages": "total passages offered to the answering step.",
+    "retrieval_modes": "search modes to fan out over (text, vector, graph, hybrid). "
+    "'vector' is dropped automatically when no vector index is built.",
+    "expand_graph": "walk the knowledge graph out of the best hits, reaching "
+    "documents that share no vocabulary with the question.",
+    "expand_depth": "hops to walk when expanding.",
+    "expand_per_node": "neighbours taken per expanded node.",
+    "grade_evidence": "ask the model to grade its own evidence before answering.",
+    "verify_citations": "drop [n] markers that do not resolve to a real citation.",
+    "max_facts": "graph facts surfaced alongside the answer.",
+}
+
+#: Config sections that can be changed on a running server, and what changing
+#: one actually costs. ``True`` means the live process picks it up; ``False``
+#: means it is written to the file and needs a restart. Being honest about the
+#: difference is the whole point — a UI that says "saved" for a setting the
+#: process is still ignoring has lied to the user.
+LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
+    "search": True,
+    "assistant": True,
+    "graph": True,
+    "obsidian": True,
+    "memory": True,
+    "ingestion": False,  # captioner/transcriber are wired at engine construction
+    "sync": False,  # watcher/scheduler services are started at boot
+    "security": False,  # path policy is read per request, but ACL wiring is not
+    "synapse": True,
+    "storage": False,
+    "server": False,
+    "pheasant": False,
+}
 
 
 def _allowed_roots(config: PheasantConfig) -> list[Path]:
@@ -441,6 +518,88 @@ def graph_neighbors(
     return {"node_id": node_id, "depth": depth, "neighbors": neighbors}
 
 
+def _shortest_path(
+    graph: SimpleMultiDiGraph,
+    source: str,
+    target: str,
+    *,
+    max_depth: int = 8,
+    max_visited: int = 200_000,
+) -> list[str] | None:
+    """Fewest hops between two nodes, or None.
+
+    Edges are followed in **both** directions on purpose. "How are these two
+    related?" is a question about connectivity, not about which way an import
+    happens to point — a file and the concept it mentions are related whether
+    you walk `mentions` forwards or backwards, and a direction-respecting
+    search reports "no path" for pairs a human would call obviously connected.
+
+    Bidirectional BFS: two frontiers meeting in the middle explore
+    O(b^(d/2)) instead of O(b^d), which is the difference between a usable
+    answer and a graph walk on a hub-heavy index. ``max_visited`` bounds the
+    work on a miss so a bad pair cannot pin the server.
+    """
+    if source == target:
+        return [source]
+    with graph.reading():
+        adjacency: dict[str, set[str]] = {}
+        for (edge_source, edge_target), _edge_map in graph.iter_edges():
+            adjacency.setdefault(edge_source, set()).add(edge_target)
+            adjacency.setdefault(edge_target, set()).add(edge_source)
+
+    # Parent maps double as visited sets; walking them back at the meeting
+    # point is what reconstructs the path.
+    forward: dict[str, str | None] = {source: None}
+    backward: dict[str, str | None] = {target: None}
+    front, back = [source], [target]
+    for depth in range(max_depth):
+        if not front or not back:
+            return None
+        if len(forward) + len(backward) > max_visited:
+            return None
+        # Always expand the smaller frontier: it is what keeps the
+        # bidirectional saving rather than degenerating to one deep search.
+        expand_forward = len(front) <= len(back)
+        frontier, seen, other = (
+            (front, forward, backward) if expand_forward else (back, backward, forward)
+        )
+        next_frontier: list[str] = []
+        for node in frontier:
+            for neighbour in adjacency.get(node, ()):
+                if neighbour in seen:
+                    continue
+                seen[neighbour] = node
+                if neighbour in other:
+                    return _join_paths(neighbour, forward, backward)
+                next_frontier.append(neighbour)
+        if expand_forward:
+            front = next_frontier
+        else:
+            back = next_frontier
+        if depth + 1 >= max_depth:
+            break
+    return None
+
+
+def _join_paths(
+    meeting: str,
+    forward: dict[str, str | None],
+    backward: dict[str, str | None],
+) -> list[str]:
+    head: list[str] = []
+    cursor: str | None = meeting
+    while cursor is not None:
+        head.append(cursor)
+        cursor = forward.get(cursor)
+    head.reverse()
+    tail: list[str] = []
+    cursor = backward.get(meeting)
+    while cursor is not None:
+        tail.append(cursor)
+        cursor = backward.get(cursor)
+    return head + tail
+
+
 def _edge_type_set(value: str | None) -> set[str] | None:
     items = {item.strip() for item in (value or "").split(",") if item.strip()}
     return items or None
@@ -583,15 +742,14 @@ def create_app(
     # Chat API keys a user pastes in the browser live here and nowhere else:
     # process memory, TTL'd, gone on restart.
     app.state.session_keys = SessionKeyStore(config.assistant.session_key_ttl_minutes)
-    # Background-sync bookkeeping (`wait=false` on quick-add/register/sync):
-    # in-memory only, process lifetime, guarded by one lock. `syncing` holds
-    # a source name while its background thread is running; `sync_outcomes`
-    # keeps the *last* background result per source (cleared on the next
-    # background sync of that source) so a client that missed the transient
-    # `syncing` window still sees why it failed instead of just "not syncing".
+    # Background work (`wait=false` on quick-add/register/sync/upload) is
+    # tracked in one job registry: in-memory, process lifetime, with a phase,
+    # a counter and a terminal outcome per job. The `syncing_sources` /
+    # `sync_outcomes` dicts this replaced could only say "true" for however
+    # many minutes a first index took, which is indistinguishable from a hang.
     app.state.sync_lock = threading.Lock()
-    app.state.syncing_sources = {}
-    app.state.sync_outcomes = {}
+    app.state.jobs = JobRegistry()
+    jobs = app.state.jobs
 
     # The web UI is a separate workload that talks to this API over HTTP, so the
     # browser origin differs in development — but this API is unauthenticated,
@@ -670,21 +828,24 @@ def create_app(
         return {"knowledge_bases": KnowledgeBaseRegistry(state).list()}
 
     def _with_sync_state(records: list[dict]) -> list[dict]:
-        """Overlay live background-sync state (`_run_background_sync`) onto
-        persisted source rows, for every route that lists sources — a client
-        polling either one sees a source currently syncing, and the outcome
-        of the last one that ran in the background even after it finishes:
-        `syncing` alone would flicker to nothing the instant a background
-        sync completes, which is exactly when a caller most wants to know
-        whether it succeeded.
+        """Overlay live job state onto persisted source rows.
+
+        Every route that lists sources carries this, so a client polling any
+        of them sees what is running and — via `sync_error` — why the last
+        background pass failed. `syncing` alone flickers to nothing the
+        instant a job completes, which is exactly when a caller most wants to
+        know whether it succeeded. `job` adds the phase and counter behind
+        that boolean, which is what turns a spinner into a progress bar.
         """
-        with app.state.sync_lock:
-            syncing = dict(app.state.syncing_sources)
-            outcomes = dict(app.state.sync_outcomes)
         for record in records:
             name = record.get("name")
-            record["syncing"] = name in syncing
-            record["sync_error"] = (outcomes.get(name) or {}).get("error")
+            if not name:
+                continue
+            active = jobs.active_for(name)
+            last = jobs.last_outcome_for(name)
+            record["syncing"] = active is not None
+            record["sync_error"] = last.error if last else None
+            record["job"] = active.as_dict() if active else None
         return records
 
     @app.get("/sources")
@@ -751,6 +912,7 @@ def create_app(
         audit(source.name, "register_source", {"source": source.model_dump(mode="json")})
         result = None
         syncing = False
+        job_id = None
         if req.sync_now:
             if req.wait:
                 try:
@@ -758,7 +920,7 @@ def create_app(
                 except (KeyError, ValueError) as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
             else:
-                _start_background_sync(source.name, req.sync_mode)
+                job_id = _start_background_sync(source.name, req.sync_mode)
                 syncing = True
         return {
             "status": "registered",
@@ -766,6 +928,7 @@ def create_app(
             "source": source.model_dump(mode="json"),
             "sync_result": result,
             "syncing": syncing,
+            "job_id": job_id,
             "config_update_required": True,
         }
 
@@ -848,7 +1011,7 @@ def create_app(
             payload = json.loads(row["config_json"])
             source = PheasantConfig.model_validate({"sources": [payload]}).sources[0]
         source_payload = source.model_dump(mode="json")
-        yaml_patch = yaml.safe_dump({"sources": [source_payload]}, sort_keys=False)
+        yaml_patch = dump_config_yaml({"sources": [source_payload]})
         wrote = False
         # `config_path` is caller-supplied: constrain it to this server's own
         # config (or an allowed root) so promotion cannot be used to write a
@@ -873,7 +1036,7 @@ def create_app(
                 item for item in data.get("sources", []) or [] if item.get("name") != source.name
             ]
             data["sources"] = [*existing, source_payload]
-            path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+            path.write_text(dump_config_yaml(data), encoding="utf-8")
             wrote = True
         audit(source_id, "promote_runtime_source_to_config", {"write": wrote, "path": target})
         return {
@@ -928,85 +1091,94 @@ def create_app(
             )
         return {"results": [r.__dict__ for r in results]}
 
-    def _run_background_sync(source_name: str | None, mode: str, names: list[str]) -> None:
-        """The `wait=false` path: same worker-subprocess sync as `_index`,
-        off the request thread, outcome recorded instead of returned.
+    def _run_background_sync(source_name: str | None, mode: str, job_id: str) -> None:
+        """The `wait=false` path: same worker-subprocess sync as `_index`, off
+        the request thread, reporting into the job registry as it goes.
 
-        ``names`` is exactly what `_start_background_sync` already marked
-        as syncing (under `sync_lock`, before this thread was even
-        started) — every one of them is guaranteed to leave
-        `syncing_sources` in the `finally`, success or failure, sync error
-        or unexpected exception, so a source can never get stuck showing
-        "syncing" forever.
+        The job is guaranteed to reach a terminal state on every exit path —
+        success, sync failure, or an unexpected exception — so a source can
+        never get stuck showing "syncing" forever.
         """
         from pheasant.sync.worker import WorkerBackedEngine
+
+        def forward(event: dict) -> None:
+            jobs.progress(
+                job_id,
+                phase=event.get("phase"),
+                current=event.get("current"),
+                total=event.get("total"),
+                detail=event.get("detail"),
+            )
 
         try:
             worker = WorkerBackedEngine(engine, app.state.config_path)
             if source_name:
-                results = [worker.sync_source(source_name, mode)]
+                results = [worker.sync_source(source_name, mode, on_progress=forward)]
             else:
-                results = worker.sync_all(mode)
+                results = worker.sync_all(mode, on_progress=forward)
         except Exception as exc:  # background thread — never propagate, just record
-            with app.state.sync_lock:
-                for name in names:
-                    app.state.sync_outcomes[name] = {
-                        "status": "error",
-                        "error": str(exc),
-                        "finished_at": utc_now(),
-                    }
+            logger.exception("background sync failed")
+            jobs.finish(job_id, "failed", error=str(exc))
             return
-        finally:
-            with app.state.sync_lock:
-                for name in names:
-                    app.state.syncing_sources.pop(name, None)
-        with app.state.sync_lock:
-            for result in results:
-                app.state.sync_outcomes[result.source_id] = {
-                    "status": result.status,
-                    "error": (
-                        result.details.get("error")
-                        if result.status in {"failed", "timeout"}
-                        else None
-                    ),
-                    "finished_at": utc_now(),
-                }
+        failed = [r for r in results if r.status in {"failed", "timeout", "limit_exceeded"}]
+        jobs.finish(
+            job_id,
+            "failed" if failed else "succeeded",
+            error=(failed[0].details.get("error") or failed[0].status) if failed else None,
+            result={
+                "results": [
+                    {
+                        "source_id": r.source_id,
+                        "indexed_artifacts": r.indexed_artifacts,
+                        "skipped_artifacts": r.skipped_artifacts,
+                        "status": r.status,
+                    }
+                    for r in results
+                ]
+            },
+        )
 
-    def _start_background_sync(source_name: str | None, mode: str) -> bool:
-        """Returns False (no-op) instead of starting a second overlapping
-        pass over a source that is already syncing in the background.
+    def _start_background_sync(source_name: str | None, mode: str) -> str | None:
+        """Start a background sync. Returns the job id, or None if one is
+        already running over the same source.
 
-        Found live: a source with `sync.on_startup: true` and no checkpoint
-        yet (so every attempt does a full, expensive pass) got resynced by
-        both a container-startup trigger and a manual `wait: false` trigger
-        landing close together — two concurrent embedding-heavy syncs over
-        the same large source, which tripped the OpenAI embeddings
-        endpoint's rate limit and multiplied disk/CPU work for no benefit.
-        The mark-as-syncing step happens *here*, under one lock acquisition
-        that also checks for an existing entry, rather than inside the
-        thread — so the check-and-mark is atomic against a second caller
+        Refusing the overlap matters: found live, a source with
+        `sync.on_startup: true` and no checkpoint yet (so every attempt does a
+        full, expensive pass) got resynced by both a container-startup trigger
+        and a manual `wait: false` trigger landing close together — two
+        concurrent embedding-heavy syncs over the same source, which tripped
+        the embeddings endpoint's rate limit and multiplied disk and CPU work
+        for no benefit. The check-and-claim happens under one lock acquisition
+        here, not inside the thread, so it is atomic against a second caller
         racing in before the first thread has even started.
         """
         names = [source_name] if source_name else [s.name for s in config.sources if s.enabled]
         with app.state.sync_lock:
-            to_start = [n for n in names if n not in app.state.syncing_sources]
-            for name in to_start:
-                app.state.syncing_sources[name] = {"mode": mode, "started_at": utc_now()}
-        if not to_start:
-            return False
+            to_start = [name for name in names if jobs.active_for(name) is None]
+            if not to_start:
+                return None
+            job = jobs.create(
+                "sync",
+                f"Indexing {source_name}" if source_name else "Indexing all sources",
+                to_start,
+            )
         threading.Thread(
             target=_run_background_sync,
-            args=(source_name, mode, to_start),
+            args=(source_name, mode, job.id),
             name=f"pheasant-bgsync-{source_name or 'all'}",
             daemon=True,
         ).start()
-        return True
+        return job.id
 
     @app.post("/sync")
     def sync_all(req: SyncRequest) -> dict:
         if not req.wait:
-            _start_background_sync(None, req.mode)
-            return {"status": "syncing", "sources": [s.name for s in config.sources if s.enabled]}
+            job_id = _start_background_sync(None, req.mode)
+            return {
+                "status": "syncing" if job_id else "already_syncing",
+                "job_id": job_id,
+                "sources": [s.name for s in config.sources if s.enabled],
+            }
         try:
             return _index(req.source_name, req.mode, req.depth, req.full_scan)
         except KeyError as exc:
@@ -1029,9 +1201,10 @@ def create_app(
             )
             if not known:
                 raise HTTPException(status_code=404, detail=f"Unknown source: {source_id}")
-            started = _start_background_sync(source_id, mode)
+            job_id = _start_background_sync(source_id, mode)
             return {
-                "status": "syncing" if started else "already_syncing",
+                "status": "syncing" if job_id else "already_syncing",
+                "job_id": job_id,
                 "source_id": source_id,
             }
         try:
@@ -1048,6 +1221,120 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/sources/upload")
+    async def upload_documents(
+        files: Annotated[list[UploadFile], File()],
+        source_name: Annotated[str, Form()] = "uploads",
+        sync_now: Annotated[bool, Form()] = True,
+        wait: Annotated[bool, Form()] = False,
+    ) -> dict:
+        """Index documents dropped into the UI, with no filesystem setup.
+
+        The files land in a directory under ``/state/uploads`` which is
+        registered as an ordinary ``document_folder`` source — so they flow
+        through the same connector → chunk → graph pipeline as everything
+        else, get the same idempotent re-sync, and can be removed by deleting
+        the source. There is deliberately no second ingestion path.
+
+        Uploading again into the same source name adds to it rather than
+        replacing it, which is what "drop a few more files in" should mean.
+        """
+        from pheasant.api.uploads import safe_filename, store_upload, upload_root
+
+        if not files:
+            raise HTTPException(status_code=400, detail="No files uploaded")
+        name = safe_filename(source_name or "uploads", fallback="uploads")
+        directory = upload_root(Path(config.pheasant.state_path), name)
+        limits = config.sync.limits
+        max_bytes = (limits.max_file_size_mb or 0) * 1024 * 1024 or None
+
+        stored: list[dict] = []
+        rejected: list[dict] = []
+        for upload in files:
+            data = await upload.read()
+            try:
+                record = store_upload(
+                    directory,
+                    upload.filename or "upload",
+                    data,
+                    max_bytes=max_bytes,
+                )
+            except ValueError as exc:
+                # One bad file must not lose the good ones in the same drop.
+                rejected.append({"filename": upload.filename, "error": str(exc)})
+                continue
+            stored.append(record.__dict__)
+        if not stored:
+            raise HTTPException(
+                status_code=400,
+                detail="; ".join(item["error"] for item in rejected) or "Nothing stored",
+            )
+
+        registry = SourceRegistry(config, state)
+        existing = next((s for s in config.sources if s.name == name), None)
+        if existing is None:
+            source = _source_from_payload(
+                {
+                    "name": name,
+                    "type": "document_folder",
+                    "path": str(directory),
+                    "description": f"Documents uploaded through the UI ({name})",
+                    # Uploads are arbitrary documents, not a code tree: the
+                    # default include list is code-shaped and would silently
+                    # drop a dropped PDF or .docx.
+                    "include": ["**/*"],
+                }
+            )
+            registry.register_source(source)
+            config.sources = [s for s in config.sources if s.name != name]
+            config.sources.append(source)
+        audit(name, "upload_documents", {"files": [item["filename"] for item in stored]})
+
+        syncing = False
+        job_id = None
+        sync_result = None
+        if sync_now:
+            if wait:
+                try:
+                    sync_result = engine.sync_source(name, "incremental").__dict__
+                except (KeyError, ValueError) as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            else:
+                job_id = _start_background_sync(name, "incremental")
+                syncing = job_id is not None
+        return {
+            "status": "stored",
+            "source_name": name,
+            "path": str(directory),
+            "stored": stored,
+            "rejected": rejected,
+            "syncing": syncing,
+            "job_id": job_id,
+            "sync_result": sync_result,
+        }
+
+    @app.get("/fs/host-path")
+    def fs_host_path(path: str) -> dict:
+        """Can pheasant see this path — and if not, exactly how to fix it.
+
+        The most common first-run failure is a real host path that simply is
+        not mounted into the container. Answering "does not exist" there is
+        true and useless; this returns the bind mount, the ``docker run``
+        flag and the ``allow_workspace_roots`` entry needed to make it work.
+        """
+        from pheasant.deployment.mounts import in_container, resolve_host_path
+
+        report = resolve_host_path(path)
+        report["in_container"] = in_container()
+        report["allowed"] = False
+        if report.get("container_path"):
+            try:
+                _resolve_source_path(report["container_path"], config)
+                report["allowed"] = True
+            except PathPolicyError as exc:
+                report["policy_error"] = str(exc)
+        return report
 
     @app.post("/sources/{source_id}/scan")
     def scan_source(source_id: str, depth: int | None = None) -> dict:
@@ -1137,6 +1424,88 @@ def create_app(
         from pheasant.security.idp import idp_status
 
         return idp_status(config, state)
+
+    # ------------------------------------------------------------------
+    # Jobs — everything running in the background, with real progress.
+    # ------------------------------------------------------------------
+    @app.get("/jobs")
+    def list_jobs(active: bool = False, limit: int = 50) -> dict:
+        records = jobs.list(active_only=active, limit=limit)
+        return {
+            "jobs": records,
+            "active_count": sum(1 for job in records if job["active"]),
+        }
+
+    # Registered BEFORE /jobs/{job_id}: FastAPI matches routes in declaration
+    # order, so the parameterised path would otherwise capture "stream" as a
+    # job id and answer this with a 404.
+    @app.get("/jobs/stream")
+    def stream_jobs():
+        """Server-sent events, one per job update.
+
+        The alternative — polling `/jobs` on a timer — is the wrong shape for
+        something that changes hundreds of times over a few minutes and then
+        not at all for an hour.
+
+        Deliberately an **async** generator polling a plain queue, not a sync
+        generator blocking on ``queue.get(timeout=...)``. Starlette runs a sync
+        generator in a threadpool and cannot interrupt it, so a client that
+        disconnects leaves that thread blocking on a queue nobody will ever
+        write to again — one leaked thread per dropped connection, forever. An
+        async generator is cancelled at the first ``await`` after the
+        disconnect, which is at most ``POLL_SECONDS`` away.
+        """
+        import asyncio
+        import json as json_module
+        import queue as queue_module
+
+        from starlette.responses import StreamingResponse
+
+        poll_seconds = 0.25
+        ping_every = 4.0
+
+        async def publish():
+            queue = jobs.subscribe()
+            try:
+                # Prime the stream with current state, so a client that
+                # connects mid-job renders immediately instead of waiting for
+                # the next update to tell it anything at all.
+                for job in jobs.list(active_only=True):
+                    yield f"data: {json_module.dumps({'type': 'job', 'job': job})}\n\n"
+                since_ping = 0.0
+                while True:
+                    drained = False
+                    while True:
+                        try:
+                            item = queue.get_nowait()
+                        except queue_module.Empty:
+                            break
+                        drained = True
+                        yield f"data: {json_module.dumps({'type': 'job', 'job': item})}\n\n"
+                    if drained:
+                        since_ping = 0.0
+                    elif since_ping >= ping_every:
+                        # Keeps proxies from closing an idle connection, and is
+                        # the write that surfaces a dropped client as an error.
+                        since_ping = 0.0
+                        yield ": ping\n\n"
+                    await asyncio.sleep(poll_seconds)
+                    since_ping += poll_seconds
+            finally:
+                jobs.unsubscribe(queue)
+
+        return StreamingResponse(
+            publish(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/jobs/{job_id}")
+    def get_job(job_id: str) -> dict:
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Unknown job: {job_id}")
+        return job
 
     @app.get("/sync/status")
     def sync_status() -> dict:
@@ -1350,6 +1719,84 @@ def create_app(
             exclude_node_types=_edge_type_set(exclude_types),
         )
 
+    @app.get("/graph/diagnostics")
+    def graph_diagnostics(top: int = 20) -> dict:
+        """Structural health of the graph, for the full-screen workspace.
+
+        Answers the questions a picture cannot: which nodes are hubs, how much
+        of the graph is disconnected, which edge types actually carry weight,
+        and how the sources compare. One pinned read of the graph — this walks
+        it, so it must not be on a hot path the UI polls.
+        """
+        graph_obj = engine.graph_builder.graph
+        # `iter_edges`/`node_map` hand back the live mappings instead of
+        # copying 850k edges per call; both require holding `reading()` for
+        # the whole walk, which is exactly what this block does.
+        with graph_obj.reading():
+            node_types = graph_obj.type_counts()
+            total_nodes = graph_obj.number_of_nodes()
+            total_links = graph_obj.number_of_edges()
+            nodes = graph_obj.node_map()
+            degree: dict[str, int] = {}
+            edge_types: dict[str, int] = {}
+            for (source_id, target_id), edge_map in graph_obj.iter_edges():
+                count = len(edge_map)
+                degree[source_id] = degree.get(source_id, 0) + count
+                degree[target_id] = degree.get(target_id, 0) + count
+                for data in edge_map.values():
+                    kind = str(data.get("type") or "unknown")
+                    edge_types[kind] = edge_types.get(kind, 0) + 1
+            hubs = sorted(degree.items(), key=lambda item: (-item[1], item[0]))[: max(1, top)]
+            # An orphan is a node no edge touches. On a healthy index this is
+            # near zero; a large number means enrichment did not run, or a
+            # source indexed content that nothing links to.
+            orphans = [node_id for node_id in nodes if node_id not in degree]
+            hub_rows = [
+                {
+                    "node_id": node_id,
+                    "degree": count,
+                    "label": (nodes.get(node_id) or {}).get("label"),
+                    "type": (nodes.get(node_id) or {}).get("type"),
+                }
+                for node_id, count in hubs
+            ]
+        return {
+            "total_nodes": total_nodes,
+            "total_links": total_links,
+            "node_types": node_types,
+            "edge_types": dict(sorted(edge_types.items(), key=lambda kv: -kv[1])),
+            "orphan_count": len(orphans),
+            "orphan_sample": orphans[:20],
+            "density": round(total_links / total_nodes, 3) if total_nodes else 0.0,
+            "hubs": hub_rows,
+        }
+
+    @app.get("/graph/path")
+    def graph_path(source: str, target: str, max_depth: int = 8) -> dict:
+        """Shortest path between two nodes, as a navigable chain.
+
+        "How are these two things related?" is the question a graph is
+        uniquely able to answer and the canvas alone cannot — two nodes six
+        hops apart are never on screen together. Bidirectional BFS so a miss
+        on a large graph costs two shallow frontiers rather than one deep one.
+        """
+        graph_obj = engine.graph_builder.graph
+        if source not in graph_obj:
+            raise HTTPException(status_code=404, detail=f"Unknown node: {source}")
+        if target not in graph_obj:
+            raise HTTPException(status_code=404, detail=f"Unknown node: {target}")
+        path = _shortest_path(graph_obj, source, target, max_depth=max_depth)
+        return {
+            "source": source,
+            "target": target,
+            "found": path is not None,
+            "hops": len(path) - 1 if path else None,
+            "path": [
+                {"node_id": node_id, **dict(graph_obj.nodes.get(node_id) or {})}
+                for node_id in (path or [])
+            ],
+        }
+
     @app.get("/nodes/explain")
     def explain_node(node_id: str) -> dict:
         g = engine.graph_builder.graph
@@ -1442,9 +1889,7 @@ def create_app(
             raise HTTPException(status_code=400, detail="; ".join(errors))
         path = Path(app.state.config_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        rendered = (
-            req.yaml_text if req.yaml_text is not None else yaml.safe_dump(data, sort_keys=False)
-        )
+        rendered = req.yaml_text if req.yaml_text is not None else dump_config_yaml(data)
         path.write_text(rendered, encoding="utf-8")
         audit(None, "write_config", {"path": str(path)})
         return {
@@ -1733,11 +2178,147 @@ def create_app(
             return False
         merged = deep_merge(existing, patch)
         sources = merged.pop("sources", []) or []
-        rendered = yaml.safe_dump(merged, sort_keys=False)
+        rendered = dump_config_yaml(merged)
         if sources:
             rendered += _render_sources_block(sources)
         path.write_text(rendered, encoding="utf-8")
         return True
+
+    # ------------------------------------------------------------------
+    # Editing the live knowledge base, one section at a time. `PUT /config`
+    # replaces the whole file and always demands a restart; these routes let
+    # the UI change one thing and be told honestly what happened to it.
+    # ------------------------------------------------------------------
+    @app.get("/config/sections")
+    def config_sections() -> dict:
+        effective = config.model_dump(mode="json")
+        return {
+            "sections": [
+                {
+                    "id": name,
+                    "values": effective.get(name, {}),
+                    "live_applicable": live,
+                }
+                for name, live in LIVE_APPLICABLE_SECTIONS.items()
+            ]
+        }
+
+    @app.patch("/config/section/{section}")
+    def patch_config_section(section: str, req: ConfigSectionRequest) -> dict:
+        """Validate, persist and (where safe) hot-apply one config section.
+
+        Validation goes through the *whole* config rather than the section
+        alone: sections are not independent (``storage`` paths derive from
+        ``pheasant.state_path``), and validating a fragment in isolation
+        accepts combinations the loader would reject.
+        """
+        if section not in LIVE_APPLICABLE_SECTIONS:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Unknown config section: {section}. Known sections: "
+                + ", ".join(sorted(LIVE_APPLICABLE_SECTIONS)),
+            )
+        if not isinstance(req.values, dict):
+            raise HTTPException(status_code=400, detail="values must be a mapping")
+
+        from pheasant.config.loader import deep_merge
+
+        current = config.model_dump(mode="json")
+        candidate_data = deep_merge(current, {section: req.values})
+        try:
+            candidate = PheasantConfig.model_validate(candidate_data)
+        except (ConfigError, ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid {section}: {exc}") from exc
+
+        live = LIVE_APPLICABLE_SECTIONS[section]
+        applied = False
+        if live:
+            # Swap the whole settings object rather than patching fields one by
+            # one: a partial swap leaves the process in a state that is neither
+            # the old config nor the new one, which is the worst of both.
+            setattr(config, section, getattr(candidate, section))
+            applied = True
+            if section == "search":
+                try:
+                    _reload_vector_stack()
+                except Exception as exc:  # embeddings may be misconfigured
+                    logger.warning("search section applied but vectors not reloaded: %s", exc)
+        wrote = False
+        if req.persist:
+            wrote = _merge_into_config_file({section: req.values})
+        audit(None, "patch_config_section", {"section": section, "persisted": wrote})
+        return {
+            "status": "updated",
+            "section": section,
+            "applied": applied,
+            "restart_required": not live,
+            "wrote_config": wrote,
+            "values": candidate.model_dump(mode="json").get(section, {}),
+        }
+
+    @app.get("/knowledge-base")
+    def knowledge_base() -> dict:
+        return {
+            "id": config.knowledge_base_id,
+            "name": config.pheasant.name,
+            "description": config.pheasant.description,
+            "environment": config.pheasant.environment,
+            "version": __version__,
+            "state_path": str(config.pheasant.state_path),
+            "config_path": str(app.state.config_path),
+        }
+
+    @app.put("/knowledge-base")
+    def update_knowledge_base(req: KnowledgeBaseRequest) -> dict:
+        """Edit this knowledge base's identity.
+
+        ``description`` is free to change. ``name`` is not cosmetic — it *is*
+        ``kb_id``: the graph's root node id, the key every stable artifact ID
+        hangs off, and the identity a Synapse router routes to (CLAUDE.md §4
+        rule 3). Renaming is allowed, but it is reported as what it is: the
+        existing graph belongs to the old name and a full re-index is needed
+        to rebuild it under the new one. Silently accepting the rename and
+        leaving an orphaned graph behind would be the actual bug.
+        """
+        changes: dict = {}
+        if req.description is not None:
+            config.pheasant.description = req.description
+            changes["description"] = req.description
+        rename = None
+        if req.name is not None and req.name != config.pheasant.name:
+            previous = config.pheasant.name
+            if not req.name.strip():
+                raise HTTPException(status_code=400, detail="name must not be empty")
+            changes["name"] = req.name
+            rename = {
+                "previous": previous,
+                "current": req.name,
+                "reindex_required": True,
+                "detail": (
+                    f"The indexed graph is stored under {previous!r}. Run a full "
+                    f"sync (`pheasant sync --all --mode full`) to rebuild it under "
+                    f"{req.name!r}; until then this knowledge base will look empty."
+                ),
+            }
+        if not changes:
+            return {"status": "unchanged", **knowledge_base()}
+        wrote = False
+        if req.persist:
+            wrote = _merge_into_config_file({"pheasant": changes})
+        if rename:
+            # Applied to the file only. Swapping kb_id in the live process
+            # would repoint every subsequent write at a graph this process has
+            # not loaded, which is a worse outcome than requiring a restart.
+            config.pheasant.name = rename["previous"]
+        audit(None, "update_knowledge_base", {"changes": sorted(changes), "persisted": wrote})
+        return {
+            "status": "updated",
+            "changed": sorted(changes),
+            "wrote_config": wrote,
+            "restart_required": rename is not None,
+            "rename": rename,
+            **knowledge_base(),
+        }
 
     @app.get("/config/effective")
     def config_effective(profile: str = "quickstart") -> dict:
@@ -1976,6 +2557,60 @@ def create_app(
             },
         )
 
+    # ------------------------------------------------------------------
+    # Retrieval criteria. The same knobs an MCP client can override per
+    # call (`preview_retrieval`), reachable as standing configuration.
+    # ------------------------------------------------------------------
+    def _retrieval_payload() -> dict:
+        from pheasant.assistant.workflows.agentic import DEFAULTS as AGENTIC_DEFAULTS
+
+        settings = config.assistant.retrieval
+        return {
+            "retrieval": settings.model_dump(mode="json"),
+            # What actually reaches the workflow once workflow_options is
+            # layered on top — the honest answer to "what is it doing", which
+            # is not the same as "what did I set" whenever both are in play.
+            "effective": {
+                **settings.as_options(),
+                **{
+                    key: value
+                    for key, value in (config.assistant.workflow_options or {}).items()
+                    if not isinstance(value, dict)
+                },
+            },
+            "workflow_options": dict(config.assistant.workflow_options or {}),
+            "defaults": AGENTIC_DEFAULTS,
+            "field_help": RETRIEVAL_FIELD_HELP,
+        }
+
+    @app.get("/assistant/retrieval")
+    def assistant_retrieval() -> dict:
+        return _retrieval_payload()
+
+    @app.put("/assistant/retrieval")
+    def assistant_retrieval_update(req: RetrievalRequest) -> dict:
+        settings = config.assistant.retrieval
+        # `exclude_none` on purpose: a PUT that sets one knob must not reset
+        # the other nine to their schema defaults.
+        changes = req.model_dump(exclude={"persist"}, exclude_none=True)
+        for key, value in changes.items():
+            setattr(settings, key, value)
+        wrote = False
+        if req.persist and changes:
+            wrote = _merge_into_config_file(
+                {"assistant": {"retrieval": settings.model_dump(mode="json")}}
+            )
+        audit(None, "update_retrieval", {"changes": sorted(changes), "persisted": wrote})
+        return {
+            "status": "updated",
+            "changed": sorted(changes),
+            "wrote_config": wrote,
+            # Retrieval is query-time only, so this takes effect on the next
+            # question — no restart, nothing to re-index.
+            "applied": True,
+            **_retrieval_payload(),
+        }
+
     @app.get("/assistant/workflows")
     def assistant_workflows() -> dict:
         """Every question-answering workflow this deployment can run."""
@@ -2071,6 +2706,7 @@ def create_app(
 
         results = []
         syncing: list[str] = []
+        job_ids: list[str] = []
         if req.sync_now:
             if req.wait:
                 from dataclasses import asdict
@@ -2090,13 +2726,16 @@ def create_app(
                 # background; the caller gets sources back already
                 # registered and polls GET /sources' `syncing` field.
                 for entry in created:
-                    _start_background_sync(entry["name"], req.sync_mode)
+                    job_id = _start_background_sync(entry["name"], req.sync_mode)
+                    if job_id:
+                        job_ids.append(job_id)
                     syncing.append(entry["name"])
         return {
             "status": "registered",
             "sources": created,
             "sync_results": results,
             "syncing": syncing,
+            "job_ids": job_ids,
         }
 
     _mount_ui(app, config)

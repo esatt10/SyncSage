@@ -9,28 +9,24 @@ real hand-off doc.
 this repository (what pheasant is, repo layout, canonical commands, rules,
 current work queue). Everything below is a pointer, not a substitute.
 
-## Building a knowledge-source config (`pheasant.yaml` + `.env`)
+## "How do I configure pheasant?"
 
-If the user wants to configure a new pheasant knowledge source — set up
-`pheasant.yaml`, generate a matching `.env`, and get the exact commands to
-start the instance — **read `agent/config_wizard_prompt.md` in full and
-follow it exactly.** It is a self-contained, tool-agnostic operating
-procedure: a guided Q&A that explains every config option before asking
-for it, tracks progress in on-disk state so the user never loses their
-place across sessions or tools, and ends with a complete config, a
-complete `.env`, and the startup commands (including any dependency
-installs) for the deployment target they chose.
+Do not answer from memory, and do not hand-write a `pheasant.yaml`. The
+product configures itself:
 
-Do not attempt to answer "how do I configure pheasant" questions from
-memory instead of running the wizard — pheasant's config surface changes
-often (see `CLAUDE.md`'s work-queue history), and the wizard's own first
-rule is to re-read the live schema/docs rather than recite anything
-memorized.
+```bash
+pheasant setup          # interactive, sectioned, explains every option,
+                        # writes pheasant.yaml + a 0600 .env + the commands
+pheasant setup --accept-defaults   # non-interactive, all defaults
+```
+
+It reads the live schema in `src/pheasant/config/schema.py`, so it is always
+current — which is exactly why it replaced the prose wizard that used to live
+here. See `docs/how-to/setup.md`.
 
 ## Everything else
 
 Ordinary code changes (bug fixes, features, tests) follow the rules in
-`CLAUDE.md` §4, the canonical commands in §3, and — if the change touches
-`src/pheasant/config/schema.py` — the freshness obligation described in
-`.claude/skills/config-surface-sync/SKILL.md` and enforced by
-`tests/test_config_wizard_freshness.py`.
+`CLAUDE.md` §4 and the canonical commands in §3. A change that touches
+`src/pheasant/config/schema.py` owes `docs/configuration.md` an update —
+`tests/test_config_surface_freshness.py` enforces the mechanical part.

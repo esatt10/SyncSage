@@ -233,3 +233,4 @@ __marimo__/
 .obsidian/
 # Synapse run summaries (framework convention: runs/ is local-only)
 runs/
+.venv-dev/

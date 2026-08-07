@@ -13,15 +13,17 @@ export function TopBar() {
   const overview = useQuery({
     queryKey: ["overview"],
     queryFn: api.overview,
-    // Rendered once, above every page's routes, so this is what keeps a
-    // source registered from the Sources page (or the Notebook rail's
-    // quick-add) visibly "syncing" even after you've closed that dialog
-    // and moved on — including to Settings, which has no sync UI of its
-    // own. Polls only while something actually is syncing.
+    // Rendered once, above every page's routes, so a source registered from
+    // the Sources page (or the Notebook rail's quick-add) stays visibly
+    // "syncing" even after you've closed that dialog and moved on. Polls only
+    // while something actually is syncing.
     refetchInterval: (query) => (query.state.data?.sources?.some((s) => s.syncing) ? 1500 : false),
   });
-  const syncingSources = overview.data?.sources?.filter((s) => s.syncing) ?? [];
 
+  // The "Syncing N sources…" badge that used to live here is gone: the jobs
+  // tray (bottom of every page) says the same thing with a phase, a counter
+  // and the file currently being read, so the badge was a strictly worse
+  // duplicate of it.
   return (
     <header className="topbar">
       <div className="topbar__brand">
@@ -32,19 +34,12 @@ export function TopBar() {
         {overview.data ? <span className="topbar__kb">{overview.data.name}</span> : null}
       </div>
 
-      {syncingSources.length > 0 ? (
-        <span
-          className="sync-badge"
-          title={`Syncing: ${syncingSources.map((s) => s.name).join(", ")} — search and chat may be slower until this finishes.`}
-        >
-          <span className="spinner" />
-          Syncing {syncingSources.length} source{syncingSources.length === 1 ? "" : "s"}…
-        </span>
-      ) : null}
-
       <nav className="topbar__nav">
         <NavLink to="/" end className={({ isActive }) => (isActive ? "navlink active" : "navlink")}>
           Notebook
+        </NavLink>
+        <NavLink to="/graph" className={({ isActive }) => (isActive ? "navlink active" : "navlink")}>
+          Graph
         </NavLink>
         <NavLink
           to="/sources"
