@@ -190,7 +190,12 @@ def source_includes_audio(source: Any) -> bool:
     from pheasant.ingestion.content_types import AUDIO_EXTENSIONS
 
     includes = list(getattr(source, "include", None) or [])
-    return any(pattern.lower().endswith(tuple(AUDIO_EXTENSIONS)) for pattern in includes)
+    broad = {"*", "**", "**/*", "*.*", "**/*.*"}
+    return any(
+        pattern.replace("\\", "/").lower().rstrip("/") in broad
+        or pattern.lower().endswith(tuple(AUDIO_EXTENSIONS))
+        for pattern in includes
+    )
 
 
 def config_has_audio_source(config: Any) -> bool:
@@ -208,7 +213,9 @@ def transcriber_from_config(config: Any, *, source: Any = None) -> Transcriber |
     config the engine was constructed from never mentioned it.
     """
 
-    wanted = source_includes_audio(source) if source is not None else config_has_audio_source(config)
+    wanted = (
+        source_includes_audio(source) if source is not None else config_has_audio_source(config)
+    )
     if not wanted:
         return None
     try:

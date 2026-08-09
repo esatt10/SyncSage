@@ -22,10 +22,22 @@ Wire shapes (all POST + JSON):
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+
+from pheasant.assistant.catalog import (
+    AUTO_ORDER as CATALOG_AUTO_ORDER,
+)
+from pheasant.assistant.catalog import (
+    PROVIDERS as CATALOG_PROVIDERS,
+)
+from pheasant.assistant.catalog import (
+    ProviderSpec as CatalogProviderSpec,
+)
+from pheasant.assistant.catalog import (
+    resolve_auto_provider as catalog_resolve_auto_provider,
+)
 
 DEFAULT_TIMEOUT = 90.0
 
@@ -89,11 +101,15 @@ AUTO_ORDER = ("anthropic", "openai", "gemini")
 
 def resolve_auto_provider(env: dict[str, str] | None = None) -> str | None:
     """First provider whose default key env var is populated, else None."""
-    source = env if env is not None else os.environ
-    for name in AUTO_ORDER:
-        if source.get(PROVIDERS[name].api_key_env):
-            return name
-    return None
+    return catalog_resolve_auto_provider(env)
+
+
+# The catalogue is the source of truth for setup and runtime.  Keep the
+# compatibility names exported by this module while allowing older imports to
+# continue working.
+ProviderSpec = CatalogProviderSpec
+PROVIDERS = CATALOG_PROVIDERS
+AUTO_ORDER = CATALOG_AUTO_ORDER
 
 
 def _http_json(

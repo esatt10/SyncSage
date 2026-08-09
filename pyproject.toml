@@ -29,6 +29,7 @@ dependencies = [
   "PyYAML>=6.0",
   "networkx>=3.3",
   "typer>=0.12",
+  "rich>=13.7",
   "watchdog>=4.0",
   "markdown-it-py>=3.0",
   "beautifulsoup4>=4.12",

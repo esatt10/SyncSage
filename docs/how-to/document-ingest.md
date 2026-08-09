@@ -37,9 +37,11 @@ sqlite3 /state/pheasant.db "
 
 ## Turn it on
 
-Extraction is **opt-in by file extension** — the extractor is only built when a
-source's `include` globs admit `.pdf` or `.docx`. The default `include` list is
-code/markdown/config only, so add the extensions you want:
+Extraction is **opt-in by source include** — the extractor is only built when a
+source's `include` globs admit a document extension. The default `include` list
+is code/markdown/config only. `pheasant setup` and `pheasant up` emit
+`**/*` for a detected mixed document folder; hand-written sources should add
+the extensions they want explicitly:
 
 ```yaml
 sources:

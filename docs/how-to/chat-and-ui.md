@@ -147,7 +147,7 @@ pheasant client-config claude-code -c pheasant.yaml -o .mcp.json
 |---|---|---|
 | `assistant.enabled` | `true` | Turn the chat surface off entirely (`/assistant/chat` returns 403). |
 | `assistant.provider` | `auto` | `auto`, `anthropic`, `openai`, `gemini`, or `none`. |
-| `assistant.model` | provider default | Override the model id. |
+| `assistant.model` | provider default | The single chat and agent workflow model; setup marks the tested provider default as Recommended and also accepts a custom model ID. With `provider: auto`, leave this null. |
 | `assistant.base_url` | provider default | Point at a gateway or self-hosted OpenAI-spec endpoint. |
 | `assistant.api_key_env` | provider default | Read the key from a differently-named variable. |
 | `assistant.allow_session_keys` | `true` | Allow browser-supplied keys. |
