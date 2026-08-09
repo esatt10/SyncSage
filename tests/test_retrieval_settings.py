@@ -169,6 +169,24 @@ def test_a_put_can_persist_to_the_config_file(loaded_config, config_path: Path) 
     assert written["assistant"]["retrieval"]["max_rounds"] == 6
 
 
+def test_a_read_only_config_reports_conflict_and_rolls_back(loaded_config, tmp_path: Path) -> None:
+    # A directory is reliably unwritable as a file on every test platform;
+    # chmod-based read-only tests are not reliable on Windows.
+    config_path = tmp_path / "config-as-directory"
+    config_path.mkdir()
+    before = loaded_config.assistant.retrieval.max_rounds
+    client = TestClient(create_app(config=loaded_config, config_path=config_path))
+
+    response = client.put(
+        "/assistant/retrieval",
+        json={"max_rounds": before + 1, "persist": True},
+    )
+
+    assert response.status_code == 409
+    assert "persistence" in response.json()["detail"]
+    assert loaded_config.assistant.retrieval.max_rounds == before
+
+
 # ------------------------------------------------------------------ the MCP
 
 

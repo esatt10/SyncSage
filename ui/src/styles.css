@@ -1221,6 +1221,12 @@ select.text-input {
   box-shadow: var(--shadow-sm);
 }
 
+.graph-badge--warning {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-color: var(--warn);
+}
+
 /* Horizon controls: depth is the main readability lever on a big graph, so it
    sits on the canvas rather than in a menu. The overlay itself is
    pointer-events:none so the canvas stays draggable; the controls opt back in. */

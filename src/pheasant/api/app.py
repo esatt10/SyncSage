@@ -637,16 +637,21 @@ def graph_slice(
     exclude_node_types: set[str] | None = None,
 ) -> dict:
     """Connected sub-graph around a node (mirrors PheasantTools.get_graph_slice)."""
+    # Ask for one more neighbour than the caller will receive.  Without that
+    # sentinel a bounded UI slice silently looked complete whenever it filled
+    # its budget, which made large documents appear to have lost chunks.
+    neighbour_limit = max(0, int(limit))
     traversal = graph_neighbors(
         graph,
         node_id,
         depth,
         edge_types,
-        max_nodes=limit,
+        max_nodes=neighbour_limit + 1,
         exclude_edge_types=exclude_edge_types,
         exclude_node_types=exclude_node_types,
     )
-    kept = traversal["neighbors"][:limit]
+    all_neighbors = traversal["neighbors"]
+    kept = all_neighbors[:neighbour_limit]
     node_ids = [node_id] + [item["node_id"] for item in kept]
     node_set = set(node_ids)
     # Hop distance per node, nearest wins (BFS order, so the first sighting is
@@ -676,6 +681,7 @@ def graph_slice(
         "nodes": [dict(attrs) for attrs in (graph.nodes.get(item) for item in node_ids) if attrs],
         "links": links,
         "depths": depths,
+        "truncated": len(all_neighbors) > neighbour_limit,
     }
 
 
@@ -2272,9 +2278,15 @@ def create_app(
         path = Path(app.state.config_path)
         if not path.exists():
             return False
+        yaml_error = getattr(yaml, "YAMLError", ValueError)
         try:
             existing = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        except yaml.YAMLError:
+        except OSError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Configuration file cannot be read for persistence: {path}",
+            ) from exc
+        except yaml_error:
             return False
         if not isinstance(existing, dict):
             return False
@@ -2283,7 +2295,16 @@ def create_app(
         rendered = dump_config_yaml(merged)
         if sources:
             rendered += _render_sources_block(sources)
-        path.write_text(rendered, encoding="utf-8")
+        try:
+            path.write_text(rendered, encoding="utf-8")
+        except OSError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Configuration file is not writable: {path}. "
+                    "Mount it read-write or save with persistence disabled."
+                ),
+            ) from exc
         return True
 
     # ------------------------------------------------------------------
@@ -2695,13 +2716,21 @@ def create_app(
         # `exclude_none` on purpose: a PUT that sets one knob must not reset
         # the other nine to their schema defaults.
         changes = req.model_dump(exclude={"persist"}, exclude_none=True)
+        previous = {key: getattr(settings, key) for key in changes}
         for key, value in changes.items():
             setattr(settings, key, value)
         wrote = False
-        if req.persist and changes:
-            wrote = _merge_into_config_file(
-                {"assistant": {"retrieval": settings.model_dump(mode="json")}}
-            )
+        try:
+            if req.persist and changes:
+                wrote = _merge_into_config_file(
+                    {"assistant": {"retrieval": settings.model_dump(mode="json")}}
+                )
+        except HTTPException:
+            # A failed disk write must not leave a request that reported an
+            # error active only in memory until the next restart.
+            for key, value in previous.items():
+                setattr(settings, key, value)
+            raise
         audit(None, "update_retrieval", {"changes": sorted(changes), "persisted": wrote})
         return {
             "status": "updated",

@@ -40,6 +40,8 @@ export interface GraphSlice {
   links: GraphLink[];
   /** Hop distance from the slice's center, nearest wins. Center is 0. */
   depths?: Record<string, number>;
+  /** True when the neighbour budget omitted nodes from this slice. */
+  truncated?: boolean;
 }
 
 export interface NeighborEntry {

@@ -8,6 +8,7 @@ interface HorizonControlsProps {
   centerLabel: string | null;
   surfacedCount: number;
   nodeCount: number;
+  truncated: boolean;
   busy: boolean;
   /** Anything the user has narrowed to: a selection, a center, an answer. */
   dirty: boolean;
@@ -33,6 +34,7 @@ export function HorizonControls({
   centerLabel,
   surfacedCount,
   nodeCount,
+  truncated,
   busy,
   dirty,
   onDepth,
@@ -45,6 +47,14 @@ export function HorizonControls({
     <div className="horizon">
       <div className="horizon__row">
         <span className="graph-badge">{nodeCount} nodes</span>
+        {truncated ? (
+          <span
+            className="graph-badge graph-badge--warning"
+            title="This view reached its graph safety limit. Recenter the node or use Show all to inspect the wider graph."
+          >
+            limited view
+          </span>
+        ) : null}
         {busy ? <span className="graph-badge">loading…</span> : null}
         {mode === "answer" ? (
           <button

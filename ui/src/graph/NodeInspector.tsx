@@ -11,6 +11,7 @@ interface NodeInspectorProps {
   nodes: GraphNode[];
   links: GraphLink[];
   onExpand: (nodeId: string, depth?: number) => void;
+  onShowChunks: (nodeId: string) => void;
   onPivot: (nodeId: string) => void;
 }
 
@@ -35,6 +36,7 @@ function renderMarkdown(text: string): string {
 }
 
 const CONTENT_TYPES = new Set(["file", "document", "markdown_note", "chunk"]);
+const ARTIFACT_TYPES = new Set(["file", "document", "markdown_note"]);
 
 // Internal bookkeeping the user never needs to see.
 const HIDDEN_KEYS = new Set(["label", "type", "id", "knowledge_base_id"]);
@@ -44,6 +46,7 @@ export function NodeInspector({
   nodes,
   links,
   onExpand,
+  onShowChunks,
   onPivot,
 }: NodeInspectorProps) {
   const [tab, setTab] = useState<Tab>("overview");
@@ -101,9 +104,16 @@ export function NodeInspector({
         </div>
       </div>
 
-      <button className="btn btn--small" onClick={() => onExpand(selectedId)}>
-        Expand neighbourhood
-      </button>
+      <div className="pane__actions">
+        <button className="btn btn--small" onClick={() => onExpand(selectedId)}>
+          Expand neighbourhood
+        </button>
+        {ARTIFACT_TYPES.has(node.type ?? "") ? (
+          <button className="btn btn--small" onClick={() => onShowChunks(selectedId)}>
+            Show passages on graph
+          </button>
+        ) : null}
+      </div>
 
       <div className="tabs">
         <button
