@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from pheasant.persistence.state_store import StateStore
 
@@ -56,12 +57,29 @@ class SearchStore:
     def __init__(self, state: StateStore):
         self.state = state
 
+    def _memory_sql(self, policy: Any, now: str | None) -> tuple[str, str, list[object]]:
+        """`(join, where_suffix, params)` enforcing an agent-memory policy.
+
+        All three are empty unless the region has memory records *and* the
+        policy asks for something — so the query a memory-less region runs is
+        character-for-character the one it ran before Step 33.6.
+        """
+        if policy is None or now is None:
+            return "", "", []
+        from pheasant.memory.policy import sql_predicate
+
+        condition, params = sql_predicate(policy, now=now, alias="memory_records")
+        join = "LEFT JOIN memory_records ON memory_records.artifact_id = chunks.artifact_id"
+        return join, f" AND {condition}", list(params)
+
     def search(
         self,
         query: str,
         source_name: str | None = None,
         max_results: int = 10,
         section: str | None = None,
+        memory_policy: Any = None,
+        memory_now: str | None = None,
     ) -> list[dict]:
         # Natural-language queries ("where does the X service run") must not
         # fall to FTS5's implicit-AND — a single unmatched stopword would
@@ -82,6 +100,15 @@ class SearchStore:
         if section_needle(section):
             where += " AND LOWER(COALESCE(chunks.heading_path, '')) LIKE ?"
             params.append(f"%{section_needle(section)}%")
+        # Step 33.6 — agent-memory policy. Pushed into SQL for the same reason
+        # as `section`: `mode="only"` is a very narrow slice, and post-filtering
+        # a globally-ranked page would return an empty list while the matching
+        # memories sat just past the cut. The join is added *only* when the
+        # region actually has memory records, so a region without agent memory
+        # runs the identical query it ran before this step.
+        memory_join, memory_where, memory_params = self._memory_sql(memory_policy, memory_now)
+        where += memory_where
+        params.extend(memory_params)
         params.append(max_results)
         sql = f"""
         SELECT chunks_fts.chunk_id, chunks_fts.source_id, chunks_fts.artifact_id,
@@ -92,6 +119,7 @@ class SearchStore:
         FROM chunks_fts
         JOIN chunks ON chunks.id = chunks_fts.chunk_id
         JOIN artifacts ON artifacts.id = chunks_fts.artifact_id
+        {memory_join}
         WHERE {where}
         ORDER BY rank_score LIMIT ?
         """
@@ -103,6 +131,12 @@ class SearchStore:
             if section_needle(section):
                 fallback_where += " AND LOWER(COALESCE(chunks.heading_path, '')) LIKE ?"
                 fallback_params.append(f"%{section_needle(section)}%")
+            # The fallback has to enforce the same policy. Leaving it out would
+            # make a corrected memory reappear on exactly the path taken when
+            # FTS5 is unavailable — a leak that only shows up in the degraded
+            # configuration, which is the worst place to have one.
+            fallback_where += memory_where
+            fallback_params.extend(memory_params)
             fallback_params.append(max_results)
             rows = self.state.rows(
                 f"""SELECT chunks.id AS chunk_id, chunks.source_id, chunks.artifact_id,
@@ -110,6 +144,7 @@ class SearchStore:
                 chunks.start_line, chunks.end_line, artifacts.path AS absolute_path,
                 artifacts.relative_path, 0.0 AS rank_score
                 FROM chunks JOIN artifacts ON artifacts.id=chunks.artifact_id
+                {memory_join}
                 WHERE {fallback_where} LIMIT ?""",
                 tuple(fallback_params),
             )

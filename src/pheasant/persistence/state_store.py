@@ -180,6 +180,47 @@ CREATE TABLE IF NOT EXISTS idp_sync_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- Step 33.5 — the structured face of the agent-memory records that already
+-- live as Markdown files under the `type: memory` source.
+--
+-- This is a **projection**, not a second source of truth: every column is
+-- derivable from the record files, and `replace_memory_records` rebuilds a
+-- source's rows wholesale on each sync, exactly as `chunks_fts` is a derived
+-- cache over `chunks` + `artifacts`. Losing this table costs a re-sync, never
+-- data. The records themselves stay append-only files on disk.
+--
+-- It exists because scope/subject/asserted_at/supersedes were reachable only
+-- as *prose inside the indexed chunk text* — so nothing could filter on them,
+-- and a superseded record stayed retrievable until a batch job archived it.
+--
+-- `valid_until` is derived, never double-stored: when B supersedes A, A's
+-- validity ends at B's `asserted_at`. An explicit `valid_until` in the record
+-- wins when it is earlier.
+CREATE TABLE IF NOT EXISTS memory_records (
+  record_id TEXT PRIMARY KEY,
+  artifact_id TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  subject TEXT,
+  kind TEXT NOT NULL DEFAULT 'fact',
+  asserted_at TEXT NOT NULL,
+  valid_from TEXT,
+  valid_until TEXT,
+  supersedes TEXT,
+  tags TEXT,
+  written_by TEXT,
+  salience REAL NOT NULL DEFAULT 1.0,
+  uses INTEGER NOT NULL DEFAULT 0,
+  last_used_at TEXT,
+  schema_version INTEGER NOT NULL DEFAULT 1,
+  FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
+);
+-- Retrieval joins chunks -> artifacts -> memory_records on every memory-aware
+-- query, and the validity predicate is `scope` + `valid_until`.
+CREATE INDEX IF NOT EXISTS idx_memory_records_artifact_id
+  ON memory_records(artifact_id);
+CREATE INDEX IF NOT EXISTS idx_memory_records_scope
+  ON memory_records(scope, valid_until);
 -- What the indexed state was built with, per scope (a source, or the vector
 -- space). A restart compares the live config against these: same fingerprint
 -- means the stored artifacts/chunks/vectors are still valid and there is
@@ -648,6 +689,59 @@ class StateStore:
             for row in rows
         ]
 
+    def replace_memory_records(self, source_id: str, records: list[dict[str, Any]]) -> int:
+        """Rebuild one memory source's projection rows (Step 33.5).
+
+        Transactional and wholesale: the table is a projection of the record
+        files, so rebuilding it is always safe and always correct, and a
+        record archived on disk disappears here without needing its own
+        delete path. Returns the number of rows written.
+
+        ``salience``/``uses``/``last_used_at`` are carried over from the
+        existing row when one is present — they are earned by *use* (Step
+        33.9) and are the one thing here that is not derivable from the file,
+        so a re-sync must not silently reset them to zero.
+        """
+        with self.conn:
+            earned = {
+                str(row["record_id"]): row
+                for row in self.conn.execute(
+                    "SELECT record_id, salience, uses, last_used_at "
+                    "FROM memory_records WHERE source_id=?",
+                    (source_id,),
+                )
+            }
+            self.conn.execute("DELETE FROM memory_records WHERE source_id=?", (source_id,))
+            for record in records:
+                prior = earned.get(str(record.get("record_id")))
+                self.conn.execute(
+                    """INSERT INTO memory_records(
+                        record_id,artifact_id,source_id,scope,subject,kind,asserted_at,
+                        valid_from,valid_until,supersedes,tags,written_by,
+                        salience,uses,last_used_at,schema_version
+                    )
+                    VALUES(
+                        :record_id,:artifact_id,:source_id,:scope,:subject,:kind,:asserted_at,
+                        :valid_from,:valid_until,:supersedes,:tags,:written_by,
+                        :salience,:uses,:last_used_at,:schema_version
+                    )""",
+                    {
+                        "subject": None,
+                        "kind": "fact",
+                        "valid_from": None,
+                        "valid_until": None,
+                        "supersedes": None,
+                        "tags": None,
+                        "written_by": None,
+                        "schema_version": 1,
+                        **record,
+                        "salience": float(prior["salience"]) if prior else 1.0,
+                        "uses": int(prior["uses"]) if prior else 0,
+                        "last_used_at": prior["last_used_at"] if prior else None,
+                    },
+                )
+        return len(records)
+
     def delete_source_artifacts(self, source_id: str) -> int:
         rows = self.rows("SELECT COUNT(*) AS c FROM artifacts WHERE source_id=?", (source_id,))
         count = int(rows[0]["c"]) if rows else 0
@@ -657,6 +751,14 @@ class StateStore:
             self.conn.execute("DELETE FROM symbols WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM artifact_terms WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM artifacts WHERE source_id=?", (source_id,))
+        # Deliberately NOT clearing memory_records here. This runs on every
+        # *full* sync (engine.py's rebuild path, which consolidation takes after
+        # each archive), and `replace_memory_records` rebuilds the rows moments
+        # later anyway — so dropping them buys nothing and costs the one thing
+        # in that table that is earned rather than derived: `uses`, `salience`
+        # and `last_used_at`. Wiping those on every consolidation pass would
+        # quietly reset a memory's track record. Genuine removal goes through
+        # `delete_source`, which does clear them.
         return count
 
     def delete_source(self, source_id: str) -> None:
@@ -665,6 +767,7 @@ class StateStore:
             self.conn.execute("DELETE FROM chunks WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM symbols WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM artifact_terms WHERE source_id=?", (source_id,))
+            self.conn.execute("DELETE FROM memory_records WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM artifacts WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM source_checkpoints WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM sources WHERE id=?", (source_id,))

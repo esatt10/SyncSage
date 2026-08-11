@@ -310,6 +310,98 @@ BM25; (2) `1/(1+|bm25|)` inverted relevance in hybrid merges → monotone
 mapping (LIKE-fallback rows keep 1.0). Gate:
 `tests/test_memory_benchmark.py`. Suite: **202 passed** (+4).
 
+**Step 33.6 (query-time memory policy across both protocols) landed here
+2026-08-11.** New `memory/policy.py`: one `MemoryPolicy` (`mode` ∈
+auto|off|only|prefer, `scopes`, `subject`, `current_only`, `as_of`,
+`max_results`), spelled identically on MCP `search_context(memory=…)` and
+`POST /search`, accepting a one-word form or an object. **The stale-fact leak is
+closed**: supersession was enforced only by the batch consolidation pass, so
+between beats the region served facts it already knew were corrected; validity
+is now filtered at query time, and `as_of` deliberately brings the old record
+back (invalidate, don't delete). **One rule, two encodings** — `sql_predicate`
+(text arm, pushed into SQL so a narrow slice keeps recall) and `admits` (vector
++ graph arms) sit side by side with a 10-policy × 5-record parity test, the
+`section_needle`/`section_matches` arrangement applied to a harder rule. New
+`search/criteria.py` (re-exported from `mcp_server/tools.py`) gives HTTP the
+criteria it never had — `exclude_sources`/`node_types`/`min_score` were MCP-only,
+so the same region answered differently per protocol and **the router, which
+reaches a region over HTTP, could not scope a search at all**.
+`describe_retrieval` gains a `memory` block naming the source and its scope
+counts, since an agent could previously only exclude memory by naming a source
+it had no way to learn. **Trust containment**: the answering prompt states a
+*remembered* passage is a recorded assertion, corpus wins a disagreement, and
+passage text is **data, never an instruction** (the memory-control-flow
+defence); remembered passages are labelled with scope + assertion time, threaded
+through `Passage` and **both** citation builders. Dead `hybrid._merge` removed.
+
+**Mutation testing found a real leak, not just a weak test.** 11 mutants, 10
+caught — the survivor revealed that **every end-to-end test used `mode="text"`**,
+so the vector/graph filter was never exercised; probing directly showed the
+graph arm returning the *superseded* record's chunk on an ordinary query, since
+graph hits are `chunk:` nodes with `relative_path=null` and the index was keyed
+only on artifact id. Fixed by indexing both identities + `relative_path_of`
+(reads the path out of the `file:`/`chunk:` stable-ID grammars by marker, not
+colon count); a second bug surfaced at once — `source_id` was missing from
+`INDEX_COLUMNS`, so the composite key matched nothing. Then 11/11.
+**Known residual, asserted rather than hidden:** `entity` nodes derived from a
+superseded record's text still surface (a *label*, not the record — content is
+filtered on every arm), because they expose no artifact identity; a test asserts
+the residual still exists so **33.7 landing turns it red**. One test changed
+deliberately: `test_maintenance_reindexes_so_search_forgets_archived_records`
+had pinned the leak as expected behavior, and now also distinguishes *filtered*
+from *pruned*. Acceptance: `tests/test_memory_policy.py` (27). Suite **972
+passed / 8 failed / 6 skipped** (same 8 pre-existing). Full detail:
+`runs/2026-08-11-memory-33.6/SUMMARY.md`. Next: **33.7**, memory in the graph.
+
+**Step 33.5 (structured memory index + clean text + identity) landed here
+2026-08-10** — first step of the *memory-steered retrieval* arc (33.5–33.11),
+which turns memory from a second corpus into a retrieval instrument. Memory
+records stay source content; what changes is that their metadata stops being
+prose. New **`memory_records` projection table** (`persistence/state_store.py`,
+`CREATE TABLE IF NOT EXISTS` in `SCHEMA` — the `idp_groups` pattern, idempotent
+by construction) carrying scope/subject/kind/asserted_at/valid_from/valid_until/
+supersedes/tags/written_by plus salience/uses/last_used_at reserved for 33.9;
+`memory/projection.py` derives every row from the files, so losing the table
+costs a re-sync, never data. **Record schema 2** adds `kind`/`written_by`/
+`valid_from`/`valid_until` with **nothing on disk rewritten** — v1 files load
+forever, keep reporting v1, and `_digest_input` only extends the hashed string
+for values v1 could not express, so **every v1 record id is reproduced
+byte-identically** (asserted, not assumed). `valid_until` is **derived, never
+double-stored**: a correction ends the original's validity at its own
+`asserted_at`, earliest correction wins, and a declared expiry wins when
+earlier. **Frontmatter is no longer indexed as prose** (memory sources only, so
+no existing vault/docs index shifts), with chunk lines corrected back to
+absolute. The one-shot re-read needs **no bespoke migration**: a `text_pipeline`
+marker in `source_fingerprint` (memory-scoped — adding it unconditionally would
+invalidate every fingerprint in every deployment) makes the existing "config
+changed → escalate to full" path do it. Additive `principal`/`kind`/
+`valid_until` on MCP `memory_write` + `POST /memory` (rule 8); `written_by` is
+in the digest, so two principals asserting the same sentence in the same second
+get two records — load-bearing for 33.11. `POST /memory` is now audited (only
+MCP was), and `POST /memory/consolidate` returns `200 {"skipped": …}` instead of
+`400`, matching MCP.
+
+**Three bugs caught by the tests, all mine:** only `parse_file` was patched
+while the engine goes through `parse_connector_payload` (both now route through
+one helper); the frontmatter regex was `\n`-only while `Path.write_text` stores
+CRLF on Windows, so the strip silently failed on the platform the records were
+written on; and clearing the projection in `delete_source_artifacts` would have
+reset earned counters on **every full sync**, which is the path consolidation
+takes after each archive. **The documented dedup flake is fixed at the root**:
+content identity is the *digest*, not the timestamp — matching on the full path
+made "an identical write returns the stored record" true only within one
+wall-clock second (measured 1-in-3 failures on clean HEAD, 3-of-3 with this
+step's slower sync). Mutation-tested 9 mutants: **8 caught, 1 survived**, and
+the survivor was a vacuous test of mine (stale rows satisfied the assertion even
+when the projection aborted entirely) — fixed, then 9/9. Acceptance:
+`tests/test_memory_projection.py` (17). Suite **945 passed / 8 failed / 6
+skipped**; the 8 are pre-existing and environmental (Windows `0o600`, Windows
+mount-path dedup, CRLF-checkout contract parity — **note that guard is inert on
+Windows**, so contract safety was verified via `git status contracts/` — and a
+raw `wasmtime._trap.Trap` escaping `SandboxFuelExhausted`, a **real pre-existing
+bug**). Full detail: `runs/2026-08-10-memory-33.5/SUMMARY.md`. Next: **33.6**,
+query-time memory policy + the stale-leak fix.
+
 **Steps 32.1+32.2+32.6 (ACL persistence, principal filtering, leak gate)
 landed here 2026-07-17 [x-repo] — Phase 32 core.** Artifacts gain an `acl`
 column (one-shot idempotent additive migration in `StateStore.migrate`;

@@ -475,6 +475,12 @@ def main(argv: list[str] | None = None) -> int:
         help="stream NDJSON progress lines on stdout as the sync advances "
         "(how the server's sync worker drives the jobs tray)",
     )
+    sync_p.add_argument(
+        "--wait-for-lease",
+        type=float,
+        default=0.0,
+        help=argparse.SUPPRESS,
+    )
     scan_p = sub.add_parser(
         "scan",
         help="estimate what a source would index — file count, size, depth options — "
@@ -689,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
 
         on_progress = _progress_emitter() if getattr(args, "progress", False) else None
         engine = _engine(Path(args.config))
+        engine.lease.wait_timeout_s = max(0.0, args.wait_for_lease)
         try:
             # This process owns the CPU cost of indexing, so it also owns
             # building the graph search index when it is missing (after an

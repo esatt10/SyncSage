@@ -40,26 +40,41 @@ def _digest(payload: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+#: Bumped when the *code* — not the config — changes what text a memory source
+#: produces. Step 33.5 stopped indexing record frontmatter as prose, so chunks
+#: written before it are wrong, and a re-read is the fix. Carrying it in the
+#: fingerprint means the existing "config changed → escalate to full" path does
+#: the migration itself: no bespoke marker, no one-shot script, idempotent
+#: because the new fingerprint is stored once the full pass succeeds.
+MEMORY_TEXT_PIPELINE = "33.5-frontmatter-stripped"
+
+
 def source_fingerprint(source: SourceConfig) -> str:
     """Fingerprint the settings that decide *what text* a source produces."""
 
     chunking = getattr(source, "chunking", None)
-    return _digest(
-        {
-            "type": getattr(source.type, "value", str(source.type)),
-            "path": str(getattr(source, "path", "") or ""),
-            "url": str(getattr(source, "url", "") or ""),
-            "include": sorted(source.include or []),
-            "exclude": sorted(source.exclude or []),
-            "max_depth": getattr(source, "max_depth", None),
-            "chunking": {
-                "enabled": getattr(chunking, "enabled", None),
-                "strategy": getattr(chunking, "strategy", None),
-                "max_chars": getattr(chunking, "max_chars", None),
-                "overlap_chars": getattr(chunking, "overlap_chars", None),
-            },
-        }
-    )
+    source_type = getattr(source.type, "value", str(source.type))
+    payload: dict[str, Any] = {
+        "type": source_type,
+        "path": str(getattr(source, "path", "") or ""),
+        "url": str(getattr(source, "url", "") or ""),
+        "include": sorted(source.include or []),
+        "exclude": sorted(source.exclude or []),
+        "max_depth": getattr(source, "max_depth", None),
+        "chunking": {
+            "enabled": getattr(chunking, "enabled", None),
+            "strategy": getattr(chunking, "strategy", None),
+            "max_chars": getattr(chunking, "max_chars", None),
+            "overlap_chars": getattr(chunking, "overlap_chars", None),
+        },
+    }
+    if source_type == "memory":
+        # Scoped to memory on purpose. Every other source's text pipeline is
+        # unchanged, and adding this key unconditionally would invalidate every
+        # fingerprint in every deployment — re-reading a 2,000-file repository
+        # to fix agent memory is a re-index nobody asked for.
+        payload["text_pipeline"] = MEMORY_TEXT_PIPELINE
+    return _digest(payload)
 
 
 def embedding_fingerprint(config: PheasantConfig) -> str:

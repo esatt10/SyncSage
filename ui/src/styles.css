@@ -2125,6 +2125,24 @@ select.text-input {
   gap: 12px;
 }
 
+.jobs-tray__actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.job__clear {
+  border: 0;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  padding: 0 2px;
+}
+
+.job__clear:hover {
+  color: var(--text);
+}
+
 .job {
   display: flex;
   flex-direction: column;

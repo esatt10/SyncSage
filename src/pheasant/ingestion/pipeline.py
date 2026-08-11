@@ -193,6 +193,61 @@ def extract_to_text(
         return ""
 
 
+def _chunks_and_headings(
+    source: SourceConfig, text: str
+) -> tuple[list[TextChunk], list[SectionHeading]]:
+    """Detect headings and cut chunks, minus any agent-memory frontmatter.
+
+    Both parse entry points route through here so the strip cannot be applied
+    on one and forgotten on the other. That is not hypothetical: the first
+    version of Step 33.5 patched only ``parse_file``, while the sync engine
+    goes through ``parse_connector_payload`` — so record frontmatter went on
+    being indexed as prose everywhere it actually mattered.
+
+    Line numbers are corrected back to absolute afterwards, because
+    ``chunk_text`` derives them from offsets into the text it is handed and
+    strips each slice; without the correction every memory chunk would claim
+    to start at line 1.
+    """
+    text, line_offset = _strip_memory_frontmatter(source, text)
+    headings = headings_for_source(source, text)
+    chunks = chunks_for_source(source, text, headings)
+    if not line_offset:
+        return chunks, headings
+    chunks = [
+        replace(
+            chunk,
+            start_line=chunk.start_line + line_offset,
+            end_line=chunk.end_line + line_offset,
+        )
+        for chunk in chunks
+    ]
+    headings = [replace(heading, line=heading.line + line_offset) for heading in headings]
+    return chunks, headings
+
+
+def _strip_memory_frontmatter(source: SourceConfig, text: str) -> tuple[str, int]:
+    """Drop an agent-memory record's frontmatter before it is indexed.
+
+    Returns ``(text, lines_removed)``; a no-op for every other source type, so
+    no existing index shifts. Scoped this narrowly on purpose: stripping YAML
+    frontmatter from *all* Markdown would change chunk boundaries — and
+    therefore ``chunk:{...}:sha256={text_hash}`` ids — for every vault and
+    docs folder already indexed, which is a re-index nobody asked for.
+
+    For memory records it is a straight win. The frontmatter is machine-written
+    bookkeeping (`record_id`, `schema_version`, ISO timestamps) that no one
+    would ever search for, and Step 33.5 puts every one of those fields in the
+    `memory_records` table where it can actually be queried. Leaving it in the
+    text only diluted BM25 with high-cardinality tokens.
+    """
+    if getattr(source.type, "value", source.type) != "memory":
+        return text, 0
+    from pheasant.memory.store import strip_frontmatter
+
+    return strip_frontmatter(text)
+
+
 def chunks_for_source(
     source: SourceConfig,
     text: str,
@@ -380,8 +435,7 @@ def parse_file(
         )
     else:
         text = read_text(path, extractor)
-    headings = headings_for_source(source, text)
-    chunks = chunks_for_source(source, text, headings)
+    chunks, headings = _chunks_and_headings(source, text)
     stat = path.stat()
     artifact_id = f"file:{source.name}:{relative}:branch={branch or 'none'}"
     return ParsedArtifact(
@@ -457,8 +511,7 @@ def parse_connector_payload(
         )
     else:
         text = read_text_bytes(payload.content, item.relative_path, extractor)
-    headings = headings_for_source(source, text)
-    chunks = chunks_for_source(source, text, headings)
+    chunks, headings = _chunks_and_headings(source, text)
     artifact_id = f"file:{source.name}:{item.relative_path}:branch={branch or 'none'}"
     return ParsedArtifact(
         id=artifact_id,

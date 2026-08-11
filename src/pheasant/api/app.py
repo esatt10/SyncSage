@@ -106,6 +106,16 @@ class SearchRequest(BaseModel):
     # Restrict to one part of a document's extracted taxonomy, matched against
     # the heading breadcrumb. Only meaningful for sources with taxonomy on.
     section: str | None = None
+    # Step 33.6 — the same retrieval criteria the MCP tool has always had.
+    # They lived only on the MCP surface, so the same region answered a query
+    # differently depending on which protocol asked; the router, which reaches
+    # this region over HTTP, could not scope a search at all.
+    exclude_sources: list[str] | None = None
+    node_types: list[str] | None = None
+    min_score: float | None = None
+    # How this region's agent memory takes part: "auto" (default), "off",
+    # "only", "prefer", or an object with scopes/subject/current_only/as_of.
+    memory: dict | str | None = None
 
 
 class MemoryWriteRequest(BaseModel):
@@ -115,6 +125,13 @@ class MemoryWriteRequest(BaseModel):
     supersedes: str | None = None
     tags: list[str] = []
     sync: bool = True
+    # Step 33.5, all optional and defaulting to the pre-33.5 behavior.
+    # `principal` is who asserted this; it is part of the record id, so two
+    # callers writing the same sentence in the same second get two records
+    # rather than silently sharing one.
+    kind: str = "fact"
+    principal: str | None = None
+    valid_until: str | None = None
 
 
 class SyncRequest(BaseModel):
@@ -1129,6 +1146,11 @@ def create_app(
             )
 
         try:
+            jobs.progress(
+                job_id,
+                phase="waiting_for_indexer",
+                detail="Queued for the index writer",
+            )
             worker = WorkerBackedEngine(engine, app.state.config_path)
             if source_name:
                 results = [worker.sync_source(source_name, mode, on_progress=forward)]
@@ -1387,12 +1409,30 @@ def create_app(
                 subject=req.subject,
                 supersedes=req.supersedes,
                 tags=req.tags,
+                kind=req.kind,
+                written_by=req.principal,
+                valid_until=req.valid_until,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         payload: dict = {"record": record.as_dict(), "created": created, "source": source.name}
         if req.sync and created:
             payload["sync"] = engine.sync_source(source.name, "incremental").__dict__
+        # Writing a memory is a mutation of what this region will later assert
+        # as fact, which is exactly what the audit log is for. The MCP path has
+        # always recorded it; this one silently did not, so the same action was
+        # traceable or not depending on which protocol the caller happened to
+        # use.
+        audit(
+            source.name,
+            "memory_write",
+            {
+                "record_id": record.record_id,
+                "scope": record.scope,
+                "kind": record.kind,
+                "created": created,
+            },
+        )
         return payload
 
     @app.get("/memory")
@@ -1420,12 +1460,18 @@ def create_app(
 
         result = run_memory_maintenance(engine)
         if result is None:
-            raise HTTPException(
-                status_code=400,
-                detail=(
+            # 200 with a reason, matching the MCP tool exactly. This used to be
+            # a 400, which made the same condition an error over HTTP and a
+            # normal outcome over MCP — and it is not a client error: the
+            # request was well-formed and the server declined because of its
+            # own configuration. A scheduler polling this endpoint should not
+            # have to treat "consolidation is switched off" as a failure.
+            return {
+                "skipped": (
                     "memory consolidation is disabled or no `type: memory` source is configured"
-                ),
-            )
+                )
+            }
+        audit(result["source"], "memory_consolidate", result["report"])
         return result
 
     @app.post("/security/idp/sync")
@@ -1518,6 +1564,19 @@ def create_app(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.delete("/jobs")
+    def clear_finished_jobs() -> dict:
+        return {"cleared": jobs.clear()}
+
+    @app.delete("/jobs/{job_id}")
+    def clear_job(job_id: str) -> dict:
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Unknown job: {job_id}")
+        if job["active"]:
+            raise HTTPException(status_code=409, detail="A running job cannot be cleared")
+        return {"cleared": jobs.clear(job_id)}
+
     @app.get("/jobs/{job_id}")
     def get_job(job_id: str) -> dict:
         job = jobs.get(job_id)
@@ -1534,18 +1593,44 @@ def create_app(
 
     @app.post("/search")
     def search_context(req: SearchRequest) -> dict:
-        return search.search_context(
+        from pheasant.search.criteria import (
+            apply_retrieval_criteria,
+            criteria_active,
+            criteria_dict,
+        )
+
+        # Over-fetch when a post-filter will drop rows, so `max_results` keeps
+        # meaning "give me this many" — the same bookkeeping the MCP tool does.
+        filtering = criteria_active(req.exclude_sources, req.node_types, req.min_score)
+        payload = search.search_context(
             req.knowledge_base or config.knowledge_base_id,
             req.query,
             req.mode,
-            req.max_results,
+            req.max_results * 4 if filtering else req.max_results,
             req.source_name,
             graph=engine.graph_builder.graph,
             principal=req.principal,
             principal_groups=req.principal_groups,
             security=config.security,
             section=req.section,
+            memory=req.memory,
         )
+        if filtering:
+            payload = dict(payload)
+            payload["results"] = apply_retrieval_criteria(
+                payload.get("results") or [],
+                exclude_sources=req.exclude_sources,
+                node_types=req.node_types,
+                min_score=req.min_score,
+            )[: req.max_results]
+            payload["criteria"] = criteria_dict(
+                req.source_name,
+                req.exclude_sources,
+                req.node_types,
+                req.min_score,
+                req.memory,
+            )
+        return payload
 
     @app.post("/relevant-files")
     def relevant_files(req: SearchRequest) -> dict:
@@ -1565,6 +1650,10 @@ def create_app(
             principal_groups=req.principal_groups,
             security=config.security,
             section=req.section,
+            # Same reasoning as the ACL note above: this is the same retrieval,
+            # so it owes the caller the same memory policy. Omitting it would
+            # leave one route still serving corrected records.
+            memory=req.memory,
         )
         seen = set()
         files = []

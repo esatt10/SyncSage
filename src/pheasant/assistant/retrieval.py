@@ -68,6 +68,11 @@ class Passage:
     # is what lets a citation say *which section* answered rather than only
     # which file.
     heading_path: str | None = None
+    # Set when this evidence is a remembered assertion rather than a document
+    # (Step 33.6). Carried here for the same reason as heading_path: the
+    # answering prompt and the citation both need to say so, and neither can
+    # infer it from a path that merely happens to start with a scope directory.
+    memory: dict | None = None
     raw: dict = field(default_factory=dict, repr=False)
 
     def key(self) -> str:
@@ -536,6 +541,7 @@ class PheasantRetriever:
             snippet=snippet[:900],
             mode=mode,
             heading_path=(item.get("heading_path") or provenance.get("heading_path")) or None,
+            memory=item.get("memory") or None,
             raw=item,
         )
 

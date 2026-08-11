@@ -58,6 +58,8 @@ def _sync_counts(output: str) -> list[tuple[int, int]]:
     "url",
     [
         "https://github.com/anthropics/claude-code",
+        "https://www.github.com/apache/spark/tree/master/python",
+        "https://github.com/apache/spark/tree/master",
         "git@github.com:owner/repo.git",
         "https://gitlab.com/group/project",
         "https://example.com/thing.git",
@@ -195,6 +197,7 @@ def test_fetch_target_passes_the_clone_url_through_to_git_env(
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
         captured["env"] = kwargs.get("env")
+        Path(cmd[-1]).mkdir(parents=True)
         return FakeResult()
 
     monkeypatch.setattr("pheasant.targets.subprocess.run", fake_run)
@@ -266,6 +269,37 @@ def test_remote_and_connector_targets_resolve_without_touching_disk(roots) -> No
     assert repo.clone_url == "https://github.com/owner/proj"
     assert repo.name == "proj"
     assert repo.path.endswith("proj")
+
+    subtree = resolve_target(
+        "https://github.com/apache/spark/tree/master/python",
+        clone_root=clone_root,
+        workspace=workspace,
+    )
+    assert subtree.type == "repository"
+    assert subtree.clone_url == "https://github.com/apache/spark"
+    assert subtree.clone_ref == "master"
+    assert subtree.clone_path is not None and subtree.clone_path.endswith("spark")
+    assert Path(subtree.path).parts[-2:] == ("spark", "python")
+    assert Path(subtree.to_source_dict()["path"]).parts[-2:] == ("spark", "python")
+
+    branch_root = resolve_target(
+        "https://www.github.com/apache/spark/tree/master",
+        clone_root=clone_root,
+        workspace=workspace,
+    )
+    assert branch_root.clone_url == "https://github.com/apache/spark"
+    assert branch_root.clone_ref == "master"
+    assert branch_root.path.endswith("spark")
+
+
+def test_github_subtree_rejects_encoded_path_traversal(roots) -> None:
+    clone_root, workspace = roots
+    with pytest.raises(TargetError, match="subpath"):
+        resolve_target(
+            "https://github.com/owner/repo/tree/main/%2e%2e/private",
+            clone_root=clone_root,
+            workspace=workspace,
+        )
 
     web = resolve_target(
         "https://docs.example.com/guide", clone_root=clone_root, workspace=workspace

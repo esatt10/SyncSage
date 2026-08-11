@@ -160,14 +160,34 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         supersedes: str | None = None,
         tags: list[str] | None = None,
         sync: bool = True,
+        kind: str = "fact",
+        principal: str | None = None,
+        valid_until: str | None = None,
     ) -> dict:
         """Persist one agent-memory record (session/user/org scope) and index it.
 
         The memory becomes retrievable via search_context immediately when
         sync=true (read-your-writes). Requires a `type: memory` source.
+
+        principal records who asserted the memory; pass it whenever you know
+        the caller's identity, since it is what keeps one agent's memories
+        distinct from another's. kind marks a record as retrieval policy
+        (alias/preference/exclusion) instead of a fact. valid_until gives the
+        record an expiry it declares itself.
         """
 
-        return tools.memory_write(knowledge_base, text, scope, subject, supersedes, tags, sync)
+        return tools.memory_write(
+            knowledge_base,
+            text,
+            scope,
+            subject,
+            supersedes,
+            tags,
+            sync,
+            kind,
+            principal,
+            valid_until,
+        )
 
     @mcp.tool()
     def memory_consolidate(knowledge_base: str) -> dict:
@@ -201,6 +221,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         exclude_sources: list[str] | None = None,
         node_types: list[str] | None = None,
         min_score: float | None = None,
+        memory: dict | str | None = None,
     ) -> dict:
         """Search indexed context and return compact results with provenance.
 
@@ -217,6 +238,13 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         was configured. Call describe_retrieval to see what this region
         offers, and preview_retrieval to compare criteria against the
         standing configuration before committing to them.
+
+        memory controls how this region's agent memory takes part: one of
+        "auto" (default), "off", "only", "prefer", or an object such as
+        {"scopes": ["user"], "subject": "deploy", "as_of": "2026-01-01T00:00:00Z"}.
+        Records a later record corrected are excluded by default; pass an
+        as_of instant to ask what was believed at that time. Results that came
+        from memory carry a "memory" block naming the record and its scope.
         """
 
         return tools.search_context(
@@ -233,6 +261,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             exclude_sources=exclude_sources,
             node_types=node_types,
             min_score=min_score,
+            memory=memory,
         )
 
     @mcp.tool()
@@ -259,6 +288,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         exclude_sources: list[str] | None = None,
         node_types: list[str] | None = None,
         min_score: float | None = None,
+        memory: dict | str | None = None,
     ) -> dict:
         """Try retrieval criteria and see how they differ from the configuration.
 
@@ -277,6 +307,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             exclude_sources=exclude_sources,
             node_types=node_types,
             min_score=min_score,
+            memory=memory,
         )
 
     @mcp.tool()

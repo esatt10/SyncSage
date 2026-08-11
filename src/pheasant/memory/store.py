@@ -9,16 +9,27 @@ path, so the no-LLM/determinism pillar and the engine's sha256 idempotency
 apply to memory exactly as to any other source.
 
 Record ids are deterministic: ``mem-<asserted-at>-<blake2b8(scope|subject|text)>``.
-An identical write (same text/scope/subject at the same instant) maps to
-the same file and is reported as not-created — append-only, nothing is
-ever overwritten. Re-asserting a fact at a later time creates a new
-record; recency is signal, and consolidation of supersedes-chains is Step
-33.2's job.
+An identical write is reported as not-created — append-only, nothing is
+ever overwritten. Identity is the **digest**, not the timestamp: re-asserting
+the same thing returns the record already stored however much later it
+happens (Step 33.5; before that it deduplicated only within the same
+wall-clock second, which was a race rather than a rule). A write that
+differs in any way the digest covers — corrected text, a different writer,
+kind or validity window — is a genuinely new assertion and gets its own
+record. Consolidation of supersedes-chains is Step 33.2's job.
+
+Schema version 2 (Step 33.5) adds ``kind``, ``written_by``, ``valid_from``
+and ``valid_until``. **Version 1 records stay valid forever** — nothing on
+disk is rewritten (rule 2), :func:`MemoryStore.load` fills the new fields
+with their v1 meanings, and the id digest only grows extra parts for
+values a v1 record could not have carried, so **every v1 record id is
+reproduced byte-identically**. See :func:`_digest_input`.
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -27,10 +38,94 @@ from pathlib import Path
 
 from pheasant.config.schema import PheasantConfig, SourceConfig, SourceType
 
-MEMORY_RECORD_VERSION = 1
+logger = logging.getLogger(__name__)
+
+MEMORY_RECORD_VERSION = 2
 VALID_SCOPES = ("session", "user", "org")
 
-_FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n", re.S)
+#: What a record *is*. ``fact`` is an assertion to recall; the other three are
+#: retrieval policy, read by Step 33.8's steering loader. The distinction is
+#: stored from 33.5 so enabling steering later needs no second schema bump.
+DEFAULT_KIND = "fact"
+VALID_KINDS = ("fact", "alias", "preference", "exclusion")
+
+#: ``\r?`` is load-bearing, not defensive. ``_render`` joins with ``\n`` but
+#: ``Path.write_text`` translates to the platform newline, so on Windows every
+#: record is stored CRLF. ``load`` never noticed — ``read_text`` translates
+#: back — but the *indexing* path decodes the bytes itself, so a ``\n``-only
+#: pattern silently failed to match there and the frontmatter went on being
+#: indexed as prose on exactly the platform it was written on.
+_FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.S)
+
+
+def strip_frontmatter(text: str) -> tuple[str, int]:
+    """Split a record's frontmatter off its body. Returns ``(body, lines_removed)``.
+
+    The frontmatter was being indexed as prose: ``record_id``, ISO timestamps
+    and ``schema_version`` all became BM25 terms, so every record carried a
+    handful of high-cardinality tokens that match nothing a person would ask
+    while diluting the terms that do.
+
+    ``lines_removed`` exists because :func:`~pheasant.ingestion.chunking.chunk_text`
+    derives ``start_line``/``end_line`` from offsets into the text it is handed.
+    Dropping the frontmatter without telling the caller how many lines went with
+    it would silently re-point every chunk's provenance at the wrong line of the
+    real file, so callers add it back — the same absolute-line correction
+    ``_section_aligned_chunks`` already applies.
+
+    The blank separator line is consumed too, and counted. ``chunk_text``
+    ``strip()``s each slice while computing ``start_line`` from the *unstripped*
+    offset, so leaving the blank line in would report a chunk as starting one
+    line above its own first word. The invariant callers get: the returned text
+    begins at the first content character, and ``lines_removed`` is exactly how
+    many lines of the file precede it.
+    """
+    match = _FRONTMATTER_RE.match(text or "")
+    if not match:
+        return text, 0
+    body = text[match.end() :]
+    content = body.lstrip("\r\n")
+    consumed = body[: len(body) - len(content)]
+    return content, match.group(0).count("\n") + consumed.count("\n")
+
+
+def _digest_input(
+    scope: str,
+    subject: str | None,
+    text: str,
+    kind: str,
+    written_by: str | None,
+    valid_from: str,
+    valid_until: str | None,
+    asserted_at: str,
+) -> str:
+    """The string hashed into a record id.
+
+    Backward compatibility is the whole design here. A v1 record was hashed
+    over exactly ``scope|subject|text``, so this must reproduce that string
+    for anything a v1 write could have expressed — otherwise every existing
+    record's id changes, the file on disk stops matching its own frontmatter,
+    and the append-only guarantee turns into silent duplication.
+
+    So the extra parts are appended **only when they differ from what v1
+    implied**. They are appended at all because each one genuinely
+    distinguishes an assertion: the same sentence stored as an ``alias``
+    rather than a ``fact`` is a different record, and — load-bearing for the
+    per-principal isolation in 33.11 — the same sentence written by two
+    principals in the same second must not collide into one file owned by
+    whoever got there first.
+    """
+    base = f"{scope}|{subject or ''}|{text}"
+    extras: list[str] = []
+    if kind != DEFAULT_KIND:
+        extras.append(f"kind={kind}")
+    if written_by:
+        extras.append(f"by={written_by}")
+    if valid_from and valid_from != asserted_at:
+        extras.append(f"from={valid_from}")
+    if valid_until:
+        extras.append(f"until={valid_until}")
+    return base + ("|" + "|".join(extras) if extras else "")
 
 
 def memory_source(config: PheasantConfig) -> SourceConfig | None:
@@ -72,6 +167,19 @@ class MemoryRecord:
     supersedes: str | None
     tags: tuple[str, ...]
     path: Path
+    # Schema 2 (Step 33.5). Defaulted so that positional construction from
+    # before 33.5 still works, and so a v1 file on disk loads without a
+    # rewrite: kind="fact", nobody recorded as the writer, valid from the
+    # instant it was asserted, and open-ended.
+    kind: str = DEFAULT_KIND
+    written_by: str | None = None
+    valid_from: str = ""
+    valid_until: str | None = None
+
+    #: Version of the on-disk record this instance was read from. A v1 file
+    #: keeps reporting 1 — `as_dict` must not claim a record carries fields it
+    #: does not, or a reader cannot tell a real `valid_until` from a default.
+    schema_version: int = MEMORY_RECORD_VERSION
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -83,7 +191,11 @@ class MemoryRecord:
             "supersedes": self.supersedes,
             "tags": list(self.tags),
             "path": str(self.path),
-            "schema_version": MEMORY_RECORD_VERSION,
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "written_by": self.written_by,
+            "valid_from": self.valid_from or self.asserted_at,
+            "valid_until": self.valid_until,
         }
 
 
@@ -102,6 +214,10 @@ class MemoryStore:
         supersedes: str | None = None,
         tags: tuple[str, ...] | list[str] = (),
         now: datetime | None = None,
+        kind: str = DEFAULT_KIND,
+        written_by: str | None = None,
+        valid_from: str | None = None,
+        valid_until: str | None = None,
     ) -> tuple[MemoryRecord, bool]:
         """Write one memory record; returns ``(record, created)``.
 
@@ -113,13 +229,37 @@ class MemoryStore:
             raise ValueError("memory text must be a non-empty string")
         if scope not in VALID_SCOPES:
             raise ValueError(f"memory scope must be one of {VALID_SCOPES}, got {scope!r}")
+        if kind not in VALID_KINDS:
+            raise ValueError(f"memory kind must be one of {VALID_KINDS}, got {kind!r}")
         instant = (now or datetime.now(tz=UTC)).astimezone(UTC).replace(microsecond=0)
         asserted_at = instant.isoformat().replace("+00:00", "Z")
+        valid_from = valid_from or asserted_at
         digest = hashlib.blake2b(
-            f"{scope}|{subject or ''}|{text}".encode(), digest_size=8
+            _digest_input(
+                scope, subject, text, kind, written_by, valid_from, valid_until, asserted_at
+            ).encode(),
+            digest_size=8,
         ).hexdigest()
         record_id = f"mem-{instant.strftime('%Y%m%dT%H%M%SZ')}-{digest}"
         path = self.root / scope / f"{record_id}.md"
+        # Content identity is the *digest*; the timestamp prefix orders and
+        # labels records, it does not identify them. Matching on the full path
+        # alone made "an identical write returns the stored record" true only
+        # when both writes landed in the same wall-clock second — so the same
+        # assertion deduplicated or duplicated depending on how long the
+        # intervening sync took. Nobody means "within one second" as a
+        # semantic boundary; that was a race, and it is the cause of the
+        # long-standing flake in
+        # `test_memory_write_is_searchable_immediately_and_resync_is_zero_work`.
+        #
+        # Anything that genuinely differs still makes a new record, and 33.5
+        # widened that set: a correction, a different writer, a different kind
+        # or a different validity window all change the digest. An *archived*
+        # record no longer matches, so re-asserting something that was
+        # consolidated away correctly brings it back.
+        existing = next(iter(sorted((self.root / scope).glob(f"mem-*-{digest}.md"))), None)
+        if existing is not None:
+            return self.load(existing), False
         record = MemoryRecord(
             record_id=record_id,
             scope=scope,
@@ -129,6 +269,10 @@ class MemoryStore:
             supersedes=supersedes,
             tags=tuple(tags),
             path=path,
+            kind=kind,
+            written_by=written_by,
+            valid_from=valid_from,
+            valid_until=valid_until,
         )
         if path.exists():
             return self.load(path), False
@@ -148,15 +292,27 @@ class MemoryStore:
             key, _, value = line.partition(":")
             fields[key.strip()] = value.strip()
         tags = tuple(t.strip() for t in fields.get("tags", "").split(",") if t.strip())
+        asserted_at = fields.get("asserted_at", "")
+        try:
+            version = int(fields.get("schema_version", "1"))
+        except ValueError:
+            version = 1
         return MemoryRecord(
             record_id=fields.get("record_id", Path(path).stem),
             scope=fields.get("memory_scope", "user"),
             subject=fields.get("memory_subject") or None,
             text=raw[match.end() :].strip(),
-            asserted_at=fields.get("asserted_at", ""),
+            asserted_at=asserted_at,
             supersedes=fields.get("supersedes") or None,
             tags=tags,
             path=Path(path),
+            # v1 defaults, spelled out: an ordinary fact, no recorded writer,
+            # true from the moment it was asserted, open-ended.
+            kind=fields.get("kind") or DEFAULT_KIND,
+            written_by=fields.get("written_by") or None,
+            valid_from=fields.get("valid_from") or asserted_at,
+            valid_until=fields.get("valid_until") or None,
+            schema_version=version,
         )
 
     def list_records(
@@ -177,7 +333,17 @@ class MemoryStore:
             if not scope_dir.is_dir():
                 continue
             for path in sorted(scope_dir.glob("mem-*.md")):
-                everything.append(self.load(path))
+                try:
+                    everything.append(self.load(path))
+                except (ValueError, OSError):
+                    # One unreadable file must not cost the caller everything
+                    # else. This method backs listing, consolidation *and* the
+                    # 33.5 projection, so raising meant a single stray or
+                    # half-written file in the memory directory took down all
+                    # three — the same reason a malformed document contributes
+                    # no text instead of aborting a whole sync. Logged, never
+                    # silent, and the file itself is left untouched.
+                    logger.warning("skipping unreadable memory record: %s", path, exc_info=True)
         if current_only:
             superseded = self.superseded_ids(everything)
             everything = [r for r in everything if r.record_id not in superseded]
@@ -252,5 +418,16 @@ def _render(record: MemoryRecord) -> str:
         lines.append(f"supersedes: {record.supersedes}")
     if record.tags:
         lines.append(f"tags: {', '.join(record.tags)}")
+    # Schema 2. Each is written only when it says something a reader could not
+    # have assumed, so a plain fact still renders exactly the v1 way and the
+    # file stays as small as it was.
+    if record.kind != DEFAULT_KIND:
+        lines.append(f"kind: {record.kind}")
+    if record.written_by:
+        lines.append(f"written_by: {record.written_by}")
+    if record.valid_from and record.valid_from != record.asserted_at:
+        lines.append(f"valid_from: {record.valid_from}")
+    if record.valid_until:
+        lines.append(f"valid_until: {record.valid_until}")
     lines.append("---")
     return "\n".join(lines) + "\n\n" + record.text + "\n"

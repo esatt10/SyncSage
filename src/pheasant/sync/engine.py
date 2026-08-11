@@ -474,6 +474,35 @@ class SyncEngine:
         if self.transcriber is None and source_includes_audio(source):
             self.transcriber = transcriber_from_config(self.config, source=source)
 
+    def _project_memory_records(self, source: Any) -> None:
+        """Rebuild ``memory_records`` for a ``type: memory`` source (Step 33.5).
+
+        A no-op for every other source type, so a region without agent memory
+        is untouched. Rebuilding wholesale — rather than diffing — is what
+        keeps the table a *projection*: it cannot drift from the files, an
+        archived record disappears without needing its own delete path, and a
+        second sync over unchanged records writes identical rows.
+
+        Fail-soft, the same posture document extraction takes: one unreadable
+        record must not abort a sync that indexed everything else. The rows
+        from the previous pass survive (the write is a single transaction that
+        never runs), and the warning says so.
+        """
+        if getattr(source.type, "value", source.type) != "memory":
+            return
+        try:
+            from pheasant.memory.projection import project
+            from pheasant.memory.store import MemoryStore
+
+            records = MemoryStore(source.path).list_records()
+            self.state.replace_memory_records(source.name, project(source.name, records))
+        except Exception:
+            logger.warning(
+                "memory projection failed for %s; keeping the previous rows",
+                source.name,
+                exc_info=True,
+            )
+
     def sync_source(
         self,
         source_name: str,
@@ -774,6 +803,10 @@ class SyncEngine:
                         pruned["removed"],
                         pruned["restored"],
                     )
+            # Step 33.5 — refresh the structured face of the memory records.
+            # After indexing, so every row's artifact_id names an artifact that
+            # exists; a no-op for every source that is not `type: memory`.
+            self._project_memory_records(source)
             report("saving", total_items, total_items, "writing the graph and index")
             manifest["last_indexed_at"] = utc_now()
             manifest["connector"] = {"type": connector.connector_type}
