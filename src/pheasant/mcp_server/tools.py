@@ -530,6 +530,43 @@ class PheasantTools:
             "field_help": RETRIEVAL_FIELD_HELP,
         }
 
+    def _memory_graph_coverage(self) -> dict:
+        """How many records are actually wired into the graph (Step 33.7).
+
+        Computed from the live graph rather than from a stored report, so it
+        cannot go stale: "12 records, 9 bridged" is the difference between a
+        bridge that is working and one that silently connects nothing, and an
+        operator has no other way to tell those apart.
+        """
+        from pheasant.memory.bridge import ABOUT_EDGE
+
+        try:
+            rows = self.state.rows("SELECT artifact_id FROM memory_records")
+        except Exception:  # pragma: no cover - state store older than 33.5
+            return {}
+        artifacts = {str(row["artifact_id"]) for row in rows}
+        if not artifacts:
+            return {"records": 0, "bridged": 0, "unbridged": 0, "by_signal": {}}
+
+        bridged: set[str] = set()
+        by_signal: dict[str, int] = {}
+        graph = self.engine.graph_builder.graph
+        with graph.reading():
+            for (source, _target), edge_map in graph.iter_edges():
+                if source not in artifacts:
+                    continue
+                for data in edge_map.values():
+                    if data.get("type") == ABOUT_EDGE:
+                        bridged.add(source)
+                        signal = str(data.get("match_signal") or "unknown")
+                        by_signal[signal] = by_signal.get(signal, 0) + 1
+        return {
+            "records": len(artifacts),
+            "bridged": len(bridged),
+            "unbridged": len(artifacts) - len(bridged),
+            "by_signal": by_signal,
+        }
+
     def _describe_memory(self) -> dict:
         """What this region remembers, and how a caller may ask for it.
 
@@ -557,6 +594,7 @@ class PheasantTools:
         return {
             "enabled": True,
             "source_name": source.name,
+            "graph": self._memory_graph_coverage(),
             "scopes": {
                 str(row["scope"]): {
                     "records": int(row["n"] or 0),

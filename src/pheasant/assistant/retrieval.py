@@ -41,6 +41,7 @@ from typing import Any
 
 from pheasant.api.app import graph_neighbors as _graph_neighbors
 from pheasant.api.app import graph_slice as _graph_slice
+from pheasant.ingestion.content_types import ARTIFACT_TYPES
 
 VALID_MODES = ("hybrid", "text", "graph", "vector")
 
@@ -587,7 +588,7 @@ class PheasantRetriever:
                     continue
                 # Only documents carry answerable prose; concept/chunk nodes
                 # are navigation, not evidence.
-                if node.get("type") not in ("file", "document", "markdown_note"):
+                if node.get("type") not in ARTIFACT_TYPES:
                     continue
                 seen.add(node_id)
                 found.append(

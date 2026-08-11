@@ -479,33 +479,28 @@ def test_the_leak_is_closed_on_every_arm_not_just_text(corrected) -> None:
             )
 
 
-def test_known_residual_derived_entity_labels_are_not_yet_policy_aware(corrected) -> None:
-    """A documented limitation, asserted so it cannot be quietly forgotten.
+def test_labels_derived_from_a_superseded_record_are_filtered_too(corrected) -> None:
+    """Closed by Step 33.7. This test replaced the one that pinned the gap.
 
-    Entity extraction turns a memory's text into `entity` graph nodes — the
-    superseded record's "BANANAS" becomes `entity:<kb>:agent-memory:bananas`.
-    Those nodes carry a label but no artifact identity a search hit exposes, so
-    the policy cannot tell which record they came from and they survive a
-    validity filter that correctly drops the record itself.
+    Entity extraction turns a memory's text into `entity` nodes, so the
+    superseded record's "BANANAS" exists as `entity:<kb>:agent-memory:bananas`.
+    Through 33.6 those nodes exposed no artifact identity to a search hit, so
+    the policy could not tell which record they came from and they survived a
+    filter that correctly dropped the record itself.
 
-    The leak is a *label*, not the assertion: the record's text and chunks are
-    filtered on every arm (see the test above), and this is only reachable by
-    querying the label or the record id directly. Closing it needs the
-    entity→record provenance that Step 33.7 introduces along with the
-    `memory_record` node type. **When 33.7 lands, this test should start
-    failing** — that is the intended signal to delete it.
+    33.7 surfaces the `artifact_id` the enrichment pass had always written, and
+    resolves a relationship hit through either of its endpoints — so a label and
+    an edge are now judged by the record they belong to.
     """
     tools, _old, _new = corrected
-    labels = [
-        item
-        for item in tools.search_context("memory-test", "bananas", mode="graph").get("results")
-        or []
-        if item.get("type") == "entity" and "bananas" in str(item.get("label") or "").lower()
-    ]
-    assert labels, (
-        "the derived-entity residual appears to be fixed — if Step 33.7 landed, "
-        "delete this test; if not, the policy silently changed"
-    )
+    for mode in ("graph", "hybrid"):
+        results = tools.search_context("memory-test", "bananas", mode=mode).get("results") or []
+        stale = [
+            item
+            for item in results
+            if "bananas" in str(item.get("label") or item.get("title") or "").lower()
+        ]
+        assert not stale, f"a label from the superseded record survived mode={mode!r}"
 
 
 def test_graph_arm_hits_are_labelled_as_remembered(corrected) -> None:

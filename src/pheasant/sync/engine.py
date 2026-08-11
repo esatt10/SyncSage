@@ -474,6 +474,31 @@ class SyncEngine:
         if self.transcriber is None and source_includes_audio(source):
             self.transcriber = transcriber_from_config(self.config, source=source)
 
+    def _bridge_memory(self) -> None:
+        """Emit memory `supersedes` + `about` edges (Step 33.7).
+
+        Runs on the global-enrichment beat rather than per source, because a
+        record can be about content that lives in a *different* source and the
+        bridge can only see it once that source is indexed too.
+
+        Fail-soft, matching every other global pass here: a bridge that cannot
+        be derived costs some edges, never the sync that produced the content.
+        """
+        try:
+            report = self.graph_builder.add_memory_edges(self.state)
+        except Exception:
+            logger.warning("memory graph bridge failed; edges not updated", exc_info=True)
+            return
+        if report.get("records"):
+            logger.info(
+                "Memory bridged: %s records, %s about edges %s, %s supersedes, %s unbridged",
+                report["records"],
+                report["about"],
+                report.get("by_signal") or {},
+                report["supersedes"],
+                len(report.get("unbridged") or []),
+            )
+
     def _project_memory_records(self, source: Any) -> None:
         """Rebuild ``memory_records`` for a ``type: memory`` source (Step 33.5).
 
@@ -768,6 +793,13 @@ class SyncEngine:
             # scheduled sync over untouched content used to re-derive every
             # similarity pair and re-scan every edge on each beat, which is
             # what pinned a container's CPU while indexing nothing.
+            # Step 33.5 — refresh the structured face of the memory records.
+            # After the artifact loop, so every row's artifact_id names an
+            # artifact that exists, and *before* global enrichment, because
+            # 33.7's graph bridge reads this table: projecting afterwards
+            # meant the memory source's own first sync bridged zero records.
+            # A no-op for every source that is not `type: memory`.
+            self._project_memory_records(source)
             if indexed or mode == "full":
                 # Global enrichment is proportional to the whole graph, not to
                 # what changed, so on a large index this is where a sync
@@ -788,6 +820,11 @@ class SyncEngine:
                 # idempotent via edge upsert, so re-sync produces an identical
                 # graph.
                 self.graph_builder.add_cross_source_edges()
+                # Step 33.7 — memory into the graph. **After** cross-source
+                # resolution, because the bridge's strongest rung is "this
+                # record explicitly names a file", and that edge does not exist
+                # until the pass above has resolved it. A no-op without memory.
+                self._bridge_memory()
                 # Keep only the concepts that connect something. Runs last so
                 # similarity (which reads concept_terms off artifact nodes,
                 # not concept nodes) is unaffected.
@@ -803,10 +840,6 @@ class SyncEngine:
                         pruned["removed"],
                         pruned["restored"],
                     )
-            # Step 33.5 — refresh the structured face of the memory records.
-            # After indexing, so every row's artifact_id names an artifact that
-            # exists; a no-op for every source that is not `type: memory`.
-            self._project_memory_records(source)
             report("saving", total_items, total_items, "writing the graph and index")
             manifest["last_indexed_at"] = utc_now()
             manifest["connector"] = {"type": connector.connector_type}

@@ -26,6 +26,7 @@ import re
 from typing import Any
 
 from pheasant.assistant.providers import PROVIDERS
+from pheasant.ingestion.content_types import ARTIFACT_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +188,7 @@ _CITATION_RE = re.compile(r"\[(\d{1,2})\]")
 #
 # Structural edges are excluded separately (STRUCTURAL_EDGES), so admitting
 # artifacts here does not let "directory contains file" back in.
-ARTIFACT_FACT_TYPES = {"file", "markdown_note", "document"}
+ARTIFACT_FACT_TYPES = ARTIFACT_TYPES
 FACT_NODE_TYPES = {
     "concept",
     "entity",

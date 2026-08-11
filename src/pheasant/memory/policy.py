@@ -284,6 +284,27 @@ def resolve(item: Mapping[str, Any], index: dict[str, dict[str, Any]]) -> dict[s
     record = index.get(node_id)
     if record is not None:
         return record
+    # A node *derived* from an artifact — a chunk, symbol or entity — names the
+    # artifact it came from. This is what lets the policy judge an entity label
+    # extracted out of a memory record, which before Step 33.7 exposed no
+    # identity at all and so survived a filter that correctly dropped the
+    # record itself.
+    derived_from = item.get("artifact_id")
+    if derived_from:
+        record = index.get(str(derived_from))
+        if record is not None:
+            return record
+    # A relationship hit is one edge, and it belongs to memory if *either* end
+    # does — `entity:…:bananas --derived_from--> <the record>` carries the
+    # record's content just as surely as the record's own chunk. Its `node_id`
+    # is the edge's source node, so neither of the lookups above sees the
+    # target at all.
+    for endpoint in ("target", "source"):
+        value = item.get(endpoint)
+        if value:
+            record = index.get(str(value))
+            if record is not None:
+                return record
     provenance = item.get("provenance")
     provenance = provenance if isinstance(provenance, Mapping) else {}
     source_id = item.get("source_id") or provenance.get("source_id") or ""

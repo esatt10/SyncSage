@@ -20,6 +20,7 @@ export const NODE_COLORS: Record<string, string> = {
   file: "#5f6b45",
   document: "#5f6b45",
   markdown_note: "#7d8d5c",
+  memory_record: "#8a6f9e",
   chunk: "#6e6480",
   symbol: "#a06b3f",
   entity: "#9a5a58",
@@ -38,6 +39,8 @@ export const EDGE_COLORS: Record<string, string> = {
   references: "#5f8b93",
   similar_to: "#9b86ad",
   links_to: "#6b8a9e",
+  about: "#8a6f9e",
+  supersedes: "#b0654f",
 };
 
 export const ALL_EDGE_TYPES = Object.keys(EDGE_COLORS);
@@ -71,6 +74,7 @@ export const NODE_TYPE_SHAPES: Record<string, string> = {
   file: "rectangle",
   document: "rectangle",
   markdown_note: "rectangle",
+  memory_record: "round-rectangle",
   chunk: "ellipse",
   symbol: "diamond",
   entity: "ellipse",
@@ -87,6 +91,7 @@ const NODE_SIZES: Record<string, number> = {
   file: 26,
   document: 26,
   markdown_note: 26,
+  memory_record: 26,
   chunk: 14,
   symbol: 18,
   entity: 18,

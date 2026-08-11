@@ -10,6 +10,7 @@ pheasant uses a directed multi-graph model, compatible with `networkx.MultiDiGra
 | `source` | Configured source root. |
 | `repository`, `branch`, `commit` | Git-aware repository context. |
 | `directory`, `file`, `document`, `markdown_note` | Indexed filesystem artifacts. |
+| `memory_record` | One agent-memory record (Step 33.7). Still an ordinary Markdown artifact indexed by the ordinary pipeline — the type exists because the graph previously could not say which of its notes an agent had *remembered*. Attributes: `scope`, `subject`, `asserted_at`, `kind`. Its stable ID is unchanged (`file:{source}:{relpath}:branch=none`); only the type attribute is new, so a graph written before 2026-08-11 types these `markdown_note` until its next sync. |
 | `heading`, `chunk` | Retrieval and document structure units. `heading` carries a document's structural outline (chapter/section/§ code) and is emitted when a source sets `taxonomy.enabled` — **note it went unemitted from the initial build until 2026-08-06**, so a graph written before then contains none. Attributes: `level`, `number`, `title`, `kind`, `heading_path`, `start_line`. |
 | `symbol` | Code symbols, constants, and call targets extracted from language-aware passes. |
 | `entity` | Named systems, products, people, or CamelCase/Title Case mentions. |
@@ -27,7 +28,8 @@ pheasant uses a directed multi-graph model, compatible with `networkx.MultiDiGra
 | `references` | Markdown links, URLs, wiki links, citations, and other external references. |
 | ~~`similar_to`~~ | **Retired 2026-08-03** with the concept layer it keyed off. Not a silent loss: a live 2,132-file graph contained zero of these edges, so the pairwise pass that produced them was doing a full artifact-by-artifact scan every sync and emitting nothing. |
 | `links_to`, `tagged_with` | Optional Markdown/document relationships. |
-| `belongs_to_branch`, `at_commit`, `supersedes` | Git and version lineage. |
+| `about` | What an agent-memory record is *about* (Step 33.7): the record to the corpus artifact, symbol, heading or entity it refers to. Attributes: `record_id`, `match_signal` (`reference` \| `symbol` \| `heading` \| `entity`, strongest first — a record takes the first that fires), `matched` (what actually matched) and `confidence`. Capped per record, so total `about` edges stay bounded by `records x targets`. A lexical/BM25 rung was deliberately **not** materialized: the search index answers that at query time, and materializing it is how the concept layer reached 98.6% of all edges. |
+| `belongs_to_branch`, `at_commit`, `supersedes` | Git and version lineage. `supersedes` was documented from the initial build but **unemitted until 2026-08-11**, when Step 33.7 began drawing it between agent-memory records — before that a correction existed only as a frontmatter string resolved in Python, and the graph could not answer "what replaced this". |
 | `generated_note`, `retrieved_by`, `modified_by` | Obsidian projection and agent audit. |
 
 ## Stable IDs

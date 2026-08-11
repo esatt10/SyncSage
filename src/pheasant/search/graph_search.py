@@ -229,7 +229,7 @@ def _node_result(
     node_id: str, attrs: dict[str, Any], score: float, field: str | None
 ) -> dict[str, Any]:
     label = str(attrs.get("label") or node_id)
-    return {
+    result = {
         "kind": "node",
         "node_id": node_id,
         "type": attrs.get("type"),
@@ -248,6 +248,18 @@ def _node_result(
             "path": attrs.get("path"),
         },
     }
+    # Which artifact a derived node came from. `chunk`, `symbol` and `entity`
+    # nodes have carried this attribute since enrichment first wrote them; it
+    # simply never reached a search hit, so nothing downstream could tell which
+    # file — or which memory record — a symbol or entity was extracted from.
+    #
+    # That was the Step 33.6 residual: a superseded memory's entity label
+    # survived a validity filter because the hit exposed no identity the policy
+    # could resolve. Added only when the attribute exists (artifact nodes *are*
+    # the artifact and carry none), so payloads that had no answer are unchanged.
+    if attrs.get("artifact_id"):
+        result["artifact_id"] = attrs["artifact_id"]
+    return result
 
 
 def _node_summary(attrs: dict[str, Any]) -> str:

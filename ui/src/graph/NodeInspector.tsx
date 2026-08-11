@@ -19,7 +19,7 @@ type Tab = "overview" | "relationships" | "content";
 type View = "rich" | "raw";
 
 /** Node types whose indexed text is Markdown worth rendering. */
-const MARKDOWN_TYPES = new Set(["markdown_note", "document"]);
+const MARKDOWN_TYPES = new Set(["markdown_note", "document", "memory_record"]);
 
 /**
  * Render Markdown to sanitized HTML.
@@ -35,8 +35,8 @@ function renderMarkdown(text: string): string {
   return DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
 }
 
-const CONTENT_TYPES = new Set(["file", "document", "markdown_note", "chunk"]);
-const ARTIFACT_TYPES = new Set(["file", "document", "markdown_note"]);
+const CONTENT_TYPES = new Set(["file", "document", "markdown_note", "memory_record", "chunk"]);
+const ARTIFACT_TYPES = new Set(["file", "document", "markdown_note", "memory_record"]);
 
 // Internal bookkeeping the user never needs to see.
 const HIDDEN_KEYS = new Set(["label", "type", "id", "knowledge_base_id"]);
