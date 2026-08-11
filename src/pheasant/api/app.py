@@ -1129,6 +1129,11 @@ def create_app(
             )
 
         try:
+            jobs.progress(
+                job_id,
+                phase="waiting_for_indexer",
+                detail="Queued for the index writer",
+            )
             worker = WorkerBackedEngine(engine, app.state.config_path)
             if source_name:
                 results = [worker.sync_source(source_name, mode, on_progress=forward)]

@@ -17,6 +17,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -173,6 +174,26 @@ def test_second_engine_process_fails_fast_with_lease_error(
     finally:
         engine.close()
     assert not (_state_dir(config_file) / "engine.lease").exists()
+
+
+def test_engine_lease_can_wait_for_current_writer(tmp_path: Path) -> None:
+    owner = EngineLease(tmp_path, heartbeat_interval_s=0.02, stale_after_s=1.0)
+    owner.acquire()
+    contender = EngineLease(
+        tmp_path,
+        heartbeat_interval_s=0.02,
+        stale_after_s=1.0,
+        wait_timeout_s=1.0,
+        poll_interval_s=0.01,
+    )
+    timer = threading.Timer(0.05, owner.release)
+    timer.start()
+    try:
+        contender.acquire()
+        assert contender.held
+    finally:
+        contender.release()
+        timer.join()
 
 
 def test_stale_lease_is_taken_over_with_warning(

@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 #: A sync that has produced no output at all for this long is presumed hung.
 DEFAULT_TIMEOUT_S = 6 * 60 * 60
+# Leave a little time for the child to report a useful lease-timeout error
+# before the parent subprocess timeout expires.
+DEFAULT_LEASE_WAIT_S = DEFAULT_TIMEOUT_S - 60
 
 
 def run_sync(
@@ -78,6 +81,9 @@ def run_sync(
         command += ["--depth", str(depth)]
     if on_progress is not None:
         command += ["--progress"]
+    # Server-owned workers queue behind another legitimate writer. The public
+    # CLI remains fail-fast, which is important for scripts and diagnostics.
+    command += ["--wait-for-lease", str(DEFAULT_LEASE_WAIT_S)]
 
     logger.info("Starting sync worker: %s", " ".join(command[3:]))
     try:

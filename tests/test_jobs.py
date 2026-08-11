@@ -212,6 +212,21 @@ def test_worker_forwards_progress_lines_and_still_parses_the_report() -> None:
     assert json.loads(progress)["marker"] == PROGRESS_MARKER
 
 
+def test_server_worker_waits_for_an_existing_index_writer(monkeypatch) -> None:
+    from pheasant.sync import worker
+
+    seen: list[str] = []
+
+    def fake_run(command, timeout, on_progress):
+        seen.extend(command)
+        return 0, json.dumps({"status": "ok", "results": []}), ""
+
+    monkeypatch.setattr(worker, "_run_streaming", fake_run)
+    assert worker.run_sync("pheasant.yaml")["status"] == "ok"
+    option = seen.index("--wait-for-lease")
+    assert float(seen[option + 1]) > 0
+
+
 def test_run_streaming_forwards_progress_before_the_process_exits(tmp_path: Path) -> None:
     """The point of streaming is seeing movement *during* a long sync."""
     import sys
