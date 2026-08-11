@@ -360,6 +360,9 @@ export const api = {
   jobs: (activeOnly = false) =>
     request<{ jobs: JobRecord[]; active_count: number }>(`/jobs${qs({ active: activeOnly })}`),
   job: (jobId: string) => request<JobRecord>(`/jobs/${encodeURIComponent(jobId)}`),
+  clearJob: (jobId: string) =>
+    request<{ cleared: number }>(`/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" }),
+  clearJobs: () => request<{ cleared: number }>("/jobs", { method: "DELETE" }),
 
   // Retrieval tuning
   retrieval: () => request<RetrievalResponse>("/assistant/retrieval"),

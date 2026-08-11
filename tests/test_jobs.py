@@ -273,6 +273,24 @@ def test_jobs_routes_expose_the_registry(loaded_config, config_path: Path) -> No
     assert client.get("/jobs/nope").status_code == 404
 
 
+def test_finished_job_notifications_can_be_cleared(loaded_config, config_path: Path) -> None:
+    client = TestClient(create_app(config=loaded_config, config_path=config_path))
+    registry = client.app.state.jobs
+    active = registry.create("sync", "Indexing active", ["active"])
+    finished = registry.create("sync", "Indexed docs", ["docs"])
+    registry.finish(finished.id)
+
+    assert client.delete(f"/jobs/{active.id}").status_code == 409
+    assert client.delete(f"/jobs/{finished.id}").json() == {"cleared": 1}
+    assert client.get(f"/jobs/{finished.id}").status_code == 404
+
+    failed = registry.create("sync", "Failed", ["docs"])
+    registry.finish(failed.id, "failed", error="boom")
+    assert client.delete("/jobs").json() == {"cleared": 1}
+    listing = client.get("/jobs").json()
+    assert [job["id"] for job in listing["jobs"]] == [active.id]
+
+
 def test_the_stream_route_is_registered_before_the_job_id_route(
     loaded_config, config_path: Path
 ) -> None:

@@ -267,6 +267,18 @@ def test_remote_and_connector_targets_resolve_without_touching_disk(roots) -> No
     assert repo.name == "proj"
     assert repo.path.endswith("proj")
 
+    subtree = resolve_target(
+        "https://github.com/apache/spark/tree/master/python",
+        clone_root=clone_root,
+        workspace=workspace,
+    )
+    assert subtree.type == "repository"
+    assert subtree.clone_url == "https://github.com/apache/spark"
+    assert subtree.clone_ref == "master"
+    assert subtree.clone_path is not None and subtree.clone_path.endswith("spark")
+    assert subtree.path.endswith("spark/python")
+    assert subtree.to_source_dict()["path"].endswith("spark/python")
+
     web = resolve_target(
         "https://docs.example.com/guide", clone_root=clone_root, workspace=workspace
     )

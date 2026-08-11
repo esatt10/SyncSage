@@ -74,6 +74,9 @@ class ResolvedTarget:
     connector: dict | None = None
     # Remote repos: clone this before the first sync. None for local targets.
     clone_url: str | None = None
+    # GitHub tree URLs clone the repository here, then expose only subpath.
+    clone_path: str | None = None
+    clone_ref: str | None = None
     # True when `path` is a real local directory/file that must exist.
     local: bool = True
 
@@ -108,9 +111,8 @@ def is_git_url(spec: str) -> bool:
     if parsed.scheme in ("http", "https") and parsed.netloc:
         host = parsed.netloc.split("@")[-1].split(":")[0].lower()
         if host in GIT_HOSTS:
-            # A repo root is /owner/name; anything deeper is a page, not a clone.
             parts = [p for p in parsed.path.split("/") if p]
-            return len(parts) == 2
+            return len(parts) == 2 or (len(parts) >= 5 and parts[2] == "tree")
     return False
 
 
@@ -235,15 +237,28 @@ def _local_target(path: Path, *, name: str | None, forced: SourceType | None) ->
 
 
 def _git_target(url: str, clone_root: Path, *, name: str | None) -> ResolvedTarget:
+    original_url = url
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    tree_ref: str | None = None
+    subpath: Path | None = None
+    if parsed.netloc.lower() == "github.com" and len(parts) >= 5 and parts[2] == "tree":
+        owner, repository, _, tree_ref, *subparts = parts
+        if any(part in {".", ".."} for part in subparts):
+            raise TargetError("GitHub repository subpath cannot contain '.' or '..'")
+        url = f"{parsed.scheme}://{parsed.netloc}/{owner}/{repository}"
+        subpath = Path(*subparts)
     url = validate_clone_url(url)
     repo = name or repo_name_from_url(url)
     destination = (clone_root / repo).resolve()
     return ResolvedTarget(
         name=repo,
         type=SourceType.repository.value,
-        path=str(destination),
-        description=f"Git repository cloned from {url}",
+        path=str(destination / subpath) if subpath else str(destination),
+        description=f"Git repository cloned from {original_url}",
         clone_url=url,
+        clone_path=str(destination),
+        clone_ref=tree_ref,
     )
 
 
@@ -485,7 +500,7 @@ def fetch_target(target: ResolvedTarget) -> str | None:
     clone_url = validate_clone_url(target.clone_url)
     if shutil.which("git") is None:
         raise TargetError("git is required to clone a remote repository but was not found on PATH")
-    destination = Path(target.path)
+    destination = Path(target.clone_path or target.path)
     if (destination / ".git").is_dir():
         subprocess.run(
             ["git", "-C", str(destination), "fetch", "--all", "--quiet"],
@@ -493,11 +508,24 @@ def fetch_target(target: ResolvedTarget) -> str | None:
             capture_output=True,
             env=_git_env(clone_url),
         )
-        return f"{target.name}: reusing existing clone at {destination}"
+        source_path = Path(target.path)
+        if not source_path.exists():
+            raise TargetError(
+                f"GitHub repository path does not exist at ref {target.clone_ref!r}: {source_path}"
+            )
+        return f"{target.name}: reusing existing clone at {source_path}"
     destination.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
         # `--` ends option parsing, so nothing after it can be read as a flag.
-        ["git", "clone", "--quiet", "--", clone_url, str(destination)],
+        [
+            "git",
+            "clone",
+            "--quiet",
+            *(["--branch", target.clone_ref, "--single-branch"] if target.clone_ref else []),
+            "--",
+            clone_url,
+            str(destination),
+        ],
         capture_output=True,
         text=True,
         env=_git_env(clone_url),
@@ -506,4 +534,9 @@ def fetch_target(target: ResolvedTarget) -> str | None:
         raise TargetError(
             f"could not clone {target.clone_url}: {result.stderr.strip() or 'git clone failed'}"
         )
-    return f"{target.name}: cloned {target.clone_url} → {destination}"
+    source_path = Path(target.path)
+    if not source_path.exists():
+        raise TargetError(
+            f"GitHub repository path does not exist at ref {target.clone_ref!r}: {source_path}"
+        )
+    return f"{target.name}: cloned {target.clone_url} → {source_path}"

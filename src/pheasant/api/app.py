@@ -1530,6 +1530,19 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"Unknown job: {job_id}")
         return job
 
+    @app.delete("/jobs")
+    def clear_finished_jobs() -> dict:
+        return {"cleared": jobs.clear()}
+
+    @app.delete("/jobs/{job_id}")
+    def clear_job(job_id: str) -> dict:
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Unknown job: {job_id}")
+        if job["active"]:
+            raise HTTPException(status_code=409, detail="A running job cannot be cleared")
+        return {"cleared": jobs.clear(job_id)}
+
     @app.get("/sync/status")
     def sync_status() -> dict:
         return {

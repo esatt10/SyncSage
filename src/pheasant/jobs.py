@@ -225,6 +225,20 @@ class JobRegistry:
                     return job
         return None
 
+    def clear(self, job_id: str | None = None) -> int:
+        """Remove finished notifications; active work is never cancelled."""
+        with self._lock:
+            selected = [job_id] if job_id is not None else list(self._order)
+            removed = 0
+            for candidate in selected:
+                job = self._jobs.get(candidate)
+                if job is not None and job.status in TERMINAL:
+                    self._jobs.pop(candidate, None)
+                    removed += 1
+            if removed:
+                self._order = [candidate for candidate in self._order if candidate in self._jobs]
+            return removed
+
     # -- streaming --------------------------------------------------------
 
     def subscribe(self) -> Queue:
