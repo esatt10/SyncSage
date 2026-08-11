@@ -122,6 +122,10 @@ class VectorStore(Protocol):
 
     def source_chunk_ids(self, source_id: str) -> set[str]: ...
 
+    def reset(self) -> int:
+        """Remove every vector and any backend schema tied to its dimensions."""
+        ...
+
     def flush(self) -> None:
         """Persist any writes a backend may have deferred. Backends that
         already write durably on every `upsert`/`delete` (e.g. LanceDB) make
@@ -472,6 +476,18 @@ class NumpyVectorStore:
             if item.get("payload", {}).get("source_id") == source_id
         }
 
+    def reset(self) -> int:
+        """Clear the regenerable index and its decoded-matrix cache."""
+
+        removed = len(self._items())
+        self._cache = {}
+        self._version += 1
+        self._dirty = True
+        self._matrix_cache = None
+        self._matrix_sig = None
+        self._maybe_flush(force=True)
+        return removed
+
     def all_vectors(self) -> list[tuple[str, list[float]]]:
         """Bulk (chunk_id, vector) reader used by the contract publisher."""
 
@@ -596,6 +612,21 @@ class LanceDBVectorStore:
             if row["source_id"] == source_id
         }
 
+    def reset(self) -> int:
+        """Drop the table so the next insert can establish a new vector width.
+
+        Deleting every row is insufficient for LanceDB: an empty table keeps
+        its Arrow ``FixedSizeList`` schema, so switching from a 1,536- to a
+        3,072-dimensional model still fails on the first new insert.
+        """
+
+        table = self._table()
+        if table is None:
+            return 0
+        removed = table.count_rows()
+        self._database().drop_table(self.TABLE)
+        return removed
+
     def flush(self) -> None:
         """No-op: `upsert`/`delete` already write through to the LanceDB
         table on every call — nothing is ever buffered here."""
@@ -704,6 +735,12 @@ class VectorIndexer:
         if not stale:
             return 0
         return self.store.delete(chunk_ids=stale)
+
+    def reset(self) -> int:
+        """Discard pending work and reset the store's vector-space schema."""
+
+        self._pending = []
+        return self.store.reset()
 
     def flush(self) -> None:
         """Embed anything still queued, then force the store's writes to

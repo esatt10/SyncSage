@@ -323,6 +323,7 @@ export interface EmbeddingsStatus {
   store_providers: VectorStoreProvider[];
   wrote_config?: boolean;
   vectors_invalidated?: boolean;
+  vectors_dropped?: number;
   reindex?: { embedded_chunks: number; artifacts_scanned: number; vector_count: number };
   embedded_chunks?: number;
   artifacts_scanned?: number;

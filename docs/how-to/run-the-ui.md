@@ -17,10 +17,11 @@ making sure the UI you are looking at is the current one.
 |---|---|---|
 | I already run `pheasant` from the CLI and just want the UI | [Option 1 — pheasant serves it](#option-1-let-pheasant-serve-the-ui-no-docker) | `http://localhost:8765` |
 | I want the whole thing in containers, one command | [Option 2 — `pheasant host`](#option-2-pheasant-host-one-line-containers) | `http://localhost:8080` |
+| I want a brand-new container configured entirely in the UI | [Fresh UI-native reset](#fresh-ui-native-reset) | `http://localhost:8765` |
 | I have this repo cloned and want the standard stack | [Option 3 — `docker compose`](#option-3-docker-compose-from-this-repo) | `http://localhost:8080` |
 | I am editing the UI source | [Option 4 — Vite dev server](#option-4-vite-dev-server-for-ui-development) | `http://localhost:5173` |
 
-All four serve the same bundle from `ui/`. None of them change how indexing
+Every path serves the same bundle from `ui/`. None of them change how indexing
 works.
 
 ---
@@ -125,6 +126,33 @@ Which UI bundle you get:
 
 The generated `docker-compose.pheasant.yml` is a normal file: edit it, commit
 it, or re-run it yourself with `docker compose -f docker-compose.pheasant.yml up -d --build`.
+
+---
+
+## Fresh UI-native reset
+
+From a clone of this repository, run exactly one Docker command:
+
+```bash
+docker compose -f docker-compose.fresh.yml up -d --build --force-recreate
+```
+
+Open **<http://localhost:8765>**. The container starts with a freshly generated
+container-native config and no sources, ready to configure from the browser.
+Files uploaded in the UI are stored inside the persistent state volume.
+
+!!! danger "This resets pheasant's Docker data"
+    Every run clears the named config, state, vault, and export volumes before
+    startup. It does not delete host files, Docker images, or unrelated Docker
+    volumes. Use ordinary `docker compose up -d --build` when you want to keep
+    an existing knowledge base.
+
+The compose file is standalone, so Docker does not load this checkout's
+`docker-compose.override.yml`; an old `pheasant.yaml` bind mount or repository
+workspace therefore cannot be reused accidentally. The standard image then
+creates `/config/pheasant.yaml` from its live defaults. If `OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, or `GEMINI_API_KEY` exists in your shell or repository
+`.env`, Compose passes it into the container without writing its value to YAML.
 
 ---
 

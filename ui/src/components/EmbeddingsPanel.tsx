@@ -46,8 +46,8 @@ export function EmbeddingsPanel() {
       invalidate();
       setNotice(
         data.vectors_invalidated
-          ? "Saved. The model or dimension changed, so existing vectors are in a different " +
-            "space — rebuild them before relying on semantic search."
+          ? `Saved. The embedding space changed, so ${data.vectors_dropped ?? 0} incompatible ` +
+            "vectors were cleared. Build vectors before relying on semantic search."
           : data.wrote_config
             ? "Saved to your config file."
             : "Saved to the running process.",

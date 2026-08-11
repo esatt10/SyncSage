@@ -84,6 +84,18 @@ Open <http://localhost:8080> for the web UI, or <http://localhost:8765> for the
 API and MCP endpoint. Trouble getting the UI up, or seeing a stale one? →
 **[Run the web UI](docs/how-to/run-the-ui.md)**.
 
+Want a completely fresh, UI-managed container instead? This single command
+rebuilds pheasant, clears its named config/state/vault/export volumes, creates
+a clean container-native config, and serves the UI at
+<http://localhost:8765>:
+
+```bash
+docker compose -f docker-compose.fresh.yml up -d --build --force-recreate
+```
+
+This is intentionally destructive to pheasant's Docker data. It does not mount
+or index the repository; add sources and configure models from the web UI.
+
 ### The longer way
 
 Prefer to be walked through every option instead of hand-editing YAML?

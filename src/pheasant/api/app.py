@@ -2145,25 +2145,30 @@ def create_app(
                 + (f" — {hint}" if hint else "")
                 + ". The 'numpy' store needs no extra dependencies.",
             )
+        requested = {
+            "enabled": req.enabled,
+            "provider": req.provider,
+            "model": req.model,
+            "base_url": req.base_url,
+            "api_key_env": req.api_key_env,
+            "dimensions": req.dimensions,
+            "batch_size": req.batch_size,
+        }
         changes = {
             key: value
-            for key, value in {
-                "enabled": req.enabled,
-                "provider": req.provider,
-                "model": req.model,
-                "base_url": req.base_url,
-                "api_key_env": req.api_key_env,
-                "dimensions": req.dimensions,
-                "batch_size": req.batch_size,
-            }.items()
-            if value is not None
+            for key, value in requested.items()
+            if value is not None or (key == "dimensions" and key in req.model_fields_set)
         }
-        # Changing the model or dimension invalidates every existing vector:
-        # a store mixing two embedding spaces returns nonsense similarities.
-        # Detect it here so the caller is told rather than finding out later.
-        dimension_change = (
-            "dimensions" in changes and changes["dimensions"] != settings.dimensions
-        ) or ("model" in changes and changes["model"] != settings.model)
+        # Provider, endpoint, model and dimensions together define the vector
+        # space. A backend change can also uncover an older index in a
+        # different space. Any of them invalidates every existing vector.
+        vector_space_change = any(
+            key in changes and changes[key] != getattr(settings, key)
+            for key in ("provider", "base_url", "model", "dimensions")
+        ) or (
+            req.store_provider is not None
+            and req.store_provider != config.search.vector_store.provider
+        )
 
         for key, value in changes.items():
             setattr(settings, key, value)
@@ -2176,6 +2181,15 @@ def create_app(
             raise HTTPException(
                 status_code=400, detail=f"Could not enable embeddings: {exc}"
             ) from exc
+
+        # Clear incompatible vectors immediately, even when the caller wants
+        # to rebuild later. Leaving them queryable lets the new embedder send
+        # (for example) 3,072-wide queries to a 1,536-wide Lance table. Reset
+        # drops Lance's Arrow schema as well as its rows; row deletion alone
+        # cannot change a FixedSizeList width.
+        dropped_vectors = 0
+        if vector_space_change and engine.vectors is not None:
+            dropped_vectors = engine.vectors.reset()
 
         wrote_config = False
         if req.persist:
@@ -2191,11 +2205,14 @@ def create_app(
         result = {
             "status": "updated",
             "wrote_config": wrote_config,
-            "vectors_invalidated": dimension_change,
+            "vectors_invalidated": vector_space_change,
+            "vectors_dropped": dropped_vectors,
             **_embeddings_status(),
         }
         if req.reindex and engine.vectors is not None:
-            result["reindex"] = _rebuild_vectors(drop_existing=dimension_change)
+            # A changed vector space was reset above; unchanged settings keep
+            # their existing vectors and fill only missing chunk ids.
+            result["reindex"] = _rebuild_vectors(drop_existing=False)
             # Record the space we just embedded into, so the next restart sees
             # a matching fingerprint and does not drop and re-embed all over
             # again for a change that has already been applied.

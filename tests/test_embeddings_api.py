@@ -112,6 +112,8 @@ def test_changing_the_model_flags_and_can_drop_stale_vectors(
     # A different dimension means every stored vector is in the wrong space.
     changed = client.put("/search/embeddings", json={"dimensions": 128, "persist": False}).json()
     assert changed["vectors_invalidated"] is True
+    assert changed["vectors_dropped"] > 0
+    assert changed["vector_count"] == 0
 
     dropped = client.post("/search/embeddings/reindex", params={"drop_existing": True}).json()
     assert dropped["embedded_chunks"] > 0

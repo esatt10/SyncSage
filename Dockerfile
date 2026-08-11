@@ -68,7 +68,8 @@ RUN pip install --no-cache-dir ".[${PHEASANT_EXTRAS}]"
 COPY --from=ui /ui/dist /app/ui
 COPY pheasant.example.yaml /app/pheasant.default.yaml
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
+COPY docker-fresh-entrypoint.sh /app/docker-fresh-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh /app/docker-fresh-entrypoint.sh
 
 # Run as an unprivileged user. The indexer reads whatever paths it is pointed
 # at, so running it as root means a misconfigured source — or a bug in the
