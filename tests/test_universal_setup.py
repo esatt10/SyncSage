@@ -58,6 +58,8 @@ def _sync_counts(output: str) -> list[tuple[int, int]]:
     "url",
     [
         "https://github.com/anthropics/claude-code",
+        "https://www.github.com/apache/spark/tree/master/python",
+        "https://github.com/apache/spark/tree/master",
         "git@github.com:owner/repo.git",
         "https://gitlab.com/group/project",
         "https://example.com/thing.git",
@@ -278,6 +280,25 @@ def test_remote_and_connector_targets_resolve_without_touching_disk(roots) -> No
     assert subtree.clone_path is not None and subtree.clone_path.endswith("spark")
     assert subtree.path.endswith("spark/python")
     assert subtree.to_source_dict()["path"].endswith("spark/python")
+
+    branch_root = resolve_target(
+        "https://www.github.com/apache/spark/tree/master",
+        clone_root=clone_root,
+        workspace=workspace,
+    )
+    assert branch_root.clone_url == "https://github.com/apache/spark"
+    assert branch_root.clone_ref == "master"
+    assert branch_root.path.endswith("spark")
+
+
+def test_github_subtree_rejects_encoded_path_traversal(roots) -> None:
+    clone_root, workspace = roots
+    with pytest.raises(TargetError, match="subpath"):
+        resolve_target(
+            "https://github.com/owner/repo/tree/main/%2e%2e/private",
+            clone_root=clone_root,
+            workspace=workspace,
+        )
 
     web = resolve_target(
         "https://docs.example.com/guide", clone_root=clone_root, workspace=workspace

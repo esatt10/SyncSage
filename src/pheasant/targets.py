@@ -28,7 +28,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from pheasant.config.schema import SourceType
 
@@ -110,9 +110,11 @@ def is_git_url(spec: str) -> bool:
     parsed = urlparse(spec)
     if parsed.scheme in ("http", "https") and parsed.netloc:
         host = parsed.netloc.split("@")[-1].split(":")[0].lower()
-        if host in GIT_HOSTS:
+        if host.removeprefix("www.") in GIT_HOSTS:
             parts = [p for p in parsed.path.split("/") if p]
-            return len(parts) == 2 or (len(parts) >= 5 and parts[2] == "tree")
+            return len(parts) == 2 or (
+                host.removeprefix("www.") == "github.com" and len(parts) >= 4 and parts[2] == "tree"
+            )
     return False
 
 
@@ -239,15 +241,16 @@ def _local_target(path: Path, *, name: str | None, forced: SourceType | None) ->
 def _git_target(url: str, clone_root: Path, *, name: str | None) -> ResolvedTarget:
     original_url = url
     parsed = urlparse(url)
-    parts = [part for part in parsed.path.split("/") if part]
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
     tree_ref: str | None = None
     subpath: Path | None = None
-    if parsed.netloc.lower() == "github.com" and len(parts) >= 5 and parts[2] == "tree":
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if host == "github.com" and len(parts) >= 4 and parts[2] == "tree":
         owner, repository, _, tree_ref, *subparts = parts
-        if any(part in {".", ".."} for part in subparts):
+        if any(part in {"", ".", ".."} or "/" in part or "\\" in part for part in subparts):
             raise TargetError("GitHub repository subpath cannot contain '.' or '..'")
-        url = f"{parsed.scheme}://{parsed.netloc}/{owner}/{repository}"
-        subpath = Path(*subparts)
+        url = f"{parsed.scheme}://github.com/{owner}/{repository}"
+        subpath = Path(*subparts) if subparts else None
     url = validate_clone_url(url)
     repo = name or repo_name_from_url(url)
     destination = (clone_root / repo).resolve()
@@ -264,6 +267,17 @@ def _git_target(url: str, clone_root: Path, *, name: str | None) -> ResolvedTarg
 
 def _web_target(url: str, workspace: Path, *, name: str | None) -> ResolvedTarget:
     parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    parts = [part for part in parsed.path.split("/") if part]
+    if host == "github.com" and len(parts) >= 3 and parts[2] == "tree":
+        # This is a guardrail as well as an error message. GitHub tree URLs
+        # must go through _git_target; treating one as a web collection later
+        # fails at WebCollectionConnector._require_experimental_enabled and
+        # hides the real classification problem behind a traceback.
+        raise TargetError(
+            "GitHub /tree/ URLs are repository paths, not web collections; "
+            "use https://github.com/<owner>/<repo>/tree/<ref>/<path>"
+        )
     label = name or slugify(parsed.netloc or "web")
     return ResolvedTarget(
         name=label,

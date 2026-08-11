@@ -269,6 +269,18 @@ class WebCollectionConnector(SourceConnector):
         self._seen_validators = {}
 
     def list_items(self) -> list[ConnectorItem]:
+        github_tree_urls = [
+            url
+            for url in self.source.urls
+            if (urlparse(url).hostname or "").lower().removeprefix("www.") == "github.com"
+            and "/tree/" in urlparse(url).path
+        ]
+        if github_tree_urls:
+            raise ConnectorUnavailable(
+                f"source {self.source.name} was registered as a web collection, but its URL is "
+                "a GitHub repository path. Remove this source and add the GitHub /tree/ URL "
+                "again so pheasant can clone the repository and index its subfolder."
+            )
         self._require_experimental_enabled()
         items: list[ConnectorItem] = []
         for index, url in enumerate(self.source.urls):

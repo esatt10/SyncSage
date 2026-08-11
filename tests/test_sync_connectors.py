@@ -25,6 +25,7 @@ from pheasant.config.schema import (
     SourceType,
 )
 from pheasant.mcp_server.tools import PheasantTools
+from pheasant.sync.connectors import ConnectorUnavailable, WebCollectionConnector
 from pheasant.sync.engine import SyncEngine
 
 
@@ -154,6 +155,15 @@ def _web_config(tmp_path: Path, urls: list[str]) -> PheasantConfig:
             connector=SourceConnectorSettings(allow_experimental=True),
         ),
     )
+
+
+def test_misclassified_github_tree_url_has_actionable_error(tmp_path: Path) -> None:
+    config = _web_config(tmp_path, ["https://github.com/apache/spark/tree/master/python"])
+    engine = SyncEngine(config)
+    connector = WebCollectionConnector(config.sources[0], engine.state)
+
+    with pytest.raises(ConnectorUnavailable, match="clone the repository"):
+        connector.list_items()
 
 
 def _artifact_rows(engine: SyncEngine, source_id: str) -> list[tuple]:
