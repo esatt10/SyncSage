@@ -22,6 +22,8 @@ export interface HorizonGraph {
   mode: HorizonMode;
   /** Nodes matching the filters before the horizon/limit was applied. */
   matchedNodes?: number;
+  /** At least one backing request omitted nodes because of its safety limit. */
+  truncated?: boolean;
 }
 
 export interface HorizonOptions {
@@ -61,7 +63,7 @@ const PER_ANSWER_NODE_LIMIT = 150;
 /** How many surfaced nodes get their own neighbourhood after a question. */
 const MAX_ANSWER_CENTERS = 5;
 /** Neighbours pulled in for the selected node, outside the horizon. */
-const SELECTION_NEIGHBOUR_LIMIT = 120;
+const SELECTION_NEIGHBOUR_LIMIT = SINGLE_CENTER_LIMIT;
 
 export function useHorizonGraph(options: HorizonOptions) {
   const { centerId, depth, showAll, surfacedIds, hiddenTypes, sourceFilter, selectedId } = options;
@@ -93,6 +95,7 @@ export function useHorizonGraph(options: HorizonOptions) {
           depths: {},
           mode,
           matchedNodes: graph.matched_nodes,
+          truncated: graph.truncated,
         };
       }
 
@@ -117,7 +120,14 @@ export function useHorizonGraph(options: HorizonOptions) {
               excludeTypes: hiddenTypes,
             })
             // One unreachable center must not blank the canvas.
-            .catch(() => ({ node_id: nodeId, depth: hops, nodes: [], links: [], depths: {} })),
+            .catch(() => ({
+              node_id: nodeId,
+              depth: hops,
+              nodes: [],
+              links: [],
+              depths: {},
+              truncated: false,
+            })),
         ),
       );
       return merge(slices, hiddenTypes, sourceFilter, mode);
@@ -139,7 +149,12 @@ export function useHorizonGraph(options: HorizonOptions) {
  * with them — a dangling edge renders as a line to nowhere.
  */
 function merge(
-  slices: Array<{ nodes: GraphNode[]; links: GraphLink[]; depths?: Record<string, number> }>,
+  slices: Array<{
+    nodes: GraphNode[];
+    links: GraphLink[];
+    depths?: Record<string, number>;
+    truncated?: boolean;
+  }>,
   hiddenTypes: string[],
   sourceFilter: string | null,
   mode: HorizonMode,
@@ -177,5 +192,6 @@ function merge(
     depths,
     mode,
     matchedNodes: matched,
+    truncated: slices.some((slice) => slice.truncated),
   };
 }

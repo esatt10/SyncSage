@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 
 from pheasant.config.schema import ExtractorSettings, PheasantConfig
+from pheasant.ingestion.captioner import source_includes_images
 from pheasant.ingestion.extractor import (
     AutoExtractor,
     BuiltinExtractor,
@@ -40,6 +41,7 @@ from pheasant.ingestion.extractor import (
     source_includes_documents,
 )
 from pheasant.ingestion.pipeline import read_text, read_text_bytes
+from pheasant.ingestion.transcriber import source_includes_audio
 from pheasant.search.hybrid import HybridSearch
 from pheasant.search.sqlite_store import SearchStore
 from pheasant.sync.engine import SyncEngine
@@ -235,6 +237,9 @@ def test_document_capability_is_opt_in_by_glob() -> None:
 
     assert source_includes_documents(Source(["**/*.pdf"]))
     assert source_includes_documents(Source(["**/*.docx"]))
+    assert source_includes_documents(Source(["**/*"]))
+    assert source_includes_images(Source(["**/*"]))
+    assert source_includes_audio(Source(["**/*"]))
     assert not source_includes_documents(Source(["**/*.py", "**/*.md"]))
 
 
@@ -631,7 +636,9 @@ def test_an_image_source_registered_at_runtime_is_still_captioned(tmp_path: Path
         tmp_path, Path("tests/fixtures/sample_workspace/images/diagram.png"), "**/*.png"
     )
     hits = client.post("/search", json={"query": "diagram", "mode": "text"}).json()["results"]
-    text = " ".join(chunk.get("text_preview", "") for hit in hits for chunk in hit.get("chunks", []))
+    text = " ".join(
+        chunk.get("text_preview", "") for hit in hits for chunk in hit.get("chunks", [])
+    )
     assert "fingerprint" in text, f"captioner did not run; got the filename fallback: {text!r}"
 
 
@@ -641,5 +648,7 @@ def test_an_audio_source_registered_at_runtime_is_still_transcribed(tmp_path: Pa
         tmp_path, Path("tests/fixtures/sample_workspace/audio/briefing.wav"), "**/*.wav"
     )
     hits = client.post("/search", json={"query": "briefing", "mode": "text"}).json()["results"]
-    text = " ".join(chunk.get("text_preview", "") for hit in hits for chunk in hit.get("chunks", []))
+    text = " ".join(
+        chunk.get("text_preview", "") for hit in hits for chunk in hit.get("chunks", [])
+    )
     assert "fingerprint" in text, f"transcriber did not run; got the fallback: {text!r}"

@@ -44,6 +44,7 @@ the UI.
 |---|---|
 | `--advanced` | Ask about every option, not just the ones that usually matter |
 | `--accept-defaults` | Ask nothing; write a config of defaults (scriptable) |
+| `--plain` | Disable color and terminal control sequences (useful for logs and narrow terminals) |
 | `--answers FILE` | Answer from a JSON file of `{"dotted.config.key": value}` |
 | `--target local\|docker\|compose` | Which startup commands to print at the end |
 | `-o PATH` | Where to write the config (default `pheasant.yaml`) |
@@ -74,6 +75,29 @@ Interrupt it (`Ctrl-C`) and answers so far are checkpointed to
 `.pheasant-setup.json`; re-run to resume. Secrets are deliberately **not**
 checkpointed — the whole point of the `0600` file is that the key exists in
 exactly one place.
+
+### Responsive terminal flow
+
+The guided interview uses the available terminal width (up to 100 columns),
+never clears the screen, and is grouped into six chapters: Foundation; Sources
+& content; Search & graph; Assistant & memory; Operations & security; and
+Federation. On an interactive terminal a redacted review screen lets you write
+files, revisit a chapter, or save progress and exit.
+
+Use `--plain` for log-friendly output without color or terminal control
+sequences. Non-TTY and `--accept-defaults` runs keep the original scriptable
+behavior and skip the review.
+
+The wizard labels `search.embeddings.model` **Search embedding model** and
+`assistant.model` **Chat and agent workflow model**. An explicit provider offers
+its tested runtime default as **Recommended** plus **Custom model ID**. For
+`provider: auto`, setup displays the currently resolved provider and exact
+default from available environment keys, while keeping `assistant.model: null`.
+When no key is available it reports that extractive answers only are available.
+
+Document extraction is enabled by source include globs; PDF and DOCX files are
+handled by the existing extractor. OCR is intentionally not a setup option:
+image-only scanned PDFs need an authored `<file>.extract.txt` sidecar.
 
 ## 3. Point-and-click
 

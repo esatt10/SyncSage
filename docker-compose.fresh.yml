@@ -1,0 +1,51 @@
+# A destructive, UI-first reset of the local pheasant stack.
+#
+# Run from this repository:
+#
+#   docker compose -f docker-compose.fresh.yml up -d --build --force-recreate
+#
+# This file is deliberately standalone. Passing it explicitly prevents Compose
+# from loading docker-compose.override.yml, so an old host-side pheasant.yaml or
+# workspace mount cannot leak into the fresh instance. On every container
+# recreation it empties only pheasant's four named volumes, then the normal
+# image entrypoint generates a clean, container-native config. Configure the
+# instance and upload/add sources from http://localhost:8765.
+services:
+  pheasant:
+    build:
+      context: .
+    image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.9.0}
+    container_name: ${PHEASANT_CONTAINER_NAME:-pheasant}
+    restart: unless-stopped
+    ports:
+      - "${PHEASANT_BIND:-127.0.0.1}:${PHEASANT_PORT:-8765}:8765"
+    environment:
+      PHEASANT_CONFIG: /config/pheasant.yaml
+      # Keep the image entrypoint from treating this source checkout as the
+      # initial corpus. Sources are intentionally configured in the web UI.
+      PHEASANT_WORKSPACE: /ui-managed-sources
+      # Compose reads these from the shell or .env. Empty values are harmless;
+      # the UI also supports a browser-session key for assistant providers.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    volumes:
+      - "pheasant-config:/config"
+      - "pheasant-state:/state"
+      - "pheasant-vault:/vault"
+      - "pheasant-exports:/exports"
+    # Recreating this service is the reset operation. Targets are explicit and
+    # restricted to the four named-volume mount points above.
+    entrypoint: ["/app/docker-fresh-entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  pheasant-config:
+  pheasant-state:
+  pheasant-vault:
+  pheasant-exports:

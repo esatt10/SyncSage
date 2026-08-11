@@ -332,6 +332,18 @@ def test_vector_store_roundtrip(store_backend: Any) -> None:
     assert store_backend.delete(artifact_id="a2") == 1
     assert store_backend.count() == 1
 
+    # Reset must remove the backend's vector-width schema, not just its rows.
+    # LanceDB otherwise keeps a FixedSizeList(3) table and rejects this new
+    # five-dimensional embedding space even though the table is empty.
+    assert store_backend.reset() == 1
+    assert store_backend.count() == 0
+    store_backend.upsert(
+        ["c4"],
+        [[1.0, 0.0, 0.0, 0.0, 0.0]],
+        [{"source_id": "s3", "artifact_id": "a3", "text_hash": "h4"}],
+    )
+    assert len(store_backend.all_vectors()[0][1]) == 5
+
 
 def test_engine_embeds_with_lancedb_backend(tmp_path: Path) -> None:
     pytest.importorskip(

@@ -30,8 +30,10 @@ from pheasant.config.loader import load_config
 from pheasant.config.schema import PheasantConfig
 from pheasant.setup_wizard import (
     PROGRESS_FILENAME,
+    Prompter,
     ScriptedPrompter,
     Wizard,
+    build_phases,
     build_sections,
     ensure_gitignored,
     load_progress,
@@ -110,6 +112,88 @@ def test_choice_questions_reject_a_value_that_is_not_offered() -> None:
     assert any("pick one of" in line for line in prompter.transcript)
 
 
+def test_assistant_model_is_explicitly_asked_when_chat_is_enabled() -> None:
+    wizard = Wizard(
+        prompter=ScriptedPrompter(["gpt-test"]),
+        preset={"assistant.enabled": True, "assistant.provider": "openai"},
+    )
+    question = next(q for s in build_sections() for q in s.questions if q.key == "assistant.model")
+    wizard._ask(question)
+    assert wizard.answers["assistant.model"] == "gpt-test"
+
+
+def test_setup_uses_six_responsive_phases() -> None:
+    assert [phase.title for phase in build_phases()] == [
+        "Foundation",
+        "Sources & content",
+        "Search & graph",
+        "Assistant & memory",
+        "Operations & security",
+        "Federation",
+    ]
+
+
+def test_explicit_provider_writes_recommended_model_and_custom_model() -> None:
+    question = next(q for s in build_sections() for q in s.questions if q.key == "assistant.model")
+    recommended = Wizard(
+        prompter=ScriptedPrompter([]),
+        preset={"assistant.enabled": True, "assistant.provider": "openai"},
+        accept_defaults=True,
+    )
+    recommended._ask(question)
+    assert recommended.answers["assistant.model"] == "gpt-5.6-luna"
+
+    custom = Wizard(
+        prompter=ScriptedPrompter(["2", "my-account-model"]),
+        preset={"assistant.enabled": True, "assistant.provider": "openai"},
+    )
+    custom._ask(question)
+    assert custom.answers["assistant.model"] == "my-account-model"
+
+
+def test_auto_model_is_resolved_for_display_but_never_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "present")
+    question = next(q for s in build_sections() for q in s.questions if q.key == "assistant.model")
+    wizard = Wizard(
+        prompter=ScriptedPrompter([]),
+        preset={
+            "assistant.enabled": True,
+            "assistant.provider": "auto",
+            "assistant.model": "unsafe",
+        },
+    )
+    wizard._ask(question)
+    assert wizard.answers["assistant.model"] is None
+    assert any("OpenAI" in line for line in wizard.prompter.transcript)
+
+
+def test_plain_output_is_wrapped_and_has_no_ansi(capsys: pytest.CaptureFixture[str]) -> None:
+    prompter = Prompter(plain=True, width=40, interactive=False)
+    Wizard(prompter=prompter, accept_defaults=True).run()
+    output = capsys.readouterr().out
+    assert all(len(line) <= 40 for line in output.splitlines())
+    assert "\033[" not in output
+
+
+def test_embedding_env_question_rejects_a_pasted_secret() -> None:
+    prompter = ScriptedPrompter(["sk-pasted-secret", "OPENAI_API_KEY"])
+    wizard = Wizard(
+        prompter=prompter,
+        preset={
+            "search.embeddings.enabled": True,
+            "search.embeddings.provider": "openai-spec",
+        },
+    )
+    question = next(
+        q for s in build_sections() for q in s.questions if q.key == "search.embeddings.api_key_env"
+    )
+    wizard._ask(question)
+    assert wizard.answers[question.key] == "OPENAI_API_KEY"
+    assert any("do not paste the key itself" in line for line in prompter.transcript)
+
+
 def test_bool_questions_accept_yes_and_no_and_reject_prose() -> None:
     prompter = ScriptedPrompter(["maybe", "no"])
     wizard = Wizard(prompter=prompter)
@@ -126,6 +210,14 @@ def test_sources_resolve_through_the_same_detection_as_pheasant_up() -> None:
     # Round-trips through the loader as a real source, not just a dict.
     config = PheasantConfig.model_validate({"sources": wizard.sources})
     assert config.sources[0].name == wizard.sources[0]["name"]
+
+
+def test_detected_document_folder_admits_documents() -> None:
+    """The setup-generated source must not fall back to code-only includes."""
+    wizard = Wizard(prompter=ScriptedPrompter([str(SAMPLE_WORKSPACE / "documents"), ""]))
+    wizard._ask_sources()
+    assert wizard.sources[0]["type"] == "document_folder"
+    assert wizard.sources[0]["include"] == ["**/*"]
 
 
 def test_a_bad_target_is_reported_and_reasked_rather_than_fatal(tmp_path: Path) -> None:

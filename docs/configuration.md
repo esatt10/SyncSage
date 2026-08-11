@@ -302,9 +302,11 @@ audio file not at all. This section configures the handlers that turn those
 into text, which then flows through the **normal** chunk → embed → graph path
 like any other document.
 
-Every handler is **opt-in by file extension**. A source whose `include` globs
+Every handler is **opt-in by source include**. A source whose `include` globs
 admit only code/markdown/config builds none of them, and behaves exactly as it
-would if this section did not exist.
+would if this section did not exist. `pheasant setup` and `pheasant up` emit
+`**/*` for detected mixed document folders; hand-written sources can use
+explicit document extensions instead.
 
 | Handler | Extensions | Built when `include` admits | Network? |
 |---|---|---|---|
@@ -516,7 +518,7 @@ default and works fully offline.
 |---|---|---|---|
 | `enabled` | bool | `true` | `false` makes `/assistant/chat` return 403. |
 | `provider` | str | `auto` | `auto` \| `anthropic` \| `openai` \| `gemini` \| `none`. `auto` picks the first provider whose key env var is set, in the order Anthropic → OpenAI → Gemini. |
-| `model` | str \| null | `null` | Provider default when unset (`claude-sonnet-5`, `gpt-4o-mini`, `gemini-2.5-flash`). |
+| `model` | str \| null | `null` | Provider default when unset (`claude-sonnet-5`, `gpt-5.6-luna`, `gemini-2.5-flash`). |
 | `base_url` | str \| null | `null` | Point at a gateway or self-hosted OpenAI-spec endpoint. |
 | `api_key_env` | str \| null | `null` | Read the key from a differently-named variable. Defaults to the provider's own (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`). |
 | `allow_session_keys` | bool | `true` | Let a UI user paste a key for their browser session. Held in server memory behind an opaque token — never written to config, `/state`, or logs; dropped on expiry, revoke, or restart. Set `false` to require the env var. |
@@ -929,4 +931,3 @@ sources:
 - Keep `scheduler.interval_seconds` enabled as a safety net even when watcher is on.
 - Enable vector settings only if you intend to run an embedding/vector stack.
 - For production, disable OpenAPI/UI if not required.
-

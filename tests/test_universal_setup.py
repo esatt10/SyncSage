@@ -244,6 +244,18 @@ def test_local_shapes_are_classified(tmp_path: Path, roots) -> None:
     assert kind(single) == "single_file"
 
 
+def test_document_folder_target_emits_broad_include(tmp_path: Path, roots) -> None:
+    clone_root, workspace = roots
+    mixed = tmp_path / "mixed"
+    mixed.mkdir()
+    (mixed / "agreement.pdf").write_bytes(b"%PDF-")
+
+    target = resolve_target(str(mixed), clone_root=clone_root, workspace=workspace)
+
+    assert target.type == "document_folder"
+    assert target.to_source_dict()["include"] == ["**/*"]
+
+
 def test_remote_and_connector_targets_resolve_without_touching_disk(roots) -> None:
     clone_root, workspace = roots
 

@@ -32,18 +32,22 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import sys
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pheasant.assistant.catalog import PROVIDERS, resolve_auto_provider
 from pheasant.config.schema import PheasantConfig
 
 #: Where an interrupted run leaves its answers, so a second invocation can
 #: pick up where it stopped rather than starting the interview again.
 PROGRESS_FILENAME = ".pheasant-setup.json"
 
-QuestionKind = str  # text | bool | int | float | choice | list | secret | path
+QuestionKind = str  # text | bool | int | float | choice | model | list | secret | path
+QuestionValidator = Callable[[Any], Any]
 
 
 def schema_default(dotted: str) -> Any:
@@ -86,6 +90,9 @@ class Question:
     advanced: bool = False
     #: ``kind="secret"`` only: dotted path of the field naming the env var.
     secret_env_key: str | None = None
+    #: Optional semantic validation applied both while prompting and when
+    #: answers supplied by ``--answers`` are rendered.
+    validate: QuestionValidator | None = None
 
     def resolved_default(self) -> Any:
         if self.default is not None or self.kind == "secret":
@@ -102,6 +109,16 @@ class Section:
     #: freshness test asserts every one of them is claimed by some section.
     covers: tuple[str, ...]
     questions: list[Question] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class Phase:
+    """A user-facing chapter made up of the existing schema sections."""
+
+    id: str
+    title: str
+    blurb: str
+    section_ids: tuple[str, ...]
 
 
 # --------------------------------------------------------------------------
@@ -276,7 +293,8 @@ def build_sections() -> list[Section]:
                 ),
                 Question(
                     key="search.embeddings.model",
-                    prompt="Embedding model",
+                    prompt="Search embedding model",
+                    help="The model used to turn indexed text into vectors for semantic search.",
                     when=lambda a: a.get("search.embeddings.provider") == "openai-spec",
                 ),
                 Question(
@@ -289,6 +307,7 @@ def build_sections() -> list[Section]:
                     key="search.embeddings.api_key_env",
                     prompt="Environment variable holding the API key",
                     help="Only the NAME goes in the config. The value goes to .env.",
+                    validate=_validate_env_name,
                     when=lambda a: a.get("search.embeddings.provider") == "openai-spec",
                 ),
                 Question(
@@ -339,6 +358,18 @@ def build_sections() -> list[Section]:
                         Choice("none", "None", "Extractive answers only. No network."),
                     ],
                     when=lambda a: bool(a.get("assistant.enabled")),
+                ),
+                Question(
+                    key="assistant.model",
+                    prompt="Chat and agent workflow model",
+                    kind="model",
+                    help=(
+                        "One model powers grounded chat and the agent workflow. "
+                        "Choose the tested provider default or enter a custom model ID."
+                    ),
+                    when=lambda a: (
+                        bool(a.get("assistant.enabled")) and a.get("assistant.provider") != "none"
+                    ),
                 ),
                 Question(
                     key="__secret__.assistant",
@@ -498,7 +529,9 @@ def build_sections() -> list[Section]:
                 "(<file>.extract.txt / .caption.txt / .transcript.txt) always wins, "
                 "and none of the three is built unless a source's include globs "
                 "admit those extensions. Without the extractor a document is "
-                "findable by its path and invisible by its content."
+                "findable by its path and invisible by its content. PDF extraction "
+                "reads an existing text layer; OCR for image-only scans is not "
+                "currently bundled, so use an .extract.txt sidecar for those."
             ),
             covers=("ingestion",),
             questions=[
@@ -678,12 +711,61 @@ def build_sections() -> list[Section]:
     ]
 
 
+def build_phases(sections: list[Section] | None = None) -> list[Phase]:
+    """Return the six concise chapters shown by the guided terminal flow.
+
+    ``build_sections`` remains the canonical flat schema surface so existing
+    answer files and freshness checks continue to work.
+    """
+
+    available = {section.id for section in (sections or build_sections())}
+    definitions = (
+        Phase(
+            "foundation",
+            "Foundation",
+            "Identity and the directories pheasant owns.",
+            ("identity", "paths"),
+        ),
+        Phase(
+            "sources-content",
+            "Sources & content",
+            "What to index, how documents are extracted, and the Obsidian projection.",
+            ("sources", "ingestion", "obsidian"),
+        ),
+        Phase(
+            "search-graph",
+            "Search & graph",
+            "Keyword/vector search, embeddings, and relationships between artifacts.",
+            ("search", "embeddings", "graph"),
+        ),
+        Phase(
+            "assistant-memory",
+            "Assistant & memory",
+            "The single chat/agent model, retrieval behavior, and agent memory.",
+            ("assistant", "retrieval", "memory"),
+        ),
+        Phase(
+            "operations-security",
+            "Operations & security",
+            "Synchronization, the server surface, and filesystem safeguards.",
+            ("sync", "server", "security"),
+        ),
+        Phase(
+            "federation",
+            "Federation",
+            "Optional Synapse publication settings.",
+            ("synapse",),
+        ),
+    )
+    return [phase for phase in definitions if any(item in available for item in phase.section_ids)]
+
+
 # --------------------------------------------------------------------------
 # Prompting
 # --------------------------------------------------------------------------
 
 
-class Prompter:
+class _LegacyPrompter:
     """Terminal I/O, isolated so the whole wizard is testable.
 
     :class:`ScriptedPrompter` below is the test double; nothing in the wizard
@@ -702,6 +784,13 @@ class Prompter:
 
     def ask(self, prompt: str, default_hint: str) -> str:
         suffix = f" [{default_hint}]" if default_hint else ""
+        rendered = f"{prompt}{suffix}"
+        if len(rendered) > self.width - 2:
+            lines = _wrap(rendered, max(20, self.width - 2))
+            for line in lines[:-1]:
+                self.say(line)
+            prompt = lines[-1]
+            suffix = ""
         try:
             return input(f"{prompt}{suffix}: ").strip()
         except EOFError:  # piped stdin that ran out — take the defaults
@@ -720,8 +809,25 @@ class Prompter:
     def _bold(self, text: str) -> str:
         return f"\033[1m{text}\033[0m" if self.color else text
 
+    def styled(self, text: str, style: str) -> None:
+        """Print a consistently styled status line when Rich is available."""
 
-class ScriptedPrompter(Prompter):
+        if self._console is not None:
+            self._console.print(text, style=style, markup=False, soft_wrap=True)
+        else:
+            self.say(text)
+
+    def success(self, text: str) -> None:
+        self.styled(text, "green")
+
+    def warning(self, text: str) -> None:
+        self.styled(text, "yellow")
+
+    def error(self, text: str) -> None:
+        self.styled(text, "bold red")
+
+
+class _LegacyScriptedPrompter(_LegacyPrompter):
     """A prompter driven by a list of canned answers (tests, ``--answers``)."""
 
     def __init__(self, answers: Iterable[str]) -> None:
@@ -744,6 +850,170 @@ class ScriptedPrompter(Prompter):
         return self._answers.pop(0).strip() if self._answers else ""
 
 
+class Prompter:
+    """Responsive terminal renderer with a dependency-free plain fallback."""
+
+    def __init__(
+        self,
+        *,
+        color: bool | None = None,
+        plain: bool = False,
+        width: int | None = None,
+        interactive: bool | None = None,
+    ) -> None:
+        detected = width or shutil.get_terminal_size(fallback=(80, 24)).columns
+        self.width = max(40, min(100, detected))
+        self.plain = (
+            plain or os.environ.get("NO_COLOR") is not None or os.environ.get("TERM") == "dumb"
+        )
+        self.interactive = (
+            bool(interactive)
+            if interactive is not None
+            else bool(
+                getattr(sys.stdin, "isatty", lambda: False)()
+                and getattr(sys.stdout, "isatty", lambda: False)()
+            )
+        )
+        self.color = (not self.plain) if color is None else bool(color and not self.plain)
+        self._console = None
+        if self.color and self.interactive:
+            try:
+                from rich.console import Console
+
+                self._console = Console(width=self.width, force_terminal=True, highlight=False)
+            except ImportError:  # pragma: no cover - minimal installs
+                pass
+
+    def say(self, text: str = "") -> None:
+        if self.plain:
+            text = (
+                text.replace("\u2014", "-")
+                .replace("\u2192", "->")
+                .replace("\u2190", "<-")
+                .replace("\u2026", "...")
+                .replace("\u2500", "-")
+            )
+            text = (
+                text.replace("—", "-")
+                .replace("→", "->")
+                .replace("←", "<-")
+                .replace("…", "...")
+                .replace("─", "-")
+                .encode("ascii", "replace")
+                .decode("ascii")
+            )
+        if self._console is not None:
+            self._console.print(text, markup=False, soft_wrap=True)
+        else:
+            lines = text.splitlines() or [""]
+            for line in lines:
+                if len(line) <= self.width:
+                    print(line)
+                else:
+                    for wrapped in _wrap(line, self.width):
+                        print(wrapped)
+
+    def rule(self, title: str, *, progress: str | None = None) -> None:
+        label = f"{progress}  {title}" if progress else title
+        self.say()
+        if self.width < 60:
+            self.say(f"-- {label} --")
+        else:
+            self.say(f"{'─' * 2} {label} " + "─" * max(0, self.width - len(label) - 4))
+
+    def show_choices(self, choices: Sequence[Choice], default: Any = None) -> None:
+        if self.width < 60 or self._console is None:
+            for choice in choices:
+                marker = "*" if choice.value == default else " "
+                detail = f" — {choice.detail}" if choice.detail else ""
+                for line in _wrap(
+                    f"{marker} {choice.value}: {choice.label}{detail}", self.width - 4
+                ):
+                    self.say(f"    {line}")
+            return
+        from rich.table import Table
+
+        table = Table(show_header=False, box=None, padding=(0, 1), expand=True)
+        table.add_column("", width=2)
+        table.add_column("Choice", no_wrap=True)
+        table.add_column("Description", overflow="fold")
+        for choice in choices:
+            marker = "*" if choice.value == default else " "
+            detail = f"{choice.label} — {choice.detail}" if choice.detail else choice.label
+            table.add_row(marker, choice.value, detail)
+        self._console.print(table)
+
+    def ask(self, prompt: str, default_hint: str) -> str:
+        suffix = f" [{default_hint}]" if default_hint else ""
+        rendered = f"{prompt}{suffix}"
+        if len(rendered) > self.width - 2:
+            lines = _wrap(rendered, max(20, self.width - 2))
+            for line in lines[:-1]:
+                self.say(line)
+            prompt = lines[-1]
+            suffix = ""
+        try:
+            return input(f"{prompt}{suffix}: ").strip()
+        except EOFError:
+            self.say()
+            return ""
+
+    def ask_secret(self, prompt: str) -> str:
+        import getpass
+
+        try:
+            return getpass.getpass(f"{prompt}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            self.say()
+            return ""
+
+    def _bold(self, text: str) -> str:
+        return f"\033[1m{text}\033[0m" if self.color else text
+
+    def styled(self, text: str, style: str) -> None:
+        """Print a consistently styled status line when Rich is available."""
+
+        if self._console is not None:
+            self._console.print(text, style=style, markup=False, soft_wrap=True)
+        else:
+            self.say(text)
+
+    def success(self, text: str) -> None:
+        self.styled(text, "green")
+
+    def warning(self, text: str) -> None:
+        self.styled(text, "yellow")
+
+    def error(self, text: str) -> None:
+        self.styled(text, "bold red")
+
+
+TerminalRenderer = Prompter
+
+
+class ScriptedPrompter(Prompter):
+    """A prompter driven by canned answers (tests and ``--answers``)."""
+
+    def __init__(self, answers: Iterable[str], *, width: int = 80) -> None:
+        super().__init__(color=False, plain=True, width=width, interactive=False)
+        self._answers = list(answers)
+        self.transcript: list[str] = []
+
+    def say(self, text: str = "") -> None:
+        self.transcript.append(text)
+
+    def rule(self, title: str, *, progress: str | None = None) -> None:
+        self.transcript.append(f"== {progress + ' ' if progress else ''}{title}")
+
+    def ask(self, prompt: str, default_hint: str) -> str:
+        self.transcript.append(f"? {prompt} [{default_hint}]")
+        return self._answers.pop(0).strip() if self._answers else ""
+
+    def ask_secret(self, prompt: str) -> str:
+        self.transcript.append(f"?? {prompt}")
+        return self._answers.pop(0).strip() if self._answers else ""
+
+
 def _format_default(value: Any) -> str:
     if isinstance(value, bool):
         return "yes" if value else "no"
@@ -752,6 +1022,20 @@ def _format_default(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_env_name(value: Any) -> str:
+    """Accept an environment-variable *name*, never a pasted credential."""
+
+    text = str(value).strip()
+    if not _ENV_NAME_RE.fullmatch(text):
+        raise ValueError(
+            "enter an environment-variable name such as OPENAI_API_KEY; do not paste the key itself"
+        )
+    return text
 
 
 def _coerce(kind: QuestionKind, raw: str, default: Any) -> Any:
@@ -773,14 +1057,9 @@ def _coerce(kind: QuestionKind, raw: str, default: Any) -> Any:
     return raw
 
 
-#: Provider id → the env var its key is read from. Mirrors
-#: ``assistant.providers.PROVIDERS`` without importing it, so the wizard has no
-#: dependency on the assistant package being importable.
-PROVIDER_KEY_ENV = {
-    "anthropic": "ANTHROPIC_API_KEY",
-    "openai": "OPENAI_API_KEY",
-    "gemini": "GEMINI_API_KEY",
-}
+#: Provider id -> the env var its key is read from. Shared with the runtime
+#: provider catalogue so setup labels and credential handling cannot drift.
+PROVIDER_KEY_ENV = {name: spec.api_key_env for name, spec in PROVIDERS.items()}
 
 
 class Wizard:
@@ -856,6 +1135,8 @@ class Wizard:
             raw = self.prompter.ask(f"  {question.prompt}", _format_default(default))
             try:
                 value = _coerce(question.kind, raw, default)
+                if question.validate is not None:
+                    value = question.validate(value)
             except ValueError as exc:
                 self.prompter.say(f"    ! {exc}")
                 continue
@@ -926,6 +1207,12 @@ class Wizard:
 
     def config_dict(self) -> dict[str, Any]:
         """Assemble the answers into a config mapping, validated before return."""
+        # Answers supplied from a file or a resumed run bypass the interactive
+        # prompt, so apply the same validators before serializing them.
+        for section in build_sections():
+            for question in section.questions:
+                if question.validate is not None and question.key in self.answers:
+                    self.answers[question.key] = question.validate(self.answers[question.key])
         data: dict[str, Any] = {}
         for key, value in self.answers.items():
             if key.startswith("__"):
@@ -940,6 +1227,318 @@ class Wizard:
 
     def env_values(self) -> dict[str, str]:
         return dict(self.secrets)
+
+
+class SetupSaveAndExit(KeyboardInterrupt):
+    """The review menu's explicit "Save progress and exit" action."""
+
+
+class GuidedWizard(Wizard):
+    """Six-phase responsive interview layered over the stable wizard API."""
+
+    def run(self, sections: list[Section] | None = None) -> dict[str, Any]:
+        p = self.prompter
+        p.say()
+        for line in _wrap("pheasant setup — a guided, scrollable configuration interview", p.width):
+            p.say(line)
+        for line in _wrap(
+            "Press Enter to accept a default. Secrets are written only to .env (never YAML).",
+            p.width,
+        ):
+            p.say(line)
+        if not self.advanced:
+            for line in _wrap(
+                "Essentials are shown first; use --advanced for expert fields.", p.width
+            ):
+                p.say(line)
+
+        if sections is not None:
+            for section in sections:
+                self._run_section(section)
+        else:
+            phases = build_phases()
+            all_sections = {section.id: section for section in build_sections()}
+            for index, phase in enumerate(phases, 1):
+                p.rule(phase.title, progress=f"Phase {index}/{len(phases)}")
+                for line in _wrap(phase.blurb, max(20, p.width - 4)):
+                    p.say(f"  {line}")
+                for section_id in phase.section_ids:
+                    section = all_sections.get(section_id)
+                    if section is None:
+                        continue
+                    self._run_section(section, nested=True)
+
+        if p.interactive and not self.accept_defaults:
+            self._review()
+        return self.answers
+
+    def _run_section(self, section: Section, *, nested: bool = False, force: bool = False) -> None:
+        p = self.prompter
+        if nested:
+            p.say()
+            p.say(f"  {section.title}")
+        else:
+            p.rule(section.title)
+        for line in _wrap(section.blurb, max(20, p.width - 4)):
+            p.say(f"    {line}")
+        p.say()
+        if section.id == "sources":
+            self._ask_sources(force=force)
+            return
+        for question in section.questions:
+            self._ask(question, force=force)
+
+    def _ask(self, question: Question, *, force: bool = False) -> None:
+        if question.when is not None and not question.when(self.answers):
+            if question.kind == "model":
+                self.answers[question.key] = None
+            return
+        default = question.resolved_default()
+        if question.advanced and not self.advanced:
+            if question.key not in self.answers and question.kind != "secret":
+                self.answers[question.key] = default
+            return
+        if question.kind == "model" and self.answers.get("assistant.provider") == "auto":
+            # A provider-specific ID is unsafe when this config moves between
+            # environments, even if an answers file supplied one.
+            self._ask_model(question)
+            return
+        if question.key in self.answers and not force:
+            return
+        if question.kind == "secret":
+            self._ask_secret(question)
+            return
+        if question.kind == "model":
+            self._ask_model(question)
+            return
+        if self.accept_defaults:
+            self.answers[question.key] = default
+            return
+        if question.help:
+            for line in _wrap(question.help, max(20, self.prompter.width - 8)):
+                self.prompter.say(f"    {line}")
+        if question.kind == "choice":
+            self.prompter.show_choices(question.choices, default)
+        while True:
+            raw = self.prompter.ask(f"  {question.prompt}", _format_default(default))
+            try:
+                value = _coerce(question.kind, raw, default)
+                if question.validate is not None:
+                    value = question.validate(value)
+            except (TypeError, ValueError) as exc:
+                self.prompter.error(f"    ! {exc}")
+                continue
+            if question.kind == "choice" and value not in {c.value for c in question.choices}:
+                self.prompter.error(
+                    "    ! pick one of: " + ", ".join(c.value for c in question.choices)
+                )
+                continue
+            self.answers[question.key] = value
+            return
+
+    def _ask_model(self, question: Question) -> None:
+        provider = str(self.answers.get("assistant.provider") or "auto")
+        if provider == "auto":
+            resolved = resolve_auto_provider()
+            if resolved:
+                spec = PROVIDERS[resolved]
+                self.prompter.say(
+                    f"    Resolved provider: {spec.label} ({spec.api_key_env} available)"
+                )
+                self.prompter.say(f"    Runtime default: {spec.default_model}")
+            else:
+                self.prompter.warning("    No model currently available — extractive answers only.")
+            self.answers[question.key] = None
+            return
+        spec = PROVIDERS.get(provider)
+        if spec is None:
+            self.answers[question.key] = None
+            return
+        default = spec.default_model
+        choices = (
+            Choice(
+                default, f"{default} (Recommended)", "Tested runtime default for this provider."
+            ),
+            Choice("__custom__", "Custom model ID", "Enter an ID your account can access."),
+        )
+        if self.accept_defaults:
+            self.answers[question.key] = default
+            return
+        self.prompter.say(f"    {spec.label} uses one model for chat and agent workflows.")
+        self.prompter.show_choices(choices, default)
+        while True:
+            raw = self.prompter.ask(f"  {question.prompt}", default).strip()
+            if not raw or raw in {"1", default}:
+                self.answers[question.key] = default
+                return
+            if raw in {"2", "custom", "Custom model ID", "__custom__"}:
+                custom = self.prompter.ask("  Custom model ID", default)
+                if custom.strip():
+                    self.answers[question.key] = custom.strip()
+                    return
+                self.prompter.say("    ! enter a model ID or choose the recommended default")
+                continue
+            self.answers[question.key] = raw
+            return
+
+    def _ask_sources(self, *, force: bool = False) -> None:
+        if self.sources and not force:
+            return
+        if self.accept_defaults and not force:
+            return
+        from pheasant.targets import TargetError, resolve_target
+
+        p = self.prompter
+        if force and self.sources:
+            p.say("    Existing sources:")
+            for index, source in enumerate(self.sources, 1):
+                p.say(f"      {index}. {source.get('name')} — {source.get('path')}")
+            while True:
+                action = p.ask("  Source action (list/add/remove/done)", "done").lower()
+                if action in {"", "done", "d"}:
+                    return
+                if action in {"list", "l"}:
+                    for index, source in enumerate(self.sources, 1):
+                        p.say(f"      {index}. {source.get('name')} — {source.get('path')}")
+                    continue
+                if action in {"remove", "remove source", "r"}:
+                    raw = p.ask("  Source number or name to remove", "")
+                    removed = self._remove_source(raw)
+                    p.say(f"    {'Removed ' + removed if removed else 'No matching source.'}")
+                    continue
+                if action in {"add", "add source", "a"}:
+                    self._add_source(resolve_target, TargetError)
+                    continue
+                p.say("    ! choose list, add, remove, or done")
+            return
+        while True:
+            raw = p.ask("  Target (path, git URL, https:// page, s3://, notion:…)", "done")
+            if not raw or raw.lower() == "done":
+                break
+            self._add_source(resolve_target, TargetError, raw)
+        if not self.sources:
+            p.warning("    No sources yet — add them later with `pheasant up <target>`.")
+
+    def _add_source(self, resolve_target: Any, target_error: Any, raw: str | None = None) -> None:
+        p = self.prompter
+        raw = raw or p.ask("  Target", "done")
+        if not raw or raw.lower() == "done":
+            return
+        try:
+            target = resolve_target(
+                raw, clone_root=Path(".pheasant/sources"), workspace=Path(".pheasant/external")
+            )
+        except target_error as exc:
+            p.error(f"    ! {exc}")
+            return
+        payload = target.to_source_dict()
+        existing = {source["name"] for source in self.sources}
+        if payload["name"] in existing:
+            payload["name"] = f"{payload['name']}-{len(self.sources) + 1}"
+        self.sources.append(payload)
+        p.success(f"    + {payload['name']} ({payload['type']}) ← {payload['path']}")
+
+    def _remove_source(self, raw: str) -> str | None:
+        try:
+            index = int(raw) - 1
+            if 0 <= index < len(self.sources):
+                return str(self.sources.pop(index).get("name"))
+        except ValueError:
+            pass
+        for index, source in enumerate(self.sources):
+            if source.get("name") == raw:
+                return str(self.sources.pop(index).get("name"))
+        return None
+
+    def _review(self) -> None:
+        p = self.prompter
+        phases = build_phases()
+        while True:
+            p.rule("Review configuration")
+            for line in self._review_lines():
+                for wrapped in _wrap(line, max(20, p.width - 4)):
+                    p.say(f"  {wrapped}")
+            p.say()
+            p.say("  [w] Write files   [e] Edit a phase   [s] Save progress and exit")
+            action = p.ask("  Review action", "w").lower()
+            if action in {"", "w", "write", "write files"}:
+                return
+            if action in {"s", "save", "save progress and exit", "q", "quit"}:
+                raise SetupSaveAndExit()
+            if action in {"e", "edit", "edit a phase"}:
+                options = ", ".join(f"{i + 1} {phase.title}" for i, phase in enumerate(phases))
+                choice = p.ask(f"  Phase ({options})", "1")
+                try:
+                    phase = phases[int(choice.split()[0]) - 1]
+                except (ValueError, IndexError):
+                    phase = next((item for item in phases if item.id == choice), None)
+                if phase is None:
+                    p.say("    ! choose a phase number")
+                    continue
+                sections = {section.id: section for section in build_sections()}
+                for section_id in phase.section_ids:
+                    if section_id in sections:
+                        self._run_section(sections[section_id], nested=True, force=True)
+                continue
+            p.say("    ! choose write, edit, or save")
+
+    def _review_lines(self) -> list[str]:
+        data = self.config_dict()
+        assistant = data.get("assistant", {})
+        search = data.get("search", {})
+        embeddings = search.get("embeddings", {})
+        provider = assistant.get("provider", "auto")
+        model = assistant.get("model")
+        if provider == "auto":
+            resolved = resolve_auto_provider()
+            model_text = PROVIDERS[resolved].default_model if resolved else "none available"
+            provider_text = f"auto → {resolved or 'none'} / {model_text}"
+        elif provider in PROVIDERS:
+            provider_text = f"{provider} / {model or PROVIDERS[provider].default_model}"
+        else:
+            provider_text = str(provider)
+        pheasant = data.get("pheasant", {})
+        server = data.get("server", {})
+        synapse = data.get("synapse", {})
+        embedding_model = (
+            embeddings.get("model") or schema_default("search.embeddings.model")
+            if embeddings.get("enabled")
+            else "off"
+        )
+        federation = "on" if synapse.get("publish") else "off"
+        output_path = getattr(self, "output_path", "pheasant.yaml")
+        env_output_path = getattr(self, "env_output_path", ".env")
+        lines = [
+            f"Output: {output_path}; secrets: {env_output_path} (values hidden)",
+            f"Paths: state={pheasant.get('state_path')}; vault={pheasant.get('vault_path')}",
+            "       exports="
+            f"{pheasant.get('exports_path')}; workspace={pheasant.get('workspace_root')}",
+            f"Sources: {len(self.sources)} configured",
+            f"Search: {search.get('default_mode')} | embedding model: {embedding_model}",
+            f"Assistant: {provider_text} | workflow={assistant.get('workflow')}",
+            f"Server: {server.get('host')}:{server.get('port')} | federation: {federation}",
+        ]
+        for source in self.sources:
+            lines.append(f"  - {source.get('name')} ({source.get('type')}): {source.get('path')}")
+        credential_envs: list[str] = []
+        if embeddings.get("api_key_env"):
+            credential_envs.append(str(embeddings["api_key_env"]))
+        if provider == "auto":
+            credential_envs.extend(spec.api_key_env for spec in PROVIDERS.values())
+        elif provider != "none" and provider in PROVIDERS:
+            credential_envs.append(PROVIDERS[provider].api_key_env)
+        for env_name in dict.fromkeys(credential_envs):
+            status = (
+                "available"
+                if (os.environ.get(env_name) or self.secrets.get(env_name))
+                else "not set"
+            )
+            lines.append(f"Credential {env_name}: {status}")
+        return lines
+
+
+# Keep the public class name and all existing imports stable.
+Wizard = GuidedWizard
 
 
 def _set_in(data: dict[str, Any], dotted: str, value: Any) -> None:

@@ -40,6 +40,8 @@ export interface GraphSlice {
   links: GraphLink[];
   /** Hop distance from the slice's center, nearest wins. Center is 0. */
   depths?: Record<string, number>;
+  /** True when the neighbour budget omitted nodes from this slice. */
+  truncated?: boolean;
 }
 
 export interface NeighborEntry {
@@ -321,6 +323,7 @@ export interface EmbeddingsStatus {
   store_providers: VectorStoreProvider[];
   wrote_config?: boolean;
   vectors_invalidated?: boolean;
+  vectors_dropped?: number;
   reindex?: { embedded_chunks: number; artifacts_scanned: number; vector_count: number };
   embedded_chunks?: number;
   artifacts_scanned?: number;

@@ -216,6 +216,13 @@ def _local_target(path: Path, *, name: str | None, forced: SourceType | None) ->
     include = None
     if source_type is SourceType.markdown_folder:
         include = list(MARKDOWN_INCLUDES)
+    elif source_type is SourceType.document_folder:
+        # A user who points setup/up at a mixed folder is explicitly asking
+        # pheasant to inspect that folder.  The schema's conservative default
+        # is intentionally code/Markdown-only, so carry an explicit broad
+        # include here; the extractor/captioner/transcriber gates recognize it
+        # and secret-file exclusions still apply at sync time.
+        include = ["**/*"]
     elif source_type is SourceType.single_file:
         include = [resolved.name]
     return ResolvedTarget(

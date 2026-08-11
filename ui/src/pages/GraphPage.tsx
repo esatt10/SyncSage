@@ -83,6 +83,7 @@ export function GraphPage() {
             centerLabel={centerLabel}
             surfacedCount={state.surfacedIds.length}
             nodeCount={graph.nodes.length}
+            truncated={Boolean(graph.truncated)}
             busy={isFetching}
             dirty={
               state.selectedId !== null ||
@@ -286,6 +287,12 @@ export function GraphPage() {
               nodes={graph.nodes}
               links={graph.links}
               onExpand={(nodeId) => dispatch({ type: "center-node", nodeId })}
+              onShowChunks={(nodeId) => {
+                if (state.hiddenTypes.includes("chunk")) {
+                  dispatch({ type: "toggle-type", nodeType: "chunk" });
+                }
+                dispatch({ type: "center-node", nodeId });
+              }}
               onPivot={(nodeId) => nodeId && dispatch({ type: "select-node", nodeId })}
             />
           </div>

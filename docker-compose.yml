@@ -30,7 +30,8 @@ services:
     volumes:
       # No config file? Leave this commented out and the entrypoint generates
       # one on first boot from the same defaults `pheasant setup` uses.
-      # - ${PHEASANT_CONFIG_PATH:-./pheasant.yaml}:/config/pheasant.yaml:ro
+      # Keep this writable: settings changed in the web UI are persisted here.
+      # - ${PHEASANT_CONFIG_PATH:-./pheasant.yaml}:/config/pheasant.yaml:rw
       - pheasant-config:/config
       # Whatever is mounted here is the corpus. Defaults to the repository
       # root; point it anywhere with PHEASANT_WORKSPACE_PATH.

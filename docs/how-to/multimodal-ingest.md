@@ -7,10 +7,11 @@ this page is the configuration reference.
 
 ## Turn it on
 
-Captioning/transcription is **opt-in by file extension**. The captioner is only
+Captioning/transcription is **opt-in by source include**. The captioner is only
 built when a source's `include` globs admit an image extension; the transcriber
-only when they admit an audio extension. A text-only config builds neither and
-is byte-identical to a pheasant without multi-modal.
+only when they admit an audio extension. `pheasant setup` and `pheasant up` use
+`**/*` for mixed folders, which admits both. A text-only config builds neither
+and is byte-identical to a pheasant without multi-modal.
 
 | Modality | Extensions | Built when `include` admits | Producer |
 |---|---|---|---|

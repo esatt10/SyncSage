@@ -168,6 +168,8 @@ def _run_setup(args) -> int:
     """
     from pheasant.setup_wizard import (
         PROGRESS_FILENAME,
+        Prompter,
+        SetupSaveAndExit,
         Wizard,
         ensure_gitignored,
         load_progress,
@@ -193,13 +195,20 @@ def _run_setup(args) -> int:
     merged = {**resumed_answers, **preset}
 
     wizard = Wizard(
+        prompter=Prompter(plain=getattr(args, "plain", False)),
         advanced=args.advanced,
         accept_defaults=args.accept_defaults,
         preset=merged,
     )
     wizard.sources = resumed_sources
+    wizard.output_path = str(output)
+    wizard.env_output_path = str(args.env_output)
     try:
         wizard.run()
+    except SetupSaveAndExit:
+        save_progress(progress_path, wizard)
+        print(f"\nProgress saved to {progress_path}.")
+        return 0
     except KeyboardInterrupt:
         save_progress(progress_path, wizard)
         print(f"\nStopped. Answers so far saved to {progress_path} — re-run to resume.")
@@ -382,6 +391,11 @@ def main(argv: list[str] | None = None) -> int:
         "--accept-defaults",
         action="store_true",
         help="ask nothing; write a config of defaults (scriptable)",
+    )
+    setup_p.add_argument(
+        "--plain",
+        action="store_true",
+        help="use wrapped plain text output without color or terminal control sequences",
     )
     setup_p.add_argument(
         "--answers",

@@ -304,6 +304,25 @@ def test_graph_slice_reports_hop_distance_per_node() -> None:
     assert "two" not in shallow["depths"]
 
 
+def test_graph_slice_reports_when_neighbor_budget_omits_nodes() -> None:
+    """A full slice budget must not silently look like the complete graph."""
+
+    graph = SimpleMultiDiGraph()
+    graph.add_node("document", id="document", type="document", label="document")
+    for index in range(4):
+        chunk_id = f"chunk-{index}"
+        graph.add_node(chunk_id, id=chunk_id, type="chunk", label=chunk_id)
+        graph.add_edge("document", chunk_id, type="has_chunk")
+
+    capped = graph_slice(graph, "document", depth=1, limit=2)
+    complete = graph_slice(graph, "document", depth=1, limit=4)
+
+    assert len(capped["nodes"]) == 3  # center plus two neighbours
+    assert capped["truncated"] is True
+    assert len(complete["nodes"]) == 5
+    assert complete["truncated"] is False
+
+
 def test_node_content_concatenates_chunks_in_index_order(loaded_config) -> None:
     """GROUP_CONCAT must respect chunk_index even when rows were written out of order."""
     app = create_app(config=loaded_config)

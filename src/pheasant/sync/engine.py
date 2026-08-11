@@ -398,8 +398,10 @@ class SyncEngine:
         if self.vectors is None:
             return 0
         if drop_existing:
-            for row in self.state.rows("SELECT DISTINCT source_id FROM artifacts"):
-                self.vectors.prune_source(str(row["source_id"]), set())
+            # LanceDB's vector width lives in the table schema. Deleting rows
+            # leaves that schema behind, so a model dimension change must
+            # reset the store itself before the first new vector is inserted.
+            self.vectors.reset()
         embedded = 0
         for artifact in self.state.rows("SELECT id, source_id FROM artifacts ORDER BY id"):
             chunks = self.state.rows(

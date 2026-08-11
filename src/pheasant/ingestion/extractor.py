@@ -718,8 +718,17 @@ def source_includes_documents(source: Any) -> bool:
     asserts the two sets agree.
     """
     includes = list(getattr(source, "include", None) or [])
+    # ``**/*`` is the explicit "this folder may contain anything" form used
+    # by setup/up and uploads.  Treating it as admitting documents keeps the
+    # handler-build gate aligned with the filesystem walk instead of silently
+    # indexing broad document sources with zero chunks.
+    broad = {"*", "**", "**/*", "*.*", "**/*.*"}
     admitted = tuple(EXTRACTED_EXTENSIONS)
-    return any(pattern.lower().endswith(admitted) for pattern in includes)
+    return any(
+        pattern.replace("\\", "/").lower().rstrip("/") in broad
+        or pattern.lower().endswith(admitted)
+        for pattern in includes
+    )
 
 
 def config_has_document_source(config: Any) -> bool:
@@ -742,7 +751,9 @@ def extractor_from_config(config: Any, *, source: Any = None) -> DocumentExtract
         return None
     html_on = bool(getattr(settings, "html_text", False))
     wanted = (
-        source_includes_documents(source) if source is not None else config_has_document_source(config)
+        source_includes_documents(source)
+        if source is not None
+        else config_has_document_source(config)
     )
     if not wanted and not html_on:
         return None
