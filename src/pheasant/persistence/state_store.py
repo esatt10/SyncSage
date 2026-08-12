@@ -9,6 +9,22 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+#: How long a statement waits for a competing writer before giving up.
+#:
+#: Was 5 s, which is fine when the only writer is a short sync. It is **not**
+#: fine during a multi-hour index of a large repository with the UI open: the
+#: sync worker writes continuously in one process while the API server serves
+#: `/overview`, `/jobs` and `/graph/slice` polls in another, and a 12,667-file
+#: run of microsoft/vscode died on
+#:
+#:     sqlite3.OperationalError: database is locked
+#:
+#: after ~40 minutes. WAL lets readers and one writer coexist, but checkpoints
+#: and the enrichment pass's multi-statement transactions still take the write
+#: lock long enough to blow a 5-second budget under that load. Waiting a minute
+#: costs nothing when the alternative is losing the whole index.
+BUSY_TIMEOUT_MS = 60_000
+
 
 def _basename(path: str | None) -> str:
     """Final path segment, for the FTS ``title`` column.
@@ -283,7 +299,7 @@ class StateStore:
             # kill -9 mid-write, busy_timeout rides out concurrent readers,
             # synchronous=NORMAL is the sanctioned WAL durability level.
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
             conn.execute("PRAGMA synchronous=NORMAL")
             self._local.conn = conn
             with self._registry_lock:

@@ -299,6 +299,13 @@ class EmbeddingsSettings(ModelMixin):
     api_key_env: str = "OPENAI_API_KEY"
     dimensions: int | None = None
     batch_size: int = 64
+    #: Bounded retry on *transient* embedding failures (TLS blips, 429s, 5xx).
+    #: Indexing a large corpus is hundreds of HTTPS calls, and without this a
+    #: single flaky one aborts the whole sync — a real 12,667-file run died
+    #: ~45 minutes in on an `SSLV3_ALERT_BAD_RECORD_MAC`. A wrong key or a
+    #: malformed request is never retried.
+    max_retries: int = 4
+    retry_backoff_seconds: float = 1.0
 
 
 @dataclass

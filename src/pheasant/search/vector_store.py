@@ -53,11 +53,14 @@ import json
 import logging
 import os
 import re
+import socket
+import ssl
 import struct
 import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import numpy as np
@@ -185,6 +188,32 @@ class StubEmbedder:
         return direction
 
 
+#: HTTP statuses worth trying again: overload, rate limiting, and the gateway
+#: family. Explicitly *not* 400/401/403/404 — a malformed request or a wrong
+#: key fails identically on every retry, so retrying only spends time.
+_RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+#: Transport-level failures. `ssl.SSLError` is first because it is the one a
+#: real 12k-file index actually died on.
+_TRANSIENT_ERRORS = (ssl.SSLError, URLError, TimeoutError, ConnectionError, socket.timeout)
+
+#: Ceiling on the backoff, so a long outage retries steadily rather than
+#: sleeping for minutes on the last attempt.
+_MAX_BACKOFF_SECONDS = 30.0
+
+
+def _retry_after_seconds(header: str | None, fallback: float) -> float:
+    """Parse a `Retry-After` value, falling back to our own backoff."""
+    if not header:
+        return fallback
+    try:
+        return max(0.0, min(float(header), _MAX_BACKOFF_SECONDS))
+    except (TypeError, ValueError):
+        # The HTTP-date form is legal but rare from these APIs; our own
+        # backoff is a better answer than parsing it wrong.
+        return fallback
+
+
 class OpenAISpecEmbedder:
     """OpenAI-spec HTTP embedding client (stdlib urllib, no SDK).
 
@@ -203,6 +232,8 @@ class OpenAISpecEmbedder:
         dimensions: int | None = None,
         batch_size: int = 64,
         timeout: int = 30,
+        max_retries: int = 4,
+        retry_backoff_seconds: float = 1.0,
     ):
         self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
         self.model = model
@@ -210,6 +241,9 @@ class OpenAISpecEmbedder:
         self.dimensions = int(dimensions) if dimensions else None
         self.batch_size = max(1, int(batch_size or 64))
         self.timeout = timeout
+        # Bounded retry on transient transport failures — see _post_with_retry.
+        self.max_retries = max(0, int(max_retries))
+        self.retry_backoff_seconds = max(0.1, float(retry_backoff_seconds))
         self.calls = 0
         self.texts_embedded = 0
 
@@ -218,6 +252,55 @@ class OpenAISpecEmbedder:
         for start in range(0, len(texts), self.batch_size):
             vectors.extend(self._embed_batch(texts[start : start + self.batch_size]))
         return vectors
+
+    def _post_with_retry(self, request: Request) -> dict[str, Any]:
+        """POST with bounded exponential backoff on *transient* failures.
+
+        Indexing a large corpus is hundreds of HTTPS calls — 12,667 files of
+        microsoft/vscode took over 200 — and without this a single flaky one
+        aborts the whole sync. That is not hypothetical: a real run died ~45
+        minutes in on
+
+            ssl.SSLError: [SSL: SSLV3_ALERT_BAD_RECORD_MAC]
+
+        which is a corrupted TLS record, i.e. precisely the sort of thing that
+        succeeds on the next attempt. Resuming is cheap (the sha256 pre-read
+        skip means unchanged files are not re-embedded), but a multi-hour index
+        should not need a human to notice and restart it.
+
+        Only *transient* conditions are retried. A 401 is a wrong key and a 400
+        is a malformed request; retrying either burns time and money to fail
+        the same way, so both surface immediately.
+        """
+        delay = self.retry_backoff_seconds
+        last: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                with urlopen(request, timeout=self.timeout) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:  # noqa: PERF203 - retry loop
+                if exc.code not in _RETRYABLE_STATUS or attempt == self.max_retries:
+                    raise
+                last = exc
+                # Honour the server's own pacing when it offers one; guessing
+                # shorter than a stated Retry-After is how a 429 becomes a ban.
+                header = exc.headers.get("Retry-After") if exc.headers else None
+                wait = _retry_after_seconds(header, delay)
+            except _TRANSIENT_ERRORS as exc:
+                if attempt == self.max_retries:
+                    raise
+                last = exc
+                wait = delay
+            logger.warning(
+                "embedding request failed (%s), retrying in %.1fs [%d/%d]",
+                type(last).__name__,
+                wait,
+                attempt + 1,
+                self.max_retries,
+            )
+            time.sleep(wait)
+            delay = min(delay * 2, _MAX_BACKOFF_SECONDS)
+        raise RuntimeError("unreachable: retry loop exhausted without raising")
 
     def _embed_batch(self, batch: list[str]) -> list[list[float]]:
         body: dict[str, Any] = {"model": self.model, "input": list(batch)}
@@ -233,8 +316,7 @@ class OpenAISpecEmbedder:
             headers=headers,
             method="POST",
         )
-        with urlopen(request, timeout=self.timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        payload = self._post_with_retry(request)
         self.calls += 1
         self.texts_embedded += len(batch)
         data = sorted(payload.get("data", []), key=lambda item: int(item.get("index", 0)))
@@ -831,6 +913,8 @@ def build_embedder(settings: EmbeddingsSettings) -> Embedder:
             api_key_env=settings.api_key_env,
             dimensions=settings.dimensions,
             batch_size=settings.batch_size,
+            max_retries=getattr(settings, "max_retries", 4),
+            retry_backoff_seconds=getattr(settings, "retry_backoff_seconds", 1.0),
         )
     raise ValueError(
         f"Unsupported search.embeddings.provider {settings.provider!r}; "

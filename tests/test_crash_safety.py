@@ -96,8 +96,13 @@ def test_state_store_connections_use_wal_and_timeouts(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.db")
     store.migrate()
     try:
+        from pheasant.persistence.state_store import BUSY_TIMEOUT_MS
+
         assert store.rows("PRAGMA journal_mode")[0][0] == "wal"
-        assert int(store.rows("PRAGMA busy_timeout")[0][0]) == 5000
+        # Reads the constant rather than repeating a literal: the value was
+        # raised from 5 s after a real index died on "database is locked", and
+        # a second copy of the number is how that silently reverts.
+        assert int(store.rows("PRAGMA busy_timeout")[0][0]) == BUSY_TIMEOUT_MS
         assert int(store.rows("PRAGMA synchronous")[0][0]) == 1  # NORMAL
     finally:
         store.close()
@@ -407,3 +412,25 @@ def test_legacy_manifests_migrate_exactly_once(
         ] == rows
     finally:
         second.close()
+
+
+def test_busy_timeout_is_long_enough_for_a_long_sync(tmp_path) -> None:
+    """A 5-second budget lost a 12,667-file index to `database is locked`.
+
+    The sync worker writes continuously in one process while the API server
+    serves UI polls in another. WAL lets them coexist, but checkpoints and the
+    enrichment pass's multi-statement transactions still take the write lock
+    for long enough to blow a short budget — so the timeout has to be measured
+    in tens of seconds, not units.
+    """
+    from pheasant.persistence.state_store import BUSY_TIMEOUT_MS, StateStore
+
+    assert BUSY_TIMEOUT_MS >= 30_000, "too short to survive a real indexing run"
+
+    store = StateStore(tmp_path / "state.db")
+    try:
+        store.migrate()
+        applied = store.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        assert applied == BUSY_TIMEOUT_MS, "the pragma is not reaching the connection"
+    finally:
+        store.close()
