@@ -128,11 +128,44 @@ def _digest_input(
     return base + ("|" + "|".join(extras) if extras else "")
 
 
-def memory_source(config: PheasantConfig) -> SourceConfig | None:
-    """The first enabled ``type: memory`` source, or None."""
+def memory_source(config: PheasantConfig, state: object | None = None) -> SourceConfig | None:
+    """The first enabled ``type: memory`` source, or None.
+
+    ``state`` enables the same **runtime-registry fallback** ``SyncEngine._source``
+    has: a source created through the API (``POST /memory/enable``, the UI's
+    Enable-memory button) lives in the state registry and only reaches
+    ``config.sources`` in the process that created it. Without the fallback,
+    memory enabled from the UI is invisible to every *other* process — a fresh
+    MCP stdio server, the sync worker subprocess, the container after a
+    restart — and `describe_retrieval` truthfully reports no memory at all.
+    Found on a live run, where enabling worked and then the region said it had
+    no memory source.
+
+    Config wins when it has one, so a YAML-declared source is never shadowed.
+    """
     for source in config.sources:
         if source.enabled and source.type == SourceType.memory:
             return source
+    if state is None:
+        return None
+    try:
+        rows = state.rows(  # type: ignore[attr-defined]
+            "SELECT config_json FROM sources WHERE type='memory' AND enabled=1 ORDER BY name"
+        )
+    except Exception:  # pragma: no cover - defensive; a missing table is not fatal
+        return None
+    for row in rows:
+        try:
+            import json
+
+            payload = json.loads(row["config_json"])
+            resolved = PheasantConfig.model_validate({"sources": [payload]}).sources[0]
+        except Exception:  # pragma: no cover - a malformed row is not fatal
+            continue
+        # Cached on the live config so repeat lookups (and everything else that
+        # reads `config.sources`) see it too, exactly as `_source` does.
+        config.sources.append(resolved)
+        return resolved
     return None
 
 

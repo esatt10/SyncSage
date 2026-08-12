@@ -27,7 +27,7 @@ def run_memory_maintenance(engine: Any, *, now: datetime | None = None) -> dict[
     settings = getattr(config, "memory", None)
     if settings is None or not settings.consolidation_enabled:
         return None
-    source = memory_source(config)
+    source = memory_source(config, getattr(engine, "state", None))
     if source is None:
         return None
     store = MemoryStore(source.path)

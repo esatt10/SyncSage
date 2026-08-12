@@ -193,7 +193,7 @@ def run_memory_recall_benchmark(
 
     spec = spec or MemoryBenchSpec()
     kb = knowledge_base or tools.config.pheasant.name
-    source = memory_source(tools.config)
+    source = memory_source(tools.config, tools.state)
     if source is None:
         raise ValueError("benchmark needs a `type: memory` source in the config")
     cases = generate_cases(spec)
@@ -307,7 +307,7 @@ def _store_health(tools: Any) -> dict[str, float]:
             return 0.0
         return round(ages[min(len(ages) - 1, int(len(ages) * fraction))], 4)
 
-    source = memory_source(tools.config)
+    source = memory_source(tools.config, tools.state)
     total_bytes = 0
     if source is not None:
         for path in Path(source.path).rglob("mem-*.md"):

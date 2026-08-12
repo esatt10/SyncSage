@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from collections import deque
 from pathlib import Path
@@ -27,6 +28,8 @@ from pheasant.search.hybrid import HybridSearch
 from pheasant.search.sqlite_store import SearchStore
 from pheasant.security.path_policy import resolve_config_write_target, resolve_under
 from pheasant.sync.engine import SyncEngine
+
+logger = logging.getLogger(__name__)
 
 #: Step 33.6 — the criteria filters moved to `pheasant.search.criteria` so
 #: `POST /search` and the MCP tool share one implementation instead of HTTP
@@ -352,7 +355,7 @@ class PheasantTools:
         from pheasant.memory.store import MemoryStore, memory_source
 
         self._require_knowledge_base(knowledge_base)
-        source = memory_source(self.config)
+        source = memory_source(self.config, self.state)
         if source is None:
             raise ValueError(
                 "no enabled memory source configured. Add one to pheasant.yaml:\n"
@@ -372,8 +375,18 @@ class PheasantTools:
             valid_until=valid_until,
         )
         result: dict = {"record": record.as_dict(), "created": created, "source": source.name}
+        # The record is already durably on disk; this sync only makes it
+        # *searchable now*. Failing the whole request when it cannot run — most
+        # often because another writer holds the engine lease, which a live run
+        # hit immediately — reports "your memory was not saved" when it was.
+        # Degrade to deferred indexing instead: the scheduler and the next sync
+        # both pick it up.
         if sync and created:
-            result["sync"] = self.engine.sync_source(source.name, "incremental").__dict__
+            try:
+                result["sync"] = self.engine.sync_source(source.name, "incremental").__dict__
+            except Exception as exc:
+                logger.warning("memory write indexed later: %s", exc)
+                result["sync_deferred"] = str(exc)
         self._audit(
             source.name,
             "memory_write",
@@ -404,7 +417,7 @@ class PheasantTools:
         from pheasant.memory.store import MemoryStore, memory_source
 
         self._require_knowledge_base(knowledge_base)
-        source = memory_source(self.config)
+        source = memory_source(self.config, self.state)
         if source is None:
             return {"enabled": False, "records": []}
         records = MemoryStore(source.path).list_records(scope, current_only=current_only)
@@ -627,7 +640,7 @@ class PheasantTools:
         from pheasant.memory.policy import VALID_MODES
         from pheasant.memory.store import memory_source
 
-        source = memory_source(self.config)
+        source = memory_source(self.config, self.state)
         if source is None:
             return {"enabled": False}
         try:

@@ -273,8 +273,10 @@ class GraphBuilder:
         headings: dict[str, list[str]] = {}
         entities: dict[str, list[str]] = {}
         referenced: dict[str, list[str]] = {}
+        node_types: dict[str, str] = {}
         with self.graph.reading():
             for node_id, attrs in self.graph.iter_nodes():
+                node_types[node_id] = str(attrs.get("type") or "")
                 node_type = attrs.get("type")
                 if attrs.get("source_id") in memory_sources:
                     continue
@@ -293,9 +295,18 @@ class GraphBuilder:
                 if source not in memory_artifacts:
                     continue
                 for data in edge_map.values():
-                    if data.get("type") in {"references", "imports"}:
+                    if data.get("type") not in {"references", "imports"}:
+                        continue
+                    # Only the *resolved* artifact, not the `external_reference`
+                    # stub the link itself produced. Both edges exist and both
+                    # are `references`, so taking either spent half the
+                    # per-record cap pointing at a node that stands for the
+                    # link rather than for what the record is about — visible
+                    # on a live run, where one record drew two edges and only
+                    # one of them reached a file.
+                    if node_types.get(target) in ARTIFACT_TYPES:
                         referenced.setdefault(source, []).append(target)
-                        break
+                    break
 
         return BridgeInputs(
             records=records,

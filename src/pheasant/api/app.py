@@ -119,10 +119,18 @@ class SearchRequest(BaseModel):
 
 
 class MemoryEnableRequest(BaseModel):
-    """Provision the agent-memory source. Defaults are the documented layout."""
+    """Provision the agent-memory source.
+
+    ``path`` defaults to ``<state_path>/memory`` rather than a workspace-
+    relative folder, because memory is the **only** source type pheasant
+    writes to. Every containerised deployment mounts the corpus read-only
+    (`/workspace:ro` in both the standard and demo compose files), so
+    anchoring memory there registers a source that can never be written —
+    found by a live run, where the first write returned a bare 500.
+    """
 
     name: str = "agent-memory"
-    path: str = "memory"
+    path: str | None = None
 
 
 class MemoryWriteRequest(BaseModel):
@@ -1406,7 +1414,7 @@ def create_app(
     def memory_write(req: MemoryWriteRequest) -> dict:
         from pheasant.memory.store import MemoryStore, memory_source
 
-        source = memory_source(config)
+        source = memory_source(config, state)
         if source is None:
             raise HTTPException(
                 status_code=400,
@@ -1428,9 +1436,31 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            # A memory source pointed at somewhere unwritable — most often a
+            # read-only corpus mount — used to surface as a bare 500 with the
+            # traceback only in the container logs. The caller can act on this.
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"could not write the memory record to {source.path}: {exc}. "
+                    "The memory source needs a writable location; a read-only mount "
+                    "will not do."
+                ),
+            ) from exc
         payload: dict = {"record": record.as_dict(), "created": created, "source": source.name}
+        # The record is already durably on disk; this sync only makes it
+        # *searchable now*. Failing the whole request when it cannot run — most
+        # often because another writer holds the engine lease, which a live run
+        # hit immediately — reports "your memory was not saved" when it was.
+        # Degrade to deferred indexing instead: the scheduler and the next sync
+        # both pick it up.
         if req.sync and created:
-            payload["sync"] = engine.sync_source(source.name, "incremental").__dict__
+            try:
+                payload["sync"] = engine.sync_source(source.name, "incremental").__dict__
+            except Exception as exc:
+                logger.warning("memory write indexed later: %s", exc)
+                payload["sync_deferred"] = str(exc)
         # Writing a memory is a mutation of what this region will later assert
         # as fact, which is exactly what the audit log is for. The MCP path has
         # always recorded it; this one silently did not, so the same action was
@@ -1452,7 +1482,7 @@ def create_app(
     def memory_list(scope: str | None = None, current_only: bool = False) -> dict:
         from pheasant.memory.store import MemoryStore, memory_source
 
-        source = memory_source(config)
+        source = memory_source(config, state)
         if source is None:
             raise HTTPException(
                 status_code=400,
@@ -1484,28 +1514,50 @@ def create_app(
         """
         from pheasant.memory.store import memory_source
 
-        existing = memory_source(config)
+        existing = memory_source(config, state)
         if existing is not None:
             return {"status": "already-enabled", "source": existing.model_dump(mode="json")}
 
-        # Anchored to `pheasant.workspace_root`, exactly as config load anchors
-        # a relative path on any FILESYSTEM_SOURCE_TYPE. Going through
-        # `_resolve_source_path` instead resolves against the *process CWD*,
-        # which put the folder wherever the server happened to be started from
-        # — during development that was the repo checkout, and a record was
-        # written into it.
-        requested = Path(req.path).expanduser()
-        path = (
-            requested
-            if requested.is_absolute()
-            else Path(config.pheasant.workspace_root) / requested
-        )
-        path.mkdir(parents=True, exist_ok=True)
-        if not config.security.allow_user_selected_source_paths:
-            try:
-                path = resolve_under(str(path), _allowed_roots(config))
-            except PathPolicyError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if req.path is None:
+            # `/state` is the one location pheasant owns and can always write.
+            path = Path(config.pheasant.state_path) / "memory"
+        else:
+            # An explicit relative path anchors to `pheasant.workspace_root`,
+            # exactly as config load anchors any FILESYSTEM_SOURCE_TYPE. Going
+            # through `_resolve_source_path` instead resolves against the
+            # *process CWD*, which put the folder wherever the server happened
+            # to be started from — during development that was the repo
+            # checkout, and a record was written into it.
+            requested = Path(req.path).expanduser()
+            path = (
+                requested
+                if requested.is_absolute()
+                else Path(config.pheasant.workspace_root) / requested
+            )
+            if not config.security.allow_user_selected_source_paths:
+                try:
+                    path = resolve_under(str(path), _allowed_roots(config))
+                except PathPolicyError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # Prove it is writable *before* registering. Otherwise enabling
+        # "succeeds" and every later write fails — which is exactly what a
+        # read-only corpus mount produced on a live run.
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".pheasant-write-test"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+        except OSError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"cannot write memory records to {path}: {exc}. Memory is the one "
+                    "source pheasant writes to, so it needs a writable location — a "
+                    "read-only corpus mount will not do. Pass an explicit `path`, or "
+                    "mount a writable volume."
+                ),
+            ) from exc
 
         try:
             source = _source_from_payload(

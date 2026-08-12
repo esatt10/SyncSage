@@ -530,14 +530,18 @@ def test_enable_provisions_the_memory_source_and_is_idempotent(tmp_path: Path) -
         assert first.status_code == 200, first.text
         assert first.json()["status"] == "enabled"
 
-        # *Where* it landed is the assertion that matters. Resolving the
-        # relative path against the process CWD instead of the configured
-        # workspace put the folder in whatever directory the server was
-        # started from — during development, the repo checkout, which is where
-        # a stray record actually got written.
+        # *Where* it landed is the assertion that matters, and it has been
+        # wrong twice. It must be under `state_path` — the one location
+        # pheasant owns and can always write. Anchoring to the workspace put
+        # memory under the corpus mount, which every container mounts
+        # read-only, so enabling "succeeded" and the first write returned 500;
+        # before that, resolving through `_resolve_source_path` used the
+        # process CWD and wrote a record into the repo checkout.
         registered = Path(first.json()["source"]["path"]).resolve()
-        assert registered == (tmp_path / "memory").resolve(), registered
+        state_root = Path(load_config(config_path).pheasant.state_path).resolve()
+        assert registered == (state_root / "memory"), registered
         assert registered.is_dir()
+        assert tmp_path.resolve() not in registered.parents or state_root in registered.parents
 
         # Idempotent: enabling twice returns the existing source rather than
         # registering a second one.
@@ -642,5 +646,71 @@ def test_about_max_targets_is_read_by_the_engine(tmp_path: Path) -> None:
                 if data.get("type") == "about"
             ]
         assert about == [], "the engine ignored memory.about_max_targets"
+    finally:
+        tools.engine.close()
+
+
+def test_enable_refuses_an_unwritable_location(tmp_path: Path) -> None:
+    """Memory is the one source pheasant *writes*, so a location it cannot
+    write is a configuration error to report, not a source to register.
+
+    A live run enabled memory under a read-only `/workspace` mount: enabling
+    returned 200 and every subsequent write returned a bare 500.
+    """
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from pheasant.api.app import create_app
+
+    config_path = _write_config(tmp_path, include_memory=False)
+    app = create_app(load_config(config_path), config_path=str(config_path))
+    client = fastapi_testclient.TestClient(app)
+    try:
+        # A path under a file is unwritable on every platform, without needing
+        # real permission games that behave differently on Windows.
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("", encoding="utf-8")
+        response = client.post("/memory/enable", json={"path": str(blocker / "memory")})
+        assert response.status_code == 400, response.text
+        assert "writable" in response.json()["detail"].lower()
+
+        # And nothing was registered, so the region is still honestly "off".
+        assert client.get("/memory").status_code == 400
+    finally:
+        app.state.engine.close()
+
+
+def test_a_runtime_registered_memory_source_is_visible_to_a_new_process(
+    tmp_path: Path,
+) -> None:
+    """Enabling from the API must not be invisible to everything else.
+
+    A source created through `POST /memory/enable` lives in the state registry
+    and only reaches `config.sources` in the process that created it. Without a
+    registry fallback, a fresh MCP server, the sync worker, or the container
+    after a restart all report no memory at all — which is what a live run saw
+    from `describe_retrieval` immediately after enabling successfully.
+    """
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from pheasant.api.app import create_app
+    from pheasant.memory.store import memory_source
+
+    config_path = _write_config(tmp_path, include_memory=False)
+    app = create_app(load_config(config_path), config_path=str(config_path))
+    client = fastapi_testclient.TestClient(app)
+    try:
+        assert client.post("/memory/enable", json={}).status_code == 200
+    finally:
+        app.state.engine.close()
+
+    # A *different* process: config re-read from the file, which never mentions
+    # the source.
+    fresh = load_config(config_path)
+    assert memory_source(fresh) is None, "the YAML genuinely does not declare it"
+
+    tools = PheasantTools(load_config(config_path))
+    try:
+        assert memory_source(tools.config, tools.state) is not None
+        described = tools.describe_retrieval("memory-test")["memory"]
+        assert described["enabled"] is True
+        assert described["source_name"] == "agent-memory"
     finally:
         tools.engine.close()

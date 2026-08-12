@@ -383,10 +383,35 @@ only, never the path).
 
 Suite **1052 passed / 8 failed / 6 skipped** (+73; same 8 pre-existing).
 Mutation **26/26 caught** across three batches, after fixing four vacuous tests
-the mutants exposed. **Still not done: `tsc -b && vite build` never ran** (no
-local npm) — a new page, a new panel, client methods, type additions and four
-component edits are compiler-unverified, and that is the outstanding risk; no
-live demo-stack validation either. Note `ruff check src tests` is **red on
+the mutants exposed. **`tsc -b && vite build` passes** — run in a throwaway
+`node:22-alpine` container (no local npm, the same route the 2026-08-04 UI
+change took): `tsc -b` reports zero type errors and vite transforms 132 modules
+to an 883.94 kB bundle (281.90 kB gzipped), up from 847 kB, with only the
+pre-existing >500 kB chunk-size advisory. **Live-validated 2026-08-12** in a real
+container (self-contained: pheasant's own docs + `src/pheasant/memory` as the
+corpus, stub embedder, since the demo overlay needs an absent third-party clone
+and a paid key). It found **three bugs the 1052-test suite did not** — the
+fourth time a live run has done that here:
+(1) **`/memory/enable` provisioned memory under `workspace_root`, which every
+container mounts read-only** — enabling returned 200 and the first write
+returned a bare 500; the default is now `<state_path>/memory` and enable
+**probes writability before registering**;
+(2) **memory enabled via the API was invisible to every other process** — a
+runtime-registered source only reaches `config.sources` in its creating process,
+so a fresh MCP server / sync worker / restarted container reported
+`enabled: false` seconds after enabling succeeded; `memory_source()` now takes
+an optional state store and falls back to the registry, mirroring
+`SyncEngine._source`;
+(3) **half the `about` edge budget pointed at the `external_reference` stub**
+rather than the resolved file, because a markdown link produces two `references`
+edges and rung 1 took both.
+All three are pinned by tests. Live checks then passed end to end: off/auto/only
+policies (superseded record absent under `auto`, visible under
+`current_only: false`), `describe_retrieval` from a fresh process, steering in
+force, `about → file:guides:setup.md` in one hop plus a `supersedes` edge, and
+the benchmark unchanged. Suite **1054 passed / 8 failed / 6 skipped**. Detail:
+`runs/2026-08-12-memory-live/SUMMARY.md`. Still unmeasured: bridge and vector
+behaviour at 2,000-file scale with a real embedder. Note `ruff check src tests` is **red on
 HEAD** from 5 pre-existing E501s in `tests/test_taxonomy.py` (verified against
 the committed file); a repo-wide `ruff format` swept them up and I reverted
 that to keep this change set scoped. Full detail:
