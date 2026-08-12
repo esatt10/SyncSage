@@ -660,7 +660,8 @@ def build_sections() -> list[Section]:
                 "Agents can write memories through MCP; they become ordinary indexed "
                 "content, so recall is just search. Consolidation archives superseded "
                 "records (renamed in place, never deleted). TTLs are opt-in — blank "
-                "means a scope never expires."
+                "means a scope never expires. A corrected memory stops being returned "
+                "immediately, without waiting for consolidation."
             ),
             covers=("memory",),
             questions=[
@@ -668,6 +669,56 @@ def build_sections() -> list[Section]:
                     key="memory.consolidation_enabled",
                     prompt="Consolidate superseded memories?",
                     kind="bool",
+                    advanced=True,
+                ),
+                Question(
+                    key="memory.default_policy",
+                    prompt="How should memory take part in a search that does not say?",
+                    help=(
+                        "auto: like any other source. off: never in results. "
+                        "only: memory and nothing else. prefer: memory keeps a share "
+                        "of the slots. A per-call setting always wins over this."
+                    ),
+                    kind="choice",
+                    choices=(
+                        Choice("auto", "Like any other source"),
+                        Choice("off", "Never in results"),
+                        Choice("only", "Memory and nothing else"),
+                        Choice("prefer", "Guaranteed a share of the slots"),
+                    ),
+                    advanced=True,
+                ),
+                Question(
+                    key="memory.steering_enabled",
+                    prompt="Let memories re-rank results (aliases, path preferences)?",
+                    help=(
+                        "Records written as kind alias/preference/exclusion become "
+                        "retrieval rules — an alias makes a query for your word find "
+                        "documents that only use the other one. Off by default because "
+                        "a memory that silently re-orders searches is a surprise."
+                    ),
+                    kind="bool",
+                    advanced=True,
+                ),
+                Question(
+                    key="memory.usage_tracking",
+                    prompt="Count which memories retrieval returns?",
+                    help=(
+                        "Feeds salience, which decides what is dropped first when the "
+                        "store is bounded. It is a write on the read path, so it is "
+                        "off unless you ask for it."
+                    ),
+                    kind="bool",
+                    advanced=True,
+                ),
+                Question(
+                    key="memory.max_records",
+                    prompt="Maximum memory records to keep (blank = unbounded)",
+                    help=(
+                        "Past this many, the least salient are archived — renamed in "
+                        "place, never deleted."
+                    ),
+                    kind="int",
                     advanced=True,
                 ),
             ],

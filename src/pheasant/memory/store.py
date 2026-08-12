@@ -400,8 +400,18 @@ class MemoryStore:
         )
 
     @staticmethod
-    def _archive(record: MemoryRecord) -> None:
+    def archive(record: MemoryRecord) -> None:
+        """Rename a record out of the include glob. Bytes are never deleted.
+
+        Public because capacity pruning (Step 33.9) archives on a different
+        trigger than consolidation — the store is over its bound rather than
+        the record being corrected or expired — but must forget in exactly the
+        same way.
+        """
         os.replace(record.path, record.path.parent / (record.path.name + ".archived"))
+
+    #: Pre-33.9 name, kept because it is used throughout this module.
+    _archive = archive
 
 
 def _render(record: MemoryRecord) -> str:

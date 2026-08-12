@@ -231,6 +231,38 @@ security:
 
 # Grounded chat over your index (the UI's chat layer). Query-time only — no
 # LLM ever runs during indexing, so re-syncing unchanged content stays
+# Agent memory. Records are append-only Markdown files written by agents
+# (MCP `memory_write` / `POST /memory`) into a `type: memory` source and
+# indexed by the ordinary pipeline — recall is just search, there is no second
+# retrieval path. This block controls consolidation, how memory takes part in
+# retrieval, and how the store is bounded.
+#
+# A *corrected* record is dropped from results at query time, without waiting
+# for consolidation; pass `{"current_only": false}` or an `as_of` instant on a
+# search to see it again.
+memory:
+  # Archive superseded and TTL-expired records on the scheduler beat. The file
+  # is renamed `<id>.md.archived` in place — bytes preserved, never deleted.
+  consolidation_enabled: true
+  # Per-scope age limits. null = that scope never expires by age.
+  session_ttl_days: null
+  user_ttl_days: null
+  org_ttl_days: null
+  # How memory takes part in a search that does not say. A per-call `memory`
+  # argument always wins over this. auto | off | only | prefer
+  default_policy: auto
+  # Let `alias`/`preference`/`exclusion` records re-rank results, not merely be
+  # retrievable. Off by default: a memory that silently re-orders searches is a
+  # surprise unless it was asked for.
+  steering_enabled: false
+  # Count which records retrieval returns, so salience reflects use. Off by
+  # default — a write on the read path, and an operator's decision to make.
+  usage_tracking: false
+  # Archive the least salient records past this many. null = unbounded.
+  max_records: null
+  # Cap on `about` graph edges drawn per record by the memory bridge.
+  about_max_targets: 3
+
 # byte-for-byte deterministic.
 #
 # With no provider reachable the assistant still answers, extractively: the

@@ -35,6 +35,9 @@ class HybridSearch:
         vector: VectorSearcher | None = None,
         node_index: Any = None,
         wasm_relationship_search: bool = False,
+        steering_enabled: bool = False,
+        default_memory_policy: str = "auto",
+        usage_tracking: bool = False,
     ):
         self.store = store
         # Optional semantic candidates (Synapse 21.4). None when
@@ -48,6 +51,17 @@ class HybridSearch:
         # (search.wasm_relationship_search). Default off; falls back to pure
         # Python on any failure.
         self.wasm_relationship_search = wasm_relationship_search
+        # Step 33.8: let memory rules steer ranking (memory.steering_enabled).
+        # Default off, so a region that has not asked for it ranks exactly as
+        # it did before.
+        self.steering_enabled = steering_enabled
+        # memory.default_policy — what a caller that says nothing gets. A
+        # per-call `memory` argument always wins, so this only fills the gap.
+        self.default_memory_policy = default_memory_policy
+        # memory.usage_tracking — count which memories retrieval returns, so
+        # salience can reflect use. Off by default: it is a write on the read
+        # path and recording what someone looks up is an operator's choice.
+        self.usage_tracking = usage_tracking
 
     def search_context(
         self,
@@ -79,10 +93,26 @@ class HybridSearch:
         # against the same rows below, and every arm's hits are annotated from
         # it. An empty index means the region has no memory records, and then
         # none of this does anything at all.
-        policy = MemoryPolicy.parse(memory)
+        policy = MemoryPolicy.parse(memory if memory is not None else self.default_memory_policy)
         memory_index = load_memory_index(getattr(self.store, "state", None))
         memory_now = utc_now_iso() if memory_index else None
         memory_filtered = bool(memory_index) and not policy.is_default
+        # Step 33.8 — rules from `alias`/`preference`/`exclusion` records, put
+        # through the same `admits` predicate as retrieval so a corrected or
+        # out-of-scope record steers nothing. Empty unless steering is on.
+        steering = None
+        if memory_index and self.steering_enabled:
+            from pheasant.memory.steering import load_steering, load_steering_records
+
+            steering = (
+                load_steering(
+                    load_steering_records(self.store.state),
+                    policy,
+                    now=memory_now,
+                    enabled=True,
+                )
+                or None
+            )
         # A section filter narrows hard, so the arms that can only be filtered
         # after the fact (graph, which has no breadcrumb at all) need room to
         # find in-section hits — same over-fetch reasoning as the ACL pass, and
@@ -111,6 +141,7 @@ class HybridSearch:
                 section=section,
                 memory_policy=policy if memory_index else None,
                 memory_now=memory_now,
+                steering=steering,
             )
         # Graph search needs the live graph; callers that don't supply one
         # (e.g. CLI/MCP search_context) transparently fall back to text search.
@@ -227,6 +258,22 @@ class HybridSearch:
         results = _merge_rrf(text_results, vector_results, graph_results, max_results)
         if memory_index:
             _annotate_memory(results, memory_index, policy)
+            if self.usage_tracking:
+                # Step 33.9 — count what retrieval actually returned. Last,
+                # after truncation, so a record is credited for being *served*
+                # rather than merely considered. Best-effort by construction:
+                # `record_memory_use` swallows its own failures, because a
+                # ranking signal must never cost a query.
+                self.store.state.record_memory_use(
+                    sorted(
+                        {
+                            str(item["memory"]["record_id"])
+                            for item in results
+                            if item.get("memory") and item["memory"].get("record_id")
+                        }
+                    ),
+                    memory_now,
+                )
         payload = {
             "query": query,
             "knowledge_base": knowledge_base,
@@ -244,6 +291,10 @@ class HybridSearch:
         # when it says something" rule `heading_path` follows.
         if memory_index:
             payload["memory_policy"] = policy.as_dict()
+        if steering:
+            # Reported so an agent can see *why* it got what it got — a rule
+            # that silently re-orders results is the thing to avoid.
+            payload["memory_steering"] = steering.describe()
         return payload
 
 

@@ -8,6 +8,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from pheasant.config.schema import FILESYSTEM_SOURCE_TYPES, PheasantConfig, SourceConfig
@@ -474,6 +475,23 @@ class SyncEngine:
         if self.transcriber is None and source_includes_audio(source):
             self.transcriber = transcriber_from_config(self.config, source=source)
 
+    @staticmethod
+    def _memory_acl(path: Any) -> dict[str, Any] | None:
+        """`{scope, written_by}` read from the record file (Step 33.11).
+
+        Read from the file rather than the `memory_records` projection because
+        this runs *inside* the artifact loop, before the projection for this
+        sync exists. Fail-soft: an unreadable record simply expresses no ACL
+        and falls back to the region default, which is what it did before 33.11.
+        """
+        try:
+            from pheasant.memory.store import MemoryStore
+
+            record = MemoryStore(Path(path).parent).load(Path(path))
+        except Exception:
+            return None
+        return {"scope": record.scope, "written_by": record.written_by}
+
     def _bridge_memory(self) -> None:
         """Emit memory `supersedes` + `about` edges (Step 33.7).
 
@@ -484,8 +502,12 @@ class SyncEngine:
         Fail-soft, matching every other global pass here: a bridge that cannot
         be derived costs some edges, never the sync that produced the content.
         """
+        if not self.config.graph.memory_entity_bridging:
+            return
         try:
-            report = self.graph_builder.add_memory_edges(self.state)
+            report = self.graph_builder.add_memory_edges(
+                self.state, self.config.memory.about_max_targets
+            )
         except Exception:
             logger.warning("memory graph bridge failed; edges not updated", exc_info=True)
             return
@@ -704,7 +726,16 @@ class SyncEngine:
                 now = utc_now()
                 from pheasant.security.acl import normalize_acl
 
-                acl_doc = normalize_acl(connector.connector_type, (item.metadata or {}).get("acl"))
+                acl_raw = (item.metadata or {}).get("acl")
+                acl_kind = connector.connector_type
+                if getattr(source.type, "value", source.type) == "memory":
+                    # Step 33.11 — a memory record is served by the ordinary
+                    # filesystem connector, so its connector type says nothing
+                    # about who may read it. Its *scope* does, and that lives
+                    # in the record, not in the file's metadata.
+                    acl_kind = "memory"
+                    acl_raw = self._memory_acl(parsed.path)
+                acl_doc = normalize_acl(acl_kind, acl_raw)
                 artifact_row = {
                     "acl": json.dumps(acl_doc, sort_keys=True) if acl_doc else None,
                     "id": parsed.id,

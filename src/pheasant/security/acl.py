@@ -38,7 +38,27 @@ def normalize_acl(connector_type: str, raw: dict[str, Any] | None) -> dict[str, 
         return None
     allow: list[str] = []
     public = False
-    if connector_type == "notion":
+    if connector_type == "memory":
+        # Step 33.11 — an agent-memory record's ACL follows its *scope*, which
+        # is the only thing the store knows about who a memory was for.
+        #
+        # `org` is a shared assertion and stays visible per the region default.
+        # `user` and `session` were written by and for one principal, so they
+        # are readable only by their writer — without this, `acl_enforced`
+        # filtered every corpus document by principal while leaving one agent's
+        # private notes readable by every other agent in the same region.
+        scope = str(raw.get("scope") or "")
+        written_by = str(raw.get("written_by") or "")
+        if scope == "org":
+            public = True
+        elif written_by:
+            allow.append(written_by if ":" in written_by else f"user:{written_by}")
+        else:
+            # No recorded writer and not org-scope: nothing can be asserted
+            # about who may read it, so fall through to the region default
+            # rather than inventing an owner.
+            return None
+    elif connector_type == "notion":
         for key in ("created_by", "last_edited_by"):
             if raw.get(key):
                 allow.append(f"user:{raw[key]}")

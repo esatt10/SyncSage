@@ -55,6 +55,10 @@ export function ChatPanel({
   // Live workflow steps for the in-flight question. Local, not session state:
   // they describe one request and are meaningless once it resolves.
   const [progress, setProgress] = useState<{ name: string; detail: string }[]>([]);
+  // Whether this region's remembered assertions may inform the answer. The
+  // same `memory` field MCP and the router send, so the three surfaces cannot
+  // disagree about what "off" means.
+  const [useMemory, setUseMemory] = useState(true);
 
   const ask = useMutation({
     mutationFn: (question: string) => {
@@ -65,6 +69,7 @@ export function ChatPanel({
           session_id: sessionId,
           source_name: sourceFilter,
           workflow,
+          memory: useMemory ? null : "off",
         },
         (step) => setProgress((prev) => [...prev, { name: step.name, detail: step.detail }]),
       );
@@ -217,6 +222,14 @@ export function ChatPanel({
         </div>
         <div className="composer__hint">
           {sourceFilter ? <span className="pill pill--accent">scoped to {sourceFilter}</span> : null}
+          <label className="composer__memory" title="Let remembered assertions inform the answer">
+            <input
+              type="checkbox"
+              checked={useMemory}
+              onChange={(event) => setUseMemory(event.target.checked)}
+            />
+            use memory
+          </label>
           {extractive ? (
             <>
               <span>No model connected — answers are extracted passages, not synthesis.</span>

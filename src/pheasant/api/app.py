@@ -118,6 +118,13 @@ class SearchRequest(BaseModel):
     memory: dict | str | None = None
 
 
+class MemoryEnableRequest(BaseModel):
+    """Provision the agent-memory source. Defaults are the documented layout."""
+
+    name: str = "agent-memory"
+    path: str = "memory"
+
+
 class MemoryWriteRequest(BaseModel):
     text: str
     scope: str = "user"
@@ -224,6 +231,9 @@ class ChatRequest(BaseModel):
     workflow: str | None = None
     # Per-request workflow knobs, merged over assistant.workflow_options.
     options: dict | None = None
+    # How this region's agent memory takes part in the answer: "auto", "off",
+    # "only", "prefer", or the full policy object (Step 33.10).
+    memory: dict | str | None = None
 
 
 class EmbeddingsRequest(BaseModel):
@@ -724,6 +734,9 @@ def create_app(
         vector=engine.vector_searcher(),
         node_index=engine.node_index,
         wasm_relationship_search=config.search.wasm_relationship_search,
+        steering_enabled=config.memory.steering_enabled,
+        default_memory_policy=config.memory.default_policy,
+        usage_tracking=config.memory.usage_tracking,
     )
 
     @asynccontextmanager
@@ -1453,6 +1466,62 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"source": source.name, "records": [r.as_dict() for r in records]}
+
+    @app.post("/memory/enable")
+    def memory_enable(req: MemoryEnableRequest) -> dict:
+        """Provision the agent-memory source (Step 33.11).
+
+        `SourceType.memory` is deliberately absent from `BUILTIN_SOURCE_TYPES`
+        — memory sources are owned by the store, not hand-registered through
+        the generic source picker, and letting someone point one at an
+        arbitrary folder full of unrelated Markdown would make every file in it
+        look like something an agent asserted.
+
+        But "not in the picker" had come to mean **unreachable**: a person
+        could not turn memory on from the UI at all. A dedicated action keeps
+        the invariant (one well-known layout, created by us) while closing that
+        gap. Idempotent — enabling twice returns the existing source.
+        """
+        from pheasant.memory.store import memory_source
+
+        existing = memory_source(config)
+        if existing is not None:
+            return {"status": "already-enabled", "source": existing.model_dump(mode="json")}
+
+        # Anchored to `pheasant.workspace_root`, exactly as config load anchors
+        # a relative path on any FILESYSTEM_SOURCE_TYPE. Going through
+        # `_resolve_source_path` instead resolves against the *process CWD*,
+        # which put the folder wherever the server happened to be started from
+        # — during development that was the repo checkout, and a record was
+        # written into it.
+        requested = Path(req.path).expanduser()
+        path = (
+            requested
+            if requested.is_absolute()
+            else Path(config.pheasant.workspace_root) / requested
+        )
+        path.mkdir(parents=True, exist_ok=True)
+        if not config.security.allow_user_selected_source_paths:
+            try:
+                path = resolve_under(str(path), _allowed_roots(config))
+            except PathPolicyError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
+            source = _source_from_payload(
+                {"name": req.name, "type": "memory", "path": str(path), "enabled": True}
+            )
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid source: {exc}") from exc
+
+        SourceRegistry(config, state).register_source(source)
+        # Same step every other registration takes: the engine reads sources off
+        # the live config object, so a source that only reached the registry is
+        # invisible to sync.
+        config.sources = [s for s in config.sources if s.name != source.name]
+        config.sources.append(source)
+        audit(source.name, "memory_enable", {"path": str(path)})
+        return {"status": "enabled", "source": source.model_dump(mode="json")}
 
     @app.post("/memory/consolidate")
     def memory_consolidate() -> dict:
@@ -2700,6 +2769,7 @@ def create_app(
             principal_groups=req.principal_groups,
             workflow=req.workflow,
             options=req.options,
+            memory=req.memory,
         )
 
     @app.post("/assistant/chat/stream")

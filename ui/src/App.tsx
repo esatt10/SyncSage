@@ -3,6 +3,7 @@ import { TopBar } from "./components/TopBar";
 import { JobsTray } from "./components/JobsTray";
 import { Notebook } from "./pages/Notebook";
 import { GraphPage } from "./pages/GraphPage";
+import { MemoryPage } from "./pages/MemoryPage";
 import { SourcesPage } from "./pages/SourcesPage";
 import { ConfigPage } from "./pages/ConfigPage";
 import { SessionProvider } from "./state/session";
@@ -25,6 +26,7 @@ export function App() {
           <Routes>
             <Route path="/" element={<Notebook />} />
             <Route path="/graph" element={<GraphPage />} />
+            <Route path="/memory" element={<MemoryPage />} />
             <Route path="/sources" element={<SourcesPage />} />
             <Route path="/config" element={<ConfigPage />} />
           </Routes>

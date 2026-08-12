@@ -63,6 +63,23 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 | `get_sync_status` | Return queue, lock, error, freshness, and connector checkpoint status. |
 | `get_sync_history` | Return runtime registration, sync, promotion, disable, and removal audit events. |
 
+### Agent memory in retrieval
+
+`search_context` and `preview_retrieval` take a `memory` argument: one of
+`"auto"` (default), `"off"`, `"only"`, `"prefer"`, or an object with
+`scopes` / `subject` / `current_only` / `as_of` / `max_results`. Records a
+later record corrected are excluded automatically — pass an `as_of` instant to
+ask what was believed then. Hits that came from memory carry a `memory` block
+naming the record, its scope and when it was asserted.
+
+`memory_write` takes `kind` (`fact` by default; `alias` / `preference` /
+`exclusion` are retrieval rules), `principal` (who asserted it — part of the
+record id, and what scopes it under `security.acl_enforced`) and `valid_until`.
+
+`describe_retrieval` reports the memory source's name, its scopes and counts,
+how many records are wired into the graph, and any steering in force, so an
+agent never has to guess the source name to exclude it.
+
 ## Resources
 
 ```text

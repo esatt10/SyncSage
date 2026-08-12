@@ -310,6 +310,134 @@ BM25; (2) `1/(1+|bm25|)` inverted relevance in hybrid merges → monotone
 mapping (LIKE-fallback rows keep 1.0). Gate:
 `tests/test_memory_benchmark.py`. Suite: **202 passed** (+4).
 
+**Steps 33.8–33.11 landed here 2026-08-11 — the memory-steered-retrieval arc
+(33.5–33.11) is complete.** Four steps in one session at the user's request,
+departing from rule 10's one-step norm.
+
+**33.8 retrieval steering** — `kind` becomes load-bearing. New
+`memory/steering.py` turns a record's text into a ranking rule: `alias`
+(`router -> pheasant-flock`) expands the query, `preference`
+(`when: deploy -> prefer: docs/`) adds a path term to `_STRUCTURAL_PRIOR`,
+`exclusion` (`never: vendor/**`) suppresses. This is the half that changes
+queries returning **no memory at all**. Two design bugs the tests found:
+`memory: "off"` was disabling steering outright (mode is about *result
+composition*, not rule validity — a caller who wants no remembered passages
+still wants the remembered vocabulary; scope/subject/validity still apply), and
+a hyphenated trigger never fired because `_query_tokens` splits
+`pheasant-flock` into two tokens (triggers now match the tokenized query, **all
+parts required**). Also wired the deferred `memory.default_policy`.
+**8/8 mutants**, `tests/test_memory_steering.py` (23).
+
+**33.9 salience + bounded growth** — `memory/salience.py`: recency (90-day half
+life) × use (`log1p`, diminishing returns) × scope weight. `uses` is counted
+**after truncation**, so a record is credited for being *served*, not
+considered. `memory.max_records` archives the least salient via consolidation's
+existing `.md.archived` rename; salience is written back so a prune is
+explainable. `usage_tracking`/`max_records` default off/unbounded.
+**10/10 mutants**, `tests/test_memory_salience.py` (15) — after fixing another
+vacuous test of mine (the `salience` column defaults to 1.0, so a range
+assertion passed whether or not anything was written).
+
+**33.10 front end** — the `/memory` endpoints had existed since 33.1 with
+**zero UI callers**. New `/memory` page (grouped by subject; corrections go
+through *superseding*, never editing, because the chain is what `as_of` reads),
+a `use memory` chat toggle posting the same field MCP and the router send
+(threaded `ChatRequest.memory` → `answer_question` → `PheasantRetriever`, held
+on the retriever so an answering loop cannot half-honour it, and part of the
+memo key so two turns cannot share cached passages), citation chips that say
+when a passage was remembered, plus client/types/nav/styles.
+
+**33.11 isolation, benchmark, docs** — **the ACL leak is closed**:
+`normalize_acl` gains a `memory` rule keyed on **scope** (`org` shared,
+`user`/`session` readable only by their writer), read from the record file
+because the ACL is computed inside the artifact loop before the projection
+exists. Before this, `acl_enforced` filtered every corpus document by principal
+while leaving one agent's private notes readable by every other agent.
+Benchmark keys on the typed `memory.record_id` (retiring the pre-33.6
+substring hack) and gains contradiction rate, staleness p50/p95, bytes/record
+and **measured** latency — recall@5 **1.000**, update **1.000**, stale_leak
+**0.000**, abstention **1.000**, 212.9 B/record, 4.51 ms write, 11.83 ms
+search. Docs: `configuration.md` §memory, the first `memory:` block in
+`pheasant.example.yaml`, `how-to/agent-memory.md` (query-time control,
+steering, salience, UI, isolation), `mcp_tools.md`, five wizard questions.
+
+**Completion pass (same session).** The first pass implemented every step's
+mechanism but left a tail of surface items, and I wrongly reported the arc
+complete. Then closed: **`POST /memory/enable`** + an Enable-memory button
+(`SourceType.memory` stays out of the generic picker, but "not in the picker"
+had come to mean *unreachable*), **`MemoryPanel.tsx`** in Settings,
+**`pheasant://…/memory` MCP resource** (`current_only` defaults True there —
+corrected records without their chain are worse than none),
+`docs/reference/http-api.md`, and the two config flags the plan named but
+nothing had: **`graph.memory_entity_bridging`** and
+**`memory.about_max_targets`**. Two test gaps closed: **`prefer` had zero
+tests** despite being documented, and **the vector arm had never run under a
+memory policy** (every fixture had embeddings off — the same blind spot that
+hid the 33.7 graph-arm leak); now asserted with exact counts.
+**Real bug found:** `/memory/enable` resolved its relative path through
+`_resolve_source_path`, which anchors to the **process CWD** — the memory
+folder landed wherever the server started, and in development a record was
+written into the repo checkout. Now anchored to `pheasant.workspace_root`;
+mutation testing showed my first test would not have caught it (status codes
+only, never the path).
+
+Suite **1052 passed / 8 failed / 6 skipped** (+73; same 8 pre-existing).
+Mutation **26/26 caught** across three batches, after fixing four vacuous tests
+the mutants exposed. **Still not done: `tsc -b && vite build` never ran** (no
+local npm) — a new page, a new panel, client methods, type additions and four
+component edits are compiler-unverified, and that is the outstanding risk; no
+live demo-stack validation either. Note `ruff check src tests` is **red on
+HEAD** from 5 pre-existing E501s in `tests/test_taxonomy.py` (verified against
+the committed file); a repo-wide `ruff format` swept them up and I reverted
+that to keep this change set scoped. Full detail:
+`runs/2026-08-11-memory-33.8-33.11/SUMMARY.md`.
+
+**Step 33.7 (memory in the knowledge graph) landed here 2026-08-11.** Memory
+stops being a graph island. New `memory_record` node type (stable ID unchanged
+— rule 3 protects the grammar, not the type attribute; SQLite `artifacts.type`
+agrees), `supersedes` edges finally **emitted** between records (a documented
+edge type nothing had ever drawn, so a correction existed only as a frontmatter
+string), and a new `memory/bridge.py` drawing `about` edges from a record to
+what it is about. **`entity` cannot be the bridge on its own** — entity
+extraction runs only for `.md/.txt/.html/.xml`, so all seven extracted document
+formats produce **zero** entity nodes and Python yields them only for class
+names; an entity-only bridge looks fine on Markdown and is a silent no-op on
+PDFs or non-Python code. So it is a precedence ladder — **reference** (already
+drawn by `resolve_cross_source_edges`; needed no new matching code) →
+**symbol** → **heading** → **entity** — first rung wins, capped at 3 targets
+per record. The lexical/BM25 rung is deliberately **not** materialized: the
+search index answers it at query time, and materializing it is how the concept
+layer reached 98.6% of all edges. Coverage is **reported, not silent**:
+`describe_retrieval`'s memory block gains `graph:{records,bridged,unbridged,
+by_signal}`, computed live. Also consolidated `ARTIFACT_TYPES` into **one**
+definition in `ingestion/content_types.py` — four modules had independently
+hard-coded `{"file","markdown_note","document"}`. **The 33.6 entity residual is
+closed**: `_node_result` now exposes the `artifact_id` that chunk/symbol/entity
+nodes always carried, and `policy.resolve` resolves a *relationship* hit
+through either endpoint; the test that asserted the residual existed went red
+as designed and was replaced by its positive form.
+
+**Two pre-existing defects found by building it:** entity labels **spanned line
+breaks** (`\s+` matches newlines, so a heading fused with the next paragraph
+into `"Runbook\r\n\r\nThe Kestrel Gateway"` — junk that could never match
+anything by name; now `[ \t]+`, mirrored in the bridge), and a **leading
+article split one entity in two** (corpus *The Kestrel Gateway* vs memory
+*Kestrel Gateway*; `normalize_label` drops `the`/`a`/`an`, with a test that it
+is not over-eager). **Ordering bug caught by the tests:** the bridge ran with
+the other global passes, *before* `_project_memory_records`, so on the memory
+source's own sync it saw zero records — the projection now runs right after the
+artifact loop. **Deviation:** the plan's rung-4 "merge and drop the duplicate
+entity" was **not** implemented — deleting the memory-local entity destroys the
+`artifact_id` provenance that closes the 33.6 residual, so it would have
+reintroduced the leak; acceptance is ≤2-hop reachability via `GET /graph/path`
+(both directions) rather than a node-count drop. Mutation-tested **12/12
+caught**. Acceptance: `tests/test_memory_graph.py` (23) — per corpus type
+(markdown / python / opaque), not in aggregate, because that is exactly what an
+entity-only bridge would have passed. Suite **1002 passed / 8 failed / 6
+skipped** (same 8 pre-existing). UI legend updated but `vite build` not run (no
+local npm). Full detail: `runs/2026-08-11-memory-33.7/SUMMARY.md`. Next:
+**33.8**, retrieval steering.
+
 **Step 33.6 (query-time memory policy across both protocols) landed here
 2026-08-11.** New `memory/policy.py`: one `MemoryPolicy` (`mode` ∈
 auto|off|only|prefer, `scopes`, `subject`, `current_only`, `as_of`,

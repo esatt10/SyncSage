@@ -507,3 +507,140 @@ def test_written_by_is_recorded_and_audited_over_http(tmp_path: Path) -> None:
         assert "record_id" in str(rows[0]["details_json"])
     finally:
         app.state.engine.close()
+
+
+# ---------------------------------------------------------------------------
+# Provisioning and the bridge's configuration surface
+# ---------------------------------------------------------------------------
+
+
+def test_enable_provisions_the_memory_source_and_is_idempotent(tmp_path: Path) -> None:
+    """`SourceType.memory` is absent from the generic source picker on purpose,
+    but that must not mean a person can never turn memory on."""
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from pheasant.api.app import create_app
+
+    config_path = _write_config(tmp_path, include_memory=False)
+    app = create_app(load_config(config_path), config_path=str(config_path))
+    client = fastapi_testclient.TestClient(app)
+    try:
+        assert client.get("/memory").status_code == 400
+
+        first = client.post("/memory/enable", json={})
+        assert first.status_code == 200, first.text
+        assert first.json()["status"] == "enabled"
+
+        # *Where* it landed is the assertion that matters. Resolving the
+        # relative path against the process CWD instead of the configured
+        # workspace put the folder in whatever directory the server was
+        # started from — during development, the repo checkout, which is where
+        # a stray record actually got written.
+        registered = Path(first.json()["source"]["path"]).resolve()
+        assert registered == (tmp_path / "memory").resolve(), registered
+        assert registered.is_dir()
+
+        # Idempotent: enabling twice returns the existing source rather than
+        # registering a second one.
+        assert client.post("/memory/enable", json={}).json()["status"] == "already-enabled"
+
+        listing = client.get("/memory")
+        assert listing.status_code == 200
+        assert listing.json()["records"] == []
+
+        written = client.post("/memory", json={"text": "Enabled from the UI."})
+        assert written.status_code == 200, written.text
+        assert written.json()["created"] is True
+    finally:
+        app.state.engine.close()
+
+
+def test_the_memory_mcp_resource_returns_current_records(tmp_path: Path) -> None:
+    """Context an agent can read directly, without spending a search on it."""
+    tools = PheasantTools(load_config(_write_config(tmp_path)))
+    try:
+        first = tools.memory_write("memory-test", "the old answer", scope="org")
+        tools.memory_write(
+            "memory-test",
+            "the corrected answer",
+            scope="org",
+            supersedes=str(first["record"]["record_id"]),
+        )
+        listing = tools.memory_list("memory-test")
+        assert listing["enabled"] is True
+        # current_only defaults True here: handing an agent corrected records
+        # without the chain to interpret them is worse than handing it none.
+        assert [record["text"] for record in listing["records"]] == ["the corrected answer"]
+    finally:
+        tools.engine.close()
+
+
+def test_the_resource_reports_disabled_rather_than_raising(tmp_path: Path) -> None:
+    tools = PheasantTools(load_config(_write_config(tmp_path, include_memory=False)))
+    try:
+        assert tools.memory_list("memory-test") == {"enabled": False, "records": []}
+    finally:
+        tools.engine.close()
+
+
+def test_bridging_can_be_switched_off(tmp_path: Path) -> None:
+    """A config knob that changes nothing is worse than no knob."""
+    config_path = _write_config(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "sources:", "graph:\n  memory_entity_bridging: false\nsources:"
+        ),
+        encoding="utf-8",
+    )
+    tools = PheasantTools(load_config(config_path))
+    try:
+        assert tools.config.graph.memory_entity_bridging is False
+        tools.memory_write("memory-test", "See [the readme](readme.md) for detail.", scope="org")
+        tools.sync_source("memory-test", "notes", "full")
+        tools.sync_source("memory-test", "agent-memory", "full")
+
+        graph = tools.engine.graph_builder.graph
+        with graph.reading():
+            about = [
+                data
+                for (_source, _target), edge_map in graph.iter_edges()
+                for data in edge_map.values()
+                if data.get("type") == "about"
+            ]
+        assert about == []
+    finally:
+        tools.engine.close()
+
+
+def test_about_max_targets_is_read_by_the_engine(tmp_path: Path) -> None:
+    """Driven through a real sync, not by handing the value to the bridge.
+
+    Passing `config.memory.about_max_targets` straight into `add_memory_edges`
+    proves the *bridge* honours a cap and says nothing about whether the engine
+    ever reads the setting — mutation testing caught exactly that. A cap of 0 is
+    the unambiguous end-to-end signal, since this fixture otherwise draws edges.
+    """
+    config_path = _write_config(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "sources:", "memory:\n  about_max_targets: 0\nsources:"
+        ),
+        encoding="utf-8",
+    )
+    tools = PheasantTools(load_config(config_path))
+    try:
+        assert tools.config.memory.about_max_targets == 0
+        tools.memory_write("memory-test", "See [the readme](readme.md) for detail.", scope="org")
+        tools.sync_source("memory-test", "notes", "full")
+        tools.sync_source("memory-test", "agent-memory", "full")
+
+        graph = tools.engine.graph_builder.graph
+        with graph.reading():
+            about = [
+                data
+                for (_source, _target), edge_map in graph.iter_edges()
+                for data in edge_map.values()
+                if data.get("type") == "about"
+            ]
+        assert about == [], "the engine ignored memory.about_max_targets"
+    finally:
+        tools.engine.close()

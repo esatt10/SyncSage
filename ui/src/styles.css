@@ -2492,3 +2492,97 @@ select.text-input {
   border-color: var(--accent-border);
   color: var(--accent-text);
 }
+
+/* --- Agent memory (Step 33.10) ------------------------------------------ */
+.memory-page .memory-empty {
+  padding: 1.25rem 1.5rem;
+}
+.memory-draft {
+  width: 100%;
+  resize: vertical;
+  font: inherit;
+}
+.memory-draft__row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-top: 0.5rem;
+  flex-wrap: wrap;
+}
+.memory-filters {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+}
+.memory-group h3 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.7;
+  margin: 1rem 0 0.5rem;
+}
+.memory-card {
+  border: 1px solid var(--border, #33333a);
+  border-radius: 8px;
+  padding: 0.75rem 0.9rem;
+  margin-bottom: 0.5rem;
+}
+/* A corrected record stays visible — the point of superseding rather than
+   deleting is that the history is still there — but must not read as current. */
+.memory-card--superseded {
+  opacity: 0.55;
+}
+.memory-card__meta {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  font-size: 0.75rem;
+  opacity: 0.75;
+  margin-bottom: 0.35rem;
+  flex-wrap: wrap;
+}
+.memory-card__text {
+  margin: 0;
+  white-space: pre-wrap;
+}
+.memory-card__actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 0.5rem;
+  font-size: 0.75rem;
+}
+.memory-card__chain {
+  opacity: 0.6;
+}
+.badge--org {
+  background: #3c4a63;
+}
+.badge--user {
+  background: #4a4363;
+}
+.badge--session {
+  background: #4a4a4a;
+}
+.badge--stale {
+  background: #6b3f3f;
+}
+/* Citation chips: say when a passage was remembered rather than read. */
+.source-chip__memory {
+  background: #8a6f9e;
+  color: #fff;
+  border-radius: 4px;
+  padding: 0 0.35em;
+  font-size: 0.7em;
+  margin-left: 0.35em;
+}
+.composer__memory {
+  display: inline-flex;
+  gap: 0.35em;
+  align-items: center;
+  font-size: 0.8em;
+  opacity: 0.8;
+}

@@ -539,3 +539,155 @@ def test_relative_path_is_recovered_from_both_stable_id_grammars() -> None:
     # the colon count — is what the split keys on.
     assert relative_path_of("file:src:notes/a:b.md:branch=main") == "notes/a:b.md"
     assert relative_path_of("not-an-id") == ""
+
+
+def test_the_chat_path_honours_the_memory_toggle(corrected) -> None:
+    """The UI toggle posts `memory` on /assistant/chat; it has to reach the
+    retriever, or the switch is decoration.
+
+    Held on the retriever rather than passed per call, because an answering
+    loop issues many searches and a turn that half-honoured the toggle would
+    be worse than one that ignored it.
+    """
+    from pheasant.assistant.retrieval import PheasantRetriever
+
+    tools, _old, new = corrected
+    seen: list = []
+
+    class _Recording:
+        def search_context(self, *args, **kwargs):
+            seen.append(kwargs.get("memory"))
+            return {"results": []}
+
+    retriever = PheasantRetriever(search=_Recording(), knowledge_base="memory-test", memory="off")
+    retriever.search("anything")
+    assert seen == ["off"]
+
+    # And the policy is part of the per-request memo key, so two turns with
+    # different toggles cannot serve each other's cached passages.
+    retriever.memory = "only"
+    retriever.search("anything")
+    assert seen == ["off", "only"]
+    assert new.record_id
+
+
+# ---------------------------------------------------------------------------
+# `prefer` and the vector arm — the two gaps the plan's acceptance implied but
+# nothing exercised until now.
+# ---------------------------------------------------------------------------
+
+
+def test_prefer_reserves_slots_for_memory(tmp_path: Path) -> None:
+    """`prefer` is a documented mode, so its behaviour has to be pinned.
+
+    Fusion ranks memory against a whole corpus, so a genuinely relevant memory
+    can lose every slot to documents that merely match more words. `prefer`
+    promotes memory within its own arm — RRF reads each arm's internal rank —
+    up to half the requested results.
+    """
+    config_path = _write_config(tmp_path)
+    docs = tmp_path / "docs"
+    for index in range(8):
+        (docs / f"filler{index}.md").write_text(
+            f"# Filler {index}\n\nThe rollout password policy is discussed here.\n",
+            encoding="utf-8",
+        )
+    store_path = tmp_path / "memory"
+    from pheasant.memory.store import MemoryStore
+
+    MemoryStore(store_path).append(
+        "The rollout password is GRAPES.", scope="org", now=datetime(2026, 6, 1, tzinfo=UTC)
+    )
+    tools = PheasantTools(load_config(config_path))
+    try:
+        tools.sync_source("memory-test", "notes", "full")
+        tools.sync_source("memory-test", "agent-memory", "full")
+
+        def memory_rank(policy: str) -> int | None:
+            results = (
+                tools.search_context(
+                    "memory-test", "rollout password", mode="text", max_results=4, memory=policy
+                ).get("results")
+                or []
+            )
+            for position, item in enumerate(results):
+                if item.get("memory"):
+                    return position
+            return None
+
+        preferred = memory_rank("prefer")
+        assert preferred is not None, "prefer must keep memory in the results"
+        assert preferred < 2, f"prefer should reserve an early slot, got {preferred}"
+
+        # And it is a *reordering*, not a score change: the same hits come back.
+        def paths(policy: str) -> set:
+            return {
+                str(item.get("relative_path") or "")
+                for item in tools.search_context(
+                    "memory-test", "rollout password", mode="text", max_results=20, memory=policy
+                ).get("results")
+                or []
+            }
+
+        assert paths("prefer") == paths("auto")
+    finally:
+        tools.engine.close()
+
+
+def test_the_vector_arm_honours_the_memory_policy(tmp_path: Path) -> None:
+    """Every other end-to-end test runs with embeddings off, so `self.vector`
+    is None and that arm never executes — the same blind spot that hid the
+    graph-arm leak. This one turns the stub embedder on."""
+    config_path = _write_config(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "sources:",
+            "search:\n"
+            "  embeddings:\n"
+            "    enabled: true\n"
+            "    provider: stub\n"
+            "  vector_store:\n"
+            "    provider: numpy\n"
+            "sources:",
+        ),
+        encoding="utf-8",
+    )
+    from pheasant.memory.store import MemoryStore
+
+    store = MemoryStore(tmp_path / "memory")
+    old, _ = store.append(
+        "The rollout password is BANANAS.", scope="org", now=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    store.append(
+        "The rollout password is GRAPES.",
+        scope="org",
+        supersedes=old.record_id,
+        now=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+    tools = PheasantTools(load_config(config_path))
+    try:
+        assert tools.engine.vectors is not None, "the vector arm must actually be built"
+        tools.sync_source("memory-test", "notes", "full")
+        tools.sync_source("memory-test", "agent-memory", "full")
+        assert tools.searcher.vector is not None
+
+        vector_hits = _texts(tools.search_context("memory-test", "rollout password", mode="vector"))
+        assert "bananas" not in vector_hits, "superseded record leaked through the vector arm"
+
+        # Asserted on real counts, not defensively: this arm genuinely returns
+        # hits here, so an `or []` escape would let the test pass on an empty
+        # result set and prove nothing.
+        def vector_flags(policy: str) -> list[bool]:
+            payload = tools.search_context(
+                "memory-test", "rollout password", mode="vector", memory=policy
+            )
+            assert payload["counts"]["vector"] > 0, f"vector arm returned nothing for {policy!r}"
+            return [bool(item.get("memory")) for item in payload["results"]]
+
+        # auto: the current memory plus the corpus document; the superseded
+        # record is gone. off: corpus only. only: memory only.
+        assert vector_flags("auto") == [True, False]
+        assert vector_flags("off") == [False]
+        assert vector_flags("only") == [True]
+    finally:
+        tools.engine.close()

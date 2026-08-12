@@ -490,6 +490,20 @@ def create_mcp_server(config: PheasantConfig) -> Any:
 
         return _json(tools.get_graph_slice(kb_id, node_id, depth=2))
 
+    @mcp.resource("pheasant://knowledge-bases/{kb_id}/memory")
+    def memory_resource(kb_id: str) -> str:
+        """Return this region's current agent-memory records as JSON.
+
+        A *resource* rather than only a tool because "what does this region
+        remember" is context to read, not an action to take — an agent can
+        pull it into a conversation the way it pulls a file, without spending
+        a tool call on a search that may or may not surface the record it
+        needs. Corrected records are excluded; use `search_context` with an
+        `as_of` instant to see what was believed at a past time.
+        """
+
+        return _json(tools.memory_list(kb_id, current_only=True))
+
     @mcp.resource("pheasant://knowledge-bases/{kb_id}/contract")
     def contract_resource(kb_id: str) -> str:
         """Return this region's published Synapse semantic contract as JSON."""

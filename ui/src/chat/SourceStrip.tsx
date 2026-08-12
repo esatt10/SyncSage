@@ -52,8 +52,18 @@ export function SourceStrip({
           >
             <span className="source-chip__n">{citation.index}</span>
             <span className="source-chip__label">
-              {citation.relative_path ?? citation.title}
+              {citation.memory
+                ? (citation.memory.subject ?? "remembered")
+                : (citation.relative_path ?? citation.title)}
             </span>
+            {/* A reader who cannot tell a remembered assertion from a document
+                cannot catch a bad memory — and the path a memory cites is
+                `org/mem-2026….md`, which says nothing. */}
+            {citation.memory ? (
+              <span className="source-chip__memory" title={`asserted ${citation.memory.asserted_at ?? "unknown"}`}>
+                {citation.memory.scope ?? "memory"}
+              </span>
+            ) : null}
             {section ? <span className="source-chip__section">{section}</span> : null}
           </button>
         );

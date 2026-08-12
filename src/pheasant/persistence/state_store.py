@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _basename(path: str | None) -> str:
@@ -741,6 +744,50 @@ class StateStore:
                     },
                 )
         return len(records)
+
+    def record_memory_use(self, record_ids: list[str], when: str) -> int:
+        """Bump `uses`/`last_used_at` for records retrieval just returned.
+
+        Best-effort and off the critical path (Step 33.9): a counter that fails
+        to increment costs a little ranking signal, never a search. One
+        statement for the whole batch, because this runs on the *read* path and
+        a per-record round trip there would be a real cost for a soft benefit.
+        """
+        if not record_ids:
+            return 0
+        placeholders = ",".join("?" for _ in record_ids)
+        try:
+            with self.conn:
+                cursor = self.conn.execute(
+                    "UPDATE memory_records SET uses = uses + 1, last_used_at = ? "
+                    f"WHERE record_id IN ({placeholders})",
+                    (when, *record_ids),
+                )
+            return int(cursor.rowcount or 0)
+        except Exception:  # pragma: no cover - never fail a query over a counter
+            logger.debug("memory use counters not recorded", exc_info=True)
+            return 0
+
+    def memory_salience_rows(self) -> list[dict[str, Any]]:
+        """Everything the salience formula reads, for a pruning pass."""
+        try:
+            rows = self.rows(
+                "SELECT record_id, scope, asserted_at, uses, last_used_at, salience "
+                "FROM memory_records"
+            )
+        except Exception:  # pragma: no cover - state store older than 33.5
+            return []
+        return [dict(row) for row in rows]
+
+    def set_memory_salience(self, scores: dict[str, float]) -> None:
+        """Persist computed salience so it is visible without recomputing."""
+        if not scores:
+            return
+        with self.conn:
+            self.conn.executemany(
+                "UPDATE memory_records SET salience = ? WHERE record_id = ?",
+                [(value, key) for key, value in sorted(scores.items())],
+            )
 
     def delete_source_artifacts(self, source_id: str) -> int:
         rows = self.rows("SELECT COUNT(*) AS c FROM artifacts WHERE source_id=?", (source_id,))

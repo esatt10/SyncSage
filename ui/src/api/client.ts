@@ -1,4 +1,7 @@
 import type {
+  MemoryConsolidateResponse,
+  MemoryListResponse,
+  MemoryWriteResponse,
   AssistantStatus,
   ChatAnswer,
   ConfigResponse,
@@ -254,6 +257,7 @@ export const api = {
       source_name?: string | null;
       workflow?: string | null;
       options?: Record<string, unknown>;
+      memory?: string | null;
     },
     onStep: (step: { name: string; detail: string; passages: number }) => void,
     signal?: AbortSignal,
@@ -384,6 +388,30 @@ export const api = {
     request<KnowledgeBaseUpdate>("/knowledge-base", {
       method: "PUT",
       body: JSON.stringify(body),
+    }),
+
+  // Agent memory (Step 33.10). These endpoints have existed since 33.1;
+  // nothing in the UI had ever called them.
+  memory: (params: { scope?: string; current_only?: boolean } = {}) =>
+    request<MemoryListResponse>(`/memory${qs(params)}`),
+  memoryWrite: (body: {
+    text: string;
+    scope?: string;
+    subject?: string | null;
+    supersedes?: string | null;
+    tags?: string[];
+    kind?: string;
+    principal?: string | null;
+    sync?: boolean;
+  }) => request<MemoryWriteResponse>("/memory", { method: "POST", body: JSON.stringify(body) }),
+  memoryConsolidate: () =>
+    request<MemoryConsolidateResponse>("/memory/consolidate", { method: "POST" }),
+  // `type: memory` is deliberately absent from the generic source picker, so
+  // this is the one way a person can turn memory on from the UI.
+  memoryEnable: () =>
+    request<{ status: string; source: SourceRecord }>("/memory/enable", {
+      method: "POST",
+      body: JSON.stringify({}),
     }),
 
   // Graph diagnostics + path finding (the full-screen workspace)

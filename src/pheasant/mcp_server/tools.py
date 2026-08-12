@@ -66,6 +66,9 @@ class PheasantTools:
             vector=self.engine.vector_searcher(),
             node_index=self.engine.node_index,
             wasm_relationship_search=config.search.wasm_relationship_search,
+            steering_enabled=config.memory.steering_enabled,
+            default_memory_policy=config.memory.default_policy,
+            usage_tracking=config.memory.usage_tracking,
         )
 
     def list_knowledge_bases(self) -> dict:
@@ -387,6 +390,30 @@ class PheasantTools:
         )
         return result
 
+    def memory_list(
+        self, knowledge_base: str, scope: str | None = None, current_only: bool = True
+    ) -> dict:
+        """This region's memory records, newest last.
+
+        Backs the `pheasant://…/memory` resource. `current_only` defaults to
+        **True** here, unlike `GET /memory`, because a resource is context an
+        agent reads directly: handing it corrected records without the
+        supersedes chain to interpret them would be worse than handing it
+        nothing.
+        """
+        from pheasant.memory.store import MemoryStore, memory_source
+
+        self._require_knowledge_base(knowledge_base)
+        source = memory_source(self.config)
+        if source is None:
+            return {"enabled": False, "records": []}
+        records = MemoryStore(source.path).list_records(scope, current_only=current_only)
+        return {
+            "enabled": True,
+            "source": source.name,
+            "records": [record.as_dict() for record in records],
+        }
+
     def memory_consolidate(self, knowledge_base: str) -> dict:
         """Run one memory-consolidation pass now (Step 33.2).
 
@@ -530,6 +557,26 @@ class PheasantTools:
             "field_help": RETRIEVAL_FIELD_HELP,
         }
 
+    def _describe_steering(self) -> dict:
+        """The rules that actually re-rank this region's searches (Step 33.8).
+
+        Reported because steering is invisible otherwise: a query that lands
+        differently because someone once wrote down a synonym is a mystery
+        unless the region can say so.
+        """
+        if not self.config.memory.steering_enabled:
+            return {"enabled": False}
+        from pheasant.memory.policy import MemoryPolicy, utc_now_iso
+        from pheasant.memory.steering import load_steering, load_steering_records
+
+        rules = load_steering(
+            load_steering_records(self.state),
+            MemoryPolicy(),
+            now=utc_now_iso(),
+            enabled=True,
+        )
+        return {"enabled": True, **rules.describe()}
+
     def _memory_graph_coverage(self) -> dict:
         """How many records are actually wired into the graph (Step 33.7).
 
@@ -603,7 +650,8 @@ class PheasantTools:
                 for row in rows
             },
             "modes": list(VALID_MODES),
-            "default_mode": "auto",
+            "default_mode": self.config.memory.default_policy,
+            "steering": self._describe_steering(),
             "accepts": ["mode", "scopes", "subject", "current_only", "as_of", "max_results"],
             "note": (
                 "Corrected records are excluded by default; pass "

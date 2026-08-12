@@ -730,6 +730,7 @@ def answer_question(
     workflow: str | None = None,
     options: dict | None = None,
     on_step: Any = None,
+    memory: Any = None,
 ) -> dict:
     """Answer ``question`` from the knowledge base, with citations and facts.
 
@@ -761,6 +762,7 @@ def answer_question(
         graph=graph,
         state=state,
         config=config,
+        memory=memory,
     )
 
     name = resolve_workflow_name(
