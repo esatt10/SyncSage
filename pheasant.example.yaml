@@ -94,6 +94,26 @@ search:
     prefer_recent_commits: true
     graph_neighbor_boost: true
     max_results_default: 10
+  # Run graph_search._scan_edges through the vendored WASM accelerator
+  # (Synapse 34.5b) instead of pure Python. Needs the [wasm] extra; falls back
+  # to pure Python on any failure or if the extra is missing, so it is never a
+  # correctness dependency. A consistent, growing win on the relationship-search
+  # query path. Off here, but the Docker image turns it ON in a config it
+  # generates itself, since that image always installs [wasm].
+  wasm_relationship_search: false
+
+# Knowledge-graph construction.
+graph:
+  # Run resolve_cross_source_edges (import/link resolution across sources)
+  # through the same vendored accelerator (Synapse 34.5a). Same fallback
+  # guarantee as above. Conditional win per the 34.4 benchmark: it LOSES to
+  # pure Python below roughly 1,300-2,500 cross-source edges and wins above
+  # it, so leave it off for a small static corpus and turn it on for a large
+  # or growing multi-source graph. The Docker image turns it ON, on the
+  # assumption a container's graph grows past that crossover.
+  wasm_cross_source_resolution: false
+  # Minimum documents a concept must appear in to be kept.
+  concept_min_documents: 2
 
 sync:
   # Guardrails on how much one filesystem source may pull in. A source may
