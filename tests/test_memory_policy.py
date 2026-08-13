@@ -76,9 +76,17 @@ def _texts(payload: dict) -> str:
 #: not-yet-valid, self-expired, and the empty-string corner where SQL's
 #: comparison semantics and Python's truthiness diverge if left unguarded.
 RECORD_MATRIX = [
-    {"record_id": "a", "scope": "org", "subject": "infra", "valid_from": NOW, "valid_until": None},
+    {
+        "record_id": "a",
+        "scope": "org",
+        "subject": "infra",
+        "kind": "fact",
+        "valid_from": NOW,
+        "valid_until": None,
+    },
     {
         "record_id": "b",
+        "kind": "fact",
         "scope": "user",
         "subject": "prefs",
         "valid_from": "2026-01-01T00:00:00Z",
@@ -86,14 +94,33 @@ RECORD_MATRIX = [
     },
     {
         "record_id": "c",
+        "kind": "fact",
         "scope": "session",
         "subject": None,
         "valid_from": "2027-01-01T00:00:00Z",
         "valid_until": None,
     },
-    {"record_id": "d", "scope": "org", "subject": "", "valid_from": "", "valid_until": ""},
+    {
+        "record_id": "d",
+        "scope": "org",
+        "subject": "",
+        "kind": "",
+        "valid_from": "",
+        "valid_until": "",
+    },
+    # A steering rule: retrieval machinery, excluded from *content* results
+    # unless asked for, which both halves of the predicate must agree on.
+    {
+        "record_id": "f",
+        "scope": "org",
+        "subject": None,
+        "kind": "alias",
+        "valid_from": NOW,
+        "valid_until": None,
+    },
     {
         "record_id": "e",
+        "kind": "fact",
         "scope": "user",
         "subject": "deploy",
         "valid_from": "2026-01-01T00:00:00Z",
@@ -112,10 +139,16 @@ POLICY_MATRIX = [
     MemoryPolicy(as_of="2026-03-01T00:00:00Z"),
     MemoryPolicy(as_of="2027-06-01T00:00:00Z"),
     MemoryPolicy(mode="only", scopes=("org",), subject="infra"),
+    MemoryPolicy(include_rules=True),
+    MemoryPolicy(mode="only", include_rules=True),
 ]
 
 
-@pytest.mark.parametrize("policy", POLICY_MATRIX, ids=lambda p: f"{p.mode}-{p.scopes}-{p.as_of}")
+@pytest.mark.parametrize(
+    "policy",
+    POLICY_MATRIX,
+    ids=lambda p: f"{p.mode}-{p.scopes}-{p.as_of}-rules{int(p.include_rules)}",
+)
 def test_sql_and_python_halves_of_the_rule_agree(policy: MemoryPolicy) -> None:
     """The text arm filters in SQL, the other two in Python. They must match.
 
@@ -127,16 +160,16 @@ def test_sql_and_python_halves_of_the_rule_agree(policy: MemoryPolicy) -> None:
     conn.row_factory = sqlite3.Row
     conn.execute(
         "CREATE TABLE memory_records (record_id TEXT, scope TEXT, subject TEXT, "
-        "valid_from TEXT, valid_until TEXT)"
+        "kind TEXT, valid_from TEXT, valid_until TEXT)"
     )
     for record in RECORD_MATRIX:
         conn.execute(
-            "INSERT INTO memory_records VALUES (:record_id,:scope,:subject,"
+            "INSERT INTO memory_records VALUES (:record_id,:scope,:subject,:kind,"
             ":valid_from,:valid_until)",
             record,
         )
     # A non-memory row, modelled the way the real LEFT JOIN produces one.
-    conn.execute("INSERT INTO memory_records VALUES (NULL,NULL,NULL,NULL,NULL)")
+    conn.execute("INSERT INTO memory_records VALUES (NULL,NULL,NULL,NULL,NULL,NULL)")
 
     condition, params = sql_predicate(policy, now=NOW, alias="memory_records")
     sql_ids = {
@@ -691,3 +724,47 @@ def test_the_vector_arm_honours_the_memory_policy(tmp_path: Path) -> None:
         assert vector_flags("only") == [True]
     finally:
         tools.engine.close()
+
+
+def test_steering_rules_are_machinery_not_content() -> None:
+    """An `alias` record steers retrieval; it is not itself an answer.
+
+    Found by live evaluation on the vscode corpus, not by this suite: the rule
+    `filewatch daemon -> fileService, watcher` was returned as the **rank 1**
+    result for "where is the file service implemented", pushing the real
+    `fileService.ts` down to rank 5 and dropping corpus MRR from 0.462 to
+    0.335. Two things wrong with that, only one of them about ranking — an
+    agent asking for code got handed a line of rule syntax dressed as
+    retrieved knowledge.
+
+    The rule stays in force; this is only about whether it comes back as a
+    passage. `include_rules=True` is the escape hatch for a UI that wants to
+    list them.
+    """
+    rule = {"record_id": "r", "scope": "org", "kind": "alias", "valid_from": NOW}
+    fact = {"record_id": "f", "scope": "org", "kind": "fact", "valid_from": NOW}
+
+    assert admits(MemoryPolicy(), fact, now=NOW)
+    assert not admits(MemoryPolicy(), rule, now=NOW)
+    # Even an explicit request for memory returns assertions, not machinery...
+    assert not admits(MemoryPolicy(mode="only"), rule, now=NOW)
+    # ...unless the caller asks for the rules by name.
+    assert admits(MemoryPolicy(include_rules=True), rule, now=NOW)
+    assert admits(MemoryPolicy(mode="only", include_rules=True), rule, now=NOW)
+
+    # Steering itself must still see its own rules, or the feature is dead.
+    from pheasant.memory.steering import load_steering
+
+    records = [
+        {
+            "record_id": "r",
+            "scope": "org",
+            "kind": "alias",
+            "valid_from": NOW,
+            "valid_until": None,
+            "text": "filewatch daemon -> fileService, watcher",
+        }
+    ]
+    loaded = load_steering(records, MemoryPolicy(), now=NOW, enabled=True)
+    assert loaded.aliases, "excluding rules from results must not disable steering"
+    assert "fileservice" in loaded.expand(["filewatch", "daemon"])

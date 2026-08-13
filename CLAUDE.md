@@ -1558,6 +1558,76 @@ until the numeric-citation case was written. Full detail:
 
 ---
 
+## Memory at scale on microsoft/vscode + MCP A/B evaluation, 2026-08-12
+
+A fresh full image (all extras, WASM on) with memory enabled, OpenAI
+`text-embedding-3-small` + `gpt-5.6-luna`, indexing **microsoft/vscode**, then an
+evaluation driven through the **real MCP surface** (`search_context` over stdio,
+a fresh `pheasant mcp` process per arm — not a Python import of the search code).
+Three suites, because memory cannot improve recall of what it does not know and
+one blended score would hide both the win and the regression:
+**corpus** MRR 0.462 → **0.495** (memory is not a tax), **memory-only** 0.000 →
+**1.000**, **steering** 0.167 → 0.250. Separately, the config-level steering
+ablation: team-vocabulary queries **0.029 → 0.467 (+0.438)** while control
+queries move **+0.000** — 33.8's acceptance criterion genuinely met, and it was
+**not** met before this run though the suite said it was.
+
+**Seven bugs, six of which the 1,067-test suite passes straight over.**
+(1) The embedder had **no retry** — one `SSLV3_ALERT_BAD_RECORD_MAC`, then a
+`429`, each killed the whole multi-hour index; `_post_with_retry` with bounded
+backoff + `Retry-After`. (2) `busy_timeout` 5s → **60s**; real
+sync/API/scheduler contention at this size hit "database is locked".
+(3) **`serve` advertised `streamable_http_url: <base>/mcp` and never mounted
+it** — 404/405 to every agent it told to connect. Three things had to be right:
+mount it; **run its lifespan** (`app.mount()` does not, and FastMCP without it
+raises "Task group is not initialized" on every request); and the
+**DNS-rebinding guard**, whose localhost-only default 421s the container
+hostname this normally runs behind — now derived from `server.api.cors_origins`
+rather than a second allow-list, widening only to hosts already admitted. Plus a
+**307** (never 302) redirect for the slash-less form, since Starlette's `Mount`
+only matches paths continuing past the prefix. (4) A pre-existing **`yaml.py`
+shim** bug — it split list items on *any* colon, so `- http://host:8765` became
+`{"http": "//host:8765"}`, corrupting `cors_origins` and anything else listing a
+URL; now YAML's real rule (colon + whitespace/EOL). Third in that shim's family.
+(5) **`pheasant mcp`/`serve` ignored `PHEASANT_CONFIG`** although the Dockerfile
+sets it, the docs say to check it, and **pheasant's own generated MCP client
+configs put it in the agent's environment** — so an agent pointed at another
+config silently searched the **wrong knowledge base and reported it as the right
+one**. (6) **Multi-word alias triggers never fired**: `Steering.expand()` looked
+up `aliases[token]` one token at a time, so `filewatch daemon -> …` parsed,
+loaded, was reported in force by `describe_retrieval`, and never once fired —
+`prefers()` directly below it already had the fix and a docstring explaining it.
+Every alias fixture in the suite was single-word (`router -> flock`). This is
+what turned steering from inert into +0.438 MRR.
+
+**The evaluation's own finding — steering rules were being returned as search
+results.** `memory=auto` first *dropped* corpus MRR to 0.335. Not crowding-out:
+only **one** memory row entered the top 10 yet `fileService.ts` fell 1 → 5, and
+`MemoryPolicy.max_results` (the lever built for this) made it slightly *worse*
+because it caps the output, not the fusion input. The rank-1 hit was the **alias
+rule itself** — an agent asking for code got a line of rule syntax dressed as
+retrieved knowledge, the cheap half of the memory-control-flow surface 33.6 set
+out to contain. Steering-kind records are now excluded from result lists by
+default (`MemoryPolicy.include_rules`, default false); the rules stay in force
+and inspectable via `describe_retrieval` and `GET /memory`. Note `admits()`
+serves two callers — "may this be *returned*" and "does this policy admit this
+rule's *scope*" — so the lift is applied where rules are loaded, beside the
+pre-existing `mode="auto"` lift that exists for the same reason.
+**Corpus MRR 0.335 → 0.495.**
+
+Suite **1,067 passed / 6 skipped / 8 failed** — all 8 verified **pre-existing**
+by stashing every change and re-running on a clean tree (Windows path separators,
+0600 perms, CRLF-inert `test_contract_parity`, the known wasmtime trap bug).
+Mutation-tested **5/5 killed** (the 307→302 mutant is killed by *hanging*: a 302
+downgrades the POST to GET and the endpoint holds it open as SSE). Contract
+untouched, no re-vendor. **Caveat: the vscode index did not finish** — ~9,700 of
+12,667 files at ~20 files/min, bounded by the embedding endpoint, so the numbers
+are on a partial index; the harness has a preflight that **excludes** unindexed
+gold targets rather than scoring them as misses in both arms. Full detail:
+`runs/2026-08-12-memory-scale-eval/SUMMARY.md`.
+
+---
+
 ## 6. Pointers
 
 - **Region-side Synapse spec:** `docs/SYNAPSE_INTEGRATION.md`

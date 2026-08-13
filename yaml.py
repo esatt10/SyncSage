@@ -36,6 +36,28 @@ def _strip_comment(text: str) -> str:
     return text
 
 
+def _mapping_colon(text: str) -> int:
+    """Index of the colon separating a YAML key from its value, or -1.
+
+    In YAML a colon only separates when followed by whitespace or end-of-line.
+    Splitting on *any* colon turned every URL in a list into a mapping —
+    ``- http://host:8765`` parsed as ``{"http": "//host:8765"}``, silently
+    corrupting list-of-URL config (``server.api.cors_origins`` is the one that
+    caught this) wherever this shim stands in for PyYAML. Quoted colons are
+    skipped for the same reason PyYAML skips them.
+    """
+    in_single = in_double = False
+    for index, char in enumerate(text):
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif char == ":" and not in_single and not in_double:
+            if index + 1 == len(text) or text[index + 1] in " \t":
+                return index
+    return -1
+
+
 def _scalar(text: str) -> Any:
     text = _strip_comment(text).strip()
     if text in {"", "null", "~"}: return None if text in {"null", "~"} else ""
@@ -73,8 +95,9 @@ def safe_load(stream: str) -> Any:
             if text.startswith("- "):
                 if container is None: container = []
                 item = text[2:]
-                if ":" in item and not item.startswith(('"', "'")):
-                    key, val = item.split(":", 1)
+                colon = _mapping_colon(item)
+                if colon != -1 and not item.startswith(('"', "'")):
+                    key, val = item[:colon], item[colon + 1 :]
                     d = {key.strip(): _scalar(val.strip()) if val.strip() else None}
                     idx += 1
                     if not val.strip() and idx < len(lines):

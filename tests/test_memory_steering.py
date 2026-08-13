@@ -337,3 +337,34 @@ def test_default_policy_applies_when_the_caller_says_nothing(tmp_path: Path) -> 
         assert any(item.get("memory") for item in asked.get("results") or [])
     finally:
         tools.engine.close()
+
+
+def test_multi_word_alias_triggers_actually_fire() -> None:
+    """A trigger written as several words must match the tokenized query.
+
+    Regression test, found by live evaluation rather than by this suite: every
+    alias fixture here happened to be single-word on the left (`router ->
+    flock`), and `expand` looked up `aliases[token]` one token at a time. So
+    the natural way to write a rule — `filewatch daemon -> fileService,
+    watcher` — parsed correctly, loaded correctly, and was reported by
+    `describe_retrieval` as being in force, while never once firing. The
+    steering feature was inert for exactly the rules people would write.
+    """
+    steering = Steering(
+        aliases={
+            "filewatch daemon": ["fileservice", "watcher"],
+            "router": ["flock"],
+        }
+    )
+
+    fired = steering.expand(["filewatch", "daemon"])
+    assert "fileservice" in fired and "watcher" in fired
+    # Additive: the original tokens always survive.
+    assert {"filewatch", "daemon"} <= set(fired)
+
+    # Every part must be present — a partial match must not fire.
+    assert "fileservice" not in steering.expand(["daemon", "process"])
+    # Single-word triggers keep working exactly as before.
+    assert "flock" in steering.expand(["router"])
+    # Order stays deterministic: the expansion feeds an FTS MATCH string.
+    assert fired == sorted(fired)

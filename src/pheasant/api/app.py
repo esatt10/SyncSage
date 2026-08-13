@@ -747,6 +747,12 @@ def create_app(
         usage_tracking=config.memory.usage_tracking,
     )
 
+    # Built before the lifespan so the lifespan closure can start its session
+    # manager: FastMCP's streamable-http app is useless without its own
+    # lifespan running ("Task group is not initialized"), and a plain
+    # app.mount() does not run a sub-app's lifespan.
+    mcp_asgi_app = _mcp_asgi_app(config)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         import asyncio
@@ -788,7 +794,11 @@ def create_app(
                 logger.info("Agent workflow ready (langgraph imported and graph compiled)")
 
         threading.Thread(target=_warm_workflows, name="pheasant-warm", daemon=True).start()
-        yield
+        if mcp_asgi_app is None:
+            yield
+        else:
+            async with mcp_asgi_app.router.lifespan_context(app):
+                yield
 
     app = FastAPI(title="pheasant", version=__version__, lifespan=lifespan)
     app.state.config = config
@@ -3099,6 +3109,23 @@ def create_app(
             "job_ids": job_ids,
         }
 
+    # Mounted *before* the UI so the SPA catch-all cannot swallow /mcp.
+    if mcp_asgi_app is not None:
+
+        @app.api_route("/mcp", methods=["GET", "POST", "DELETE"], include_in_schema=False)
+        async def _mcp_no_slash():
+            """Send the slash-less form to the mount, preserving method + body.
+
+            Starlette's ``Mount`` only matches paths that continue past the
+            prefix, so the ``/mcp`` we advertise would 405 while ``/mcp/``
+            worked. 307 (not 302) is what keeps a POST a POST and carries the
+            JSON-RPC body with it.
+            """
+            from starlette.responses import RedirectResponse
+
+            return RedirectResponse(url="/mcp/", status_code=307)
+
+        app.mount("/mcp", mcp_asgi_app)
     _mount_ui(app, config)
     return app
 
@@ -3122,6 +3149,28 @@ def _mcp_tool_summaries() -> list[dict]:
         doc = (member.__doc__ or "").strip().splitlines()
         summaries.append({"name": name, "description": doc[0] if doc else ""})
     return summaries
+
+
+def _mcp_asgi_app(config: PheasantConfig):
+    """The MCP streamable-HTTP ASGI app to mount at ``/mcp``, or None.
+
+    ``GET /mcp/info`` has always advertised ``streamable_http_url:
+    <base>/mcp``, but ``pheasant serve`` only ever built the FastAPI app — so
+    that URL 404'd, and a client POSTing to it got a 405. Found by pointing a
+    real MCP client at a live container: the server was telling every agent to
+    connect somewhere it did not listen.
+
+    Returns None when MCP or the transport is disabled, or when the installed
+    ``mcp`` package cannot build the app — the caller then mounts nothing and
+    the API behaves exactly as it did before.
+    """
+    try:
+        from pheasant.mcp_server.server import streamable_http_app
+
+        return streamable_http_app(config)
+    except Exception:  # pragma: no cover - depends on the optional [mcp] extra
+        logger.warning("MCP streamable-http app unavailable; /mcp not mounted", exc_info=True)
+        return None
 
 
 def _mount_ui(app: FastAPI, config: PheasantConfig) -> None:

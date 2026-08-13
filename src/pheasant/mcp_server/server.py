@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from pheasant.config.schema import PheasantConfig
 from pheasant.graph.exporter import node_link
 from pheasant.mcp_server.tools import PheasantTools
+
+logger = logging.getLogger(__name__)
 
 
 def create_mcp_tools(config: PheasantConfig) -> PheasantTools:
@@ -533,6 +536,81 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         )
 
     return mcp
+
+
+def _apply_transport_security(settings: Any, config: PheasantConfig) -> None:
+    """Point FastMCP's DNS-rebinding guard at pheasant's own CORS policy.
+
+    FastMCP defaults the guard to ``127.0.0.1``/``localhost``/``[::1]`` only,
+    which is right for a laptop and wrong for the container this normally runs
+    in: reach the very same server as ``http://pheasant:8765`` or by LAN IP and
+    every MCP request answers **421 Misdirected Request**.
+
+    Rather than invent a second allow-list, this derives one from
+    ``server.api.cors_origins`` — the knob an operator already uses to say who
+    may reach this API — and honours ``cors_allow_all_origins`` as the same
+    documented escape hatch it already is. FastMCP's localhost defaults are
+    kept alongside, so this only ever *widens* to hosts the operator already
+    admitted, and a config that never mentions CORS behaves as FastMCP intends.
+    """
+    from urllib.parse import urlsplit
+
+    security = getattr(settings, "transport_security", None)
+    if security is None:
+        return
+    api = config.server.api
+    if getattr(api, "cors_allow_all_origins", False):
+        # The operator has declared this API open (their own authenticating
+        # ingress fronts it). Refusing MCP on host grounds here would be
+        # inconsistent with every other route on the same port.
+        security.enable_dns_rebinding_protection = False
+        return
+    hosts = list(security.allowed_hosts)
+    origins = list(security.allowed_origins)
+    for origin in api.cors_origins or []:
+        parsed = urlsplit(origin)
+        if not parsed.netloc:
+            continue
+        if parsed.netloc not in hosts:
+            hosts.append(parsed.netloc)
+        if origin not in origins:
+            origins.append(origin)
+    security.allowed_hosts = hosts
+    security.allowed_origins = origins
+
+
+def streamable_http_app(config: PheasantConfig) -> Any:
+    """The MCP streamable-HTTP ASGI app, for mounting inside the API server.
+
+    ``pheasant serve`` advertises ``streamable_http_url: <base>/mcp`` from
+    ``GET /mcp/info`` whenever ``server.mcp.transports.streamable_http`` is on
+    (the default) — but it only ever built the FastAPI app, so that URL 404'd
+    and a client POSTing to it got a 405. Found by pointing a real MCP client
+    at a live container: the server was telling every agent to connect
+    somewhere it did not listen.
+
+    Returns None when the transport is disabled or the installed ``mcp``
+    package cannot build the app, so the caller mounts nothing and the API
+    behaves exactly as it did.
+    """
+    if not config.server.mcp.enabled:
+        return None
+    if not config.server.mcp.transports.get("streamable_http", False):
+        return None
+    try:
+        mcp = create_mcp_server(config)
+        # The route inside FastMCP's app becomes the *mount* point's suffix, so
+        # its internal path has to be "/" — leaving it at "/mcp" while mounting
+        # at "/mcp" would serve "/mcp/mcp". Mounting the app at "/" instead
+        # would put an ASGI catch-all ahead of the UI's static files.
+        settings = getattr(mcp, "settings", None)
+        if settings is not None:
+            settings.streamable_http_path = "/"
+            _apply_transport_security(settings, config)
+        return mcp.streamable_http_app()
+    except Exception:  # pragma: no cover - depends on the installed mcp version
+        logger.warning("MCP streamable-http app unavailable; /mcp not mounted", exc_info=True)
+        return None
 
 
 def run_mcp_server(config: PheasantConfig, transport: str = "stdio") -> None:

@@ -34,6 +34,12 @@ from typing import Any
 #: `only`   — memory and nothing else.
 #: `prefer` — memory participates, and is guaranteed a share of the slots it
 #:            would otherwise have been truncated out of.
+#: Record kinds that carry a retrieval *rule* rather than an assertion. Defined
+#: here rather than in `steering.py` because `admits`/`sql_predicate` need it and
+#: `steering` already imports from this module — `steering.STEERING_KINDS` re-exports
+#: it so the name stays where readers of the steering code expect to find it.
+STEERING_KINDS = ("alias", "preference", "exclusion")
+
 VALID_MODES = ("auto", "off", "only", "prefer")
 DEFAULT_MODE = "auto"
 
@@ -59,6 +65,19 @@ class MemoryPolicy:
     as_of: str | None = None
     #: Cap on how many of the returned slots memory may occupy.
     max_results: int | None = None
+    #: Return steering records (`alias`/`preference`/`exclusion`) as content
+    #: too. Off by default: a steering record is retrieval *machinery*, not an
+    #: assertion, and returning it answers a question nobody asked. Measured
+    #: live on the vscode corpus — the alias rule `filewatch daemon ->
+    #: fileService, watcher` took **rank 1** for "where is the file service
+    #: implemented", pushing the real `fileService.ts` to rank 5 and dropping
+    #: corpus MRR from 0.462 to 0.335. It also hands an agent rule syntax
+    #: dressed as retrieved knowledge, which is the cheap half of the
+    #: memory-control-flow surface 33.6 set out to contain. The rules stay
+    #: fully in force and fully inspectable via `describe_retrieval`'s memory
+    #: block and `GET /memory`; this governs only whether they are *returned
+    #: as passages*. Set true to see them in results anyway.
+    include_rules: bool = False
 
     @property
     def is_default(self) -> bool:
@@ -107,6 +126,7 @@ class MemoryPolicy:
             current_only=bool(value.get("current_only", True)),
             as_of=(str(value["as_of"]) if value.get("as_of") else None),
             max_results=(int(max_results) if max_results is not None else None),
+            include_rules=bool(value.get("include_rules", False)),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -117,6 +137,7 @@ class MemoryPolicy:
             "current_only": self.current_only,
             "as_of": self.as_of,
             "max_results": self.max_results,
+            "include_rules": self.include_rules,
         }
 
 
@@ -147,6 +168,8 @@ def admits(policy: MemoryPolicy, record: Mapping[str, Any] | None, *, now: str) 
     if record is None:
         return policy.mode != "only"
     if policy.mode == "off":
+        return False
+    if not policy.include_rules and str(record.get("kind") or "") in STEERING_KINDS:
         return False
     if policy.scopes and str(record.get("scope") or "") not in policy.scopes:
         return False
@@ -179,6 +202,10 @@ def sql_predicate(
 
     clauses: list[str] = []
     params: list[Any] = []
+    if not policy.include_rules:
+        placeholders = ",".join("?" for _ in STEERING_KINDS)
+        clauses.append(f"COALESCE({alias}.kind, '') NOT IN ({placeholders})")
+        params.extend(STEERING_KINDS)
     if policy.scopes:
         placeholders = ",".join("?" for _ in policy.scopes)
         clauses.append(f"{alias}.scope IN ({placeholders})")

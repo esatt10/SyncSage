@@ -32,10 +32,12 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from pheasant.memory.policy import MemoryPolicy, admits
+from pheasant.memory.policy import STEERING_KINDS, MemoryPolicy, admits
 
-#: Record kinds that carry a rule rather than an assertion.
-STEERING_KINDS = ("alias", "preference", "exclusion")
+#: Record kinds that carry a rule rather than an assertion. Canonical
+#: definition lives in `policy` (which cannot import this module); re-exported
+#: here because this is where readers look for it.
+__all__ = ["STEERING_KINDS", "Steering", "load_steering", "load_steering_records", "parse_rule"]
 
 #: Bounds. A steering set is meant to be a handful of deliberate rules; these
 #: stop a runaway store from turning every query into a thousand-term
@@ -83,13 +85,24 @@ class Steering:
         Additive only: the original tokens always survive, so an alias can
         widen a search but never narrow one. Deterministic order, because the
         expansion feeds an FTS `MATCH` string that must be stable.
+
+        A trigger is matched against the *tokenized* query the same way
+        `prefers` matches its own, and for the same reason: this looked up
+        `aliases[token]` one token at a time, so a multi-word trigger — the
+        natural way to write one, `filewatch daemon -> fileService, watcher` —
+        could never match any single token and silently never fired. Every
+        part must be present, so a rule about `filewatch daemon` does not fire
+        on a query that merely said `daemon`.
         """
         if not self.aliases:
             return tokens
         extra: set[str] = set()
         present = set(tokens)
-        for token in tokens:
-            for value in self.aliases.get(token, []):
+        for trigger, values in self.aliases.items():
+            parts = {part for part in re.split(r"[\s_\-]+", trigger) if len(part) > 1}
+            if trigger not in present and not (parts and parts <= present):
+                continue
+            for value in values:
                 for word in re.split(r"[\s_\-]+", value):
                     word = word.strip().lower()
                     if word and len(word) > 1 and word not in present:
@@ -216,7 +229,12 @@ def load_steering(
     """
     if not enabled or not records:
         return Steering()
-    rule_policy = replace(policy, mode="auto")
+    # `include_rules` is a statement about what is *returned as content* —
+    # steering records are machinery, so they stay out of result lists by
+    # default. Here we are deciding which rules are in force, which is the one
+    # place that must see them, so the content filter is lifted while scope,
+    # subject and validity gating stay exactly as they were.
+    rule_policy = replace(policy, mode="auto", include_rules=True)
 
     aliases: dict[str, list[str]] = {}
     preferences: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
