@@ -299,6 +299,13 @@ class EmbeddingsSettings(ModelMixin):
     api_key_env: str = "OPENAI_API_KEY"
     dimensions: int | None = None
     batch_size: int = 64
+    #: Bounded retry on *transient* embedding failures (TLS blips, 429s, 5xx).
+    #: Indexing a large corpus is hundreds of HTTPS calls, and without this a
+    #: single flaky one aborts the whole sync — a real 12,667-file run died
+    #: ~45 minutes in on an `SSLV3_ALERT_BAD_RECORD_MAC`. A wrong key or a
+    #: malformed request is never retried.
+    max_retries: int = 4
+    retry_backoff_seconds: float = 1.0
 
 
 @dataclass
@@ -505,6 +512,11 @@ class GraphSettings(ModelMixin):
     """
 
     concept_min_documents: int = 2
+    #: Wire agent-memory records into the graph (Step 33.7): `about` edges to
+    #: what a record refers to, plus `supersedes` between corrections. A no-op
+    #: without a memory source, so turning it off only matters to a region that
+    #: has one and would rather keep memory out of its graph.
+    memory_entity_bridging: bool = True
     # Synapse Step 34.5a: run graph.enrichment.resolve_cross_source_edges
     # through the vendored WASM accelerator instead of pure Python. Default
     # off — needs the [wasm] extra; falls back to pure Python on any
@@ -661,6 +673,27 @@ class MemorySettings(ModelMixin):
     session_ttl_days: int | None = None
     user_ttl_days: int | None = None
     org_ttl_days: int | None = None
+
+    # --- retrieval (Steps 33.6-33.9) -------------------------------------
+    #: How memory takes part in a search that does not say: ``auto`` (like any
+    #: other source), ``off``, ``only`` or ``prefer``. A per-call ``memory``
+    #: argument always wins over this.
+    default_policy: str = "auto"
+    #: Let ``alias``/``preference``/``exclusion`` records steer *ranking*, not
+    #: just be retrievable (Step 33.8). Off by default: a memory that silently
+    #: re-orders results is a surprise unless it was asked for.
+    steering_enabled: bool = False
+    #: Count which memories retrieval actually returns, so salience can reflect
+    #: use (Step 33.9). Off by default — it is a write on the read path, and
+    #: recording what a person looks up is a choice an operator should make.
+    usage_tracking: bool = False
+    #: Archive the least salient records once the store exceeds this many.
+    #: ``None`` = unbounded, which is the pre-33.9 behavior.
+    max_records: int | None = None
+    #: Cap on `about` edges drawn per record by the graph bridge (Step 33.7).
+    #: Total `about` edges stay bounded by this times the record count — the
+    #: ceiling the retired concept layer never had.
+    about_max_targets: int = 3
 
 
 @dataclass

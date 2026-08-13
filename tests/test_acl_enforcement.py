@@ -186,3 +186,130 @@ def test_is_allowed_semantics() -> None:
     assert not is_allowed(None, None, default_public=False)  # private default, anonymous
     assert is_allowed(None, ids, default_public=False)  # private default, authenticated
     assert not is_allowed("not-json", ids, default_public=True)  # fails closed
+
+
+# ---------------------------------------------------------------------------
+# Step 33.11 — agent-memory isolation
+# ---------------------------------------------------------------------------
+
+
+def _memory_config(tmp_path, *, enforced: bool = True):
+    (tmp_path / "docs").mkdir(exist_ok=True)
+    (tmp_path / "docs" / "readme.md").write_text("# Shared\n\nA public note.\n", encoding="utf-8")
+    (tmp_path / "memory").mkdir(exist_ok=True)
+    config_path = tmp_path / "pheasant.yaml"
+    config_path.write_text(
+        f"""pheasant:
+  name: acl-memory
+  state_path: {tmp_path / ".pheasant" / "state"}
+  vault_path: {tmp_path / ".pheasant" / "vault"}
+  exports_path: {tmp_path / ".pheasant" / "exports"}
+  workspace_root: {tmp_path}
+sync:
+  watcher:
+    enabled: false
+  scheduler:
+    enabled: false
+security:
+  acl_enforced: {"true" if enforced else "false"}
+sources:
+  - name: docs
+    type: document_folder
+    path: docs
+  - name: agent-memory
+    type: memory
+    path: memory
+""",
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def test_a_user_scope_memory_is_readable_only_by_its_writer(tmp_path) -> None:
+    """The leak Step 33.11 closes.
+
+    Before it, `acl_enforced` filtered every corpus document by principal while
+    leaving one agent's private notes readable by every other agent sharing the
+    region — memory was the one source that carried no ACL at all.
+    """
+    from pheasant.config.loader import load_config
+    from pheasant.mcp_server.tools import PheasantTools
+
+    config_path = _memory_config(tmp_path)
+    tools = PheasantTools(load_config(config_path))
+    try:
+        tools.memory_write(
+            "acl-memory",
+            "Alice keeps the release calendar in her head.",
+            scope="user",
+            principal="user:alice",
+        )
+        tools.sync_source("acl-memory", "agent-memory", "full")
+
+        def seen_by(principal: str) -> str:
+            # The *results*, not the whole payload: that echoes the query back,
+            # so stringifying it would match no matter what was filtered.
+            payload = tools.search_context(
+                "acl-memory", "release calendar", mode="text", principal=principal
+            )
+            return str(payload.get("results") or []).lower()
+
+        assert "release calendar" in seen_by("user:alice")
+        assert "release calendar" not in seen_by("user:bob")
+    finally:
+        tools.engine.close()
+
+
+def test_an_org_scope_memory_stays_shared(tmp_path) -> None:
+    """Scope is the whole rule: `org` was written for everyone."""
+    from pheasant.config.loader import load_config
+    from pheasant.mcp_server.tools import PheasantTools
+
+    config_path = _memory_config(tmp_path)
+    tools = PheasantTools(load_config(config_path))
+    try:
+        tools.memory_write(
+            "acl-memory",
+            "Deploy freezes start Friday at five.",
+            scope="org",
+            principal="user:alice",
+        )
+        tools.sync_source("acl-memory", "agent-memory", "full")
+        payload = tools.search_context(
+            "acl-memory", "deploy freezes", mode="text", principal="user:bob"
+        )
+        assert "deploy freezes" in str(payload.get("results") or []).lower()
+    finally:
+        tools.engine.close()
+
+
+def test_memory_acl_normalization_rules() -> None:
+    from pheasant.security.acl import normalize_acl
+
+    assert normalize_acl("memory", {"scope": "org", "written_by": "user:alice"})["public"] is True
+    private = normalize_acl("memory", {"scope": "user", "written_by": "user:alice"})
+    assert private["allow"] == ["user:alice"]
+    assert private["public"] is False
+    # No recorded writer: nothing can be asserted, so fall through to the
+    # region default rather than inventing an owner.
+    assert normalize_acl("memory", {"scope": "session", "written_by": None}) is None
+
+
+def test_enforcement_off_leaves_memory_visible_to_everyone(tmp_path) -> None:
+    """Pre-33.11 behavior is preserved when ACLs are not enforced."""
+    from pheasant.config.loader import load_config
+    from pheasant.mcp_server.tools import PheasantTools
+
+    config_path = _memory_config(tmp_path, enforced=False)
+    tools = PheasantTools(load_config(config_path))
+    try:
+        tools.memory_write(
+            "acl-memory", "Alice keeps the calendar.", scope="user", principal="user:alice"
+        )
+        tools.sync_source("acl-memory", "agent-memory", "full")
+        payload = tools.search_context(
+            "acl-memory", "keeps the calendar", mode="text", principal="user:bob"
+        )
+        assert "keeps the calendar" in str(payload.get("results") or []).lower()
+    finally:
+        tools.engine.close()

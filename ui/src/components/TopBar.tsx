@@ -42,6 +42,12 @@ export function TopBar() {
           Graph
         </NavLink>
         <NavLink
+          to="/memory"
+          className={({ isActive }) => (isActive ? "navlink active" : "navlink")}
+        >
+          Memory
+        </NavLink>
+        <NavLink
           to="/sources"
           className={({ isActive }) => (isActive ? "navlink active" : "navlink")}
         >

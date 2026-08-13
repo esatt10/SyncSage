@@ -156,7 +156,7 @@ just a networking detail — see [security.md](security.md#trust-model-for-the-h
 | `ranking.prefer_recent_commits` | bool | `true` (example) | Boost content tied to recent commits. |
 | `ranking.graph_neighbor_boost` | bool | `true` (example) | Boost graph-adjacent matches. |
 | `ranking.max_results_default` | integer | `10` | Default result count cap. |
-| `wasm_relationship_search` | bool | `false` | Run `graph_search._scan_edges` through the vendored WASM accelerator (Synapse 34.5b) instead of pure Python. Needs the `[wasm]` extra; falls back to pure Python on any failure or if the extra is missing — never a correctness dependency. A consistent, growing win (2-8x at 34.4's benchmark scale) on the relationship-search query path. |
+| `wasm_relationship_search` | bool | `false` | Run `graph_search._scan_edges` through the vendored WASM accelerator (Synapse 34.5b) instead of pure Python. Needs the `[wasm]` extra; falls back to pure Python on any failure or if the extra is missing — never a correctness dependency. A consistent, growing win (2-8x at 34.4's benchmark scale) on the relationship-search query path. **The Docker image turns this on** in a config it generates itself, since it always installs the `[wasm]` extra. |
 
 ---
 
@@ -417,7 +417,8 @@ lands in config or on disk.
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `concept_min_documents` | integer | `2` | Distinct documents that must share a term before it becomes a `concept` node. A concept exists to link the documents that share it; one mentioned by a single document is pure weight — measured on a real corpus, 74.2% of concept nodes were single-document and concepts made up 87.2% of a bloated graph. Set to `1` to keep every term as a node (pre-2026-08 behavior). Nothing becomes unfindable at higher values: the term stays on `concept_terms`/`artifact_terms` and in searchable text either way. |
-| `wasm_cross_source_resolution` | bool | `false` | Run `resolve_cross_source_edges` (import/link resolution across sources) through the vendored WASM accelerator (Synapse 34.5a) instead of pure Python. Needs the `[wasm]` extra; falls back to pure Python on any failure or if the extra is missing. Conditional win per the 34.4 benchmark — loses to Python below roughly 1,300-2,500 edges, wins modestly above it; opt in for large/growing multi-source graphs, leave off for small ones. |
+| `memory_entity_bridging` | bool | `true` | Wire agent-memory records into the graph (`about` edges to what a record refers to, `supersedes` between corrections). A no-op without a memory source. |
+| `wasm_cross_source_resolution` | bool | `false` | Run `resolve_cross_source_edges` (import/link resolution across sources) through the vendored WASM accelerator (Synapse 34.5a) instead of pure Python. Needs the `[wasm]` extra; falls back to pure Python on any failure or if the extra is missing. Conditional win per the 34.4 benchmark — loses to Python below roughly 1,300-2,500 edges, wins modestly above it; opt in for large/growing multi-source graphs, leave off for small ones. **The Docker image turns this on** in a config it generates itself, on the assumption that a container's graph grows past the crossover; set it to `false` in your config if you are indexing a small, static corpus. |
 
 ---
 
@@ -484,14 +485,14 @@ exactly like a router-less pheasant. Read
 
 ---
 
-## `memory` (agent-memory consolidation, optional)
+## `memory` (agent memory, optional)
 
-Governs the built-in `memory` source type (Step 33.x): agents write
-records via MCP `memory_write` / `POST /memory`, which land as append-only
-frontmatter Markdown files indexed by the ordinary pipeline — recall is
-just search. This block only controls **consolidation** (archiving), not
-whether the memory source itself is registered. See
-[Agent memory](how-to/agent-memory.md).
+Governs the built-in `memory` source type: agents write records via MCP
+`memory_write` / `POST /memory`, which land as append-only frontmatter
+Markdown files indexed by the ordinary pipeline — recall is just search.
+This block controls **consolidation** (archiving), how memory takes part in
+**retrieval**, and how the store is **bounded**; it does not register the
+memory source itself. See [Agent memory](how-to/agent-memory.md).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
@@ -499,6 +500,16 @@ whether the memory source itself is registered. See
 | `session_ttl_days` | integer \| null | `null` | TTL for `session`-scoped records. `null` = never expires by age. |
 | `user_ttl_days` | integer \| null | `null` | TTL for `user`-scoped records. |
 | `org_ttl_days` | integer \| null | `null` | TTL for `org`-scoped records. |
+| `default_policy` | `auto` \| `off` \| `only` \| `prefer` | `auto` | How memory takes part in a search that does not say. A per-call `memory` argument (MCP `search_context`, `POST /search`, `POST /assistant/chat`) always wins. `auto` = like any other source; `only` = memory and nothing else; `prefer` = memory is guaranteed a share of the result slots. |
+| `steering_enabled` | bool | `false` | Let `alias` / `preference` / `exclusion` records re-rank results rather than merely be retrievable. Off by default: a memory that silently re-orders searches is a surprise unless it was asked for. See [Agent memory](how-to/agent-memory.md#steering). |
+| `usage_tracking` | bool | `false` | Count which records retrieval actually returns, so salience reflects use. Off by default — it is a write on the read path, and recording what someone looks up is an operator's decision. |
+| `max_records` | integer \| null | `null` | Archive the least salient records once the store exceeds this many. `null` = unbounded. Pruning uses the same in-place `.md.archived` rename as consolidation; nothing is deleted. |
+| `about_max_targets` | integer | `3` | Cap on `about` edges the graph bridge draws per record. Total `about` edges stay bounded by this times the record count — the ceiling the retired concept layer never had. |
+
+**Corrected records are excluded from retrieval automatically**, at query time,
+without waiting for a consolidation pass — pass `{"current_only": false}` or an
+`as_of` instant to see them. That is a property of the retrieval path, not a
+setting here.
 
 ---
 

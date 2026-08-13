@@ -8,6 +8,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from pheasant.config.schema import FILESYSTEM_SOURCE_TYPES, PheasantConfig, SourceConfig
@@ -474,6 +475,81 @@ class SyncEngine:
         if self.transcriber is None and source_includes_audio(source):
             self.transcriber = transcriber_from_config(self.config, source=source)
 
+    @staticmethod
+    def _memory_acl(path: Any) -> dict[str, Any] | None:
+        """`{scope, written_by}` read from the record file (Step 33.11).
+
+        Read from the file rather than the `memory_records` projection because
+        this runs *inside* the artifact loop, before the projection for this
+        sync exists. Fail-soft: an unreadable record simply expresses no ACL
+        and falls back to the region default, which is what it did before 33.11.
+        """
+        try:
+            from pheasant.memory.store import MemoryStore
+
+            record = MemoryStore(Path(path).parent).load(Path(path))
+        except Exception:
+            return None
+        return {"scope": record.scope, "written_by": record.written_by}
+
+    def _bridge_memory(self) -> None:
+        """Emit memory `supersedes` + `about` edges (Step 33.7).
+
+        Runs on the global-enrichment beat rather than per source, because a
+        record can be about content that lives in a *different* source and the
+        bridge can only see it once that source is indexed too.
+
+        Fail-soft, matching every other global pass here: a bridge that cannot
+        be derived costs some edges, never the sync that produced the content.
+        """
+        if not self.config.graph.memory_entity_bridging:
+            return
+        try:
+            report = self.graph_builder.add_memory_edges(
+                self.state, self.config.memory.about_max_targets
+            )
+        except Exception:
+            logger.warning("memory graph bridge failed; edges not updated", exc_info=True)
+            return
+        if report.get("records"):
+            logger.info(
+                "Memory bridged: %s records, %s about edges %s, %s supersedes, %s unbridged",
+                report["records"],
+                report["about"],
+                report.get("by_signal") or {},
+                report["supersedes"],
+                len(report.get("unbridged") or []),
+            )
+
+    def _project_memory_records(self, source: Any) -> None:
+        """Rebuild ``memory_records`` for a ``type: memory`` source (Step 33.5).
+
+        A no-op for every other source type, so a region without agent memory
+        is untouched. Rebuilding wholesale — rather than diffing — is what
+        keeps the table a *projection*: it cannot drift from the files, an
+        archived record disappears without needing its own delete path, and a
+        second sync over unchanged records writes identical rows.
+
+        Fail-soft, the same posture document extraction takes: one unreadable
+        record must not abort a sync that indexed everything else. The rows
+        from the previous pass survive (the write is a single transaction that
+        never runs), and the warning says so.
+        """
+        if getattr(source.type, "value", source.type) != "memory":
+            return
+        try:
+            from pheasant.memory.projection import project
+            from pheasant.memory.store import MemoryStore
+
+            records = MemoryStore(source.path).list_records()
+            self.state.replace_memory_records(source.name, project(source.name, records))
+        except Exception:
+            logger.warning(
+                "memory projection failed for %s; keeping the previous rows",
+                source.name,
+                exc_info=True,
+            )
+
     def sync_source(
         self,
         source_name: str,
@@ -650,7 +726,16 @@ class SyncEngine:
                 now = utc_now()
                 from pheasant.security.acl import normalize_acl
 
-                acl_doc = normalize_acl(connector.connector_type, (item.metadata or {}).get("acl"))
+                acl_raw = (item.metadata or {}).get("acl")
+                acl_kind = connector.connector_type
+                if getattr(source.type, "value", source.type) == "memory":
+                    # Step 33.11 — a memory record is served by the ordinary
+                    # filesystem connector, so its connector type says nothing
+                    # about who may read it. Its *scope* does, and that lives
+                    # in the record, not in the file's metadata.
+                    acl_kind = "memory"
+                    acl_raw = self._memory_acl(parsed.path)
+                acl_doc = normalize_acl(acl_kind, acl_raw)
                 artifact_row = {
                     "acl": json.dumps(acl_doc, sort_keys=True) if acl_doc else None,
                     "id": parsed.id,
@@ -739,6 +824,13 @@ class SyncEngine:
             # scheduled sync over untouched content used to re-derive every
             # similarity pair and re-scan every edge on each beat, which is
             # what pinned a container's CPU while indexing nothing.
+            # Step 33.5 — refresh the structured face of the memory records.
+            # After the artifact loop, so every row's artifact_id names an
+            # artifact that exists, and *before* global enrichment, because
+            # 33.7's graph bridge reads this table: projecting afterwards
+            # meant the memory source's own first sync bridged zero records.
+            # A no-op for every source that is not `type: memory`.
+            self._project_memory_records(source)
             if indexed or mode == "full":
                 # Global enrichment is proportional to the whole graph, not to
                 # what changed, so on a large index this is where a sync
@@ -759,6 +851,11 @@ class SyncEngine:
                 # idempotent via edge upsert, so re-sync produces an identical
                 # graph.
                 self.graph_builder.add_cross_source_edges()
+                # Step 33.7 — memory into the graph. **After** cross-source
+                # resolution, because the bridge's strongest rung is "this
+                # record explicitly names a file", and that edge does not exist
+                # until the pass above has resolved it. A no-op without memory.
+                self._bridge_memory()
                 # Keep only the concepts that connect something. Runs last so
                 # similarity (which reads concept_terms off artifact nodes,
                 # not concept nodes) is unaffected.

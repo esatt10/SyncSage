@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from urllib.parse import urlparse
 
 from pheasant.config.schema import SourceConfig
+from pheasant.ingestion.content_types import ARTIFACT_TYPES
 from pheasant.ingestion.pipeline import ParsedArtifact
 
 ENRICHED_NODE_TYPES = {"symbol", "entity", "concept", "external_reference"}
@@ -312,7 +313,9 @@ class SemanticSimilarityPass:
         return edges
 
 
-ARTIFACT_NODE_TYPES = {"file", "markdown_note", "document"}
+#: Re-exported under its long-standing name; the definition now lives in
+#: `ingestion.content_types` so the four modules that need it cannot drift.
+ARTIFACT_NODE_TYPES = ARTIFACT_TYPES
 
 
 @dataclass(frozen=True)
@@ -705,8 +708,14 @@ def _keyword_bigrams(words: list[str]) -> set[str]:
 
 
 def _entity_candidates(text: str) -> set[str]:
+    # `[ \t]+`, not `\s+`: `\s` matches newlines, so a Title Case heading fused
+    # with the opening words of the next paragraph into a single "entity" whose
+    # label literally contained the line breaks — e.g.
+    # "Runbook\r\n\r\nThe Kestrel Gateway". That is not one entity, it is two,
+    # and the junk label meant nothing could ever match the real one by name
+    # (found by Step 33.7's graph bridge, which matches entities by label).
     candidates = set(re.findall(r"\b[A-Z][A-Za-z0-9]+(?:[A-Z][A-Za-z0-9]+)+\b", text))
-    candidates.update(re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b", text))
+    candidates.update(re.findall(r"\b[A-Z][a-z]+(?:[ \t]+[A-Z][a-z]+){1,3}\b", text))
     return candidates
 
 

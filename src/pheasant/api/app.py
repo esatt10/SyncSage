@@ -106,6 +106,31 @@ class SearchRequest(BaseModel):
     # Restrict to one part of a document's extracted taxonomy, matched against
     # the heading breadcrumb. Only meaningful for sources with taxonomy on.
     section: str | None = None
+    # Step 33.6 — the same retrieval criteria the MCP tool has always had.
+    # They lived only on the MCP surface, so the same region answered a query
+    # differently depending on which protocol asked; the router, which reaches
+    # this region over HTTP, could not scope a search at all.
+    exclude_sources: list[str] | None = None
+    node_types: list[str] | None = None
+    min_score: float | None = None
+    # How this region's agent memory takes part: "auto" (default), "off",
+    # "only", "prefer", or an object with scopes/subject/current_only/as_of.
+    memory: dict | str | None = None
+
+
+class MemoryEnableRequest(BaseModel):
+    """Provision the agent-memory source.
+
+    ``path`` defaults to ``<state_path>/memory`` rather than a workspace-
+    relative folder, because memory is the **only** source type pheasant
+    writes to. Every containerised deployment mounts the corpus read-only
+    (`/workspace:ro` in both the standard and demo compose files), so
+    anchoring memory there registers a source that can never be written —
+    found by a live run, where the first write returned a bare 500.
+    """
+
+    name: str = "agent-memory"
+    path: str | None = None
 
 
 class MemoryWriteRequest(BaseModel):
@@ -115,6 +140,13 @@ class MemoryWriteRequest(BaseModel):
     supersedes: str | None = None
     tags: list[str] = []
     sync: bool = True
+    # Step 33.5, all optional and defaulting to the pre-33.5 behavior.
+    # `principal` is who asserted this; it is part of the record id, so two
+    # callers writing the same sentence in the same second get two records
+    # rather than silently sharing one.
+    kind: str = "fact"
+    principal: str | None = None
+    valid_until: str | None = None
 
 
 class SyncRequest(BaseModel):
@@ -207,6 +239,9 @@ class ChatRequest(BaseModel):
     workflow: str | None = None
     # Per-request workflow knobs, merged over assistant.workflow_options.
     options: dict | None = None
+    # How this region's agent memory takes part in the answer: "auto", "off",
+    # "only", "prefer", or the full policy object (Step 33.10).
+    memory: dict | str | None = None
 
 
 class EmbeddingsRequest(BaseModel):
@@ -707,7 +742,16 @@ def create_app(
         vector=engine.vector_searcher(),
         node_index=engine.node_index,
         wasm_relationship_search=config.search.wasm_relationship_search,
+        steering_enabled=config.memory.steering_enabled,
+        default_memory_policy=config.memory.default_policy,
+        usage_tracking=config.memory.usage_tracking,
     )
+
+    # Built before the lifespan so the lifespan closure can start its session
+    # manager: FastMCP's streamable-http app is useless without its own
+    # lifespan running ("Task group is not initialized"), and a plain
+    # app.mount() does not run a sub-app's lifespan.
+    mcp_asgi_app = _mcp_asgi_app(config)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -750,7 +794,11 @@ def create_app(
                 logger.info("Agent workflow ready (langgraph imported and graph compiled)")
 
         threading.Thread(target=_warm_workflows, name="pheasant-warm", daemon=True).start()
-        yield
+        if mcp_asgi_app is None:
+            yield
+        else:
+            async with mcp_asgi_app.router.lifespan_context(app):
+                yield
 
     app = FastAPI(title="pheasant", version=__version__, lifespan=lifespan)
     app.state.config = config
@@ -1129,6 +1177,11 @@ def create_app(
             )
 
         try:
+            jobs.progress(
+                job_id,
+                phase="waiting_for_indexer",
+                detail="Queued for the index writer",
+            )
             worker = WorkerBackedEngine(engine, app.state.config_path)
             if source_name:
                 results = [worker.sync_source(source_name, mode, on_progress=forward)]
@@ -1371,7 +1424,7 @@ def create_app(
     def memory_write(req: MemoryWriteRequest) -> dict:
         from pheasant.memory.store import MemoryStore, memory_source
 
-        source = memory_source(config)
+        source = memory_source(config, state)
         if source is None:
             raise HTTPException(
                 status_code=400,
@@ -1387,19 +1440,59 @@ def create_app(
                 subject=req.subject,
                 supersedes=req.supersedes,
                 tags=req.tags,
+                kind=req.kind,
+                written_by=req.principal,
+                valid_until=req.valid_until,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            # A memory source pointed at somewhere unwritable — most often a
+            # read-only corpus mount — used to surface as a bare 500 with the
+            # traceback only in the container logs. The caller can act on this.
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"could not write the memory record to {source.path}: {exc}. "
+                    "The memory source needs a writable location; a read-only mount "
+                    "will not do."
+                ),
+            ) from exc
         payload: dict = {"record": record.as_dict(), "created": created, "source": source.name}
+        # The record is already durably on disk; this sync only makes it
+        # *searchable now*. Failing the whole request when it cannot run — most
+        # often because another writer holds the engine lease, which a live run
+        # hit immediately — reports "your memory was not saved" when it was.
+        # Degrade to deferred indexing instead: the scheduler and the next sync
+        # both pick it up.
         if req.sync and created:
-            payload["sync"] = engine.sync_source(source.name, "incremental").__dict__
+            try:
+                payload["sync"] = engine.sync_source(source.name, "incremental").__dict__
+            except Exception as exc:
+                logger.warning("memory write indexed later: %s", exc)
+                payload["sync_deferred"] = str(exc)
+        # Writing a memory is a mutation of what this region will later assert
+        # as fact, which is exactly what the audit log is for. The MCP path has
+        # always recorded it; this one silently did not, so the same action was
+        # traceable or not depending on which protocol the caller happened to
+        # use.
+        audit(
+            source.name,
+            "memory_write",
+            {
+                "record_id": record.record_id,
+                "scope": record.scope,
+                "kind": record.kind,
+                "created": created,
+            },
+        )
         return payload
 
     @app.get("/memory")
     def memory_list(scope: str | None = None, current_only: bool = False) -> dict:
         from pheasant.memory.store import MemoryStore, memory_source
 
-        source = memory_source(config)
+        source = memory_source(config, state)
         if source is None:
             raise HTTPException(
                 status_code=400,
@@ -1414,18 +1507,102 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"source": source.name, "records": [r.as_dict() for r in records]}
 
+    @app.post("/memory/enable")
+    def memory_enable(req: MemoryEnableRequest) -> dict:
+        """Provision the agent-memory source (Step 33.11).
+
+        `SourceType.memory` is deliberately absent from `BUILTIN_SOURCE_TYPES`
+        — memory sources are owned by the store, not hand-registered through
+        the generic source picker, and letting someone point one at an
+        arbitrary folder full of unrelated Markdown would make every file in it
+        look like something an agent asserted.
+
+        But "not in the picker" had come to mean **unreachable**: a person
+        could not turn memory on from the UI at all. A dedicated action keeps
+        the invariant (one well-known layout, created by us) while closing that
+        gap. Idempotent — enabling twice returns the existing source.
+        """
+        from pheasant.memory.store import memory_source
+
+        existing = memory_source(config, state)
+        if existing is not None:
+            return {"status": "already-enabled", "source": existing.model_dump(mode="json")}
+
+        if req.path is None:
+            # `/state` is the one location pheasant owns and can always write.
+            path = Path(config.pheasant.state_path) / "memory"
+        else:
+            # An explicit relative path anchors to `pheasant.workspace_root`,
+            # exactly as config load anchors any FILESYSTEM_SOURCE_TYPE. Going
+            # through `_resolve_source_path` instead resolves against the
+            # *process CWD*, which put the folder wherever the server happened
+            # to be started from — during development that was the repo
+            # checkout, and a record was written into it.
+            requested = Path(req.path).expanduser()
+            path = (
+                requested
+                if requested.is_absolute()
+                else Path(config.pheasant.workspace_root) / requested
+            )
+            if not config.security.allow_user_selected_source_paths:
+                try:
+                    path = resolve_under(str(path), _allowed_roots(config))
+                except PathPolicyError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # Prove it is writable *before* registering. Otherwise enabling
+        # "succeeds" and every later write fails — which is exactly what a
+        # read-only corpus mount produced on a live run.
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".pheasant-write-test"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+        except OSError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"cannot write memory records to {path}: {exc}. Memory is the one "
+                    "source pheasant writes to, so it needs a writable location — a "
+                    "read-only corpus mount will not do. Pass an explicit `path`, or "
+                    "mount a writable volume."
+                ),
+            ) from exc
+
+        try:
+            source = _source_from_payload(
+                {"name": req.name, "type": "memory", "path": str(path), "enabled": True}
+            )
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid source: {exc}") from exc
+
+        SourceRegistry(config, state).register_source(source)
+        # Same step every other registration takes: the engine reads sources off
+        # the live config object, so a source that only reached the registry is
+        # invisible to sync.
+        config.sources = [s for s in config.sources if s.name != source.name]
+        config.sources.append(source)
+        audit(source.name, "memory_enable", {"path": str(path)})
+        return {"status": "enabled", "source": source.model_dump(mode="json")}
+
     @app.post("/memory/consolidate")
     def memory_consolidate() -> dict:
         from pheasant.memory.maintenance import run_memory_maintenance
 
         result = run_memory_maintenance(engine)
         if result is None:
-            raise HTTPException(
-                status_code=400,
-                detail=(
+            # 200 with a reason, matching the MCP tool exactly. This used to be
+            # a 400, which made the same condition an error over HTTP and a
+            # normal outcome over MCP — and it is not a client error: the
+            # request was well-formed and the server declined because of its
+            # own configuration. A scheduler polling this endpoint should not
+            # have to treat "consolidation is switched off" as a failure.
+            return {
+                "skipped": (
                     "memory consolidation is disabled or no `type: memory` source is configured"
-                ),
-            )
+                )
+            }
+        audit(result["source"], "memory_consolidate", result["report"])
         return result
 
     @app.post("/security/idp/sync")
@@ -1518,6 +1695,19 @@ def create_app(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.delete("/jobs")
+    def clear_finished_jobs() -> dict:
+        return {"cleared": jobs.clear()}
+
+    @app.delete("/jobs/{job_id}")
+    def clear_job(job_id: str) -> dict:
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Unknown job: {job_id}")
+        if job["active"]:
+            raise HTTPException(status_code=409, detail="A running job cannot be cleared")
+        return {"cleared": jobs.clear(job_id)}
+
     @app.get("/jobs/{job_id}")
     def get_job(job_id: str) -> dict:
         job = jobs.get(job_id)
@@ -1534,18 +1724,44 @@ def create_app(
 
     @app.post("/search")
     def search_context(req: SearchRequest) -> dict:
-        return search.search_context(
+        from pheasant.search.criteria import (
+            apply_retrieval_criteria,
+            criteria_active,
+            criteria_dict,
+        )
+
+        # Over-fetch when a post-filter will drop rows, so `max_results` keeps
+        # meaning "give me this many" — the same bookkeeping the MCP tool does.
+        filtering = criteria_active(req.exclude_sources, req.node_types, req.min_score)
+        payload = search.search_context(
             req.knowledge_base or config.knowledge_base_id,
             req.query,
             req.mode,
-            req.max_results,
+            req.max_results * 4 if filtering else req.max_results,
             req.source_name,
             graph=engine.graph_builder.graph,
             principal=req.principal,
             principal_groups=req.principal_groups,
             security=config.security,
             section=req.section,
+            memory=req.memory,
         )
+        if filtering:
+            payload = dict(payload)
+            payload["results"] = apply_retrieval_criteria(
+                payload.get("results") or [],
+                exclude_sources=req.exclude_sources,
+                node_types=req.node_types,
+                min_score=req.min_score,
+            )[: req.max_results]
+            payload["criteria"] = criteria_dict(
+                req.source_name,
+                req.exclude_sources,
+                req.node_types,
+                req.min_score,
+                req.memory,
+            )
+        return payload
 
     @app.post("/relevant-files")
     def relevant_files(req: SearchRequest) -> dict:
@@ -1565,6 +1781,10 @@ def create_app(
             principal_groups=req.principal_groups,
             security=config.security,
             section=req.section,
+            # Same reasoning as the ACL note above: this is the same retrieval,
+            # so it owes the caller the same memory policy. Omitting it would
+            # leave one route still serving corrected records.
+            memory=req.memory,
         )
         seen = set()
         files = []
@@ -2611,6 +2831,7 @@ def create_app(
             principal_groups=req.principal_groups,
             workflow=req.workflow,
             options=req.options,
+            memory=req.memory,
         )
 
     @app.post("/assistant/chat/stream")
@@ -2888,6 +3109,23 @@ def create_app(
             "job_ids": job_ids,
         }
 
+    # Mounted *before* the UI so the SPA catch-all cannot swallow /mcp.
+    if mcp_asgi_app is not None:
+
+        @app.api_route("/mcp", methods=["GET", "POST", "DELETE"], include_in_schema=False)
+        async def _mcp_no_slash():
+            """Send the slash-less form to the mount, preserving method + body.
+
+            Starlette's ``Mount`` only matches paths that continue past the
+            prefix, so the ``/mcp`` we advertise would 405 while ``/mcp/``
+            worked. 307 (not 302) is what keeps a POST a POST and carries the
+            JSON-RPC body with it.
+            """
+            from starlette.responses import RedirectResponse
+
+            return RedirectResponse(url="/mcp/", status_code=307)
+
+        app.mount("/mcp", mcp_asgi_app)
     _mount_ui(app, config)
     return app
 
@@ -2911,6 +3149,28 @@ def _mcp_tool_summaries() -> list[dict]:
         doc = (member.__doc__ or "").strip().splitlines()
         summaries.append({"name": name, "description": doc[0] if doc else ""})
     return summaries
+
+
+def _mcp_asgi_app(config: PheasantConfig):
+    """The MCP streamable-HTTP ASGI app to mount at ``/mcp``, or None.
+
+    ``GET /mcp/info`` has always advertised ``streamable_http_url:
+    <base>/mcp``, but ``pheasant serve`` only ever built the FastAPI app — so
+    that URL 404'd, and a client POSTing to it got a 405. Found by pointing a
+    real MCP client at a live container: the server was telling every agent to
+    connect somewhere it did not listen.
+
+    Returns None when MCP or the transport is disabled, or when the installed
+    ``mcp`` package cannot build the app — the caller then mounts nothing and
+    the API behaves exactly as it did before.
+    """
+    try:
+        from pheasant.mcp_server.server import streamable_http_app
+
+        return streamable_http_app(config)
+    except Exception:  # pragma: no cover - depends on the optional [mcp] extra
+        logger.warning("MCP streamable-http app unavailable; /mcp not mounted", exc_info=True)
+        return None
 
 
 def _mount_ui(app: FastAPI, config: PheasantConfig) -> None:

@@ -38,7 +38,40 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
 
 
-def artifact_type(path: Path) -> str:
+#: Step 33.7 — an agent-memory record is its own kind of artifact. It is still
+#: a Markdown file and still goes through the identical pipeline, but calling it
+#: a `markdown_note` left the graph unable to say which of its notes were things
+#: an agent *remembered*, and left the UI legend unable to show them apart.
+MEMORY_ARTIFACT_TYPE = "memory_record"
+
+#: Node types that stand for a **whole indexed artifact**, as opposed to a piece
+#: of one (`chunk`, `heading`) or something derived from one (`entity`,
+#: `symbol`, `external_reference`).
+#:
+#: Defined once because four modules independently hard-coded
+#: `{"file", "markdown_note", "document"}` — similarity edges, cross-source
+#: reference resolution, the assistant's graph-fact filter and its neighbour
+#: walk. Adding a fifth artifact type meant finding all four and hoping; the
+#: taxonomy work hit exactly this and fixed it the same way, by asserting one
+#: definition instead of repeating a literal.
+#:
+#: `image` and `audio` are deliberately absent, as they have been since 25.4:
+#: their captions and transcripts are indexed as text, but a caption is not a
+#: document that can resolve a link or anchor a similarity pair.
+ARTIFACT_TYPES = frozenset({"file", "markdown_note", "document", MEMORY_ARTIFACT_TYPE})
+
+
+def artifact_type(path: Path, source_type: str | None = None) -> str:
+    """The node/artifact type for a file.
+
+    ``source_type`` is optional and additive: without it the answer is exactly
+    what it was before Step 33.7, which keeps every caller that classifies a
+    bare path working unchanged.
+    """
+    if source_type == "memory":
+        # Checked before the suffix, because a memory record *is* a `.md` file
+        # and the point is that it is not merely one.
+        return MEMORY_ARTIFACT_TYPE
     if path.suffix.lower() == ".md":
         return "markdown_note"
     if path.suffix.lower() in DOCUMENT_EXTENSIONS:

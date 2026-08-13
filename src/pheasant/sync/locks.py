@@ -5,6 +5,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -100,10 +101,14 @@ class EngineLease:
         *,
         heartbeat_interval_s: float = 5.0,
         stale_after_s: float = 30.0,
+        wait_timeout_s: float = 0.0,
+        poll_interval_s: float = 0.25,
     ):
         self.path = Path(state_dir) / "engine.lease"
         self.heartbeat_interval_s = heartbeat_interval_s
         self.stale_after_s = stale_after_s
+        self.wait_timeout_s = wait_timeout_s
+        self.poll_interval_s = poll_interval_s
         self._held = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -113,15 +118,25 @@ class EngineLease:
         return self._held
 
     def acquire(self) -> None:
-        """Take the lease, or raise :class:`EngineLeaseError`. Idempotent."""
+        """Take the lease, optionally waiting for the current writer.
+
+        Interactive/embedded engines remain fail-fast by default. Server sync
+        workers set ``wait_timeout_s`` because two legitimate background
+        triggers (most commonly startup indexing and a source just added in
+        the UI) should queue, not make the first user-visible sync fail.
+        """
         if self._held:
             return
-        existing = self._read()
-        if existing is not None:
+        deadline = time.monotonic() + self.wait_timeout_s
+        logged_wait = False
+        while True:
+            existing = self._read()
+            if existing is None:
+                break
             pid = existing.get("pid")
             same_host = existing.get("hostname") in (None, socket.gethostname())
             if isinstance(pid, int) and pid == os.getpid() and same_host:
-                pass  # another engine in this process holds it; share ownership
+                break  # another engine in this process holds it; share ownership
             elif self._is_stale(existing, same_host):
                 logger.warning(
                     "Taking over stale engine lease %s (pid=%s, heartbeat_at=%s)",
@@ -129,7 +144,8 @@ class EngineLease:
                     pid,
                     existing.get("heartbeat_at"),
                 )
-            else:
+                break
+            elif time.monotonic() >= deadline:
                 raise EngineLeaseError(
                     f"Another pheasant engine (pid={pid}, "
                     f"host={existing.get('hostname')}) holds the writer lease at "
@@ -138,6 +154,16 @@ class EngineLease:
                     f"wait ~{self.stale_after_s:.0f}s for the lease to go stale "
                     f"if the process crashed."
                 )
+            else:
+                if not logged_wait:
+                    logger.info(
+                        "Waiting for pheasant writer lease %s (pid=%s, host=%s)",
+                        self.path,
+                        pid,
+                        existing.get("hostname"),
+                    )
+                    logged_wait = True
+                time.sleep(self.poll_interval_s)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._write()
         self._held = True

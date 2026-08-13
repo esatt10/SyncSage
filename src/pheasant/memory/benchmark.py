@@ -26,7 +26,10 @@ proxy. Reproduce the recorded numbers with::
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 WORDS = (
@@ -57,6 +60,15 @@ class MemoryBenchReport:
     stale_leak_rate: float
     abstention_accuracy: float
     spec: MemoryBenchSpec
+    #: Step 33.11 additions. Recall alone says whether the right memory came
+    #: back; these say what it cost and how healthy the store is — the layers
+    #: the agent-memory literature calls memory quality and efficiency.
+    contradiction_rate: float = 0.0
+    staleness_p50_days: float = 0.0
+    staleness_p95_days: float = 0.0
+    bytes_per_record: float = 0.0
+    write_latency_ms: float = 0.0
+    search_latency_ms: float = 0.0
     details: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -72,6 +84,12 @@ class MemoryBenchReport:
             "n_abstain": self.spec.n_abstain,
             "seed": self.spec.seed,
             "mode": self.spec.mode,
+            "contradiction_rate": self.contradiction_rate,
+            "staleness_p50_days": self.staleness_p50_days,
+            "staleness_p95_days": self.staleness_p95_days,
+            "bytes_per_record": self.bytes_per_record,
+            "write_latency_ms": self.write_latency_ms,
+            "search_latency_ms": self.search_latency_ms,
         }
 
 
@@ -135,9 +153,29 @@ def generate_cases(spec: MemoryBenchSpec) -> dict[str, list[dict[str, str]]]:
     return {"facts": facts, "distractors": distractors, "updates": updates, "abstain": abstain}
 
 
-def _hit_paths(tools: Any, kb: str, query: str, k: int, mode: str) -> list[str]:
+def _hit_paths(
+    tools: Any, kb: str, query: str, k: int, mode: str, timer: list[float] | None = None
+) -> list[str]:
+    """Record ids of the memory hits, plus paths for anything else.
+
+    Step 33.11: a memory hit now *says* it is one, so this reads the typed
+    `memory.record_id` instead of substring-matching a record id out of the
+    relative path. That hack was the only way to tell a memory apart before
+    33.6 and it would silently start counting any file whose name happened to
+    contain a record id.
+    """
+    started = time.perf_counter()
     payload = tools.search_context(kb, query, mode=mode, max_results=k)
-    return [str(item.get("relative_path") or "") for item in payload["results"]]
+    if timer is not None:
+        timer.append(time.perf_counter() - started)
+    out: list[str] = []
+    for item in payload["results"]:
+        memory = item.get("memory")
+        if isinstance(memory, dict) and memory.get("record_id"):
+            out.append(str(memory["record_id"]))
+        else:
+            out.append(str(item.get("relative_path") or ""))
+    return out
 
 
 def run_memory_recall_benchmark(
@@ -155,18 +193,30 @@ def run_memory_recall_benchmark(
 
     spec = spec or MemoryBenchSpec()
     kb = knowledge_base or tools.config.pheasant.name
-    source = memory_source(tools.config)
+    source = memory_source(tools.config, tools.state)
     if source is None:
         raise ValueError("benchmark needs a `type: memory` source in the config")
     cases = generate_cases(spec)
 
+    # Latency is measured, not declared: a field reporting 0.0 because nobody
+    # timed it is worse than no field, since it reads as "measured, and fast".
+    writes = 0
+    write_seconds = 0.0
+    search_times: list[float] = []
+
     fact_ids: dict[str, str] = {}
     for case in cases["facts"]:
+        started = time.perf_counter()
         record = tools.memory_write(kb, case["text"], scope="org", sync=False)["record"]
+        write_seconds += time.perf_counter() - started
+        writes += 1
         fact_ids[case["text"]] = record["record_id"]
     for idx, distractor in enumerate(cases["distractors"]):
         scope = ("session", "user", "org")[idx % 3]
+        started = time.perf_counter()
         tools.memory_write(kb, distractor["text"], scope=scope, sync=False)
+        write_seconds += time.perf_counter() - started
+        writes += 1
     tools.sync_source(kb, source.name, "incremental")
 
     recalled = sum(
@@ -174,7 +224,7 @@ def run_memory_recall_benchmark(
         for case in cases["facts"]
         if any(
             fact_ids[case["text"]] in path
-            for path in _hit_paths(tools, kb, case["query"], spec.k, spec.mode)
+            for path in _hit_paths(tools, kb, case["query"], spec.k, spec.mode, search_times)
         )
     )
 
@@ -194,7 +244,7 @@ def run_memory_recall_benchmark(
     updated_ok = 0
     stale_leaks = 0
     for case in cases["updates"]:
-        paths = _hit_paths(tools, kb, case["query"], spec.k, spec.mode)
+        paths = _hit_paths(tools, kb, case["query"], spec.k, spec.mode, search_times)
         if any(update_ids[case["new_text"]] in p for p in paths):
             updated_ok += 1
         if any(fact_ids[case["old_text"]] in p for p in paths):
@@ -203,9 +253,12 @@ def run_memory_recall_benchmark(
     abstained = sum(
         1
         for case in cases["abstain"]
-        if not _hit_paths(tools, kb, case["query"], spec.k, spec.mode)
+        if not _hit_paths(tools, kb, case["query"], spec.k, spec.mode, search_times)
     )
 
+    health = _store_health(tools)
+    health["write_latency_ms"] = round(1000.0 * write_seconds / max(writes, 1), 3)
+    health["search_latency_ms"] = round(1000.0 * sum(search_times) / max(len(search_times), 1), 3)
     return MemoryBenchReport(
         recall_at_k=recalled / spec.n_facts,
         update_accuracy=updated_ok / max(spec.n_updates, 1),
@@ -213,7 +266,62 @@ def run_memory_recall_benchmark(
         abstention_accuracy=abstained / max(spec.n_abstain, 1),
         spec=spec,
         details={"recalled": recalled, "updated_ok": updated_ok, "stale_leaks": stale_leaks},
+        **health,
     )
+
+
+def _store_health(tools: Any) -> dict[str, float]:
+    """Memory-quality and efficiency numbers, measured off the live store.
+
+    Recall says whether the right memory came back. These say whether the
+    store is *healthy*: how much of it contradicts itself, how old what it
+    serves is, and what it costs per record. All read from `memory_records`
+    and the record files, so they cost one query and a stat.
+    """
+    from pheasant.memory.store import memory_source
+
+    try:
+        rows = tools.engine.state.rows("SELECT asserted_at, valid_until FROM memory_records")
+    except Exception:  # pragma: no cover - store older than 33.5
+        return {}
+    if not rows:
+        return {}
+
+    total = len(rows)
+    # A record whose validity was ended by a *later* record is a contradiction
+    # the store is carrying: it was asserted, then corrected.
+    contradicted = sum(1 for row in rows if row["valid_until"])
+
+    now = datetime.now(tz=UTC)
+    ages: list[float] = []
+    for row in rows:
+        try:
+            moment = datetime.fromisoformat(str(row["asserted_at"]).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        ages.append(max(0.0, (now - moment).total_seconds() / 86400.0))
+    ages.sort()
+
+    def percentile(fraction: float) -> float:
+        if not ages:
+            return 0.0
+        return round(ages[min(len(ages) - 1, int(len(ages) * fraction))], 4)
+
+    source = memory_source(tools.config, tools.state)
+    total_bytes = 0
+    if source is not None:
+        for path in Path(source.path).rglob("mem-*.md"):
+            try:
+                total_bytes += path.stat().st_size
+            except OSError:
+                continue
+
+    return {
+        "contradiction_rate": round(contradicted / total, 4),
+        "staleness_p50_days": percentile(0.5),
+        "staleness_p95_days": percentile(0.95),
+        "bytes_per_record": round(total_bytes / total, 1),
+    }
 
 
 def main() -> None:  # pragma: no cover - manual reproduction entry point

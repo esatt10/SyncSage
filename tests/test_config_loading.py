@@ -191,3 +191,33 @@ def test_yaml_shim_strips_trailing_comments_like_pyyaml() -> None:
     assert limits["follow_symlinks"] is False
     assert limits["label"] == "red#1"  # '#' without leading space is literal
     assert limits["quoted"] == "has # inside"  # '#' inside quotes is literal
+
+
+def test_yaml_shim_keeps_urls_in_lists_as_strings_like_pyyaml() -> None:
+    """A colon only separates a YAML key when followed by space or EOL.
+
+    Regression test: the shim split list items on *any* colon, so
+    `- http://host:8765` parsed as `{"http": "//host:8765"}` — silently
+    turning every list-of-URL config into a list of dicts wherever this shim
+    stands in for PyYAML. `server.api.cors_origins` is the one that caught it
+    (a dict there breaks CORS *and* the MCP transport guard derived from it),
+    but the same shape appears anywhere a URL is listed.
+    """
+    import yaml
+
+    parsed = yaml.safe_load(
+        "server:\n"
+        "  api:\n"
+        "    cors_origins:\n"
+        "      - http://localhost:8765\n"
+        "      - https://pheasant.internal:443\n"
+        "sources:\n"
+        "  - name: repo\n"
+        "    type: git_repository\n"
+    )
+    assert parsed["server"]["api"]["cors_origins"] == [
+        "http://localhost:8765",
+        "https://pheasant.internal:443",
+    ]
+    # A genuine mapping item (colon *then space*) still parses as a mapping.
+    assert parsed["sources"] == [{"name": "repo", "type": "git_repository"}]

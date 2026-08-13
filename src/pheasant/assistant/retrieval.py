@@ -41,6 +41,7 @@ from typing import Any
 
 from pheasant.api.app import graph_neighbors as _graph_neighbors
 from pheasant.api.app import graph_slice as _graph_slice
+from pheasant.ingestion.content_types import ARTIFACT_TYPES
 
 VALID_MODES = ("hybrid", "text", "graph", "vector")
 
@@ -68,6 +69,11 @@ class Passage:
     # is what lets a citation say *which section* answered rather than only
     # which file.
     heading_path: str | None = None
+    # Set when this evidence is a remembered assertion rather than a document
+    # (Step 33.6). Carried here for the same reason as heading_path: the
+    # answering prompt and the citation both need to say so, and neither can
+    # infer it from a path that merely happens to start with a scope directory.
+    memory: dict | None = None
     raw: dict = field(default_factory=dict, repr=False)
 
     def key(self) -> str:
@@ -393,12 +399,18 @@ class PheasantRetriever:
         graph: Any = None,
         state: Any = None,
         config: Any = None,
+        memory: Any = None,
     ) -> None:
         self.search_engine = search
         self.knowledge_base = knowledge_base
         self.graph = graph
         self.state = state
         self.config = config
+        # Step 33.10 — how memory takes part in *this* question. Held on the
+        # retriever rather than passed per call: an answering loop issues many
+        # searches and every one of them must see the same policy, or a chat
+        # turn could half-honour a toggle the user set.
+        self.memory = memory
         # Per-request memo: an agent loop re-issues overlapping queries, and
         # paying twice for the identical (query, mode, limit, source) tuple is
         # pure waste — pheasant's index does not change mid-answer.
@@ -421,7 +433,7 @@ class PheasantRetriever:
         if not query:
             return []
         mode = mode if mode in VALID_MODES else "hybrid"
-        cache_key = (query, mode, limit, source_name, principal)
+        cache_key = (query, mode, limit, source_name, principal, str(self.memory))
         if cache_key in self._cache:
             return self._cache[cache_key]
 
@@ -435,6 +447,7 @@ class PheasantRetriever:
             principal=principal,
             principal_groups=principal_groups,
             security=getattr(self.config, "security", None),
+            memory=self.memory,
         )
         passages = [self._passage(item, mode) for item in payload.get("results", [])]
         self._cache[cache_key] = passages
@@ -536,6 +549,7 @@ class PheasantRetriever:
             snippet=snippet[:900],
             mode=mode,
             heading_path=(item.get("heading_path") or provenance.get("heading_path")) or None,
+            memory=item.get("memory") or None,
             raw=item,
         )
 
@@ -581,7 +595,7 @@ class PheasantRetriever:
                     continue
                 # Only documents carry answerable prose; concept/chunk nodes
                 # are navigation, not evidence.
-                if node.get("type") not in ("file", "document", "markdown_note"):
+                if node.get("type") not in ARTIFACT_TYPES:
                     continue
                 seen.add(node_id)
                 found.append(

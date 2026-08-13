@@ -5,6 +5,16 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from pheasant.graph.simple import SimpleMultiDiGraph
+from pheasant.memory.policy import (
+    PREFER_SHARE,
+    MemoryPolicy,
+    admits,
+    describe,
+    load_memory_index,
+    may_filter,
+    resolve,
+    utc_now_iso,
+)
 from pheasant.search.graph_search import search_graph
 from pheasant.search.sqlite_store import SearchStore, section_matches, section_needle
 from pheasant.search.vector_store import VectorSearcher
@@ -26,6 +36,9 @@ class HybridSearch:
         vector: VectorSearcher | None = None,
         node_index: Any = None,
         wasm_relationship_search: bool = False,
+        steering_enabled: bool = False,
+        default_memory_policy: str = "auto",
+        usage_tracking: bool = False,
     ):
         self.store = store
         # Optional semantic candidates (Synapse 21.4). None when
@@ -39,6 +52,17 @@ class HybridSearch:
         # (search.wasm_relationship_search). Default off; falls back to pure
         # Python on any failure.
         self.wasm_relationship_search = wasm_relationship_search
+        # Step 33.8: let memory rules steer ranking (memory.steering_enabled).
+        # Default off, so a region that has not asked for it ranks exactly as
+        # it did before.
+        self.steering_enabled = steering_enabled
+        # memory.default_policy — what a caller that says nothing gets. A
+        # per-call `memory` argument always wins, so this only fills the gap.
+        self.default_memory_policy = default_memory_policy
+        # memory.usage_tracking — count which memories retrieval returns, so
+        # salience can reflect use. Off by default: it is a write on the read
+        # path and recording what someone looks up is an operator's choice.
+        self.usage_tracking = usage_tracking
 
     def search_context(
         self,
@@ -52,6 +76,7 @@ class HybridSearch:
         principal_groups: list[str] | None = None,
         security: Any = None,
         section: str | None = None,
+        memory: Any = None,
     ) -> dict:
         mode = mode if mode in VALID_MODES else "hybrid"
         # Clamped, not just floored: `max_results` arrives straight off an
@@ -64,11 +89,38 @@ class HybridSearch:
         # security.acl_enforced. Candidates are over-fetched, filtered
         # against artifact ACLs *before* the merge/return, then truncated.
         enforced = bool(security is not None and getattr(security, "acl_enforced", False))
+        # Step 33.6 — agent-memory policy. The index is loaded once and shared:
+        # the text arm filters in SQL (recall), the vector and graph arms filter
+        # against the same rows below, and every arm's hits are annotated from
+        # it. An empty index means the region has no memory records, and then
+        # none of this does anything at all.
+        policy = MemoryPolicy.parse(memory if memory is not None else self.default_memory_policy)
+        memory_index = load_memory_index(getattr(self.store, "state", None))
+        memory_now = utc_now_iso() if memory_index else None
+        memory_filtered = may_filter(policy, memory_index, now=memory_now or "")
+        # Step 33.8 — rules from `alias`/`preference`/`exclusion` records, put
+        # through the same `admits` predicate as retrieval so a corrected or
+        # out-of-scope record steers nothing. Empty unless steering is on.
+        steering = None
+        if memory_index and self.steering_enabled:
+            from pheasant.memory.steering import load_steering, load_steering_records
+
+            steering = (
+                load_steering(
+                    load_steering_records(self.store.state),
+                    policy,
+                    now=memory_now,
+                    enabled=True,
+                )
+                or None
+            )
         # A section filter narrows hard, so the arms that can only be filtered
         # after the fact (graph, which has no breadcrumb at all) need room to
-        # find in-section hits — same over-fetch reasoning as the ACL pass.
+        # find in-section hits — same over-fetch reasoning as the ACL pass, and
+        # the same again for a memory policy, where `only` narrows to a handful
+        # of records and `off` can drop a lot.
         sectioned = bool(section_needle(section))
-        fetch_n = max_results * 3 if (enforced or sectioned) else max_results
+        fetch_n = max_results * 3 if (enforced or sectioned or memory_filtered) else max_results
 
         text_results: list[dict[str, Any]] = []
         graph_results: list[dict[str, Any]] = []
@@ -84,7 +136,13 @@ class HybridSearch:
         jobs: dict[str, Any] = {}
         if mode in {"hybrid", "text"}:
             jobs["text"] = lambda: self.store.search(
-                query, source_name=source_name, max_results=fetch_n, section=section
+                query,
+                source_name=source_name,
+                max_results=fetch_n,
+                section=section,
+                memory_policy=policy if memory_index else None,
+                memory_now=memory_now,
+                steering=steering,
             )
         # Graph search needs the live graph; callers that don't supply one
         # (e.g. CLI/MCP search_context) transparently fall back to text search.
@@ -140,8 +198,23 @@ class HybridSearch:
             # a symbol or entity node is not part of any document section, so it
             # cannot satisfy a claim about one (the same conservative call the
             # ACL pass makes for nodes with no artifact row).
-            vector_results = [r for r in vector_results if section_matches(r.get("heading_path"), section)]
-            graph_results = [r for r in graph_results if section_matches(r.get("heading_path"), section)]
+            vector_results = [
+                r for r in vector_results if section_matches(r.get("heading_path"), section)
+            ]
+            graph_results = [
+                r for r in graph_results if section_matches(r.get("heading_path"), section)
+            ]
+
+        if memory_index:
+            # The text arm was already narrowed in SQL. These two carry no
+            # memory columns of their own, so they are filtered against the
+            # same rows through the same predicate — one rule, two encodings,
+            # and `tests/test_memory_policy.py` pins them together.
+            def memory_admits(item: dict[str, Any]) -> bool:
+                return admits(policy, resolve(item, memory_index), now=memory_now)
+
+            vector_results = [r for r in vector_results if memory_admits(r)]
+            graph_results = [r for r in graph_results if memory_admits(r)]
 
         if enforced:
             from pheasant.security.acl import expand_principal, is_allowed
@@ -178,8 +251,31 @@ class HybridSearch:
             vector_results = [r for r in vector_results if visible(r)]
             graph_results = [r for r in graph_results if visible(r)]
 
+        if memory_index and policy.mode == "prefer":
+            text_results, vector_results, graph_results = _prefer_memory(
+                text_results, vector_results, graph_results, memory_index, max_results
+            )
+
         results = _merge_rrf(text_results, vector_results, graph_results, max_results)
-        return {
+        if memory_index:
+            _annotate_memory(results, memory_index, policy)
+            if self.usage_tracking:
+                # Step 33.9 — count what retrieval actually returned. Last,
+                # after truncation, so a record is credited for being *served*
+                # rather than merely considered. Best-effort by construction:
+                # `record_memory_use` swallows its own failures, because a
+                # ranking signal must never cost a query.
+                self.store.state.record_memory_use(
+                    sorted(
+                        {
+                            str(item["memory"]["record_id"])
+                            for item in results
+                            if item.get("memory") and item["memory"].get("record_id")
+                        }
+                    ),
+                    memory_now,
+                )
+        payload = {
             "query": query,
             "knowledge_base": knowledge_base,
             "mode": mode,
@@ -191,6 +287,16 @@ class HybridSearch:
                 "returned": len(results),
             },
         }
+        # Reported only when the region has memory, so a corpus without it
+        # returns the exact payload it did before — the same "add the key only
+        # when it says something" rule `heading_path` follows.
+        if memory_index:
+            payload["memory_policy"] = policy.as_dict()
+        if steering:
+            # Reported so an agent can see *why* it got what it got — a rule
+            # that silently re-orders results is the thing to avoid.
+            payload["memory_steering"] = steering.describe()
+        return payload
 
 
 #: Reciprocal-rank-fusion constant. 60 is the value from the original RRF
@@ -280,57 +386,59 @@ def _merge_rrf(
     return results
 
 
-def _merge(
-    text_results: list[dict[str, Any]],
-    graph_results: list[dict[str, Any]],
-    max_results: int,
-) -> list[dict[str, Any]]:
-    """Interleave text/vector and graph hits, deduplicating nodes by node_id.
+def _annotate_memory(
+    results: list[dict[str, Any]],
+    memory_index: dict[str, dict[str, Any]],
+    policy: Any,
+) -> None:
+    """Mark which hits are remembered assertions rather than corpus content.
 
-    Text (chunk/FTS) and vector hits are favoured for files because they
-    carry chunk previews and line ranges; graph hits add concepts, symbols,
-    entities and relationships that the FTS index never surfaces. Chunk hits
-    additionally dedupe on chunk_id so a vector hit never repeats an FTS hit.
+    Added only to hits that *are* memory records, so a corpus result keeps the
+    exact shape it had before Step 33.6 — the same rule `heading_path` follows.
+
+    This is not decoration. A caller that cannot tell a remembered assertion
+    from a document has no way to weigh it differently, and the answering
+    prompt and the UI both need the distinction to be explicit rather than
+    inferred from a path that happens to start with a scope directory.
     """
-
-    deduped_chunks: list[dict[str, Any]] = []
-    seen_chunks: set[str] = set()
-    for item in text_results:
-        chunk_id = item.get("chunk_id")
-        if chunk_id and chunk_id in seen_chunks:
+    for item in results:
+        record = resolve(item, memory_index)
+        if record is None:
             continue
-        if chunk_id:
-            seen_chunks.add(chunk_id)
-        deduped_chunks.append(item)
-    text_results = deduped_chunks
+        item["memory"] = describe(record)
+        provenance = item.get("provenance")
+        if isinstance(provenance, dict):
+            provenance["memory"] = True
+    _ = policy
 
-    if not graph_results:
-        results = text_results[:max_results]
-        for rank, item in enumerate(results, start=1):
-            item["rank"] = rank
-        return results
-    if not text_results:
-        return graph_results[:max_results]
 
-    merged: list[dict[str, Any]] = []
-    seen_nodes: set[str] = set()
+def _prefer_memory(
+    text_results: list[dict[str, Any]],
+    vector_results: list[dict[str, Any]],
+    graph_results: list[dict[str, Any]],
+    memory_index: dict[str, dict[str, Any]],
+    max_results: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Guarantee memory a share of the slots under `mode="prefer"`.
 
-    def _add(item: dict[str, Any]) -> None:
-        node_id = item.get("node_id")
-        if item.get("kind") != "relationship" and node_id and node_id in seen_nodes:
-            return
-        if node_id:
-            seen_nodes.add(node_id)
-        merged.append(item)
+    Fusion ranks memory against a whole corpus, so on a large index a genuinely
+    relevant memory can lose every slot to documents that merely match more
+    words. `prefer` reserves up to half the results for memory hits by moving
+    them to the front of their own arm, which is enough for RRF to keep them:
+    their rank within the arm is what the fusion actually reads.
 
-    combined = sorted(
-        text_results + graph_results,
-        key=lambda item: -float(item.get("score") or 0.0),
-    )
-    for item in combined:
-        if len(merged) >= max_results:
-            break
-        _add(item)
-    for rank, item in enumerate(merged, start=1):
-        item["rank"] = rank
-    return merged
+    Deliberately a *reordering*, not a score change. Inventing a boost would
+    make the same query answer differently depending on a flag, in a way no
+    caller could predict; promoting within an arm is bounded, explainable and
+    leaves every other hit's relative order intact.
+    """
+    reserved = max(1, int(max_results * PREFER_SHARE))
+
+    def promote(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        remembered = [r for r in results if resolve(r, memory_index) is not None]
+        if not remembered:
+            return results
+        rest = [r for r in results if resolve(r, memory_index) is None]
+        return remembered[:reserved] + rest + remembered[reserved:]
+
+    return promote(text_results), promote(vector_results), promote(graph_results)

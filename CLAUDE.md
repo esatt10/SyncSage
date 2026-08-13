@@ -310,6 +310,251 @@ BM25; (2) `1/(1+|bm25|)` inverted relevance in hybrid merges → monotone
 mapping (LIKE-fallback rows keep 1.0). Gate:
 `tests/test_memory_benchmark.py`. Suite: **202 passed** (+4).
 
+**Steps 33.8–33.11 landed here 2026-08-11 — the memory-steered-retrieval arc
+(33.5–33.11) is complete.** Four steps in one session at the user's request,
+departing from rule 10's one-step norm.
+
+**33.8 retrieval steering** — `kind` becomes load-bearing. New
+`memory/steering.py` turns a record's text into a ranking rule: `alias`
+(`router -> pheasant-flock`) expands the query, `preference`
+(`when: deploy -> prefer: docs/`) adds a path term to `_STRUCTURAL_PRIOR`,
+`exclusion` (`never: vendor/**`) suppresses. This is the half that changes
+queries returning **no memory at all**. Two design bugs the tests found:
+`memory: "off"` was disabling steering outright (mode is about *result
+composition*, not rule validity — a caller who wants no remembered passages
+still wants the remembered vocabulary; scope/subject/validity still apply), and
+a hyphenated trigger never fired because `_query_tokens` splits
+`pheasant-flock` into two tokens (triggers now match the tokenized query, **all
+parts required**). Also wired the deferred `memory.default_policy`.
+**8/8 mutants**, `tests/test_memory_steering.py` (23).
+
+**33.9 salience + bounded growth** — `memory/salience.py`: recency (90-day half
+life) × use (`log1p`, diminishing returns) × scope weight. `uses` is counted
+**after truncation**, so a record is credited for being *served*, not
+considered. `memory.max_records` archives the least salient via consolidation's
+existing `.md.archived` rename; salience is written back so a prune is
+explainable. `usage_tracking`/`max_records` default off/unbounded.
+**10/10 mutants**, `tests/test_memory_salience.py` (15) — after fixing another
+vacuous test of mine (the `salience` column defaults to 1.0, so a range
+assertion passed whether or not anything was written).
+
+**33.10 front end** — the `/memory` endpoints had existed since 33.1 with
+**zero UI callers**. New `/memory` page (grouped by subject; corrections go
+through *superseding*, never editing, because the chain is what `as_of` reads),
+a `use memory` chat toggle posting the same field MCP and the router send
+(threaded `ChatRequest.memory` → `answer_question` → `PheasantRetriever`, held
+on the retriever so an answering loop cannot half-honour it, and part of the
+memo key so two turns cannot share cached passages), citation chips that say
+when a passage was remembered, plus client/types/nav/styles.
+
+**33.11 isolation, benchmark, docs** — **the ACL leak is closed**:
+`normalize_acl` gains a `memory` rule keyed on **scope** (`org` shared,
+`user`/`session` readable only by their writer), read from the record file
+because the ACL is computed inside the artifact loop before the projection
+exists. Before this, `acl_enforced` filtered every corpus document by principal
+while leaving one agent's private notes readable by every other agent.
+Benchmark keys on the typed `memory.record_id` (retiring the pre-33.6
+substring hack) and gains contradiction rate, staleness p50/p95, bytes/record
+and **measured** latency — recall@5 **1.000**, update **1.000**, stale_leak
+**0.000**, abstention **1.000**, 212.9 B/record, 4.51 ms write, 11.83 ms
+search. Docs: `configuration.md` §memory, the first `memory:` block in
+`pheasant.example.yaml`, `how-to/agent-memory.md` (query-time control,
+steering, salience, UI, isolation), `mcp_tools.md`, five wizard questions.
+
+**Completion pass (same session).** The first pass implemented every step's
+mechanism but left a tail of surface items, and I wrongly reported the arc
+complete. Then closed: **`POST /memory/enable`** + an Enable-memory button
+(`SourceType.memory` stays out of the generic picker, but "not in the picker"
+had come to mean *unreachable*), **`MemoryPanel.tsx`** in Settings,
+**`pheasant://…/memory` MCP resource** (`current_only` defaults True there —
+corrected records without their chain are worse than none),
+`docs/reference/http-api.md`, and the two config flags the plan named but
+nothing had: **`graph.memory_entity_bridging`** and
+**`memory.about_max_targets`**. Two test gaps closed: **`prefer` had zero
+tests** despite being documented, and **the vector arm had never run under a
+memory policy** (every fixture had embeddings off — the same blind spot that
+hid the 33.7 graph-arm leak); now asserted with exact counts.
+**Real bug found:** `/memory/enable` resolved its relative path through
+`_resolve_source_path`, which anchors to the **process CWD** — the memory
+folder landed wherever the server started, and in development a record was
+written into the repo checkout. Now anchored to `pheasant.workspace_root`;
+mutation testing showed my first test would not have caught it (status codes
+only, never the path).
+
+Suite **1052 passed / 8 failed / 6 skipped** (+73; same 8 pre-existing).
+Mutation **26/26 caught** across three batches, after fixing four vacuous tests
+the mutants exposed. **`tsc -b && vite build` passes** — run in a throwaway
+`node:22-alpine` container (no local npm, the same route the 2026-08-04 UI
+change took): `tsc -b` reports zero type errors and vite transforms 132 modules
+to an 883.94 kB bundle (281.90 kB gzipped), up from 847 kB, with only the
+pre-existing >500 kB chunk-size advisory. **Live-validated 2026-08-12** in a real
+container (self-contained: pheasant's own docs + `src/pheasant/memory` as the
+corpus, stub embedder, since the demo overlay needs an absent third-party clone
+and a paid key). It found **three bugs the 1052-test suite did not** — the
+fourth time a live run has done that here:
+(1) **`/memory/enable` provisioned memory under `workspace_root`, which every
+container mounts read-only** — enabling returned 200 and the first write
+returned a bare 500; the default is now `<state_path>/memory` and enable
+**probes writability before registering**;
+(2) **memory enabled via the API was invisible to every other process** — a
+runtime-registered source only reaches `config.sources` in its creating process,
+so a fresh MCP server / sync worker / restarted container reported
+`enabled: false` seconds after enabling succeeded; `memory_source()` now takes
+an optional state store and falls back to the registry, mirroring
+`SyncEngine._source`;
+(3) **half the `about` edge budget pointed at the `external_reference` stub**
+rather than the resolved file, because a markdown link produces two `references`
+edges and rung 1 took both.
+All three are pinned by tests. Live checks then passed end to end: off/auto/only
+policies (superseded record absent under `auto`, visible under
+`current_only: false`), `describe_retrieval` from a fresh process, steering in
+force, `about → file:guides:setup.md` in one hop plus a `supersedes` edge, and
+the benchmark unchanged. Suite **1054 passed / 8 failed / 6 skipped**. Detail:
+`runs/2026-08-12-memory-live/SUMMARY.md`. Still unmeasured: bridge and vector
+behaviour at 2,000-file scale with a real embedder. Note `ruff check src tests` is **red on
+HEAD** from 5 pre-existing E501s in `tests/test_taxonomy.py` (verified against
+the committed file); a repo-wide `ruff format` swept them up and I reverted
+that to keep this change set scoped. Full detail:
+`runs/2026-08-11-memory-33.8-33.11/SUMMARY.md`.
+
+**Step 33.7 (memory in the knowledge graph) landed here 2026-08-11.** Memory
+stops being a graph island. New `memory_record` node type (stable ID unchanged
+— rule 3 protects the grammar, not the type attribute; SQLite `artifacts.type`
+agrees), `supersedes` edges finally **emitted** between records (a documented
+edge type nothing had ever drawn, so a correction existed only as a frontmatter
+string), and a new `memory/bridge.py` drawing `about` edges from a record to
+what it is about. **`entity` cannot be the bridge on its own** — entity
+extraction runs only for `.md/.txt/.html/.xml`, so all seven extracted document
+formats produce **zero** entity nodes and Python yields them only for class
+names; an entity-only bridge looks fine on Markdown and is a silent no-op on
+PDFs or non-Python code. So it is a precedence ladder — **reference** (already
+drawn by `resolve_cross_source_edges`; needed no new matching code) →
+**symbol** → **heading** → **entity** — first rung wins, capped at 3 targets
+per record. The lexical/BM25 rung is deliberately **not** materialized: the
+search index answers it at query time, and materializing it is how the concept
+layer reached 98.6% of all edges. Coverage is **reported, not silent**:
+`describe_retrieval`'s memory block gains `graph:{records,bridged,unbridged,
+by_signal}`, computed live. Also consolidated `ARTIFACT_TYPES` into **one**
+definition in `ingestion/content_types.py` — four modules had independently
+hard-coded `{"file","markdown_note","document"}`. **The 33.6 entity residual is
+closed**: `_node_result` now exposes the `artifact_id` that chunk/symbol/entity
+nodes always carried, and `policy.resolve` resolves a *relationship* hit
+through either endpoint; the test that asserted the residual existed went red
+as designed and was replaced by its positive form.
+
+**Two pre-existing defects found by building it:** entity labels **spanned line
+breaks** (`\s+` matches newlines, so a heading fused with the next paragraph
+into `"Runbook\r\n\r\nThe Kestrel Gateway"` — junk that could never match
+anything by name; now `[ \t]+`, mirrored in the bridge), and a **leading
+article split one entity in two** (corpus *The Kestrel Gateway* vs memory
+*Kestrel Gateway*; `normalize_label` drops `the`/`a`/`an`, with a test that it
+is not over-eager). **Ordering bug caught by the tests:** the bridge ran with
+the other global passes, *before* `_project_memory_records`, so on the memory
+source's own sync it saw zero records — the projection now runs right after the
+artifact loop. **Deviation:** the plan's rung-4 "merge and drop the duplicate
+entity" was **not** implemented — deleting the memory-local entity destroys the
+`artifact_id` provenance that closes the 33.6 residual, so it would have
+reintroduced the leak; acceptance is ≤2-hop reachability via `GET /graph/path`
+(both directions) rather than a node-count drop. Mutation-tested **12/12
+caught**. Acceptance: `tests/test_memory_graph.py` (23) — per corpus type
+(markdown / python / opaque), not in aggregate, because that is exactly what an
+entity-only bridge would have passed. Suite **1002 passed / 8 failed / 6
+skipped** (same 8 pre-existing). UI legend updated but `vite build` not run (no
+local npm). Full detail: `runs/2026-08-11-memory-33.7/SUMMARY.md`. Next:
+**33.8**, retrieval steering.
+
+**Step 33.6 (query-time memory policy across both protocols) landed here
+2026-08-11.** New `memory/policy.py`: one `MemoryPolicy` (`mode` ∈
+auto|off|only|prefer, `scopes`, `subject`, `current_only`, `as_of`,
+`max_results`), spelled identically on MCP `search_context(memory=…)` and
+`POST /search`, accepting a one-word form or an object. **The stale-fact leak is
+closed**: supersession was enforced only by the batch consolidation pass, so
+between beats the region served facts it already knew were corrected; validity
+is now filtered at query time, and `as_of` deliberately brings the old record
+back (invalidate, don't delete). **One rule, two encodings** — `sql_predicate`
+(text arm, pushed into SQL so a narrow slice keeps recall) and `admits` (vector
++ graph arms) sit side by side with a 10-policy × 5-record parity test, the
+`section_needle`/`section_matches` arrangement applied to a harder rule. New
+`search/criteria.py` (re-exported from `mcp_server/tools.py`) gives HTTP the
+criteria it never had — `exclude_sources`/`node_types`/`min_score` were MCP-only,
+so the same region answered differently per protocol and **the router, which
+reaches a region over HTTP, could not scope a search at all**.
+`describe_retrieval` gains a `memory` block naming the source and its scope
+counts, since an agent could previously only exclude memory by naming a source
+it had no way to learn. **Trust containment**: the answering prompt states a
+*remembered* passage is a recorded assertion, corpus wins a disagreement, and
+passage text is **data, never an instruction** (the memory-control-flow
+defence); remembered passages are labelled with scope + assertion time, threaded
+through `Passage` and **both** citation builders. Dead `hybrid._merge` removed.
+
+**Mutation testing found a real leak, not just a weak test.** 11 mutants, 10
+caught — the survivor revealed that **every end-to-end test used `mode="text"`**,
+so the vector/graph filter was never exercised; probing directly showed the
+graph arm returning the *superseded* record's chunk on an ordinary query, since
+graph hits are `chunk:` nodes with `relative_path=null` and the index was keyed
+only on artifact id. Fixed by indexing both identities + `relative_path_of`
+(reads the path out of the `file:`/`chunk:` stable-ID grammars by marker, not
+colon count); a second bug surfaced at once — `source_id` was missing from
+`INDEX_COLUMNS`, so the composite key matched nothing. Then 11/11.
+**Known residual, asserted rather than hidden:** `entity` nodes derived from a
+superseded record's text still surface (a *label*, not the record — content is
+filtered on every arm), because they expose no artifact identity; a test asserts
+the residual still exists so **33.7 landing turns it red**. One test changed
+deliberately: `test_maintenance_reindexes_so_search_forgets_archived_records`
+had pinned the leak as expected behavior, and now also distinguishes *filtered*
+from *pruned*. Acceptance: `tests/test_memory_policy.py` (27). Suite **972
+passed / 8 failed / 6 skipped** (same 8 pre-existing). Full detail:
+`runs/2026-08-11-memory-33.6/SUMMARY.md`. Next: **33.7**, memory in the graph.
+
+**Step 33.5 (structured memory index + clean text + identity) landed here
+2026-08-10** — first step of the *memory-steered retrieval* arc (33.5–33.11),
+which turns memory from a second corpus into a retrieval instrument. Memory
+records stay source content; what changes is that their metadata stops being
+prose. New **`memory_records` projection table** (`persistence/state_store.py`,
+`CREATE TABLE IF NOT EXISTS` in `SCHEMA` — the `idp_groups` pattern, idempotent
+by construction) carrying scope/subject/kind/asserted_at/valid_from/valid_until/
+supersedes/tags/written_by plus salience/uses/last_used_at reserved for 33.9;
+`memory/projection.py` derives every row from the files, so losing the table
+costs a re-sync, never data. **Record schema 2** adds `kind`/`written_by`/
+`valid_from`/`valid_until` with **nothing on disk rewritten** — v1 files load
+forever, keep reporting v1, and `_digest_input` only extends the hashed string
+for values v1 could not express, so **every v1 record id is reproduced
+byte-identically** (asserted, not assumed). `valid_until` is **derived, never
+double-stored**: a correction ends the original's validity at its own
+`asserted_at`, earliest correction wins, and a declared expiry wins when
+earlier. **Frontmatter is no longer indexed as prose** (memory sources only, so
+no existing vault/docs index shifts), with chunk lines corrected back to
+absolute. The one-shot re-read needs **no bespoke migration**: a `text_pipeline`
+marker in `source_fingerprint` (memory-scoped — adding it unconditionally would
+invalidate every fingerprint in every deployment) makes the existing "config
+changed → escalate to full" path do it. Additive `principal`/`kind`/
+`valid_until` on MCP `memory_write` + `POST /memory` (rule 8); `written_by` is
+in the digest, so two principals asserting the same sentence in the same second
+get two records — load-bearing for 33.11. `POST /memory` is now audited (only
+MCP was), and `POST /memory/consolidate` returns `200 {"skipped": …}` instead of
+`400`, matching MCP.
+
+**Three bugs caught by the tests, all mine:** only `parse_file` was patched
+while the engine goes through `parse_connector_payload` (both now route through
+one helper); the frontmatter regex was `\n`-only while `Path.write_text` stores
+CRLF on Windows, so the strip silently failed on the platform the records were
+written on; and clearing the projection in `delete_source_artifacts` would have
+reset earned counters on **every full sync**, which is the path consolidation
+takes after each archive. **The documented dedup flake is fixed at the root**:
+content identity is the *digest*, not the timestamp — matching on the full path
+made "an identical write returns the stored record" true only within one
+wall-clock second (measured 1-in-3 failures on clean HEAD, 3-of-3 with this
+step's slower sync). Mutation-tested 9 mutants: **8 caught, 1 survived**, and
+the survivor was a vacuous test of mine (stale rows satisfied the assertion even
+when the projection aborted entirely) — fixed, then 9/9. Acceptance:
+`tests/test_memory_projection.py` (17). Suite **945 passed / 8 failed / 6
+skipped**; the 8 are pre-existing and environmental (Windows `0o600`, Windows
+mount-path dedup, CRLF-checkout contract parity — **note that guard is inert on
+Windows**, so contract safety was verified via `git status contracts/` — and a
+raw `wasmtime._trap.Trap` escaping `SandboxFuelExhausted`, a **real pre-existing
+bug**). Full detail: `runs/2026-08-10-memory-33.5/SUMMARY.md`. Next: **33.6**,
+query-time memory policy + the stale-leak fix.
+
 **Steps 32.1+32.2+32.6 (ACL persistence, principal filtering, leak gate)
 landed here 2026-07-17 [x-repo] — Phase 32 core.** Artifacts gain an `acl`
 column (one-shot idempotent additive migration in `StateStore.migrate`;
@@ -1310,6 +1555,185 @@ Acceptance: `tests/test_taxonomy.py` 64 → **91**, `tests/test_document_extract
 sectioned *hybrid* search (one added), and the keyword prose filter was inert
 until the numeric-citation case was written. Full detail:
 `runs/2026-08-07-taxonomy-finish/SUMMARY.md`.
+
+---
+
+## Memory at scale on microsoft/vscode + MCP A/B evaluation, 2026-08-12
+
+A fresh full image (all extras, WASM on) with memory enabled, OpenAI
+`text-embedding-3-small` + `gpt-5.6-luna`, indexing **microsoft/vscode**, then an
+evaluation driven through the **real MCP surface** (`search_context` over stdio,
+a fresh `pheasant mcp` process per arm — not a Python import of the search code).
+Three suites, because memory cannot improve recall of what it does not know and
+one blended score would hide both the win and the regression:
+**corpus** MRR 0.462 → **0.495** (memory is not a tax), **memory-only** 0.000 →
+**1.000**, **steering** 0.167 → 0.250. Separately, the config-level steering
+ablation: team-vocabulary queries **0.029 → 0.467 (+0.438)** while control
+queries move **+0.000** — 33.8's acceptance criterion genuinely met, and it was
+**not** met before this run though the suite said it was.
+
+**Seven bugs, six of which the 1,067-test suite passes straight over.**
+(1) The embedder had **no retry** — one `SSLV3_ALERT_BAD_RECORD_MAC`, then a
+`429`, each killed the whole multi-hour index; `_post_with_retry` with bounded
+backoff + `Retry-After`. (2) `busy_timeout` 5s → **60s**; real
+sync/API/scheduler contention at this size hit "database is locked".
+(3) **`serve` advertised `streamable_http_url: <base>/mcp` and never mounted
+it** — 404/405 to every agent it told to connect. Three things had to be right:
+mount it; **run its lifespan** (`app.mount()` does not, and FastMCP without it
+raises "Task group is not initialized" on every request); and the
+**DNS-rebinding guard**, whose localhost-only default 421s the container
+hostname this normally runs behind — now derived from `server.api.cors_origins`
+rather than a second allow-list, widening only to hosts already admitted. Plus a
+**307** (never 302) redirect for the slash-less form, since Starlette's `Mount`
+only matches paths continuing past the prefix. (4) A pre-existing **`yaml.py`
+shim** bug — it split list items on *any* colon, so `- http://host:8765` became
+`{"http": "//host:8765"}`, corrupting `cors_origins` and anything else listing a
+URL; now YAML's real rule (colon + whitespace/EOL). Third in that shim's family.
+(5) **`pheasant mcp`/`serve` ignored `PHEASANT_CONFIG`** although the Dockerfile
+sets it, the docs say to check it, and **pheasant's own generated MCP client
+configs put it in the agent's environment** — so an agent pointed at another
+config silently searched the **wrong knowledge base and reported it as the right
+one**. (6) **Multi-word alias triggers never fired**: `Steering.expand()` looked
+up `aliases[token]` one token at a time, so `filewatch daemon -> …` parsed,
+loaded, was reported in force by `describe_retrieval`, and never once fired —
+`prefers()` directly below it already had the fix and a docstring explaining it.
+Every alias fixture in the suite was single-word (`router -> flock`). This is
+what turned steering from inert into +0.438 MRR.
+
+**The evaluation's own finding — steering rules were being returned as search
+results.** `memory=auto` first *dropped* corpus MRR to 0.335. Not crowding-out:
+only **one** memory row entered the top 10 yet `fileService.ts` fell 1 → 5, and
+`MemoryPolicy.max_results` (the lever built for this) made it slightly *worse*
+because it caps the output, not the fusion input. The rank-1 hit was the **alias
+rule itself** — an agent asking for code got a line of rule syntax dressed as
+retrieved knowledge, the cheap half of the memory-control-flow surface 33.6 set
+out to contain. Steering-kind records are now excluded from result lists by
+default (`MemoryPolicy.include_rules`, default false); the rules stay in force
+and inspectable via `describe_retrieval` and `GET /memory`. Note `admits()`
+serves two callers — "may this be *returned*" and "does this policy admit this
+rule's *scope*" — so the lift is applied where rules are loaded, beside the
+pre-existing `mode="auto"` lift that exists for the same reason.
+**Corpus MRR 0.335 → 0.495.**
+
+Suite **1,067 passed / 6 skipped / 8 failed** — all 8 verified **pre-existing**
+by stashing every change and re-running on a clean tree (Windows path separators,
+0600 perms, CRLF-inert `test_contract_parity`, the known wasmtime trap bug).
+Mutation-tested **5/5 killed** (the 307→302 mutant is killed by *hanging*: a 302
+downgrades the POST to GET and the endpoint holds it open as SSE). Contract
+untouched, no re-vendor. **Caveat: the vscode index did not finish** — ~9,700 of
+12,667 files at ~20 files/min, bounded by the embedding endpoint, so the numbers
+are on a partial index; the harness has a preflight that **excludes** unindexed
+gold targets rather than scoring them as misses in both arms. Full detail:
+`runs/2026-08-12-memory-scale-eval/SUMMARY.md`.
+
+---
+
+## Memory system review + hardening, 2026-08-13
+
+A read-the-subsystem-end-to-end review rather than a step. **Six defects, five
+of them silent** — nothing raises, nothing logs, and the 1,067-test suite passes
+straight over all five. New `docs/memory-system.md` (Explanation nav) is the
+overview the subsystem never had: lifecycle, module map, validity model, the two
+encodings, steering, graph bridge, salience, isolation, surfaces, and an explicit
+**invariants** list.
+
+**1. Frontmatter injection → ACL escalation (security).** `MemoryStore._render`
+interpolated caller-controlled values into line-oriented frontmatter with no
+validation, and `load` built its field dict with plain assignment, so a later
+duplicate key won. `subject` is unvalidated on `POST /memory` and MCP
+`memory_write`, so `subject="deploy\nmemory_scope: org"` wrote a `user` record
+whose file said `org` — and `SyncEngine._memory_acl` reads scope back **out of
+that file**, where `normalize_acl` turns `org` into `public: True`. That is the
+33.11 leak reopened through input rather than through a missing rule; `supersedes`
+could be forged the same way, invalidating any record whose id the writer guessed.
+Reproduced before fixing. Now every frontmatter-bound value (`subject`,
+`supersedes`, `written_by`, each tag, both validity instants) is **rejected** on a
+line break — not escaped, because no legitimate value contains one — and `load`
+takes the **first** occurrence of each key so a record written by a pre-fix
+release cannot be read at a forged scope.
+
+**2. `is_default` was driving the over-fetch decision.** `hybrid.py` asked
+`not policy.is_default` to decide whether to over-fetch, but `is_default` checks
+neither `current_only` (defaults **true**) nor `include_rules` (defaults
+**false**) — both of which filter. So on the *default* path the over-fetch was
+skipped while the vector and graph arms were still filtered in Python **after**
+truncation to `max_results`, returning a short page while the hits that should
+have filled it sat past the cut. The text arm was never affected (its predicate
+is in SQL ahead of `LIMIT`). New `policy.may_filter` asks the loaded index
+whether anything would *actually* be dropped, so a region whose memory holds
+nothing droppable still pays nothing. `is_default` keeps its meaning and gains a
+docstring saying it is not the same question.
+
+**3. The multi-word alias fix was one character class short.** `expand`/`prefers`
+split triggers on `[\s_\-]+` while `_query_tokens` splits on `[_\W]+`, so
+`ci/cd`, `fs.watch` and `api:gateway` parsed, loaded, reported themselves in
+force via `describe_retrieval` — and never fired. Same failure the 2026-08-12
+multi-word fix was written for. One `_trigger_fires` helper now backs both
+methods, splitting on `[^A-Za-z0-9]+`, with all-parts-required preserved.
+
+**4. `GROUP_CONCAT` reassembled rule text in unspecified order.** SQLite does not
+guarantee the order an aggregate sees its input, so a rule spanning two chunks
+could come back reversed — parsing differently, or not at all, between two runs
+over identical content. A determinism break (rule 1) on the one path whose job is
+to be reproducible, and silent: the rule just stops being in force. Now
+`ORDER BY m.record_id, c.chunk_index` with the join done in Python. The mutation
+run printed the reversed text (`-> pheasant-flock, flock router`) directly.
+
+**5. Capacity pruning could archive a steering rule.** `_prune_to_capacity`
+ranked by salience with no `kind` awareness, so crossing `memory.max_records`
+could silently switch off an `exclusion` — changing ranking for every future
+query with no signal anywhere. Steering records are now exempt in both
+directions (they neither consume slots nor get archived); `MAX_RULES` already
+bounds what is in force. `memory_salience_rows` gained `kind`.
+
+**6. `valid_until` was never validated.** Compared lexicographically everywhere
+downstream, so `"soon"` sorts above every real instant and silently means "never
+expires". Both validity instants must now parse as ISO-8601.
+
+Acceptance: `tests/test_memory_hardening.py` (26). **Mutation-tested per fix**,
+not in aggregate — four reverts (store / hybrid call site / steering / maintenance
++ state_store), each failing exactly the tests written for it and nothing else.
+Suite **1093 passed / 8 failed / 6 skipped** (+26; same 8 pre-existing, verified
+unchanged against the baseline run). `ruff check` clean on every touched file
+(the 5 `test_taxonomy.py` E501s remain pre-existing and untouched). Fresh
+`--no-cache` image rebuilt and smoke-tested live: all five extras import, UI
+bundle serves, and a real MCP `initialize` handshake round-trips through the
+newly-mounted `/mcp` (307 → session manager → JSON-RPC result). Docs:
+`docs/memory-system.md`, plus `how-to/agent-memory.md`, `reference/http-api.md`
+and `mcp_tools.md` updated for `include_rules`, the field rules and the pruning
+exemption. Full detail: `runs/2026-08-13-memory-hardening/SUMMARY.md`.
+
+**Container WASM defaults, same session.** A container that generates its own
+config now enables the two accelerators (`search.wasm_relationship_search`,
+`graph.wasm_cross_source_resolution`). They are opt-in in the *schema* — a
+source install may not have the `[wasm]` extra — but the image always installs
+it and ships the precompiled guest, so a fresh container was leaving switched
+off exactly what it was built with. Supplied through `pheasant setup --answers`
+rather than by post-editing YAML, so `docker-entrypoint.sh` keeps one code path
+for "what does a default config look like". Gated on `import wasmtime` actually
+succeeding: both accelerators fall back to pure Python silently, so enabling
+them without the extra would be *correct* but would log a warning per call and
+mean nothing. **`ingestion.extractor.provider: sandboxed` is deliberately NOT
+swept in** — that is a fidelity trade, not an acceleration one (the default
+`auto` reads encrypted PDFs, LZW/CCITT and Type0/CID CMaps the sandboxed
+tokenizer cannot), and a test asserts the answers file contains exactly the two
+accelerator keys. **Honest caveat recorded in `configuration.md`:**
+`wasm_cross_source_resolution` *loses* to Python below ~1,300-2,500 cross-source
+edges per the 34.4 benchmark, which is where a brand-new container starts; it is
+on anyway on the assumption a container's graph grows past the crossover, with
+the escape hatch documented. Verified in a real container **both ways** —
+wasmtime present → both flags true and the guest instantiates exporting
+`scan_edges`/`resolve_cross_source`; wasmtime shadowed by a raising stub →
+flags absent and the gate logs why. Tests driven through the **real wizard**
+rather than string-matching the script, because a schema-key rename would
+otherwise leave a green test while the container silently generated a config
+with acceleration off. `tests/test_fresh_ui_compose.py` (+4).
+
+**Not fixed, recorded instead:** `supersedes` is still not
+authorization-checked — injection can no longer forge it, but the API accepts it
+as a legitimate parameter, so any writer may correct any record whose id it
+knows. That is a design decision (does a region want cross-principal
+correction?), not a bug to quietly close.
 
 ---
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from pheasant.api.app import create_app, graph_neighbors, graph_slice
@@ -489,3 +490,137 @@ def test_hierarchy_survives_a_bounded_horizon() -> None:
     assert {"dir:1", "dir:2", "dir:3", "dir:4", deep_file} <= ids
     assert not any(node_id.startswith("file:flat") for node_id in ids)
     assert without_shortcut["depths"][deep_file] == 6
+
+
+def test_the_advertised_mcp_endpoint_is_actually_mounted(tmp_path) -> None:
+    """`/mcp/info` advertises a streamable-HTTP URL; it has to exist.
+
+    A live container told an MCP client to connect to `<base>/mcp` and then
+    answered 404/405, because `serve` built the FastAPI app and never mounted
+    the MCP one. Advertising an endpoint that is not served is worse than not
+    offering the transport.
+    """
+    pytest.importorskip("mcp")
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from pheasant.api.app import create_app
+    from pheasant.config.loader import load_config
+
+    config_path = tmp_path / "pheasant.yaml"
+    config_path.write_text(
+        f"""pheasant:
+  name: mcp-mount
+  state_path: {tmp_path / "state"}
+  vault_path: {tmp_path / "vault"}
+  exports_path: {tmp_path / "exports"}
+  workspace_root: {tmp_path}
+sync:
+  watcher:
+    enabled: false
+  scheduler:
+    enabled: false
+sources: []
+""",
+        encoding="utf-8",
+    )
+    app = create_app(load_config(config_path), config_path=str(config_path))
+    handshake = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "pheasant-tests", "version": "1"},
+        },
+    }
+    headers = {"accept": "application/json, text/event-stream"}
+    try:
+        # The `with` matters: FastMCP's session manager starts in the app's
+        # lifespan, and mounting a sub-app does not run its lifespan for it.
+        with fastapi_testclient.TestClient(app, base_url="http://localhost:8765") as client:
+            advertised = client.get("/mcp/info").json()
+            assert advertised["transports"]["streamable_http"] is True
+            assert advertised["streamable_http_url"].endswith("/mcp")
+
+            # Assert a real protocol handshake, not merely "not 404". The
+            # mount reached the session manager long before it could answer,
+            # so a routing-only assertion would have called this fixed twice
+            # over while every client still failed.
+            for path in ("/mcp", "/mcp/"):
+                response = client.post(path, json=handshake, headers=headers)
+                assert response.status_code == 200, (
+                    f"advertised MCP endpoint {path} is not usable "
+                    f"(HTTP {response.status_code}): {response.text[:200]}"
+                )
+                assert response.json()["result"]["serverInfo"]["name"]
+
+            # Mounting an ASGI catch-all at /mcp must not shadow the sibling
+            # routes that share the prefix, nor anything else.
+            assert client.get("/mcp/info").status_code == 200
+            assert client.get("/health").status_code == 200
+    finally:
+        app.state.engine.close()
+
+
+def test_mcp_transport_security_follows_the_configured_cors_origins(tmp_path) -> None:
+    """A container is not reached at `localhost`, and MCP must survive that.
+
+    FastMCP's DNS-rebinding guard allows only 127.0.0.1/localhost/[::1] by
+    default, so the same server reached as `http://pheasant:8765` answers 421
+    Misdirected Request to every MCP call. pheasant already has an operator
+    knob for who may reach this API — `server.api.cors_origins` — so the guard
+    is driven from that rather than from a second, separate allow-list.
+    """
+    pytest.importorskip("mcp")
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from pheasant.api.app import create_app
+    from pheasant.config.loader import load_config
+
+    config_path = tmp_path / "pheasant.yaml"
+    config_path.write_text(
+        f"""pheasant:
+  name: mcp-hosts
+  state_path: {tmp_path / "state"}
+  vault_path: {tmp_path / "vault"}
+  exports_path: {tmp_path / "exports"}
+  workspace_root: {tmp_path}
+server:
+  api:
+    cors_origins:
+      - http://pheasant.internal:8765
+sync:
+  watcher:
+    enabled: false
+  scheduler:
+    enabled: false
+sources: []
+""",
+        encoding="utf-8",
+    )
+    handshake = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "pheasant-tests", "version": "1"},
+        },
+    }
+    headers = {"accept": "application/json, text/event-stream"}
+
+    def handshake_status(host: str) -> int:
+        # A fresh app per call: FastMCP's session manager refuses to `run()`
+        # twice, so two TestClient contexts cannot share one app.
+        app = create_app(load_config(config_path), config_path=str(config_path))
+        try:
+            with fastapi_testclient.TestClient(app, base_url=f"http://{host}") as client:
+                return client.post("/mcp/", json=handshake, headers=headers).status_code
+        finally:
+            app.state.engine.close()
+
+    assert handshake_status("pheasant.internal:8765") == 200, (
+        "a host the operator allowed via cors_origins was refused by the MCP transport guard"
+    )
+    # Narrowed to the operator's list, not switched off.
+    assert handshake_status("evil.example:8765") == 421, "an unlisted host should be refused"

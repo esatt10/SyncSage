@@ -245,7 +245,64 @@ export interface Citation {
   /** Breadcrumb of the section this passage came from; absent unless the
    *  source has taxonomy extraction enabled. */
   heading_path?: string;
+  /** Present only when this passage is a remembered assertion rather than a
+   *  document, so the UI can say so instead of the reader having to infer it
+   *  from a path that starts with a scope directory. */
+  memory?: CitationMemory;
 }
+
+export interface CitationMemory {
+  record_id?: string;
+  scope?: MemoryScope;
+  subject?: string | null;
+  kind?: string;
+  asserted_at?: string;
+}
+
+export type MemoryScope = "session" | "user" | "org";
+
+export interface MemoryRecord {
+  record_id: string;
+  scope: MemoryScope;
+  subject?: string | null;
+  text: string;
+  asserted_at: string;
+  supersedes?: string | null;
+  tags: string[];
+  path: string;
+  schema_version: number;
+  kind: string;
+  written_by?: string | null;
+  valid_from?: string;
+  valid_until?: string | null;
+}
+
+export interface MemoryListResponse {
+  source: string;
+  records: MemoryRecord[];
+}
+
+export interface MemoryWriteResponse {
+  record: MemoryRecord;
+  created: boolean;
+  source: string;
+  sync?: SyncResult;
+}
+
+export interface MemoryConsolidateResponse {
+  source?: string;
+  skipped?: string;
+  report?: {
+    archived: number;
+    kept: number;
+    archived_superseded: string[];
+    archived_expired: string[];
+  };
+  pruned?: string[];
+}
+
+/** How memory takes part in one search. Mirrors `MemoryPolicy` server-side. */
+export type MemoryMode = "auto" | "off" | "only" | "prefer";
 
 export interface GraphFact {
   subject: string;

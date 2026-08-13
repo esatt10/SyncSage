@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { JobRecord } from "../api/types";
 
@@ -18,6 +18,11 @@ import type { JobRecord } from "../api/types";
  */
 export function JobsTray() {
   const [expanded, setExpanded] = useState(false);
+  const queryClient = useQueryClient();
+  const clear = useMutation({
+    mutationFn: (jobId?: string) => (jobId ? api.clearJob(jobId) : api.clearJobs()),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+  });
 
   const jobs = useQuery({
     queryKey: ["jobs"],
@@ -64,6 +69,13 @@ export function JobsTray() {
 
       {expanded ? (
         <div className="jobs-tray__body">
+          {recent.length > 0 ? (
+            <div className="jobs-tray__actions">
+              <button className="button button--ghost" onClick={() => clear.mutate(undefined)}>
+                Clear finished
+              </button>
+            </div>
+          ) : null}
           {records.length === 0 ? (
             <p className="muted small" style={{ margin: 0 }}>
               Nothing running. Syncs, uploads and re-indexes show up here with
@@ -71,7 +83,7 @@ export function JobsTray() {
             </p>
           ) : null}
           {[...active, ...recent].map((job) => (
-            <JobRow key={job.id} job={job} />
+            <JobRow key={job.id} job={job} onClear={() => clear.mutate(job.id)} />
           ))}
         </div>
       ) : null}
@@ -79,7 +91,7 @@ export function JobsTray() {
   );
 }
 
-function JobRow({ job }: { job: JobRecord }) {
+function JobRow({ job, onClear }: { job: JobRecord; onClear: () => void }) {
   const fraction = job.progress.fraction;
   return (
     <div className={`job job--${job.status}`}>
@@ -88,6 +100,16 @@ function JobRow({ job }: { job: JobRecord }) {
         <span className="job__status">
           {job.active ? job.progress.phase : job.status}
         </span>
+        {!job.active ? (
+          <button
+            className="job__clear"
+            onClick={onClear}
+            aria-label={`Clear ${job.label}`}
+            title="Clear"
+          >
+            ×
+          </button>
+        ) : null}
       </div>
 
       {/* An unknown total renders as an indeterminate bar rather than 0%:

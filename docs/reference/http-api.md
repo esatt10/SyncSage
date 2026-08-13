@@ -82,11 +82,38 @@ and `job` — the live job behind the boolean, with its phase and counter.
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/search` | Search (`mode`: `text` / `graph` / `vector` / `hybrid`). |
+| POST | `/search` | Search (`mode`: `text` / `graph` / `vector` / `hybrid`). Also takes `source_name`, `exclude_sources`, `node_types`, `min_score`, `section` and `memory`. |
 | POST | `/relevant-files` | Rank relevant files for a task/query. |
 | GET | `/files/summary` | Summarize a file node. |
 | GET | `/nodes/content` | Fetch a node's content. |
 | GET | `/nodes/explain` | Explain why a node matched / its provenance. |
+
+### The `memory` argument
+
+`POST /search`, `/relevant-files` and `/assistant/chat` all accept `memory`:
+one of `"auto"` (default), `"off"`, `"only"`, `"prefer"`, or an object with
+`scopes`, `subject`, `current_only`, `as_of`, `max_results` and
+`include_rules`.
+
+`include_rules` defaults to `false`: `alias`/`preference`/`exclusion` records
+steer ranking but are not themselves returned as passages. Set it true to see
+them in results.
+
+Records a later record corrected are excluded automatically — you do not have
+to wait for a consolidation pass. Pass `{"current_only": false}` or an `as_of`
+instant to see them. Hits that came from memory carry a `memory` block naming
+the record, its scope, subject and when it was asserted.
+
+## Agent memory
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/memory/enable` | Provision the `type: memory` source. Idempotent; the only way to turn memory on without editing `pheasant.yaml`. |
+| POST | `/memory` | Append one record. Body: `text`, `scope` (`session`/`user`/`org`), `subject`, `supersedes`, `tags`, `kind`, `principal`, `valid_until`, `sync`. |
+| GET | `/memory` | List records. Query: `scope`, `current_only`. |
+| POST | `/memory/consolidate` | Archive superseded/expired records, prune past `memory.max_records`, then re-index. Returns `{"skipped": …}` when consolidation is off — not an error. |
+
+See [Agent memory](../how-to/agent-memory.md).
 
 ## Assistant (grounded chat)
 

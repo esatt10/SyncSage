@@ -4,6 +4,7 @@ import yaml from "js-yaml";
 import { api } from "../api/client";
 import { ObjectEditor } from "../config/ObjectEditor";
 import { EmbeddingsPanel } from "../components/EmbeddingsPanel";
+import { MemoryPanel } from "../components/MemoryPanel";
 import { WorkflowPanel } from "../components/WorkflowPanel";
 import { KnowledgeBasePanel } from "../components/KnowledgeBasePanel";
 import { RetrievalPanel } from "../components/RetrievalPanel";
@@ -147,6 +148,13 @@ export function ConfigPage() {
         <h2 className="section__title">Retrieval tuning</h2>
         <div className="card" style={{ padding: 16 }}>
           <RetrievalPanel />
+        </div>
+      </section>
+
+      <section className="section">
+        <h2 className="section__title">Agent memory</h2>
+        <div className="card" style={{ padding: 16 }}>
+          <MemoryPanel />
         </div>
       </section>
 

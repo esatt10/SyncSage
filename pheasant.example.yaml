@@ -94,6 +94,26 @@ search:
     prefer_recent_commits: true
     graph_neighbor_boost: true
     max_results_default: 10
+  # Run graph_search._scan_edges through the vendored WASM accelerator
+  # (Synapse 34.5b) instead of pure Python. Needs the [wasm] extra; falls back
+  # to pure Python on any failure or if the extra is missing, so it is never a
+  # correctness dependency. A consistent, growing win on the relationship-search
+  # query path. Off here, but the Docker image turns it ON in a config it
+  # generates itself, since that image always installs [wasm].
+  wasm_relationship_search: false
+
+# Knowledge-graph construction.
+graph:
+  # Run resolve_cross_source_edges (import/link resolution across sources)
+  # through the same vendored accelerator (Synapse 34.5a). Same fallback
+  # guarantee as above. Conditional win per the 34.4 benchmark: it LOSES to
+  # pure Python below roughly 1,300-2,500 cross-source edges and wins above
+  # it, so leave it off for a small static corpus and turn it on for a large
+  # or growing multi-source graph. The Docker image turns it ON, on the
+  # assumption a container's graph grows past that crossover.
+  wasm_cross_source_resolution: false
+  # Minimum documents a concept must appear in to be kept.
+  concept_min_documents: 2
 
 sync:
   # Guardrails on how much one filesystem source may pull in. A source may
@@ -231,6 +251,38 @@ security:
 
 # Grounded chat over your index (the UI's chat layer). Query-time only — no
 # LLM ever runs during indexing, so re-syncing unchanged content stays
+# Agent memory. Records are append-only Markdown files written by agents
+# (MCP `memory_write` / `POST /memory`) into a `type: memory` source and
+# indexed by the ordinary pipeline — recall is just search, there is no second
+# retrieval path. This block controls consolidation, how memory takes part in
+# retrieval, and how the store is bounded.
+#
+# A *corrected* record is dropped from results at query time, without waiting
+# for consolidation; pass `{"current_only": false}` or an `as_of` instant on a
+# search to see it again.
+memory:
+  # Archive superseded and TTL-expired records on the scheduler beat. The file
+  # is renamed `<id>.md.archived` in place — bytes preserved, never deleted.
+  consolidation_enabled: true
+  # Per-scope age limits. null = that scope never expires by age.
+  session_ttl_days: null
+  user_ttl_days: null
+  org_ttl_days: null
+  # How memory takes part in a search that does not say. A per-call `memory`
+  # argument always wins over this. auto | off | only | prefer
+  default_policy: auto
+  # Let `alias`/`preference`/`exclusion` records re-rank results, not merely be
+  # retrievable. Off by default: a memory that silently re-orders searches is a
+  # surprise unless it was asked for.
+  steering_enabled: false
+  # Count which records retrieval returns, so salience reflects use. Off by
+  # default — a write on the read path, and an operator's decision to make.
+  usage_tracking: false
+  # Archive the least salient records past this many. null = unbounded.
+  max_records: null
+  # Cap on `about` graph edges drawn per record by the memory bridge.
+  about_max_targets: 3
+
 # byte-for-byte deterministic.
 #
 # With no provider reachable the assistant still answers, extractively: the

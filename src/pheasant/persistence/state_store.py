@@ -1,10 +1,29 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+#: How long a statement waits for a competing writer before giving up.
+#:
+#: Was 5 s, which is fine when the only writer is a short sync. It is **not**
+#: fine during a multi-hour index of a large repository with the UI open: the
+#: sync worker writes continuously in one process while the API server serves
+#: `/overview`, `/jobs` and `/graph/slice` polls in another, and a 12,667-file
+#: run of microsoft/vscode died on
+#:
+#:     sqlite3.OperationalError: database is locked
+#:
+#: after ~40 minutes. WAL lets readers and one writer coexist, but checkpoints
+#: and the enrichment pass's multi-statement transactions still take the write
+#: lock long enough to blow a 5-second budget under that load. Waiting a minute
+#: costs nothing when the alternative is losing the whole index.
+BUSY_TIMEOUT_MS = 60_000
 
 
 def _basename(path: str | None) -> str:
@@ -180,6 +199,47 @@ CREATE TABLE IF NOT EXISTS idp_sync_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- Step 33.5 — the structured face of the agent-memory records that already
+-- live as Markdown files under the `type: memory` source.
+--
+-- This is a **projection**, not a second source of truth: every column is
+-- derivable from the record files, and `replace_memory_records` rebuilds a
+-- source's rows wholesale on each sync, exactly as `chunks_fts` is a derived
+-- cache over `chunks` + `artifacts`. Losing this table costs a re-sync, never
+-- data. The records themselves stay append-only files on disk.
+--
+-- It exists because scope/subject/asserted_at/supersedes were reachable only
+-- as *prose inside the indexed chunk text* — so nothing could filter on them,
+-- and a superseded record stayed retrievable until a batch job archived it.
+--
+-- `valid_until` is derived, never double-stored: when B supersedes A, A's
+-- validity ends at B's `asserted_at`. An explicit `valid_until` in the record
+-- wins when it is earlier.
+CREATE TABLE IF NOT EXISTS memory_records (
+  record_id TEXT PRIMARY KEY,
+  artifact_id TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  subject TEXT,
+  kind TEXT NOT NULL DEFAULT 'fact',
+  asserted_at TEXT NOT NULL,
+  valid_from TEXT,
+  valid_until TEXT,
+  supersedes TEXT,
+  tags TEXT,
+  written_by TEXT,
+  salience REAL NOT NULL DEFAULT 1.0,
+  uses INTEGER NOT NULL DEFAULT 0,
+  last_used_at TEXT,
+  schema_version INTEGER NOT NULL DEFAULT 1,
+  FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
+);
+-- Retrieval joins chunks -> artifacts -> memory_records on every memory-aware
+-- query, and the validity predicate is `scope` + `valid_until`.
+CREATE INDEX IF NOT EXISTS idx_memory_records_artifact_id
+  ON memory_records(artifact_id);
+CREATE INDEX IF NOT EXISTS idx_memory_records_scope
+  ON memory_records(scope, valid_until);
 -- What the indexed state was built with, per scope (a source, or the vector
 -- space). A restart compares the live config against these: same fingerprint
 -- means the stored artifacts/chunks/vectors are still valid and there is
@@ -239,7 +299,7 @@ class StateStore:
             # kill -9 mid-write, busy_timeout rides out concurrent readers,
             # synchronous=NORMAL is the sanctioned WAL durability level.
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
             conn.execute("PRAGMA synchronous=NORMAL")
             self._local.conn = conn
             with self._registry_lock:
@@ -648,6 +708,105 @@ class StateStore:
             for row in rows
         ]
 
+    def replace_memory_records(self, source_id: str, records: list[dict[str, Any]]) -> int:
+        """Rebuild one memory source's projection rows (Step 33.5).
+
+        Transactional and wholesale: the table is a projection of the record
+        files, so rebuilding it is always safe and always correct, and a
+        record archived on disk disappears here without needing its own
+        delete path. Returns the number of rows written.
+
+        ``salience``/``uses``/``last_used_at`` are carried over from the
+        existing row when one is present — they are earned by *use* (Step
+        33.9) and are the one thing here that is not derivable from the file,
+        so a re-sync must not silently reset them to zero.
+        """
+        with self.conn:
+            earned = {
+                str(row["record_id"]): row
+                for row in self.conn.execute(
+                    "SELECT record_id, salience, uses, last_used_at "
+                    "FROM memory_records WHERE source_id=?",
+                    (source_id,),
+                )
+            }
+            self.conn.execute("DELETE FROM memory_records WHERE source_id=?", (source_id,))
+            for record in records:
+                prior = earned.get(str(record.get("record_id")))
+                self.conn.execute(
+                    """INSERT INTO memory_records(
+                        record_id,artifact_id,source_id,scope,subject,kind,asserted_at,
+                        valid_from,valid_until,supersedes,tags,written_by,
+                        salience,uses,last_used_at,schema_version
+                    )
+                    VALUES(
+                        :record_id,:artifact_id,:source_id,:scope,:subject,:kind,:asserted_at,
+                        :valid_from,:valid_until,:supersedes,:tags,:written_by,
+                        :salience,:uses,:last_used_at,:schema_version
+                    )""",
+                    {
+                        "subject": None,
+                        "kind": "fact",
+                        "valid_from": None,
+                        "valid_until": None,
+                        "supersedes": None,
+                        "tags": None,
+                        "written_by": None,
+                        "schema_version": 1,
+                        **record,
+                        "salience": float(prior["salience"]) if prior else 1.0,
+                        "uses": int(prior["uses"]) if prior else 0,
+                        "last_used_at": prior["last_used_at"] if prior else None,
+                    },
+                )
+        return len(records)
+
+    def record_memory_use(self, record_ids: list[str], when: str) -> int:
+        """Bump `uses`/`last_used_at` for records retrieval just returned.
+
+        Best-effort and off the critical path (Step 33.9): a counter that fails
+        to increment costs a little ranking signal, never a search. One
+        statement for the whole batch, because this runs on the *read* path and
+        a per-record round trip there would be a real cost for a soft benefit.
+        """
+        if not record_ids:
+            return 0
+        placeholders = ",".join("?" for _ in record_ids)
+        try:
+            with self.conn:
+                cursor = self.conn.execute(
+                    "UPDATE memory_records SET uses = uses + 1, last_used_at = ? "
+                    f"WHERE record_id IN ({placeholders})",
+                    (when, *record_ids),
+                )
+            return int(cursor.rowcount or 0)
+        except Exception:  # pragma: no cover - never fail a query over a counter
+            logger.debug("memory use counters not recorded", exc_info=True)
+            return 0
+
+    def memory_salience_rows(self) -> list[dict[str, Any]]:
+        """Everything the salience formula reads, for a pruning pass."""
+        try:
+            rows = self.rows(
+                # `kind` is here so capacity pruning can tell a retrieval *rule*
+                # from a recallable fact; see `memory.maintenance`.
+                "SELECT record_id, scope, kind, asserted_at, uses, last_used_at, salience "
+                "FROM memory_records"
+            )
+        except Exception:  # pragma: no cover - state store older than 33.5
+            return []
+        return [dict(row) for row in rows]
+
+    def set_memory_salience(self, scores: dict[str, float]) -> None:
+        """Persist computed salience so it is visible without recomputing."""
+        if not scores:
+            return
+        with self.conn:
+            self.conn.executemany(
+                "UPDATE memory_records SET salience = ? WHERE record_id = ?",
+                [(value, key) for key, value in sorted(scores.items())],
+            )
+
     def delete_source_artifacts(self, source_id: str) -> int:
         rows = self.rows("SELECT COUNT(*) AS c FROM artifacts WHERE source_id=?", (source_id,))
         count = int(rows[0]["c"]) if rows else 0
@@ -657,6 +816,14 @@ class StateStore:
             self.conn.execute("DELETE FROM symbols WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM artifact_terms WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM artifacts WHERE source_id=?", (source_id,))
+        # Deliberately NOT clearing memory_records here. This runs on every
+        # *full* sync (engine.py's rebuild path, which consolidation takes after
+        # each archive), and `replace_memory_records` rebuilds the rows moments
+        # later anyway — so dropping them buys nothing and costs the one thing
+        # in that table that is earned rather than derived: `uses`, `salience`
+        # and `last_used_at`. Wiping those on every consolidation pass would
+        # quietly reset a memory's track record. Genuine removal goes through
+        # `delete_source`, which does clear them.
         return count
 
     def delete_source(self, source_id: str) -> None:
@@ -665,6 +832,7 @@ class StateStore:
             self.conn.execute("DELETE FROM chunks WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM symbols WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM artifact_terms WHERE source_id=?", (source_id,))
+            self.conn.execute("DELETE FROM memory_records WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM artifacts WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM source_checkpoints WHERE source_id=?", (source_id,))
             self.conn.execute("DELETE FROM sources WHERE id=?", (source_id,))

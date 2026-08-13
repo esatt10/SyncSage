@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from collections import deque
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -16,57 +18,25 @@ from pheasant.persistence.paths import StatePaths
 from pheasant.persistence.state_store import StateStore
 from pheasant.registry.knowledge_base_registry import KnowledgeBaseRegistry
 from pheasant.registry.source_registry import SourceRegistry
+from pheasant.search.criteria import (
+    apply_retrieval_criteria,
+    criteria_active,
+    criteria_dict,
+    source_of,
+)
 from pheasant.search.hybrid import HybridSearch
 from pheasant.search.sqlite_store import SearchStore
 from pheasant.security.path_policy import resolve_config_write_target, resolve_under
 from pheasant.sync.engine import SyncEngine
 
+logger = logging.getLogger(__name__)
 
-def apply_retrieval_criteria(
-    results: list[dict],
-    *,
-    exclude_sources: list[str] | None = None,
-    node_types: list[str] | None = None,
-    min_score: float | None = None,
-) -> list[dict]:
-    """Filter search hits by caller-supplied criteria. Order is preserved.
-
-    Ranking is not recomputed: these are *post-filters* over an already-ranked
-    list, so a criterion can only ever remove rows. Re-scoring here would make
-    the same query answer differently depending on which filters were passed,
-    which is exactly the surprise a retrieval-tuning surface must not have.
-    """
-    excluded = {str(name) for name in (exclude_sources or [])}
-    wanted_types = {str(name) for name in (node_types or [])}
-    kept: list[dict] = []
-    for item in results:
-        if excluded and _source_of(item) in excluded:
-            continue
-        if wanted_types and str(item.get("type") or "") not in wanted_types:
-            continue
-        if min_score is not None:
-            try:
-                if float(item.get("score") or 0.0) < min_score:
-                    continue
-            except (TypeError, ValueError):
-                continue
-        kept.append(item)
-    return kept
-
-
-def _source_of(item: dict) -> str:
-    """The source a search hit came from.
-
-    Hits do **not** carry a top-level ``source_id`` — it lives under
-    ``provenance``, alongside the path. Reading the wrong key here meant
-    ``exclude_sources`` matched nothing and silently returned unfiltered
-    results, which is worse than refusing the filter outright. Both shapes are
-    accepted so a caller passing already-flattened rows still works.
-    """
-    provenance = item.get("provenance")
-    if isinstance(provenance, dict) and provenance.get("source_id"):
-        return str(provenance["source_id"])
-    return str(item.get("source_id") or item.get("source") or "")
+#: Step 33.6 — the criteria filters moved to `pheasant.search.criteria` so
+#: `POST /search` and the MCP tool share one implementation instead of HTTP
+#: silently having fewer filters. `apply_retrieval_criteria` stays importable
+#: from this module (it is imported above, and callers and tests reach for it
+#: here); `_source_of` keeps its old private name for the same reason.
+_source_of = source_of
 
 
 def _preview_rows(results: list[dict]) -> list[dict]:
@@ -99,6 +69,9 @@ class PheasantTools:
             vector=self.engine.vector_searcher(),
             node_index=self.engine.node_index,
             wasm_relationship_search=config.search.wasm_relationship_search,
+            steering_enabled=config.memory.steering_enabled,
+            default_memory_policy=config.memory.default_policy,
+            usage_tracking=config.memory.usage_tracking,
         )
 
     def list_knowledge_bases(self) -> dict:
@@ -359,6 +332,9 @@ class PheasantTools:
         supersedes: str | None = None,
         tags: list[str] | None = None,
         sync: bool = True,
+        kind: str = "fact",
+        principal: str | None = None,
+        valid_until: str | None = None,
     ) -> dict:
         """Append one memory record and (by default) index it immediately.
 
@@ -366,11 +342,20 @@ class PheasantTools:
         source; ``sync=True`` runs an incremental sync of that source so the
         memory is retrievable via ``search_context`` in the same session
         (read-your-writes). Recall is ordinary search — no separate path.
+
+        ``principal`` records *who asserted this* — it is what lets a later
+        step scope a user's memories to that user rather than to everyone
+        (Step 33.11), and it is part of the record id, so two agents writing
+        the same sentence in the same second get two records instead of
+        silently sharing one. ``kind`` marks a record as retrieval policy
+        rather than a fact; ``valid_until`` gives it an expiry it declares
+        itself. All three are optional and default to the pre-33.5 behavior
+        (CLAUDE.md §4 rule 8: additive only).
         """
         from pheasant.memory.store import MemoryStore, memory_source
 
         self._require_knowledge_base(knowledge_base)
-        source = memory_source(self.config)
+        source = memory_source(self.config, self.state)
         if source is None:
             raise ValueError(
                 "no enabled memory source configured. Add one to pheasant.yaml:\n"
@@ -380,21 +365,67 @@ class PheasantTools:
                 "      path: memory"
             )
         record, created = MemoryStore(source.path).append(
-            text, scope=scope, subject=subject, supersedes=supersedes, tags=tags or ()
+            text,
+            scope=scope,
+            subject=subject,
+            supersedes=supersedes,
+            tags=tags or (),
+            kind=kind,
+            written_by=principal,
+            valid_until=valid_until,
         )
         result: dict = {"record": record.as_dict(), "created": created, "source": source.name}
+        # The record is already durably on disk; this sync only makes it
+        # *searchable now*. Failing the whole request when it cannot run — most
+        # often because another writer holds the engine lease, which a live run
+        # hit immediately — reports "your memory was not saved" when it was.
+        # Degrade to deferred indexing instead: the scheduler and the next sync
+        # both pick it up.
         if sync and created:
-            result["sync"] = self.engine.sync_source(source.name, "incremental").__dict__
+            try:
+                result["sync"] = self.engine.sync_source(source.name, "incremental").__dict__
+            except Exception as exc:
+                logger.warning("memory write indexed later: %s", exc)
+                result["sync_deferred"] = str(exc)
         self._audit(
             source.name,
             "memory_write",
-            "mcp",
+            principal or "mcp",
             "mcp",
             None,
             utc_now(),
-            {"record_id": record.record_id, "scope": record.scope, "created": created},
+            {
+                "record_id": record.record_id,
+                "scope": record.scope,
+                "kind": record.kind,
+                "created": created,
+            },
         )
         return result
+
+    def memory_list(
+        self, knowledge_base: str, scope: str | None = None, current_only: bool = True
+    ) -> dict:
+        """This region's memory records, newest last.
+
+        Backs the `pheasant://…/memory` resource. `current_only` defaults to
+        **True** here, unlike `GET /memory`, because a resource is context an
+        agent reads directly: handing it corrected records without the
+        supersedes chain to interpret them would be worse than handing it
+        nothing.
+        """
+        from pheasant.memory.store import MemoryStore, memory_source
+
+        self._require_knowledge_base(knowledge_base)
+        source = memory_source(self.config, self.state)
+        if source is None:
+            return {"enabled": False, "records": []}
+        records = MemoryStore(source.path).list_records(scope, current_only=current_only)
+        return {
+            "enabled": True,
+            "source": source.name,
+            "records": [record.as_dict() for record in records],
+        }
 
     def memory_consolidate(self, knowledge_base: str) -> dict:
         """Run one memory-consolidation pass now (Step 33.2).
@@ -433,26 +464,38 @@ class PheasantTools:
         exclude_sources: list[str] | None = None,
         node_types: list[str] | None = None,
         min_score: float | None = None,
+        memory: Any = None,
     ) -> dict:
         """Retrieve passages for a query.
 
-        The last five parameters are **retrieval criteria** an agent can set
-        per call rather than having them fixed in config: restrict to one
-        section of a document's taxonomy, scope to one source or away from
-        noisy ones, keep only certain node types, and floor the score. All are
-        optional and default to the pre-existing behavior, so an existing
-        caller is unaffected (CLAUDE.md §4 rule 8: additive only).
+        The trailing parameters are **retrieval criteria** an agent can set per
+        call rather than having them fixed in config: restrict to one section
+        of a document's taxonomy, scope to one source or away from noisy ones,
+        keep only certain node types, floor the score, and decide how this
+        region's agent memory participates. All are optional and default to the
+        pre-existing behavior, so an existing caller is unaffected
+        (CLAUDE.md §4 rule 8: additive only).
 
         ``section`` matches the heading breadcrumb, so "§ 12.3", "Article IV"
         or a section's wording all reach it and naming a parent returns
         everything nested under it. Only meaningful for sources with taxonomy
         extraction enabled.
+
+        ``memory`` takes one word — ``"off"``, ``"only"``, ``"prefer"`` or the
+        default ``"auto"`` — or an object for the rest:
+        ``{"scopes": ["user"], "subject": "deploy", "as_of": "2026-01-01T00:00:00Z",
+        "current_only": false}``. Corrected records are dropped by default, so
+        you do not have to wait for a consolidation pass to stop seeing a fact
+        the region already knows was superseded; ``as_of`` deliberately brings
+        them back, for asking what was believed at a past instant. Hits that
+        came from memory carry a ``memory`` block with the record's scope,
+        subject and when it was asserted.
         """
         self._require_knowledge_base(knowledge_base)
         # Over-fetch when a filter will drop rows, so `max_results` still
         # means "give me this many" rather than "look at this many and give me
         # whatever survives" — the latter silently returns short answers.
-        filtering = bool(exclude_sources or node_types or min_score is not None)
+        filtering = criteria_active(exclude_sources, node_types, min_score)
         fetch = max_results * 4 if filtering else max_results
         payload = self.searcher.search_context(
             knowledge_base or self.config.knowledge_base_id,
@@ -465,6 +508,7 @@ class PheasantTools:
             principal_groups=principal_groups,
             security=self.config.security,
             section=section,
+            memory=memory,
         )
         if filtering:
             payload = dict(payload)
@@ -474,12 +518,9 @@ class PheasantTools:
                 node_types=node_types,
                 min_score=min_score,
             )[:max_results]
-            payload["criteria"] = {
-                "source_name": source_name,
-                "exclude_sources": exclude_sources,
-                "node_types": node_types,
-                "min_score": min_score,
-            }
+            payload["criteria"] = criteria_dict(
+                source_name, exclude_sources, node_types, min_score, memory
+            )
         return payload
 
     def describe_retrieval(self, knowledge_base: str) -> dict:
@@ -510,6 +551,7 @@ class PheasantTools:
                 "provider": self.config.search.embeddings.provider,
             },
             "sources": [str(row["source_id"]) for row in rows],
+            "memory": self._describe_memory(),
             "retrieval": settings.model_dump(mode="json"),
             "workflow": self.config.assistant.workflow,
             "workflow_options": dict(self.config.assistant.workflow_options or {}),
@@ -521,10 +563,113 @@ class PheasantTools:
                     "exclude_sources",
                     "node_types",
                     "min_score",
+                    "memory",
                 ],
                 "ask_knowledge_base": ["workflow", "mode", "max_results", "options"],
             },
             "field_help": RETRIEVAL_FIELD_HELP,
+        }
+
+    def _describe_steering(self) -> dict:
+        """The rules that actually re-rank this region's searches (Step 33.8).
+
+        Reported because steering is invisible otherwise: a query that lands
+        differently because someone once wrote down a synonym is a mystery
+        unless the region can say so.
+        """
+        if not self.config.memory.steering_enabled:
+            return {"enabled": False}
+        from pheasant.memory.policy import MemoryPolicy, utc_now_iso
+        from pheasant.memory.steering import load_steering, load_steering_records
+
+        rules = load_steering(
+            load_steering_records(self.state),
+            MemoryPolicy(),
+            now=utc_now_iso(),
+            enabled=True,
+        )
+        return {"enabled": True, **rules.describe()}
+
+    def _memory_graph_coverage(self) -> dict:
+        """How many records are actually wired into the graph (Step 33.7).
+
+        Computed from the live graph rather than from a stored report, so it
+        cannot go stale: "12 records, 9 bridged" is the difference between a
+        bridge that is working and one that silently connects nothing, and an
+        operator has no other way to tell those apart.
+        """
+        from pheasant.memory.bridge import ABOUT_EDGE
+
+        try:
+            rows = self.state.rows("SELECT artifact_id FROM memory_records")
+        except Exception:  # pragma: no cover - state store older than 33.5
+            return {}
+        artifacts = {str(row["artifact_id"]) for row in rows}
+        if not artifacts:
+            return {"records": 0, "bridged": 0, "unbridged": 0, "by_signal": {}}
+
+        bridged: set[str] = set()
+        by_signal: dict[str, int] = {}
+        graph = self.engine.graph_builder.graph
+        with graph.reading():
+            for (source, _target), edge_map in graph.iter_edges():
+                if source not in artifacts:
+                    continue
+                for data in edge_map.values():
+                    if data.get("type") == ABOUT_EDGE:
+                        bridged.add(source)
+                        signal = str(data.get("match_signal") or "unknown")
+                        by_signal[signal] = by_signal.get(signal, 0) + 1
+        return {
+            "records": len(artifacts),
+            "bridged": len(bridged),
+            "unbridged": len(artifacts) - len(bridged),
+            "by_signal": by_signal,
+        }
+
+    def _describe_memory(self) -> dict:
+        """What this region remembers, and how a caller may ask for it.
+
+        Without this an agent could only turn memory off by naming the source,
+        which it had no way to learn: `sources` is a list of bare ids and
+        nothing said which one was the memory. Reporting the scopes and counts
+        that actually exist is also the difference between "this region has
+        memory" and "this region has memory *about deployments, written this
+        week*", which is what decides whether to ask for it at all.
+        """
+        from pheasant.memory.policy import VALID_MODES
+        from pheasant.memory.store import memory_source
+
+        source = memory_source(self.config, self.state)
+        if source is None:
+            return {"enabled": False}
+        try:
+            rows = self.state.rows(
+                "SELECT scope, COUNT(*) AS n, "
+                "SUM(CASE WHEN valid_until IS NULL THEN 1 ELSE 0 END) AS current "
+                "FROM memory_records GROUP BY scope ORDER BY scope"
+            )
+        except Exception:  # pragma: no cover - state store older than 33.5
+            rows = []
+        return {
+            "enabled": True,
+            "source_name": source.name,
+            "graph": self._memory_graph_coverage(),
+            "scopes": {
+                str(row["scope"]): {
+                    "records": int(row["n"] or 0),
+                    "current": int(row["current"] or 0),
+                }
+                for row in rows
+            },
+            "modes": list(VALID_MODES),
+            "default_mode": self.config.memory.default_policy,
+            "steering": self._describe_steering(),
+            "accepts": ["mode", "scopes", "subject", "current_only", "as_of", "max_results"],
+            "note": (
+                "Corrected records are excluded by default; pass "
+                "{'current_only': false} or an 'as_of' instant to see them."
+            ),
         }
 
     def preview_retrieval(
@@ -537,6 +682,7 @@ class PheasantTools:
         exclude_sources: list[str] | None = None,
         node_types: list[str] | None = None,
         min_score: float | None = None,
+        memory: Any = None,
     ) -> dict:
         """Run retrieval criteria and report how they differ from the config.
 
@@ -570,6 +716,7 @@ class PheasantTools:
             exclude_sources=exclude_sources,
             node_types=node_types,
             min_score=min_score,
+            memory=memory,
         )
 
         def keys(payload: dict) -> list[str]:
@@ -590,6 +737,7 @@ class PheasantTools:
                 "exclude_sources": exclude_sources,
                 "node_types": node_types,
                 "min_score": min_score,
+                "memory": memory,
             },
             "configured": {
                 "mode": self.config.search.default_mode,

@@ -541,3 +541,126 @@ def test_sync_engine_flushes_the_vector_store_at_the_end_of_a_sync(tmp_path: Pat
     assert index_path.exists()
     on_disk = json.loads(index_path.read_text(encoding="utf-8"))
     assert len(on_disk["items"]) == engine.vectors.store.count() > 0
+
+
+# ---------------------------------------------------------------------------
+# Transient-failure retry (found by a live 12,667-file index)
+# ---------------------------------------------------------------------------
+
+
+def _embedder(**kwargs):
+    from pheasant.search.vector_store import OpenAISpecEmbedder
+
+    return OpenAISpecEmbedder(
+        base_url="https://example.invalid/v1",
+        model="text-embedding-3-small",
+        retry_backoff_seconds=0.01,
+        **kwargs,
+    )
+
+
+def _ok_response(count: int):
+    import io
+    import json as _json
+
+    body = _json.dumps(
+        {"data": [{"index": i, "embedding": [0.1, 0.2]} for i in range(count)]}
+    ).encode()
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    return _Resp(body)
+
+
+def test_a_transient_tls_error_is_retried(monkeypatch) -> None:
+    """The exact failure a real vscode index died on, 45 minutes in.
+
+    `ssl.SSLError: SSLV3_ALERT_BAD_RECORD_MAC` is a corrupted TLS record — it
+    succeeds on the next attempt. Without a retry, one flaky call out of the
+    ~200 a large corpus needs aborts the entire sync.
+    """
+    import ssl
+
+    from pheasant.search import vector_store
+
+    calls = {"n": 0}
+
+    def flaky(request, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ssl.SSLError("SSLV3_ALERT_BAD_RECORD_MAC")
+        return _ok_response(1)
+
+    monkeypatch.setattr(vector_store, "urlopen", flaky)
+    vectors = _embedder().embed(["hello"])
+    assert calls["n"] == 2
+    assert vectors == [[0.1, 0.2]]
+
+
+def test_a_rate_limit_is_retried_and_honours_retry_after(monkeypatch) -> None:
+    from urllib.error import HTTPError
+
+    from pheasant.search import vector_store
+
+    calls = {"n": 0}
+    slept: list[float] = []
+
+    def limited(request, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise HTTPError(
+                "u", 429, "Too Many Requests", {"Retry-After": "2"}, None
+            )
+        return _ok_response(1)
+
+    monkeypatch.setattr(vector_store, "urlopen", limited)
+    monkeypatch.setattr(vector_store.time, "sleep", lambda s: slept.append(s))
+    _embedder().embed(["hello"])
+    assert calls["n"] == 2
+    # Guessing shorter than a stated Retry-After is how a 429 becomes a ban.
+    assert slept == [2.0]
+
+
+def test_a_bad_key_is_not_retried(monkeypatch) -> None:
+    """401 fails identically every time; retrying only spends time and money."""
+    from urllib.error import HTTPError
+
+    import pytest as _pytest
+
+    from pheasant.search import vector_store
+
+    calls = {"n": 0}
+
+    def unauthorized(request, timeout=None):
+        calls["n"] += 1
+        raise HTTPError("u", 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(vector_store, "urlopen", unauthorized)
+    with _pytest.raises(HTTPError):
+        _embedder().embed(["hello"])
+    assert calls["n"] == 1, "a wrong key must surface immediately"
+
+
+def test_retries_are_bounded(monkeypatch) -> None:
+    import ssl
+
+    import pytest as _pytest
+
+    from pheasant.search import vector_store
+
+    calls = {"n": 0}
+
+    def always_broken(request, timeout=None):
+        calls["n"] += 1
+        raise ssl.SSLError("still broken")
+
+    monkeypatch.setattr(vector_store, "urlopen", always_broken)
+    monkeypatch.setattr(vector_store.time, "sleep", lambda s: None)
+    with _pytest.raises(ssl.SSLError):
+        _embedder(max_retries=3).embed(["hello"])
+    assert calls["n"] == 4, "initial attempt plus exactly max_retries"

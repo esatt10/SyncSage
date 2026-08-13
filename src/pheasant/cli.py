@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -475,6 +476,12 @@ def main(argv: list[str] | None = None) -> int:
         help="stream NDJSON progress lines on stdout as the sync advances "
         "(how the server's sync worker drives the jobs tray)",
     )
+    sync_p.add_argument(
+        "--wait-for-lease",
+        type=float,
+        default=0.0,
+        help=argparse.SUPPRESS,
+    )
     scan_p = sub.add_parser(
         "scan",
         help="estimate what a source would index — file count, size, depth options — "
@@ -484,10 +491,19 @@ def main(argv: list[str] | None = None) -> int:
     scan_p.add_argument("--source", "-s", help="source to scan (default: every enabled source)")
     scan_p.add_argument("--depth", type=int, default=None, help="cap directory depth for the scan")
     scan_p.add_argument("--json", action="store_true", help="emit the raw report as JSON")
+    # `PHEASANT_CONFIG` is the container's documented way to relocate the
+    # config (Dockerfile sets it, docker-entrypoint.sh reads it,
+    # troubleshooting.md tells you to check it) — and pheasant's *own*
+    # generated MCP client configs put it in the agent's environment
+    # (`deployment/host.py`, `mcp_client/vscode.py`). These two servers
+    # hardcoded the default instead, so an agent pointed at a non-default
+    # config silently got `/config/pheasant.yaml`: the wrong knowledge base,
+    # reported as if it were the right one. Explicit `--config` still wins.
+    server_config_default = os.environ.get("PHEASANT_CONFIG", "/config/pheasant.yaml")
     serve_p = sub.add_parser("serve")
-    serve_p.add_argument("--config", "-c", default="/config/pheasant.yaml")
+    serve_p.add_argument("--config", "-c", default=server_config_default)
     mcp_p = sub.add_parser("mcp")
-    mcp_p.add_argument("--config", "-c", default="/config/pheasant.yaml")
+    mcp_p.add_argument("--config", "-c", default=server_config_default)
     mcp_p.add_argument("--transport", choices=("stdio", "streamable-http", "sse"), default="stdio")
     client_p = sub.add_parser("client-config")
     client_sub = client_p.add_subparsers(dest="client")
@@ -689,6 +705,7 @@ def main(argv: list[str] | None = None) -> int:
 
         on_progress = _progress_emitter() if getattr(args, "progress", False) else None
         engine = _engine(Path(args.config))
+        engine.lease.wait_timeout_s = max(0.0, args.wait_for_lease)
         try:
             # This process owns the CPU cost of indexing, so it also owns
             # building the graph search index when it is missing (after an

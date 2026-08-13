@@ -321,10 +321,28 @@ def test_maintenance_reindexes_so_search_forgets_archived_records(tmp_path: Path
             scope="org",
             supersedes=old_id,
         )
-        assert (
-            "bananas"
-            in str(tools.search_context("memory-test", "rollout password", mode="text")).lower()
+        # Step 33.6 changed what this line asserts, and the change is the
+        # point. It used to require that the *superseded* record was still
+        # returned before consolidation ran — the stale-fact leak, pinned as
+        # expected behavior. Query-time validity now drops it immediately, so
+        # a corrected fact is never served while waiting for a batch pass.
+        default_hits = str(tools.search_context("memory-test", "rollout password", mode="text"))
+        assert "bananas" not in default_hits.lower()
+        assert "grapes" in default_hits.lower()
+
+        # It is *filtered*, not yet gone: still on disk and still indexed,
+        # which is what `current_only: false` exists to reach. Distinguishing
+        # the two is what makes the post-maintenance assertion below mean
+        # something — otherwise it could pass on filtering alone.
+        history = str(
+            tools.search_context(
+                "memory-test",
+                "rollout password",
+                mode="text",
+                memory={"current_only": False},
+            )
         )
+        assert "bananas" in history.lower()
 
         result = run_memory_maintenance(tools.engine)
         assert result is not None
@@ -336,6 +354,21 @@ def test_maintenance_reindexes_so_search_forgets_archived_records(tmp_path: Path
         ).lower()
         assert "grapes" in flattened
         assert "bananas" not in flattened
+
+        # Now it is genuinely *pruned*, not merely filtered: asking for the
+        # full history reaches nothing, because consolidation archived the file
+        # and the re-index dropped its chunks. This is what maintenance adds
+        # over query-time policy, and asserting it here is what stops the two
+        # mechanisms from being confused for one another.
+        after_history = str(
+            tools.search_context(
+                "memory-test",
+                "rollout password",
+                mode="text",
+                memory={"current_only": False},
+            )
+        ).lower()
+        assert "bananas" not in after_history
 
         # Second pass: nothing to archive, no re-sync.
         again = run_memory_maintenance(tools.engine)

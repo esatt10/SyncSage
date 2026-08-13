@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from pheasant.persistence.state_store import StateStore
 
@@ -52,9 +53,65 @@ _STRUCTURAL_PRIOR = f"""(
 )"""
 
 
+#: How much a `preference` rule is worth. The prior is a *divisor* on a
+#: negative BM25 cost, so subtracting from it makes a match rank better. Sized
+#: to outweigh roughly six levels of path depth (`_DEPTH_PRIOR` 0.05) — enough
+#: that "prefer docs/" actually moves a deep document above a shallow one,
+#: small enough that it cannot promote an irrelevant match over a strong one.
+_PREFER_BONUS = 0.35
+#: Floor on the divisor. It must stay positive or the ranking inverts, and a
+#: caller with several preference rules could otherwise drive it to zero.
+_PRIOR_FLOOR = 0.25
+
+
+def _structural_prior(steering: Any, tokens: list[str]) -> tuple[str, list[object]]:
+    """The ranking divisor, plus any `preference` bonus in force.
+
+    Returns SQL and its params, because a preference is a per-query LIKE
+    pattern and cannot live in the module-level constant.
+    """
+    if not steering:
+        return _STRUCTURAL_PRIOR, []
+    prefixes = steering.prefers(tokens)
+    if not prefixes:
+        return _STRUCTURAL_PRIOR, []
+    cases = " ".join("WHEN artifacts.relative_path LIKE ? THEN 1 " for _ in prefixes)
+    params: list[object] = [f"{prefix.rstrip('/*')}%" for prefix in prefixes]
+    return (
+        f"MAX({_PRIOR_FLOOR}, {_STRUCTURAL_PRIOR} - {_PREFER_BONUS} * (CASE {cases} ELSE 0 END))",
+        params,
+    )
+
+
+def _exclusion_sql(steering: Any) -> tuple[str, list[object]]:
+    """`AND relative_path NOT LIKE ?` per `exclusion` rule."""
+    if not steering or not steering.exclusions:
+        return "", []
+    clauses = "".join(
+        " AND COALESCE(artifacts.relative_path, '') NOT LIKE ?" for _ in steering.exclusions
+    )
+    params: list[object] = [f"%{pattern.strip('*').strip('/')}%" for pattern in steering.exclusions]
+    return clauses, params
+
+
 class SearchStore:
     def __init__(self, state: StateStore):
         self.state = state
+
+    def _memory_sql(self, policy: Any, now: str | None) -> tuple[str, str, list[object]]:
+        """`(join, where_suffix, params)` enforcing an agent-memory policy.
+
+        All three are empty unless the region has memory records *and* the
+        policy asks for something — so the query a memory-less region runs is
+        character-for-character the one it ran before Step 33.6.
+        """
+        if policy is None or now is None:
+            return "", "", []
+        from pheasant.memory.policy import sql_predicate
+
+        condition, params = sql_predicate(policy, now=now, alias="memory_records")
+        join = "LEFT JOIN memory_records ON memory_records.artifact_id = chunks.artifact_id"
+        return join, f" AND {condition}", list(params)
 
     def search(
         self,
@@ -62,6 +119,9 @@ class SearchStore:
         source_name: str | None = None,
         max_results: int = 10,
         section: str | None = None,
+        memory_policy: Any = None,
+        memory_now: str | None = None,
+        steering: Any = None,
     ) -> list[dict]:
         # Natural-language queries ("where does the X service run") must not
         # fall to FTS5's implicit-AND — a single unmatched stopword would
@@ -69,9 +129,21 @@ class SearchStore:
         # OR the sanitized tokens instead and let BM25 rank by token rarity;
         # quoting each token also neutralizes FTS5 query-syntax characters.
         tokens = _query_tokens(query)
+        # Step 33.8 — alias expansion. Additive: the caller's own tokens always
+        # survive, so a remembered synonym can widen a search and never narrow
+        # one. This is the whole reason steering is worth having — it changes
+        # queries that return no memory at all.
+        if steering:
+            tokens = steering.expand(tokens)
         match_expr = " OR ".join(f'"{token}"' for token in tokens) if tokens else query
-        params: list[object] = [match_expr]
+
+        # Params are positional, so they must be assembled in the order the
+        # placeholders appear in the final SQL: the ranking expression sits in
+        # the SELECT, ahead of every WHERE clause.
+        prior_sql, prior_params = _structural_prior(steering, tokens)
+        params: list[object] = [*prior_params, match_expr]
         where = "chunks_fts MATCH ?"
+        exclusion_where, exclusion_params = _exclusion_sql(steering)
         if source_name:
             where += " AND source_id = ?"
             params.append(source_name)
@@ -82,16 +154,28 @@ class SearchStore:
         if section_needle(section):
             where += " AND LOWER(COALESCE(chunks.heading_path, '')) LIKE ?"
             params.append(f"%{section_needle(section)}%")
+        # Step 33.6 — agent-memory policy. Pushed into SQL for the same reason
+        # as `section`: `mode="only"` is a very narrow slice, and post-filtering
+        # a globally-ranked page would return an empty list while the matching
+        # memories sat just past the cut. The join is added *only* when the
+        # region actually has memory records, so a region without agent memory
+        # runs the identical query it ran before this step.
+        memory_join, memory_where, memory_params = self._memory_sql(memory_policy, memory_now)
+        where += memory_where
+        params.extend(memory_params)
+        where += exclusion_where
+        params.extend(exclusion_params)
         params.append(max_results)
         sql = f"""
         SELECT chunks_fts.chunk_id, chunks_fts.source_id, chunks_fts.artifact_id,
                chunks_fts.path, chunks_fts.heading_path, chunks.text,
                chunks.start_line, chunks.end_line, artifacts.path AS absolute_path,
                artifacts.relative_path,
-               bm25(chunks_fts, {_BM25_WEIGHTS}) / {_STRUCTURAL_PRIOR} AS rank_score
+               bm25(chunks_fts, {_BM25_WEIGHTS}) / {prior_sql} AS rank_score
         FROM chunks_fts
         JOIN chunks ON chunks.id = chunks_fts.chunk_id
         JOIN artifacts ON artifacts.id = chunks_fts.artifact_id
+        {memory_join}
         WHERE {where}
         ORDER BY rank_score LIMIT ?
         """
@@ -103,6 +187,14 @@ class SearchStore:
             if section_needle(section):
                 fallback_where += " AND LOWER(COALESCE(chunks.heading_path, '')) LIKE ?"
                 fallback_params.append(f"%{section_needle(section)}%")
+            # The fallback has to enforce the same policy. Leaving it out would
+            # make a corrected memory reappear on exactly the path taken when
+            # FTS5 is unavailable — a leak that only shows up in the degraded
+            # configuration, which is the worst place to have one.
+            fallback_where += memory_where
+            fallback_params.extend(memory_params)
+            fallback_where += exclusion_where
+            fallback_params.extend(exclusion_params)
             fallback_params.append(max_results)
             rows = self.state.rows(
                 f"""SELECT chunks.id AS chunk_id, chunks.source_id, chunks.artifact_id,
@@ -110,6 +202,7 @@ class SearchStore:
                 chunks.start_line, chunks.end_line, artifacts.path AS absolute_path,
                 artifacts.relative_path, 0.0 AS rank_score
                 FROM chunks JOIN artifacts ON artifacts.id=chunks.artifact_id
+                {memory_join}
                 WHERE {fallback_where} LIMIT ?""",
                 tuple(fallback_params),
             )

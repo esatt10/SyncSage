@@ -6,6 +6,10 @@ ordinary indexed knowledge — searchable with the same `search_context` /
 `/search` surface as everything else, provenance included. No separate
 memory database, no second retrieval path.
 
+> For how the whole subsystem fits together — the validity model, the two
+> encodings of the query policy, the graph bridge, salience and the invariants
+> — see [The memory system](../memory-system.md).
+
 ## 1. Configure a memory source
 
 One block in `pheasant.yaml`:
@@ -39,6 +43,14 @@ Scopes are `session`, `user`, or `org`; `subject` identifies whose memory
 it is (a session id, a user, a team). With `sync: true` (the default) the
 record is indexed before the call returns — **read-your-writes**: the very
 next `search_context` finds it.
+
+**Field rules.** `subject`, `supersedes`, `written_by` and each tag must not
+contain a line break, and `valid_from` / `valid_until` must be ISO-8601
+instants; a write that breaks either rule is rejected with a `400`. The
+frontmatter block is line-oriented and a record's `memory_scope` is what
+decides its read ACL, so a newline in a field value would otherwise let a
+caller forge frontmatter and escalate a private note to `org`. Everything else
+— colons, unicode, punctuation — round-trips unchanged.
 
 ## 3. Recall is just search
 
@@ -102,3 +114,123 @@ traffic with the existing `--modality memory` filter — no wire-format
 change. Router-side, the `synapse_remember` MCP tool (Step 33.3) routes a
 write to the fleet's memory-capable region and recall stays ordinary
 `synapse_search`.
+
+## Controlling memory at query time
+
+Every retrieval surface takes a `memory` argument — MCP `search_context`,
+`POST /search`, `POST /relevant-files` and `POST /assistant/chat`. One word
+covers the common cases:
+
+```jsonc
+{"query": "rollout password", "memory": "off"}    // no memory in the results
+{"query": "rollout password", "memory": "only"}   // memory and nothing else
+{"query": "rollout password", "memory": "prefer"} // memory keeps a share of the slots
+```
+
+or an object for the rest:
+
+```json
+{
+  "query": "rollout password",
+  "memory": {
+    "scopes": ["user"],
+    "subject": "deploy",
+    "as_of": "2026-01-01T00:00:00Z",
+    "current_only": false
+  }
+}
+```
+
+**A corrected record is never returned by default.** Supersession is enforced
+at query time, so you do not have to wait for a consolidation pass to stop
+seeing a fact the region already knows was replaced. `as_of` deliberately
+brings it back — that is the point of invalidating rather than deleting, and it
+is how you ask what was believed at a past instant.
+
+Results that came from memory carry a `memory` block:
+
+```json
+{"record_id": "mem-…", "scope": "user", "subject": "deploy", "kind": "fact",
+ "asserted_at": "2026-07-16T12:00:00Z"}
+```
+
+`describe_retrieval` reports the memory source's name, its scopes and record
+counts, how many records are wired into the graph, and any steering in force —
+so an agent never has to guess.
+
+## Steering — memory that improves every query {#steering}
+
+Set `memory.steering_enabled: true` and a record's `kind` becomes a retrieval
+rule rather than an assertion to recall. This is the one part of memory that
+changes queries returning **no memory at all**.
+
+| kind | Write | Effect |
+|---|---|---|
+| `alias` | `router -> pheasant-flock, flock` | Expands the query, so asking about "the router" finds documents that only say "pheasant-flock" |
+| `preference` | `when: deploy, docker -> prefer: docs/, deploy/` | Adds a path prior alongside the built-in depth/tests/samples ones |
+| `exclusion` | `never: vendor/**` | Suppresses matching paths |
+
+```bash
+curl -X POST localhost:8765/memory -H 'content-type: application/json' \
+  -d '{"text": "router -> pheasant-flock, flock", "kind": "alias", "scope": "org"}'
+```
+
+Paths are matched against a source-relative `relative_path`, so a source rooted
+at `docs/` uses `vendor/`, not `docs/vendor/`.
+
+**Scope decides reach, and that is a security property.** A rule applies only
+where its scope does: `session` steering is confined to that session, `user` to
+that principal, `org` fleet-wide. A corrected or expired rule steers nothing —
+the same validity predicate governs steering and retrieval, so the two cannot
+disagree. Note that `memory: "off"` suppresses memory *content* but still
+honours steering: not wanting remembered passages is not the same as not
+wanting the region's remembered vocabulary.
+
+**Rules steer; they are not results.** A steering record is retrieval
+machinery, so it is excluded from result lists by default — measured live, an
+alias rule was taking rank 1 for the very query it was written to improve,
+pushing the real answer down five places. It stays fully in force and fully
+inspectable via `describe_retrieval` and `GET /memory`. Pass
+`"memory": {"include_rules": true}` to see rules in results anyway.
+
+**Triggers match the tokenized query.** Write them however reads naturally —
+`filewatch daemon`, `pheasant-flock`, `ci/cd`, `fs.watch` all work — and every
+part of the trigger must be present for the rule to fire, so a rule about
+`pheasant-flock` does not fire on a query that merely said `pheasant`.
+
+## Salience and bounded growth
+
+With `memory.usage_tracking: true`, retrieval counts which records it actually
+returned. That feeds a deterministic salience score — recency (90-day half
+life) × use (with diminishing returns) × scope weight — which decides what goes
+first when `memory.max_records` is set. Pruning archives with the same in-place
+`.md.archived` rename consolidation uses: bytes are preserved, never deleted.
+
+Both are off by default. Usage tracking is a write on the read path, and
+bounded growth should be a decision, not a surprise.
+
+`max_records` bounds **recallable facts**. Steering records are exempt in both
+directions — they neither consume slots nor get archived — because ranking a
+deliberate rule against ordinary facts, on a formula built for facts, meant
+crossing the cap could silently switch off an `exclusion` and change ranking
+for every future query.
+
+## In the UI
+
+The **Memory** tab lists what has been recorded, grouped by subject, with the
+scope, when it was asserted and who wrote it. Corrections are made by
+*superseding* — never by editing — so the history `as_of` reads stays intact;
+the "Correct" button pre-fills a superseding write. Consolidation runs from the
+same page.
+
+In chat, a **use memory** switch on the composer sends the same `memory` field
+MCP and the router send, and any passage that came from memory is chipped with
+its scope so an answer never silently passes off a remembered assertion as a
+document.
+
+## Isolation
+
+When `security.acl_enforced` is on, a record's ACL follows its scope: `org` is
+shared, while `user` and `session` records are readable only by the principal
+that wrote them (`memory_write(..., principal="user:alice")`). Without a
+recorded writer nothing is asserted and the region default applies.

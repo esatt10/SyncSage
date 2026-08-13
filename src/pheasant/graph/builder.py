@@ -13,6 +13,7 @@ from pheasant.graph.enrichment import (
     resolve_cross_source_edges,
 )
 from pheasant.graph.simple import SimpleMultiDiGraph
+from pheasant.ingestion.content_types import ARTIFACT_TYPES
 from pheasant.ingestion.pipeline import ParsedArtifact, utc_now
 from pheasant.sync.pacing import serve_yield
 
@@ -170,6 +171,152 @@ class GraphBuilder:
         self.apply_enrichment(enrichment)
         return enrichment
 
+    def add_memory_edges(self, state: Any, max_targets: int | None = None) -> dict[str, Any]:
+        """Wire memory records into the graph (Step 33.7). Returns a report.
+
+        Two kinds of edge, both previously missing:
+
+        * ``supersedes`` — a documented edge type nothing emitted, so a
+          correction existed only as a frontmatter string and the graph could
+          not answer "what replaced this".
+        * ``about`` — the record to what it is *about*, by the strongest signal
+          that fires (see :mod:`pheasant.memory.bridge`).
+
+        A no-op returning zeros when the region has no memory records, so a
+        graph without agent memory is byte-identical to before. Idempotent via
+        ``upsert_edge``: re-running over unchanged content re-derives the same
+        edges and changes nothing.
+        """
+        from pheasant.memory.bridge import (
+            ABOUT_EDGE,
+            DEFAULT_MAX_TARGETS,
+            resolve_bridges,
+            supersedes_edges,
+        )
+
+        report = {"records": 0, "about": 0, "supersedes": 0, "unbridged": [], "by_signal": {}}
+        records = self._memory_rows(state)
+        if not records:
+            return report
+        report["records"] = len(records)
+
+        for newer, older in supersedes_edges(records):
+            self.upsert_edge(newer, older, "supersedes", {"enrichment_pass": "memory_bridge"})
+            report["supersedes"] += 1
+
+        inputs = self._bridge_inputs(state, records)
+        edges, unbridged = resolve_bridges(
+            inputs, max_targets if max_targets is not None else DEFAULT_MAX_TARGETS
+        )
+        for edge in edges:
+            self.upsert_edge(
+                edge.artifact_id,
+                edge.target_id,
+                ABOUT_EDGE,
+                {
+                    "record_id": edge.record_id,
+                    "match_signal": edge.signal,
+                    "matched": edge.matched,
+                    "confidence": edge.confidence,
+                    "enrichment_pass": "memory_bridge",
+                },
+            )
+            report["by_signal"][edge.signal] = report["by_signal"].get(edge.signal, 0) + 1
+        report["about"] = len(edges)
+        # Reported, not silent: a corpus where no rung fires is a real outcome
+        # an operator should be able to see, not a feature that quietly does
+        # nothing. Surfaced through describe_retrieval's memory block.
+        report["unbridged"] = unbridged
+        return report
+
+    @staticmethod
+    def _memory_rows(state: Any) -> list[dict[str, Any]]:
+        try:
+            rows = state.rows(
+                "SELECT record_id, artifact_id, source_id, supersedes FROM memory_records"
+            )
+        except Exception:  # pragma: no cover - state store older than 33.5
+            return []
+        return [dict(row) for row in rows]
+
+    def _bridge_inputs(self, state: Any, records: list[dict[str, Any]]) -> Any:
+        """Read the ladder's inputs out of SQLite and the graph.
+
+        Corpus-only on purpose: a memory must not be matched against symbols,
+        headings or entities extracted from *another memory*, or a store of
+        related notes would knit itself together and call that grounding.
+        """
+        from pheasant.memory.bridge import BridgeInputs, normalize_label
+
+        memory_sources = {str(row.get("source_id") or "") for row in records}
+        memory_artifacts = {str(row.get("artifact_id") or "") for row in records}
+
+        texts: dict[str, str] = {}
+        placeholders = ",".join("?" for _ in memory_sources)
+        for row in state.rows(
+            "SELECT artifact_id, GROUP_CONCAT(text, ' ') AS body FROM chunks "
+            f"WHERE source_id IN ({placeholders}) GROUP BY artifact_id",
+            tuple(memory_sources),
+        ):
+            texts[str(row["artifact_id"])] = str(row["body"] or "")
+
+        symbols: dict[str, list[str]] = {}
+        for row in state.rows(
+            "SELECT name, qualified_name, artifact_id FROM symbols "
+            f"WHERE source_id NOT IN ({placeholders})",
+            tuple(memory_sources),
+        ):
+            for value in (row["name"], row["qualified_name"]):
+                if value:
+                    symbols.setdefault(str(value).lower(), []).append(str(row["artifact_id"]))
+
+        headings: dict[str, list[str]] = {}
+        entities: dict[str, list[str]] = {}
+        referenced: dict[str, list[str]] = {}
+        node_types: dict[str, str] = {}
+        with self.graph.reading():
+            for node_id, attrs in self.graph.iter_nodes():
+                node_types[node_id] = str(attrs.get("type") or "")
+                node_type = attrs.get("type")
+                if attrs.get("source_id") in memory_sources:
+                    continue
+                if node_type == "heading":
+                    key = normalize_label(attrs.get("title") or attrs.get("label") or "")
+                    if key:
+                        headings.setdefault(key, []).append(node_id)
+                elif node_type == "entity":
+                    key = normalize_label(attrs.get("label") or "")
+                    if key:
+                        entities.setdefault(key, []).append(node_id)
+            for (source, target), edge_map in self.graph.iter_edges():
+                # Rung 1: an explicit link the cross-source pass already
+                # resolved to a real artifact. One pair can carry several edge
+                # types, so the map is what has to be inspected.
+                if source not in memory_artifacts:
+                    continue
+                for data in edge_map.values():
+                    if data.get("type") not in {"references", "imports"}:
+                        continue
+                    # Only the *resolved* artifact, not the `external_reference`
+                    # stub the link itself produced. Both edges exist and both
+                    # are `references`, so taking either spent half the
+                    # per-record cap pointing at a node that stands for the
+                    # link rather than for what the record is about — visible
+                    # on a live run, where one record drew two edges and only
+                    # one of them reached a file.
+                    if node_types.get(target) in ARTIFACT_TYPES:
+                        referenced.setdefault(source, []).append(target)
+                    break
+
+        return BridgeInputs(
+            records=records,
+            texts=texts,
+            symbols={key: sorted(set(value)) for key, value in symbols.items()},
+            headings={key: sorted(set(value)) for key, value in headings.items()},
+            entities={key: sorted(set(value)) for key, value in entities.items()},
+            referenced={key: sorted(set(value)) for key, value in referenced.items()},
+        )
+
     def add_headings(self, source: SourceConfig, artifact: ParsedArtifact) -> int:
         """Emit the artifact's structural outline as `heading` nodes.
 
@@ -287,7 +434,7 @@ class GraphBuilder:
         artifacts = []
         with self.graph.reading():
             for node_id, attrs in self.graph.iter_nodes():
-                if attrs.get("type") not in {"file", "markdown_note", "document"}:
+                if attrs.get("type") not in ARTIFACT_TYPES:
                     continue
                 if source_name and attrs.get("source_id") != source_name:
                     continue
