@@ -11,6 +11,7 @@ from pheasant.memory.policy import (
     admits,
     describe,
     load_memory_index,
+    may_filter,
     resolve,
     utc_now_iso,
 )
@@ -96,7 +97,7 @@ class HybridSearch:
         policy = MemoryPolicy.parse(memory if memory is not None else self.default_memory_policy)
         memory_index = load_memory_index(getattr(self.store, "state", None))
         memory_now = utc_now_iso() if memory_index else None
-        memory_filtered = bool(memory_index) and not policy.is_default
+        memory_filtered = may_filter(policy, memory_index, now=memory_now or "")
         # Step 33.8 — rules from `alias`/`preference`/`exclusion` records, put
         # through the same `admits` predicate as retrieval so a corrected or
         # out-of-scope record steers nothing. Empty unless steering is on.

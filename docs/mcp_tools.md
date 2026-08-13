@@ -67,7 +67,9 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 
 `search_context` and `preview_retrieval` take a `memory` argument: one of
 `"auto"` (default), `"off"`, `"only"`, `"prefer"`, or an object with
-`scopes` / `subject` / `current_only` / `as_of` / `max_results`. Records a
+`scopes` / `subject` / `current_only` / `as_of` / `max_results` /
+`include_rules` (default `false` — steering records steer ranking but are not
+returned as passages). Records a
 later record corrected are excluded automatically — pass an `as_of` instant to
 ask what was believed then. Hits that came from memory carry a `memory` block
 naming the record, its scope and when it was asserted.

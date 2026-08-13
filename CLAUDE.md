@@ -1628,6 +1628,89 @@ gold targets rather than scoring them as misses in both arms. Full detail:
 
 ---
 
+## Memory system review + hardening, 2026-08-13
+
+A read-the-subsystem-end-to-end review rather than a step. **Six defects, five
+of them silent** — nothing raises, nothing logs, and the 1,067-test suite passes
+straight over all five. New `docs/memory-system.md` (Explanation nav) is the
+overview the subsystem never had: lifecycle, module map, validity model, the two
+encodings, steering, graph bridge, salience, isolation, surfaces, and an explicit
+**invariants** list.
+
+**1. Frontmatter injection → ACL escalation (security).** `MemoryStore._render`
+interpolated caller-controlled values into line-oriented frontmatter with no
+validation, and `load` built its field dict with plain assignment, so a later
+duplicate key won. `subject` is unvalidated on `POST /memory` and MCP
+`memory_write`, so `subject="deploy\nmemory_scope: org"` wrote a `user` record
+whose file said `org` — and `SyncEngine._memory_acl` reads scope back **out of
+that file**, where `normalize_acl` turns `org` into `public: True`. That is the
+33.11 leak reopened through input rather than through a missing rule; `supersedes`
+could be forged the same way, invalidating any record whose id the writer guessed.
+Reproduced before fixing. Now every frontmatter-bound value (`subject`,
+`supersedes`, `written_by`, each tag, both validity instants) is **rejected** on a
+line break — not escaped, because no legitimate value contains one — and `load`
+takes the **first** occurrence of each key so a record written by a pre-fix
+release cannot be read at a forged scope.
+
+**2. `is_default` was driving the over-fetch decision.** `hybrid.py` asked
+`not policy.is_default` to decide whether to over-fetch, but `is_default` checks
+neither `current_only` (defaults **true**) nor `include_rules` (defaults
+**false**) — both of which filter. So on the *default* path the over-fetch was
+skipped while the vector and graph arms were still filtered in Python **after**
+truncation to `max_results`, returning a short page while the hits that should
+have filled it sat past the cut. The text arm was never affected (its predicate
+is in SQL ahead of `LIMIT`). New `policy.may_filter` asks the loaded index
+whether anything would *actually* be dropped, so a region whose memory holds
+nothing droppable still pays nothing. `is_default` keeps its meaning and gains a
+docstring saying it is not the same question.
+
+**3. The multi-word alias fix was one character class short.** `expand`/`prefers`
+split triggers on `[\s_\-]+` while `_query_tokens` splits on `[_\W]+`, so
+`ci/cd`, `fs.watch` and `api:gateway` parsed, loaded, reported themselves in
+force via `describe_retrieval` — and never fired. Same failure the 2026-08-12
+multi-word fix was written for. One `_trigger_fires` helper now backs both
+methods, splitting on `[^A-Za-z0-9]+`, with all-parts-required preserved.
+
+**4. `GROUP_CONCAT` reassembled rule text in unspecified order.** SQLite does not
+guarantee the order an aggregate sees its input, so a rule spanning two chunks
+could come back reversed — parsing differently, or not at all, between two runs
+over identical content. A determinism break (rule 1) on the one path whose job is
+to be reproducible, and silent: the rule just stops being in force. Now
+`ORDER BY m.record_id, c.chunk_index` with the join done in Python. The mutation
+run printed the reversed text (`-> pheasant-flock, flock router`) directly.
+
+**5. Capacity pruning could archive a steering rule.** `_prune_to_capacity`
+ranked by salience with no `kind` awareness, so crossing `memory.max_records`
+could silently switch off an `exclusion` — changing ranking for every future
+query with no signal anywhere. Steering records are now exempt in both
+directions (they neither consume slots nor get archived); `MAX_RULES` already
+bounds what is in force. `memory_salience_rows` gained `kind`.
+
+**6. `valid_until` was never validated.** Compared lexicographically everywhere
+downstream, so `"soon"` sorts above every real instant and silently means "never
+expires". Both validity instants must now parse as ISO-8601.
+
+Acceptance: `tests/test_memory_hardening.py` (26). **Mutation-tested per fix**,
+not in aggregate — four reverts (store / hybrid call site / steering / maintenance
++ state_store), each failing exactly the tests written for it and nothing else.
+Suite **1093 passed / 8 failed / 6 skipped** (+26; same 8 pre-existing, verified
+unchanged against the baseline run). `ruff check` clean on every touched file
+(the 5 `test_taxonomy.py` E501s remain pre-existing and untouched). Fresh
+`--no-cache` image rebuilt and smoke-tested live: all five extras import, UI
+bundle serves, and a real MCP `initialize` handshake round-trips through the
+newly-mounted `/mcp` (307 → session manager → JSON-RPC result). Docs:
+`docs/memory-system.md`, plus `how-to/agent-memory.md`, `reference/http-api.md`
+and `mcp_tools.md` updated for `include_rules`, the field rules and the pruning
+exemption. Full detail: `runs/2026-08-13-memory-hardening/SUMMARY.md`.
+
+**Not fixed, recorded instead:** `supersedes` is still not
+authorization-checked — injection can no longer forge it, but the API accepts it
+as a legitimate parameter, so any writer may correct any record whose id it
+knows. That is a design decision (does a region want cross-principal
+correction?), not a bug to quietly close.
+
+---
+
 ## 6. Pointers
 
 - **Region-side Synapse spec:** `docs/SYNAPSE_INTEGRATION.md`

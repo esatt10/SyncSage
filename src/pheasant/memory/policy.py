@@ -84,6 +84,12 @@ class MemoryPolicy:
         """True when this policy asks for nothing the pre-33.6 code did not do.
 
         Used to keep a region without memory on exactly its old code path.
+
+        **Not** the same question as "does this policy filter anything" — the
+        default policy filters plenty (`current_only` drops corrected records,
+        `include_rules=False` drops steering rules), which is why those two are
+        deliberately absent from the check below. Ask :func:`may_filter` for
+        that; conflating the two is what caused the vector/graph under-fetch.
         """
         return (
             self.mode == DEFAULT_MODE
@@ -186,6 +192,46 @@ def admits(policy: MemoryPolicy, record: Mapping[str, Any] | None, *, now: str) 
         if valid_until and valid_until <= instant:
             return False
     return True
+
+
+def unique_records(index: Mapping[str, Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """One entry per record from a `load_memory_index` map.
+
+    The index deliberately holds two keys per record (artifact id and
+    `source_id\\0relative_path`), so its values repeat.
+    """
+    seen: set[str] = set()
+    out: list[Mapping[str, Any]] = []
+    for record in index.values():
+        key = str(record.get("record_id") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(record)
+    return out
+
+
+def may_filter(policy: MemoryPolicy, index: Mapping[str, Mapping[str, Any]], *, now: str) -> bool:
+    """Could this policy drop a hit, given the records that actually exist?
+
+    Drives the over-fetch decision in `HybridSearch.search_context`, which used
+    to ask `policy.is_default` — a different question, answered wrong. The
+    default policy is *not* inert: `current_only=True` drops corrected records
+    and `include_rules=False` drops steering rules. So on the default path the
+    over-fetch was skipped, the vector and graph arms were fetched at exactly
+    `max_results`, and were then filtered in Python *after* that truncation —
+    returning a short page while the hits that should have filled it sat just
+    past the cut. The text arm was never affected: its predicate is pushed into
+    SQL ahead of `LIMIT`.
+
+    Answered against the loaded index rather than against the policy alone, so a
+    region whose memory happens to hold nothing droppable still pays nothing.
+    """
+    if not index:
+        return False
+    if not policy.is_default:
+        return True
+    return any(not admits(policy, record, now=now) for record in unique_records(index))
 
 
 def sql_predicate(

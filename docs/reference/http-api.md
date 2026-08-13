@@ -92,7 +92,12 @@ and `job` — the live job behind the boolean, with its phase and counter.
 
 `POST /search`, `/relevant-files` and `/assistant/chat` all accept `memory`:
 one of `"auto"` (default), `"off"`, `"only"`, `"prefer"`, or an object with
-`scopes`, `subject`, `current_only`, `as_of` and `max_results`.
+`scopes`, `subject`, `current_only`, `as_of`, `max_results` and
+`include_rules`.
+
+`include_rules` defaults to `false`: `alias`/`preference`/`exclusion` records
+steer ranking but are not themselves returned as passages. Set it true to see
+them in results.
 
 Records a later record corrected are excluded automatically — you do not have
 to wait for a consolidation pass. Pass `{"current_only": false}` or an `as_of`

@@ -92,6 +92,7 @@ nav:
       - Deployment: deployment.md
   - Explanation:
       - Architecture: architecture.md
+      - The memory system: memory-system.md
       - Troubleshooting: troubleshooting.md
   - Contributor / internal:
       - pheasant as a Synapse region (internal spec): SYNAPSE_INTEGRATION.md

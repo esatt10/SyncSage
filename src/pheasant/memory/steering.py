@@ -45,12 +45,38 @@ __all__ = ["STEERING_KINDS", "Steering", "load_steering", "load_steering_records
 MAX_ALIAS_TERMS = 8
 MAX_RULES = 64
 
+#: How a rule's trigger is broken up so it can be compared against a tokenized
+#: query. This must agree with `search.sqlite_store._query_tokens`, which keeps
+#: runs matching ``[A-Za-z][A-Za-z0-9_]{1,}`` and additionally splits each run on
+#: ``[_\W]+``. Splitting on whitespace/underscore/hyphen alone — as this did —
+#: covers `filewatch daemon` and `pheasant-flock` but leaves every other
+#: separator silently dead: `ci/cd`, `fs.watch` and `api:gateway` tokenize to
+#: two query terms each while the trigger stayed one unsplittable string, so the
+#: rule parsed, loaded, was reported in force by `describe_retrieval`, and never
+#: fired. That is the same failure the multi-word fix was written for, one
+#: character class short.
+_TRIGGER_SPLIT = re.compile(r"[^A-Za-z0-9]+")
+
 _ARROW = re.compile(r"\s*(?:->|→|=>)\s*")
 _WHEN = re.compile(
     r"\bwhen\s*:\s*(?P<when>[^\n]*?)\s*(?:->|→|=>)\s*prefer\s*:\s*(?P<prefer>[^\n]+)",
     re.I,
 )
 _NEVER = re.compile(r"\bnever\s*:\s*(?P<never>[^\n]+)", re.I)
+
+
+def _trigger_fires(trigger: str, present: set[str]) -> bool:
+    """Does `trigger` match this tokenized query?
+
+    True when the trigger survives tokenization whole (`file_service` is itself
+    a token), or when **every** part of it is present. All parts, never any:
+    matching on one would let a rule about `pheasant-flock` fire on a query that
+    merely said `pheasant`.
+    """
+    if trigger in present:
+        return True
+    parts = {part for part in _TRIGGER_SPLIT.split(trigger) if len(part) > 1}
+    return bool(parts) and parts <= present
 
 
 def _terms(value: str) -> list[str]:
@@ -90,17 +116,15 @@ class Steering:
         `prefers` matches its own, and for the same reason: this looked up
         `aliases[token]` one token at a time, so a multi-word trigger — the
         natural way to write one, `filewatch daemon -> fileService, watcher` —
-        could never match any single token and silently never fired. Every
-        part must be present, so a rule about `filewatch daemon` does not fire
-        on a query that merely said `daemon`.
+        could never match any single token and silently never fired. See
+        :func:`_trigger_fires` for the matching rule.
         """
         if not self.aliases:
             return tokens
         extra: set[str] = set()
         present = set(tokens)
         for trigger, values in self.aliases.items():
-            parts = {part for part in re.split(r"[\s_\-]+", trigger) if len(part) > 1}
-            if trigger not in present and not (parts and parts <= present):
+            if not _trigger_fires(trigger, present):
                 continue
             for value in values:
                 for word in re.split(r"[\s_\-]+", value):
@@ -112,19 +136,17 @@ class Steering:
     def prefers(self, query_tokens: list[str]) -> tuple[str, ...]:
         """Path prefixes preferred for this query, or empty.
 
-        A trigger is compared against the *tokenized* query, so a hyphenated
-        or underscored term written naturally in a rule still matches: the
-        tokenizer splits `pheasant-flock` into `pheasant` and `flock`, and a
-        trigger compared whole would never have fired. Every part must be
-        present — matching on any one would let a rule about `pheasant-flock`
-        fire on a query that merely said `pheasant`.
+        A trigger is compared against the *tokenized* query, so a hyphenated,
+        underscored or slash-separated term written naturally in a rule still
+        matches: the tokenizer splits `pheasant-flock` into `pheasant` and
+        `flock`, and a trigger compared whole would never have fired. See
+        :func:`_trigger_fires` for the matching rule.
         """
         wanted = set(query_tokens)
         out: list[str] = []
         for triggers, paths in self.preferences:
             for trigger in triggers:
-                parts = {part for part in re.split(r"[\s_\-]+", trigger) if len(part) > 1}
-                if trigger in wanted or (parts and parts <= wanted):
+                if _trigger_fires(trigger, wanted):
                     out.extend(paths)
                     break
         return tuple(dict.fromkeys(out))
@@ -192,17 +214,36 @@ def load_steering_records(state: Any) -> list[dict[str, Any]]:
     and the rule lives in its prose. Restricted to non-`fact` kinds in SQL, so
     a store of ordinary memories costs one indexed lookup that returns nothing
     rather than a scan of every record's body.
+
+    The chunks are re-assembled **in `chunk_index` order, here**, rather than by
+    `GROUP_CONCAT`. SQLite does not guarantee the order an aggregate sees its
+    input, so a rule long enough to span two chunks could be concatenated back
+    to front — parsing differently, or not at all, between two runs over
+    identical content. That is a determinism break (rule 1) on a path whose
+    whole job is to be reproducible, and it fails *silently*: the rule simply
+    stops being in force.
     """
     try:
         rows = state.rows(
             "SELECT m.record_id, m.scope, m.subject, m.kind, m.valid_from, m.valid_until, "
-            "GROUP_CONCAT(c.text, ' ') AS text "
+            "c.chunk_index, c.text "
             "FROM memory_records m JOIN chunks c ON c.artifact_id = m.artifact_id "
-            "WHERE m.kind <> 'fact' GROUP BY m.record_id"
+            "WHERE m.kind <> 'fact' ORDER BY m.record_id, c.chunk_index"
         )
     except Exception:  # pragma: no cover - state store older than 33.5
         return []
-    return [dict(row) for row in rows]
+    records: dict[str, dict[str, Any]] = {}
+    pieces: dict[str, list[str]] = {}
+    for row in rows:
+        record = dict(row)
+        record_id = str(record.get("record_id") or "")
+        text = str(record.pop("text", "") or "")
+        record.pop("chunk_index", None)
+        records.setdefault(record_id, record)
+        pieces.setdefault(record_id, []).append(text)
+    for record_id, record in records.items():
+        record["text"] = " ".join(pieces[record_id])
+    return list(records.values())
 
 
 def load_steering(

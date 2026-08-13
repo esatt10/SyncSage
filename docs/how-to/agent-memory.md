@@ -6,6 +6,10 @@ ordinary indexed knowledge — searchable with the same `search_context` /
 `/search` surface as everything else, provenance included. No separate
 memory database, no second retrieval path.
 
+> For how the whole subsystem fits together — the validity model, the two
+> encodings of the query policy, the graph bridge, salience and the invariants
+> — see [The memory system](../memory-system.md).
+
 ## 1. Configure a memory source
 
 One block in `pheasant.yaml`:
@@ -39,6 +43,14 @@ Scopes are `session`, `user`, or `org`; `subject` identifies whose memory
 it is (a session id, a user, a team). With `sync: true` (the default) the
 record is indexed before the call returns — **read-your-writes**: the very
 next `search_context` finds it.
+
+**Field rules.** `subject`, `supersedes`, `written_by` and each tag must not
+contain a line break, and `valid_from` / `valid_until` must be ISO-8601
+instants; a write that breaks either rule is rejected with a `400`. The
+frontmatter block is line-oriented and a record's `memory_scope` is what
+decides its read ACL, so a newline in a field value would otherwise let a
+caller forge frontmatter and escalate a private note to `org`. Everything else
+— colons, unicode, punctuation — round-trips unchanged.
 
 ## 3. Recall is just search
 
@@ -174,6 +186,18 @@ disagree. Note that `memory: "off"` suppresses memory *content* but still
 honours steering: not wanting remembered passages is not the same as not
 wanting the region's remembered vocabulary.
 
+**Rules steer; they are not results.** A steering record is retrieval
+machinery, so it is excluded from result lists by default — measured live, an
+alias rule was taking rank 1 for the very query it was written to improve,
+pushing the real answer down five places. It stays fully in force and fully
+inspectable via `describe_retrieval` and `GET /memory`. Pass
+`"memory": {"include_rules": true}` to see rules in results anyway.
+
+**Triggers match the tokenized query.** Write them however reads naturally —
+`filewatch daemon`, `pheasant-flock`, `ci/cd`, `fs.watch` all work — and every
+part of the trigger must be present for the rule to fire, so a rule about
+`pheasant-flock` does not fire on a query that merely said `pheasant`.
+
 ## Salience and bounded growth
 
 With `memory.usage_tracking: true`, retrieval counts which records it actually
@@ -184,6 +208,12 @@ first when `memory.max_records` is set. Pruning archives with the same in-place
 
 Both are off by default. Usage tracking is a write on the read path, and
 bounded growth should be a decision, not a surprise.
+
+`max_records` bounds **recallable facts**. Steering records are exempt in both
+directions — they neither consume slots nor get archived — because ranking a
+deliberate rule against ordinary facts, on a formula built for facts, meant
+crossing the cap could silently switch off an `exclusion` and change ranking
+for every future query.
 
 ## In the UI
 

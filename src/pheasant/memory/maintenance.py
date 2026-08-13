@@ -59,6 +59,7 @@ def _prune_to_capacity(engine: Any, store: MemoryStore, settings: Any, *, now=No
     Salience is also written back so an operator can see the score that
     decided it rather than having to recompute the formula by hand.
     """
+    from pheasant.memory.policy import STEERING_KINDS
     from pheasant.memory.salience import over_capacity, salience
 
     max_records = getattr(settings, "max_records", None)
@@ -70,7 +71,19 @@ def _prune_to_capacity(engine: Any, store: MemoryStore, settings: Any, *, now=No
     if not max_records:
         return []
 
-    doomed = {str(row["record_id"]) for row in over_capacity(rows, max_records, now=now)}
+    # `alias`/`preference`/`exclusion` records are retrieval *machinery*, not
+    # recallable content, and they are exempt from the cap in both directions:
+    # they neither consume slots nor get archived. Ranking them by salience put
+    # a deliberate operator-written rule in competition with ordinary facts on
+    # a formula built for facts — recency decay and use counts — so crossing
+    # `max_records` could silently switch off an `exclusion` with no signal
+    # anywhere, changing ranking for every future query. The number of rules
+    # actually in force is already bounded, by `steering.MAX_RULES`.
+    prunable = [row for row in rows if str(row.get("kind") or "") not in STEERING_KINDS]
+    if not prunable:
+        return []
+
+    doomed = {str(row["record_id"]) for row in over_capacity(prunable, max_records, now=now)}
     if not doomed:
         return []
     archived: list[str] = []

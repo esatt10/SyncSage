@@ -788,7 +788,9 @@ class StateStore:
         """Everything the salience formula reads, for a pruning pass."""
         try:
             rows = self.rows(
-                "SELECT record_id, scope, asserted_at, uses, last_used_at, salience "
+                # `kind` is here so capacity pruning can tell a retrieval *rule*
+                # from a recallable fact; see `memory.maintenance`.
+                "SELECT record_id, scope, kind, asserted_at, uses, last_used_at, salience "
                 "FROM memory_records"
             )
         except Exception:  # pragma: no cover - state store older than 33.5

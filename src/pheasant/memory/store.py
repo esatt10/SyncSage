@@ -57,6 +57,50 @@ VALID_KINDS = ("fact", "alias", "preference", "exclusion")
 #: indexed as prose on exactly the platform it was written on.
 _FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.S)
 
+#: A line break in any frontmatter value forges frontmatter. ``_render`` writes
+#: one ``key: value`` per line and :meth:`MemoryStore.load` reads them back the
+#: same way, so a newline smuggled into a caller-supplied field appends
+#: arbitrary *keys* to the block. That is not a formatting nuisance:
+#: ``memory_scope`` is what :func:`pheasant.security.acl.normalize_acl` reads to
+#: build a record's read ACL, so ``subject="x\nmemory_scope: org"`` turns a
+#: private ``user`` note into a world-readable ``org`` one under
+#: ``security.acl_enforced`` — reopening the very leak Step 33.11 closed, this
+#: time through input rather than through a missing rule. ``supersedes`` is the
+#: other prize: forging it invalidates any record whose id the writer can guess.
+#: Rejected rather than escaped, because no legitimate subject, tag or writer id
+#: contains a line break, and a value that survives a round trip unchanged is
+#: worth more here than one that is silently mangled into safety.
+_FORBIDDEN_IN_FIELD = ("\n", "\r")
+
+
+def _checked_field(name: str, value: str | None) -> str | None:
+    """A frontmatter-safe scalar, or raise. ``None`` passes through."""
+    if value is None:
+        return None
+    text = str(value)
+    if any(char in text for char in _FORBIDDEN_IN_FIELD):
+        raise ValueError(f"memory {name} must not contain a line break")
+    return text
+
+
+def _checked_instant(name: str, value: str | None) -> str | None:
+    """A frontmatter-safe ISO-8601 instant, or raise. ``None`` passes through.
+
+    Validity is compared as a *string* everywhere downstream (``admits``,
+    ``sql_predicate`` and ``effective_valid_until`` all rely on ISO-8601 in Z
+    form sorting lexicographically). An unparseable value therefore does not
+    fail loudly — it sorts above every real instant, so ``valid_until="soon"``
+    silently means "never expires". Checked at the door instead.
+    """
+    text = _checked_field(name, value)
+    if text is None:
+        return None
+    try:
+        datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"memory {name} must be an ISO-8601 instant, got {value!r}") from None
+    return text
+
 
 def strip_frontmatter(text: str) -> tuple[str, int]:
     """Split a record's frontmatter off its body. Returns ``(body, lines_removed)``.
@@ -264,9 +308,18 @@ class MemoryStore:
             raise ValueError(f"memory scope must be one of {VALID_SCOPES}, got {scope!r}")
         if kind not in VALID_KINDS:
             raise ValueError(f"memory kind must be one of {VALID_KINDS}, got {kind!r}")
+        # Every caller-supplied value that reaches the frontmatter is checked
+        # here, before it can reach `_render` *or* the id digest — see
+        # `_FORBIDDEN_IN_FIELD`. `scope` and `kind` are already closed sets
+        # above, and `asserted_at`/`record_id` are generated below.
+        subject = _checked_field("subject", subject)
+        supersedes = _checked_field("supersedes", supersedes)
+        written_by = _checked_field("written_by", written_by)
+        tags = tuple(str(_checked_field("tag", tag)) for tag in tags)
         instant = (now or datetime.now(tz=UTC)).astimezone(UTC).replace(microsecond=0)
         asserted_at = instant.isoformat().replace("+00:00", "Z")
-        valid_from = valid_from or asserted_at
+        valid_from = _checked_instant("valid_from", valid_from) or asserted_at
+        valid_until = _checked_instant("valid_until", valid_until)
         digest = hashlib.blake2b(
             _digest_input(
                 scope, subject, text, kind, written_by, valid_from, valid_until, asserted_at
@@ -323,7 +376,14 @@ class MemoryStore:
         fields: dict[str, str] = {}
         for line in match.group(1).splitlines():
             key, _, value = line.partition(":")
-            fields[key.strip()] = value.strip()
+            # **First occurrence wins**, deliberately. `_render` writes each key
+            # exactly once and in a fixed order, so a duplicate can only come
+            # from a value that contained a line break — and last-wins is what
+            # let such a value *override* the real `memory_scope` rather than
+            # merely appear after it. Writes are now rejected at the door
+            # (`_checked_field`); this keeps any record already on disk from a
+            # pre-fix release from being read at the forged scope.
+            fields.setdefault(key.strip(), value.strip())
         tags = tuple(t.strip() for t in fields.get("tags", "").split(",") if t.strip())
         asserted_at = fields.get("asserted_at", "")
         try:
