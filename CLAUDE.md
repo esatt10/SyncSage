@@ -1703,6 +1703,32 @@ newly-mounted `/mcp` (307 → session manager → JSON-RPC result). Docs:
 and `mcp_tools.md` updated for `include_rules`, the field rules and the pruning
 exemption. Full detail: `runs/2026-08-13-memory-hardening/SUMMARY.md`.
 
+**Container WASM defaults, same session.** A container that generates its own
+config now enables the two accelerators (`search.wasm_relationship_search`,
+`graph.wasm_cross_source_resolution`). They are opt-in in the *schema* — a
+source install may not have the `[wasm]` extra — but the image always installs
+it and ships the precompiled guest, so a fresh container was leaving switched
+off exactly what it was built with. Supplied through `pheasant setup --answers`
+rather than by post-editing YAML, so `docker-entrypoint.sh` keeps one code path
+for "what does a default config look like". Gated on `import wasmtime` actually
+succeeding: both accelerators fall back to pure Python silently, so enabling
+them without the extra would be *correct* but would log a warning per call and
+mean nothing. **`ingestion.extractor.provider: sandboxed` is deliberately NOT
+swept in** — that is a fidelity trade, not an acceleration one (the default
+`auto` reads encrypted PDFs, LZW/CCITT and Type0/CID CMaps the sandboxed
+tokenizer cannot), and a test asserts the answers file contains exactly the two
+accelerator keys. **Honest caveat recorded in `configuration.md`:**
+`wasm_cross_source_resolution` *loses* to Python below ~1,300-2,500 cross-source
+edges per the 34.4 benchmark, which is where a brand-new container starts; it is
+on anyway on the assumption a container's graph grows past the crossover, with
+the escape hatch documented. Verified in a real container **both ways** —
+wasmtime present → both flags true and the guest instantiates exporting
+`scan_edges`/`resolve_cross_source`; wasmtime shadowed by a raising stub →
+flags absent and the gate logs why. Tests driven through the **real wizard**
+rather than string-matching the script, because a schema-key rename would
+otherwise leave a green test while the container silently generated a config
+with acceleration off. `tests/test_fresh_ui_compose.py` (+4).
+
 **Not fixed, recorded instead:** `supersedes` is still not
 authorization-checked — injection can no longer forge it, but the API accepts it
 as a legitimate parameter, so any writer may correct any record whose id it

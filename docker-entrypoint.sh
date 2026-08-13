@@ -34,12 +34,53 @@ WORKSPACE="${PHEASANT_WORKSPACE:-/workspace}"
 # result and exits loudly if it's still missing; every other invocation is
 # best-effort — a `--help`-shaped command should not be blocked by a
 # read-only /config it never needed.
+# The two WASM accelerators (`search.wasm_relationship_search`,
+# `graph.wasm_cross_source_resolution`) default to **off** in the schema,
+# because a source install may not have the [wasm] extra. This image always
+# installs it (PHEASANT_EXTRAS defaults to mcp,agent,vector,wasm,a2a) and ships
+# the precompiled guest, so a container that generates its own config should
+# use what it was built with rather than leave it switched off.
+#
+# Written through `--answers` rather than by post-editing the YAML, so the
+# entrypoint keeps having exactly one code path for "what does a default config
+# look like" — `pheasant setup` still renders it, this only supplies two answers.
+#
+# Gated on wasmtime actually importing. Both accelerators fall back to pure
+# Python on any failure, so enabling them without the extra would still be
+# *correct* — it would just log a warning per call and mean nothing. Deliberately
+# NOT enabled here: `ingestion.extractor.provider: sandboxed`. That is a
+# fidelity trade, not an acceleration one — `native` handles encrypted PDFs,
+# LZW/CCITT and Type0/CID CMaps that the sandboxed tokenizer does not.
+WASM_ANSWERS='{"search.wasm_relationship_search": true, "graph.wasm_cross_source_resolution": true}'
+
 ensure_config() {
     [ -f "$CONFIG_PATH" ] && return 0
     mkdir -p "$(dirname "$CONFIG_PATH")" 2>/dev/null || return 1
     echo "pheasant: no config at $CONFIG_PATH — generating one." >&2
+
+    answers_file=""
+    if python -c "import wasmtime" >/dev/null 2>&1; then
+        answers_file="${TMPDIR:-/tmp}/pheasant-wasm-answers.json"
+        if printf '%s' "$WASM_ANSWERS" > "$answers_file" 2>/dev/null; then
+            echo "pheasant: wasmtime present — enabling WASM acceleration." >&2
+        else
+            answers_file=""
+        fi
+    else
+        echo "pheasant: wasmtime not installed — WASM acceleration stays off." >&2
+    fi
+
     # `--accept-defaults` asks nothing and reads every default off the live
     # schema, so this stays correct as the schema changes.
+    if [ -n "$answers_file" ]; then
+        if python -m pheasant setup --accept-defaults --output "$CONFIG_PATH" \
+                --answers "$answers_file" >/dev/null; then
+            rm -f "$answers_file"
+            return 0
+        fi
+        rm -f "$answers_file"
+        return 1
+    fi
     python -m pheasant setup --accept-defaults --output "$CONFIG_PATH" >/dev/null
 }
 
