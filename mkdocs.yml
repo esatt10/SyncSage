@@ -77,6 +77,7 @@ nav:
       - Extract a taxonomy from structured documents: how-to/structured-documents.md
       - Multi-modal ingest: how-to/multimodal-ingest.md
       - Vector self-search: how-to/vector-search.md
+      - Speed up indexing: how-to/indexing-performance.md
       - Attach to a Synapse fleet: how-to/attach-to-synapse.md
       - Backup & restore: how-to/backup-restore.md
       - Obsidian integration: obsidian_integration.md

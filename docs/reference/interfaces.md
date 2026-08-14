@@ -27,13 +27,14 @@ Legend: — means "not offered on this surface"; use one of the others.
 | List sources | — | `GET /sources` | Sources page | `list_sources` |
 | Set up from one target (path/URL/glob) | `pheasant up <target>…` | `POST /sources/quick-add` | Sources → **+ Add source** | — |
 | List registerable source types (built-in + plugins) | — | `GET /sources/types` | Sources → Advanced… (type picker) | — |
-| Register a source (full schema) | (edit YAML) | `POST /sources` | Sources → **Advanced…** | `register_source` |
+| Register a source (full schema) | (edit YAML) | `POST /sources` | Sources → **Advanced…** | `register_source` (`sync_now`, `wait`) |
 | Update a source | (edit YAML) | `PUT /sources/{id}` | Sources → edit | — |
 | Disable a source | (edit YAML) | `POST /sources/{id}/disable` | Sources page | `disable_source` |
 | Remove a source | (edit YAML) | `DELETE /sources/{id}` | Sources page | `remove_source` |
 | Promote runtime source to config | — | `POST /sources/{id}/promote` | Sources → promote | `promote_runtime_source_to_config` |
 | Sync one source | `pheasant sync --source <name>` | `POST /sync/{id}` | Source manager | `sync_source` |
 | Sync all sources | `pheasant sync --all` | `POST /sync` | Source manager | `sync_all` |
+| Start/follow background sync | `pheasant sync --progress` | `POST /sync/{id}` (`wait=false`), `GET /jobs/{job_id}`, `GET /jobs/stream` | Source manager | `start_sync_source`, `get_job`, `list_jobs` |
 | Repair state | `pheasant repair`, `pheasant sync --mode repair` | `POST /sync` (mode) | — | — |
 | Sync status | — | `GET /sync/status` | Source manager | `get_sync_status` |
 | Sync history | — | `GET /sources/{id}/history` | — | `get_sync_history` |

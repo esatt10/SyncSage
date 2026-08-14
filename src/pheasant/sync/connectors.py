@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
 from pheasant.config.schema import SourceConfig
-from pheasant.ingestion.pipeline import _match_any, sha256_file, utc_now, within_max_depth
+from pheasant.ingestion.pipeline import _match_any, utc_now, within_max_depth
 from pheasant.ingestion.walk import walk_source
 from pheasant.persistence.state_store import StateStore
 
@@ -215,7 +215,6 @@ class FilesystemConnector(SourceConnector):
         for path in report.files:
             relative = path.relative_to(root if root.is_dir() else root.parent).as_posix()
             stat = path.stat()
-            digest = sha256_file(path)
             items.append(
                 ConnectorItem(
                     identity=f"filesystem:{self.source.name}:{relative}",
@@ -223,7 +222,6 @@ class FilesystemConnector(SourceConnector):
                     uri=_path_uri(path),
                     mime_type=mimetypes.guess_type(path.name)[0],
                     size_bytes=stat.st_size,
-                    sha256=digest,
                     mtime=_timestamp(stat.st_mtime),
                     metadata={"path": str(path)},
                 )

@@ -1735,6 +1735,36 @@ as a legitimate parameter, so any writer may correct any record whose id it
 knows. That is a design decision (does a region want cross-principal
 correction?), not a bug to quietly close.
 
+### 2026-08-13 — indexing concurrency now changes throughput, not just status
+
+The scheduling fields introduced with background MCP jobs are now implemented.
+`SyncEngine` discovers work once, prepares independent files through a bounded
+thread/process/remote worker window, and applies SQLite/vector/graph/manifest
+mutations in stable discovery order under the shared writer lock. `sync_all`
+uses `max_parallel_sources`; file preparation uses `max_parallel_files`; and
+embedding transport uses ordered provider-sized batches bounded by
+`max_parallel_embeddings`. Filesystem discovery no longer hashes every file
+serially: preparation reads and hashes each file once, and unchanged files skip
+parse, chunk, and embedding work. Canonical graph serialization keeps persisted
+bytes stable across worker counts.
+
+Remote workers expose one opt-in, bearer-authenticated internal preparation
+endpoint. They receive immutable file bytes plus a whitelisted parse config and
+cannot write coordinator state or receive connector credentials. Local commit
+remains centralized deliberately; remote mode scales parse/chunk preparation,
+not authoritative state writes. See `docs/how-to/indexing-performance.md` and
+`runs/2026-08-13-indexing-parallelization/SUMMARY.md` for configuration,
+security limits, tests, and benchmark data.
+
+Acceptance: the regression suite excluding the seven already-recorded Windows
+baseline failures is **1023 passed / 31 skipped / 7 deselected**. Strict MkDocs,
+targeted Ruff checks, conflict-marker and whitespace checks pass. The warm
+100-file/80-line offline stub-embedding benchmark measured 1/2/4/8 file workers
+at 138.93/139.51/148.17/154.65 files/s (up to 1.113x); the immediate unchanged
+run indexed zero artifacts and made zero embedding calls. This small fixture is
+commit-dominated, so worker counts are capacity controls rather than a blanket
+speedup promise; use the checked-in benchmark against representative content.
+
 ---
 
 ## 6. Pointers

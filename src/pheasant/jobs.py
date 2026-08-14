@@ -146,12 +146,18 @@ class JobRegistry:
             job = self._jobs.get(job_id)
             if job is None or job.status in TERMINAL:
                 return
+            phase_changed = phase is not None and phase != job.progress.phase
             if phase is not None:
                 job.progress.phase = phase
             if current is not None:
                 job.progress.current = current
             if total is not None:
                 job.progress.total = total
+            elif phase_changed:
+                # Counters have phase-local units (files while preparing,
+                # chunks while embedding). Carrying the old denominator into
+                # a new unknown-total phase produces a plausible but false bar.
+                job.progress.total = None
             if detail is not None:
                 job.progress.detail = detail
                 job.log.append(f"{utc_now()} {detail}")

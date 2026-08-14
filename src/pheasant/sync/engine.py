@@ -6,16 +6,25 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
 from pheasant.config.schema import FILESYSTEM_SOURCE_TYPES, PheasantConfig, SourceConfig
 from pheasant.graph.builder import GraphBuilder
 from pheasant.ingestion.captioner import captioner_from_config, source_includes_images
+from pheasant.ingestion.content_types import TEXT_EXTENSIONS
 from pheasant.ingestion.extractor import extractor_from_config, source_includes_documents
-from pheasant.ingestion.pipeline import git_state, parse_connector_payload, utc_now
+from pheasant.ingestion.pipeline import (
+    ParsedArtifact,
+    git_state,
+    parse_connector_payload,
+    sha256_bytes,
+    utc_now,
+)
 from pheasant.ingestion.transcriber import source_includes_audio, transcriber_from_config
 from pheasant.ingestion.walk import (
     SyncBudgetExceeded,
@@ -35,7 +44,12 @@ from pheasant.search.vector_store import (
 )
 from pheasant.synapse.events import EventStream, RouterWebhook
 from pheasant.synapse.publisher import ContractPublisher
-from pheasant.sync.connectors import ConnectorItem, ItemNotModified, connector_for_source
+from pheasant.sync.connectors import (
+    ConnectorItem,
+    ConnectorPayload,
+    ItemNotModified,
+    connector_for_source,
+)
 from pheasant.sync.fingerprint import (
     EMBEDDING_SCOPE,
     SOURCE_SCOPE,
@@ -110,6 +124,92 @@ class SyncResult:
     details: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class _PreparedItem:
+    """Immutable worker output consumed by the single coordinated writer."""
+
+    position: int
+    item: ConnectorItem
+    previous: dict[str, Any] | None
+    parsed: ParsedArtifact | None = None
+    fetched: bool = False
+    skipped: bool = False
+    transfer_skipped: bool = False
+
+
+_PROCESS_SAFE_TEXT_EXTENSIONS = TEXT_EXTENSIONS - {".html"}
+
+
+def _process_cpu_capacity() -> int:
+    """CPU count visible to this process (affinity/cgroup aware where available)."""
+
+    process_cpu_count = getattr(os, "process_cpu_count", None)
+    if process_cpu_count is not None:
+        return max(1, int(process_cpu_count() or 1))
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        return max(1, int(os.cpu_count() or 1))
+
+
+def _prepare_filesystem_item_process(
+    source: SourceConfig,
+    mode: SyncMode,
+    git_metadata: tuple[str | None, str | None, bool] | None,
+    position: int,
+    item: ConnectorItem,
+    previous: dict[str, Any] | None,
+) -> _PreparedItem:
+    """Stateless process-worker entry point for ordinary filesystem text."""
+
+    if (
+        mode == "incremental"
+        and previous is not None
+        and item.sha256 is not None
+        and previous.get("sha256") == item.sha256
+    ):
+        return _PreparedItem(
+            position,
+            item,
+            previous,
+            skipped=True,
+            transfer_skipped=True,
+        )
+    path = Path(str(item.metadata["path"]))
+    content = path.read_bytes()
+    content_hash = sha256_bytes(content)
+    if mode == "incremental" and previous and previous.get("sha256") == content_hash:
+        return _PreparedItem(
+            position,
+            item,
+            previous,
+            fetched=True,
+            skipped=True,
+        )
+    payload = ConnectorPayload(
+        item=item,
+        content=content,
+        mime_type=item.mime_type,
+        size_bytes=item.size_bytes,
+        sha256=content_hash,
+        mtime=item.mtime,
+        metadata={"path": str(path)},
+    )
+    parsed = parse_connector_payload(source, item, payload, git_metadata)
+    if parsed is None:
+        return _PreparedItem(position, item, previous, fetched=True)
+    if mode == "incremental" and previous and previous.get("sha256") == parsed.sha256:
+        return _PreparedItem(
+            position,
+            item,
+            previous,
+            parsed=parsed,
+            fetched=True,
+            skipped=True,
+        )
+    return _PreparedItem(position, item, previous, parsed=parsed, fetched=True)
+
+
 class SyncEngine:
     def __init__(
         self,
@@ -128,9 +228,10 @@ class SyncEngine:
         # running server) keep working against a served state directory.
         self.lease = lease or EngineLease(self.paths.state)
         # In-process serialization across all writers (watcher, scheduler,
-        # API startup executor, HTTP /sync): SyncEngine is not safe for
-        # concurrent syncs within a process.
+        # API startup executor, HTTP /sync). Preparation may run concurrently;
+        # only state/graph/vector commits take this mutex.
         self._sync_mutex = threading.RLock()
+        self._lease_mutex = threading.Lock()
         SourceRegistry(self.config, self.state).initialize()
         self.manifests = ManifestStore(self.paths.manifests, self.state)
         self.graph_store = GraphStore(self.paths.graphs)
@@ -438,17 +539,348 @@ class SyncEngine:
         full_scan: bool = False,
         on_progress: ProgressHook | None = None,
     ) -> list[SyncResult]:
-        return [
-            self.sync_source(
-                source.name,
-                mode,
-                max_depth=max_depth,
-                full_scan=full_scan,
-                on_progress=on_progress,
+        sources = [source for source in self.config.sources if source.enabled]
+        if not sources:
+            return []
+        workers = min(
+            len(sources),
+            max(1, int(self.config.sync.concurrency.max_parallel_sources or 1)),
+        )
+        if workers == 1:
+            return [
+                self.sync_source(
+                    source.name,
+                    mode,
+                    max_depth=max_depth,
+                    full_scan=full_scan,
+                    on_progress=on_progress,
+                )
+                for source in sources
+            ]
+
+        # A shared callback may write NDJSON or mutate a job record; serialize
+        # calls while still allowing the source pipelines themselves to overlap.
+        progress_lock = threading.Lock()
+
+        def progress_for(source_name: str) -> ProgressHook:
+            def source_progress(
+                phase: str,
+                current: int,
+                total: int | None,
+                detail: str,
+            ) -> None:
+                if on_progress is None:
+                    return
+                with progress_lock:
+                    on_progress(phase, current, total, f"[{source_name}] {detail}")
+
+            return source_progress
+
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="pheasant-source",
+        ) as executor:
+            futures = [
+                executor.submit(
+                    self.sync_source,
+                    source.name,
+                    mode,
+                    max_depth=max_depth,
+                    full_scan=full_scan,
+                    on_progress=progress_for(source.name),
+                )
+                for source in sources
+            ]
+            # Preserve configured source order in the public result even when
+            # a later source finishes first.
+            return [future.result() for future in futures]
+
+    def _prepare_item(
+        self,
+        connector: Any,
+        source: SourceConfig,
+        mode: SyncMode,
+        artifacts: dict[str, Any],
+        git_metadata: tuple[str | None, str | None, bool] | None,
+        position: int,
+        item: ConnectorItem,
+    ) -> _PreparedItem:
+        """Read and parse one item without mutating authoritative state."""
+
+        previous = artifacts.get(item.relative_path)
+        if self._can_skip_before_read(mode, previous, item):
+            return _PreparedItem(
+                position,
+                item,
+                previous,
+                skipped=True,
+                transfer_skipped=True,
             )
-            for source in self.config.sources
-            if source.enabled
-        ]
+        try:
+            payload = connector.read_item(item)
+        except ItemNotModified:
+            return _PreparedItem(
+                position,
+                item,
+                previous,
+                skipped=True,
+                transfer_skipped=True,
+            )
+        content_hash = payload.sha256 or item.sha256 or sha256_bytes(payload.content)
+        if mode == "incremental" and previous and previous.get("sha256") == content_hash:
+            return _PreparedItem(
+                position,
+                item,
+                previous,
+                fetched=True,
+                skipped=True,
+            )
+        if payload.sha256 != content_hash:
+            payload = replace(payload, sha256=content_hash)
+        parsed = parse_connector_payload(
+            source,
+            item,
+            payload,
+            git_metadata,
+            captioner=self.captioner,
+            transcriber=self.transcriber,
+            extractor=self.extractor,
+        )
+        if parsed is None:
+            return _PreparedItem(position, item, previous, fetched=True)
+        if mode == "incremental" and previous and previous.get("sha256") == parsed.sha256:
+            return _PreparedItem(
+                position,
+                item,
+                previous,
+                parsed=parsed,
+                fetched=True,
+                skipped=True,
+            )
+        if mode == "repair" and not self._needs_repair(
+            source.name,
+            parsed.id,
+            parsed.sha256,
+            previous,
+            len(parsed.chunks),
+        ):
+            return _PreparedItem(
+                position,
+                item,
+                previous,
+                parsed=parsed,
+                fetched=True,
+                skipped=True,
+            )
+        return _PreparedItem(
+            position,
+            item,
+            previous,
+            parsed=parsed,
+            fetched=True,
+        )
+
+    def _prepare_item_remote(
+        self,
+        connector: Any,
+        source: SourceConfig,
+        mode: SyncMode,
+        artifacts: dict[str, Any],
+        git_metadata: tuple[str | None, str | None, bool] | None,
+        position: int,
+        item: ConnectorItem,
+        endpoint: str,
+        token: str,
+    ) -> _PreparedItem:
+        """Read locally, prepare on an authenticated stateless worker."""
+
+        previous = artifacts.get(item.relative_path)
+        if self._can_skip_before_read(mode, previous, item):
+            return _PreparedItem(
+                position,
+                item,
+                previous,
+                skipped=True,
+                transfer_skipped=True,
+            )
+        try:
+            payload = connector.read_item(item)
+        except ItemNotModified:
+            return _PreparedItem(
+                position,
+                item,
+                previous,
+                skipped=True,
+                transfer_skipped=True,
+            )
+        content_hash = payload.sha256 or item.sha256 or sha256_bytes(payload.content)
+        if mode == "incremental" and previous and previous.get("sha256") == content_hash:
+            return _PreparedItem(
+                position,
+                item,
+                previous,
+                fetched=True,
+                skipped=True,
+            )
+        if payload.sha256 != content_hash:
+            payload = replace(payload, sha256=content_hash)
+        from pheasant.sync.remote_worker import prepare_remote, task_payload
+
+        parsed = prepare_remote(
+            endpoint,
+            token,
+            task_payload(source, item, payload, git_metadata),
+            timeout=float(self.config.sync.concurrency.remote_worker_timeout_seconds or 120),
+        )
+        if parsed is None:
+            return _PreparedItem(position, item, previous, fetched=True)
+        if parsed.source_id != source.name or parsed.relative_path != item.relative_path:
+            raise ValueError(
+                "Remote worker returned an artifact for a different source/item: "
+                f"{parsed.source_id}/{parsed.relative_path}"
+            )
+        expected_hash = payload.sha256 or item.sha256
+        if expected_hash is not None and parsed.sha256 != expected_hash:
+            raise ValueError(
+                f"Remote worker returned the wrong content hash for {item.relative_path}"
+            )
+        if mode == "incremental" and previous and previous.get("sha256") == parsed.sha256:
+            return _PreparedItem(
+                position,
+                item,
+                previous,
+                parsed=parsed,
+                fetched=True,
+                skipped=True,
+            )
+        return _PreparedItem(position, item, previous, parsed=parsed, fetched=True)
+
+    def _prepared_items(
+        self,
+        connector: Any,
+        source: SourceConfig,
+        mode: SyncMode,
+        artifacts: dict[str, Any],
+        git_metadata: tuple[str | None, str | None, bool] | None,
+        items: list[ConnectorItem],
+    ):
+        """Yield prepared items in discovery order with bounded look-ahead.
+
+        Workers never touch manifests, SQLite, vectors, or the graph. Keeping
+        at most two work windows in flight avoids turning a 50k-file source
+        into a second in-memory copy of the repository.
+        """
+
+        if not items:
+            return
+        workers = min(
+            len(items),
+            max(1, int(self.config.sync.concurrency.max_parallel_files or 1)),
+        )
+        requested_executor = str(self.config.sync.concurrency.file_executor or "thread").lower()
+        if workers <= 1 and requested_executor == "thread":
+            for position, item in enumerate(items, start=1):
+                yield self._prepare_item(
+                    connector,
+                    source,
+                    mode,
+                    artifacts,
+                    git_metadata,
+                    position,
+                    item,
+                )
+            return
+
+        plain_text_source = (
+            connector.connector_type == "filesystem"
+            and mode != "repair"
+            and not bool(getattr(source.taxonomy, "enabled", False))
+            and all(
+                Path(item.relative_path).suffix.lower() in _PROCESS_SAFE_TEXT_EXTENSIONS
+                for item in items
+            )
+        )
+        process_safe = requested_executor == "process" and plain_text_source
+        remote_urls = list(self.config.sync.concurrency.remote_worker_urls or [])
+        remote_safe = requested_executor == "remote" and plain_text_source and bool(remote_urls)
+        remote_token = ""
+        if remote_safe:
+            from pheasant.sync.remote_worker import configured_token
+
+            remote_token = configured_token(self.config.sync.concurrency.remote_worker_token_env)
+        if requested_executor not in {"thread", "process", "remote"}:
+            logger.warning(
+                "Unknown sync.concurrency.file_executor=%r; using thread workers",
+                requested_executor,
+            )
+        elif requested_executor == "process" and not process_safe:
+            logger.info(
+                "Source %s needs connector/modal/repair state; using thread workers",
+                source.name,
+            )
+        elif requested_executor == "remote" and not remote_safe:
+            logger.warning(
+                "Source %s cannot use remote workers (requires URLs and plain text without "
+                "taxonomy/repair); using thread workers",
+                source.name,
+            )
+        executor_type = ProcessPoolExecutor if process_safe else ThreadPoolExecutor
+        if process_safe:
+            workers = min(workers, _process_cpu_capacity())
+
+        with executor_type(
+            max_workers=workers,
+            **({} if process_safe else {"thread_name_prefix": f"pheasant-file-{source.name}"}),
+        ) as executor:
+            pending: deque[Future[_PreparedItem]] = deque()
+            iterator = iter(enumerate(items, start=1))
+
+            def submit(position: int, item: ConnectorItem) -> Future[_PreparedItem]:
+                if process_safe:
+                    return executor.submit(
+                        _prepare_filesystem_item_process,
+                        source,
+                        mode,
+                        git_metadata,
+                        position,
+                        item,
+                        artifacts.get(item.relative_path),
+                    )
+                if remote_safe:
+                    endpoint = remote_urls[(position - 1) % len(remote_urls)]
+                    return executor.submit(
+                        self._prepare_item_remote,
+                        connector,
+                        source,
+                        mode,
+                        artifacts,
+                        git_metadata,
+                        position,
+                        item,
+                        endpoint,
+                        remote_token,
+                    )
+                return executor.submit(
+                    self._prepare_item,
+                    connector,
+                    source,
+                    mode,
+                    artifacts,
+                    git_metadata,
+                    position,
+                    item,
+                )
+
+            for _ in range(min(len(items), workers * 2)):
+                position, item = next(iterator)
+                pending.append(submit(position, item))
+            while pending:
+                yield pending.popleft().result()
+                try:
+                    position, item = next(iterator)
+                except StopIteration:
+                    continue
+                pending.append(submit(position, item))
 
     def _ensure_modal_handlers(self, source: Any) -> None:
         """Build the caption/transcribe/extract handlers this source needs.
@@ -550,6 +982,76 @@ class SyncEngine:
                 exc_info=True,
             )
 
+    def _finalize_index_state(
+        self,
+        *,
+        source: SourceConfig,
+        connector: Any,
+        mode: SyncMode,
+        manifest: dict[str, Any],
+        indexed: int,
+        embedded_chunks: int,
+        changed_ids: set[str],
+        total_items: int,
+        report: Callable[[str, int, int | None, str], None],
+        embedding_progress: Callable[[int], None],
+    ) -> int:
+        """Finalize one source while holding the coordinated writer mutex."""
+
+        with self._sync_mutex:
+            pruned_vectors = 0
+            if self.vectors is not None:
+                live_chunk_ids = {
+                    str(row["id"])
+                    for row in self.state.rows(
+                        "SELECT id FROM chunks WHERE source_id=?", (source.name,)
+                    )
+                }
+                pruned_vectors = self.vectors.prune_source(source.name, live_chunk_ids)
+
+            self._project_memory_records(source)
+            if indexed or mode == "full":
+                report("enriching", total_items, total_items, "linking the graph")
+                self.graph_builder.add_similarity_edges(
+                    source.name,
+                    changed_ids=None if mode == "full" else changed_ids,
+                )
+                self.graph_builder.add_cross_source_edges()
+                self._bridge_memory()
+                pruned = self.graph_builder.reconcile_concepts(
+                    self.state,
+                    min_documents=int(self.config.graph.concept_min_documents),
+                    changed_ids=changed_ids,
+                )
+                if pruned["removed"] or pruned["restored"]:
+                    logger.info(
+                        "Concepts reconciled: kept=%s removed=%s restored=%s",
+                        pruned["kept"],
+                        pruned["removed"],
+                        pruned["restored"],
+                    )
+
+            if self.vectors is not None:
+                # Finish provider work before advertising a saved, completed
+                # source. Network batches run concurrently inside this call;
+                # the vector-store upsert itself remains ordered.
+                self.vectors.flush(on_progress=embedding_progress)
+                report(
+                    "embedding",
+                    embedded_chunks,
+                    embedded_chunks,
+                    f"embedded {embedded_chunks} changed chunk(s)",
+                )
+            report("saving", total_items, total_items, "writing the graph and index")
+            manifest["last_indexed_at"] = utc_now()
+            manifest["connector"] = {"type": connector.connector_type}
+            self.manifests.save(source.name, manifest)
+            self.flush_node_index()
+            self.graph_store.save(self.config.knowledge_base_id, self.graph_builder.graph)
+            self._graph_dirty = False
+            self._last_checkpoint = time.monotonic()
+            return pruned_vectors
+
     def sync_source(
         self,
         source_name: str,
@@ -595,11 +1097,16 @@ class SyncEngine:
                 mode,
             )
             mode = "full"
-        self.lease.acquire()
+        with self._lease_mutex:
+            self.lease.acquire()
         # Test-only hook (Synapse 21.2 crash-safety tests): widens the window
         # between per-artifact writes so a kill -9 can land mid-sync.
         slow_sync_s = float(os.environ.get("PHEASANT_TEST_SLOW_SYNC_MS", "0") or 0) / 1000.0
-        with self._sync_mutex, source_lock(self.paths.locks, source.name):
+        with source_lock(
+            self.paths.locks,
+            source.name,
+            timeout_s=float(self.config.sync.concurrency.lock_timeout_seconds or 0),
+        ):
             connector = connector_for_source(source, self.state)
             if mode == "validate_only":
                 health = connector.validate()
@@ -673,8 +1180,9 @@ class SyncEngine:
                     },
                 )
             if mode == "full":
-                self.state.delete_source_artifacts(source.name)
-                self.graph_builder.remove_source_content(source.name)
+                with self._sync_mutex:
+                    self.state.delete_source_artifacts(source.name)
+                    self.graph_builder.remove_source_content(source.name)
                 manifest = {"source_id": source.name, "artifacts": {}}
                 artifacts = manifest["artifacts"]
             indexed = 0
@@ -686,42 +1194,36 @@ class SyncEngine:
             git_metadata = git_state(source.path) if source.type.value == "repository" else None
             # The denominator only exists now — listing is what produced it.
             total_items = len(items)
-            report("indexing", 0, total_items, f"{total_items} item(s) to consider")
-            for position, item in enumerate(items, start=1):
-                previous = artifacts.get(item.relative_path)
-                if self._can_skip_before_read(mode, previous, item):
-                    skipped += 1
-                    transfer_skipped += 1
-                    continue
-                try:
-                    payload = connector.read_item(item)
-                except ItemNotModified:
-                    skipped += 1
-                    transfer_skipped += 1
-                    continue
-                fetched += 1
-                parsed = parse_connector_payload(
-                    source,
-                    item,
-                    payload,
-                    git_metadata,
-                    captioner=self.captioner,
-                    transcriber=self.transcriber,
-                    extractor=self.extractor,
+            report("preparing", 0, total_items, f"queued {total_items} item(s)")
+            embedding_completed = 0
+
+            def embedding_progress(completed: int) -> None:
+                nonlocal embedding_completed
+                embedding_completed += completed
+                report(
+                    "embedding",
+                    embedding_completed,
+                    None,
+                    f"embedded {embedding_completed} changed chunk(s)",
                 )
-                if parsed is None:
-                    continue
-                if mode == "incremental" and previous and previous.get("sha256") == parsed.sha256:
-                    skipped += 1
-                    continue
-                if mode == "repair" and not self._needs_repair(
-                    source.name,
-                    parsed.id,
-                    parsed.sha256,
-                    previous,
-                    len(parsed.chunks),
-                ):
-                    skipped += 1
+
+            prepared_items = self._prepared_items(
+                connector,
+                source,
+                mode,
+                dict(artifacts),
+                git_metadata,
+                items,
+            )
+            for prepared in prepared_items:
+                position = prepared.position
+                item = prepared.item
+                fetched += int(prepared.fetched)
+                skipped += int(prepared.skipped)
+                transfer_skipped += int(prepared.transfer_skipped)
+                report("preparing", position, total_items, item.relative_path)
+                parsed = prepared.parsed
+                if prepared.skipped or parsed is None:
                     continue
                 now = utc_now()
                 from pheasant.security.acl import normalize_acl
@@ -771,32 +1273,39 @@ class SyncEngine:
                     }
                     for chunk in parsed.chunks
                 ]
-                self.state.replace_artifact_chunks(artifact_row, chunk_rows)
-                if self.vectors is not None:
-                    # Chunk ids are content-addressed (text_hash in the id),
-                    # so only new/changed chunk text reaches the embedder.
-                    embedded_chunks += self.vectors.index_artifact(
-                        source.name, parsed.id, chunk_rows
+                with self._sync_mutex:
+                    self.state.replace_artifact_chunks(artifact_row, chunk_rows)
+                    if self.vectors is not None:
+                        # Chunk ids are content-addressed (text_hash in the id),
+                        # so only new/changed chunk text reaches the embedder.
+                        embedded_chunks += self.vectors.index_artifact(
+                            source.name,
+                            parsed.id,
+                            chunk_rows,
+                            on_progress=embedding_progress,
+                        )
+                    enrichment = self.graph_builder.add_artifact(source, parsed)
+                    self.state.replace_artifact_enrichment(
+                        parsed.id,
+                        parsed.source_id,
+                        enrichment.terms,
+                        enrichment.symbols,
                     )
-                enrichment = self.graph_builder.add_artifact(source, parsed)
-                self.state.replace_artifact_enrichment(
-                    parsed.id,
-                    parsed.source_id,
-                    enrichment.terms,
-                    enrichment.symbols,
-                )
-                artifacts[parsed.relative_path] = {
-                    "sha256": parsed.sha256,
-                    "artifact_id": parsed.id,
-                    "last_indexed_at": now,
-                    "git_branch": parsed.git_branch,
-                    "git_commit": parsed.git_commit,
-                }
+                    artifacts[parsed.relative_path] = {
+                        "sha256": parsed.sha256,
+                        "artifact_id": parsed.id,
+                        "last_indexed_at": now,
+                        "git_branch": parsed.git_branch,
+                        "git_commit": parsed.git_commit,
+                    }
+                    changed_ids.add(parsed.id)
+                    self._maybe_checkpoint(source.name, manifest)
                 indexed += 1
-                changed_ids.add(parsed.id)
-                # Rides the existing per-artifact yield point rather than
-                # adding a second one: progress costs no extra traversal.
+                # Compatibility phase retained for existing CLI/API/MCP
+                # progress consumers; ``committing`` is the more precise new
+                # phase for callers that understand the staged pipeline.
                 report("indexing", position, total_items, parsed.relative_path)
+                report("committing", position, total_items, parsed.relative_path)
                 # Let anything waiting on the API get a turn before the next
                 # file. Without this a long index makes the UI unusable.
                 serve_yield()
@@ -805,88 +1314,20 @@ class SyncEngine:
                 # container an hour into a first index threw that hour away:
                 # the next start re-read every file (stale manifest) and
                 # rebuilt the whole graph.
-                self._maybe_checkpoint(source.name, manifest)
                 if slow_sync_s:
                     time.sleep(slow_sync_s)
-            pruned_vectors = 0
-            if self.vectors is not None:
-                # Drop vectors whose chunks left the chunks table (removed
-                # artifacts, re-chunked text, full-mode deletions).
-                live_chunk_ids = {
-                    str(row["id"])
-                    for row in self.state.rows(
-                        "SELECT id FROM chunks WHERE source_id=?", (source.name,)
-                    )
-                }
-                pruned_vectors = self.vectors.prune_source(source.name, live_chunk_ids)
-            # Global enrichment is proportional to the whole graph, not to what
-            # changed — so it only runs when something actually changed. A
-            # scheduled sync over untouched content used to re-derive every
-            # similarity pair and re-scan every edge on each beat, which is
-            # what pinned a container's CPU while indexing nothing.
-            # Step 33.5 — refresh the structured face of the memory records.
-            # After the artifact loop, so every row's artifact_id names an
-            # artifact that exists, and *before* global enrichment, because
-            # 33.7's graph bridge reads this table: projecting afterwards
-            # meant the memory source's own first sync bridged zero records.
-            # A no-op for every source that is not `type: memory`.
-            self._project_memory_records(source)
-            if indexed or mode == "full":
-                # Global enrichment is proportional to the whole graph, not to
-                # what changed, so on a large index this is where a sync
-                # "stops" from the outside. Naming the phase is the difference
-                # between "still working" and "hung".
-                report("enriching", total_items, total_items, "linking the graph")
-                self.graph_builder.add_similarity_edges(
-                    source.name,
-                    # A full pass rebuilt this source from scratch, so every
-                    # pair is genuinely new; an incremental one only needs the
-                    # artifacts it rewrote.
-                    changed_ids=None if mode == "full" else changed_ids,
-                )
-                # Synapse 21.6B: global cross-source edge pass. Resolves python
-                # imports / document links whose targets land in a *different*
-                # source into imports/references edges. Runs over the whole
-                # accumulated graph (sources sync independently) and is
-                # idempotent via edge upsert, so re-sync produces an identical
-                # graph.
-                self.graph_builder.add_cross_source_edges()
-                # Step 33.7 — memory into the graph. **After** cross-source
-                # resolution, because the bridge's strongest rung is "this
-                # record explicitly names a file", and that edge does not exist
-                # until the pass above has resolved it. A no-op without memory.
-                self._bridge_memory()
-                # Keep only the concepts that connect something. Runs last so
-                # similarity (which reads concept_terms off artifact nodes,
-                # not concept nodes) is unaffected.
-                pruned = self.graph_builder.reconcile_concepts(
-                    self.state,
-                    min_documents=int(self.config.graph.concept_min_documents),
-                    changed_ids=changed_ids,
-                )
-                if pruned["removed"] or pruned["restored"]:
-                    logger.info(
-                        "Concepts reconciled: kept=%s removed=%s restored=%s",
-                        pruned["kept"],
-                        pruned["removed"],
-                        pruned["restored"],
-                    )
-            report("saving", total_items, total_items, "writing the graph and index")
-            manifest["last_indexed_at"] = utc_now()
-            manifest["connector"] = {"type": connector.connector_type}
-            self.manifests.save(source.name, manifest)
-            self.flush_node_index()
-            self.graph_store.save(self.config.knowledge_base_id, self.graph_builder.graph)
-            if self.vectors is not None:
-                # Guaranteed final flush of whatever NumpyVectorStore has
-                # buffered (LanceDB's flush() is a no-op) — mirrors the
-                # unconditional graph save on the line above, for the same
-                # reason: the periodic self-throttled flush inside upsert()
-                # only guarantees durability up to its last threshold, not
-                # up to this artifact.
-                self.vectors.flush()
-            self._graph_dirty = False
-            self._last_checkpoint = time.monotonic()
+            pruned_vectors = self._finalize_index_state(
+                source=source,
+                connector=connector,
+                mode=mode,
+                manifest=manifest,
+                indexed=indexed,
+                embedded_chunks=embedded_chunks,
+                changed_ids=changed_ids,
+                total_items=total_items,
+                report=report,
+                embedding_progress=embedding_progress,
+            )
             # Recorded only after the pass succeeded, so a sync that dies
             # halfway is retried rather than being remembered as "done with
             # this config".

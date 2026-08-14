@@ -50,31 +50,58 @@ def _lock_is_active(lock: Path) -> bool:
     return isinstance(pid, int) and _pid_is_running(pid)
 
 
+def _unlink_lock(lock: Path, *, retry_seconds: float = 0.5) -> None:
+    """Remove a lock, riding out a concurrent Windows reader briefly."""
+
+    deadline = time.monotonic() + max(0.0, retry_seconds)
+    while True:
+        try:
+            lock.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            # On Windows, Path.read_text() in a waiting contender can deny the
+            # owner's unlink for the few microseconds its handle is open.
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
 @contextmanager
-def source_lock(lock_dir: str | Path, source_id: str):
+def source_lock(
+    lock_dir: str | Path,
+    source_id: str,
+    *,
+    timeout_s: float = 0.0,
+    poll_interval_s: float = 0.1,
+):
     root = Path(lock_dir)
     root.mkdir(parents=True, exist_ok=True)
     lock = root / f"{source_id}.lock"
-    if lock.exists():
-        if _lock_is_active(lock):
-            raise RuntimeError(f"Source is already locked: {source_id}")
-        lock.unlink(missing_ok=True)
-
     payload = {
         "source_id": source_id,
         "pid": os.getpid(),
         "hostname": socket.gethostname(),
         "created_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
     }
-    try:
-        with lock.open("x", encoding="utf-8") as fh:
-            json.dump(payload, fh)
-    except FileExistsError:
-        raise RuntimeError(f"Source is already locked: {source_id}") from None
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        if lock.exists() and not _lock_is_active(lock):
+            _unlink_lock(lock)
+        try:
+            with lock.open("x", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Source is already locked after waiting {max(0.0, timeout_s):.1f}s: "
+                    f"{source_id}"
+                ) from None
+            time.sleep(max(0.01, float(poll_interval_s)))
     try:
         yield
     finally:
-        lock.unlink(missing_ok=True)
+        _unlink_lock(lock)
 
 
 class EngineLeaseError(RuntimeError):

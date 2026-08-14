@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from collections import defaultdict
 from typing import Any
@@ -292,14 +293,23 @@ class SimpleMultiDiGraph:
     def to_node_link(self):
         with self._lock:
             links = []
-            for (source, target), edge_map in self._edges.items():
-                for key, data in edge_map.items():
+            for source, target in sorted(self._edges):
+                # Edge keys are insertion-order implementation details and are
+                # discarded by ``from_node_link``. Canonicalize parallel edges
+                # by their semantic payload so concurrent source/file workers
+                # cannot change persisted graph bytes merely by finishing in a
+                # different order.
+                edge_rows = sorted(
+                    self._edges[(source, target)].values(),
+                    key=lambda data: json.dumps(data, sort_keys=True, separators=(",", ":")),
+                )
+                for key, data in enumerate(edge_rows):
                     links.append({"source": source, "target": target, "key": key, **data})
             return {
                 "directed": True,
                 "multigraph": True,
                 "graph": {},
-                "nodes": list(self._nodes.values()),
+                "nodes": [self._nodes[node_id] for node_id in sorted(self._nodes)],
                 "links": links,
             }
 

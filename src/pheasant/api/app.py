@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Annotated
 
 import yaml
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -318,6 +318,15 @@ class QuickAddRequest(BaseModel):
     # false so pasting a large repo's URL never blocks the form (and the
     # reverse proxy in front of it) on however long the first index takes.
     wait: bool = True
+
+
+class RemotePrepareRequest(BaseModel):
+    """Immutable coordinator task accepted by an opt-in indexing worker."""
+
+    source: dict
+    item: dict
+    payload: dict
+    git_metadata: list[str | bool | None] | None = None
 
 
 #: One line per retrieval knob, so a UI (or an agent reading
@@ -867,6 +876,37 @@ def create_app(
     @app.get("/ready")
     def ready() -> dict:
         return {"status": "ready", "knowledge_base": config.knowledge_base_id}
+
+    @app.post("/internal/indexing/prepare")
+    def remote_prepare(
+        req: RemotePrepareRequest,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict:
+        """Stateless authenticated parse/chunk worker for remote coordinators."""
+
+        concurrency = config.sync.concurrency
+        if not concurrency.remote_worker_enabled:
+            raise HTTPException(status_code=404, detail="remote indexing worker is disabled")
+        import hmac
+
+        from pheasant.sync.remote_worker import RemoteWorkerError, configured_token, prepare_task
+
+        try:
+            expected = configured_token(concurrency.remote_worker_token_env)
+        except RemoteWorkerError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        scheme, _, supplied = (authorization or "").partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(supplied, expected):
+            raise HTTPException(status_code=401, detail="invalid indexing worker token")
+        max_mb = config.sync.limits.max_file_size_mb
+        encoded = str(req.payload.get("content_base64") or "")
+        if max_mb is not None and len(encoded) > int(max_mb) * 1024 * 1024 * 4 // 3 + 4:
+            raise HTTPException(status_code=413, detail="indexing task exceeds max_file_size_mb")
+        try:
+            parsed = prepare_task(req.model_dump())
+        except (KeyError, TypeError, ValueError, RemoteWorkerError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"parsed": parsed}
 
     @app.get("/metrics")
     def metrics() -> str:

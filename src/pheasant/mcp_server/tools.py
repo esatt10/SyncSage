@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ import yaml
 from pheasant.config.loader import dump_config_yaml
 from pheasant.config.schema import PheasantConfig, SourceConfig, SourceType
 from pheasant.ingestion.pipeline import utc_now
+from pheasant.jobs import JobRegistry
 from pheasant.obsidian.exporter import ObsidianExporter
 from pheasant.persistence.paths import StatePaths
 from pheasant.persistence.state_store import StateStore
@@ -64,6 +66,12 @@ class PheasantTools:
         self.state = StateStore(self.paths.sqlite)
         self.state.migrate()
         self.engine = SyncEngine(config, self.paths, self.state)
+        # MCP and A2A callers cannot consume the HTTP server's in-process job
+        # registry.  Keep the same progress contract on the tool facade so an
+        # agent can start a long first index, retain the job id, and inspect it
+        # without holding a tool call open for minutes.
+        self.jobs = JobRegistry()
+        self._job_lock = threading.Lock()
         self.searcher = HybridSearch(
             SearchStore(self.state),
             vector=self.engine.vector_searcher(),
@@ -91,6 +99,9 @@ class PheasantTools:
         actor: str = "mcp",
         transport: str = "mcp",
         client_id: str | None = None,
+        sync_now: bool = False,
+        wait: bool = False,
+        sync_mode: str = "incremental",
     ) -> dict:
         self._require_knowledge_base(knowledge_base)
         if self.config.security.allow_user_selected_source_paths:
@@ -139,7 +150,7 @@ class PheasantTools:
             created_at,
             {"source": source.model_dump(mode="json")},
         )
-        return {
+        response = {
             "status": "registered",
             "knowledge_base": self.config.knowledge_base_id,
             "source": source.model_dump(mode="json"),
@@ -152,6 +163,76 @@ class PheasantTools:
                 "config_update_required": True,
             },
         }
+        if sync_now:
+            if wait:
+                response["sync_result"] = self.sync_source(knowledge_base, source.name, sync_mode)
+            else:
+                response["job"] = self.start_sync_source(knowledge_base, source.name, sync_mode)
+        return response
+
+    def start_sync_source(
+        self,
+        knowledge_base: str,
+        source_name: str,
+        mode: str = "incremental",
+        max_depth: int | None = None,
+        full_scan: bool = False,
+    ) -> dict:
+        """Start indexing and immediately return a followable job record."""
+        self._require_knowledge_base(knowledge_base)
+        self._require_source(source_name)
+        with self._job_lock:
+            active = self.jobs.active_for(source_name)
+            if active is not None:
+                return active.as_dict()
+            job = self.jobs.create("sync", f"Indexing {source_name}", [source_name])
+
+        def run() -> None:
+            def progress(phase: str, current: int, total: int | None, detail: str) -> None:
+                self.jobs.progress(
+                    job.id,
+                    phase=phase,
+                    current=current,
+                    total=total,
+                    detail=detail,
+                )
+
+            try:
+                result = self.engine.sync_source(
+                    source_name,
+                    mode,  # type: ignore[arg-type]
+                    max_depth=max_depth,
+                    full_scan=full_scan,
+                    on_progress=progress,
+                ).__dict__
+            except Exception as exc:  # background tool work cannot propagate
+                self.jobs.finish(job.id, "failed", error=str(exc))
+                return
+            failed = result.get("status") in {"failed", "timeout", "limit_exceeded"}
+            self.jobs.finish(
+                job.id,
+                "failed" if failed else "succeeded",
+                error=(result.get("details") or {}).get("error") if failed else None,
+                result=result,
+            )
+
+        threading.Thread(
+            target=run,
+            name=f"pheasant-mcp-sync-{source_name}",
+            daemon=True,
+        ).start()
+        return job.as_dict()
+
+    def get_job(self, job_id: str) -> dict:
+        """Return current progress and the terminal result for one tool job."""
+        job = self.jobs.get(job_id)
+        if job is None:
+            raise KeyError(f"Unknown job: {job_id}")
+        return job
+
+    def list_jobs(self, active_only: bool = False, limit: int = 50) -> dict:
+        """List recent tool jobs, with active indexing jobs first."""
+        return {"jobs": self.jobs.list(active_only=active_only, limit=limit)}
 
     def list_sources(
         self,

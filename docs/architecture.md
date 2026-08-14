@@ -19,7 +19,7 @@ pheasant is a Docker-first MCP server with an admin API, source registry, sync e
 | MCP server | Agent-facing tools, resources, and prompts. |
 | Admin API | Health, readiness, source, sync, search, graph, and Obsidian endpoints. |
 | Source registry | Configured and runtime-registered source metadata, lifecycle state, and audit history. |
-| Sync engine | Connector-backed startup validation, incremental sync, scheduled sync, manual sync, and repair orchestration. |
+| Sync engine | Connector-backed startup validation, incremental sync, scheduled sync, manual sync, and repair orchestration. It pipelines discovery → bounded immutable preparation → bounded batched embedding → ordered commits → global enrichment/finalization. |
 | Watcher service | Debounced filesystem events for configured paths. |
 | Git monitor | Branch, commit, and working tree state detection without mutating repositories. |
 | Ingestion pipeline | Repository, Markdown, document, HTML/XML, and web artifact parsing. |
@@ -40,3 +40,21 @@ pheasant is a Docker-first MCP server with an admin API, source registry, sync e
 - Do not execute code from indexed repositories.
 - Keep Obsidian optional; pheasant must work without it.
 - Prefer one isolated state volume per pheasant instance.
+
+## Indexing concurrency
+
+Discovery establishes a stable item order without reading every file twice.
+File workers read and SHA-256 independent items, skip unchanged content before
+parsing, then parse changed items without mutating operational state. Prepared artifacts
+are consumed in discovery order; SQLite rows, graph mutations, manifests and
+vector-store upserts pass through one coordinated writer. Embedding HTTP calls
+may overlap in provider-sized batches, but their results are reassembled in
+input order before one upsert. The persisted node-link graph sorts nodes and
+semantic edge payloads, so executor scheduling cannot change its bytes.
+
+Local `thread` workers suit connector/file I/O. Local `process` workers move
+plain-text parsing onto separate interpreters and size themselves from the CPU
+quota visible to the process. In cluster mode, `remote` workers accept the same
+immutable preparation task over an authenticated HTTP protocol. Remote workers
+are stateless: they do not mount or mutate the coordinator's `/state`; all
+authoritative commits remain centralized.
