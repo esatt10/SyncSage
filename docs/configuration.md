@@ -280,8 +280,33 @@ standing behavior of a scheduled one.
 | `idempotency.compare_size_mtime_hash` | bool | `true` | Use multiple file properties before reprocess. |
 | `idempotency.skip_unchanged_files` | bool | `true` | Skip ingestion when source file is unchanged. |
 | `concurrency.max_parallel_sources` | integer | `4` | Concurrent source processing cap. |
-| `concurrency.max_parallel_files` | integer | `8` | Per-source file concurrency cap. |
-| `concurrency.lock_timeout_seconds` | integer | `120` | Lock acquisition timeout. |
+| `concurrency.max_parallel_files` | integer | `8` | Per-source preparation workers. Workers read/parse immutable inputs; SQLite, graph, manifest and vector-store commits stay coordinated and deterministic. |
+| `concurrency.max_parallel_embeddings` | integer | `4` | Provider-sized embedding requests allowed in flight. Set this to the provider/rate-limit capacity, not blindly to CPU count. |
+| `concurrency.file_executor` | string | `thread` | `thread` for low-overhead I/O overlap; `process` for CPU-heavy plain-text parsing (capped by the process-visible CPU quota); `remote` for authenticated worker nodes. Document/modal/taxonomy/repair work that needs local handler state falls back to threads. |
+| `concurrency.remote_worker_urls` | list[string] | `[]` | Worker base URLs used round-robin when `file_executor: remote`. The coordinator reads the connector payload, then sends that immutable text payload for parsing/chunking. |
+| `concurrency.remote_worker_enabled` | bool | `false` | Expose this instance's authenticated `POST /internal/indexing/prepare` worker endpoint. It never writes SQLite, graph, manifests or vectors. |
+| `concurrency.remote_worker_token_env` | string | `PHEASANT_INDEX_WORKER_TOKEN` | Environment variable containing the shared bearer token. Required on coordinators and workers; the token is never stored in config or task bodies. |
+| `concurrency.remote_worker_timeout_seconds` | integer | `120` | Per-task remote-worker HTTP timeout. |
+| `concurrency.lock_timeout_seconds` | integer | `120` | How long an in-process sync waits for an already-active lock on the same source. The interactive engine lease remains fail-fast; server-owned subprocess workers use their existing explicit lease wait. |
+
+`max_parallel_sources` overlaps independent connectors and preparation. Shared
+state commits and global graph enrichment remain serialized, so the setting is
+a throughput cap rather than permission for competing writers. `sync_all()`
+returns results in configured source order regardless of completion order.
+
+Measure the useful worker count on the target filesystem/CPU/provider:
+
+```bash
+python -m pheasant.sync.benchmark --workers 1,2,4,8
+python -m pheasant.sync.benchmark --workers 1,2,4 --executor process --embeddings
+```
+
+The benchmark is deterministic and offline (`stub` embeddings when requested).
+After an unmeasured warm-up it reports median wall time, individual trials,
+files/second and speedup for both a clean full index and its immediately
+unchanged incremental pass (three trials by default). A 60-second cold-index
+target is workload- and provider-dependent; use this output rather than assuming
+that a larger cap is faster.
 
 ### Manual sync modes
 
@@ -911,6 +936,8 @@ sync:
   concurrency:
     max_parallel_sources: 6
     max_parallel_files: 12
+    max_parallel_embeddings: 4
+    file_executor: process
     lock_timeout_seconds: 180
 
 sources:

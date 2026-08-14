@@ -47,6 +47,7 @@ matches without any model or network.
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import hashlib
 import importlib.util
 import json
@@ -58,6 +59,7 @@ import ssl
 import struct
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from urllib.error import HTTPError, URLError
@@ -157,11 +159,13 @@ class StubEmbedder:
         self.synonyms = dict(DEFAULT_STUB_SYNONYMS if synonyms is None else synonyms)
         self.calls = 0
         self.texts_embedded = 0
+        self._counter_lock = threading.Lock()
         self._directions: dict[str, np.ndarray] = {}
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        self.calls += 1
-        self.texts_embedded += len(texts)
+        with self._counter_lock:
+            self.calls += 1
+            self.texts_embedded += len(texts)
         return [self._embed_one(text) for text in texts]
 
     def _embed_one(self, text: str) -> list[float]:
@@ -246,6 +250,7 @@ class OpenAISpecEmbedder:
         self.retry_backoff_seconds = max(0.1, float(retry_backoff_seconds))
         self.calls = 0
         self.texts_embedded = 0
+        self._counter_lock = threading.Lock()
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         vectors: list[list[float]] = []
@@ -317,8 +322,9 @@ class OpenAISpecEmbedder:
             method="POST",
         )
         payload = self._post_with_retry(request)
-        self.calls += 1
-        self.texts_embedded += len(batch)
+        with self._counter_lock:
+            self.calls += 1
+            self.texts_embedded += len(batch)
         data = sorted(payload.get("data", []), key=lambda item: int(item.get("index", 0)))
         if len(data) != len(batch):
             raise ValueError(
@@ -733,21 +739,26 @@ class VectorIndexer:
     packing many files' chunks into one request. On a few-hundred-file repo
     that was the difference between a handful of embedding calls and
     hundreds, entirely serial on the sync's only thread. Queued chunks are
-    flushed automatically once `queue_size` accumulates (so a large source
-    still embeds in bounded batches, and a crash mid-sync loses at most one
-    batch's progress) and explicitly by `flush()`, which the caller
+    flushed automatically once `queue_size` accumulates (one provider batch
+    per allowed concurrent request by default, so memory stays bounded) and
+    explicitly by `flush()`, which the caller
     (`SyncEngine`) already calls at the end of every sync.
     """
 
-    def __init__(self, embedder: Embedder, store: VectorStore, queue_size: int | None = None):
+    def __init__(
+        self,
+        embedder: Embedder,
+        store: VectorStore,
+        queue_size: int | None = None,
+        max_parallel_embeddings: int = 1,
+    ):
         self.embedder = embedder
         self.store = store
-        # Default to the embedder's own batch size: `embed()` already
-        # sub-batches internally at that size, so queuing exactly that many
-        # pending chunks before flushing yields one HTTP call per flush
-        # rather than a request smaller than what the provider was
-        # configured to accept in one round-trip.
-        self.queue_size = int(queue_size or getattr(embedder, "batch_size", 64) or 64)
+        self.max_parallel_embeddings = max(1, int(max_parallel_embeddings or 1))
+        # Queue one provider-sized group per concurrency slot. This fills each
+        # request without allowing pending text to grow with source size.
+        provider_batch_size = int(getattr(embedder, "batch_size", 64) or 64)
+        self.queue_size = int(queue_size or provider_batch_size * self.max_parallel_embeddings)
         self._pending: list[dict[str, Any]] = []
 
     def index_artifact(
@@ -755,6 +766,7 @@ class VectorIndexer:
         source_id: str,
         artifact_id: str,
         chunk_rows: list[dict[str, Any]],
+        on_progress: Callable[[int], None] | None = None,
     ) -> int:
         """Queue new/changed chunks for embedding; returns how many were queued.
 
@@ -782,16 +794,55 @@ class VectorIndexer:
                 }
             )
         if len(self._pending) >= self.queue_size:
-            self.flush_pending()
+            self.flush_pending(on_progress=on_progress)
         return len(pending)
 
-    def flush_pending(self) -> None:
+    def flush_pending(self, on_progress: Callable[[int], None] | None = None) -> None:
         """Embed and upsert everything queued so far, across every file
-        `index_artifact` has touched since the last flush."""
+        `index_artifact` has touched since the last flush.
+
+        Provider-sized batches may be in flight concurrently, but results are
+        reassembled in input order and the vector store receives one ordered
+        upsert. A failed batch therefore commits no partial flush and the
+        content-addressed ids make a retry safe.
+        """
         if not self._pending:
             return
         batch, self._pending = self._pending, []
-        vectors = self.embedder.embed([item["text"] for item in batch])
+        batch_size = max(1, int(getattr(self.embedder, "batch_size", len(batch)) or len(batch)))
+        groups = [batch[start : start + batch_size] for start in range(0, len(batch), batch_size)]
+        grouped_vectors: list[list[list[float]] | None] = [None] * len(groups)
+
+        def embed_group(group: list[dict[str, Any]]) -> list[list[float]]:
+            return self.embedder.embed([str(item["text"]) for item in group])
+
+        try:
+            if self.max_parallel_embeddings <= 1 or len(groups) <= 1:
+                for index, group in enumerate(groups):
+                    grouped_vectors[index] = embed_group(group)
+                    if on_progress is not None:
+                        on_progress(len(group))
+            else:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(self.max_parallel_embeddings, len(groups)),
+                    thread_name_prefix="pheasant-embed",
+                ) as executor:
+                    futures = {
+                        executor.submit(embed_group, group): (index, len(group))
+                        for index, group in enumerate(groups)
+                    }
+                    for future in concurrent.futures.as_completed(futures):
+                        index, size = futures[future]
+                        grouped_vectors[index] = future.result()
+                        if on_progress is not None:
+                            on_progress(size)
+        except BaseException:
+            # Nothing reached the store. Put the exact ordered work back so a
+            # caller that catches the provider error may retry this indexer.
+            self._pending = batch + self._pending
+            raise
+
+        vectors = [vector for group in grouped_vectors for vector in (group or [])]
         self.store.upsert(
             [item["id"] for item in batch],
             vectors,
@@ -824,12 +875,12 @@ class VectorIndexer:
         self._pending = []
         return self.store.reset()
 
-    def flush(self) -> None:
+    def flush(self, on_progress: Callable[[int], None] | None = None) -> None:
         """Embed anything still queued, then force the store's writes to
         disk now. The caller (`SyncEngine`) MUST call this at the end of a
         sync, alongside its own final graph save — see `NumpyVectorStore`'s
         docstring for why the disk-flush half exists."""
-        self.flush_pending()
+        self.flush_pending(on_progress=on_progress)
         self.store.flush()
 
 
@@ -979,7 +1030,11 @@ def vector_indexer_from_config(config: PheasantConfig) -> VectorIndexer | None:
     if not settings.enabled:
         return None
     try:
-        return VectorIndexer(build_embedder(settings), build_vector_store(config))
+        return VectorIndexer(
+            build_embedder(settings),
+            build_vector_store(config),
+            max_parallel_embeddings=getattr(config.sync.concurrency, "max_parallel_embeddings", 1),
+        )
     except ValueError as exc:
         logger.warning("Vector search disabled: %s", exc)
         return None

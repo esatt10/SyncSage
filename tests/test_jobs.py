@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 from pheasant.api.app import create_app
 from pheasant.cli import PROGRESS_MARKER, _progress_emitter
 from pheasant.jobs import JobRegistry
+from pheasant.mcp_server.tools import PheasantTools
 from pheasant.sync.engine import _progress_reporter
 
 SAMPLE_WORKSPACE = Path(__file__).resolve().parent / "fixtures" / "sample_workspace"
@@ -59,6 +60,18 @@ def test_an_unknown_total_reports_no_fraction() -> None:
     job = registry.create("sync", "Indexing", ["docs"])
     registry.progress(job.id, phase="listing", current=0)
     assert registry.get(job.id)["progress"]["fraction"] is None
+
+
+def test_a_new_unknown_total_phase_drops_the_previous_denominator() -> None:
+    registry = JobRegistry()
+    job = registry.create("sync", "Indexing", ["docs"])
+    registry.progress(job.id, phase="preparing", current=8, total=10)
+    registry.progress(job.id, phase="embedding", current=3, total=None)
+
+    progress = registry.get(job.id)["progress"]
+    assert progress["phase"] == "embedding"
+    assert progress["total"] is None
+    assert progress["fraction"] is None
 
 
 def test_finishing_completes_the_bar() -> None:
@@ -366,3 +379,53 @@ def test_a_background_sync_produces_a_followable_job(
             break
         time.sleep(0.1)
     assert job["status"] == "succeeded", job
+
+
+def test_mcp_background_sync_is_followable(loaded_config) -> None:
+    """Agents get the same immediate acknowledgement and progress contract."""
+    tools = PheasantTools(loaded_config)
+    try:
+        source = loaded_config.sources[0].name
+        started = tools.start_sync_source(loaded_config.knowledge_base_id, source)
+        assert started["id"]
+        assert started["targets"] == [source]
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            job = tools.get_job(started["id"])
+            if not job["active"]:
+                break
+            time.sleep(0.01)
+        assert job["status"] == "succeeded", job
+        assert tools.list_jobs()["jobs"][0]["id"] == started["id"]
+    finally:
+        tools.engine.close()
+
+
+def test_mcp_registration_can_acknowledge_and_start_sync(loaded_config, tmp_path) -> None:
+    folder = tmp_path / "agent-source"
+    folder.mkdir()
+    (folder / "readme.md").write_text("agent-visible progress", encoding="utf-8")
+    loaded_config.security.allow_user_selected_source_paths = True
+    tools = PheasantTools(loaded_config)
+    try:
+        response = tools.register_source(
+            loaded_config.knowledge_base_id,
+            "agent-source",
+            "markdown_folder",
+            str(folder),
+            sync_now=True,
+        )
+        assert response["status"] == "registered"
+        assert response["source"]["name"] == "agent-source"
+        assert response["job"]["id"]
+        assert response["job"]["active"] is True
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            job = tools.get_job(response["job"]["id"])
+            if not job["active"]:
+                break
+            time.sleep(0.01)
+        assert job["status"] == "succeeded", job
+    finally:
+        tools.engine.close()

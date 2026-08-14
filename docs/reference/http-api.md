@@ -14,6 +14,7 @@ The routes below are the consolidated surface defined in
 | GET | `/health` | Liveness probe. |
 | GET | `/ready` | Readiness probe. |
 | GET | `/metrics` | Operational metrics. |
+| POST | `/internal/indexing/prepare` | Opt-in stateless remote preparation worker. Disabled unless `sync.concurrency.remote_worker_enabled`; requires `Authorization: Bearer` matching the environment variable named by `remote_worker_token_env`. Intended for pheasant coordinators, not public clients. |
 
 ## Synapse region
 

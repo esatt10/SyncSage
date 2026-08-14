@@ -155,6 +155,12 @@ sync:
   concurrency:
     max_parallel_sources: 4
     max_parallel_files: 8
+    max_parallel_embeddings: 4
+    file_executor: thread # thread | process | remote
+    remote_worker_urls: []
+    remote_worker_enabled: false
+    remote_worker_token_env: PHEASANT_INDEX_WORKER_TOKEN
+    remote_worker_timeout_seconds: 120
     lock_timeout_seconds: 120
 
 # Turning binary/markup files into indexable text. Every handler here is

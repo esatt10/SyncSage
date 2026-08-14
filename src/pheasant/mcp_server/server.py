@@ -61,6 +61,9 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         include: list[str] | None = None,
         exclude: list[str] | None = None,
         taxonomy: bool = False,
+        sync_now: bool = False,
+        wait: bool = False,
+        sync_mode: str = "incremental",
     ) -> dict:
         """Register a source path after allowlisted path validation.
 
@@ -81,7 +84,34 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             include=include,
             exclude=exclude,
             taxonomy=taxonomy,
+            sync_now=sync_now,
+            wait=wait,
+            sync_mode=sync_mode,
         )
+
+    @mcp.tool()
+    def start_sync_source(
+        knowledge_base: str,
+        source_name: str,
+        mode: str = "incremental",
+        max_depth: int | None = None,
+        full_scan: bool = False,
+    ) -> dict:
+        """Start a source sync and return immediately with a progress job id."""
+
+        return tools.start_sync_source(knowledge_base, source_name, mode, max_depth, full_scan)
+
+    @mcp.tool()
+    def get_job(job_id: str) -> dict:
+        """Inspect phase, counts, messages, and outcome of a background job."""
+
+        return tools.get_job(job_id)
+
+    @mcp.tool()
+    def list_jobs(active_only: bool = False, limit: int = 50) -> dict:
+        """List recent background jobs, with active jobs first."""
+
+        return tools.list_jobs(active_only, limit)
 
     @mcp.tool()
     def list_sources(

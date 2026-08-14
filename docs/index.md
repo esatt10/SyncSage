@@ -53,6 +53,7 @@ as a federated **"brain region"** inside a **Synapse** fleet.
 | Index images and audio (offline) | [Multi-modal tutorial](tutorials/multimodal.md) |
 | Configure source types and sync modes | [Configure sources](how-to/sources.md) |
 | Turn on semantic / vector search | [Vector self-search](how-to/vector-search.md) |
+| Tune local workers or add indexing nodes | [Speed up indexing](how-to/indexing-performance.md) |
 | Join a federated Synapse fleet | [Attach to a Synapse fleet](how-to/attach-to-synapse.md) |
 | Connect an agent over MCP | [MCP for agents](mcp_client.md) |
 | Back up and restore region state | [Backup & restore](how-to/backup-restore.md) |

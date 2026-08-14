@@ -487,11 +487,32 @@ class SyncLimitsSettings(ModelMixin):
 
 
 @dataclass
+class SyncConcurrencySettings(ModelMixin):
+    """Bounded indexing concurrency, shared by every configuration surface.
+
+    File workers only prepare immutable parse results. SQLite, graph,
+    manifest, and vector-store mutations remain coordinated by the engine so
+    increasing a cap cannot change stable IDs or persisted graph bytes.
+    """
+
+    max_parallel_sources: int = 4
+    max_parallel_files: int = 8
+    max_parallel_embeddings: int = 4
+    file_executor: str = "thread"
+    remote_worker_urls: list[str] = field(default_factory=list)
+    remote_worker_enabled: bool = False
+    remote_worker_token_env: str = "PHEASANT_INDEX_WORKER_TOKEN"
+    remote_worker_timeout_seconds: int = 120
+    lock_timeout_seconds: int = 120
+
+
+@dataclass
 class SyncSettings(ModelMixin):
     watcher: WatcherSettings = field(default_factory=WatcherSettings)
     git: GitSettings = field(default_factory=GitSettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
     limits: SyncLimitsSettings = field(default_factory=SyncLimitsSettings)
+    concurrency: SyncConcurrencySettings = field(default_factory=SyncConcurrencySettings)
 
 
 @dataclass
@@ -939,6 +960,8 @@ class PheasantConfig(ModelMixin):
                     raw["scheduler"] = build(SchedulerSettings, raw["scheduler"])
                 if "limits" in raw and isinstance(raw["limits"], dict):
                     raw["limits"] = build(SyncLimitsSettings, raw["limits"])
+                if "concurrency" in raw and isinstance(raw["concurrency"], dict):
+                    raw["concurrency"] = build(SyncConcurrencySettings, raw["concurrency"])
             return dc(**{k: v for k, v in raw.items() if k in dc.__dataclass_fields__})
 
         cfg = cls(

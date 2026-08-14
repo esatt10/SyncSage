@@ -479,7 +479,7 @@ def main(argv: list[str] | None = None) -> int:
     sync_p.add_argument(
         "--wait-for-lease",
         type=float,
-        default=0.0,
+        default=None,
         help=argparse.SUPPRESS,
     )
     scan_p = sub.add_parser(
@@ -705,7 +705,8 @@ def main(argv: list[str] | None = None) -> int:
 
         on_progress = _progress_emitter() if getattr(args, "progress", False) else None
         engine = _engine(Path(args.config))
-        engine.lease.wait_timeout_s = max(0.0, args.wait_for_lease)
+        if args.wait_for_lease is not None:
+            engine.lease.wait_timeout_s = max(0.0, args.wait_for_lease)
         try:
             # This process owns the CPU cost of indexing, so it also owns
             # building the graph search index when it is missing (after an
