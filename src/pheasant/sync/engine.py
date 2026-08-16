@@ -264,7 +264,7 @@ class SyncEngine:
         self.config = config
         self.paths = paths or StatePaths.from_config(config)
         self.paths.ensure()
-        self.state = state or StateStore(self.paths.sqlite)
+        self.state = state or StateStore.from_config(self.config, self.paths.sqlite)
         self.state.migrate()
         # Single-writer lease (Synapse 21.2): acquired lazily on the first
         # sync so read-only engines (e.g. docker-exec MCP stdio beside a

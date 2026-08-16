@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-import threading
 from pathlib import Path
 from typing import Any
+
+from pheasant.persistence.backends import SqliteBackend, StateBackend, open_backend
+from pheasant.persistence.schema import schema_for
+from pheasant.persistence.secrets import resolve_dsn
+from pheasant.persistence.sql import SQLITE
 
 logger = logging.getLogger(__name__)
 
@@ -38,218 +42,9 @@ def _basename(path: str | None) -> str:
     return text.rsplit("/", 1)[-1] if "/" in text else text
 
 
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-CREATE TABLE IF NOT EXISTS knowledge_bases (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  description TEXT,
-  config_hash TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS sources (
-  id TEXT PRIMARY KEY,
-  knowledge_base_id TEXT NOT NULL,
-  name TEXT NOT NULL,
-  type TEXT NOT NULL,
-  path TEXT NOT NULL,
-  enabled INTEGER NOT NULL,
-  config_json TEXT NOT NULL,
-  last_indexed_at TEXT,
-  last_status TEXT,
-  FOREIGN KEY (knowledge_base_id) REFERENCES knowledge_bases(id)
-);
-CREATE TABLE IF NOT EXISTS artifacts (
-  id TEXT PRIMARY KEY,
-  source_id TEXT NOT NULL,
-  type TEXT NOT NULL,
-  path TEXT NOT NULL,
-  relative_path TEXT,
-  mime_type TEXT,
-  size_bytes INTEGER,
-  sha256 TEXT,
-  mtime TEXT,
-  git_branch TEXT,
-  git_commit TEXT,
-  last_indexed_at TEXT,
-  status TEXT,
-  FOREIGN KEY (source_id) REFERENCES sources(id)
-);
-CREATE TABLE IF NOT EXISTS chunks (
-  id TEXT PRIMARY KEY,
-  artifact_id TEXT NOT NULL,
-  source_id TEXT NOT NULL,
-  chunk_index INTEGER NOT NULL,
-  heading_path TEXT,
-  start_line INTEGER,
-  end_line INTEGER,
-  text TEXT NOT NULL,
-  text_hash TEXT NOT NULL,
-  summary TEXT,
-  token_estimate INTEGER,
-  FOREIGN KEY (artifact_id) REFERENCES artifacts(id),
-  FOREIGN KEY (source_id) REFERENCES sources(id)
-);
--- Same per-artifact DELETE pattern as artifact_terms; see that index's
--- comment.
-CREATE INDEX IF NOT EXISTS idx_chunks_artifact_id ON chunks(artifact_id);
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-  chunk_id UNINDEXED,
-  source_id UNINDEXED,
-  artifact_id UNINDEXED,
-  title,
-  path,
-  heading_path,
-  text
-);
--- The corpus's own vocabulary, with document frequencies, read straight off
--- the FTS index. `fts5vocab` is a view over chunks_fts's internal term table:
--- it stores nothing of its own and stays exact as the index changes.
---
--- This replaces the concept layer as the source of "what is this corpus
--- about" (the Synapse contract's vocabulary.top_concepts + minhash, and the
--- planner's structural grounding). Concept extraction had been materializing
--- 141k nodes and 1.27M artifact_terms rows to answer that question; SQLite
--- was already maintaining the same information for free.
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vocab USING fts5vocab(chunks_fts, 'row');
-CREATE TABLE IF NOT EXISTS symbols (
-  id TEXT PRIMARY KEY,
-  artifact_id TEXT NOT NULL,
-  source_id TEXT NOT NULL,
-  language TEXT,
-  symbol_type TEXT,
-  name TEXT,
-  qualified_name TEXT,
-  start_line INTEGER,
-  end_line INTEGER,
-  signature TEXT,
-  docstring_summary TEXT,
-  FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
-);
--- Same per-artifact DELETE pattern as artifact_terms; see that index's
--- comment.
-CREATE INDEX IF NOT EXISTS idx_symbols_artifact_id ON symbols(artifact_id);
-CREATE TABLE IF NOT EXISTS artifact_terms (
-  id TEXT PRIMARY KEY,
-  artifact_id TEXT NOT NULL,
-  source_id TEXT NOT NULL,
-  node_id TEXT NOT NULL,
-  node_type TEXT NOT NULL,
-  term TEXT NOT NULL,
-  normalized_term TEXT NOT NULL,
-  weight REAL NOT NULL,
-  metadata_json TEXT NOT NULL,
-  FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
-);
--- Without this, `DELETE FROM artifact_terms WHERE artifact_id=?` (run once
--- per artifact on every sync, in replace_artifact_enrichment) is a full
--- table scan. On a table that grows past a million rows over a real sync,
--- that turns a full-corpus sync into O(n^2): each artifact's delete gets
--- slower as the table grows. Measured cause of a 2,132-file sync taking
--- 1.5+ hours.
-CREATE INDEX IF NOT EXISTS idx_artifact_terms_artifact_id
-  ON artifact_terms(artifact_id);
--- Supports GraphBuilder.reconcile_concepts: `WHERE node_type='concept'
--- GROUP BY node_id, ... COUNT(DISTINCT artifact_id)`. Without it, that
--- query is an unindexed scan + sort over the whole table — measured at
--- 10+ minutes and still not finished on a 1.27M-row table.
-CREATE INDEX IF NOT EXISTS idx_artifact_terms_node_lookup
-  ON artifact_terms(node_type, node_id, artifact_id);
-CREATE TABLE IF NOT EXISTS sync_events (
-  id TEXT PRIMARY KEY,
-  source_id TEXT,
-  event_type TEXT NOT NULL,
-  status TEXT NOT NULL,
-  started_at TEXT,
-  finished_at TEXT,
-  details_json TEXT,
-  error_json TEXT
-);
-CREATE TABLE IF NOT EXISTS source_checkpoints (
-  source_id TEXT PRIMARY KEY,
-  connector_type TEXT NOT NULL,
-  cursor_json TEXT NOT NULL,
-  high_watermark_json TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  status TEXT NOT NULL,
-  FOREIGN KEY (source_id) REFERENCES sources(id)
-);
-CREATE TABLE IF NOT EXISTS source_audit_events (
-  id TEXT PRIMARY KEY,
-  source_id TEXT,
-  action TEXT NOT NULL,
-  actor TEXT,
-  transport TEXT,
-  client_id TEXT,
-  created_at TEXT NOT NULL,
-  details_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS manifests (
-  source_name TEXT PRIMARY KEY,
-  payload_json TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS idp_groups (
-  principal TEXT NOT NULL,
-  group_name TEXT NOT NULL,
-  PRIMARY KEY (principal, group_name)
-);
-CREATE TABLE IF NOT EXISTS idp_sync_meta (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
--- Step 33.5 — the structured face of the agent-memory records that already
--- live as Markdown files under the `type: memory` source.
---
--- This is a **projection**, not a second source of truth: every column is
--- derivable from the record files, and `replace_memory_records` rebuilds a
--- source's rows wholesale on each sync, exactly as `chunks_fts` is a derived
--- cache over `chunks` + `artifacts`. Losing this table costs a re-sync, never
--- data. The records themselves stay append-only files on disk.
---
--- It exists because scope/subject/asserted_at/supersedes were reachable only
--- as *prose inside the indexed chunk text* — so nothing could filter on them,
--- and a superseded record stayed retrievable until a batch job archived it.
---
--- `valid_until` is derived, never double-stored: when B supersedes A, A's
--- validity ends at B's `asserted_at`. An explicit `valid_until` in the record
--- wins when it is earlier.
-CREATE TABLE IF NOT EXISTS memory_records (
-  record_id TEXT PRIMARY KEY,
-  artifact_id TEXT NOT NULL,
-  source_id TEXT NOT NULL,
-  scope TEXT NOT NULL,
-  subject TEXT,
-  kind TEXT NOT NULL DEFAULT 'fact',
-  asserted_at TEXT NOT NULL,
-  valid_from TEXT,
-  valid_until TEXT,
-  supersedes TEXT,
-  tags TEXT,
-  written_by TEXT,
-  salience REAL NOT NULL DEFAULT 1.0,
-  uses INTEGER NOT NULL DEFAULT 0,
-  last_used_at TEXT,
-  schema_version INTEGER NOT NULL DEFAULT 1,
-  FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
-);
--- Retrieval joins chunks -> artifacts -> memory_records on every memory-aware
--- query, and the validity predicate is `scope` + `valid_until`.
-CREATE INDEX IF NOT EXISTS idx_memory_records_artifact_id
-  ON memory_records(artifact_id);
-CREATE INDEX IF NOT EXISTS idx_memory_records_scope
-  ON memory_records(scope, valid_until);
--- What the indexed state was built with, per scope (a source, or the vector
--- space). A restart compares the live config against these: same fingerprint
--- means the stored artifacts/chunks/vectors are still valid and there is
--- nothing to redo. See pheasant.sync.fingerprint.
-CREATE TABLE IF NOT EXISTS sync_fingerprints (
-  scope TEXT PRIMARY KEY,
-  fingerprint TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-"""
+#: Re-exported for callers that referenced ``state_store.SCHEMA``; the
+#: definitions now live in :mod:`pheasant.persistence.schema`, per dialect.
+SCHEMA = schema_for(SQLITE)
 
 
 class StateStore:
@@ -280,38 +75,68 @@ class StateStore:
     all readers as far as WAL's MVCC snapshot isolation is concerned.
     """
 
-    def __init__(self, path: str | Path):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._local = threading.local()
-        # Every connection ever opened, so close() can close all of them —
-        # not just whichever thread happens to call close().
-        self._all_conns: list[sqlite3.Connection] = []
-        self._registry_lock = threading.Lock()
+    def __init__(self, path: str | Path | None = None, *, backend: StateBackend | None = None):
+        """Open the store.
+
+        ``path`` is what every existing caller passes and still means "a
+        SQLite file here". ``backend`` is the Phase-35.2 seam: pass a
+        :class:`~pheasant.persistence.backends.StateBackend` (see
+        :func:`from_config`) to run on Postgres instead. Exactly one is
+        required.
+        """
+
+        if backend is None:
+            if path is None:
+                raise ValueError("StateStore needs either a path or a backend")
+            backend = SqliteBackend(path)
+        self.backend = backend
+        # Kept for the many callers that read `store.path` (backups, logging,
+        # the migration command). None on a backend that has no file.
+        self.path = getattr(backend, "path", None)
+
+    @classmethod
+    def from_config(cls, config: Any, path: str | Path | None = None) -> StateStore:
+        """Build the store the config asks for.
+
+        Falls back to ``path`` for the SQLite default so a caller can keep
+        passing the location it already computed from :class:`StatePaths`.
+        """
+
+        storage = getattr(config, "storage", None)
+        backend_name = str(getattr(storage, "backend", "sqlite") or "sqlite")
+        if backend_name.lower() != "postgres":
+            return cls(path)
+        return cls(
+            backend=open_backend(
+                path,
+                backend="postgres",
+                dsn=resolve_dsn(storage),
+                pool_size=int(getattr(storage, "pool_size", 10) or 10),
+            )
+        )
 
     @property
-    def conn(self) -> sqlite3.Connection:
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = sqlite3.connect(self.path, check_same_thread=True)
-            conn.row_factory = sqlite3.Row
-            # Crash/concurrency safety (Synapse step 21.2): WAL survives
-            # kill -9 mid-write, busy_timeout rides out concurrent readers,
-            # synchronous=NORMAL is the sanctioned WAL durability level.
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            self._local.conn = conn
-            with self._registry_lock:
-                self._all_conns.append(conn)
-        return conn
+    def dialect(self):
+        return self.backend.dialect
+
+    @property
+    def conn(self):
+        """The live connection.
+
+        On SQLite this is the real ``sqlite3.Connection``, unchanged. On
+        Postgres it is a connection-shaped adapter, so the 76 ``self.conn``
+        uses below — including ten ``with self.conn:`` transaction blocks —
+        work on both without being rewritten. Rewriting them would have put 76
+        freshly edited lines on the default path to gain nothing.
+        """
+
+        return self.backend.conn
 
     def migrate(self) -> None:
-        self.conn.executescript(SCHEMA)
+        self.backend.executescript(schema_for(self.backend.dialect))
         # Step 32.1 — one-shot idempotent column add (additive; existing rows
         # keep acl NULL = "source expressed no ACL", the pre-32 semantics).
-        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(artifacts)")}
-        if "acl" not in columns:
+        if "acl" not in self.backend.table_columns("artifacts"):
             self.conn.execute("ALTER TABLE artifacts ADD COLUMN acl TEXT")
         self.conn.commit()
         self._migrate_fts_titles()
@@ -330,6 +155,10 @@ class StateStore:
         One-shot and idempotent: the presence of a '/' in any stored title is
         the old format, and after the rebuild there is nothing left to detect.
         """
+        if self.backend.dialect.fulltext != "fts5":
+            # Postgres derives its search vector from `chunks` directly, so
+            # there is no separate FTS table whose titles could be stale.
+            return
         try:
             stale = self.conn.execute(
                 "SELECT 1 FROM chunks_fts WHERE title LIKE '%/%' LIMIT 1"
@@ -993,21 +822,16 @@ class StateStore:
         )
         return dict(rows[0]) if rows else None
 
-    def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-        # No lock: `self.conn` is this thread's own connection (see the class
-        # docstring), so there is no cursor state shared with any other
-        # thread to interleave.
-        return list(self.conn.execute(sql, params))
+    def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
+        """Run raw SQL. The escape hatch 57 call sites across the codebase use.
+
+        Routed through the backend so the statement is translated for the
+        active dialect (``?`` → ``%s``, ``GROUP_CONCAT`` → ``string_agg``).
+        On SQLite the translation is a no-op and this executes byte-identical
+        SQL over the same connection it always did.
+        """
+
+        return self.backend.rows(sql, params)
 
     def close(self) -> None:
-        # Every thread that ever touched this store opened its own
-        # connection; close them all, not just the caller's.
-        with self._registry_lock:
-            conns, self._all_conns = self._all_conns, []
-        for conn in conns:
-            try:
-                conn.close()
-            except sqlite3.Error:  # pragma: no cover - best-effort cleanup
-                pass
-        if hasattr(self._local, "conn"):
-            del self._local.conn
+        self.backend.close()

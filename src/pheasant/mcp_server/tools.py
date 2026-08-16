@@ -62,7 +62,7 @@ class PheasantTools:
         self.config = config
         self.paths = StatePaths.from_config(config)
         self.paths.ensure()
-        self.state = StateStore(self.paths.sqlite)
+        self.state = StateStore.from_config(config, self.paths.sqlite)
         self.state.migrate()
         self.engine = SyncEngine(config, self.paths, self.state)
         # MCP and A2A callers cannot consume the HTTP server's in-process job

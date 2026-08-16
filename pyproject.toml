@@ -42,6 +42,10 @@ dependencies = [
 [project.optional-dependencies]
 mcp = ["mcp>=1.27,<2"]
 vector = ["lancedb>=0.6"]
+# Phase 35.2: the Postgres state backend. Gated so a standalone region —
+# which is every default install — carries no database driver and the
+# offline suite runs without one.
+postgres = ["psycopg[binary,pool]>=3.2"]
 # Synapse 24.4: optional Ed25519 contract signing. Gated so a region that
 # never sets synapse.signing_key_ref needs no crypto dep and the offline
 # suite passes without it.

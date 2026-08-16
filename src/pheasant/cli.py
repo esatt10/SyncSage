@@ -114,7 +114,7 @@ def _engine(config_path: Path):
     cfg = load_config(config_path)
     paths = StatePaths.from_config(cfg)
     paths.ensure()
-    state = StateStore(paths.sqlite)
+    state = StateStore.from_config(cfg, paths.sqlite)
     state.migrate()
     return SyncEngine(cfg, paths, state)
 

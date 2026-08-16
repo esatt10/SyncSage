@@ -271,6 +271,23 @@ class StorageSettings(ModelMixin):
     manifest_path: Path | None = None
     max_state_size_gb: float = 10
 
+    # -- Phase 35.2: where state actually lives -------------------------------
+    #: ``sqlite`` (default) or ``postgres``. SQLite is a file and permits one
+    #: writer process per knowledge base, which is pheasant's hard scaling
+    #: ceiling; Postgres is what lets 35.4 give each *source* its own lease so
+    #: several indexers can commit at once. Leaving this alone keeps a region
+    #: byte-identical to pre-35.2 and needing no infrastructure at all.
+    backend: str = "sqlite"
+    #: Name of the environment variable holding the libpq DSN. A DSN carries a
+    #: password, so — like every other credential in pheasant — only the
+    #: variable *name* is ever written to YAML. There is deliberately no field
+    #: to paste the DSN itself into.
+    dsn_env: str = "PHEASANT_DATABASE_URL"
+    #: Server-side connections this process may hold. Unlike a SQLite file
+    #: handle a Postgres connection is a server process, so this is a real
+    #: resource on the database, not just on the client.
+    pool_size: int = 10
+
 
 @dataclass
 class EmbeddingsSettings(ModelMixin):

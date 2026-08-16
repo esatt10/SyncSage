@@ -734,7 +734,7 @@ def create_app(
         config = load_config(resolved_config_path)
     paths = StatePaths.from_config(config)
     paths.ensure()
-    state = StateStore(paths.sqlite)
+    state = StateStore.from_config(config, paths.sqlite)
     state.migrate()
     SourceRegistry(config, state).initialize()
     engine = SyncEngine(config, paths, state)
