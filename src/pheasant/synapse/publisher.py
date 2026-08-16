@@ -405,7 +405,7 @@ class ContractPublisher:
         # data — no schema bump (the 25.4 image/audio precedent).
         from pheasant.memory.store import memory_source
 
-        if memory_source(self.config, getattr(self, 'state', None)) is not None:
+        if memory_source(self.config, getattr(self, "state", None)) is not None:
             modalities.append("memory")
         # Document extraction: advertise "document" when a source is configured
         # to ingest PDF/DOCX, so the router's `--modality document` filter

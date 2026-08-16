@@ -66,6 +66,11 @@ wasm = ["wasmtime>=20"]
 # checked-in gencode, which would pin every installer to the exact protobuf
 # release the stubs were generated against.
 grpc = ["grpcio>=1.62", "grpcio-tools>=1.62", "protobuf>=5"]
+# Phase 35.5: NATS JetStream as the index work queue, for a fleet that has
+# outgrown one database. Gated because the default queue is the state store
+# itself, which needs no broker — and because the queue is off entirely
+# unless sync.queue.enabled is set.
+queue = ["nats-py>=2.7"]
 # Documentation site (MkDocs Material). Build with: mkdocs build --strict
 docs = ["mkdocs-material>=9.5"]
 dev = [

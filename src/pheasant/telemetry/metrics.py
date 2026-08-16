@@ -298,6 +298,10 @@ def register_default_metrics(version: str) -> None:
     REGISTRY.gauge("pheasant_index_queue_depth", "Sources queued or running in an index job.")
     REGISTRY.gauge("pheasant_index_inflight", "Index jobs currently running.")
     REGISTRY.gauge(
+        "pheasant_index_dead_letters",
+        "Index tasks that exhausted their attempts and need attention.",
+    )
+    REGISTRY.gauge(
         "pheasant_index_progress_ratio",
         "Fraction of the current pass complete, per source (0-1).",
         ("source",),

@@ -330,8 +330,66 @@ standing behavior of a scheduled one.
 | `concurrency.remote_worker_urls` | list[string] | `[]` | Worker base URLs used round-robin when `file_executor: remote`. The coordinator reads the connector payload, then sends that immutable text payload for parsing/chunking. |
 | `concurrency.remote_worker_enabled` | bool | `false` | Expose this instance's authenticated `POST /internal/indexing/prepare` worker endpoint. It never writes SQLite, graph, manifests or vectors. |
 | `concurrency.remote_worker_token_env` | string | `PHEASANT_INDEX_WORKER_TOKEN` | Environment variable containing the shared bearer token. Required on coordinators and workers; the token is never stored in config or task bodies. |
-| `concurrency.remote_worker_timeout_seconds` | integer | `120` | Per-task remote-worker HTTP timeout. |
+| `concurrency.remote_worker_timeout_seconds` | integer | `120` | Per-task remote-worker timeout, and the deadline sent with the request so the worker declines work whose caller has already given up. |
+| `concurrency.remote_worker_batch_size` | integer | `8` | Files per request. A batch amortizes request overhead and carries one deadline for the group, but every task in it holds its file's bytes in memory on both sides — so treat this as a memory knob as much as a throughput one. |
+| `concurrency.worker_transport` | string | `http` | `http` (stdlib, no extra) or `grpc` (needs the `[grpc]` extra). Changes only the wire format: retry, failover, breakers, deadlines and idempotency are transport-independent. |
 | `concurrency.lock_timeout_seconds` | integer | `120` | How long an in-process sync waits for an already-active lock on the same source. The interactive engine lease remains fail-fast; server-owned subprocess workers use their existing explicit lease wait. |
+
+### Worker durability
+
+`file_executor: remote` used to pick a worker with `position % len(urls)` and
+send one request per file, so a single dead worker failed its share of *every*
+sync. Dispatch is now pooled and durable, and none of it is configurable
+because none of it should be a decision an operator has to get right:
+
+* keep-alive connections, reused for the whole source;
+* bounded retry with full jitter, honouring `Retry-After`;
+* a circuit breaker per endpoint — three consecutive failures take it out of
+  rotation for 30 s, so a dead worker costs three requests rather than a share
+  of every file;
+* failover to another endpoint, then to **local preparation**. Remote
+  preparation is a throughput optimization, so it can never fail a sync: with
+  every worker down, the index is byte-identical, only slower;
+* a `pheasant_worker_up{endpoint}` gauge per endpoint;
+* content-addressed idempotency keys, so a retry after a timeout is answered
+  from the worker's bounded cache instead of re-parsed.
+
+A worker that predates the batch route answers 404 once and the coordinator
+falls back to the single-task path, so a coordinator upgraded ahead of its
+fleet keeps working.
+
+Run a gRPC worker with `pheasant worker --transport grpc --port 8766`
+(HTTP workers are served by `pheasant serve` with
+`concurrency.remote_worker_enabled: true`). gRPC carries file content as raw
+bytes rather than base64 — a flat 33% saving on the only large field — and
+streams results, so one refused file no longer fails the whole batch.
+
+### The index work queue (`sync.queue`)
+
+| Key | Type | Example | Notes |
+|---|---|---|---|
+| `queue.enabled` | bool | `false` | Off by default. With it off, `sync_all` keeps its sources in an in-process list exactly as before. |
+| `queue.backend` | string | `local` | `local` is the state store itself — no broker, works on SQLite and Postgres. `nats` needs the `[queue]` extra. |
+| `queue.visibility_seconds` | integer | `300` | How long a claimed task is invisible to other workers. Heartbeats extend it, so this bounds *silence* from a claimer, not work. |
+| `queue.max_attempts` | integer | `3` | Attempts before a task is dead-lettered. A dead task is kept, never deleted. |
+| `queue.nats_servers` | list[string] | `[]` | JetStream URLs, e.g. `nats://nats:4222`. |
+| `queue.nats_stream` / `nats_subject` / `nats_durable` | string | `PHEASANT_INDEX` / `pheasant.index.tasks` / `pheasant-indexers` | Stream, subject and durable consumer names. |
+
+Turn it on when a backlog needs to outlive the process holding it. Three
+things follow that a list cannot give: a sync killed nine sources into ten
+resumes on the tenth, `pheasant_index_queue_depth` becomes a number other
+processes (and an HPA or KEDA) can read, and a source that keeps failing is
+dead-lettered instead of retried forever.
+
+At-least-once delivery is safe here because indexing is already idempotent by
+design — content sha256 plus stable IDs — so a redelivered task re-indexes to
+identical state.
+
+```bash
+pheasant queue status         # backlog, in-flight, dead letters and why
+pheasant queue drain          # index everything currently queued
+pheasant queue requeue-dead   # replay dead letters after fixing the cause
+```
 
 `max_parallel_sources` overlaps independent connectors and preparation. Shared
 state commits and global graph enrichment remain serialized, so the setting is

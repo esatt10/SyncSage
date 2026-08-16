@@ -833,5 +833,33 @@ class StateStore:
 
         return self.backend.rows(sql, params)
 
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+        """Run a raw write and commit it (Phase 35.5).
+
+        The write counterpart to :meth:`rows`, and it commits because it is
+        used by the durable index queue, whose whole point is that a claim
+        or an ack is visible to another process the moment it returns. A
+        queue operation batched into someone else's open transaction would
+        be a queue that only works inside one process.
+        """
+
+        self.backend.execute(sql, params)
+        self.backend.commit()
+
+    def execute_returning(self, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
+        """Run a write that returns rows (``UPDATE ... RETURNING``) and commit.
+
+        Not a convenience over :meth:`rows`: routing a write through the read
+        path leaves the implicit transaction **open**, so on SQLite the WAL
+        write lock is held until the connection happens to commit something
+        else. Every other thread then blocks for the full ``busy_timeout``,
+        and — worse for a queue — the claim is not visible to another process
+        at all, which is the one property the durable queue exists to have.
+        """
+
+        result = self.backend.rows(sql, params)
+        self.backend.commit()
+        return result
+
     def close(self) -> None:
         self.backend.close()

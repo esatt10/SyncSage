@@ -544,12 +544,44 @@ class SyncConcurrencySettings(ModelMixin):
 
 
 @dataclass
+class SyncQueueSettings(ModelMixin):
+    """The durable index work queue (Phase 35.5).
+
+    Off by default, and that is a design decision rather than caution: with
+    it off, ``sync_all`` keeps its remaining sources in a Python list exactly
+    as it always has, so a single container indexing a folder needs no queue
+    to do it. Turning it on buys three things a list cannot give: a backlog
+    that survives a restart, a depth other processes can read (and a
+    scheduler can scale on), and a source that keeps failing being
+    dead-lettered instead of retried forever.
+
+    ``local`` is the state store itself — no broker to run, and it works on
+    both SQLite and Postgres. ``nats`` is for a fleet that has outgrown one
+    database; it does not buy correctness the local queue lacks.
+    """
+
+    enabled: bool = False
+    backend: str = "local"
+    #: Seconds a claimed task stays invisible to other workers. Heartbeats
+    #: extend it, so this bounds *silence* from a claimer, not work.
+    visibility_seconds: int = 300
+    #: Attempts before a task is dead-lettered. A dead task is kept, never
+    #: deleted, so it can be replayed once the cause is fixed.
+    max_attempts: int = 3
+    nats_servers: list[str] = field(default_factory=list)
+    nats_stream: str = "PHEASANT_INDEX"
+    nats_subject: str = "pheasant.index.tasks"
+    nats_durable: str = "pheasant-indexers"
+
+
+@dataclass
 class SyncSettings(ModelMixin):
     watcher: WatcherSettings = field(default_factory=WatcherSettings)
     git: GitSettings = field(default_factory=GitSettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
     limits: SyncLimitsSettings = field(default_factory=SyncLimitsSettings)
     concurrency: SyncConcurrencySettings = field(default_factory=SyncConcurrencySettings)
+    queue: SyncQueueSettings = field(default_factory=SyncQueueSettings)
 
 
 @dataclass
@@ -1001,6 +1033,8 @@ class PheasantConfig(ModelMixin):
                     raw["limits"] = build(SyncLimitsSettings, raw["limits"])
                 if "concurrency" in raw and isinstance(raw["concurrency"], dict):
                     raw["concurrency"] = build(SyncConcurrencySettings, raw["concurrency"])
+                if "queue" in raw and isinstance(raw["queue"], dict):
+                    raw["queue"] = build(SyncQueueSettings, raw["queue"])
             return dc(**{k: v for k, v in raw.items() if k in dc.__dataclass_fields__})
 
         cfg = cls(

@@ -159,7 +159,43 @@ sync:
     remote_worker_enabled: false
     remote_worker_token_env: PHEASANT_INDEX_WORKER_TOKEN
     remote_worker_timeout_seconds: 120
+    # Files per request to a worker. A batch amortizes request overhead and
+    # carries one deadline for the group, but every task in it holds its
+    # file's bytes in memory on both sides — a memory knob as much as a
+    # throughput one.
+    remote_worker_batch_size: 8
+    # http (stdlib, no extra) | grpc (needs the [grpc] extra; carries file
+    # bytes raw instead of base64, and streams results so one refused file
+    # does not fail the batch). Retry, failover, circuit breakers, deadlines
+    # and idempotency keys are transport-independent — this changes only the
+    # bytes on the wire.
+    worker_transport: http
     lock_timeout_seconds: 120
+
+  # The durable index work queue. OFF by default: with it off, a sync holds
+  # its remaining sources in a Python list, which is fine for one container
+  # indexing a few folders. Turn it on when the backlog needs to outlive the
+  # process holding it — a sync killed nine sources into ten then resumes on
+  # the tenth, the depth becomes a number an HPA/KEDA can scale on, and a
+  # source that keeps failing is dead-lettered instead of retried forever.
+  #
+  # At-least-once delivery is safe because indexing is already idempotent by
+  # design (content sha256 + stable IDs): a redelivered task re-indexes to
+  # identical state.
+  #
+  #   pheasant queue status / drain / requeue-dead
+  queue:
+    enabled: false
+    backend: local          # local (this KB's own database, no broker to run)
+                            #   | nats (JetStream; needs the [queue] extra)
+    visibility_seconds: 300 # how long a claimed task is invisible to other
+                            #   workers; heartbeats extend it, so this bounds
+                            #   SILENCE from a claimer, not work
+    max_attempts: 3         # then dead-lettered — kept, never deleted
+    nats_servers: []        # e.g. ["nats://nats:4222"]
+    nats_stream: PHEASANT_INDEX
+    nats_subject: pheasant.index.tasks
+    nats_durable: pheasant-indexers
 
 # Turning binary/markup files into indexable text. Every handler here is
 # opt-in by file extension: a source whose `include` globs admit only code and

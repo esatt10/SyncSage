@@ -560,6 +560,22 @@ def main(argv: list[str] | None = None) -> int:
     compose_env_p.add_argument("--output", "-o")
     repair_p = sub.add_parser("repair")
     repair_p.add_argument("--config", "-c", default="pheasant.example.yaml")
+    queue_p = sub.add_parser("queue", help="Inspect the durable index work queue.")
+    queue_sub = queue_p.add_subparsers(dest="queue_command")
+    queue_status_p = queue_sub.add_parser("status", help="Backlog, in-flight and dead letters.")
+    queue_status_p.add_argument("--config", "-c", default="pheasant.yaml")
+    queue_drain_p = queue_sub.add_parser("drain", help="Index everything currently queued.")
+    queue_drain_p.add_argument("--config", "-c", default="pheasant.yaml")
+    queue_drain_p.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=0.0,
+        help="Keep waiting this many seconds for new work before exiting (0 = drain and stop).",
+    )
+    queue_requeue_p = queue_sub.add_parser(
+        "requeue-dead", help="Replay dead-lettered tasks after fixing the cause."
+    )
+    queue_requeue_p.add_argument("--config", "-c", default="pheasant.yaml")
     shard_p = sub.add_parser("shard", help="Plan a multi-region split of this corpus.")
     shard_sub = shard_p.add_subparsers(dest="shard_command", required=True)
     shard_plan_p = shard_sub.add_parser("plan", help="Propose which sources go to which region.")
@@ -846,6 +862,55 @@ def main(argv: list[str] | None = None) -> int:
         for report in reports:
             _print_scan(report)
         return 0
+    if args.command == "queue":
+        from pheasant.sync.queue import DEAD, DONE, INFLIGHT, PENDING, LocalQueue, drain
+
+        engine = _engine(Path(args.config))
+        try:
+            queue = LocalQueue(engine.state)
+            if args.queue_command == "status":
+                depth = queue.depth()
+                print(
+                    f"queued: {depth[PENDING]}  in-flight: {depth[INFLIGHT]}  "
+                    f"done: {depth[DONE]}  dead: {depth[DEAD]}"
+                )
+                if depth[DEAD]:
+                    for row in engine.state.rows(
+                        "SELECT source_id, attempts, last_error FROM index_tasks "
+                        "WHERE status=? ORDER BY updated_at",
+                        (DEAD,),
+                    ):
+                        print(
+                            f"  ! {row['source_id']} failed {row['attempts']}x: {row['last_error']}"
+                        )
+                    print("\nFix the cause, then: pheasant queue requeue-dead")
+                return 0
+            if args.queue_command == "requeue-dead":
+                print(f"requeued {queue.requeue_dead()} dead-lettered task(s)")
+                return 0
+            if args.queue_command == "drain":
+                results = drain(
+                    queue,
+                    lambda task: engine.sync_source(
+                        task.source_id,
+                        task.mode,
+                        max_depth=task.max_depth,
+                        full_scan=task.full_scan,
+                    ),
+                    idle_timeout=float(args.idle_timeout or 0.0),
+                )
+                for result in results:
+                    print(
+                        f"{result.source_id}: {result.status} "
+                        f"({result.indexed_artifacts} indexed, "
+                        f"{result.skipped_artifacts} skipped)"
+                    )
+                print(f"drained {len(results)} task(s)")
+                return 0
+        finally:
+            engine.close()
+        queue_p.print_help()
+        return 2
     if args.command == "shard":
         from pheasant.config.loader import load_config
         from pheasant.sharding import SourceSize, plan_shards, render_plan

@@ -993,7 +993,7 @@ working, which is what holds the 5 MB end of the range.
 | 35.2 | `StateBackend` seam + Postgres backend (incl. FTS5 → `tsvector` port) | done (2026-08-16) |
 | 35.3 | Graph capacity measured; sharding chosen over a Postgres graph backend | done (2026-08-16) |
 | 35.4 | Multi-writer indexing: per-source leases + sharding | done (2026-08-16); durable queue deferred |
-| 35.5 | Broker (NATS JetStream) and gRPC as first-class transports | queued |
+| 35.5 | Durable worker dispatch, gRPC transport, and the durable index queue (NATS JetStream) | done (2026-08-16) |
 | 35.6 | Process roles, autoscaling, and the three runtimes | queued |
 | 35.7 | Measured capacity model and sizing guidance | queued |
 
@@ -1326,3 +1326,117 @@ already let N indexers work in parallel — a queue adds *dispatch* (who picks u
 what, retries, poison-message handling), which matters when indexers are
 autoscaled and disposable. That is 35.6's problem, and building the queue
 before the roles that consume it would be building it against a guess.
+
+### Step 35.5 — Durable dispatch, gRPC, and the index work queue (2026-08-16)
+
+**The gap, stated plainly.** `file_executor: remote` picked a worker with
+`position % len(urls)` and sent one `urlopen` per file. Every failure mode a
+distributed system actually has was unhandled: one dead worker failed *its
+share of every sync*, a rolling deploy did the same, a slow worker had no
+deadline, and a 50,000-file source paid 50,000 TCP — over TLS, 50,000
+handshake — round trips.
+
+**Durability is the bulk of the value, and it is not configurable.** Policy
+lives in `sync/worker_pool.py`, bytes in `sync/worker_transport.py`, and the
+split is what lets a second transport inherit every property rather than
+reimplement it: keep-alive pooling, batching, bounded retry with **full**
+jitter honouring `Retry-After`, a per-endpoint circuit breaker, failover across
+endpoints and then to **local preparation**, health feeding
+`pheasant_worker_up{endpoint}`, deadline propagation, and content-addressed
+idempotency keys (the sha256 was already computed before dispatch).
+
+Two policy decisions worth naming:
+
+* **A refusal is not a failover.** HTTP 422 / gRPC `INVALID_ARGUMENT` means the
+  worker understood the task and declined it; every worker runs the same
+  refusal logic, so trying four of them spends four round trips to learn one
+  thing. The coordinator prepares locally, which accepts everything the remote
+  path deliberately does not. A refusal also does not count against the
+  breaker, or one bad file would take a healthy worker offline.
+* **When every endpoint is open, the honest answer is none.** The first draft
+  probed the least-recently-tripped endpoint anyway, "because a breaker is a
+  heuristic" — which spends `MAX_ATTEMPTS` round trips *per batch* rediscovering
+  that the fleet is down, the exact expense the breaker exists to stop. It now
+  returns nothing and the caller prepares locally until the cooldown lets one
+  probe through.
+
+Remote preparation is a *throughput* optimization, so it can no longer fail a
+sync. That is asserted rather than claimed: a sync with every worker dead
+produces byte-identical artifacts to one with every worker healthy.
+
+**Worker side.** `POST /internal/indexing/prepare-batch` honours the caller's
+remaining deadline (stopping *between* tasks rather than finishing work nobody
+is waiting for) and answers a duplicate idempotency key from a bounded LRU
+cache instead of re-parsing. A worker that predates the route answers 404 once;
+the coordinator remembers and uses the single-task path, so a coordinator
+upgraded ahead of its fleet keeps working.
+
+**gRPC (`[grpc]` extra, `sync.concurrency.worker_transport: http|grpc`).** What
+it buys, measured rather than assumed: file content crosses as protobuf `bytes`
+instead of base64 — a flat 33% saving on the only large field — and
+`PrepareBatch` is bidirectional, so one refused file no longer fails the whole
+batch the way a single JSON body must. **No generated code is checked in:**
+modern `protoc` output calls `ValidateProtobufRuntimeVersion` with the exact
+runtime it was built against, so a vendored stub pins every installer to one
+protobuf release, and its generated `import pheasant_worker_pb2` is not
+package-relative and would not resolve inside the package anyway. The `.proto`
+is compiled at import time via `grpc.protos_and_services`, which is why
+`grpcio-tools` is a runtime dep of the extra. Structured fields stay JSON
+*inside* the proto so a config change is not a proto change; only the payload
+is binary. A missing extra raises rather than silently falling back to HTTP —
+an operator who asked for gRPC and got JSON would keep paying the inflation
+they chose gRPC to avoid.
+
+**The durable work queue (`sync.queue`), deferred from 35.4 and now built.**
+The deferral said a queue "adds dispatch, which matters when indexers are
+autoscaled and disposable" — but the in-memory list has a failure that does not
+wait for 35.6: a process killed nine sources into ten has *lost* the tenth,
+nothing outside that process can see the backlog, and there is no number for a
+scheduler to scale on. So the queue lands here with `local` (the state store
+itself — no broker, works on SQLite and Postgres) and `nats` (JetStream,
+`[queue]` extra) backends, and 35.6's `--role indexer` becomes the same drain
+loop with an idle timeout. **Off by default**: with `sync.queue.enabled: false`
+`sync_all` is unchanged, and a test asserts not one row is written.
+
+**Three real bugs, each found by a test rather than by review:**
+
+1. **The claim was a write running through the read path.** `LocalQueue.claim`
+   used `StateStore.rows()` for its `UPDATE … RETURNING`, which never commits —
+   so on SQLite the WAL write lock was held against every other claimant (the
+   suite went from 0.6 s to *hanging*) and, far worse for a queue, the claim was
+   invisible to another process, which is the one property the whole thing
+   exists to have. New `StateStore.execute_returning` commits.
+2. **A genuine double-claim race on Postgres**, found by a test written
+   *because* mutation testing showed the SQLite suite could not distinguish the
+   guard. My reasoning had been wrong: under READ COMMITTED only the **outer**
+   WHERE is re-evaluated after the winner commits, and this queue deliberately
+   allows claiming an `inflight` row (that is how a dead worker's task is
+   redelivered) — so `status IN (pending, inflight)` is *still true* against the
+   winner's own write and both transactions claimed the row. Repeating
+   `visible_at<=?` in the outer clause is what falsifies it. SQLite serializes
+   writers, so no arrangement of guards fails there.
+3. **`depth()` on NATS read the stream, not the consumer.** A stream's message
+   count does not drop on ack under the default retention, so the autoscaling
+   gauge would only ever grow — an HPA that scales up and never down. It reads
+   the durable consumer's `num_pending`/`num_ack_pending` now, and the consumer
+   is created on connect so a backlog with no worker yet does not read zero.
+
+**Surfaces:** `pheasant queue status|drain|requeue-dead`,
+`pheasant worker --transport grpc`, `pheasant_index_queue_depth` /
+`_inflight` / `_dead_letters` from the queue when it is on, and a
+`sync.queue` block in `pheasant.example.yaml`, `docs/configuration.md` and the
+setup wizard.
+
+**Acceptance:** `tests/test_worker_durability.py` (40),
+`tests/test_grpc_worker.py` (21, every one against a real gRPC server on a
+loopback port), `tests/test_index_queue.py` (29, including six against a real
+NATS JetStream broker and one Postgres concurrency test). Mutation-tested
+**28 mutants, 27 caught**; the one survivor is the outer `status` guard, which
+covers an ack landing between the subquery and the update — real, free, and
+not deterministically forceable without two hand-driven transactions, so it is
+recorded in the module docstring as uncovered rather than left looking
+load-bearing.
+
+**Not done, and deliberately:** the queue has no consumer role of its own yet
+(`sync_all` publishes and drains in one process), and nothing autoscales on the
+depth gauge. Both are 35.6.

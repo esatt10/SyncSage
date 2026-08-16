@@ -231,6 +231,33 @@ CREATE TABLE IF NOT EXISTS sync_fingerprints (
   fingerprint TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+-- Phase 35.5: the durable index work queue. Without it, `sync_all` holds its
+-- remaining sources in a Python list: a process killed nine sources into ten
+-- has lost the tenth, and nothing outside that process can see the backlog
+-- or act on it. A row survives the process, so a restart resumes and a
+-- scheduler has a queue depth to scale on.
+--
+-- `visible_at` is the visibility timeout: a claimed task is invisible until
+-- it expires, so a worker that dies mid-task releases it by simply not
+-- heartbeating. At-least-once redelivery is safe here because indexing is
+-- already idempotent by design (content sha256 + stable IDs) — the existing
+-- pillar is what makes the queue cheap.
+CREATE TABLE IF NOT EXISTS index_tasks (
+  id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  payload TEXT,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  owner TEXT,
+  visible_at TEXT NOT NULL,
+  enqueued_at TEXT NOT NULL,
+  updated_at TEXT,
+  last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_index_tasks_claim
+  ON index_tasks(status, visible_at, enqueued_at);
 """
 
 #: SQLite-only: WAL, plus the FTS5 virtual tables.

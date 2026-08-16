@@ -490,6 +490,34 @@ def build_sections() -> list[Section]:
                     kind="int",
                     advanced=True,
                 ),
+                Question(
+                    key="sync.queue.enabled",
+                    prompt="Keep the index backlog in a durable queue?",
+                    kind="bool",
+                    help="Off, a sync holds its remaining sources in memory: a "
+                    "process killed nine sources into ten loses the tenth. On, "
+                    "the backlog is rows, so a restart resumes, the depth is a "
+                    "number a scaler can read, and a source that keeps failing "
+                    "is set aside instead of retried forever.",
+                    advanced=True,
+                ),
+                Question(
+                    key="sync.queue.backend",
+                    prompt="Queue backend (local | nats)",
+                    kind="str",
+                    help="'local' is this knowledge base's own database — no "
+                    "broker to run. 'nats' needs the [queue] extra and is for a "
+                    "fleet that has outgrown one database.",
+                    when=lambda a: bool(a.get("sync.queue.enabled")),
+                    advanced=True,
+                ),
+                Question(
+                    key="sync.queue.max_attempts",
+                    prompt="Attempts before a source is set aside",
+                    kind="int",
+                    when=lambda a: bool(a.get("sync.queue.enabled")),
+                    advanced=True,
+                ),
             ],
         ),
         Section(

@@ -1030,6 +1030,24 @@ def create_app(
             "pheasant_graph_edges": graph.number_of_edges(),
         }
         sample.update(jobs.metrics_sample())
+        # With the durable queue on, the backlog outlives this process, so
+        # the in-memory job registry is no longer the whole truth — an HPA
+        # reading only it would see zero while a restarted fleet's rows sit
+        # waiting. The queue's own depth wins where it exists (Phase 35.5).
+        try:
+            from pheasant.sync.queue import DEAD, INFLIGHT, PENDING, queue_from_config
+
+            queue = queue_from_config(config, state)
+            if queue is not None:
+                try:
+                    depth = queue.depth()
+                finally:
+                    queue.close()
+                sample["pheasant_index_queue_depth"] = depth.get(PENDING, 0)
+                sample["pheasant_index_inflight"] = depth.get(INFLIGHT, 0)
+                sample["pheasant_index_dead_letters"] = depth.get(DEAD, 0)
+        except Exception:  # pragma: no cover - a scrape must never 500
+            logger.debug("could not sample index queue depth", exc_info=True)
         return PlainTextResponse(
             metrics.render_with(sample),
             media_type="text/plain; version=0.0.4; charset=utf-8",

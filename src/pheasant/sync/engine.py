@@ -62,6 +62,7 @@ from pheasant.sync.fingerprint import (
 )
 from pheasant.sync.locks import EngineLease, SourceLease, source_lock
 from pheasant.sync.pacing import serve_yield
+from pheasant.sync.queue import queue_from_config
 
 logger = logging.getLogger(__name__)
 
@@ -640,6 +641,23 @@ class SyncEngine:
             len(sources),
             max(1, int(self.config.sync.concurrency.max_parallel_sources or 1)),
         )
+        queue = queue_from_config(self.config, self.state)
+        if queue is not None:
+            try:
+                return self._sync_all_queued(
+                    queue,
+                    sources,
+                    mode,
+                    workers=workers,
+                    max_depth=max_depth,
+                    full_scan=full_scan,
+                    on_progress=on_progress,
+                )
+            finally:
+                # This call built the queue, so this call closes it. A no-op
+                # for the local queue; for a broker it is the difference
+                # between one connection per sync and a leak per sync.
+                queue.close()
         if workers == 1:
             return [
                 self.sync_source(
@@ -689,6 +707,102 @@ class SyncEngine:
             # Preserve configured source order in the public result even when
             # a later source finishes first.
             return [future.result() for future in futures]
+
+    def _sync_all_queued(
+        self,
+        queue: Any,
+        sources: list[SourceConfig],
+        mode: SyncMode,
+        *,
+        workers: int,
+        max_depth: int | None,
+        full_scan: bool,
+        on_progress: ProgressHook | None,
+    ) -> list[SyncResult]:
+        """Publish one task per source, then drain.
+
+        The difference from the in-memory path is what survives a kill: a
+        process stopped nine sources into ten leaves the tenth *queued*, so
+        the next run finishes it instead of starting over. Publishing is
+        idempotent — the task id is derived from the knowledge base, source
+        and mode, so re-running does not duplicate a backlog.
+
+        Ordering is by enqueue time, so with one worker the results come back
+        in configured source order exactly as before. With several the
+        interleaving is the same non-determinism the thread pool already had:
+        commit order *within* a source is what stable IDs and deterministic
+        graph bytes depend on, and that is untouched (rule 3, rule 4).
+        """
+
+        import hashlib
+
+        from pheasant.sync.queue import IndexTask, drain, owner_id
+
+        settings = self.config.sync.queue
+        progress_lock = threading.Lock()
+
+        def progress_for(source_name: str) -> ProgressHook:
+            def source_progress(
+                phase: str,
+                current: int,
+                total: int | None,
+                detail: str,
+                meta: dict[str, Any] | None = None,
+            ) -> None:
+                if on_progress is None:
+                    return
+                with progress_lock:
+                    on_progress(phase, current, total, detail, meta)
+
+            return source_progress
+
+        published = 0
+        for source in sources:
+            digest = hashlib.sha256(
+                f"{self.config.knowledge_base_id}\0{source.name}\0{mode}".encode()
+            ).hexdigest()[:24]
+            task = IndexTask(
+                id=f"idx-{digest}",
+                source_id=source.name,
+                mode=str(mode),
+                payload={"max_depth": max_depth, "full_scan": bool(full_scan)},
+                max_attempts=max(1, int(settings.max_attempts or 1)),
+            )
+            try:
+                queue.publish(task)
+                published += 1
+            except Exception as exc:  # noqa: BLE001 - an existing task is not an error
+                logger.debug("Index task for %s already queued (%s)", source.name, exc)
+        logger.info("Queued %d of %d source(s) for indexing", published, len(sources))
+
+        def run(task: Any) -> SyncResult:
+            return self.sync_source(
+                task.source_id,
+                task.mode,  # type: ignore[arg-type]
+                max_depth=task.max_depth,
+                full_scan=task.full_scan,
+                on_progress=progress_for(task.source_id),
+            )
+
+        visibility = float(settings.visibility_seconds or 300)
+        if workers <= 1:
+            results = drain(queue, run, visibility_seconds=visibility)
+        else:
+            # Each drain loop is its own claimant, so two never hold the same
+            # task — the visibility timeout is doing the mutual exclusion that
+            # the thread pool got for free from having one list.
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="pheasant-source"
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        drain, queue, run, owner=owner_id(), visibility_seconds=visibility
+                    )
+                    for _ in range(workers)
+                ]
+                results = [item for future in futures for item in future.result()]
+        order = {source.name: position for position, source in enumerate(sources)}
+        return sorted(results, key=lambda result: order.get(result.source_id, len(order)))
 
     def _prepare_item(
         self,
