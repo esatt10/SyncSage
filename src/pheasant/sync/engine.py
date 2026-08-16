@@ -775,58 +775,60 @@ class SyncEngine:
             fetched=True,
         )
 
-    def _prepare_item_remote(
+    def _remote_precheck(
         self,
         connector: Any,
         source: SourceConfig,
         mode: SyncMode,
         artifacts: dict[str, Any],
-        git_metadata: tuple[str | None, str | None, bool] | None,
         position: int,
         item: ConnectorItem,
-        endpoint: str,
-        token: str,
-    ) -> _PreparedItem:
-        """Read locally, prepare on an authenticated stateless worker."""
+    ) -> tuple[_PreparedItem | None, Any]:
+        """Everything that must happen locally before a task can be dispatched.
+
+        Returns ``(finished_item, payload)``: exactly one is not ``None``. The
+        skips are decided coordinator-side on purpose — an unchanged file
+        never becomes a request at all, which is what keeps a re-sync of a
+        large source close to zero remote work.
+        """
 
         previous = artifacts.get(item.relative_path)
         if self._can_skip_before_read(mode, previous, item):
             return _PreparedItem(
-                position,
-                item,
-                previous,
-                skipped=True,
-                transfer_skipped=True,
-            )
+                position, item, previous, skipped=True, transfer_skipped=True
+            ), None
         try:
             payload = connector.read_item(item)
         except ItemNotModified:
             return _PreparedItem(
-                position,
-                item,
-                previous,
-                skipped=True,
-                transfer_skipped=True,
-            )
+                position, item, previous, skipped=True, transfer_skipped=True
+            ), None
         content_hash = payload.sha256 or item.sha256 or sha256_bytes(payload.content)
         if mode == "incremental" and previous and previous.get("sha256") == content_hash:
-            return _PreparedItem(
-                position,
-                item,
-                previous,
-                fetched=True,
-                skipped=True,
-            )
+            return _PreparedItem(position, item, previous, fetched=True, skipped=True), None
         if payload.sha256 != content_hash:
             payload = replace(payload, sha256=content_hash)
-        from pheasant.sync.remote_worker import prepare_remote, task_payload
+        return None, payload
 
-        parsed = prepare_remote(
-            endpoint,
-            token,
-            task_payload(source, item, payload, git_metadata),
-            timeout=float(self.config.sync.concurrency.remote_worker_timeout_seconds or 120),
-        )
+    def _finish_remote(
+        self,
+        source: SourceConfig,
+        mode: SyncMode,
+        artifacts: dict[str, Any],
+        position: int,
+        item: ConnectorItem,
+        payload: Any,
+        parsed: Any,
+    ) -> _PreparedItem:
+        """Validate a worker's answer and turn it into a prepared item.
+
+        The two identity checks are not defensive padding: a worker is another
+        process reached over the network, and an answer for the wrong file
+        would be committed under this item's stable ID. Content-addressing the
+        request is what makes them checkable at all.
+        """
+
+        previous = artifacts.get(item.relative_path)
         if parsed is None:
             return _PreparedItem(position, item, previous, fetched=True)
         if parsed.source_id != source.name or parsed.relative_path != item.relative_path:
@@ -841,14 +843,77 @@ class SyncEngine:
             )
         if mode == "incremental" and previous and previous.get("sha256") == parsed.sha256:
             return _PreparedItem(
-                position,
-                item,
-                previous,
-                parsed=parsed,
-                fetched=True,
-                skipped=True,
+                position, item, previous, parsed=parsed, fetched=True, skipped=True
             )
         return _PreparedItem(position, item, previous, parsed=parsed, fetched=True)
+
+    def _prepare_batch_remote(
+        self,
+        pool: Any,
+        connector: Any,
+        source: SourceConfig,
+        mode: SyncMode,
+        artifacts: dict[str, Any],
+        git_metadata: tuple[str | None, str | None, bool] | None,
+        batch: list[tuple[int, ConnectorItem]],
+    ) -> list[_PreparedItem]:
+        """Prepare one batch remotely, falling back to local preparation.
+
+        Remote preparation is a throughput optimization, so it must never be
+        able to fail a sync. When the fleet cannot answer — every endpoint
+        down, a rolling deploy, a deadline — the bytes are already in hand and
+        parsing them here costs one CPU-bound parse, which is exactly what the
+        non-remote executors do all the time. The same policy Phase 34.5
+        applied to the WASM accelerators.
+        """
+
+        from pheasant.sync.remote_worker import task_payload
+        from pheasant.sync.worker_pool import AllWorkersFailed, TaskRejected
+
+        finished: dict[int, _PreparedItem] = {}
+        pending: list[tuple[int, ConnectorItem, Any]] = []
+        for position, item in batch:
+            done, payload = self._remote_precheck(
+                connector, source, mode, artifacts, position, item
+            )
+            if done is not None:
+                finished[position] = done
+            else:
+                pending.append((position, item, payload))
+
+        if pending:
+            tasks = [
+                task_payload(source, item, payload, git_metadata)
+                for _position, item, payload in pending
+            ]
+            timeout = float(self.config.sync.concurrency.remote_worker_timeout_seconds or 120)
+            try:
+                parsed_results = pool.prepare_batch(tasks, deadline=time.monotonic() + timeout)
+            except (AllWorkersFailed, TaskRejected) as exc:
+                logger.warning(
+                    "Preparing %d file(s) of source %s locally: %s",
+                    len(pending),
+                    source.name,
+                    exc,
+                )
+                parsed_results = [
+                    parse_connector_payload(
+                        source,
+                        item,
+                        payload,
+                        git_metadata,
+                        captioner=self.captioner,
+                        transcriber=self.transcriber,
+                        extractor=self.extractor,
+                    )
+                    for _position, item, payload in pending
+                ]
+            for (position, item, payload), parsed in zip(pending, parsed_results, strict=True):
+                finished[position] = self._finish_remote(
+                    source, mode, artifacts, position, item, payload, parsed
+                )
+
+        return [finished[position] for position, _item in batch]
 
     def _prepared_items(
         self,
@@ -919,6 +984,20 @@ class SyncEngine:
                 "taxonomy/repair); using thread workers",
                 source.name,
             )
+        if remote_safe:
+            yield from self._prepared_items_remote(
+                connector,
+                source,
+                mode,
+                artifacts,
+                git_metadata,
+                items,
+                remote_urls,
+                remote_token,
+                workers,
+            )
+            return
+
         executor_type = ProcessPoolExecutor if process_safe else ThreadPoolExecutor
         if process_safe:
             workers = min(workers, _process_cpu_capacity())
@@ -941,20 +1020,6 @@ class SyncEngine:
                         item,
                         artifacts.get(item.relative_path),
                     )
-                if remote_safe:
-                    endpoint = remote_urls[(position - 1) % len(remote_urls)]
-                    return executor.submit(
-                        self._prepare_item_remote,
-                        connector,
-                        source,
-                        mode,
-                        artifacts,
-                        git_metadata,
-                        position,
-                        item,
-                        endpoint,
-                        remote_token,
-                    )
                 return executor.submit(
                     self._prepare_item,
                     connector,
@@ -976,6 +1041,90 @@ class SyncEngine:
                 except StopIteration:
                     continue
                 pending.append(submit(position, item))
+
+    def _prepared_items_remote(
+        self,
+        connector: Any,
+        source: SourceConfig,
+        mode: SyncMode,
+        artifacts: dict[str, Any],
+        git_metadata: tuple[str | None, str | None, bool] | None,
+        items: list[ConnectorItem],
+        remote_urls: list[str],
+        remote_token: str,
+        workers: int,
+    ):
+        """Yield prepared items in discovery order, prepared by a worker fleet.
+
+        A separate generator from the thread/process path rather than another
+        branch inside it, because the unit of work is different: a *batch*, so
+        that a request carries several files, one deadline and one connection.
+        Discovery order is preserved exactly as before — batches are contiguous
+        runs of positions and the look-ahead window is FIFO — so committing
+        stays deterministic and stable IDs are unaffected (rule 3).
+        """
+
+        from pheasant.sync.worker_pool import WorkerPool
+
+        concurrency = self.config.sync.concurrency
+        batch_size = max(1, int(concurrency.remote_worker_batch_size or 1))
+        batches = [
+            list(enumerate(items, start=1))[start : start + batch_size]
+            for start in range(0, len(items), batch_size)
+        ]
+        pool = WorkerPool(
+            remote_urls,
+            remote_token,
+            timeout=float(concurrency.remote_worker_timeout_seconds or 120),
+        )
+        try:
+            pool.publish_health()
+            with ThreadPoolExecutor(
+                max_workers=max(1, min(workers, len(batches))),
+                thread_name_prefix=f"pheasant-remote-{source.name}",
+            ) as executor:
+                pending: deque[Future[list[_PreparedItem]]] = deque()
+                iterator = iter(batches)
+
+                def submit(batch: list[tuple[int, ConnectorItem]]) -> Future[list[_PreparedItem]]:
+                    return executor.submit(
+                        self._prepare_batch_remote,
+                        pool,
+                        connector,
+                        source,
+                        mode,
+                        artifacts,
+                        git_metadata,
+                        batch,
+                    )
+
+                for _ in range(min(len(batches), max(1, workers) * 2)):
+                    try:
+                        pending.append(submit(next(iterator)))
+                    except StopIteration:
+                        break
+                while pending:
+                    yield from pending.popleft().result()
+                    try:
+                        batch = next(iterator)
+                    except StopIteration:
+                        continue
+                    pending.append(submit(batch))
+        finally:
+            # Health is published again on the way out so the gauge reflects
+            # what this sync actually observed, not what it assumed at the
+            # start — a breaker that tripped mid-run is the interesting case.
+            pool.publish_health()
+            for entry in pool.stats():
+                if entry["failures"]:
+                    logger.info(
+                        "Remote worker %s: %d ok, %d failed%s",
+                        entry["endpoint"],
+                        entry["successes"],
+                        entry["failures"],
+                        " (circuit open)" if entry["circuit_open"] else "",
+                    )
+            pool.close()
 
     def _ensure_modal_handlers(self, source: Any) -> None:
         """Build the caption/transcribe/extract handlers this source needs.

@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
+from collections import OrderedDict
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -130,6 +132,94 @@ def prepare_task(task: dict[str, Any]) -> dict[str, Any] | None:
     git_metadata = tuple(git_raw) if git_raw is not None else None
     parsed = parse_connector_payload(source, item, payload, git_metadata)  # type: ignore[arg-type]
     return parsed_to_wire(parsed)
+
+
+class ResultCache:
+    """Bounded content-addressed cache of prepared results (Phase 35.5).
+
+    Preparation is a pure function of the task, so a retry after a timeout —
+    the case at-least-once delivery exists to make safe — asks for something
+    the worker may already have computed. Answering it from here turns the
+    duplicate into a lookup instead of a second parse.
+
+    Bounded and LRU on purpose: a worker serving a 50k-file source must not
+    accumulate 50k parse results, and the value of an entry decays fast (a
+    retry follows its original within one deadline, not one sync).
+    """
+
+    def __init__(self, maxsize: int = 256) -> None:
+        self._maxsize = max(1, int(maxsize))
+        self._entries: OrderedDict[str, dict[str, Any] | None] = OrderedDict()
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: str) -> tuple[bool, dict[str, Any] | None]:
+        with self._lock:
+            if key in self._entries:
+                self._entries.move_to_end(key)
+                self.hits += 1
+                return True, self._entries[key]
+            self.misses += 1
+            return False, None
+
+    def put(self, key: str, value: dict[str, Any] | None) -> None:
+        with self._lock:
+            self._entries[key] = value
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._maxsize:
+                self._entries.popitem(last=False)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+
+class DeadlineExceeded(RemoteWorkerError):
+    """The caller's budget ran out before this task was started.
+
+    Raised rather than answered: a worker that returns an answer after its
+    caller gave up has spent CPU that the next, still-live task needed. The
+    coordinator has already moved on or retried elsewhere.
+    """
+
+
+def prepare_batch_tasks(
+    tasks: list[dict[str, Any]],
+    keys: list[str] | None = None,
+    *,
+    cache: ResultCache | None = None,
+    deadline: Any = None,
+) -> list[dict[str, Any]]:
+    """Prepare several tasks, returning one ``{"parsed": ...}`` entry each.
+
+    ``deadline`` is a zero-argument callable returning the seconds remaining
+    (or ``None`` for no budget). It is checked *between* tasks: a batch whose
+    caller has given up stops rather than finishing work nobody is waiting
+    for, and the tasks already done are still returned, so the coordinator's
+    retry is cheaper than the first attempt was.
+    """
+
+    supplied = list(keys or [])
+    results: list[dict[str, Any]] = []
+    for position, task in enumerate(tasks):
+        if deadline is not None and position:
+            remaining = deadline()
+            if remaining is not None and remaining <= 0:
+                raise DeadlineExceeded(
+                    f"caller deadline passed after {position} of {len(tasks)} tasks"
+                )
+        key = supplied[position] if position < len(supplied) else ""
+        if cache is not None and key:
+            found, cached = cache.get(key)
+            if found:
+                results.append({"parsed": cached})
+                continue
+        parsed = prepare_task(task)
+        if cache is not None and key:
+            cache.put(key, parsed)
+        results.append({"parsed": parsed})
+    return results
 
 
 def prepare_remote(

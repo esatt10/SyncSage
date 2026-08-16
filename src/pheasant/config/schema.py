@@ -530,6 +530,16 @@ class SyncConcurrencySettings(ModelMixin):
     remote_worker_enabled: bool = False
     remote_worker_token_env: str = "PHEASANT_INDEX_WORKER_TOKEN"
     remote_worker_timeout_seconds: int = 120
+    #: Files per request to a remote worker. A batch amortizes the request
+    #: overhead and carries one deadline for the group, but every task in it
+    #: holds its file's bytes in memory on both sides — so this is a memory
+    #: knob as much as a throughput one. Eight is small enough that the
+    #: default 25 MB file limit cannot surprise a worker.
+    remote_worker_batch_size: int = 8
+    #: ``http`` (stdlib, no extra) or ``grpc`` (needs the ``[grpc]`` extra).
+    #: Retry, failover, breakers and deadlines are transport-independent, so
+    #: this changes bytes on the wire and nothing about durability.
+    worker_transport: str = "http"
     lock_timeout_seconds: int = 120
 
 

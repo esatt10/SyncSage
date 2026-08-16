@@ -42,6 +42,7 @@ from pheasant.security.path_policy import (
 )
 from pheasant.sync.engine import SyncEngine
 from pheasant.sync.fingerprint import EMBEDDING_SCOPE, embedding_fingerprint
+from pheasant.sync.remote_worker import ResultCache
 from pheasant.telemetry import metrics
 from pheasant.version import __version__
 
@@ -323,6 +324,30 @@ class RemotePrepareRequest(BaseModel):
     item: dict
     payload: dict
     git_metadata: list[str | bool | None] | None = None
+
+
+#: Tasks a worker will accept in one batch. Every task holds its file's bytes
+#: in memory, so this is a memory bound, not a politeness limit: at the
+#: 25 MB-per-file default a 64-task batch is already a 1.6 GB worst case, and
+#: the coordinator's own default batch is far smaller.
+MAX_PREPARE_BATCH = 64
+
+#: Entries in the per-worker idempotency cache.
+PREPARE_CACHE_SIZE = 256
+
+
+class RemotePrepareBatchRequest(BaseModel):
+    """Several preparation tasks in one request (Phase 35.5).
+
+    ``idempotency_keys`` is content-addressed by the coordinator, so a retry
+    after a timeout carries the same keys and is answered from cache instead
+    of re-parsed. ``deadline_seconds`` is the caller's remaining budget: the
+    worker stops rather than finishing a batch nobody is waiting for.
+    """
+
+    tasks: list[RemotePrepareRequest]
+    idempotency_keys: list[str] | None = None
+    deadline_seconds: float | None = None
 
 
 #: One line per retrieval knob, so a UI (or an agent reading
@@ -817,6 +842,11 @@ def create_app(
     app.state.sync_lock = threading.Lock()
     app.state.jobs = JobRegistry()
     jobs = app.state.jobs
+    # Content-addressed results for `/internal/indexing/prepare-batch`, so a
+    # coordinator's retry after a timeout is a lookup rather than a second
+    # parse. Bounded and LRU: a worker serving a 50k-file source must not
+    # accumulate 50k parse results.
+    app.state.prepare_cache = ResultCache(PREPARE_CACHE_SIZE)
     metrics.register_default_metrics(__version__)
 
     # The web UI is a separate workload that talks to this API over HTTP, so the
@@ -870,19 +900,15 @@ def create_app(
     def ready() -> dict:
         return {"status": "ready", "knowledge_base": config.knowledge_base_id}
 
-    @app.post("/internal/indexing/prepare")
-    def remote_prepare(
-        req: RemotePrepareRequest,
-        authorization: Annotated[str | None, Header()] = None,
-    ) -> dict:
-        """Stateless authenticated parse/chunk worker for remote coordinators."""
+    def _authorize_worker(authorization: str | None) -> None:
+        """Gate + constant-time token check shared by both worker routes."""
 
         concurrency = config.sync.concurrency
         if not concurrency.remote_worker_enabled:
             raise HTTPException(status_code=404, detail="remote indexing worker is disabled")
         import hmac
 
-        from pheasant.sync.remote_worker import RemoteWorkerError, configured_token, prepare_task
+        from pheasant.sync.remote_worker import RemoteWorkerError, configured_token
 
         try:
             expected = configured_token(concurrency.remote_worker_token_env)
@@ -891,15 +917,97 @@ def create_app(
         scheme, _, supplied = (authorization or "").partition(" ")
         if scheme.lower() != "bearer" or not hmac.compare_digest(supplied, expected):
             raise HTTPException(status_code=401, detail="invalid indexing worker token")
+
+    def _check_task_size(payload: dict) -> None:
         max_mb = config.sync.limits.max_file_size_mb
-        encoded = str(req.payload.get("content_base64") or "")
+        encoded = str(payload.get("content_base64") or "")
         if max_mb is not None and len(encoded) > int(max_mb) * 1024 * 1024 * 4 // 3 + 4:
             raise HTTPException(status_code=413, detail="indexing task exceeds max_file_size_mb")
+
+    @app.post("/internal/indexing/prepare")
+    def remote_prepare(
+        req: RemotePrepareRequest,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict:
+        """Stateless authenticated parse/chunk worker for remote coordinators."""
+
+        from pheasant.sync.remote_worker import RemoteWorkerError, prepare_task
+
+        _authorize_worker(authorization)
+        _check_task_size(req.payload)
         try:
             parsed = prepare_task(req.model_dump())
         except (KeyError, TypeError, ValueError, RemoteWorkerError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"parsed": parsed}
+
+    @app.post("/internal/indexing/prepare-batch")
+    def remote_prepare_batch(
+        req: RemotePrepareBatchRequest,
+        authorization: Annotated[str | None, Header()] = None,
+        x_pheasant_deadline_seconds: Annotated[str | None, Header()] = None,
+    ) -> dict:
+        """Prepare several tasks in one request (Phase 35.5).
+
+        The value is not the round trips saved — though on a large source that
+        is most of the transport cost. It is that a batch carries the caller's
+        remaining deadline and a content address per task, so a worker can
+        decline work whose caller has given up and answer a duplicate from
+        cache. Those two together are what make at-least-once retry cheap
+        enough to actually do.
+        """
+
+        import time
+
+        from pheasant.sync.remote_worker import (
+            DeadlineExceeded,
+            RemoteWorkerError,
+            prepare_batch_tasks,
+        )
+
+        _authorize_worker(authorization)
+        if not req.tasks:
+            return {"results": []}
+        if len(req.tasks) > MAX_PREPARE_BATCH:
+            raise HTTPException(
+                status_code=413,
+                detail=f"batch of {len(req.tasks)} exceeds the {MAX_PREPARE_BATCH}-task limit",
+            )
+        for task in req.tasks:
+            _check_task_size(task.payload)
+
+        budget = req.deadline_seconds
+        if budget is None:
+            try:
+                budget = float(x_pheasant_deadline_seconds or "")
+            except ValueError:
+                budget = None
+        if budget is not None and budget <= 0:
+            raise HTTPException(status_code=408, detail="caller deadline already passed")
+        started = time.monotonic()
+
+        def remaining() -> float | None:
+            return None if budget is None else budget - (time.monotonic() - started)
+
+        try:
+            results = prepare_batch_tasks(
+                [task.model_dump() for task in req.tasks],
+                list(req.idempotency_keys or []),
+                cache=app.state.prepare_cache,
+                deadline=remaining,
+            )
+        except DeadlineExceeded as exc:
+            raise HTTPException(status_code=408, detail=str(exc)) from exc
+        except (KeyError, TypeError, ValueError, RemoteWorkerError) as exc:
+            # One bad task fails the batch: the coordinator's fallback is to
+            # prepare locally, which handles every task the remote path
+            # refuses, so isolating the offender would buy nothing.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        cache = app.state.prepare_cache
+        return {
+            "results": results,
+            "cache": {"hits": cache.hits, "misses": cache.misses, "size": len(cache)},
+        }
 
     @app.get("/metrics")
     def metrics_endpoint() -> PlainTextResponse:
