@@ -65,10 +65,23 @@ GOLD: list[tuple[str, str]] = [
 ]
 
 
-#: Queries whose correct answer depends on term rarity or on a short precise
-#: document beating a long repetitive one — the two things the tsvector port
-#: cannot reproduce. See :func:`test_known_divergence_postgres_has_no_idf`.
-IDF_SENSITIVE = {"gateway restarts nightly", "deploy gateway"}
+#: The one query the Postgres arm still ranks differently, and why.
+#:
+#: Three real gaps were found and fixed (see `_postgres_rank_expression` and
+#: the schema's tokenizer note): no IDF at all, no term-frequency saturation,
+#: and filenames tokenizing as a single lexeme so ``deploy-gateway.md`` never
+#: matched "deploy". With those closed, "gateway restarts nightly" — the
+#: rare-term case, and the more important retrieval property — is now correct
+#: on both backends.
+#:
+#: What remains is structural, not a parameter. BM25 normalizes each column's
+#: contribution by *that column's* length; ``ts_rank_cd`` applies one global
+#: normalization to the whole weighted vector. So when a title match on a
+#: common term competes with body matches on rare terms, the two rank
+#: differently, and no weight vector fixes both cases at once — verified at
+#: 8:1, 16:1 and 33:1 title:body ratios, each of which merely moved the
+#: failure to the other query.
+POSTGRES_RANK_RESIDUAL = {"deploy gateway"}
 
 
 def _corpus(root: Path) -> Path:
@@ -213,7 +226,7 @@ def test_retrieval_quality_holds_on_the_gold_set(both) -> None:
     for backend in ("sqlite", "postgres"):
         ranked = both[backend]["ranked"]
         for query, expected in GOLD:
-            if backend == "postgres" and query in IDF_SENSITIVE:
+            if backend == "postgres" and query in POSTGRES_RANK_RESIDUAL:
                 continue
             hits = ranked[query]
             assert hits, f"{backend}: {query!r} returned nothing"
@@ -223,18 +236,31 @@ def test_retrieval_quality_holds_on_the_gold_set(both) -> None:
 
 
 @postgres
-def test_postgres_ranks_the_gold_set_the_same_way_sqlite_does(both) -> None:
-    """Identical ordering, except where IDF is the deciding factor."""
+def test_postgres_and_sqlite_agree_on_the_top_hit(both) -> None:
+    """Top-1 agreement is the contract; tail order is not.
+
+    Full-list equality held before the port had IDF and matched SQLite's
+    tokenizer — because Postgres was returning *fewer* documents (a filename
+    that tokenized as one lexeme matched nothing) and the short lists happened
+    to coincide. Now both backends see the same terms, both return the same
+    documents, and they can legitimately disagree about ranks 2-3 while
+    agreeing on the answer. Asserting full equality here would be asserting a
+    coincidence, and would have to be relaxed by the first real corpus.
+    """
 
     for query, _ in GOLD:
-        if query in IDF_SENSITIVE:
+        if query in POSTGRES_RANK_RESIDUAL:
             continue
-        assert both["sqlite"]["ranked"][query] == both["postgres"]["ranked"][query], query
+        sqlite_hits = both["sqlite"]["ranked"][query]
+        postgres_hits = both["postgres"]["ranked"][query]
+        assert sqlite_hits[:1] == postgres_hits[:1], query
+        # Same documents found, whatever order they came back in.
+        assert set(sqlite_hits) == set(postgres_hits), query
 
 
 @postgres
-def test_known_divergence_postgres_has_no_idf(both) -> None:
-    """**A measured limitation of the port, pinned so it cannot be forgotten.**
+def test_known_residual_postgres_lacks_per_column_length_normalization(both) -> None:
+    """**The residual after three real fixes, pinned so it cannot be forgotten.**
 
     SQLite ranks by BM25, which weights *rare* terms heavily: "restarts" and
     "nightly" occur in exactly one document, so `runbook.md` wins even though a
@@ -254,15 +280,20 @@ def test_known_divergence_postgres_has_no_idf(both) -> None:
     tsquery — which is exactly when this docstring needs deleting.
     """
 
-    for query, sqlite_winner in (
-        ("gateway restarts nightly", "runbook.md"),
-        ("deploy gateway", "deploy-gateway.md"),
-    ):
-        assert both["sqlite"]["ranked"][query][0] == sqlite_winner
-        assert both["postgres"]["ranked"][query][0] == "notes.md", (
-            f"Postgres ranked {query!r} correctly — real term weighting may have "
-            "been added; if so, delete this test and empty IDF_SENSITIVE."
-        )
+    query = "deploy gateway"
+    assert both["sqlite"]["ranked"][query][0] == "deploy-gateway.md"
+    postgres_ranking = both["postgres"]["ranked"][query]
+    # It *matches* now — the tokenizer fix did that, and before it the file
+    # named for the query did not appear at all. It simply is not first.
+    assert "deploy-gateway.md" in postgres_ranking[:2], (
+        "the file named for the query fell out of the top 2 — the tokenizer "
+        "normalization in persistence/schema.py may have regressed"
+    )
+    assert postgres_ranking[0] == "notes.md", (
+        "Postgres ranked this correctly — per-column length normalization may "
+        "have been added (a pg_search/ParadeDB backend would do it); if so, "
+        "delete this test and empty POSTGRES_RANK_RESIDUAL."
+    )
 
 
 @postgres
@@ -299,3 +330,89 @@ def test_the_sqlite_default_needs_no_dsn_and_no_driver(tmp_path: Path) -> None:
         assert engine.sync_source("docs", "full").indexed_artifacts == 5
     finally:
         engine.close()
+
+
+@postgres
+def test_migration_copies_state_and_never_destroys_the_original(tmp_path: Path) -> None:
+    """`pheasant migrate --to postgres`, end to end.
+
+    The important assertions are the safety ones: the SQLite file survives
+    (rule 2 — ``/state`` is user data), the stable IDs carry over unchanged
+    (rule 3), and ``chunks_fts`` is *rebuilt* for the target dialect rather
+    than copied, because its tokenization is dialect-specific.
+    """
+
+    from pheasant.persistence.migrate import migrate_sqlite_to_postgres
+
+    _reset(DSN)
+    workspace = _corpus(tmp_path)
+    config = _config(tmp_path, workspace, "sqlite")
+    engine = SyncEngine(config)
+    try:
+        engine.sync_source("docs", "full")
+        sqlite_path = Path(engine.state.path)
+        before = sorted(str(r["id"]) for r in engine.state.rows("SELECT id FROM artifacts"))
+        chunk_count = len(engine.state.rows("SELECT id FROM chunks"))
+    finally:
+        engine.close()
+
+    report = migrate_sqlite_to_postgres(sqlite_path, DSN)
+
+    assert report["verified"] is True
+    assert report["tables"]["artifacts"] == len(before)
+    # Derived cache, rebuilt not copied — one row per chunk.
+    assert report["chunks_fts"] == chunk_count
+
+    # The original is renamed, never deleted.
+    assert not sqlite_path.exists()
+    parked = Path(report["original_renamed_to"])
+    assert parked.exists() and parked.stat().st_size > 0
+
+    postgres_config = _config(tmp_path, workspace, "postgres")
+    migrated = SyncEngine(postgres_config)
+    try:
+        after = sorted(str(r["id"]) for r in migrated.state.rows("SELECT id FROM artifacts"))
+        assert after == before, "stable IDs changed across the migration"
+        # And the migrated index is searchable, not merely present.
+        search = HybridSearch(SearchStore(migrated.state))
+        hits = search.search_context(postgres_config.knowledge_base_id, "invoices", "text", 5)
+        assert [h.get("relative_path") for h in hits["results"]][:1] == ["billing.md"]
+    finally:
+        migrated.close()
+
+
+@postgres
+def test_migration_is_idempotent_and_verifies_before_renaming(tmp_path: Path) -> None:
+    """A re-run must not double-insert, and must not park the original twice."""
+
+    from pheasant.persistence.migrate import migrate_sqlite_to_postgres
+
+    _reset(DSN)
+    workspace = _corpus(tmp_path)
+    config = _config(tmp_path, workspace, "sqlite")
+    engine = SyncEngine(config)
+    try:
+        engine.sync_source("docs", "full")
+        sqlite_path = Path(engine.state.path)
+    finally:
+        engine.close()
+
+    first = migrate_sqlite_to_postgres(sqlite_path, DSN)
+    assert first["tables"]["artifacts"] == 5
+
+    # Re-run against the parked copy: every table is already populated, so
+    # nothing is inserted a second time.
+    parked = Path(first["original_renamed_to"])
+    second = migrate_sqlite_to_postgres(parked, DSN, keep_original=False)
+    assert second["verified"] is True
+    assert "artifacts" in second["skipped"]
+    # Tables that were empty in the source are still "copied" — of nothing.
+    # The invariant that matters is that no row was inserted twice.
+    assert all(count == 0 for count in second["tables"].values()), second["tables"]
+
+    postgres_config = _config(tmp_path, workspace, "postgres")
+    migrated = SyncEngine(postgres_config)
+    try:
+        assert len(migrated.state.rows("SELECT id FROM artifacts")) == 5
+    finally:
+        migrated.close()

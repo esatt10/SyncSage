@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -26,18 +27,29 @@ _BM25_WEIGHTS = "0.0, 0.0, 0.0, 8.0, 3.0, 2.0, 1.0"
 # having to collapse two fields together.
 _TS_RANK_WEIGHTS = "0.125, 0.25, 0.375, 1.0"
 
-# ts_rank_cd's normalization flag. **1 = divide the rank by 1 + log(document
-# length).** Not cosmetic and not a default worth accepting: with the flag left
-# at 0 (no normalization at all) `ts_rank_cd` simply accumulates term hits, so
-# a long document that repeats a query word half a dozen times outranks the
-# short document that is actually about it. BM25 has length normalization and
-# IDF built in, so SQLite never had this problem — which is precisely how a
-# naive port ships a silent ranking regression.
+# ts_rank_cd's normalization flag. **32 = rank / (rank + 1)** — term-frequency
+# *saturation*, applied per term.
 #
-# Caught by mutation testing: the first version of the parity corpus gave every
-# query a unique winning token, so it ranked correctly under *any* weighting
-# and hid this completely. The `deploy-gateway.md` case exists to keep it hid.
-_TS_RANK_NORMALIZATION = 1
+# This is the second half of making Postgres rank like BM25, and it is not a
+# tuning knob. BM25 scores a term as `IDF x tf/(tf + k1)`: the tenth occurrence
+# of a word is worth almost nothing more than the third. `ts_rank_cd` grows
+# roughly linearly with occurrences, so without saturation a long document that
+# repeats a common query word outranks the short document actually about the
+# rare one — even once IDF is applied, because linear growth outruns a 2.6x
+# weight difference.
+#
+# Measured on the parity corpus, summing IDF-weighted per-term ranks for
+# "gateway restarts nightly" (correct answer: runbook.md):
+#
+#   flag  0 (none)          notes.md 1.50   > runbook.md 0.375   WRONG
+#   flag  1 (log length)    notes.md 0.199  > runbook.md 0.132   WRONG
+#   flag 33 (1|32)          notes.md 0.145  > runbook.md 0.127   WRONG
+#   flag 32 (saturation)    runbook.md 0.368 > notes.md 0.323    correct
+#
+# Length normalization is deliberately *not* combined in (33 above): saturation
+# already defuses repetition, and dividing by document length on top penalizes
+# the document that matched two of the three query terms.
+_TS_RANK_NORMALIZATION = 32
 
 # Structural priors, applied as a DIVISOR on the (negative) BM25 cost, so they
 # scale a match rather than displacing it: a strong deep hit still beats a weak
@@ -126,6 +138,83 @@ def _exclusion_sql(steering: Any) -> tuple[str, list[object]]:
     return clauses, params
 
 
+def _postgres_document_frequencies(state: Any, tokens: list[str]) -> tuple[int, dict[str, int]]:
+    """``(total chunks, {term: how many chunks contain it})`` in one round trip.
+
+    Computed per query rather than maintained in a table. It is a GIN index
+    probe per query term — a handful of terms, all indexed — and it is always
+    correct, where a cached table is a second thing to invalidate on every
+    write and a silent source of stale ranking when it drifts.
+    """
+
+    if not tokens:
+        return 0, {}
+    rows = state.rows(
+        "SELECT t.term AS term, count(f.chunk_id) AS df, "
+        "       (SELECT count(*) FROM chunks_fts) AS total "
+        "FROM unnest(?::text[]) AS t(term) "
+        "LEFT JOIN chunks_fts f ON f.search_vector @@ to_tsquery('simple', t.term) "
+        "GROUP BY t.term",
+        (list(tokens),),
+    )
+    total = int(rows[0]["total"]) if rows else 0
+    return total, {str(row["term"]): int(row["df"]) for row in rows}
+
+
+def _idf(total_docs: int, document_frequency: int) -> float:
+    """BM25's inverse document frequency, the +1 variant.
+
+    ``ln(1 + (N - df + 0.5) / (df + 0.5))`` — the form Lucene and SQLite's
+    FTS5 both use, chosen over the classic ``ln((N - df + 0.5)/(df + 0.5))``
+    because that one goes *negative* for a term appearing in more than half
+    the corpus, which would make a common word actively push documents down
+    the ranking rather than merely counting for little.
+    """
+
+    df = max(0, int(document_frequency))
+    n = max(df, int(total_docs))
+    return math.log(1.0 + (n - df + 0.5) / (df + 0.5))
+
+
+def _postgres_rank_expression(state: Any, tokens: list[str]) -> tuple[str, list[object]]:
+    """A BM25-shaped ranking expression for Postgres.
+
+    ``ts_rank_cd`` has **no inverse document frequency**: it accumulates cover
+    density, so a long document repeating a common query word outranks the
+    short one that is actually about the rare term. That is not a tuning miss
+    — no normalization flag fixes it, because normalization is about document
+    *length* and the missing ingredient is corpus-wide *term rarity*. Measured
+    directly: for "gateway restarts nightly", plain ``ts_rank_cd`` put a decoy
+    repeating "gateway" six times above the one runbook containing "restarts".
+
+    So the expression is built the way BM25 is: a **sum over query terms** of
+    that term's rank times its IDF. The IDFs are computed here and inlined as
+    float literals (they are ours, not user input); the terms themselves stay
+    bound parameters.
+
+    Falls back to a single un-weighted ``ts_rank_cd`` when the corpus is empty,
+    where every IDF would be identical anyway.
+    """
+
+    total, frequencies = _postgres_document_frequencies(state, tokens)
+    if not tokens or not total:
+        return (
+            f"ts_rank_cd('{{{_TS_RANK_WEIGHTS}}}', chunks_fts.search_vector, "
+            f"query_ts, {_TS_RANK_NORMALIZATION})",
+            [],
+        )
+    terms: list[str] = []
+    params: list[object] = []
+    for token in dict.fromkeys(tokens):
+        weight = _idf(total, frequencies.get(token, 0))
+        terms.append(
+            f"{weight:.6f} * ts_rank_cd('{{{_TS_RANK_WEIGHTS}}}', chunks_fts.search_vector, "
+            f"to_tsquery('simple', ?), {_TS_RANK_NORMALIZATION})"
+        )
+        params.append(token)
+    return "(" + " + ".join(terms) + ")", params
+
+
 class SearchStore:
     def __init__(self, state: StateStore):
         self.state = state
@@ -174,9 +263,17 @@ class SearchStore:
         # the SELECT, ahead of every WHERE clause.
         postgres = bool(getattr(self.state, "dialect", None) and self.state.dialect.is_postgres)
         prior_sql, prior_params = _structural_prior(steering, tokens, postgres=postgres)
+        rank_sql, rank_params = "", []
         if postgres:
             match_expr = " | ".join(dict.fromkeys(tokens)) if tokens else query
-        params: list[object] = [*prior_params, match_expr]
+            rank_sql, rank_params = _postgres_rank_expression(self.state, tokens)
+        # Params are positional, so they must be assembled in the order the
+        # placeholders appear in the final SQL. On Postgres the ranking
+        # expression (`-{rank_sql}`) precedes the divisor (`/ {prior_sql}`),
+        # which precedes the CROSS JOIN's tsquery, which precedes every WHERE
+        # clause. On SQLite `bm25(...)` takes no parameters, so `prior_params`
+        # is still first and this is the order it always was.
+        params: list[object] = [*rank_params, *prior_params, match_expr]
         where = "search_vector @@ query_ts" if postgres else "chunks_fts MATCH ?"
         exclusion_where, exclusion_params = _exclusion_sql(steering)
         if source_name:
@@ -219,9 +316,7 @@ class SearchStore:
                    chunks_fts.path, chunks_fts.heading_path, chunks.text,
                    chunks.start_line, chunks.end_line, artifacts.path AS absolute_path,
                    artifacts.relative_path,
-                   -ts_rank_cd('{{{_TS_RANK_WEIGHTS}}}', chunks_fts.search_vector,
-                               query_ts, {_TS_RANK_NORMALIZATION})
-                       / {prior_sql} AS rank_score
+                   -{rank_sql} / {prior_sql} AS rank_score
             FROM chunks_fts
             JOIN chunks ON chunks.id = chunks_fts.chunk_id
             JOIN artifacts ON artifacts.id = chunks_fts.artifact_id

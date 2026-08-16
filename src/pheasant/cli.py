@@ -546,6 +546,24 @@ def main(argv: list[str] | None = None) -> int:
     compose_env_p.add_argument("--output", "-o")
     repair_p = sub.add_parser("repair")
     repair_p.add_argument("--config", "-c", default="pheasant.example.yaml")
+    migrate_p = sub.add_parser(
+        "migrate", help="Copy SQLite state into the configured Postgres backend."
+    )
+    migrate_p.add_argument("--config", "-c", default="pheasant.yaml")
+    migrate_p.add_argument(
+        "--to", choices=("postgres",), default="postgres", help="Target backend."
+    )
+    migrate_p.add_argument(
+        "--sqlite-path",
+        help="Source database. Defaults to the state path in the config.",
+    )
+    migrate_p.add_argument(
+        "--keep-original",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Rename the SQLite file to *.migrated instead of leaving it in place.",
+    )
+    migrate_p.add_argument("--json", action="store_true")
     backup_p = sub.add_parser("backup")
     backup_p.add_argument("output")
     backup_p.add_argument("--config", "-c", default="pheasant.example.yaml")
@@ -807,6 +825,44 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         for report in reports:
             _print_scan(report)
+        return 0
+    if args.command == "migrate":
+        from pheasant.config.loader import load_config
+        from pheasant.persistence.migrate import MigrationError, migrate_sqlite_to_postgres
+        from pheasant.persistence.paths import StatePaths
+        from pheasant.persistence.secrets import DsnUnavailable, resolve_dsn
+
+        cfg = load_config(Path(args.config))
+        sqlite_path = args.sqlite_path or StatePaths.from_config(cfg).sqlite
+        try:
+            dsn = resolve_dsn(cfg.storage)
+        except DsnUnavailable as exc:
+            # The DSN comes from the environment by design, so the most likely
+            # mistake is a config that still says `backend: sqlite`.
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        try:
+            report = migrate_sqlite_to_postgres(
+                sqlite_path,
+                dsn,
+                pool_size=int(getattr(cfg.storage, "pool_size", 10) or 10),
+                keep_original=bool(args.keep_original),
+            )
+        except MigrationError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print(f"Migrated {report['source']} -> {report['target']}")
+            for table, count in sorted(report["tables"].items()):
+                print(f"  {table}: {count} row(s)")
+            if report["skipped"]:
+                print(f"  already populated, left alone: {', '.join(report['skipped'])}")
+            print(f"  chunks_fts: rebuilt {report['chunks_fts']} row(s) for this dialect")
+            if report.get("original_renamed_to"):
+                print(f"  original kept at {report['original_renamed_to']}")
+            print("Set storage.backend: postgres in your config and restart.")
         return 0
     if args.command == "repair":
         from pheasant.sync.locks import EngineLeaseError

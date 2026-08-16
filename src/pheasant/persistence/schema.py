@@ -252,6 +252,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vocab USING fts5vocab(chunks_fts, 'row
 #: ``search_vector`` is a STORED generated column rather than a trigger: it
 #: cannot drift from its row, and there is no ordering hazard between the
 #: INSERT and a trigger that a concurrent reader could observe.
+#:
+#: **Punctuation is flattened to spaces before tokenizing**, which is not
+#: cosmetic. SQLite indexes these columns with FTS5's ``unicode61`` tokenizer,
+#: which splits on every non-alphanumeric: ``deploy-gateway.md`` becomes
+#: ``deploy``, ``gateway``, ``md``. Postgres's ``simple`` dictionary keeps it
+#: as the single lexeme ``deploy-gateway.md``, so a search for "deploy" did
+#: not match the file *named* for it at all — silently, with no error and a
+#: perfectly plausible result list. Measured: the file named for the query
+#: ranked below a decoy that merely repeats it in prose. The regexp restores
+#: unicode61's splitting so both backends see the same terms.
 POSTGRES_EXTRAS = """\
 CREATE TABLE IF NOT EXISTS chunks_fts (
   chunk_id TEXT PRIMARY KEY,
@@ -262,10 +272,14 @@ CREATE TABLE IF NOT EXISTS chunks_fts (
   heading_path TEXT,
   text TEXT,
   search_vector tsvector GENERATED ALWAYS AS (
-    setweight(to_tsvector('simple', coalesce(title, '')), 'A') ||
-    setweight(to_tsvector('simple', coalesce(path, '')), 'B') ||
-    setweight(to_tsvector('simple', coalesce(heading_path, '')), 'C') ||
-    setweight(to_tsvector('simple', coalesce(text, '')), 'D')
+    setweight(to_tsvector('simple',
+      regexp_replace(coalesce(title, ''), '[^a-zA-Z0-9]+', ' ', 'g')), 'A') ||
+    setweight(to_tsvector('simple',
+      regexp_replace(coalesce(path, ''), '[^a-zA-Z0-9]+', ' ', 'g')), 'B') ||
+    setweight(to_tsvector('simple',
+      regexp_replace(coalesce(heading_path, ''), '[^a-zA-Z0-9]+', ' ', 'g')), 'C') ||
+    setweight(to_tsvector('simple',
+      regexp_replace(coalesce(text, ''), '[^a-zA-Z0-9]+', ' ', 'g')), 'D')
   ) STORED
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_fts_vector ON chunks_fts USING GIN (search_vector);

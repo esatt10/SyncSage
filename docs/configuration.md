@@ -133,6 +133,53 @@ just a networking detail — see [security.md](security.md#trust-model-for-the-h
 
 ---
 
+### Where state lives (`storage.backend`)
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `backend` | `sqlite` \| `postgres` | `sqlite` | SQLite is a file and permits **one writer process per knowledge base** — pheasant's hard scaling ceiling. Postgres lifts it. |
+| `dsn_env` | string | `PHEASANT_DATABASE_URL` | Name of the environment variable holding the libpq DSN. Only the variable *name* goes in YAML — a DSN carries a password, and there is deliberately no field to paste one into. |
+| `pool_size` | integer | `10` | Server-side connections this process may hold. Unlike a SQLite file handle, each is a real process on the database. |
+
+Postgres needs the extra: `pip install 'pheasant-kb[postgres]'` (the published
+image already has it).
+
+```yaml
+storage:
+  backend: postgres
+  dsn_env: PHEASANT_DATABASE_URL
+  pool_size: 10
+```
+
+**The default needs no infrastructure and is unchanged.** Leaving `backend`
+alone gives you exactly the SQLite deployment you had.
+
+#### Moving existing state across
+
+```bash
+export PHEASANT_DATABASE_URL='postgresql://pheasant:...@db:5432/pheasant'
+pheasant migrate --to postgres -c pheasant.yaml
+```
+
+Copies every table, rebuilds `chunks_fts` for the target dialect, verifies the
+row counts, and only then renames the SQLite file to `*.migrated` — it is never
+deleted. Re-running is safe: a table that already holds rows is left alone.
+Stable IDs carry over byte-identically, so no re-index is needed.
+
+#### One difference worth knowing about
+
+Ranking is not identical between the two. SQLite ranks with FTS5's `bm25()`;
+Postgres uses `ts_rank_cd`, which has no inverse document frequency and no
+term-frequency saturation of its own. pheasant supplies both — the rank is a
+sum over query terms of `IDF x saturated rank`, and titles/paths are tokenized
+the way FTS5's `unicode61` does so a search for `deploy` still matches
+`deploy-gateway.md`. What remains is that BM25 normalizes each column by *that
+column's* length while `ts_rank_cd` normalizes the whole vector once, so the
+two can disagree about ranks 2-3 when a title match on a common word competes
+with body matches on rare ones. The top hit agrees on the gold set;
+`tests/test_backend_parity.py` is the gate.
+
+
 ## `search` (retrieval behavior)
 
 | Key | Type | Default | Notes |

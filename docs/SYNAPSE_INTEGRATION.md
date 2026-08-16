@@ -990,7 +990,7 @@ working, which is what holds the 5 MB end of the range.
 |---|---|---|
 | 35.0 | Remove the Obsidian exporter | done (2026-08-16) |
 | 35.1 | Observability: real `/metrics`, per-source progress with throughput/ETA/stall detection | done (2026-08-16) |
-| 35.2 | `StateBackend` seam + Postgres backend (incl. FTS5 → `tsvector` port) | seam done (2026-08-16); FTS port has a measured ranking gap |
+| 35.2 | `StateBackend` seam + Postgres backend (incl. FTS5 → `tsvector` port) | done (2026-08-16) |
 | 35.3 | `GraphBackend`: bounded memory, hot loops pushed into SQL | queued |
 | 35.4 | Multi-writer indexing: per-source leases + durable work queue + sharding | queued |
 | 35.5 | Broker (NATS JetStream) and gRPC as first-class transports | queued |
@@ -1131,20 +1131,42 @@ and 76 individually-edited lines on the default path.
 `chunks_fts` stays a real table with the same columns on Postgres, so the whole
 write path is untouched.
 
-**Measured gap, not yet closed — Postgres retrieval is not BM25-equivalent.**
-`ts_rank_cd` has **no inverse document frequency**. SQLite's BM25 weights rare
-terms heavily, so a short precise document beats a long one that repeats a
-common query word; Postgres accumulates cover density and ranks the long
-repetitive document first. Verified against normalization flags 0/1/2/16 — none
-fixes it, because normalization is about *length* and the missing ingredient is
-corpus-wide *term rarity*. Field weighting (title above body) **is** preserved
-via `setweight` A/B/C/D.
+**Ranking: three real gaps found and fixed, one structural residual left.**
+The first port used a bare `ts_rank_cd` and ranked badly. Three separate causes,
+each fixed:
 
-Two `IDF_SENSITIVE` queries in the parity suite pin this divergence explicitly
-rather than hiding it; `test_known_divergence_postgres_has_no_idf` goes red the
-day real term weighting is added, which is the signal to delete it. Closing it
-properly means either a `pg_search`/ParadeDB backend or a df-weighted tsquery —
-real work, not tuning, and it should be its own step.
+1. **No IDF at all.** `ts_rank_cd` has no notion of term rarity, so a decoy
+   repeating a common query word outranked the one document containing the rare
+   one. The rank is now built the way BM25 is — a **sum over query terms of
+   `IDF x that term's rank`** — with document frequencies fetched in one indexed
+   round trip per query (`_postgres_document_frequencies`) and the BM25 `+1`
+   IDF variant, chosen because the classic form goes negative for terms in over
+   half the corpus.
+2. **No term-frequency saturation.** `ts_rank_cd` grows near-linearly with
+   occurrences where BM25 saturates (`tf/(tf+k1)`), so linear growth outran a
+   2.6x IDF difference. Normalization flag **32** (`rank/(rank+1)`) supplies it;
+   measured against flags 0/1/33, which all rank the decoy first.
+3. **Tokenizer mismatch — the one that mattered most.** FTS5's `unicode61`
+   splits `deploy-gateway.md` into `deploy`/`gateway`/`md`; Postgres's `simple`
+   dictionary keeps it as **one lexeme**, so a search for "deploy" did not match
+   the file *named* for it at all — silently, with a plausible-looking result
+   list. The generated `search_vector` now flattens punctuation to spaces first.
+
+**Residual, pinned not hidden:** BM25 normalizes each column by *that column's*
+length; `ts_rank_cd` normalizes the whole weighted vector once. So when a title
+match on a common term competes with body matches on rare terms, ranks 2-3 can
+differ. Verified that no title:body weight ratio fixes both cases — 8:1, 16:1
+and 33:1 each merely move the failure to the other query. Top-1 agrees on the
+gold set. `POSTGRES_RANK_RESIDUAL` +
+`test_known_residual_postgres_lacks_per_column_length_normalization` pin it, and
+go red the day a `pg_search`/ParadeDB backend supplies real per-column
+normalization.
+
+**Migration:** `pheasant migrate --to postgres` copies every table, rebuilds
+`chunks_fts` for the target dialect (never copies it — its tokenization is
+dialect-specific), verifies row counts, and only then renames the SQLite file
+`*.migrated`. Idempotent, and it never deletes the original (rule 2). Stable IDs
+carry over byte-identically, so no re-index.
 
 **Found by mutation testing, and worth recording:** the first parity corpus gave
 every query a unique winning token, so it ranked correctly under *any* column
@@ -1153,5 +1175,6 @@ title weighting out of the generated tsvector all still passed. 3 of 4 mutants
 survived. The corpus now contains a document named for its query and a longer
 decoy that repeats it, which is what surfaced the IDF gap at all.
 
-**Still open for 35.2:** `pheasant migrate --to postgres`, and
-`docs/configuration.md` coverage of the new `storage` fields.
+**Acceptance:** `tests/test_backend_parity.py` (9), skipping cleanly without
+`PHEASANT_TEST_POSTGRES_DSN`. Docs: `configuration.md` §storage.backend.
+**Step 35.2 is complete.**
