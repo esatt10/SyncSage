@@ -563,6 +563,21 @@ class GraphSettings(ModelMixin):
     # modestly above that. Opt in for large/growing multi-source graphs.
     wasm_cross_source_resolution: bool = False
 
+    # -- Phase 35.3: the in-RAM graph has a measured ceiling ------------------
+    #: Warn once per sync when the graph passes this many nodes. **Not a
+    #: refusal** — unlike `sync.limits`, which stops a source before any work
+    #: happens, by the time this trips the graph already exists and refusing
+    #: would throw away a completed index.
+    #:
+    #: The default is derived from measurement, not taste. `graph/capacity.py`
+    #: measured a real-shaped graph at four scales; per node the cost is flat
+    #: at ~2.4 KB of process RSS, and the binding constraint is not RAM but
+    #: `storage.graph_checkpoint_seconds`: at 1.58M nodes one checkpoint takes
+    #: ~20 s to serialize against a 60 s interval, so a third of the sync is
+    #: spent writing the graph out. 750k nodes (~120k files) keeps that under
+    #: ~10%, which is the point at which sharding into several regions is the
+    #: better answer. Set to None to disable the warning.
+    max_nodes: int | None = 750_000
 
 @dataclass
 class SynapseSettings(ModelMixin):

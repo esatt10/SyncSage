@@ -1443,6 +1443,9 @@ class SyncEngine:
             # Still inside the writer lock + per-source lock; fail-soft so a
             # publish/webhook hiccup never fails the sync.
             self._publish_after_sync(source.name, mode, started_at, now, indexed, skipped)
+            capacity = self._graph_capacity_notice()
+            if capacity:
+                details_extra = {**details_extra, "capacity": capacity}
             return SyncResult(
                 source.name,
                 indexed,
@@ -1458,6 +1461,53 @@ class SyncEngine:
                     **details_extra,
                 },
             )
+
+    def _graph_capacity_notice(self) -> dict[str, Any] | None:
+        """Say something once a graph outgrows one container (Phase 35.3).
+
+        Deliberately a *notice*, not a refusal. `sync.limits` can refuse
+        because it checks before any work happens; by the time this can fire,
+        the index exists and throwing it away would help nobody.
+
+        The threshold is measured, not guessed — see `graph/capacity.py`. The
+        binding constraint is not RAM but checkpoint serialization: at 1.58M
+        nodes one `graph.latest.json.zst` write takes ~20s against a default
+        60s `storage.graph_checkpoint_seconds`, so a third of a long sync goes
+        on writing the graph out, and it gets worse linearly.
+        """
+
+        limit = getattr(self.config.graph, "max_nodes", None)
+        if not limit:
+            return None
+        nodes = self.graph_builder.graph.number_of_nodes()
+        if nodes <= int(limit):
+            return None
+        # ~2.4 KB of process RSS per node, flat across four measured scales.
+        projected_bytes = nodes * 2400
+        projected_gb = projected_bytes / 1e9
+        notice = {
+            "nodes": nodes,
+            "max_nodes": int(limit),
+            # Exact bytes as well as the rounded figure: at a low threshold the
+            # GB value rounds to 0.0, and a capacity notice reporting "0.0 GB"
+            # reads as a bug rather than as a small graph.
+            "projected_rss_bytes": projected_bytes,
+            "projected_rss_gb": round(projected_gb, 2),
+            "advice": (
+                "This graph has outgrown what one region holds comfortably. Split the "
+                "corpus across several pheasant regions and let the router fan out "
+                "(see docs/how-to/capacity-planning.md); raising graph.max_nodes "
+                "silences this without changing the cost."
+            ),
+        }
+        logger.warning(
+            "Graph is %d nodes, past graph.max_nodes=%d (~%.1f GB RSS). %s",
+            nodes,
+            int(limit),
+            projected_gb,
+            notice["advice"],
+        )
+        return notice
 
     @property
     def stats(self) -> dict[str, int]:

@@ -991,7 +991,7 @@ working, which is what holds the 5 MB end of the range.
 | 35.0 | Remove the Obsidian exporter | done (2026-08-16) |
 | 35.1 | Observability: real `/metrics`, per-source progress with throughput/ETA/stall detection | done (2026-08-16) |
 | 35.2 | `StateBackend` seam + Postgres backend (incl. FTS5 → `tsvector` port) | done (2026-08-16) |
-| 35.3 | `GraphBackend`: bounded memory, hot loops pushed into SQL | queued |
+| 35.3 | Graph capacity measured; sharding chosen over a Postgres graph backend | done (2026-08-16) |
 | 35.4 | Multi-writer indexing: per-source leases + durable work queue + sharding | queued |
 | 35.5 | Broker (NATS JetStream) and gRPC as first-class transports | queued |
 | 35.6 | Process roles, autoscaling, and the three runtimes | queued |
@@ -1178,3 +1178,55 @@ decoy that repeats it, which is what surfaced the IDF gap at all.
 **Acceptance:** `tests/test_backend_parity.py` (9), skipping cleanly without
 `PHEASANT_TEST_POSTGRES_DSN`. Docs: `configuration.md` §storage.backend.
 **Step 35.2 is complete.**
+
+### Step 35.3 — Graph capacity, and why sharding won (2026-08-16)
+
+**The step changed shape because the measurement came first.** The plan was a
+`GraphBackend` protocol with a Postgres arm. Measuring what the graph actually
+costs said that would solve the wrong problem.
+
+`src/pheasant/graph/capacity.py` builds a realistically-shaped
+`SimpleMultiDiGraph` at four scales and reports RSS, persisted bytes, checkpoint
+and load time, and edge-scan latency:
+
+| Corpus | Nodes | RSS | Checkpoint | Load | Edge scan |
+|---|---|---|---|---|---|
+| 2,000 files | 12.6k | 34 MB | 0.13 s | 0.10 s | 1.8 ms |
+| 20,000 | 126k | 314 MB | 1.3 s | 0.9 s | 16 ms |
+| 100,000 | 630k | 1.5 GB | 6.7 s | 4.6 s | 95 ms |
+| 250,000 | 1.58M | 4.3 GB | 19.9 s | 11.2 s | 240 ms |
+
+Cost per node is flat (~2.4 KB RSS), so the table interpolates. It does **not**
+extrapolate safely: a linear projection to 250k predicted 3.8 GB against a
+measured 4.3 GB, 12% low — which is why the top row was measured rather than
+derived.
+
+**The binding constraint is not RAM.** `storage.graph_checkpoint_seconds`
+defaults to 60 s and a checkpoint serializes the whole graph: 11% of the
+interval at 100k files, **33% at 250k**, and approaching 100% around 500k. A
+Postgres graph backend would lower steady-state RSS and would **not** fix that —
+the graph is still assembled in memory during a sync and still has to be
+written. Sharding fixes both, because both costs divide by the shard count and
+the shards index in parallel.
+
+So: **no `GraphBackend` protocol, no Postgres graph tables.** Building them
+would have added a second graph implementation to keep correct for a benefit
+sharding already delivers. Recorded as a decision, not an omission.
+
+**What shipped instead:** the capacity harness, and `graph.max_nodes` (default
+750,000 nodes ≈ 120,000 files) which warns once per sync with the projected RSS
+and the advice to shard. A **notice, not a refusal** — `sync.limits` can refuse
+because it checks before any work happens; by the time this fires the index
+exists.
+
+**Found while measuring:** the shipped Kubernetes manifest and Helm chart both
+cap memory at **1 Gi**, which covers about **65,000 files**. Past that the pod
+is OOM-killed mid-sync and it presents as an unexplained restart, not as a
+capacity problem. Documented in `capacity-planning.md`.
+
+**Acceptance:** `tests/test_graph_capacity.py` (6), mutation-tested 5/5 caught
+— including one asserting the default threshold and the published table cannot
+drift apart, since a warning that fires at a size the doc calls fine is worse
+than no warning. Docs: `docs/how-to/capacity-planning.md` (sizing per corpus
+size, the checkpoint ceiling, how to choose a shard boundary, and which storage
+backend), plus `configuration.md` §graph.max_nodes.

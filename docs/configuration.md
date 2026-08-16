@@ -494,6 +494,26 @@ lands in config or on disk.
 
 ---
 
+### `graph.max_nodes` — when one region is no longer enough
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `max_nodes` | integer \| null | `750000` | Warn once per sync past this many graph nodes (~120,000 files). `null` disables. |
+
+A **notice, not a refusal**: unlike `sync.limits`, which stops a source before
+any work happens, by the time this can fire the index already exists and
+discarding it would help nobody. The sync still returns `healthy`, with the
+advice under `details.capacity`.
+
+The default is measured rather than chosen. `python -m pheasant.graph.capacity`
+reports ~2.4 KB of process RSS per node — flat across four scales — and the
+binding constraint turns out not to be RAM but `storage.graph_checkpoint_seconds`:
+at 1.58M nodes one checkpoint takes ~20 s against a 60 s interval, so a third of
+a long sync is spent writing the graph out. See
+[capacity planning](how-to/capacity-planning.md) for the full table and when to
+shard into several regions.
+
+
 ## `security`
 
 | Key | Type | Example | Notes |
