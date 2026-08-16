@@ -1772,6 +1772,59 @@ speedup promise; use the checked-in benchmark against representative content.
 
 ---
 
+## Phase 35 — horizontal scale (2026-08-16)
+
+Steps 35.0–35.5 landed in one arc; per-step contracts, findings and the
+deliberate deviations are in `docs/SYNAPSE_INTEGRATION.md` §6. Headlines:
+
+- **35.0** removed the Obsidian *exporter* (the UI's graph workspace replaced
+  it). Vault **ingest** is untouched. Rule-8 exception recorded in §4.8.
+- **35.1** real `/metrics` (hand-rolled Prometheus rendering — indexing runs in
+  a child process, so a cross-process client registry cannot work) and a
+  per-source progress model with throughput, ETA and stall detection.
+- **35.2** `StateBackend` seam + a Postgres backend, including an FTS5 →
+  `tsvector` port that had to reproduce BM25's *shape* (IDF, term-frequency
+  saturation) because `ts_rank_cd` has neither.
+- **35.3** measured graph capacity at four scales (~2.4 KB RSS per node, flat)
+  and concluded a Postgres **graph** backend solves the wrong problem.
+  Sharding won; `GraphBackend` was deliberately not built.
+- **35.4** per-source write leases on Postgres (SQLite keeps its whole-state
+  lease, which is an accurate model there), Young's-formula checkpointing, and
+  `pheasant shard plan` packing **whole sources** — hashing paths balances
+  perfectly and severs every cross-source edge.
+- **35.5** durable worker dispatch (pooling, jittered retry, per-endpoint
+  circuit breakers, failover then **local** preparation, deadlines,
+  content-addressed idempotency), a gRPC transport behind the same policy
+  layer, and the durable index work queue (`local` state-store table or NATS
+  JetStream).
+
+New optional extras: `postgres`, `grpc`, `queue`. **All three defaults are
+unchanged** — SQLite, HTTP, no queue — and standalone was verified with
+`psycopg`, `grpc` and `nats` all blocked at import (rule 7).
+
+Two habits from this arc worth keeping:
+
+1. **Run the real dependency.** A real Postgres cluster and a real NATS
+   JetStream broker each found bugs a mock could not: the double-claim race
+   below, and a queue-depth gauge that could only ever grow.
+2. **A mutant that survives is a question, not a score.** Two survivors here
+   were real test gaps (nothing pinned intra-batch ordering; nothing exercised
+   the wrong-artifact identity check). One survivor was *correct* to survive
+   and is recorded as uncovered in the module docstring rather than papered
+   over with a test that cannot fail.
+
+**The sharpest bug of the arc**, because the fix follows from a fact that is
+easy to get backwards: `LocalQueue.claim` double-claimed on Postgres. Under
+READ COMMITTED only the **outer** `WHERE` is re-evaluated after a blocking
+UPDATE's winner commits — not the subquery — so the outer clause must be a
+predicate the winner's own write *falsifies*. `status IN (pending, inflight)`
+is not, because this queue deliberately allows claiming an `inflight` row
+(that is how a dead worker's task is redelivered). Repeating `visible_at<=?`
+outside is what closes it. SQLite serializes writers, so the SQLite suite
+could not fail either way — which is why the Postgres test exists.
+
+---
+
 ## 6. Pointers
 
 - **Region-side Synapse spec:** `docs/SYNAPSE_INTEGRATION.md`
