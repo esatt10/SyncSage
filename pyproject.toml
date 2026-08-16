@@ -59,6 +59,13 @@ agent = ["langgraph>=0.2", "langchain-core>=0.3"]
 # connector.runtime=sandboxed needs no wasmtime dep and the offline suite
 # passes without it.
 wasm = ["wasmtime>=20"]
+# Phase 35.5: gRPC transport for remote preparation workers. Gated so a
+# region using the default HTTP transport — which is every default install —
+# carries no gRPC stack. grpcio-tools is a *runtime* dep of this extra on
+# purpose: the .proto is compiled at import time rather than shipped as
+# checked-in gencode, which would pin every installer to the exact protobuf
+# release the stubs were generated against.
+grpc = ["grpcio>=1.62", "grpcio-tools>=1.62", "protobuf>=5"]
 # Documentation site (MkDocs Material). Build with: mkdocs build --strict
 docs = ["mkdocs-material>=9.5"]
 dev = [

@@ -193,6 +193,31 @@ def _backoff(attempt: int, retry_after: float | None) -> float:
     return random.uniform(0.0, window)
 
 
+def build_transport(name: str) -> Any:
+    """Select a wire format. Retry, failover and breakers are unaffected.
+
+    An unknown name falls back to HTTP with a warning — it is a typo, and a
+    typo should not stop a sync. A *known* name whose dependency is missing
+    raises instead: an operator who asked for gRPC and silently got JSON
+    would keep paying the base64 inflation they chose gRPC to avoid, with
+    nothing anywhere saying so.
+    """
+
+    from pheasant.sync.worker_transport import HttpTransport
+
+    requested = (name or "http").strip().lower()
+    if requested == "grpc":
+        from pheasant.sync.grpc_worker import GrpcTransport
+
+        return GrpcTransport()
+    if requested != "http":
+        logger.warning(
+            "Unknown sync.concurrency.worker_transport=%r; using http",
+            name,
+        )
+    return HttpTransport()
+
+
 class WorkerPool:
     """Dispatch preparation batches across endpoints, durably.
 
@@ -208,6 +233,7 @@ class WorkerPool:
         *,
         timeout: float = 120.0,
         transport: Any | None = None,
+        transport_name: str = "http",
         sleep: Any = time.sleep,
         clock: Any = time.monotonic,
     ) -> None:
@@ -218,9 +244,7 @@ class WorkerPool:
         self._sleep = sleep
         self._clock = clock
         self._cursor = 0
-        from pheasant.sync.worker_transport import HttpTransport
-
-        self._transport = transport if transport is not None else HttpTransport()
+        self._transport = transport if transport is not None else build_transport(transport_name)
 
     # -- health -----------------------------------------------------------
 

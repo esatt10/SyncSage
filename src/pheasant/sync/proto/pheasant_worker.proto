@@ -1,0 +1,65 @@
+// Preparation-worker service (Phase 35.5).
+//
+// A worker parses and chunks one immutable file and returns the result. It
+// never touches state, graph, manifests or vectors, and it is never given
+// connector credentials — the trust boundary established when remote
+// preparation was introduced is unchanged here; only the wire format is.
+//
+// Why the structured fields are JSON strings and only `content` is `bytes`:
+// the source spec, the connector item and the parse result are small, and
+// mirroring pheasant's config dataclasses into protobuf messages would make
+// every config change a proto change for no measurable gain. The file's
+// bytes are the payload that matters, and carrying them as `bytes` instead
+// of base64 removes the 33% inflation the JSON transport pays. So the proto
+// is deliberately stable against schema churn, and the one field where the
+// binary encoding earns something is binary.
+
+syntax = "proto3";
+
+package pheasant.worker.v1;
+
+service PreparationWorker {
+  // Bidirectional streaming: the coordinator sends tasks as it reads them
+  // and results come back as they are computed, so a slow file does not hold
+  // up the ones behind it. gRPC deadlines apply to the whole call, which is
+  // the same budget the HTTP transport sends in a header.
+  rpc PrepareBatch(stream PrepareRequest) returns (stream PrepareResponse);
+
+  // Cheap liveness probe for the coordinator's circuit breaker.
+  rpc Check(HealthRequest) returns (HealthResponse);
+}
+
+message PrepareRequest {
+  // Content-addressed: same source, same path, same bytes, same key. A retry
+  // after a timeout carries the same key and is answered from cache.
+  string idempotency_key = 1;
+  // SourceConfig subset: name, type, path, chunking, taxonomy.
+  string source_json = 2;
+  // ConnectorItem.
+  string item_json = 3;
+  // The file, raw.
+  bytes content = 4;
+  // mime_type / size_bytes / sha256 / mtime / metadata.
+  string payload_meta_json = 5;
+  // [branch, commit, dirty] or absent.
+  string git_metadata_json = 6;
+}
+
+message PrepareResponse {
+  string idempotency_key = 1;
+  // ParsedArtifact in the same wire shape the JSON transport uses, or empty
+  // when the file produced no artifact.
+  string parsed_json = 2;
+  // Set when this task was refused on its merits. The coordinator prepares
+  // it locally rather than failing over, because every worker would refuse
+  // it identically.
+  string error = 3;
+  bool cached = 4;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ready = 1;
+  string version = 2;
+}

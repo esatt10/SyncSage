@@ -1076,6 +1076,7 @@ class SyncEngine:
             remote_urls,
             remote_token,
             timeout=float(concurrency.remote_worker_timeout_seconds or 120),
+            transport_name=str(concurrency.worker_transport or "http"),
         )
         try:
             pool.publish_health()

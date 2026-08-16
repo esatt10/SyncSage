@@ -518,6 +518,20 @@ def main(argv: list[str] | None = None) -> int:
     server_config_default = os.environ.get("PHEASANT_CONFIG", "/config/pheasant.yaml")
     serve_p = sub.add_parser("serve")
     serve_p.add_argument("--config", "-c", default=server_config_default)
+    worker_p = sub.add_parser(
+        "worker",
+        help="Run a stateless preparation worker for a remote coordinator.",
+    )
+    worker_p.add_argument("--config", "-c", default=server_config_default)
+    worker_p.add_argument(
+        "--transport",
+        choices=("grpc",),
+        default="grpc",
+        help="HTTP workers are served by `pheasant serve`; this runs the gRPC one.",
+    )
+    worker_p.add_argument("--host", default="0.0.0.0")  # noqa: S104 - addressed from other pods
+    worker_p.add_argument("--port", type=int, default=8766)
+    worker_p.add_argument("--max-workers", type=int, default=8)
     mcp_p = sub.add_parser("mcp")
     mcp_p.add_argument("--config", "-c", default=server_config_default)
     mcp_p.add_argument("--transport", choices=("stdio", "streamable-http", "sse"), default="stdio")
@@ -958,6 +972,36 @@ def main(argv: list[str] | None = None) -> int:
         # `serve` is the container entrypoint, where the UI is a separate
         # sidecar workload — an npm hint in the image's logs would be noise.
         _serve_app(cfg, args.config, report_ui=False)
+        return 0
+    if args.command == "worker":
+        from pheasant.config.loader import load_config
+        from pheasant.sync.grpc_worker import GrpcUnavailable
+        from pheasant.sync.grpc_worker import serve as serve_grpc_worker
+        from pheasant.version import __version__
+
+        cfg = load_config(Path(args.config))
+        if not cfg.sync.concurrency.remote_worker_enabled:
+            print(
+                "Refusing to start: sync.concurrency.remote_worker_enabled is false.\n"
+                "A worker accepts parse work from a coordinator, so it is opt-in.",
+            )
+            return 1
+        try:
+            server = serve_grpc_worker(
+                cfg,
+                host=args.host,
+                port=args.port,
+                max_workers=args.max_workers,
+                version=__version__,
+            )
+        except GrpcUnavailable as exc:
+            print(str(exc))
+            return 1
+        print(f"pheasant preparation worker (grpc) on {args.host}:{args.port}")
+        try:
+            server.wait_for_termination()
+        except KeyboardInterrupt:
+            server.stop(grace=5).wait()
         return 0
     if args.command == "mcp":
         from pheasant.config.loader import load_config
