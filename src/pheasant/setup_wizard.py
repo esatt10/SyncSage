@@ -609,6 +609,17 @@ def build_sections() -> list[Section]:
             questions=[
                 Question(key="server.port", prompt="Port", kind="int"),
                 Question(
+                    key="server.role",
+                    prompt="Process role (all | api | indexer | worker)",
+                    kind="str",
+                    help="'all' is right for one container. Split roles only in a "
+                    "fleet, where several serving replicas must not each watch the "
+                    "same directories and each index the same source. 'api' "
+                    "publishes index work instead of running it, so it needs the "
+                    "durable queue and an indexer draining it.",
+                    advanced=True,
+                ),
+                Question(
                     key="server.host",
                     prompt="Bind address",
                     help="0.0.0.0 inside a container is correct; publish the port to "

@@ -11,8 +11,8 @@ The routes below are the consolidated surface defined in
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Liveness probe. |
-| GET | `/ready` | Readiness probe. |
+| GET | `/health` | Liveness probe. Reports `role`, so a pod can be identified from the response. Stays 200 when the state store is unreachable — restarting a pod does not bring a database back. |
+| GET | `/ready` | Readiness probe. Reports the role and what it does (`watcher`, `scheduler`, `drains_queue`, `indexes_locally`), and returns **503** when the state store is unreachable so the replica leaves the Service without being restarted. Deliberately not gated on the index being populated: a replica held unready through a multi-hour first index would take the whole Service down for that time. |
 | GET | `/metrics` | Prometheus exposition text — index queue depth, per-source throughput/ETA/stall, search latency, graph size. See [Monitor indexing](../how-to/monitor-indexing.md). |
 | POST | `/internal/indexing/prepare` | Opt-in stateless remote preparation worker. Disabled unless `sync.concurrency.remote_worker_enabled`; requires `Authorization: Bearer` matching the environment variable named by `remote_worker_token_env`. Intended for pheasant coordinators, not public clients. |
 | POST | `/internal/indexing/prepare-batch` | Several preparation tasks in one request. Same gate and token as above. Honours `deadline_seconds` (or the `X-Pheasant-Deadline-Seconds` header) by stopping between tasks rather than finishing work whose caller has given up, and answers a repeated `idempotency_keys` entry from a bounded cache instead of re-parsing. `408` when the deadline has already passed, `413` over `MAX_PREPARE_BATCH` tasks or the per-file size limit, `422` when a task is unacceptable (the coordinator then prepares it locally). A worker predating this route returns `404`, and the coordinator falls back to the single-task path. |

@@ -12,7 +12,7 @@ from typing import Annotated
 import yaml
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from pheasant.assistant.credentials import SessionKeyStore
@@ -25,6 +25,8 @@ from pheasant.config.loader import (
 )
 from pheasant.config.profiles import profile_names
 from pheasant.config.schema import PheasantConfig, SourceConfig, SourceType
+from pheasant.deployment.roles import describe as describe_role
+from pheasant.deployment.roles import resolve_role, validate_role
 from pheasant.graph.exporter import cytoscape, node_link
 from pheasant.graph.simple import SimpleMultiDiGraph
 from pheasant.ingestion.pipeline import read_text, utc_now
@@ -749,6 +751,7 @@ def graph_slice(
 def create_app(
     config: PheasantConfig | None = None,
     config_path: str | Path | None = None,
+    role: str | None = None,
 ) -> FastAPI:
     resolved_config_path = (
         str(config_path)
@@ -757,6 +760,11 @@ def create_app(
     )
     if config is None:
         config = load_config(resolved_config_path)
+    # Phase 35.6: which jobs this process takes on. `all` is the default and
+    # is byte-identical to pre-roles behavior; the one that changes anything
+    # here is `api`, which publishes index work instead of running it.
+    role_policy = resolve_role(config, role)
+    validate_role(role_policy, config)
     paths = StatePaths.from_config(config)
     paths.ensure()
     state = StateStore.from_config(config, paths.sqlite)
@@ -894,11 +902,45 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict:
-        return {"status": "ok", "service": "pheasant"}
+        """Liveness: is this process running at all.
+
+        Carries the role so a pod can be identified from a probe response —
+        "which of these five containers is the indexer" is otherwise a
+        question you answer by reading manifests.
+        """
+
+        return {"status": "ok", "service": "pheasant", "role": role_policy.name}
 
     @app.get("/ready")
     def ready() -> dict:
-        return {"status": "ready", "knowledge_base": config.knowledge_base_id}
+        """Readiness: can this process do its role's job.
+
+        Distinct from `/health` on purpose, because Kubernetes uses them for
+        different things: a failing liveness probe restarts the pod, a failing
+        readiness probe takes it out of the Service. A process whose state
+        store has gone away should stop receiving traffic, not be restarted
+        into the same problem.
+
+        Deliberately **not** gated on the index being populated. An empty
+        knowledge base still answers searches correctly (with nothing), and a
+        replica that stayed unready through a multi-hour first index would
+        take the whole Service down for that time — which is the opposite of
+        what the readiness probe is for.
+        """
+
+        payload: dict[str, object] = {
+            "status": "ready",
+            "knowledge_base": config.knowledge_base_id,
+            **describe_role(role_policy),
+        }
+        try:
+            state.rows("SELECT 1 AS ok", ())
+        except Exception as exc:  # noqa: BLE001 - any failure means not ready
+            logger.warning("readiness probe failed: %s", exc)
+            payload["status"] = "not_ready"
+            payload["reason"] = "state store unreachable"
+            return JSONResponse(status_code=503, content=payload)  # type: ignore[return-value]
+        return payload
 
     def _authorize_worker(authorization: str | None) -> None:
         """Gate + constant-time token check shared by both worker routes."""
@@ -1327,7 +1369,22 @@ def create_app(
         The server deliberately does not index in-process: that work is
         CPU-bound Python and, under the GIL, it starves the very requests this
         API exists to answer. See :mod:`pheasant.sync.worker`.
+
+        A role that does not index refuses here rather than silently doing it
+        anyway. `wait: true` asks this process to run a sync and return the
+        result, and an api replica cannot honour that — it can only publish,
+        which is a different promise. Saying so with a 409 and the fix is
+        better than either lying or quietly changing the contract.
         """
+
+        if not role_policy.indexes_locally:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"role '{role_policy.name}' does not index; retry with wait=false to "
+                    "queue this sync for an indexer to run"
+                ),
+            )
 
         from pheasant.sync.worker import WorkerBackedEngine
 
@@ -1414,6 +1471,8 @@ def create_app(
         racing in before the first thread has even started.
         """
         names = [source_name] if source_name else [s.name for s in config.sources if s.enabled]
+        if not role_policy.indexes_locally:
+            return _publish_background_sync(names, mode)
         with app.state.sync_lock:
             to_start = [name for name in names if jobs.active_for(name) is None]
             if not to_start:
@@ -1430,6 +1489,52 @@ def create_app(
             daemon=True,
         ).start()
         return job.id
+
+    def _publish_background_sync(names: list[str], mode: str) -> str | None:
+        """Hand the work to an indexer instead of running it here.
+
+        This is what the ``api`` role *is*. Three api replicas that each
+        indexed on request would put three processes on one source; publishing
+        means whichever indexer is free picks it up, exactly once, and the
+        caller still gets an id to poll.
+
+        Task ids are content-addressed on (knowledge base, source, mode) —
+        the same rule ``sync_all`` uses — so two replicas answering the same
+        user's double-click enqueue one task, not two.
+        """
+
+        import hashlib
+
+        from pheasant.sync.queue import IndexTask, queue_from_config
+
+        queue = queue_from_config(config, state)
+        if queue is None:  # pragma: no cover - validate_role refuses this at startup
+            raise HTTPException(
+                status_code=503,
+                detail="this process does not index and no queue is configured",
+            )
+        published: list[str] = []
+        try:
+            for name in names:
+                digest = hashlib.sha256(
+                    f"{config.knowledge_base_id}\0{name}\0{mode}".encode()
+                ).hexdigest()[:24]
+                task = IndexTask(
+                    id=f"idx-{digest}",
+                    source_id=name,
+                    mode=str(mode),
+                    payload={"max_depth": None, "full_scan": False},
+                    max_attempts=max(1, int(config.sync.queue.max_attempts or 1)),
+                )
+                try:
+                    queue.publish(task)
+                    published.append(task.id)
+                except Exception as exc:  # noqa: BLE001 - already queued is not an error
+                    logger.debug("Index task for %s already queued (%s)", name, exc)
+                    published.append(task.id)
+        finally:
+            queue.close()
+        return published[0] if len(published) == 1 else (published[0] if published else None)
 
     @app.post("/sync")
     def sync_all(req: SyncRequest) -> dict:

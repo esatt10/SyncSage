@@ -86,23 +86,122 @@ def _report_ui(app_obj, cfg) -> None:
         )
 
 
-def _serve_app(cfg, config_path: str, *, report_ui: bool = True) -> None:
+def _serve_app(cfg, config_path: str, *, report_ui: bool = True, role: str | None = None) -> None:
     import uvicorn
 
     from pheasant.api.app import create_app
+    from pheasant.deployment.roles import resolve_role
 
-    app_obj = create_app(cfg, config_path=config_path)
-    if report_ui:
+    policy = resolve_role(cfg, role)
+    app_obj = create_app(cfg, config_path=config_path, role=policy.name)
+    if report_ui and policy.serves_ui:
         _report_ui(app_obj, cfg)
     watcher, scheduler = _sync_services(app_obj.state.engine, cfg, config_path=config_path)
-    watcher.start()
-    scheduler.start()
+    drainer = _queue_drainer(cfg, config_path, policy)
+    if policy.runs_watcher:
+        watcher.start()
+    if policy.runs_scheduler:
+        scheduler.start()
+    if drainer is not None:
+        drainer.start()
+    if not policy.is_default:
+        print(f"role: {policy.name}")
     try:
         uvicorn.run(app_obj, host=cfg.server.host, port=cfg.server.port)
     finally:
+        if drainer is not None:
+            drainer.stop()
         scheduler.stop()
         watcher.stop()
         app_obj.state.engine.close()
+
+
+class _QueueDrainer:
+    """Claim and run index tasks for as long as this process serves.
+
+    A background thread rather than a second process: the sync it runs already
+    goes to a child through ``WorkerBackedEngine``, so the drain loop itself is
+    only waiting, and giving it its own process would buy nothing but a second
+    thing to supervise.
+
+    The loop lives here rather than in ``SyncEngine`` because it is a
+    *deployment* behavior — it exists only for the indexer role, and an engine
+    that drained a queue on its own would do it inside the CLI, the tests, and
+    every embedded caller too.
+    """
+
+    def __init__(self, cfg, config_path: str) -> None:
+        self.cfg = cfg
+        self.config_path = config_path
+        self._stop = None
+        self._thread = None
+
+    def start(self) -> None:
+        import threading
+
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="pheasant-drainer", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            # Bounded: a task in flight finishes, but a shutdown must not wait
+            # out a multi-hour index. The visibility timeout hands an
+            # unfinished task to the next indexer, which is exactly the
+            # mechanism that makes an abrupt stop safe.
+            self._thread.join(timeout=10)
+
+    def _run(self) -> None:
+        import logging
+
+        from pheasant.sync.queue import drain, owner_id, queue_from_config
+
+        log = logging.getLogger("pheasant.cli")
+        engine = _engine(Path(self.config_path))
+        queue = queue_from_config(self.cfg, engine.state)
+        if queue is None:
+            log.warning("role 'indexer' has no queue configured; nothing will be drained")
+            engine.close()
+            return
+        from pheasant.sync.worker import WorkerBackedEngine
+
+        worker = WorkerBackedEngine(engine, self.config_path)
+        owner = owner_id()
+        visibility = float(self.cfg.sync.queue.visibility_seconds or 300)
+        log.info("draining index queue as %s", owner)
+        try:
+            while not self._stop.is_set():
+                # A short idle timeout rather than a long block: `drain`
+                # returns when the backlog clears, and the outer loop is what
+                # notices the stop event. Blocking inside `drain` for minutes
+                # would make SIGTERM take minutes.
+                drain(
+                    queue,
+                    lambda task: worker.sync_source(
+                        task.source_id,
+                        task.mode,
+                        max_depth=task.max_depth,
+                        full_scan=task.full_scan,
+                    ),
+                    owner=owner,
+                    idle_timeout=2.0,
+                    visibility_seconds=visibility,
+                )
+        except Exception:  # noqa: BLE001 - a drainer that dies silently is worse
+            log.exception("index queue drainer stopped")
+        finally:
+            queue.close()
+            engine.close()
+
+
+def _queue_drainer(cfg, config_path: str, policy):
+    """The drain loop, or ``None`` when this role does not claim tasks."""
+
+    if not policy.drains_queue:
+        return None
+    return _QueueDrainer(cfg, config_path)
 
 
 def _engine(config_path: Path):
@@ -518,6 +617,12 @@ def main(argv: list[str] | None = None) -> int:
     server_config_default = os.environ.get("PHEASANT_CONFIG", "/config/pheasant.yaml")
     serve_p = sub.add_parser("serve")
     serve_p.add_argument("--config", "-c", default=server_config_default)
+    serve_p.add_argument(
+        "--role",
+        choices=("all", "api", "indexer", "worker"),
+        default=None,
+        help="Which jobs this process takes on. Default: server.role, or 'all'.",
+    )
     worker_p = sub.add_parser(
         "worker",
         help="Run a stateless preparation worker for a remote coordinator.",
@@ -1032,11 +1137,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "serve":
         from pheasant.config.loader import load_config
+        from pheasant.deployment.roles import RoleConfigurationError
 
         cfg = load_config(Path(args.config))
         # `serve` is the container entrypoint, where the UI is a separate
         # sidecar workload — an npm hint in the image's logs would be noise.
-        _serve_app(cfg, args.config, report_ui=False)
+        try:
+            _serve_app(cfg, args.config, report_ui=False, role=args.role)
+        except RoleConfigurationError as exc:
+            print(str(exc))
+            return 1
         return 0
     if args.command == "worker":
         from pheasant.config.loader import load_config

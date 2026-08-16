@@ -16,6 +16,17 @@ pheasant:
 server:
   host: 0.0.0.0
   port: 8765
+  # Which jobs this process takes on. `all` is the default and is what a
+  # single container should stay on. In a fleet, split them so N serving
+  # replicas do not each watch the same directories and each try to index the
+  # same source:
+  #   all      — serve, watch, schedule, index (one container)
+  #   api      — serve only; publishes index work instead of running it, so
+  #              it REQUIRES sync.queue.enabled and an indexer on that queue
+  #   indexer  — watch, schedule and drain the queue (one per shard)
+  #   worker   — preparation only (see sync.concurrency.remote_worker_enabled)
+  # `pheasant serve --role <name>` overrides this.
+  role: all
   mcp:
     enabled: true
     transports:

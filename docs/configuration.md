@@ -87,9 +87,56 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 |---|---|---|---|
 | `host` | string | `0.0.0.0` | Bind address. `pheasant up` generates `127.0.0.1`; containers keep `0.0.0.0` (loopback inside a container is unreachable from the host) and compose publishes them to `127.0.0.1` instead. |
 | `port` | integer | `8765` | Primary service port. |
+| `role` | string | `all` | Which jobs this process takes on. `pheasant serve --role` overrides it. See below. |
 
 The API is unauthenticated, so the bind address is a security control, not
 just a networking detail — see [security.md](security.md#trust-model-for-the-http-api).
+
+### Process roles (`server.role`)
+
+One process doing everything is right for one container and wrong for a
+fleet — not for performance reasons, but because of replicas. Run three
+copies of the default process against one knowledge base and all three watch
+the same directories, all three fire the same scheduled sync, and all three
+try to index the same source. Roles say which jobs a process has:
+
+| Role | Watches | Schedules | Drains the queue | Indexes | Typical deployment |
+|---|---|---|---|---|---|
+| `all` | yes | yes | no | in-process | one container — **the default** |
+| `api` | no | no | no | **never** | N replicas behind a Service |
+| `indexer` | yes | yes | yes | in-process | one per shard |
+| `worker` | no | no | no | no | M replicas, autoscaled |
+
+```bash
+pheasant serve                     # all — unchanged
+pheasant serve --role api          # serve; publish index work
+pheasant serve --role indexer      # watch, schedule, drain
+pheasant worker --transport grpc   # preparation only
+```
+
+`all` deliberately does **not** drain the queue: a single container turns the
+queue on for [crash resumption](#the-index-work-queue-syncqueue), not to
+become a fleet member, and `sync_all` already drains what it publishes.
+
+**`api` requires the queue.** It publishes index work rather than running it,
+so without `sync.queue.enabled: true` and an indexer on the same queue a sync
+request would be accepted and then go nowhere. `pheasant serve --role api`
+refuses to start in that case rather than letting you find out later. A
+blocking sync (`wait: true`) against an api replica returns **409** with the
+fix, because publishing is a different promise from "run this and return the
+result".
+
+Routes are *not* hidden per role. What keeps search traffic off an indexer is
+the Service selector in front of it; a role whose `/search` returned 404 would
+be much harder to debug than one that simply has no clients. What a role
+changes is what the process does **on its own**.
+
+`GET /health` and `GET /ready` both report the role, so a pod can be
+identified from a probe response. `/ready` returns 503 when the state store is
+unreachable — that should take a replica out of the Service, not restart it,
+which is why it is separate from `/health`. It is deliberately **not** gated
+on the index being populated: a replica that stayed unready through a
+multi-hour first index would take the whole Service down for that time.
 
 ### MCP options (`server.mcp`)
 

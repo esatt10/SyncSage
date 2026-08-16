@@ -1,5 +1,31 @@
 # Running a worker fleet
 
+## Split the process first
+
+Before any of the below matters, decide what each process *is*. One pheasant
+process serves search, serves the UI, watches directories, runs the scheduler
+and indexes — right for one container, wrong for several, because three
+replicas of it all watch the same directories and all try to index the same
+source.
+
+```bash
+pheasant serve                    # all: today's behavior, the default
+pheasant serve --role api         # serve; publish index work to the queue
+pheasant serve --role indexer     # watch, schedule, drain the queue
+pheasant worker --transport grpc  # preparation only
+```
+
+`api` replicas scale with request traffic and never index; one `indexer` per
+shard does the indexing; `worker` pods do the parsing. The hand-off between
+api and indexer is the [queue](#queue-the-backlog), which is why `--role api`
+refuses to start without it — a sync request that is accepted and then goes
+nowhere is worse than one that is refused.
+
+`GET /health` and `GET /ready` report the role, so you can tell pods apart
+from a probe response. Full table in
+[configuration](../configuration.md#process-roles-serverrole).
+
+
 Indexing is CPU-bound Python. One container can only parse as fast as its own
 cores, and while it does, it is holding the GIL against the request path. A
 **preparation worker** is a second process — usually a second container — that

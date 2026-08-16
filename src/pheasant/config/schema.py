@@ -236,6 +236,12 @@ class UiSettings(ModelMixin):
 class ServerSettings(ModelMixin):
     host: str = "0.0.0.0"
     port: int = 8765
+    #: Which jobs this process takes on: ``all`` (the default and today's
+    #: behavior), ``api`` (serve only — publishes index work instead of
+    #: running it), ``indexer`` (watch, schedule and drain the queue) or
+    #: ``worker`` (preparation only). `pheasant serve --role` overrides this.
+    #: See :mod:`pheasant.deployment.roles`.
+    role: str = "all"
     mcp: McpSettings = field(default_factory=McpSettings)
     api: ApiSettings = field(default_factory=ApiSettings)
     ui: UiSettings = field(default_factory=UiSettings)
