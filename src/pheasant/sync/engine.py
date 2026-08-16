@@ -1419,21 +1419,6 @@ class SyncEngine:
             max_results=max_results,
         )
 
-    def export_obsidian_notes(
-        self,
-        vault_path=None,
-        preview: bool = False,
-        template_profile: str | None = None,
-    ) -> dict:
-        from pheasant.obsidian.exporter import ObsidianExporter
-
-        if vault_path is not None:
-            self.config.pheasant.vault_path = vault_path
-        return ObsidianExporter(self.config, self.state).export(
-            preview=preview,
-            template_profile=template_profile,
-        )
-
     def _snapshot_after_sync(self) -> None:
         """Write a compressed graph snapshot (interval-throttled) + prune.
 

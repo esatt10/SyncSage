@@ -232,7 +232,7 @@ def _strip_memory_frontmatter(source: SourceConfig, text: str) -> tuple[str, int
     Returns ``(text, lines_removed)``; a no-op for every other source type, so
     no existing index shifts. Scoped this narrowly on purpose: stripping YAML
     frontmatter from *all* Markdown would change chunk boundaries — and
-    therefore ``chunk:{...}:sha256={text_hash}`` ids — for every vault and
+    therefore ``chunk:{...}:sha256={text_hash}`` ids — for every notes and
     docs folder already indexed, which is a re-index nobody asked for.
 
     For memory records it is a straight win. The frontmatter is machine-written

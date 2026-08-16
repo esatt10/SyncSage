@@ -31,7 +31,6 @@ def _make_engine(tmp_path: Path, sources: list[dict[str, Any]], *, wasm: bool) -
             "pheasant": {
                 "name": "wasm-accel-acceptance",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "ws"),
                 "exports_path": str(tmp_path / "exports"),
             },

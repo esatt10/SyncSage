@@ -58,7 +58,6 @@ def _config(tmp_path: Path, *, enforced: bool) -> Any:
         f"""pheasant:
   name: acl-test
   state_path: {tmp_path / "state"}
-  vault_path: {tmp_path / "vault"}
   exports_path: {tmp_path / "exports"}
   workspace_root: {tmp_path}
 security:
@@ -202,7 +201,6 @@ def _memory_config(tmp_path, *, enforced: bool = True):
         f"""pheasant:
   name: acl-memory
   state_path: {tmp_path / ".pheasant" / "state"}
-  vault_path: {tmp_path / ".pheasant" / "vault"}
   exports_path: {tmp_path / ".pheasant" / "exports"}
   workspace_root: {tmp_path}
 sync:

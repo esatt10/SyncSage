@@ -19,9 +19,8 @@ The project is still an active prototype, but the current architecture is intent
 - Ingests local and connector-backed sources through a `SourceConnector` abstraction.
 - Maintains SQLite search state, source manifests, connector checkpoints, graph snapshots, and audit history under `/state`.
 - Builds an enriched graph with sources, artifacts, chunks, symbols, entities, concepts, external references, and cross-artifact relationships.
-- Serves MCP tools/resources for source registration, sync, search, graph traversal, source lifecycle operations, and Obsidian export.
-- Provides HTTP endpoints for health, readiness, source status, sync, search, graph export, and Obsidian export.
-- Generates previewable Obsidian notes using workflow profiles for engineering, research, and project operations.
+- Serves MCP tools/resources for source registration, sync, search, graph traversal, and source lifecycle operations.
+- Provides HTTP endpoints for health, readiness, source status, sync, search, and graph export.
 - Supports layered configuration: base defaults + profile + YAML + CLI overrides.
 
 ## Architecture at a Glance
@@ -33,7 +32,7 @@ YAML/profile config
   -> parsing and chunking
   -> graph enrichment
   -> text / graph / hybrid search
-  -> MCP tools/resources, HTTP API, Obsidian projection
+  -> MCP tools/resources, HTTP API, web UI
 ```
 
 Core components:
@@ -47,7 +46,6 @@ Core components:
 | Graph builder | Creates stable graph nodes/edges and applies code, document, and similarity enrichment. |
 | Search store | Combines SQLite FTS/path search, graph-derived term expansion, and graph search over node/relationship attributes via `text`/`graph`/`hybrid` modes. |
 | MCP server | Provides the primary agent interface for retrieval, sync, graph navigation, and source lifecycle operations. |
-| Obsidian exporter | Creates previewable source, concept, file, and optional chunk notes with graph-driven links. |
 
 ## Quick Start
 
@@ -85,7 +83,7 @@ API and MCP endpoint. Trouble getting the UI up, or seeing a stale one? →
 **[Run the web UI](docs/how-to/run-the-ui.md)**.
 
 Want a completely fresh, UI-managed container instead? This single command
-rebuilds pheasant, clears its named config/state/vault/export volumes, creates
+rebuilds pheasant, clears its named config/state/export volumes, creates
 a clean container-native config, and serves the UI at
 <http://localhost:8765>:
 
@@ -164,9 +162,9 @@ base defaults + profile + user YAML + CLI/env overrides
 Built-in profiles:
 
 - `quickstart`: local defaults with API and MCP enabled.
-- `dev`: local developer defaults with debug logging and chunk-note export.
+- `dev`: local developer defaults with debug logging.
 - `team`: shared-service defaults with HTTP/SSE-oriented MCP settings.
-- `cloud-hybrid`: cloud/mounted-source defaults with research-style Obsidian output.
+- `cloud-hybrid`: cloud/mounted-source defaults for mounted or remote sources.
 
 Common commands:
 
@@ -264,7 +262,6 @@ Primary MCP tools:
 - `get_file_summary`
 - `get_repo_map`
 - `explain_node`
-- `export_obsidian_notes`
 - `get_sync_status`
 - `get_sync_history`
 
@@ -278,45 +275,6 @@ Runtime lifecycle flow:
 
 See [docs/mcp_tools.md](docs/mcp_tools.md) and [docs/mcp_client.md](docs/mcp_client.md).
 
-## Obsidian Projection
-
-pheasant can export a human-readable vault projection under `/vault/pheasant` by default.
-
-Preview without writing:
-
-```bash
-curl -X POST http://localhost:8765/obsidian/export \
-  -H "content-type: application/json" \
-  -d '{"preview": true, "template_profile": "engineering"}'
-```
-
-Write notes:
-
-```bash
-curl -X POST http://localhost:8765/obsidian/export
-```
-
-Generated layout:
-
-```text
-pheasant/
-  Index.md
-  Sources/
-  Concepts/
-  Files/
-  Chunks/        # optional
-```
-
-Template profiles:
-
-- `engineering`
-- `research`
-- `project-ops`
-
-The exporter creates source -> concept -> file -> chunk navigation when the indexed graph has enrichment terms and chunk notes are enabled.
-
-See [docs/obsidian_integration.md](docs/obsidian_integration.md).
-
 ## HTTP API
 
 Important endpoints:
@@ -329,7 +287,6 @@ Important endpoints:
 - `GET /search/embeddings`, `PUT /search/embeddings`, `POST /search/embeddings/reindex`
 - `GET /graph`, `GET /graph/export/node-link-json`, `GET /graph/export/cytoscape-json`
 - `GET /mcp/info`
-- `POST /obsidian/export`
 
 Full list: [docs/reference/http-api.md](docs/reference/http-api.md).
 
@@ -440,7 +397,6 @@ It is published to GitHub Pages by `.github/workflows/docs.yml` on pushes to `ma
 - [MCP client setup](docs/mcp_client.md)
 - [Deployment](docs/deployment.md)
 - [Agentic workflows](docs/agentic_workflows.md)
-- [Obsidian integration](docs/obsidian_integration.md)
 - [Security](docs/security.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [pheasant as a Synapse region](docs/SYNAPSE_INTEGRATION.md)

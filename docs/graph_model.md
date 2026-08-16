@@ -30,7 +30,8 @@ pheasant uses a directed multi-graph model, compatible with `networkx.MultiDiGra
 | `links_to`, `tagged_with` | Optional Markdown/document relationships. |
 | `about` | What an agent-memory record is *about* (Step 33.7): the record to the corpus artifact, symbol, heading or entity it refers to. Attributes: `record_id`, `match_signal` (`reference` \| `symbol` \| `heading` \| `entity`, strongest first — a record takes the first that fires), `matched` (what actually matched) and `confidence`. Capped per record, so total `about` edges stay bounded by `records x targets`. A lexical/BM25 rung was deliberately **not** materialized: the search index answers that at query time, and materializing it is how the concept layer reached 98.6% of all edges. |
 | `belongs_to_branch`, `at_commit`, `supersedes` | Git and version lineage. `supersedes` was documented from the initial build but **unemitted until 2026-08-11**, when Step 33.7 began drawing it between agent-memory records — before that a correction existed only as a frontmatter string resolved in Python, and the graph could not answer "what replaced this". |
-| `generated_note`, `retrieved_by`, `modified_by` | Obsidian projection and agent audit. |
+| ~~`generated_note`~~ | **Retired 2026-08-16** with the Obsidian projection it described. Like `heading`/`has_heading` before 2026-08-06, it was documented from the initial build and **never emitted** — no graph written by any release contains one. |
+| `retrieved_by`, `modified_by` | Agent audit. |
 
 ## Stable IDs
 

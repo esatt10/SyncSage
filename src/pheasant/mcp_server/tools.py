@@ -15,7 +15,6 @@ from pheasant.config.loader import dump_config_yaml
 from pheasant.config.schema import PheasantConfig, SourceConfig, SourceType
 from pheasant.ingestion.pipeline import utc_now
 from pheasant.jobs import JobRegistry
-from pheasant.obsidian.exporter import ObsidianExporter
 from pheasant.persistence.paths import StatePaths
 from pheasant.persistence.state_store import StateStore
 from pheasant.registry.knowledge_base_registry import KnowledgeBaseRegistry
@@ -113,7 +112,6 @@ class PheasantTools:
                 path,
                 [
                     self.config.pheasant.workspace_root,
-                    self.config.pheasant.vault_path,
                     self.config.pheasant.exports_path,
                     *self.config.security.allow_workspace_roots,
                 ],
@@ -993,21 +991,6 @@ class PheasantTools:
             "explanation": f"{node.get('label')} is a {node.get('type')} node indexed by pheasant.",
             "provenance": node.get("provenance"),
         }
-
-    def export_obsidian_notes(
-        self,
-        knowledge_base: str,
-        source_name: str | None = None,
-        scope: str = "knowledge_base",
-        preview: bool = False,
-        template_profile: str | None = None,
-    ) -> dict:
-        self._require_knowledge_base(knowledge_base)
-        return ObsidianExporter(self.config, self.state).export(
-            source_name,
-            preview=preview,
-            template_profile=template_profile,
-        )
 
     def get_sync_status(self, knowledge_base: str) -> dict:
         self._require_knowledge_base(knowledge_base)

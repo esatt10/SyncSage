@@ -32,7 +32,6 @@ def _base_config(tmp_path: Path, sources: list[dict]) -> dict:
         "pheasant": {
             "name": "path-tests",
             "state_path": str(tmp_path / "state"),
-            "vault_path": str(tmp_path / "vault"),
             "workspace_root": str(workspace),
             "exports_path": str(tmp_path / "exports"),
         },

@@ -1,6 +1,5 @@
 pheasant:
   name: acceptance-knowledge
-  vault_path: "{vault_path}"
   state_path: "{state_path}"
   exports_path: "{exports_path}"
 

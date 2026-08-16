@@ -27,7 +27,6 @@ from pheasant.graph.exporter import cytoscape, node_link
 from pheasant.graph.simple import SimpleMultiDiGraph
 from pheasant.ingestion.pipeline import read_text, utc_now
 from pheasant.jobs import JobRegistry
-from pheasant.obsidian.exporter import ObsidianExporter
 from pheasant.persistence.paths import StatePaths
 from pheasant.persistence.state_store import StateStore
 from pheasant.registry.knowledge_base_registry import KnowledgeBaseRegistry
@@ -163,12 +162,6 @@ class SyncRequest(BaseModel):
     # "sync now" button) sets this false and polls `GET /sources`'
     # `syncing`/`sync_error` fields instead.
     wait: bool = True
-
-
-class ObsidianExportRequest(BaseModel):
-    source_name: str | None = None
-    preview: bool = False
-    template_profile: str | None = None
 
 
 class RegisterSourceRequest(BaseModel):
@@ -357,7 +350,6 @@ LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
     "search": True,
     "assistant": True,
     "graph": True,
-    "obsidian": True,
     "memory": True,
     "ingestion": False,  # captioner/transcriber are wired at engine construction
     "sync": False,  # watcher/scheduler services are started at boot
@@ -376,7 +368,6 @@ def _allowed_roots(config: PheasantConfig) -> list[Path]:
     """
     roots = [
         config.pheasant.workspace_root,
-        config.pheasant.vault_path,
         config.pheasant.exports_path,
         *config.security.allow_workspace_roots,
     ]
@@ -401,7 +392,6 @@ def _configured_roots(config: PheasantConfig) -> list[Path]:
     """
     roots = [
         config.pheasant.workspace_root,
-        config.pheasant.vault_path,
         config.pheasant.exports_path,
         *config.security.allow_workspace_roots,
     ]
@@ -427,7 +417,6 @@ def _config_write_roots(config: PheasantConfig) -> list[Path]:
     """
     roots = [
         config.pheasant.workspace_root,
-        config.pheasant.vault_path,
         config.pheasant.exports_path,
         *config.security.allow_workspace_roots,
     ]
@@ -2726,14 +2715,6 @@ def create_app(
             return effective_config_dict(app.state.config_path, profile, {})
         except ConfigError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.post("/obsidian/export")
-    def obsidian_export(req: ObsidianExportRequest | None = None) -> dict:
-        return ObsidianExporter(config, state).export(
-            req.source_name if req else None,
-            preview=req.preview if req else False,
-            template_profile=req.template_profile if req else None,
-        )
 
     # ------------------------------------------------------------------
     # Overview — one call that tells the UI whether there is anything to

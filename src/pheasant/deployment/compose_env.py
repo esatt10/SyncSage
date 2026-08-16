@@ -13,7 +13,6 @@ ENV_ORDER = (
     "PHEASANT_IMAGE",
     "PHEASANT_CONFIG_PATH",
     "PHEASANT_WORKSPACE_PATH",
-    "PHEASANT_VAULT_PATH",
     "PHEASANT_DATA_PATH",
 )
 
@@ -63,7 +62,6 @@ def load_compose_environment(config_path: str | Path) -> dict[str, str]:
         "PHEASANT_WORKSPACE_PATH": _compose_host_path(
             _string(compose.get("workspace_path"), "./workspace")
         ),
-        "PHEASANT_VAULT_PATH": _compose_host_path(_string(compose.get("vault_path"), "./vault")),
         # Extra read-only bind mount for local files that live OUTSIDE the
         # workspace, surfaced in the container at /data (an allowed source root).
         "PHEASANT_DATA_PATH": _compose_host_path(_string(compose.get("data_path"), "./data")),

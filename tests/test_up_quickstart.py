@@ -166,7 +166,6 @@ def test_up_adds_a_new_target_to_an_existing_config(tmp_path: Path) -> None:
         json.dumps(
             {
                 "pheasant.state_path": str(tmp_path / "state"),
-                "pheasant.vault_path": str(tmp_path / "vault"),
                 "pheasant.exports_path": str(tmp_path / "exports"),
             }
         ),

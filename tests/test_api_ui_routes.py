@@ -510,7 +510,6 @@ def test_the_advertised_mcp_endpoint_is_actually_mounted(tmp_path) -> None:
         f"""pheasant:
   name: mcp-mount
   state_path: {tmp_path / "state"}
-  vault_path: {tmp_path / "vault"}
   exports_path: {tmp_path / "exports"}
   workspace_root: {tmp_path}
 sync:
@@ -581,7 +580,6 @@ def test_mcp_transport_security_follows_the_configured_cors_origins(tmp_path) ->
         f"""pheasant:
   name: mcp-hosts
   state_path: {tmp_path / "state"}
-  vault_path: {tmp_path / "vault"}
   exports_path: {tmp_path / "exports"}
   workspace_root: {tmp_path}
 server:

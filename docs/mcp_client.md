@@ -49,14 +49,10 @@ Then in VS Code:
 1. Run `MCP: List Servers`.
 2. Start `pheasant`.
 3. Open Chat in Agent mode.
-4. Use tools such as `list_knowledge_bases`, `sync_all`, `search_context`, and `export_obsidian_notes`.
+4. Use tools such as `list_knowledge_bases`, `sync_all`, and `search_context`.
 
 If you change the compose container name, regenerate the config with:
 
 ```bash
 pheasant client-config vscode --container-name <name> --output .vscode/mcp.json
 ```
-
-## Obsidian
-
-Set `deployment.compose.vault_path` in `pheasant.yaml` to the host folder you want to open in Obsidian. pheasant writes managed notes to `/vault/pheasant`, which appears as `pheasant/` in that host folder. Open the host folder in Obsidian and use `export_obsidian_notes` after indexing.

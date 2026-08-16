@@ -172,11 +172,10 @@ def build_sections() -> list[Section]:
             id="paths",
             title="Where things live on disk",
             blurb=(
-                "pheasant splits its storage three ways: /state is operational truth "
-                "(SQLite, the graph, manifests) and is user data — back it up; /vault "
-                "is the human-readable Obsidian projection; /exports holds regenerable "
-                "payloads. The defaults are the container paths; running outside "
-                "Docker you probably want local directories."
+                "pheasant splits its storage two ways: /state is operational truth "
+                "(SQLite, the graph, manifests) and is user data — back it up; "
+                "/exports holds regenerable payloads. The defaults are the container "
+                "paths; running outside Docker you probably want local directories."
             ),
             covers=("storage",),
             questions=[
@@ -185,11 +184,6 @@ def build_sections() -> list[Section]:
                     prompt="State directory",
                     kind="path",
                     help="SQLite + graph + manifests. Treat as user data.",
-                ),
-                Question(
-                    key="pheasant.vault_path",
-                    prompt="Vault directory (Obsidian projection)",
-                    kind="path",
                 ),
                 Question(
                     key="pheasant.exports_path",
@@ -637,23 +631,6 @@ def build_sections() -> list[Section]:
             ],
         ),
         Section(
-            id="obsidian",
-            title="Obsidian projection",
-            blurb=(
-                "Optionally mirror the index into a human-readable Obsidian vault: "
-                "one note per source and file, with backlinks and a canvas. Purely "
-                "additive — nothing else reads it."
-            ),
-            covers=("obsidian",),
-            questions=[
-                Question(
-                    key="obsidian.enabled",
-                    prompt="Write the Obsidian vault projection?",
-                    kind="bool",
-                ),
-            ],
-        ),
-        Section(
             id="memory",
             title="Agent memory",
             blurb=(
@@ -780,8 +757,8 @@ def build_phases(sections: list[Section] | None = None) -> list[Phase]:
         Phase(
             "sources-content",
             "Sources & content",
-            "What to index, how documents are extracted, and the Obsidian projection.",
-            ("sources", "ingestion", "obsidian"),
+            "What to index and how documents are extracted.",
+            ("sources", "ingestion"),
         ),
         Phase(
             "search-graph",
@@ -1561,9 +1538,8 @@ class GuidedWizard(Wizard):
         env_output_path = getattr(self, "env_output_path", ".env")
         lines = [
             f"Output: {output_path}; secrets: {env_output_path} (values hidden)",
-            f"Paths: state={pheasant.get('state_path')}; vault={pheasant.get('vault_path')}",
-            "       exports="
-            f"{pheasant.get('exports_path')}; workspace={pheasant.get('workspace_root')}",
+            f"Paths: state={pheasant.get('state_path')}; exports={pheasant.get('exports_path')}",
+            f"       workspace={pheasant.get('workspace_root')}",
             f"Sources: {len(self.sources)} configured",
             f"Search: {search.get('default_mode')} | embedding model: {embedding_model}",
             f"Assistant: {provider_text} | workflow={assistant.get('workflow')}",

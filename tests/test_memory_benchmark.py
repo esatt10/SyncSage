@@ -31,7 +31,6 @@ def _tools(tmp_path: Path) -> PheasantTools:
         f"""pheasant:
   name: membench
   state_path: {tmp_path / "state"}
-  vault_path: {tmp_path / "vault"}
   exports_path: {tmp_path / "exports"}
   workspace_root: {tmp_path}
 sync:
@@ -93,7 +92,6 @@ def test_benchmark_requires_a_memory_source(tmp_path: Path) -> None:
         f"""pheasant:
   name: nomem
   state_path: {tmp_path / "state"}
-  vault_path: {tmp_path / "vault"}
   exports_path: {tmp_path / "exports"}
   workspace_root: {tmp_path}
 sources:

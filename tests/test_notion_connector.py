@@ -163,7 +163,6 @@ def test_engine_e2e_idempotent_and_incremental(tmp_path: Path, fake_api: FakeNot
             f"""pheasant:
   name: notion-test
   state_path: {tmp_path / "state"}
-  vault_path: {tmp_path / "vault"}
   exports_path: {tmp_path / "exports"}
   workspace_root: {tmp_path}
 sources:

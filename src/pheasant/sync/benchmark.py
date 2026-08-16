@@ -49,7 +49,6 @@ def _config(
             "pheasant": {
                 "name": "sync-benchmark",
                 "state_path": str(root / f"state-{file_executor}-{workers}-{run_id}"),
-                "vault_path": str(root / "vault"),
                 "workspace_root": str(workspace),
                 "exports_path": str(root / "exports"),
             },

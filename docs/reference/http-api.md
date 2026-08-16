@@ -178,24 +178,10 @@ See [Vector self-search](../how-to/vector-search.md).
 | GET | `/config/effective` | Resolved config after profile + YAML + overrides. |
 | PUT | `/config` | Update config. |
 
-## Obsidian
-
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/obsidian/export` | Export (or preview, with `{"preview": true}`) the Obsidian vault projection. |
-
 ## Example: search
 
 ```bash
 curl -X POST http://localhost:8765/search \
   -H "content-type: application/json" \
   -d '{"query": "billing owner", "mode": "hybrid", "max_results": 5}'
-```
-
-## Example: preview an Obsidian export
-
-```bash
-curl -X POST http://localhost:8765/obsidian/export \
-  -H "content-type: application/json" \
-  -d '{"preview": true, "template_profile": "engineering"}'
 ```

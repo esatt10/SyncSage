@@ -15,7 +15,6 @@ config:
       name: helm-pheasant
       environment: kubernetes
       state_path: /state
-      vault_path: /vault
       workspace_root: /workspace
       exports_path: /exports
     server:
@@ -48,9 +47,6 @@ persistence:
   state:
     enabled: true
     size: 10Gi
-  vault:
-    enabled: true
-    size: 5Gi
 
 resources:
   requests:

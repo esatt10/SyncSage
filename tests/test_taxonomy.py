@@ -107,7 +107,6 @@ def _engine(tmp_path: Path, text: str, *, taxonomy: dict | None = None, name: st
                 "pheasant": {
                     "name": f"taxonomy-{name}",
                     "state_path": str(tmp_path / "state"),
-                    "vault_path": str(tmp_path / "vault"),
                     "workspace_root": str(tmp_path / "workspace"),
                     "exports_path": str(tmp_path / "exports"),
                 },
@@ -529,7 +528,6 @@ def _client(tmp_path: Path) -> tuple[TestClient, Path]:
             "pheasant": {
                 "name": "taxonomy-api",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "workspace"),
                 "exports_path": str(tmp_path / "exports"),
             },
@@ -643,7 +641,6 @@ def test_mcp_register_source_accepts_the_toggle(tmp_path: Path) -> None:
             "pheasant": {
                 "name": "taxonomy-mcp",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "workspace"),
                 "exports_path": str(tmp_path / "exports"),
             },
@@ -954,7 +951,6 @@ def test_taxonomy_endpoint_reports_issues_and_ordinals(tmp_path: Path) -> None:
             "pheasant": {
                 "name": "taxonomy-ordinals",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "workspace"),
                 "exports_path": str(tmp_path / "exports"),
             },
@@ -1409,7 +1405,6 @@ def _agreement_client(tmp_path: Path) -> TestClient:
             "pheasant": {
                 "name": "agreement",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "workspace"),
                 "exports_path": str(tmp_path / "exports"),
             },

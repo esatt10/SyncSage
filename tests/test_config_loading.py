@@ -27,7 +27,7 @@ def _source_names(config: object) -> set[str]:
 
 
 def test_config_loads_example_yaml_with_expected_sources(
-    loaded_config: object, state_path: Path, vault_path: Path
+    loaded_config: object, state_path: Path
 ) -> None:
     """The rendered example config should load and preserve configured paths/sources."""
 
@@ -41,9 +41,7 @@ def test_config_loads_example_yaml_with_expected_sources(
         _get(loaded_config, "pheasant") if isinstance(loaded_config, Mapping) else loaded_config
     )
     state_value = str(_get(settings, "state_path"))
-    vault_value = str(_get(settings, "vault_path"))
     assert str(state_path) in state_value
-    assert str(vault_path) in vault_value
 
 
 def test_config_validation_reports_missing_source_path(tmp_path: Path, config_path: Path) -> None:
@@ -221,3 +219,66 @@ def test_yaml_shim_keeps_urls_in_lists_as_strings_like_pyyaml() -> None:
     ]
     # A genuine mapping item (colon *then space*) still parses as a mapping.
     assert parsed["sources"] == [{"name": "repo", "type": "git_repository"}]
+
+
+def test_config_with_removed_obsidian_settings_still_loads(tmp_path: Path) -> None:
+    """A pre-removal config must keep loading, not hard-fail.
+
+    The Obsidian projection went away, but the YAML files describing it are
+    user data sitting on real disks. `model_validate` drops unknown keys, so
+    this would pass silently even without the shim — what the shim adds, and
+    what this pins, is that the removal is *reported* rather than ignored.
+    """
+
+    from pheasant.config.loader import (
+        REMOVED_SETTINGS,
+        load_config,
+        load_layered_config,
+        warn_on_removed_settings,
+    )
+
+    config_path = tmp_path / "legacy.yaml"
+    config_path.write_text(
+        "pheasant:\n"
+        "  name: legacy-kb\n"
+        f"  state_path: {tmp_path / 'state'}\n"
+        f"  vault_path: {tmp_path / 'vault'}\n"
+        f"  exports_path: {tmp_path / 'exports'}\n"
+        f"  workspace_root: {tmp_path}\n"
+        "obsidian:\n"
+        "  enabled: true\n"
+        "  template_profile: engineering\n"
+        "sources: []\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    assert config.pheasant.name == "legacy-kb"
+    assert not hasattr(config, "obsidian")
+    assert not hasattr(config.pheasant, "vault_path")
+
+    # Both loaders report both removed keys, and every key carries guidance.
+    raw = {"pheasant": {"vault_path": "/vault"}, "obsidian": {"enabled": True}}
+    assert sorted(warn_on_removed_settings(raw)) == ["obsidian", "pheasant.vault_path"]
+    assert all(REMOVED_SETTINGS[key] for key in REMOVED_SETTINGS)
+
+    layered = load_layered_config(config_path, profile="dev", overrides={})
+    assert layered.pheasant.name == "legacy-kb"
+
+
+def test_removed_setting_warning_is_logged_once_per_process(tmp_path: Path, caplog: object) -> None:
+    """Config is re-read constantly; a notice that repeats gets filtered out."""
+
+    import logging
+
+    from pheasant.config import loader as loader_module
+
+    loader_module._WARNED.discard("obsidian")
+    raw = {"obsidian": {"enabled": True}}
+    with caplog.at_level(logging.WARNING, logger="pheasant.config.loader"):  # type: ignore[attr-defined]
+        loader_module.warn_on_removed_settings(raw)
+        loader_module.warn_on_removed_settings(raw)
+
+    obsidian_warnings = [r for r in caplog.records if "obsidian" in r.getMessage()]  # type: ignore[attr-defined]
+    assert len(obsidian_warnings) == 1
+    assert "graph workspace" in obsidian_warnings[0].getMessage()

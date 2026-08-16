@@ -3,7 +3,6 @@ deployment:
     image_repository: ghcr.io/esatt10/pheasant
     image_tag: 0.9.3
     workspace_path: .
-    vault_path: ./vault
 
 pheasant:
   name: local-pheasant
@@ -11,7 +10,6 @@ pheasant:
   environment: local
   log_level: INFO
   state_path: /state
-  vault_path: /vault
   workspace_root: /workspace
   exports_path: /exports
 
@@ -199,33 +197,9 @@ ingestion:
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
 
-obsidian:
-  enabled: true
-  write_mode: upsert
-  note_root: pheasant
-  template_profile: engineering
-  create_index_notes: true
-  create_source_notes: true
-  create_file_notes: true
-  create_chunk_notes: true
-  create_canvas: true
-  frontmatter:
-    include_source_id: true
-    include_hash: true
-    include_last_indexed: true
-    include_graph_node_id: true
-  backlinks:
-    enabled: true
-    style: wikilink
-  tags:
-    base:
-      - pheasant
-    by_source_type: true
-
 security:
   allow_workspace_roots:
     - /workspace
-    - /vault
     - /exports
     # Extra mount for local files that live outside ./workspace. Point the
     # PHEASANT_DATA_PATH env var (docker-compose.yml) at any host directory and
@@ -362,7 +336,6 @@ sources:
       - "docs/**"
       - "exports/**"
       - "state/**"
-      - "vault/**"
       - "workspace/**"
     repo:
       branch_policy: current
@@ -387,7 +360,7 @@ sources:
 
   - name: existing-obsidian-vault
     type: obsidian_vault
-    path: /vault
+    path: /workspace/my-vault
     description: Optional existing Obsidian vault to index as a source
     enabled: false
     include:

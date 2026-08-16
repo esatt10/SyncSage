@@ -6,7 +6,7 @@ config if none exists, then hand off to the ordinary sync engine and
 server. Everything here is config plumbing — indexing and serving reuse
 the exact code paths behind ``pheasant sync`` and ``pheasant start``.
 
-Generated configs anchor all state under ``.pheasant/{state,vault,exports}``
+Generated configs anchor all state under ``.pheasant/{state,exports}``
 next to the config file (absolute paths, so later invocations from another
 working directory keep hitting the same state). An existing config file is
 never rewritten — re-running ``up`` reuses it unchanged.
@@ -111,7 +111,7 @@ def slugify(name: str) -> str:
 
 
 def state_root(config_path: Path) -> Path:
-    """Where a generated config anchors its state/vault/exports/clones."""
+    """Where a generated config anchors its state/exports/clones."""
     return (config_path.resolve().parent / STATE_DIRNAME).resolve()
 
 
@@ -187,7 +187,6 @@ def render_up_config(
             "name": kb_name,
             "description": f"Personal knowledge base over {origin}",
             "state_path": str(local / "state"),
-            "vault_path": str(local / "vault"),
             "exports_path": str(local / "exports"),
             "workspace_root": str(workspace),
         }
@@ -201,7 +200,7 @@ def render_up_config(
     # host); it is compose that publishes them to 127.0.0.1.
     data["server"]["host"] = "127.0.0.1"
     roots = [str(workspace)]
-    for candidate in [*(str(p) for p in local_paths), str(local / "vault"), str(local / "exports")]:
+    for candidate in [*(str(p) for p in local_paths), str(local / "exports")]:
         if candidate not in roots:
             roots.append(candidate)
     data["security"]["allow_workspace_roots"] = roots

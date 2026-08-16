@@ -670,7 +670,7 @@ A region remains the existing container (`Dockerfile`, port 8765, PVC on
   scale-up) + a headless `Service` + a `ConfigMap`**. **No pheasant code
   change** was needed: the region pod spec in the chart **mirrors this
   repo's `deploy/kubernetes/` manifests** (port 8765, `/health`+`/ready`
-  probes, `/state`+`/config`+`/vault`+`/workspace`+`/exports` mounts,
+  probes, `/state`+`/config`+`/workspace`+`/exports` mounts,
   non-root 10001, read-only rootfs) — those manifests remain the pod-spec
   baseline; the chart vendors that shape on the router side (chart values),
   the same boundary as the 25.1 compose configs. Regions publish their
@@ -959,3 +959,84 @@ a query that triggers `_relationship_hits` improves measurably with the WASM
 path enabled vs. disabled on the benchmark fixture, and that
 `pheasant sync --mode incremental` on a one-file change shows a lower fixed-
 cost floor with 34.5a enabled on a multi-source corpus.
+
+---
+
+## 6. Phase 35 — Horizontal scale, durable coordination, capacity guidance (executes in this repo)
+
+**Status:** in progress (opened 2026-08-16). Not Synapse-contract work — no
+wire-format impact, no re-vendor of `contracts/`, no `[x-repo]` obligation.
+Tracked here per the existing convention for phased region-hardening work
+(Phase 21 §2, Phase 34 §5). One step per agent session; each run writes
+`runs/<ts>-synapse-35.N/SUMMARY.md`.
+
+**Why now.** Running several large collections at once exposes that pheasant is
+architecturally *one process, one writer, one knowledge base*: `sync/locks.py`'s
+`EngineLease` permits exactly one writer per `/state` dir, the graph is a single
+in-RAM zstd-JSON blob rewritten whole on every checkpoint
+(`persistence/graph_store.py`), the shipped manifests pin `replicas: 1` on RWO
+volumes, `/metrics` is a stub returning `pheasant_up 1`, and job progress is
+per-process and in-memory (`jobs.py`) so a multi-hour first index is
+indistinguishable from a hang and invisible to any other replica. The measured
+baseline to beat: **8x the file workers bought 1.113x**, because commits are
+serialized through one coordinator — scaling preparation was the easy half.
+
+**Standalone stays sacred (rule 7).** Postgres, the broker and gRPC are
+first-class *selectable backends*, not replacements. SQLite / in-process /
+HTTP remain the defaults; a `docker run` with no infrastructure must keep
+working, which is what holds the 5 MB end of the range.
+
+| Step | What | Status |
+|---|---|---|
+| 35.0 | Remove the Obsidian exporter | done (2026-08-16) |
+| 35.1 | Observability: real `/metrics`, persisted per-source progress with throughput/ETA/stall detection | queued |
+| 35.2 | `StateBackend` seam + Postgres backend (incl. FTS5 → `tsvector` port) | queued |
+| 35.3 | `GraphBackend`: bounded memory, hot loops pushed into SQL | queued |
+| 35.4 | Multi-writer indexing: per-source leases + durable work queue + sharding | queued |
+| 35.5 | Broker (NATS JetStream) and gRPC as first-class transports | queued |
+| 35.6 | Process roles, autoscaling, and the three runtimes | queued |
+| 35.7 | Measured capacity model and sizing guidance | queued |
+
+### Step 35.0 — Remove the Obsidian exporter (done 2026-08-16)
+
+**Contract:** delete the vault *projection* in its entirety; keep indexing an
+Obsidian vault as a *source*.
+
+The UI's graph workspace (`/graph`, added 2026-08-07) replaced the reason the
+projection existed. Removing it also halves the 35.2 seam audit:
+`obsidian/exporter.py` held 8 of the 16 raw `StateStore.rows()` call sites, and
+that raw-SQL escape hatch is what would otherwise defeat a backend seam.
+
+**Removed:** the `src/pheasant/obsidian/` package;
+`SyncEngine.export_obsidian_notes`; `POST /obsidian/export`; MCP
+`export_obsidian_notes`; `ObsidianSettings` and the `obsidian` config section;
+`PheasantSettings.vault_path`, `PheasantConfig.vault_path` and
+`StatePaths.vault`; every `/vault` mount (Dockerfile, compose, k8s, Helm) and
+the `/vault` entry in `security.allow_workspace_roots`;
+`docs/obsidian_integration.md` and its nav entry.
+
+**Kept:** `SourceType.obsidian_vault`, its `.obsidian/` autodetection
+(`quickstart.py`, `targets.py`) and its watcher entry — indexing a vault is an
+ingest feature and is unaffected.
+
+**Acceptance:**
+
+- A pre-removal config carrying `obsidian:` and `pheasant.vault_path` still
+  loads. `PheasantConfig.model_validate` already drops unknown keys, so this
+  passed *silently* before the shim; what `config/loader.warn_on_removed_settings`
+  adds — and what the test pins — is that the removal is **reported**, once per
+  process per key, with guidance. Mutation-tested: neutering the helper fails
+  both tests.
+- `pheasant up` on a `.obsidian/` fixture still detects `obsidian_vault`.
+- Files already written under a `/vault` mount are user data and are left
+  untouched on disk (rule 2); nothing is deleted.
+
+**Rule 8 exception:** removing the `export_obsidian_notes` MCP tool is a
+breaking change to a public surface that is otherwise evolved additively. It
+was removed outright rather than deprecated because the exporter behind it is
+gone. Recorded in CLAUDE.md rule 8 and `docs/mcp_tools.md`.
+
+**Graph taxonomy:** `generated_note` is retired in `docs/graph_model.md`. It
+was documented from the initial build and **never emitted** by any release, so
+no persisted graph contains one — the removal cannot invalidate stored state
+(rule 3 untouched: the stable-ID grammar does not change).

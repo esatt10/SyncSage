@@ -66,7 +66,6 @@ def _make_document_engine(tmp_path: Path, *, provider: str = "auto") -> SyncEngi
             "pheasant": {
                 "name": "document-acceptance",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "workspace"),
                 "exports_path": str(tmp_path / "exports"),
             },
@@ -252,7 +251,6 @@ def test_text_only_region_builds_no_extractor(tmp_path: Path) -> None:
             "pheasant": {
                 "name": "text-only",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "workspace"),
                 "exports_path": str(tmp_path / "exports"),
             },
@@ -579,7 +577,6 @@ def _api_client(tmp_path: Path, fixture: Path, pattern: str):
             "pheasant": {
                 "name": "runtime-source",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "workspace"),
                 "exports_path": str(tmp_path / "exports"),
             },

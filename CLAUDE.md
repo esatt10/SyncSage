@@ -24,9 +24,10 @@ Design pillars (do not violate):
   call at sync time is the optional embedding provider, Phase 21.4, which
   must keep a stub/offline path.)
 - **Persistence split** — `/state` (operational truth: SQLite + graph
-  JSON + manifests), `/vault` (human-readable Obsidian projection),
-  `/exports` (regenerable payloads). State dirs are **user data**:
-  migrations must be one-shot, idempotent, and preserve originals.
+  JSON + manifests) and `/exports` (regenerable payloads). State dirs are
+  **user data**: migrations must be one-shot, idempotent, and preserve
+  originals. (A third dir, `/vault`, held the Obsidian projection until
+  it was removed 2026-08-16 — see Phase 35.0.)
 
 ### 1.1 pheasant's second role: a Synapse brain region
 
@@ -98,8 +99,7 @@ pheasant/
 │   │                            resources.py, prompts.py, contracts.py
 │   ├── api/app.py             ← FastAPI: /health /ready /sources /sync /search
 │   │                            /graph /relevant-files /files /nodes /repos
-│   │                            /config /obsidian /fs /sync/status|history
-│   ├── obsidian/              ← exporter, templates, frontmatter, backlinks, canvas
+│   │                            /config /fs /sync/status|history
 │   ├── security/path_policy.py
 │   ├── telemetry/  deployment/
 ├── ui/                        ← React+Vite: Cytoscape graph workspace, source
@@ -171,7 +171,12 @@ docker compose up                          # container + optional UI sidecar
    `synapse.router_url` is unset.
 8. **MCP tool surface is public API.** Renaming/removing tools in
    `mcp_server/tools.py` breaks deployed agents — additive evolution only,
-   deprecate before remove.
+   deprecate before remove. **One sanctioned exception to date:**
+   `export_obsidian_notes` was removed outright in Phase 35.0
+   (2026-08-16) rather than deprecated, because the exporter behind it was
+   deleted and there was nothing left for the tool to do. That was a
+   user-approved decision, recorded here and in `docs/mcp_tools.md`; it is
+   a precedent for "the feature is gone", not for renames.
 9. **Cross-repo work** (anything marked [x-repo] in
    `docs/SYNAPSE_INTEGRATION.md`) follows the `pheasant-coordinator`
    skill in the pheasant-flock repo: identical branch names in both

@@ -126,13 +126,6 @@ def state_path(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def vault_path(tmp_path: Path) -> Path:
-    path = tmp_path / "vault"
-    path.mkdir()
-    return path
-
-
-@pytest.fixture()
 def exports_path(tmp_path: Path) -> Path:
     path = tmp_path / "exports"
     path.mkdir()
@@ -144,7 +137,6 @@ def config_path(
     tmp_path: Path,
     workspace_copy: Path,
     state_path: Path,
-    vault_path: Path,
     exports_path: Path,
 ) -> Path:
     """Render the acceptance-test YAML config with temporary paths."""
@@ -152,7 +144,6 @@ def config_path(
     rendered = CONFIG_TEMPLATE.read_text(encoding="utf-8").format(
         workspace_path=workspace_copy.as_posix(),
         state_path=state_path.as_posix(),
-        vault_path=vault_path.as_posix(),
         exports_path=exports_path.as_posix(),
     )
     path = tmp_path / "pheasant.yaml"
@@ -224,7 +215,6 @@ def make_vector_engine(tmp_path: Path, vector_provider: str = "numpy") -> Any:
             "pheasant": {
                 "name": "vector-acceptance",
                 "state_path": str(tmp_path / "vector-state"),
-                "vault_path": str(tmp_path / "vector-vault"),
                 "workspace_root": str(tmp_path / "vector-workspace"),
                 "exports_path": str(tmp_path / "vector-exports"),
             },

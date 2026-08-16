@@ -10,13 +10,11 @@ PROFILES: dict[str, dict[str, Any]] = {
             "port": 8765,
             "mcp": {"enabled": True, "transports": {"stdio": True, "streamable_http": True}},
         },
-        "obsidian": {"enabled": True, "template_profile": "engineering"},
         "sync": {"watcher": {"enabled": True}, "scheduler": {"enabled": True}},
     },
     "dev": {
         "pheasant": {"environment": "dev", "log_level": "DEBUG"},
         "server": {"host": "127.0.0.1", "port": 8765},
-        "obsidian": {"template_profile": "engineering", "create_chunk_notes": True},
         "sync": {"watcher": {"enabled": True}, "scheduler": {"enabled": False}},
     },
     "team": {
@@ -27,12 +25,10 @@ PROFILES: dict[str, dict[str, Any]] = {
             "mcp": {"transports": {"stdio": False, "streamable_http": True, "sse": True}},
             "api": {"enabled": True, "openapi": False},
         },
-        "obsidian": {"template_profile": "project-ops"},
     },
     "cloud-hybrid": {
         "pheasant": {"environment": "cloud-hybrid", "log_level": "INFO"},
         "server": {"host": "0.0.0.0", "port": 8765},
-        "obsidian": {"template_profile": "research"},
         "sync": {"watcher": {"enabled": True}, "scheduler": {"enabled": True}},
     },
 }

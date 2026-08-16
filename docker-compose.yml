@@ -42,7 +42,6 @@ services:
       # mounts into docker-compose.override.yml for you, and the UI tells you
       # the exact line to add when you paste a path it cannot see.
       - ${PHEASANT_DATA_PATH:-./data}:/data:ro
-      - ${PHEASANT_VAULT_PATH:-./vault}:/vault
       - pheasant-state:/state
       - pheasant-exports:/exports
     # Sized for a busy process, not just a dead one. /health returns a constant

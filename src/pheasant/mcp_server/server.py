@@ -428,24 +428,6 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         return tools.explain_node(knowledge_base, node_id)
 
     @mcp.tool()
-    def export_obsidian_notes(
-        knowledge_base: str,
-        source_name: str | None = None,
-        scope: str = "knowledge_base",
-        preview: bool = False,
-        template_profile: str | None = None,
-    ) -> dict:
-        """Write or update Obsidian-compatible Markdown notes."""
-
-        return tools.export_obsidian_notes(
-            knowledge_base,
-            source_name,
-            scope,
-            preview,
-            template_profile,
-        )
-
-    @mcp.tool()
     def get_sync_status(knowledge_base: str) -> dict:
         """Return source freshness and last sync status."""
 

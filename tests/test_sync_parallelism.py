@@ -31,7 +31,6 @@ def _config(
             "pheasant": {
                 "name": "parallel-acceptance",
                 "state_path": str(tmp_path / state_name),
-                "vault_path": str(tmp_path / f"{state_name}-vault"),
                 "workspace_root": str(workspace),
                 "exports_path": str(tmp_path / f"{state_name}-exports"),
             },

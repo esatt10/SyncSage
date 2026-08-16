@@ -71,7 +71,6 @@ Legend: — means "not offered on this surface"; use one of the others.
 | Graph slice (around a node) | — | `GET /graph/slice` | Click a citation or node | — |
 | Export node-link JSON | — | `GET /graph/export/node-link-json` | — | — |
 | Export Cytoscape JSON | — | `GET /graph/export/cytoscape-json` | — | — |
-| Obsidian projection | — | `POST /obsidian/export` | — | `export_obsidian_notes` |
 
 ## Federation (Synapse region)
 

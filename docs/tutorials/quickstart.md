@@ -44,8 +44,8 @@ Wrote pheasant.yaml (profile: quickstart)
 ```
 
 This writes a `pheasant.yaml` pre-populated from the `quickstart` profile (local
-defaults, API + MCP enabled). Open it — you'll see `sources:`, `search:`,
-`sync:`, and an `obsidian:` block.
+defaults, API + MCP enabled). Open it — you'll see `sources:`, `search:`
+and `sync:` blocks.
 
 ## 2. Point a source at a folder
 

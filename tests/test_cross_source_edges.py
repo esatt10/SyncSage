@@ -26,7 +26,6 @@ def _make_engine(tmp_path: Path, sources: list[dict[str, Any]]) -> SyncEngine:
             "pheasant": {
                 "name": "cross-source-acceptance",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "ws"),
                 "exports_path": str(tmp_path / "exports"),
             },

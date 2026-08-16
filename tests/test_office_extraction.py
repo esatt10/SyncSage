@@ -392,7 +392,6 @@ def _make_office_engine(tmp_path: Path, *, provider: str = "auto") -> SyncEngine
             "pheasant": {
                 "name": "office-acceptance",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "workspace"),
                 "exports_path": str(tmp_path / "exports"),
             },

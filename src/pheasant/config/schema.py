@@ -186,7 +186,6 @@ class PheasantSettings(ModelMixin):
     environment: str = "local"
     log_level: str = "INFO"
     state_path: Path = Path("/state")
-    vault_path: Path = Path("/vault")
     workspace_root: Path = Path("/workspace")
     exports_path: Path = Path("/exports")
 
@@ -549,19 +548,6 @@ class GraphSettings(ModelMixin):
 
 
 @dataclass
-class ObsidianSettings(ModelMixin):
-    enabled: bool = True
-    write_mode: str = "upsert"
-    note_root: str = "pheasant"
-    template_profile: str = "engineering"
-    create_index_notes: bool = True
-    create_source_notes: bool = True
-    create_file_notes: bool = True
-    create_chunk_notes: bool = False
-    create_canvas: bool = True
-
-
-@dataclass
 class SynapseSettings(ModelMixin):
     """Synapse federation (Synapse 21.5). Standalone-safe: all router-facing
     behavior no-ops when ``router_url`` is unset and ``publish`` is false.
@@ -741,7 +727,7 @@ class IdPSettings(ModelMixin):
 @dataclass
 class SecuritySettings(ModelMixin):
     allow_workspace_roots: list[Path] = field(
-        default_factory=lambda: [Path("/workspace"), Path("/vault"), Path("/exports")]
+        default_factory=lambda: [Path("/workspace"), Path("/exports")]
     )
     # Step 32.2 — principal-aware retrieval. Off by default: a standalone /
     # single-user region behaves byte-identically to pre-32. When enforced,
@@ -899,7 +885,6 @@ class PheasantConfig(ModelMixin):
     ingestion: IngestionSettings = field(default_factory=IngestionSettings)
     sync: SyncSettings = field(default_factory=SyncSettings)
     graph: GraphSettings = field(default_factory=GraphSettings)
-    obsidian: ObsidianSettings = field(default_factory=ObsidianSettings)
     security: SecuritySettings = field(default_factory=SecuritySettings)
     synapse: SynapseSettings = field(default_factory=SynapseSettings)
     memory: MemorySettings = field(default_factory=MemorySettings)
@@ -912,7 +897,7 @@ class PheasantConfig(ModelMixin):
             raw = raw or {}
             _coerce_scalar_fields(dc, raw)
             if dc is PheasantSettings:
-                for key in ("state_path", "vault_path", "workspace_root", "exports_path"):
+                for key in ("state_path", "workspace_root", "exports_path"):
                     if key in raw:
                         raw[key] = Path(raw[key])
             if dc is StorageSettings:
@@ -972,7 +957,6 @@ class PheasantConfig(ModelMixin):
             ingestion=build(IngestionSettings, data.get("ingestion")),
             sync=build(SyncSettings, data.get("sync")),
             graph=build(GraphSettings, data.get("graph")),
-            obsidian=build(ObsidianSettings, data.get("obsidian")),
             security=build(SecuritySettings, data.get("security")),
             synapse=build(SynapseSettings, data.get("synapse")),
             memory=build(MemorySettings, data.get("memory")),
@@ -1074,7 +1058,3 @@ class PheasantConfig(ModelMixin):
     @property
     def state_path(self) -> Path:
         return self.pheasant.state_path
-
-    @property
-    def vault_path(self) -> Path:
-        return self.pheasant.vault_path

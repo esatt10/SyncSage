@@ -67,7 +67,6 @@ makes operations (backups, restores, mounts) predictable:
 | Directory | Contents | Treat as |
 |---|---|---|
 | `/state` | SQLite DB, graph JSON + zstd snapshots, manifests, the published contract, the event stream, the vector index | **Operational source of truth — user data.** Back this up. |
-| `/vault` | Human-readable Obsidian projection | Regenerable; keep concise |
 | `/exports` | Graph JSON and visualization payloads | Regenerable |
 
 See [Architecture](architecture.md) for the full component map and runtime flow.

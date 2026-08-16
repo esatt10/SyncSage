@@ -288,7 +288,7 @@ def _run_mount(args) -> int:
         roots = list(security.get("allow_workspace_roots") or [])
         if container not in roots:
             # Keep the defaults: replacing the field wholesale with one entry
-            # would lock the user out of /workspace and /vault.
+            # would lock the user out of /workspace.
             if not roots:
                 from pheasant.config.schema import SecuritySettings
 
@@ -684,7 +684,6 @@ def main(argv: list[str] | None = None) -> int:
         errors = validate_source_paths(cfg, require_exists=not args.no_require_paths)
         for path in [
             cfg.pheasant.state_path,
-            cfg.pheasant.vault_path,
             cfg.pheasant.exports_path,
         ]:
             try:

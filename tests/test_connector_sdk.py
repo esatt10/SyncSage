@@ -56,7 +56,6 @@ def _write_config(tmp_path: Path, source_type: str, content_dir: Path) -> Path:
         f"""pheasant:
   name: sdk-test
   state_path: {tmp_path / "state"}
-  vault_path: {tmp_path / "vault"}
   exports_path: {tmp_path / "exports"}
   workspace_root: {tmp_path}
 sources:

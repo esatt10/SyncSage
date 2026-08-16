@@ -74,7 +74,6 @@ def _config(tmp_path: Path, root: Path, **overrides) -> PheasantConfig:
             "name": "limits",
             "workspace_root": str(root),
             "state_path": str(tmp_path / "state"),
-            "vault_path": str(tmp_path / "vault"),
             "exports_path": str(tmp_path / "exports"),
         },
         "sources": [],

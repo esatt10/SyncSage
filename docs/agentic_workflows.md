@@ -19,7 +19,6 @@ pheasant is designed to keep agent context precise and fresh without loading who
 2. Agent uses returned chunks with source paths and headings.
 3. Agent calls `get_graph_neighbors` for referenced notes/files.
 4. Agent summarizes only from retrieved evidence.
-5. Agent can call `export_obsidian_notes` for human review.
 
 ## Multi-agent safety
 

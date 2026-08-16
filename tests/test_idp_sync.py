@@ -66,7 +66,6 @@ def _config(tmp_path: Path, *, idp_enabled: bool = True, staleness_minutes: int 
         f"""pheasant:
   name: idp-test
   state_path: {tmp_path / "state"}
-  vault_path: {tmp_path / "vault"}
   exports_path: {tmp_path / "exports"}
   workspace_root: {tmp_path}
 security:

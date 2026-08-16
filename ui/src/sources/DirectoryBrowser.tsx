@@ -44,7 +44,7 @@ export function DirectoryBrowser({ path, onNavigate, onChoose, allowFiles = fals
           className="text-input"
           value={manualPath}
           onChange={(event) => setManualPath(event.target.value)}
-          placeholder="Open a container-visible path, e.g. /workspace or /vault"
+          placeholder="Open a container-visible path, e.g. /workspace or /exports"
         />
         <button className="btn btn--small" type="submit">
           open

@@ -35,8 +35,6 @@ spec:
               readOnly: true
             - name: state
               mountPath: /state
-            - name: vault
-              mountPath: /vault
             - name: workspace
               mountPath: /workspace
               readOnly: true
@@ -61,9 +59,6 @@ spec:
         - name: state
           persistentVolumeClaim:
             claimName: {{ include "pheasant.fullname" . }}-state
-        - name: vault
-          persistentVolumeClaim:
-            claimName: {{ include "pheasant.fullname" . }}-vault
         - name: workspace
           emptyDir: {}
         - name: exports

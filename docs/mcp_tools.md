@@ -39,6 +39,21 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 
 ## Tools
 
+!!! warning "Removed in 0.10.0: `export_obsidian_notes`"
+
+    The Obsidian vault projection was removed, and with it the
+    `export_obsidian_notes` tool and the `POST /obsidian/export` endpoint. The
+    UI's graph workspace (`/graph`) covers what the vault was used for.
+
+    This is a **breaking change to the MCP tool surface**, which is otherwise
+    evolved additively — an agent still calling `export_obsidian_notes` will
+    get an unknown-tool error rather than a deprecation warning. It was
+    removed outright rather than deprecated because, with the exporter gone,
+    there is nothing left for the tool to do.
+
+    Indexing an Obsidian vault as a **source** (`type: obsidian_vault`) is
+    unaffected and remains fully supported.
+
 | Tool | Purpose |
 |---|---|
 | `list_knowledge_bases` | Return registered knowledge bases and status. |
@@ -62,7 +77,6 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 | `get_file_summary` | Return a compact summary and provenance for a file. |
 | `get_repo_map` | Return repository structure, important modules, and dependencies. |
 | `explain_node` | Explain a graph node and why it matters. |
-| `export_obsidian_notes` | Preview or write Obsidian notes for a knowledge base or source. |
 | `get_sync_status` | Return queue, lock, error, freshness, and connector checkpoint status. |
 | `get_sync_history` | Return runtime registration, sync, promotion, disable, and removal audit events. |
 

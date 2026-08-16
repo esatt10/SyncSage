@@ -339,7 +339,6 @@ def main() -> None:  # pragma: no cover - manual reproduction entry point
             f"""pheasant:
   name: membench
   state_path: {root / "state"}
-  vault_path: {root / "vault"}
   exports_path: {root / "exports"}
   workspace_root: {root}
 sync:

@@ -9,15 +9,3 @@ spec:
     requests:
       storage: {{ .Values.persistence.state.size }}
 {{- end }}
----
-{{- if .Values.persistence.vault.enabled }}
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: {{ include "pheasant.fullname" . }}-vault
-spec:
-  accessModes: ["ReadWriteOnce"]
-  resources:
-    requests:
-      storage: {{ .Values.persistence.vault.size }}
-{{- end }}

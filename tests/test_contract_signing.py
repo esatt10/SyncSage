@@ -60,7 +60,6 @@ def _no_embed_engine(tmp_path: Path, **synapse: Any) -> SyncEngine:
             "pheasant": {
                 "name": "signing-region",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "ws"),
                 "exports_path": str(tmp_path / "exports"),
             },

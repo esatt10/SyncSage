@@ -51,7 +51,7 @@ the UI.
 
 It covers: knowledge-base identity, storage paths, sources, search,
 embeddings, the assistant, retrieval tuning, sync and scheduling, the graph,
-image/audio ingestion, server and MCP, security, Obsidian, agent memory, and
+image/audio ingestion, server and MCP, security, agent memory, and
 Synapse federation.
 
 ### Secrets

@@ -37,7 +37,6 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 | `ingestion` | Turning binary/markup files (documents, images, audio) into indexable text. | Optional |
 | `sync` | Watcher, git polling, schedule, idempotency, and concurrency behavior. | Yes |
 | `graph` | Knowledge-graph density (concept-node threshold, WASM acceleration). | Optional |
-| `obsidian` | Export controls for notes/canvas/frontmatter/backlinks/tags. | Optional |
 | `security` | Path allowlisting, source-read protections, and ACL enforcement. | Strongly recommended |
 | `synapse` | Federation into a Synapse fleet (contract publishing, signing). | Optional, standalone-safe |
 | `memory` | Agent-memory consolidation policy (TTL decay, supersede archiving). | Optional |
@@ -63,7 +62,6 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 | `image_repository` | string | `ghcr.io/esatt10/pheasant` | Container image registry/repository for Compose-based runs. |
 | `image_tag` | string | `0.1.3` | Image version tag used by deployment helpers. |
 | `workspace_path` | path-like string | `./workspace` | Host path mounted to pheasant `workspace_root`. |
-| `vault_path` | path-like string | `./vault` | Host path mounted to pheasant `vault_path`. |
 
 ---
 
@@ -76,7 +74,6 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 | `environment` | string | `local` | Label (for example `local`, `dev`, `staging`, `prod`). |
 | `log_level` | string | `INFO` | Typical values: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
 | `state_path` | absolute path | `/state` | Base path for sqlite, graph snapshots, and manifests. |
-| `vault_path` | absolute path | `/vault` | Output vault root for Obsidian exports. |
 | `workspace_root` | absolute path | `/workspace` | Root path sources should live under. |
 | `exports_path` | absolute path | `/exports` | Additional output path for generated artifacts. |
 
@@ -447,27 +444,6 @@ lands in config or on disk.
 
 ---
 
-## `obsidian` (output options)
-
-| Key | Type | Default / Example | Notes |
-|---|---|---|---|
-| `enabled` | bool | `true` | Master toggle for Obsidian exports. |
-| `write_mode` | string | `upsert` | Export strategy (`upsert`, etc.). |
-| `note_root` | string | `pheasant` | Top-level folder/note namespace in the vault. |
-| `template_profile` | string | `engineering` | One of `engineering`, `research`, or `project-ops`. |
-| `create_index_notes` | bool | `true` | Generate index/navigation notes. |
-| `create_source_notes` | bool | `true` | Generate one note per source. |
-| `create_file_notes` | bool | `true` | Generate one note per file artifact. |
-| `create_chunk_notes` | bool | `false` | Generate chunk-level notes. |
-| `create_canvas` | bool | `true` | Generate canvas graph views. |
-| `frontmatter.include_source_id` | bool | `true` | Include source identifier in note frontmatter. |
-| `frontmatter.include_hash` | bool | `true` | Include content hash in frontmatter. |
-| `frontmatter.include_last_indexed` | bool | `true` | Include index timestamp metadata. |
-| `frontmatter.include_graph_node_id` | bool | `true` | Include graph node IDs in metadata. |
-| `backlinks.enabled` | bool | `true` | Generate backlinks. |
-| `backlinks.style` | string | `wikilink` | Backlink rendering style. |
-| `tags.base` | list[string] | `[pheasant]` | Base tags appended to generated notes. |
-| `tags.by_source_type` | bool | `true` | Add tags based on source type. |
 
 ---
 
@@ -475,7 +451,7 @@ lands in config or on disk.
 
 | Key | Type | Example | Notes |
 |---|---|---|---|
-| `allow_workspace_roots` | list[path] | `[/workspace, /vault]` | Allowed root prefixes for registered source paths. |
+| `allow_workspace_roots` | list[path] | `[/workspace, /exports]` | Allowed root prefixes for registered source paths. |
 | `read_only_sources` | bool | `true` | Prevent source mutation operations. |
 | `deny_path_traversal` | bool | `true` | Block `..` traversal and unsafe resolution. |
 | `allow_user_selected_source_paths` | bool | `true` | Let a source name any readable path, not just one under `allow_workspace_roots`. This is what makes "point it at anything" work; see the security notes on what compensates for it. |
@@ -830,14 +806,12 @@ deployment:
     image_repository: ghcr.io/esatt10/pheasant
     image_tag: 0.1.3
     workspace_path: ./workspace
-    vault_path: ./vault
 
 pheasant:
   environment: local
   log_level: INFO
   state_path: /state
   workspace_root: /workspace
-  vault_path: /vault
 
 server:
   host: 0.0.0.0
@@ -875,7 +849,6 @@ server:
 security:
   allow_workspace_roots:
     - /workspace
-    - /vault
     - /exports
   allow_user_selected_source_paths: true
   read_only_sources: true
@@ -883,33 +856,14 @@ security:
   default_exclude_secrets: true
 ```
 
-### 3) Obsidian-first personal knowledge vault
+### 3) Indexing an existing Obsidian vault
 
-Use this when export quality to vault notes/canvas/backlinks is your top priority.
+pheasant reads an Obsidian vault as an ordinary Markdown source: wikilinks
+resolve as references, and `.obsidian/` metadata is excluded. (pheasant no
+longer *writes* a vault — the graph workspace at `/graph` in the UI replaced
+that projection.)
 
 ```yaml
-obsidian:
-  enabled: true
-  write_mode: upsert
-  note_root: pheasant
-  create_index_notes: true
-  create_source_notes: true
-  create_file_notes: true
-  create_chunk_notes: false
-  create_canvas: true
-  frontmatter:
-    include_source_id: true
-    include_hash: true
-    include_last_indexed: true
-    include_graph_node_id: true
-  backlinks:
-    enabled: true
-    style: wikilink
-  tags:
-    base:
-      - pheasant
-    by_source_type: true
-
 sources:
   - name: existing-obsidian-vault
     type: obsidian_vault

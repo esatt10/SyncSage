@@ -51,7 +51,6 @@ them).
 | List sources + status + checkpoints | `GET /sources`, `GET /sync/status` | Exists |
 | Trigger sync (all / one, moded) | `POST /sync`, `POST /sync/{source_id}` | Exists |
 | Search content (hybrid/keyword/graph) | `POST /search`, `POST /relevant-files` | Exists |
-| Obsidian export / preview | `POST /obsidian/export` | Exists |
 | Health / readiness / liveness badges | `GET /health`, `GET /ready`, `GET /metrics` | Exists |
 | Knowledge-base list | `GET /knowledge-bases` | Exists |
 | Expand a node's neighbors (sub-network) | `GET /graph/neighbors`, `GET /graph/slice` | **Added** — thin HTTP wrappers over the same traversal logic as the MCP tools. |
@@ -165,12 +164,11 @@ the mental model transfers both directions:
 
 | UI panel | Schema source | Notable fields |
 |---|---|---|
-| Instance | `PheasantSettings` | name, description, environment, log_level, state/vault/workspace/exports paths |
+| Instance | `PheasantSettings` | name, description, environment, log_level, state/workspace/exports paths |
 | Server | `ServerSettings` / `McpSettings` / `ApiSettings` / `UiSettings` | host, port, MCP transports (stdio/streamable_http/sse), api.enabled, api.openapi, **ui.enabled, ui.graph_visualization** |
 | Storage | `StorageSettings` | graph_format, snapshot interval, sqlite/graph/manifest paths, max_state_size_gb, compression, retention |
 | Search | `SearchSettings` | default_mode, keyword engine, embeddings, vector_store, ranking boosts, max_results_default |
 | Sync | `SyncSettings` (watcher/git/scheduler/idempotency/concurrency) | debounce_ms, batch_window_ms, git triggers, scheduler interval, concurrency caps |
-| Obsidian | `ObsidianSettings` | enabled, write_mode, note_root, template_profile, note/canvas toggles, frontmatter, backlinks, tags |
 | Security | (config security block) | allow_workspace_roots, read_only_sources, deny_path_traversal, default_exclude_secrets |
 | Sources | `SourceConfig[]` | full per-source editor (see §4.2) |
 
@@ -287,7 +285,7 @@ src/
     SyncControls.tsx       # mode selector, status polling
   config/
     ConfigEditor.tsx       # section panels mirroring schema
-    SectionPanels/*        # Instance, Server, Storage, Search, Sync, Obsidian, Security
+    SectionPanels/*        # Instance, Server, Storage, Search, Sync, Security
     ConfigDiff.tsx         # YAML diff before apply
     RawYamlTab.tsx         # escape hatch
   explain/
@@ -351,7 +349,7 @@ The UI inherits, and must not weaken, the existing controls:
   against `allow_workspace_roots`; the UI cannot reach paths the policy forbids,
   and `deny_path_traversal` still applies.
 - **Read-only by default.** Mutating routes (register / sync / config write /
-  obsidian export) should be explicitly enabled and, for `team`/`prod`, sit
+  graph export) should be explicitly enabled and, for `team`/`prod`, sit
   behind ingress auth — consistent with `docs/security.md`'s "bind local API/UI
   carefully" note. Read-only graph + search can be exposed first.
 - **Untrusted indexed content.** The Content tab renders chunk/file text as
@@ -385,7 +383,7 @@ container Python-only, and are covered by `tests/test_api_ui_routes.py`:
 - `GET /files/summary`, `GET /sources/{id}/repo-map` → indexed content / file listing.
 - `POST /sources` (register, allowlist-scoped, optional `sync_now`), `POST /sources/{id}/promote`, `POST /sources/{id}/disable`, `DELETE /sources/{id}`.
 - `GET /sources/{id}/history` → audit timeline.
-- `GET /fs/list` → allowlist-scoped directory listing via `resolve_under` (rejects paths outside `workspace_root` / `vault_path` / `exports_path` with HTTP 403).
+- `GET /fs/list` → allowlist-scoped directory listing via `resolve_under` (rejects paths outside `workspace_root` / `exports_path` with HTTP 403).
 - `GET /config`, `PUT /config` → effective-config read + validated write (validation mirrors `pheasant doctor`; server-level changes require a restart).
 - CORS is enabled so the UI can run as a separate workload in development.
 
