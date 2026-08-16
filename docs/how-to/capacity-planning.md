@@ -119,6 +119,41 @@ files across 6 regions is six containers of the 100,000-file row — 1.5 GB and 
 6.7 s checkpoint each — indexing in parallel, instead of one 10 GB container
 indexing serially.
 
+### Let pheasant propose the split
+
+```bash
+pheasant shard plan -c pheasant.yaml            # fewest regions that fit
+pheasant shard plan -c pheasant.yaml --shards 4 # exactly four
+```
+
+It scans each source (a directory walk, not an index), packs whole sources
+largest-first, and prints which sources go where with a memory request per
+region:
+
+```text
+600,000 files across 3 region(s) (~3,780,000 graph nodes)
+
+  shard-1: 220,000 files, ~1,386,000 nodes, ~5.5 GB RSS -> request 8Gi
+      - platform-monorepo
+  shard-2: 200,000 files, ~1,260,000 nodes, ~5.0 GB RSS -> request 8Gi
+      - docs-site
+      - runbooks
+```
+
+The count defaults to the fewest regions that keep every shard under
+`graph.max_nodes`, so the planner and the runtime warning agree about what "too
+big" means. A single source over budget on its own is reported rather than
+split — no arrangement of whole sources fixes that, and the honest answers are
+more memory for that region or a narrower `include`/`exclude`.
+
+### Writing to one knowledge base from several indexers
+
+Separate from sharding, and only on Postgres: the write lease is **per source**
+there rather than per state directory, so two indexers can commit two different
+sources concurrently. On SQLite the whole-state lease remains, because SQLite
+genuinely permits one writer per file — that is an accurate model, not a
+limitation to route around.
+
 ## Which storage backend
 
 Independent of the graph, and a different question:
@@ -126,7 +161,7 @@ Independent of the graph, and a different question:
 | | SQLite (default) | Postgres |
 |---|---|---|
 | Setup | none | a database to run |
-| Writers | **one process per knowledge base** | many (Phase 35.4) |
+| Writers | **one process per knowledge base** | **one per source** — several indexers at once |
 | Read replicas | one container | many |
 | Ranking | BM25 | see [configuration](../configuration.md#where-state-lives-storagebackend) |
 

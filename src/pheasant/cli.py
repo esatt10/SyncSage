@@ -546,6 +546,12 @@ def main(argv: list[str] | None = None) -> int:
     compose_env_p.add_argument("--output", "-o")
     repair_p = sub.add_parser("repair")
     repair_p.add_argument("--config", "-c", default="pheasant.example.yaml")
+    shard_p = sub.add_parser("shard", help="Plan a multi-region split of this corpus.")
+    shard_sub = shard_p.add_subparsers(dest="shard_command", required=True)
+    shard_plan_p = shard_sub.add_parser("plan", help="Propose which sources go to which region.")
+    shard_plan_p.add_argument("--config", "-c", default="pheasant.yaml")
+    shard_plan_p.add_argument("--shards", type=int, help="Split into exactly this many regions.")
+    shard_plan_p.add_argument("--json", action="store_true")
     migrate_p = sub.add_parser(
         "migrate", help="Copy SQLite state into the configured Postgres backend."
     )
@@ -825,6 +831,46 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         for report in reports:
             _print_scan(report)
+        return 0
+    if args.command == "shard":
+        from pheasant.config.loader import load_config
+        from pheasant.sharding import SourceSize, plan_shards, render_plan
+
+        cfg = load_config(Path(args.config))
+        engine = _engine(Path(args.config))
+        sizes = []
+        try:
+            for source in cfg.sources:
+                if not source.enabled:
+                    continue
+                # `scan` walks without reading, so planning a split of a corpus
+                # you have not indexed yet costs a directory walk, not an index.
+                try:
+                    report = engine.scan_source(source.name)
+                except Exception as exc:  # an unwalkable source is not fatal
+                    print(f"WARNING: could not scan {source.name}: {exc}", file=sys.stderr)
+                    continue
+                if not report.get("scannable"):
+                    print(
+                        f"WARNING: skipping {source.name}: {report.get('reason')}",
+                        file=sys.stderr,
+                    )
+                    continue
+                sizes.append(
+                    SourceSize(
+                        name=source.name,
+                        files=int(report.get("file_count") or 0),
+                        bytes_=int(report.get("total_bytes") or 0),
+                    )
+                )
+        finally:
+            engine.close()
+        plan = plan_shards(
+            sizes,
+            shards=args.shards,
+            max_nodes_per_shard=int(getattr(cfg.graph, "max_nodes", None) or 1_500_000),
+        )
+        print(json.dumps(plan, indent=2, sort_keys=True) if args.json else render_plan(plan))
         return 0
     if args.command == "migrate":
         from pheasant.config.loader import load_config

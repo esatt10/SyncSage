@@ -215,6 +215,17 @@ CREATE INDEX IF NOT EXISTS idx_memory_records_scope
 -- space). A restart compares the live config against these: same fingerprint
 -- means the stored artifacts/chunks/vectors are still valid and there is
 -- nothing to redo. See pheasant.sync.fingerprint.
+-- Phase 35.4: per-source write leases. EngineLease permits one writer per
+-- /state dir, which is the right model for SQLite and is the ceiling Phase 35
+-- lifts: two different sources have no reason to wait for each other. The row
+-- is claimed by a single conditional UPDATE, so the database arbitrates races
+-- rather than a read-then-write in Python.
+CREATE TABLE IF NOT EXISTS source_leases (
+  source_id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS sync_fingerprints (
   scope TEXT PRIMARY KEY,
   fingerprint TEXT NOT NULL,

@@ -992,7 +992,7 @@ working, which is what holds the 5 MB end of the range.
 | 35.1 | Observability: real `/metrics`, per-source progress with throughput/ETA/stall detection | done (2026-08-16) |
 | 35.2 | `StateBackend` seam + Postgres backend (incl. FTS5 → `tsvector` port) | done (2026-08-16) |
 | 35.3 | Graph capacity measured; sharding chosen over a Postgres graph backend | done (2026-08-16) |
-| 35.4 | Multi-writer indexing: per-source leases + durable queue + sharding | checkpointing + container sizing done (2026-08-16); leases/queue queued |
+| 35.4 | Multi-writer indexing: per-source leases + sharding | done (2026-08-16); durable queue deferred |
 | 35.5 | Broker (NATS JetStream) and gRPC as first-class transports | queued |
 | 35.6 | Process roles, autoscaling, and the three runtimes | queued |
 | 35.7 | Measured capacity model and sizing guidance | queued |
@@ -1283,3 +1283,46 @@ caught (including reverting to the 10x rule, dropping the ceiling, and drifting
 
 **Still queued for 35.4:** per-source write leases on Postgres, the durable work
 queue with dead-lettering, and `pheasant shard plan`.
+
+### Step 35.4 (rest) — Per-source leases and shard planning (2026-08-16)
+
+**The ceiling is lifted.** `SourceLease` (`sync/locks.py`) holds a write lease
+per *source* in the state database, so two indexers can commit `docs` and
+`code` concurrently — the thing the 35.2 Postgres seam was built for. Exclusion
+is a single conditional `INSERT … ON CONFLICT DO UPDATE … RETURNING`, so the
+database arbitrates. **On SQLite nothing changes**: one writer per file is an
+accurate model there, not a limitation to route around, and `EngineLease` still
+enforces it.
+
+**`pheasant shard plan`** turns the 35.3 recommendation into a proposal. It
+scans each source (a walk, not an index) and packs **whole sources**
+largest-first. Whole sources is the load-bearing decision: hashing paths across
+shards balances perfectly and severs every `references`/`imports` edge, which
+is the opposite of what the graph is for. Even balance is the wrong objective
+when the thing being balanced is a graph. LPT lands within 4/3 of optimal, and
+optimal is both NP-hard and an answer to a size *estimate*.
+
+**Two test bugs of mine, both found by the tests failing:**
+
+* The concurrency test released each lease in `finally`, so a winner deleted
+  the row before the next thread tried — six threads acquiring *serially*, not
+  contending. It reported two winners and looked exactly like a lease race. Now
+  a `threading.Barrier` starts them together and winners hold.
+* The packing test named its sources so that alphabetical order equalled
+  descending size, making "largest-first" and "in arrival order"
+  indistinguishable. Mutation testing caught it: replacing the sort changed
+  nothing. The fixture now sorts ascending by name, and the assertion is on
+  balance rather than on a specific assignment.
+
+`try_acquire` gained `RETURNING` regardless: the original read-then-write did
+have a real window between claiming and checking, even though that is not what
+the flaky test was measuring.
+
+**Acceptance:** `tests/test_sharding_and_leases.py` (14), mutation-tested 5/5
+caught. Suite **1076 passed / 41 skipped**; 23 pass against real Postgres.
+
+**Deferred: the durable work queue with dead-lettering.** Per-source leases
+already let N indexers work in parallel — a queue adds *dispatch* (who picks up
+what, retries, poison-message handling), which matters when indexers are
+autoscaled and disposable. That is 35.6's problem, and building the queue
+before the roles that consume it would be building it against a guess.

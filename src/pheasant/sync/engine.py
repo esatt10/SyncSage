@@ -11,6 +11,7 @@ import uuid
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
@@ -59,7 +60,7 @@ from pheasant.sync.fingerprint import (
     embedding_fingerprint,
     source_fingerprint,
 )
-from pheasant.sync.locks import EngineLease, source_lock
+from pheasant.sync.locks import EngineLease, SourceLease, source_lock
 from pheasant.sync.pacing import serve_yield
 
 logger = logging.getLogger(__name__)
@@ -1191,16 +1192,10 @@ class SyncEngine:
                 mode,
             )
             mode = "full"
-        with self._lease_mutex:
-            self.lease.acquire()
         # Test-only hook (Synapse 21.2 crash-safety tests): widens the window
         # between per-artifact writes so a kill -9 can land mid-sync.
         slow_sync_s = float(os.environ.get("PHEASANT_TEST_SLOW_SYNC_MS", "0") or 0) / 1000.0
-        with source_lock(
-            self.paths.locks,
-            source.name,
-            timeout_s=float(self.config.sync.concurrency.lock_timeout_seconds or 0),
-        ):
+        with self._source_write_lock(source.name):
             connector = connector_for_source(source, self.state)
             if mode == "validate_only":
                 health = connector.validate()
@@ -1511,6 +1506,36 @@ class SyncEngine:
                     **details_extra,
                 },
             )
+
+    @contextmanager
+    def _source_write_lock(self, source_name: str):
+        """Hold everything needed to write one source, then release it.
+
+        Exclusion is per **source** on a shared backend and per **process** on
+        SQLite. Postgres arbitrates concurrent writers itself, so two indexers
+        can commit two different sources at once — which is the point of the
+        35.2 seam. SQLite genuinely permits one writer per file, so the
+        whole-state :class:`EngineLease` there is an accurate model rather than
+        a limitation to route around.
+
+        The on-disk ``source_lock`` is held in both cases: it excludes two
+        *threads* of one process, which no database lease addresses.
+        """
+
+        timeout = float(self.config.sync.concurrency.lock_timeout_seconds or 0)
+        lease = None
+        if self.state.dialect.is_postgres:
+            lease = SourceLease(self.state, source_name)
+            lease.acquire(wait_timeout_s=timeout)
+        else:
+            with self._lease_mutex:
+                self.lease.acquire()
+        try:
+            with source_lock(self.paths.locks, source_name, timeout_s=timeout):
+                yield
+        finally:
+            if lease is not None:
+                lease.release()
 
     def _graph_capacity_notice(self) -> dict[str, Any] | None:
         """Say something once a graph outgrows one container (Phase 35.3).
