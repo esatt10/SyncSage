@@ -17,6 +17,28 @@ from pheasant.persistence.state_store import StateStore
 # body word, and BM25's length normalization then ranked by body brevity.
 _BM25_WEIGHTS = "0.0, 0.0, 0.0, 8.0, 3.0, 2.0, 1.0"
 
+# The same four weights for Postgres. `ts_rank_cd` takes exactly four weight
+# classes and its array is ordered {D, C, B, A} — the reverse of how the
+# columns read above — so this is 1/2/3/8 written backwards and normalized onto
+# ts_rank_cd's 0-1 scale (divide by 8, the title weight). Four BM25 columns
+# mapping onto exactly four tsvector weight classes is luck, not design; it is
+# what makes the port preserve the *ordering* of field importance rather than
+# having to collapse two fields together.
+_TS_RANK_WEIGHTS = "0.125, 0.25, 0.375, 1.0"
+
+# ts_rank_cd's normalization flag. **1 = divide the rank by 1 + log(document
+# length).** Not cosmetic and not a default worth accepting: with the flag left
+# at 0 (no normalization at all) `ts_rank_cd` simply accumulates term hits, so
+# a long document that repeats a query word half a dozen times outranks the
+# short document that is actually about it. BM25 has length normalization and
+# IDF built in, so SQLite never had this problem — which is precisely how a
+# naive port ships a silent ranking regression.
+#
+# Caught by mutation testing: the first version of the parity corpus gave every
+# query a unique winning token, so it ranked correctly under *any* weighting
+# and hid this completely. The `deploy-gateway.md` case exists to keep it hid.
+_TS_RANK_NORMALIZATION = 1
+
 # Structural priors, applied as a DIVISOR on the (negative) BM25 cost, so they
 # scale a match rather than displacing it: a strong deep hit still beats a weak
 # shallow one, but ties break toward the more central file. An additive penalty
@@ -64,11 +86,19 @@ _PREFER_BONUS = 0.35
 _PRIOR_FLOOR = 0.25
 
 
-def _structural_prior(steering: Any, tokens: list[str]) -> tuple[str, list[object]]:
+def _structural_prior(
+    steering: Any, tokens: list[str], *, postgres: bool = False
+) -> tuple[str, list[object]]:
     """The ranking divisor, plus any `preference` bonus in force.
 
     Returns SQL and its params, because a preference is a per-query LIKE
     pattern and cannot live in the module-level constant.
+
+    ``MAX(a, b)`` is a *scalar* two-argument function in SQLite and an
+    *aggregate* in Postgres, where the scalar spelling is ``GREATEST``. Left
+    untranslated this raises rather than silently mis-ranking, but only for
+    callers who have a `preference` rule in force — which is a narrow enough
+    path that it could sit broken for a long time unnoticed.
     """
     if not steering:
         return _STRUCTURAL_PRIOR, []
@@ -77,8 +107,10 @@ def _structural_prior(steering: Any, tokens: list[str]) -> tuple[str, list[objec
         return _STRUCTURAL_PRIOR, []
     cases = " ".join("WHEN artifacts.relative_path LIKE ? THEN 1 " for _ in prefixes)
     params: list[object] = [f"{prefix.rstrip('/*')}%" for prefix in prefixes]
+    greatest = "GREATEST" if postgres else "MAX"
     return (
-        f"MAX({_PRIOR_FLOOR}, {_STRUCTURAL_PRIOR} - {_PREFER_BONUS} * (CASE {cases} ELSE 0 END))",
+        f"{greatest}({_PRIOR_FLOOR}, "
+        f"{_STRUCTURAL_PRIOR} - {_PREFER_BONUS} * (CASE {cases} ELSE 0 END))",
         params,
     )
 
@@ -140,9 +172,12 @@ class SearchStore:
         # Params are positional, so they must be assembled in the order the
         # placeholders appear in the final SQL: the ranking expression sits in
         # the SELECT, ahead of every WHERE clause.
-        prior_sql, prior_params = _structural_prior(steering, tokens)
+        postgres = bool(getattr(self.state, "dialect", None) and self.state.dialect.is_postgres)
+        prior_sql, prior_params = _structural_prior(steering, tokens, postgres=postgres)
+        if postgres:
+            match_expr = " | ".join(dict.fromkeys(tokens)) if tokens else query
         params: list[object] = [*prior_params, match_expr]
-        where = "chunks_fts MATCH ?"
+        where = "search_vector @@ query_ts" if postgres else "chunks_fts MATCH ?"
         exclusion_where, exclusion_params = _exclusion_sql(steering)
         if source_name:
             where += " AND source_id = ?"
@@ -166,19 +201,49 @@ class SearchStore:
         where += exclusion_where
         params.extend(exclusion_params)
         params.append(max_results)
-        sql = f"""
-        SELECT chunks_fts.chunk_id, chunks_fts.source_id, chunks_fts.artifact_id,
-               chunks_fts.path, chunks_fts.heading_path, chunks.text,
-               chunks.start_line, chunks.end_line, artifacts.path AS absolute_path,
-               artifacts.relative_path,
-               bm25(chunks_fts, {_BM25_WEIGHTS}) / {prior_sql} AS rank_score
-        FROM chunks_fts
-        JOIN chunks ON chunks.id = chunks_fts.chunk_id
-        JOIN artifacts ON artifacts.id = chunks_fts.artifact_id
-        {memory_join}
-        WHERE {where}
-        ORDER BY rank_score LIMIT ?
-        """
+        if postgres:
+            # `ts_rank_cd` is positive-better; `bm25()` is negative-better and
+            # everything downstream — the ORDER BY, and the `raw < 0` score
+            # mapping below — is built around that. Negating here preserves
+            # both, so the result-processing loop is shared rather than forked.
+            #
+            # The weight array is ordered {D,C,B,A}. It carries the measured
+            # 8/3/2/1 column weights from the 2026-08-03 retrieval overhaul,
+            # normalized onto ts_rank_cd's 0-1 scale: title A, path B,
+            # heading_path C, text D. This preserves the *ordering* of the four
+            # fields' importance. It does not reproduce BM25's arithmetic, and
+            # `tests/test_backend_parity.py` gates on measured retrieval
+            # quality rather than on the two backends agreeing on a number.
+            sql = f"""
+            SELECT chunks_fts.chunk_id, chunks_fts.source_id, chunks_fts.artifact_id,
+                   chunks_fts.path, chunks_fts.heading_path, chunks.text,
+                   chunks.start_line, chunks.end_line, artifacts.path AS absolute_path,
+                   artifacts.relative_path,
+                   -ts_rank_cd('{{{_TS_RANK_WEIGHTS}}}', chunks_fts.search_vector,
+                               query_ts, {_TS_RANK_NORMALIZATION})
+                       / {prior_sql} AS rank_score
+            FROM chunks_fts
+            JOIN chunks ON chunks.id = chunks_fts.chunk_id
+            JOIN artifacts ON artifacts.id = chunks_fts.artifact_id
+            CROSS JOIN to_tsquery('simple', ?) AS query_ts
+            {memory_join}
+            WHERE {where}
+            ORDER BY rank_score LIMIT ?
+            """
+        else:
+            sql = f"""
+            SELECT chunks_fts.chunk_id, chunks_fts.source_id, chunks_fts.artifact_id,
+                   chunks_fts.path, chunks_fts.heading_path, chunks.text,
+                   chunks.start_line, chunks.end_line, artifacts.path AS absolute_path,
+                   artifacts.relative_path,
+                   bm25(chunks_fts, {_BM25_WEIGHTS}) / {prior_sql} AS rank_score
+            FROM chunks_fts
+            JOIN chunks ON chunks.id = chunks_fts.chunk_id
+            JOIN artifacts ON artifacts.id = chunks_fts.artifact_id
+            {memory_join}
+            WHERE {where}
+            ORDER BY rank_score LIMIT ?
+            """
         try:
             rows = self.state.rows(sql, tuple(params))
         except Exception:

@@ -990,7 +990,7 @@ working, which is what holds the 5 MB end of the range.
 |---|---|---|
 | 35.0 | Remove the Obsidian exporter | done (2026-08-16) |
 | 35.1 | Observability: real `/metrics`, per-source progress with throughput/ETA/stall detection | done (2026-08-16) |
-| 35.2 | `StateBackend` seam + Postgres backend (incl. FTS5 → `tsvector` port) | queued |
+| 35.2 | `StateBackend` seam + Postgres backend (incl. FTS5 → `tsvector` port) | seam done (2026-08-16); FTS port has a measured ranking gap |
 | 35.3 | `GraphBackend`: bounded memory, hot loops pushed into SQL | queued |
 | 35.4 | Multi-writer indexing: per-source leases + durable work queue + sharding | queued |
 | 35.5 | Broker (NATS JetStream) and gRPC as first-class transports | queued |
@@ -1109,3 +1109,49 @@ pass (`_prepared_items` calls `future.result()` with no per-item tolerance).
 Per-item fault tolerance and a dead-letter queue are 35.4; the fields exist
 because that is where those counts will land. Documented as a caveat in
 `docs/how-to/monitor-indexing.md` rather than left for a reader to discover.
+
+### Step 35.2 — StateBackend seam + Postgres (2026-08-16)
+
+**Done:** the seam (`persistence/sql.py`, `backends.py`, `schema.py`,
+`secrets.py`), the Postgres backend, the portable schema, the Postgres arms of
+`search/sqlite_store.py` and `search/node_index.py`, `storage.backend/dsn_env/
+pool_size`, the `[postgres]` extra, and `tests/test_backend_parity.py`
+(7 tests, skipping cleanly with no DSN). Verified against a real PostgreSQL 16
+cluster throughout.
+
+**The planning estimate was wrong by 7x.** The plan said ~8 raw-SQL call sites;
+there are **57 across 15 modules**, plus **76** `self.conn` uses inside
+`StateStore` including ten `with self.conn:` transaction blocks. That changed
+the approach, not the scope: the SQL is almost entirely ANSI, so translating at
+one boundary (plus a `sqlite3.Connection`-shaped adapter) is far safer than 57
+and 76 individually-edited lines on the default path.
+
+**Proven identical across backends:** artifact/chunk/FTS/node/edge counts,
+**byte-identical stable IDs** (rule 3), and a zero-work second sync (rule 4).
+`chunks_fts` stays a real table with the same columns on Postgres, so the whole
+write path is untouched.
+
+**Measured gap, not yet closed — Postgres retrieval is not BM25-equivalent.**
+`ts_rank_cd` has **no inverse document frequency**. SQLite's BM25 weights rare
+terms heavily, so a short precise document beats a long one that repeats a
+common query word; Postgres accumulates cover density and ranks the long
+repetitive document first. Verified against normalization flags 0/1/2/16 — none
+fixes it, because normalization is about *length* and the missing ingredient is
+corpus-wide *term rarity*. Field weighting (title above body) **is** preserved
+via `setweight` A/B/C/D.
+
+Two `IDF_SENSITIVE` queries in the parity suite pin this divergence explicitly
+rather than hiding it; `test_known_divergence_postgres_has_no_idf` goes red the
+day real term weighting is added, which is the signal to delete it. Closing it
+properly means either a `pg_search`/ParadeDB backend or a df-weighted tsquery —
+real work, not tuning, and it should be its own step.
+
+**Found by mutation testing, and worth recording:** the first parity corpus gave
+every query a unique winning token, so it ranked correctly under *any* column
+weighting — flattening the ts_rank weights, reversing them, and stripping the
+title weighting out of the generated tsvector all still passed. 3 of 4 mutants
+survived. The corpus now contains a document named for its query and a longer
+decoy that repeats it, which is what surfaced the IDF gap at all.
+
+**Still open for 35.2:** `pheasant migrate --to postgres`, and
+`docs/configuration.md` coverage of the new `storage` fields.

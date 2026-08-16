@@ -36,6 +36,25 @@ CREATE VIRTUAL TABLE IF NOT EXISTS graph_nodes_fts USING fts5(
 );
 """
 
+#: Postgres has no FTS5. Same table name and columns so every write below is
+#: unchanged, plus a generated search vector and its GIN index. ``simple``
+#: (not ``english``) matches FTS5's unicode61 tokenizer: no stemming, no
+#: stopword removal — stemming here would silently change which graph nodes a
+#: query reaches.
+POSTGRES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS graph_nodes_fts (
+  node_id TEXT PRIMARY KEY,
+  source_id TEXT,
+  body TEXT,
+  search_vector tsvector GENERATED ALWAYS AS (
+    to_tsvector('simple', coalesce(body, ''))
+  ) STORED
+);
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_fts_vector
+  ON graph_nodes_fts USING GIN (search_vector);
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_fts_source ON graph_nodes_fts(source_id);
+"""
+
 #: FTS5 treats these as syntax; a query built from user text must not.
 _UNSAFE = re.compile(r"[^\w\s]", re.UNICODE)
 
@@ -46,6 +65,8 @@ class NodeIndex:
     def __init__(self, state: Any) -> None:
         self.state = state
         self._ready = False
+        dialect = getattr(state, "dialect", None)
+        self._postgres = bool(dialect is not None and dialect.is_postgres)
         # Sticky "there is something in here". A query only needs to know
         # empty-vs-not, and COUNT(*) over an FTS5 table is a full scan — on a
         # 577k-row index that was costing more than the search it guarded.
@@ -58,7 +79,7 @@ class NodeIndex:
         if self._ready:
             return True
         try:
-            self.state.conn.executescript(SCHEMA)
+            self.state.conn.executescript(POSTGRES_SCHEMA if self._postgres else SCHEMA)
             self.state.conn.commit()
             self._ready = True
         except Exception as exc:  # pragma: no cover - SQLite without FTS5
@@ -83,7 +104,8 @@ class NodeIndex:
             return True
         if not self.ensure():
             return False
-        self._populated = bool(self.state.rows("SELECT rowid FROM graph_nodes_fts LIMIT 1"))
+        probe = "node_id" if self._postgres else "rowid"
+        self._populated = bool(self.state.rows(f"SELECT {probe} FROM graph_nodes_fts LIMIT 1"))
         return self._populated
 
     def replace_all(self, nodes: Iterable[tuple[str, str, str]]) -> int:
@@ -149,8 +171,20 @@ class NodeIndex:
             return None
         if not self.populated():
             return None
-        sql = "SELECT node_id FROM graph_nodes_fts WHERE graph_nodes_fts MATCH ?"
-        params: list[Any] = [match]
+        if self._postgres:
+            # tsquery, not MATCH. Prefix search is `word:*`, and the terms are
+            # OR'd exactly as the FTS5 expression does — same recall, different
+            # spelling. Building this from the already-sanitized tokens rather
+            # than translating the FTS5 string keeps one source of truth for
+            # what a term is.
+            sql = (
+                "SELECT node_id FROM graph_nodes_fts, to_tsquery('simple', ?) q "
+                "WHERE search_vector @@ q"
+            )
+            params: list[Any] = [_tsquery_expression(tokens)]
+        else:
+            sql = "SELECT node_id FROM graph_nodes_fts WHERE graph_nodes_fts MATCH ?"
+            params = [match]
         if source_name:
             sql += " AND source_id = ?"
             params.append(source_name)
@@ -192,3 +226,21 @@ def _batched(items: Iterable[Any], size: int) -> Iterable[list[Any]]:
             batch = []
     if batch:
         yield batch
+
+
+def _tsquery_expression(tokens: list[str]) -> str:
+    """The Postgres twin of :func:`_match_expression`.
+
+    Same tokens, same OR semantics, same prefix matching — spelled ``word:*``
+    and joined with ``|`` instead of FTS5's ``"word"* OR``. Built from the
+    tokens rather than by rewriting the FTS5 string so there is one definition
+    of what counts as a term.
+    """
+
+    terms = []
+    for token in tokens:
+        cleaned = _UNSAFE.sub(" ", token).strip()
+        for word in cleaned.split():
+            if len(word) > 1:
+                terms.append(f"{word}:*")
+    return " | ".join(dict.fromkeys(terms))
