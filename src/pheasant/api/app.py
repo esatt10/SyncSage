@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Annotated
 import yaml
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from pheasant.assistant.credentials import SessionKeyStore
@@ -40,6 +42,7 @@ from pheasant.security.path_policy import (
 )
 from pheasant.sync.engine import SyncEngine
 from pheasant.sync.fingerprint import EMBEDDING_SCOPE, embedding_fingerprint
+from pheasant.telemetry import metrics
 from pheasant.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -814,6 +817,7 @@ def create_app(
     app.state.sync_lock = threading.Lock()
     app.state.jobs = JobRegistry()
     jobs = app.state.jobs
+    metrics.register_default_metrics(__version__)
 
     # The web UI is a separate workload that talks to this API over HTTP, so the
     # browser origin differs in development — but this API is unauthenticated,
@@ -898,8 +902,30 @@ def create_app(
         return {"parsed": parsed}
 
     @app.get("/metrics")
-    def metrics() -> str:
-        return "pheasant_up 1\n"
+    def metrics_endpoint() -> PlainTextResponse:
+        """Prometheus exposition text (Phase 35.1).
+
+        Named ``metrics_endpoint``, not ``metrics``: every route in this module
+        is a closure over ``create_app``, so a local named ``metrics`` would
+        shadow the imported :mod:`pheasant.telemetry.metrics` for *every other
+        route in the file* — the search handler would raise ``AttributeError``
+        on ``metrics.REGISTRY`` and only at request time.
+
+        Graph size and job state are sampled here rather than tracked
+        incrementally: both are cheap to read, and a gauge updated from a
+        write path drifts the moment any path forgets to update it.
+        """
+
+        graph = engine.graph_builder.graph
+        sample: dict[str, object] = {
+            "pheasant_graph_nodes": graph.number_of_nodes(),
+            "pheasant_graph_edges": graph.number_of_edges(),
+        }
+        sample.update(jobs.metrics_sample())
+        return PlainTextResponse(
+            metrics.render_with(sample),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     @app.get("/contract")
     def contract() -> dict:
@@ -931,6 +957,11 @@ def create_app(
         instant a job completes, which is exactly when a caller most wants to
         know whether it succeeded. `job` adds the phase and counter behind
         that boolean, which is what turns a spinner into a progress bar.
+
+        `progress` (Phase 35.1) narrows that to *this* source's slice of the
+        job. `job` is the whole run, so under `sync_all` every source in the
+        list showed the same aggregate counter and the one source that was
+        stuck looked exactly like the seven that were fine.
         """
         for record in records:
             name = record.get("name")
@@ -941,6 +972,7 @@ def create_app(
             record["syncing"] = active is not None
             record["sync_error"] = last.error if last else None
             record["job"] = active.as_dict() if active else None
+            record["progress"] = jobs.source_progress(name)
         return records
 
     @app.get("/sources")
@@ -1197,12 +1229,15 @@ def create_app(
         from pheasant.sync.worker import WorkerBackedEngine
 
         def forward(event: dict) -> None:
+            meta = event.get("meta") or {}
             jobs.progress(
                 job_id,
                 phase=event.get("phase"),
                 current=event.get("current"),
                 total=event.get("total"),
                 detail=event.get("detail"),
+                source=meta.get("source") or None,
+                stats=meta,
             )
 
         try:
@@ -1762,19 +1797,31 @@ def create_app(
         # Over-fetch when a post-filter will drop rows, so `max_results` keeps
         # meaning "give me this many" — the same bookkeeping the MCP tool does.
         filtering = criteria_active(req.exclude_sources, req.node_types, req.min_score)
-        payload = search.search_context(
-            req.knowledge_base or config.knowledge_base_id,
-            req.query,
-            req.mode,
-            req.max_results * 4 if filtering else req.max_results,
-            req.source_name,
-            graph=engine.graph_builder.graph,
-            principal=req.principal,
-            principal_groups=req.principal_groups,
-            security=config.security,
-            section=req.section,
-            memory=req.memory,
-        )
+        started = time.perf_counter()
+        try:
+            payload = search.search_context(
+                req.knowledge_base or config.knowledge_base_id,
+                req.query,
+                req.mode,
+                req.max_results * 4 if filtering else req.max_results,
+                req.source_name,
+                graph=engine.graph_builder.graph,
+                principal=req.principal,
+                principal_groups=req.principal_groups,
+                security=config.security,
+                section=req.section,
+                memory=req.memory,
+            )
+        except Exception:
+            metrics.REGISTRY.inc("pheasant_search_total", mode=req.mode, outcome="error")
+            raise
+        finally:
+            # Timed around retrieval only. Wrapping the post-filter too would
+            # fold criteria bookkeeping into what reads as retrieval latency.
+            metrics.REGISTRY.observe(
+                "pheasant_search_duration_seconds", time.perf_counter() - started, mode=req.mode
+            )
+        metrics.REGISTRY.inc("pheasant_search_total", mode=req.mode, outcome="ok")
         if filtering:
             payload = dict(payload)
             payload["results"] = apply_retrieval_criteria(

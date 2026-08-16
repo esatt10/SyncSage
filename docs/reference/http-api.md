@@ -13,7 +13,7 @@ The routes below are the consolidated surface defined in
 |---|---|---|
 | GET | `/health` | Liveness probe. |
 | GET | `/ready` | Readiness probe. |
-| GET | `/metrics` | Operational metrics. |
+| GET | `/metrics` | Prometheus exposition text — index queue depth, per-source throughput/ETA/stall, search latency, graph size. See [Monitor indexing](../how-to/monitor-indexing.md). |
 | POST | `/internal/indexing/prepare` | Opt-in stateless remote preparation worker. Disabled unless `sync.concurrency.remote_worker_enabled`; requires `Authorization: Bearer` matching the environment variable named by `remote_worker_token_env`. Intended for pheasant coordinators, not public clients. |
 
 ## Synapse region
@@ -73,11 +73,15 @@ still valid here, resolved through the same state-registry fallback
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/jobs` | Every job, newest first; running ones sort ahead of finished. `?active=true` for running only. |
-| GET | `/jobs/{job_id}` | One job: phase, counter, log tail, terminal outcome. |
+| GET | `/jobs/{job_id}` | One job: phase, counter, log tail, terminal outcome, and a `sources[]` breakdown. |
 | GET | `/jobs/stream` | Server-sent events, one per job update, primed with current state on connect. |
 
-Every source row (`/sources`, `/overview`) also carries `syncing`, `sync_error`
-and `job` — the live job behind the boolean, with its phase and counter.
+Every source row (`/sources`, `/overview`) also carries `syncing`, `sync_error`,
+`job` — the live job behind the boolean — and `progress`, **this source's own
+slice** of that job: phase, counter, observed throughput, ETA, `stalled`, and
+the indexed/unchanged counts. Under a `sync_all` the job-level counter is an
+aggregate over every source, so `progress` is what tells you which one is
+actually behind. See [Monitor indexing](../how-to/monitor-indexing.md).
 
 ## Search & retrieval
 

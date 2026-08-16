@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -65,10 +66,41 @@ logger = logging.getLogger(__name__)
 SyncMode = Literal["incremental", "full", "validate_only", "repair"]
 SYNC_MODES = {"incremental", "full", "validate_only", "repair"}
 
-#: ``(phase, current, total, detail)`` — everything a progress bar needs.
+#: ``(phase, current, total, detail)``, optionally followed by a ``meta``
+#: mapping (Phase 35.1) carrying ``source`` plus whatever counters the
+#: emitting pass has — ``indexed``, ``skipped``, ``bytes_done``.
 #: ``total`` is None until the connector has finished listing, because it is
 #: not known before then and a made-up denominator is worse than none.
-ProgressHook = Callable[[str, int, int | None, str], None]
+#: Four-argument callbacks stay supported: :func:`_hook_accepts_meta` decides
+#: by signature which form to call, so an existing caller is unaffected.
+ProgressHook = Callable[..., None]
+
+
+def _hook_accepts_meta(hook: ProgressHook) -> bool:
+    """Does this callback take the Phase-35.1 ``meta`` argument?
+
+    Determined once per wrap, by signature, rather than by catching
+    ``TypeError`` around the call — a ``TypeError`` raised *inside* a
+    four-argument hook would otherwise be misread as "wrong arity" and the
+    hook silently re-invoked with different arguments.
+    """
+
+    try:
+        signature = inspect.signature(hook)
+    except (TypeError, ValueError):  # builtins, C callables
+        return False
+    positional = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            continue
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional += 1
+    return positional >= 5
 
 
 def _progress_reporter(hook: ProgressHook | None, source_name: str):
@@ -78,19 +110,30 @@ def _progress_reporter(hook: ProgressHook | None, source_name: str):
     a closed queue, an evicted job, a typo — must cost a log line, not an
     index. Returns a no-op when there is no hook, so the un-instrumented path
     stays exactly as cheap as it was.
+
+    Every event carries its ``source`` in ``meta`` (Phase 35.1). Before this,
+    ``sync_all`` prefixed the source name into the human-readable ``detail``
+    string and nothing could tell the eight sources of one job apart without
+    parsing prose back out of it.
     """
 
     if hook is None:
         return lambda *_args, **_kwargs: None
+
+    wants_meta = _hook_accepts_meta(hook)
 
     def report(
         phase: str,
         current: int = 0,
         total: int | None = None,
         detail: str = "",
+        **stats: Any,
     ) -> None:
         try:
-            hook(phase, current, total, detail)
+            if wants_meta:
+                hook(phase, current, total, detail, {"source": source_name, **stats})
+            else:
+                hook(phase, current, total, detail)
         except Exception:  # pragma: no cover - progress is never load-bearing
             logger.debug("progress hook failed for %s", source_name, exc_info=True)
 
@@ -568,11 +611,12 @@ class SyncEngine:
                 current: int,
                 total: int | None,
                 detail: str,
+                meta: dict[str, Any] | None = None,
             ) -> None:
                 if on_progress is None:
                     return
                 with progress_lock:
-                    on_progress(phase, current, total, f"[{source_name}] {detail}")
+                    on_progress(phase, current, total, detail, meta)
 
             return source_progress
 
@@ -1190,6 +1234,7 @@ class SyncEngine:
             fetched = 0
             transfer_skipped = 0
             embedded_chunks = 0
+            indexed_bytes = 0
             changed_ids: set[str] = set()
             git_metadata = git_state(source.path) if source.type.value == "repository" else None
             # The denominator only exists now — listing is what produced it.
@@ -1221,7 +1266,15 @@ class SyncEngine:
                 fetched += int(prepared.fetched)
                 skipped += int(prepared.skipped)
                 transfer_skipped += int(prepared.transfer_skipped)
-                report("preparing", position, total_items, item.relative_path)
+                report(
+                    "preparing",
+                    position,
+                    total_items,
+                    item.relative_path,
+                    indexed=indexed,
+                    skipped=skipped,
+                    bytes_done=indexed_bytes,
+                )
                 parsed = prepared.parsed
                 if prepared.skipped or parsed is None:
                     continue
@@ -1304,8 +1357,25 @@ class SyncEngine:
                 # Compatibility phase retained for existing CLI/API/MCP
                 # progress consumers; ``committing`` is the more precise new
                 # phase for callers that understand the staged pipeline.
-                report("indexing", position, total_items, parsed.relative_path)
-                report("committing", position, total_items, parsed.relative_path)
+                indexed_bytes += int(parsed.size_bytes or 0)
+                report(
+                    "indexing",
+                    position,
+                    total_items,
+                    parsed.relative_path,
+                    indexed=indexed,
+                    skipped=skipped,
+                    bytes_done=indexed_bytes,
+                )
+                report(
+                    "committing",
+                    position,
+                    total_items,
+                    parsed.relative_path,
+                    indexed=indexed,
+                    skipped=skipped,
+                    bytes_done=indexed_bytes,
+                )
                 # Let anything waiting on the API get a turn before the next
                 # file. Without this a long index makes the UI unusable.
                 serve_yield()

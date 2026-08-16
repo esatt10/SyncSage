@@ -2,6 +2,7 @@ import { Fragment, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { SourceRecord } from "../api/types";
+import { SourceSyncProgress } from "../components/SyncProgress";
 import { AddSourceWizard } from "../sources/AddSourceWizard";
 import { TaxonomyOutline } from "../sources/TaxonomyOutline";
 import { QuickAdd } from "../components/QuickAdd";
@@ -32,7 +33,7 @@ export function SourcesPage() {
     // the request that started it, so this is how its progress actually
     // reaches the page — poll while anything is in flight, stop the moment
     // nothing is (a static page shouldn't tick a network request forever).
-    refetchInterval: (query) => (query.state.data?.some((s) => s.syncing) ? 1500 : false),
+    refetchInterval: (query) => (query.state.data?.some((s) => s.syncing) ? 1000 : false),
   });
   const [quickAdd, setQuickAdd] = useState(false);
   const [showWizard, setShowWizard] = useState(false);
@@ -110,8 +111,11 @@ export function SourcesPage() {
               </td>
               <td className="muted small">
                 {source.syncing ? (
-                  <span className="thinking">
-                    <span className="spinner" /> syncing…
+                  <span
+                    className={`thinking${source.progress?.stalled ? " thinking--stalled" : ""}`}
+                  >
+                    <span className="spinner" />{" "}
+                    {source.progress?.stalled ? "no progress" : (source.progress?.phase ?? "syncing…")}
                   </span>
                 ) : source.sync_error ? (
                   <span className="error" title={source.sync_error}>
@@ -151,6 +155,17 @@ export function SourcesPage() {
                 </button>
               </td>
             </tr>
+            {/* The whole point of Phase 35.1: a first index of a large source
+                takes minutes to hours, and the row above can only say that it
+                is happening. This says how fast, how far, and how long — and
+                distinguishes "slow" from "stuck". */}
+            {source.progress ? (
+              <tr className="row--progress">
+                <td colSpan={5}>
+                  <SourceSyncProgress row={source.progress} />
+                </td>
+              </tr>
+            ) : null}
             {outlineFor === source.name ? (
               <tr>
                 <td colSpan={5}>

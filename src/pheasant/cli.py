@@ -138,14 +138,29 @@ def _progress_emitter():
     """
     import time as _time
 
-    last = {"emitted": 0.0, "current": 0, "phase": ""}
+    # Throttle per source, not globally: with `max_parallel_sources > 1` a
+    # single counter meant a fast source could suppress every update from a
+    # slow one, which is precisely the source a watcher cares about.
+    last: dict[str, dict[str, float | int | str]] = {}
 
-    def emit(phase: str, current: int, total: int | None, detail: str) -> None:
+    def emit(
+        phase: str,
+        current: int,
+        total: int | None,
+        detail: str,
+        meta: dict | None = None,
+    ) -> None:
+        source = str((meta or {}).get("source") or "")
         now = _time.monotonic()
-        changed_phase = phase != last["phase"]
-        if not changed_phase and current - last["current"] < 25 and now - last["emitted"] < 1.0:
+        seen = last.setdefault(source, {"emitted": 0.0, "current": 0, "phase": ""})
+        changed_phase = phase != seen["phase"]
+        if (
+            not changed_phase
+            and current - int(seen["current"]) < 25
+            and now - float(seen["emitted"]) < 1.0
+        ):
             return
-        last.update({"emitted": now, "current": current, "phase": phase})
+        seen.update({"emitted": now, "current": current, "phase": phase})
         line = json.dumps(
             {
                 "marker": PROGRESS_MARKER,
@@ -153,6 +168,7 @@ def _progress_emitter():
                 "current": current,
                 "total": total,
                 "detail": detail,
+                "meta": meta or {},
             }
         )
         print(line, flush=True)

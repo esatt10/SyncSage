@@ -1,0 +1,130 @@
+# Watch an index, and scrape it
+
+A first index of a large collection takes minutes to hours. The question during
+that time is always the same — *is this working, or is it stuck?* — and until
+Phase 35.1 pheasant could not answer it: a source row said `syncing: true` and
+nothing else, and `GET /metrics` returned the literal string `pheasant_up 1`.
+
+Two surfaces answer it now: per-source progress (for a human) and Prometheus
+metrics (for a scheduler).
+
+## Per-source progress
+
+Every source-listing route (`GET /sources`, `GET /overview`) carries a
+`progress` object for any source currently being indexed:
+
+```jsonc
+{
+  "source": "handbook",
+  "phase": "preparing",
+  "current": 4120,
+  "total": 12667,          // null until the connector finishes listing
+  "fraction": 0.325,
+  "indexed": 4118,
+  "skipped": 2,
+  "bytes_done": 51221904,
+  "files_per_second": 18.4,
+  "eta_seconds": 462.3,
+  "seconds_since_progress": 0.9,
+  "stalled": false,
+  "phase_seconds": {"listing": 12.1, "preparing": 224.0},
+  "failures": []
+}
+```
+
+`GET /jobs` carries the same records under each job's `sources`, plus a
+job-level `progress` rollup.
+
+**Throughput and ETA are observed, not reported.** The server times the updates
+it receives and derives the rate over a sliding window, so they exist even for
+callers that emit neither, and the ETA reacts when a pass genuinely slows down
+rather than quoting an average from the fast early minutes.
+
+**`total` is `null` until the connector has finished listing.** A sync does not
+know how many files it will index until then, and a made-up denominator is
+worse than none — the UI renders an indeterminate bar for this period rather
+than one frozen at 0%, which reads as "stuck".
+
+### Slow is not stuck
+
+`seconds_since_progress` is always present, so a client can say "last update 4s
+ago" during healthy work. `stalled` only becomes true after five minutes of
+silence from a running source. The window is deliberately generous: one large
+PDF, or an embedding provider serving a retry with backoff, is slow but fine,
+and an indicator that cries wolf gets ignored.
+
+A stalled source is styled as a **warning**, not a failure — the pass may still
+recover.
+
+### What "unchanged" tells you
+
+On an incremental pass, `skipped` is often the number that matters:
+`2,996 unchanged · 4 indexed` is the difference between "working correctly" and
+"re-indexing everything again", and nothing in the UI used to say which.
+
+!!! note "Per-file failures abort the pass today"
+
+    `failed` and `failures` are reported but currently always empty: a file
+    that fails to prepare raises and ends the whole sync, which surfaces as the
+    job's `error` instead. Per-item fault tolerance and a dead-letter queue are
+    Phase 35.4; the fields are here because that is where the counts will land.
+
+## Metrics
+
+`GET /metrics` serves Prometheus exposition text (`text/plain; version=0.0.4`).
+No extra dependency and no configuration — it is always on.
+
+| Metric | Type | Use |
+|---|---|---|
+| `pheasant_index_queue_depth` | gauge | **The autoscaling signal.** Sources queued or running. |
+| `pheasant_index_inflight` | gauge | Index jobs currently running. |
+| `pheasant_index_progress_ratio{source}` | gauge | 0–1 completion of the current pass. |
+| `pheasant_index_files_per_second{source}` | gauge | Observed throughput. |
+| `pheasant_index_eta_seconds{source}` | gauge | Estimated seconds remaining. |
+| `pheasant_index_stalled{source}` | gauge | 1 when a running source has gone quiet. |
+| `pheasant_index_files_total{source,outcome}` | counter | Files resolved, by outcome. |
+| `pheasant_index_bytes_total{source}` | counter | Bytes read. |
+| `pheasant_sync_last_success_timestamp_seconds{source}` | gauge | Freshness; alert on age. |
+| `pheasant_search_duration_seconds{mode}` | histogram | Query latency. |
+| `pheasant_search_total{mode,outcome}` | counter | Query volume and errors. |
+| `pheasant_embedding_requests_total{outcome}` | counter | Provider health. |
+| `pheasant_graph_nodes`, `pheasant_graph_edges` | gauge | Graph size — the RAM driver. |
+| `pheasant_process_resident_bytes` | gauge | This process's RSS. |
+| `pheasant_build_info{version}` | gauge | Always 1; the version is the label. |
+| `pheasant_up` | gauge | 1 while serving. |
+
+### Scrape it
+
+```yaml
+scrape_configs:
+  - job_name: pheasant
+    static_configs:
+      - targets: ["pheasant:8765"]
+```
+
+### Useful queries
+
+```promql
+# Is anything actually stuck?
+max by (source) (pheasant_index_stalled) > 0
+
+# Sources not indexed successfully in the last day.
+time() - pheasant_sync_last_success_timestamp_seconds > 86400
+
+# Search p95 latency.
+histogram_quantile(0.95, sum by (le, mode) (rate(pheasant_search_duration_seconds_bucket[5m])))
+```
+
+!!! warning "Metrics are per process"
+
+    Counters live in the process that serves the scrape. Indexing runs in a
+    **child process**, so its throughput reaches `/metrics` through the job
+    registry rather than from a counter the indexer owns — which is also why
+    the indexing series are gauges sampled at scrape time rather than counters
+    you can `rate()` over. Run one scrape target per pheasant container and
+    aggregate in Prometheus, not in pheasant.
+
+## Related
+
+- [Speed up indexing](indexing-performance.md) — worker counts and executors.
+- [Deployment](../deployment.md) — probes and ports.

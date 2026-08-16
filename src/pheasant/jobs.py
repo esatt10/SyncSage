@@ -1,30 +1,42 @@
 """Background work you can watch: one registry for every long-running job.
 
-A first index of a real repository takes minutes. Before this, the only thing
-the UI could say about that was a boolean — ``syncing: true`` on a source row,
-flipping to nothing when the sync finished — which is indistinguishable from a
-hang for as long as it runs. That is the gap this module closes: every
-background job gets an id, a phase, a counter, a tail of what it last did, and
-a terminal outcome that survives the job itself.
+A first index of a real repository takes minutes; of a large collection, hours.
+Before this, the only thing the UI could say about that was a boolean —
+``syncing: true`` on a source row, flipping to nothing when the sync finished —
+which is indistinguishable from a hang for as long as it runs. That is the gap
+this module closes: every background job gets an id, a phase, counters, a tail
+of what it last did, and a terminal outcome that survives the job itself.
 
-Deliberately **in-process and in-memory**, like the ad-hoc
-``syncing_sources``/``sync_outcomes`` dicts it replaces:
+**Per source, not per job (Phase 35.1).** A ``sync_all`` over eight sources used
+to be one job with one counter, so the one source that was stuck was invisible
+behind the seven that were fine — and the counter's denominator changed under
+your feet as each source discovered its own file list. Each source now gets its
+own :class:`SourceProgress` record; the job-level :class:`JobProgress` is an
+aggregate derived from them, kept so existing callers and the UI keep working.
 
-* Jobs are a property of a running server, not of the knowledge base. Writing
-  them to ``/state`` would make them user data (CLAUDE.md §4 rule 2) and buy
-  nothing — a job cannot outlive the process that is running it, so a restart
-  invalidates every record anyway.
-* It keeps the indexing path free of another writer. ``/state`` has one
-  single-writer lease for good reasons.
+**Throughput and ETA are observed, not reported.** The indexing child process
+sends phase/counter updates over the existing progress wire; this module stamps
+its own clock on arrival and derives files-per-second over a sliding window and
+an ETA from that. Deriving them here rather than sending them keeps the wire
+unchanged and means a caller that never emits a rate still gets one.
 
-Bounded on purpose: ``max_records`` caps history and each job keeps only a
-tail of its log, so a server that syncs on a timer for a month does not grow a
-job list for a month.
+**"Slow" and "stuck" are different answers.** ``seconds_since_progress`` is
+always reported, so a UI can say "last update 4s ago" during healthy work.
+``stalled`` only trips after :data:`STALL_AFTER_SECONDS`, which is deliberately
+generous: a single large PDF, or an embedding provider serving a retry with
+backoff, is slow but fine, and a progress bar that cries wolf gets ignored.
+
+Still deliberately **in-memory and process-local**, as when this module
+replaced the ``syncing_sources``/``sync_outcomes`` dicts. Phase 35.1c revisits
+that — with more than one replica an in-process registry is structurally wrong
+— but it is a storage change, not a model change, and the model had to be worth
+persisting first.
 """
 
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
@@ -42,14 +54,192 @@ DEFAULT_MAX_RECORDS = 200
 #: Lines of a job's output kept for the UI. The full output goes to the log.
 LOG_TAIL = 40
 
+#: Per-source failures retained for display. Enough to see a pattern ("every
+#: .docx in this folder"), bounded so a source that fails on all 50,000 files
+#: cannot turn a progress record into a memory leak.
+FAILURE_TAIL = 25
+
+#: Progress samples kept per source for the rate calculation. At roughly one
+#: update per second (the CLI emitter's throttle) this is a ~30s window: long
+#: enough not to swing wildly on one slow file, short enough that the ETA
+#: reacts when a sync genuinely slows down. A whole-run average would keep
+#: quoting the fast early minutes of a pass that has since crawled.
+RATE_SAMPLES = 30
+
+#: How long a running source may report nothing before it is called stalled.
+#: Generous on purpose — see the module docstring. A big PDF or a rate-limited
+#: embedding batch is slow, not stuck.
+STALL_AFTER_SECONDS = 300.0
+
+
+def _fraction(current: int, total: int | None) -> float | None:
+    if not total:
+        return None
+    return min(1.0, current / total)
+
 
 @dataclass
-class JobProgress:
-    """Where a job has got to.
+class SourceProgress:
+    """Where one source has got to, and how fast it is getting there.
 
     ``total`` is ``None`` until it is known — a sync does not know how many
     files it will index until the connector has finished listing them, and
     inventing a denominator so the bar looks nicer would make it lie.
+    """
+
+    source: str
+    phase: str = "queued"
+    current: int = 0
+    total: int | None = None
+    detail: str = ""
+    status: str = "running"
+    indexed: int = 0
+    skipped: int = 0
+    failed: int = 0
+    bytes_done: int = 0
+    started_at: str = field(default_factory=utc_now)
+    last_progress_at: str = field(default_factory=utc_now)
+    finished_at: str | None = None
+    #: Cumulative wall time per phase, so "where did the hour go" is answerable.
+    phase_seconds: dict[str, float] = field(default_factory=dict)
+    failures: deque[dict[str, str]] = field(default_factory=lambda: deque(maxlen=FAILURE_TAIL))
+
+    # Monotonic bookkeeping. Kept off the wire and out of ``as_dict``: these
+    # are for arithmetic, and ``time.monotonic`` values are meaningless to a
+    # reader (and incomparable across processes).
+    _samples: deque[tuple[float, int]] = field(
+        default_factory=lambda: deque(maxlen=RATE_SAMPLES), repr=False
+    )
+    _phase_started: float = field(default_factory=time.monotonic, repr=False)
+    _last_monotonic: float = field(default_factory=time.monotonic, repr=False)
+
+    def observe(
+        self,
+        *,
+        phase: str | None,
+        current: int | None,
+        total: int | None,
+        detail: str | None,
+        stats: dict[str, Any] | None,
+        now: float,
+    ) -> None:
+        """Fold one update in. Caller holds the registry lock."""
+
+        if phase is not None and phase != self.phase:
+            # Bank the time the outgoing phase took before switching, so a
+            # phase that ran twice accumulates rather than overwrites.
+            self.phase_seconds[self.phase] = self.phase_seconds.get(self.phase, 0.0) + (
+                now - self._phase_started
+            )
+            self._phase_started = now
+            self.phase = phase
+            # Counters are phase-local (files while preparing, chunks while
+            # embedding). Carrying the old denominator into a new phase whose
+            # total is not yet known produces a plausible but false bar, and
+            # the rate samples would be comparing different units.
+            if total is None:
+                self.total = None
+            self._samples.clear()
+        if total is not None:
+            self.total = total
+        if current is not None:
+            self.current = current
+            self._samples.append((now, current))
+        if detail is not None:
+            self.detail = detail
+        for key in ("indexed", "skipped", "failed", "bytes_done"):
+            value = (stats or {}).get(key)
+            if value is not None:
+                setattr(self, key, int(value))
+        for failure in (stats or {}).get("failures") or []:
+            if isinstance(failure, dict):
+                self.failures.append(
+                    {"path": str(failure.get("path", "")), "error": str(failure.get("error", ""))}
+                )
+        self.last_progress_at = utc_now()
+        self._last_monotonic = now
+
+    def finish(self, status: str, now: float) -> None:
+        self.phase_seconds[self.phase] = self.phase_seconds.get(self.phase, 0.0) + (
+            now - self._phase_started
+        )
+        self._phase_started = now
+        self.status = status
+        self.finished_at = utc_now()
+        if self.total:
+            # A source that succeeded with its counter at 812/1000 (because the
+            # last files were skipped, not indexed) reads as "stopped early".
+            self.current = self.total
+
+    @property
+    def active(self) -> bool:
+        return self.status not in TERMINAL
+
+    def files_per_second(self, now: float) -> float | None:
+        """Throughput over the sample window, or None with too little data."""
+
+        if len(self._samples) < 2:
+            return None
+        (first_at, first_count), (last_at, last_count) = self._samples[0], self._samples[-1]
+        elapsed = last_at - first_at
+        advanced = last_count - first_count
+        if elapsed <= 0 or advanced <= 0:
+            return None
+        return advanced / elapsed
+
+    def eta_seconds(self, now: float) -> float | None:
+        rate = self.files_per_second(now)
+        if not rate or not self.total:
+            return None
+        remaining = max(0, self.total - self.current)
+        return remaining / rate
+
+    def seconds_since_progress(self, now: float) -> float:
+        return max(0.0, now - self._last_monotonic)
+
+    def stalled(self, now: float) -> bool:
+        return self.active and self.seconds_since_progress(now) > STALL_AFTER_SECONDS
+
+    def as_dict(self, now: float | None = None) -> dict[str, Any]:
+        now = time.monotonic() if now is None else now
+        elapsed_phase = self.phase_seconds.get(self.phase, 0.0)
+        if self.active:
+            elapsed_phase += now - self._phase_started
+        return {
+            "source": self.source,
+            "phase": self.phase,
+            "current": self.current,
+            "total": self.total,
+            "detail": self.detail,
+            "status": self.status,
+            "active": self.active,
+            "fraction": _fraction(self.current, self.total),
+            "indexed": self.indexed,
+            "skipped": self.skipped,
+            "failed": self.failed,
+            "bytes_done": self.bytes_done,
+            "files_per_second": self.files_per_second(now),
+            "eta_seconds": self.eta_seconds(now),
+            "seconds_since_progress": self.seconds_since_progress(now),
+            "stalled": self.stalled(now),
+            "started_at": self.started_at,
+            "last_progress_at": self.last_progress_at,
+            "finished_at": self.finished_at,
+            "phase_seconds": {
+                **self.phase_seconds,
+                **({self.phase: elapsed_phase} if self.active else {}),
+            },
+            "failures": list(self.failures),
+        }
+
+
+@dataclass
+class JobProgress:
+    """Job-level rollup. Derived from the per-source records, never authored.
+
+    Kept because it is what the pre-35.1 API and UI read. ``total`` stays
+    ``None`` until *every* running source knows its own — a partial sum would
+    shrink the denominator as sources report in and run the bar backwards.
     """
 
     phase: str = "starting"
@@ -59,9 +249,7 @@ class JobProgress:
 
     @property
     def fraction(self) -> float | None:
-        if not self.total:
-            return None
-        return min(1.0, self.current / self.total)
+        return _fraction(self.current, self.total)
 
 
 @dataclass
@@ -77,21 +265,56 @@ class Job:
     error: str | None = None
     result: dict[str, Any] | None = None
     log: deque[str] = field(default_factory=lambda: deque(maxlen=LOG_TAIL))
+    sources: dict[str, SourceProgress] = field(default_factory=dict)
 
-    def as_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
+    def source_record(self, name: str) -> SourceProgress:
+        record = self.sources.get(name)
+        if record is None:
+            record = SourceProgress(source=name)
+            self.sources[name] = record
+        return record
+
+    def recompute(self, now: float) -> None:
+        """Refresh the rollup from the per-source records."""
+
+        records = list(self.sources.values())
+        if not records:
+            return
+        active = [r for r in records if r.active] or records
+        self.progress.current = sum(r.current for r in records)
+        totals = [r.total for r in records]
+        self.progress.total = sum(t for t in totals if t) if all(t for t in totals) else None
+        # The least-advanced running phase is the honest headline: a job is not
+        # "saving" because one of its eight sources is.
+        newest = max(active, key=lambda r: r._last_monotonic)
+        self.progress.phase = newest.phase
+        self.progress.detail = (
+            f"[{newest.source}] {newest.detail}" if len(records) > 1 else newest.detail
+        )
+
+    def as_dict(self, now: float | None = None) -> dict[str, Any]:
+        now = time.monotonic() if now is None else now
+        payload = asdict(
+            self,
+            dict_factory=lambda items: {k: v for k, v in items if k not in {"log", "sources"}},
+        )
         payload["log"] = list(self.log)
         payload["progress"]["fraction"] = self.progress.fraction
         payload["active"] = self.status not in TERMINAL
+        payload["sources"] = [
+            record.as_dict(now) for record in sorted(self.sources.values(), key=lambda r: r.source)
+        ]
+        payload["stalled"] = any(record.stalled(now) for record in self.sources.values())
+        payload["failed_files"] = sum(record.failed for record in self.sources.values())
         return payload
 
 
 class JobRegistry:
     """Thread-safe registry of background jobs, with a subscription stream.
 
-    Every mutation is under one lock and every reader gets a snapshot: jobs
-    are written from worker threads and read from request threads, and handing
-    out a live object would let a response serialize a half-updated record.
+    Every mutation is under one lock and every reader gets a snapshot: jobs are
+    written from worker threads and read from request threads, and handing out
+    a live object would let a response serialize a half-updated record.
     """
 
     def __init__(self, max_records: int = DEFAULT_MAX_RECORDS) -> None:
@@ -111,14 +334,20 @@ class JobRegistry:
         *,
         job_id: str | None = None,
     ) -> Job:
+        targets = list(targets or [])
         job = Job(
             id=job_id or uuid.uuid4().hex[:12],
             kind=kind,
             label=label,
-            targets=list(targets or []),
+            targets=targets,
             status="running",
             started_at=utc_now(),
         )
+        # Seed a record per target so a source that has not reported yet still
+        # shows as queued rather than being missing from the UI entirely —
+        # "nothing here" and "waiting its turn" are different answers.
+        for target in targets:
+            job.source_record(target)
         with self._lock:
             self._jobs[job.id] = job
             self._order.append(job.id)
@@ -134,33 +363,41 @@ class JobRegistry:
         current: int | None = None,
         total: int | None = None,
         detail: str | None = None,
+        source: str | None = None,
+        stats: dict[str, Any] | None = None,
     ) -> None:
         """Record forward movement. Unknown job ids are ignored, not raised.
 
-        A progress callback fires from deep inside the indexing loop; making
-        it capable of failing a sync — because a job was evicted, or the
-        registry was swapped in a test — would be a poor trade for a
-        cosmetic feature.
+        A progress callback fires from deep inside the indexing loop; making it
+        capable of failing a sync — because a job was evicted, or the registry
+        was swapped in a test — would be a poor trade for a cosmetic feature.
+
+        ``source`` names which source the update is about. When it is absent
+        (an older caller, or a job with a single target) the update is applied
+        to the job's only source record, so nothing regresses.
         """
+        now = time.monotonic()
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None or job.status in TERMINAL:
                 return
-            phase_changed = phase is not None and phase != job.progress.phase
-            if phase is not None:
-                job.progress.phase = phase
-            if current is not None:
-                job.progress.current = current
-            if total is not None:
-                job.progress.total = total
-            elif phase_changed:
-                # Counters have phase-local units (files while preparing,
-                # chunks while embedding). Carrying the old denominator into
-                # a new unknown-total phase produces a plausible but false bar.
-                job.progress.total = None
+            name = source
+            if name is None:
+                names = list(job.sources)
+                name = names[0] if len(names) == 1 else "*"
+            record = job.source_record(name)
+            record.observe(
+                phase=phase,
+                current=current,
+                total=total,
+                detail=detail,
+                stats=stats,
+                now=now,
+            )
             if detail is not None:
-                job.progress.detail = detail
-                job.log.append(f"{utc_now()} {detail}")
+                prefix = f"[{name}] " if name != "*" and len(job.sources) > 1 else ""
+                job.log.append(f"{utc_now()} {prefix}{detail}")
+            job.recompute(now)
             snapshot = job
         self._publish(snapshot)
 
@@ -172,6 +409,7 @@ class JobRegistry:
         error: str | None = None,
         result: dict[str, Any] | None = None,
     ) -> None:
+        now = time.monotonic()
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -180,12 +418,33 @@ class JobRegistry:
             job.error = error
             job.result = result
             job.finished_at = utc_now()
+            for record in job.sources.values():
+                if record.active:
+                    record.finish(status, now)
             job.progress.phase = status
+            job.recompute(now)
             if job.progress.total:
-                # Finish the bar. A job that succeeded while its counter still
-                # reads 812/1000 (because the last files were skipped, not
-                # indexed) reads as "stopped early".
                 job.progress.current = job.progress.total
+            snapshot = job
+        self._publish(snapshot)
+
+    def finish_source(self, job_id: str, source: str, status: str = "succeeded") -> None:
+        """Mark one source terminal while the job carries on.
+
+        Without this a `sync_all` shows all eight sources running until the
+        slowest finishes, which hides exactly the information the per-source
+        breakdown exists to give.
+        """
+        now = time.monotonic()
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status in TERMINAL:
+                return
+            record = job.sources.get(source)
+            if record is None or not record.active:
+                return
+            record.finish(status, now)
+            job.recompute(now)
             snapshot = job
         self._publish(snapshot)
 
@@ -230,6 +489,64 @@ class JobRegistry:
                 if job and job.status in TERMINAL and target in job.targets:
                     return job
         return None
+
+    def source_progress(self, target: str) -> dict[str, Any] | None:
+        """The live per-source record for ``target``, if one is running."""
+
+        now = time.monotonic()
+        with self._lock:
+            for job_id in reversed(self._order):
+                job = self._jobs.get(job_id)
+                if job is None or job.status in TERMINAL:
+                    continue
+                record = job.sources.get(target)
+                if record is not None:
+                    return record.as_dict(now)
+        return None
+
+    def metrics_sample(self) -> dict[str, Any]:
+        """Gauge values for the metrics endpoint, sampled at scrape time.
+
+        Returns plain numbers and ``{source: value}`` maps, which is the shape
+        :func:`pheasant.telemetry.metrics.render_with` consumes — this module
+        stays free of any dependency on the telemetry package.
+        """
+
+        now = time.monotonic()
+        ratio: dict[str, float] = {}
+        rate: dict[str, float] = {}
+        eta: dict[str, float] = {}
+        stalled: dict[str, float] = {}
+        queued = 0
+        inflight = 0
+        with self._lock:
+            for job_id in self._order:
+                job = self._jobs.get(job_id)
+                if job is None or job.status in TERMINAL:
+                    continue
+                inflight += 1
+                for name, record in job.sources.items():
+                    if not record.active:
+                        continue
+                    queued += 1
+                    fraction = _fraction(record.current, record.total)
+                    if fraction is not None:
+                        ratio[name] = fraction
+                    observed = record.files_per_second(now)
+                    if observed is not None:
+                        rate[name] = observed
+                    remaining = record.eta_seconds(now)
+                    if remaining is not None:
+                        eta[name] = remaining
+                    stalled[name] = 1.0 if record.stalled(now) else 0.0
+        return {
+            "pheasant_index_queue_depth": queued,
+            "pheasant_index_inflight": inflight,
+            "pheasant_index_progress_ratio": ratio,
+            "pheasant_index_files_per_second": rate,
+            "pheasant_index_eta_seconds": eta,
+            "pheasant_index_stalled": stalled,
+        }
 
     def clear(self, job_id: str | None = None) -> int:
         """Remove finished notifications; active work is never cancelled."""

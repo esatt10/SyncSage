@@ -989,7 +989,7 @@ working, which is what holds the 5 MB end of the range.
 | Step | What | Status |
 |---|---|---|
 | 35.0 | Remove the Obsidian exporter | done (2026-08-16) |
-| 35.1 | Observability: real `/metrics`, persisted per-source progress with throughput/ETA/stall detection | queued |
+| 35.1 | Observability: real `/metrics`, per-source progress with throughput/ETA/stall detection | done (2026-08-16) |
 | 35.2 | `StateBackend` seam + Postgres backend (incl. FTS5 → `tsvector` port) | queued |
 | 35.3 | `GraphBackend`: bounded memory, hot loops pushed into SQL | queued |
 | 35.4 | Multi-writer indexing: per-source leases + durable work queue + sharding | queued |
@@ -1040,3 +1040,72 @@ gone. Recorded in CLAUDE.md rule 8 and `docs/mcp_tools.md`.
 was documented from the initial build and **never emitted** by any release, so
 no persisted graph contains one — the removal cannot invalidate stored state
 (rule 3 untouched: the stable-ID grammar does not change).
+
+### Step 35.1 — Observability (done 2026-08-16)
+
+**Contract:** make "is the indexer moving?" and "what does the autoscaler scale
+on?" answerable. Both were unanswerable: `/metrics` returned the literal string
+`pheasant_up 1`, and `jobs.py` tracked one phase string and one counter per
+*job* — so a `sync_all` over eight sources hid the one that was stuck behind the
+seven that were fine.
+
+**Metrics.** New `src/pheasant/telemetry/metrics.py`: counters, gauges and
+histograms rendering Prometheus exposition text, hand-rolled rather than
+depending on `prometheus-client`. The reason is not dependency asceticism — it
+is that the part of that library people need is a cross-process registry, and
+that is exactly the part which cannot work here: indexing runs in a **child
+process** (`sync/worker.py`), so in-process counters there die with the child
+regardless of library. Indexing series are therefore gauges sampled at scrape
+time from live job state (`JobRegistry.metrics_sample`), not counters. Label
+values are escaped and metric names validated at registration, because one
+malformed series breaks an entire scrape rather than just itself.
+
+**Per-source progress.** `SourceProgress` per source inside a job; `JobProgress`
+becomes a derived rollup, kept so pre-35.1 callers and the UI keep working. The
+rollup's `total` stays `None` until *every* source knows its own — a partial sum
+shrinks the denominator as sources report in and runs the bar backwards.
+Throughput and ETA are **observed** server-side over a sliding window
+(`RATE_SAMPLES`), not reported by the indexer: the wire is unchanged, and a
+caller that emits no rate still gets one. A phase change clears the denominator
+and the rate window, because counters are phase-local (files while preparing,
+chunks while embedding) and carrying them across produces a plausible, false bar.
+
+**Slow vs stuck.** `seconds_since_progress` is always reported so a client can
+say "last update 4s ago" during healthy work; `stalled` only trips after
+`STALL_AFTER_SECONDS` (300s, deliberately generous — a large PDF or a
+rate-limited embedding batch is slow, not stuck) and is styled as a warning, not
+a failure.
+
+**Wire.** `ProgressHook` gains an optional fifth `meta` argument carrying
+`source` plus counters. `_hook_accepts_meta` decides by **signature**, once per
+wrap, which form to call — not by catching `TypeError` around the call, which
+would misread a `TypeError` raised *inside* a four-argument hook as an arity
+mismatch and silently re-invoke it. Four-argument callbacks stay supported and
+are tested. `sync_all`'s `[source]` prose prefix is gone: the source is now a
+field. The CLI's NDJSON emitter throttles **per source**, since one global
+counter let a fast source suppress every update from a slow one.
+
+**Surfaces.** `_with_sync_state` (the single overlay every source-listing route
+already passed through) gains `progress` — this source's slice, not the whole
+run's. UI: `SyncProgress.tsx` is shared by the jobs tray and the Sources page so
+the two cannot disagree about what "stalled" looks like.
+
+**Acceptance:** `tests/test_observability.py` (23). Mutation-tested 8/8 caught
+**after** closing a gap the first run exposed: every test passed `source=`
+explicitly, so neutering the source-less fallback changed nothing and the whole
+back-compat branch was uncovered. Two tests now cover it. Suite **1057 passed /
+27 skipped** (+23). Docs: `docs/how-to/monitor-indexing.md`.
+
+**Deferred deliberately — job persistence (was 35.1c) moves to 35.4.** The plan
+had jobs persisted to the state store this step. Persisting them alone is a
+*partial* answer that is arguably worse than none: on restart the sync itself is
+gone (it was a subprocess), so a persisted record would show a job that is no
+longer running. The useful version is a job that can be **resumed**, which needs
+the durable queue and per-source leases of 35.4. Recorded rather than dropped.
+
+**Known gap, reported not hidden:** `failed`/`failures` are in the model and
+always empty, because a file that fails to prepare raises and ends the whole
+pass (`_prepared_items` calls `future.result()` with no per-item tolerance).
+Per-item fault tolerance and a dead-letter queue are 35.4; the fields exist
+because that is where those counts will land. Documented as a caveat in
+`docs/how-to/monitor-indexing.md` rather than left for a reader to discover.
