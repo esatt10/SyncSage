@@ -265,6 +265,17 @@ class StorageSettings(ModelMixin):
     graph_snapshots: bool = True
     graph_snapshot_interval_seconds: int = 900
     graph_checkpoint_seconds: int = 60
+    #: Expected seconds between interruptions — a container restart, a
+    #: redeploy, an OOM kill. This is the one number an operator actually
+    #: knows, and it is what sets the checkpoint interval (see
+    #: ``optimal_checkpoint_interval``). 24h suits a normally-running
+    #: deployment; lower it on spot/preemptible instances, which is exactly
+    #: the case where more frequent checkpoints pay for themselves.
+    checkpoint_mtbf_seconds: int = 86_400
+    #: Ceiling on the derived interval, so worst-case rework stays bounded no
+    #: matter what the formula returns. 30 minutes of lost indexing is
+    #: recoverable; an unbounded interval on a very large graph is not.
+    graph_checkpoint_max_seconds: int = 1_800
     compression: str = "zstd"
     sqlite_path: Path | None = None
     graph_path: Path | None = None
@@ -570,14 +581,15 @@ class GraphSettings(ModelMixin):
     #: would throw away a completed index.
     #:
     #: The default is derived from measurement, not taste. `graph/capacity.py`
-    #: measured a real-shaped graph at four scales; per node the cost is flat
-    #: at ~2.4 KB of process RSS, and the binding constraint is not RAM but
-    #: `storage.graph_checkpoint_seconds`: at 1.58M nodes one checkpoint takes
-    #: ~20 s to serialize against a 60 s interval, so a third of the sync is
-    #: spent writing the graph out. 750k nodes (~120k files) keeps that under
-    #: ~10%, which is the point at which sharding into several regions is the
-    #: better answer. Set to None to disable the warning.
-    max_nodes: int | None = 750_000
+    #: measured a real-shaped graph at four scales and found a flat ~2.4 KB of
+    #: process RSS per node. The shipped container limit is 6 Gi, and the graph
+    #: is roughly 60% of process RSS, so ~1.5M nodes (~240k files) is where a
+    #: default container is genuinely full — past that it is OOM-killed
+    #: mid-sync, which presents as an unexplained restart rather than as a
+    #: capacity problem. Raise both together for a larger container; shard once
+    #: raising them stops being comfortable. Set to None to disable.
+    max_nodes: int | None = 1_500_000
+
 
 @dataclass
 class SynapseSettings(ModelMixin):

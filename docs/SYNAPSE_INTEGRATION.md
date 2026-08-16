@@ -992,7 +992,7 @@ working, which is what holds the 5 MB end of the range.
 | 35.1 | Observability: real `/metrics`, per-source progress with throughput/ETA/stall detection | done (2026-08-16) |
 | 35.2 | `StateBackend` seam + Postgres backend (incl. FTS5 → `tsvector` port) | done (2026-08-16) |
 | 35.3 | Graph capacity measured; sharding chosen over a Postgres graph backend | done (2026-08-16) |
-| 35.4 | Multi-writer indexing: per-source leases + durable work queue + sharding | queued |
+| 35.4 | Multi-writer indexing: per-source leases + durable queue + sharding | checkpointing + container sizing done (2026-08-16); leases/queue queued |
 | 35.5 | Broker (NATS JetStream) and gRPC as first-class transports | queued |
 | 35.6 | Process roles, autoscaling, and the three runtimes | queued |
 | 35.7 | Measured capacity model and sizing guidance | queued |
@@ -1201,9 +1201,16 @@ extrapolate safely: a linear projection to 250k predicted 3.8 GB against a
 measured 4.3 GB, 12% low — which is why the top row was measured rather than
 derived.
 
-**The binding constraint is not RAM.** `storage.graph_checkpoint_seconds`
-defaults to 60 s and a checkpoint serializes the whole graph: 11% of the
-interval at 100k files, **33% at 250k**, and approaching 100% around 500k. A
+**Correction (2026-08-16, Step 35.4):** the "33% at 250k" figure below was
+**wrong**. It assumed the interval stayed at 60 s; the engine already
+self-throttled to `max(60s, last_save * 10)`, capping overhead at ~10%. The
+conclusion — shard rather than build a graph backend — is unchanged, because it
+rests on RAM and on linear growth, not on the checkpoint figure. 35.4 replaces
+the 10x rule with Young's formula and takes overhead to ~1%.
+
+**~~The binding constraint is not RAM.~~** `storage.graph_checkpoint_seconds`
+defaults to 60 s and a checkpoint serializes the whole graph: ~~11% of the
+interval at 100k files, 33% at 250k~~ (see the correction above). A
 Postgres graph backend would lower steady-state RSS and would **not** fix that —
 the graph is still assembled in memory during a sync and still has to be
 written. Sharding fixes both, because both costs divide by the shard count and
@@ -1230,3 +1237,49 @@ drift apart, since a warning that fires at a size the doc calls fine is worse
 than no warning. Docs: `docs/how-to/capacity-planning.md` (sizing per corpus
 size, the checkpoint ceiling, how to choose a shard boundary, and which storage
 backend), plus `configuration.md` §graph.max_nodes.
+
+### Step 35.4 (partial) — Checkpoint scheduling and container sizing (2026-08-16)
+
+**Correction first.** Step 35.3 reported checkpoint overhead as "33% of a 60 s
+interval at 250k files". That was wrong: the engine already self-throttled to
+`max(60s, last_save * 10)`, so the interval stretched and overhead was capped
+near **10%**, not 33%. 35.3's conclusion — shard rather than build a graph
+backend — is unaffected, because it rests on RAM and linear growth rather than
+on that figure.
+
+**Checkpointing now follows Young's formula** (`T = sqrt(2 x C x MTBF)`), the
+standard HPC and ML-training result, replacing the 10x rule. It minimizes the
+*sum* of checkpoint overhead and work redone after a crash rather than either
+alone:
+
+| Corpus | Cost | Old interval / overhead | Young / overhead | Worst-case rework |
+|---|---|---|---|---|
+| 2,000 | 0.13 s | 60 s / 0.2% | 150 s / 0.1% | 2.5 min |
+| 20,000 | 1.3 s | 60 s / 2.2% | 8 min / 0.3% | 8 min |
+| 100,000 | 6.7 s | 67 s / 10.0% | 18 min / 0.6% | 18 min |
+| 250,000 | 19.9 s | 199 s / 10.0% | 31 min / 1.1% | 31 min |
+
+An order of magnitude less overhead. The trade is bounded rework, capped by the
+new `storage.graph_checkpoint_max_seconds` (30 min). The operator-facing input
+is `storage.checkpoint_mtbf_seconds` (24h) — the one number an operator
+actually knows — and lowering it on spot/preemptible instances makes pheasant
+checkpoint more often, which is exactly where that pays.
+
+Degrades to the previous behaviour when it cannot compute: no measured save yet
+(the first checkpoint of a fresh graph) or MTBF switched off both return the
+plain floor. Returning 0 there would checkpoint on every artifact.
+
+**Container sizing.** `deploy/kubernetes/deployment.yaml` and the Helm chart go
+from **1 Gi → 6 Gi** (and 1 → 2 CPU), covering ~350,000 files instead of
+~65,000. `graph.max_nodes` moves with it — 750k → **1.5M nodes (~240k files)**,
+the point at which a 6 Gi container is genuinely full given the graph is ~60% of
+process RSS. A threshold that does not match the container it ships with either
+nags early or never fires before the OOM kill, so a test asserts the default,
+the published table and both manifests agree.
+
+**Acceptance:** `tests/test_graph_capacity.py` 6 → **10**, mutation-tested 5/5
+caught (including reverting to the 10x rule, dropping the ceiling, and drifting
+`max_nodes` away from the manifest).
+
+**Still queued for 35.4:** per-source write leases on Postgres, the durable work
+queue with dead-lettering, and `pheasant shard plan`.

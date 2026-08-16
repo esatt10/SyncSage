@@ -32,45 +32,68 @@ projection to 250k files predicted 3.8 GB and the measured answer was 4.3 GB,
 
 | Corpus | Give the container | Notes |
 |---|---|---|
-| < 5,000 files | 512 MB, 1 CPU | The shipped defaults are fine. |
+| < 5,000 files | 512 MB, 1 CPU | |
 | 5,000–25,000 | 1 GB, 2 CPU | |
 | 25,000–75,000 | 2 GB, 2–4 CPU | |
-| 75,000–120,000 | 4 GB, 4 CPU | Approaching the practical ceiling. |
-| **> 120,000** | **Shard instead** | See below. |
+| 75,000–150,000 | 4 GB, 4 CPU | |
+| 150,000–240,000 | **6 GB, 4 CPU** | The shipped default. |
+| 240,000–500,000 | 8–16 GB | Fine in the cloud; `graph.max_nodes` warns. |
+| **> 500,000** | **Shard** | One container stops being sensible. |
 
-!!! warning "The shipped Kubernetes manifest is 1 GB"
+These are per **region**, and linear — a cloud deployment can go well past the
+bottom row on a single node. Sharding is about operational sanity (parallel
+indexing, independent re-indexes, blast radius) more than about a hard wall.
 
-    `deploy/kubernetes/deployment.yaml` and the Helm chart both request a
-    **1 Gi** limit. On the table above that covers roughly **65,000 files**.
-    Past that the pod is OOM-killed mid-sync, which looks like an unexplained
-    restart rather than a capacity problem. Raise the limit or shard.
+!!! note "The shipped Kubernetes manifest allows 6 GB"
 
-## The real ceiling is checkpoint time, not RAM
+    `deploy/kubernetes/deployment.yaml` and the Helm chart limit memory to
+    **6 Gi**, which covers roughly **350,000 files** on the table above. It was
+    1 Gi (about 65,000 files) until 2026-08-16; a corpus past that was
+    OOM-killed mid-sync and it presented as an unexplained restart rather than
+    as a capacity problem. Raise it further for a cloud deployment — the
+    numbers above are per-region and linear.
 
-RAM is the obvious constraint and it is not the binding one. `storage.
-graph_checkpoint_seconds` defaults to **60 s**, and a checkpoint has to
-serialize the entire graph:
+## Checkpoint cost, and why it is no longer the ceiling
 
-| Corpus | Checkpoint write | Share of a 60 s interval |
-|---|---|---|
-| 20,000 files | 1.3 s | 2% |
-| 100,000 files | 6.7 s | 11% |
-| 250,000 files | 19.9 s | **33%** |
-| ~500,000 files | ~40 s (projected) | **67%** |
+A checkpoint serializes the entire graph, so its cost grows with the index. The
+interval is **derived from that cost**, not fixed — pheasant uses Young's
+formula (`T = sqrt(2 x C x MTBF)`), the standard HPC/ML-training result, which
+minimizes the *sum* of checkpoint overhead and work redone after a crash rather
+than either alone:
 
-A third of a long sync spent writing the graph out is already poor; past
-roughly 500,000 files the write approaches the interval and the sync spends
-most of its time serializing. **That, not memory exhaustion, is why one region
-stops being the right answer** — and it is why raising RAM alone does not buy
-you much.
+| Corpus | Checkpoint cost | Interval | Overhead | Worst-case rework |
+|---|---|---|---|---|
+| 2,000 files | 0.13 s | 150 s | 0.1% | 2.5 min |
+| 20,000 files | 1.3 s | 8 min | 0.3% | 8 min |
+| 100,000 files | 6.7 s | 18 min | 0.6% | 18 min |
+| 250,000 files | 19.9 s | 31 min | 1.1% | 31 min |
 
-pheasant warns about this once per sync via `graph.max_nodes` (default
-**750,000 nodes**, ≈120,000 files). It is a notice, not a refusal: by the time
-it can fire the index already exists, and discarding it would help nobody.
+Overhead stays around 1% at every size. The trade is bounded rework — at most
+one interval of indexing is lost to a crash — capped by
+`storage.graph_checkpoint_max_seconds` (30 min).
+
+```yaml
+storage:
+  checkpoint_mtbf_seconds: 86400      # expected time between interruptions
+  graph_checkpoint_max_seconds: 1800  # ceiling on lost work
+```
+
+Lower `checkpoint_mtbf_seconds` on spot or preemptible instances: interruptions
+are more frequent there, and the formula responds by checkpointing more often —
+which is exactly when that pays for itself.
+
+So checkpoint cost is **not** what limits one region. RAM is, and it grows
+linearly — the table at the top is the guide.
+
+pheasant warns once per sync when the graph passes `graph.max_nodes` (default
+**1.5M nodes**, ≈240,000 files — the point at which the shipped 6 Gi container
+is genuinely full). It is a notice, not a refusal: by the time it can fire the
+index already exists, and discarding it would help nobody. Raise it *and* the
+container limit together, or shard.
 
 ```yaml
 graph:
-  max_nodes: 750000   # null disables the warning
+  max_nodes: 1500000   # null disables the warning
 ```
 
 ## When you cross the line: shard
@@ -93,7 +116,8 @@ nothing, because those edges were never going to exist.
 
 Sizing a fleet is the single-region table divided by the shard count. 600,000
 files across 6 regions is six containers of the 100,000-file row — 1.5 GB and a
-6.7 s checkpoint each — not one impossible container.
+6.7 s checkpoint each — indexing in parallel, instead of one 10 GB container
+indexing serially.
 
 ## Which storage backend
 

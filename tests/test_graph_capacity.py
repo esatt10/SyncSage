@@ -134,16 +134,113 @@ def test_the_guardrail_can_be_switched_off(tmp_path: Path) -> None:
 def test_the_default_threshold_matches_the_published_table() -> None:
     """The doc and the default must not drift apart.
 
-    750,000 nodes is ~120,000 files at the measured 6.3 nodes/file, which is
-    the row `capacity-planning.md` marks as the practical ceiling. If either
-    moves without the other, the warning fires at a size the doc calls fine.
+    1.5M nodes is ~240,000 files at the measured 6.3 nodes/file, which is the
+    row `capacity-planning.md` marks as a full 6 Gi container — the limit the
+    shipped manifests set. If any of the three moves without the others, the
+    warning fires at a size the doc calls fine, or never fires before the pod
+    is OOM-killed.
     """
 
     default = PheasantConfig().graph.max_nodes
-    assert default == 750_000
+    assert default == 1_500_000
     files_at_threshold = default / capacity.NODES_PER_FILE
-    assert 110_000 <= files_at_threshold <= 130_000
+    assert 230_000 <= files_at_threshold <= 250_000
 
     doc = Path("docs/how-to/capacity-planning.md").read_text(encoding="utf-8")
-    assert "750,000 nodes" in doc or "750000" in doc
-    assert "120,000 files" in doc
+    assert "1.5M nodes" in doc
+    assert "240,000 files" in doc
+
+    # And the threshold has to fit the container the manifests actually ship.
+    # ~2.4 KB of RSS per node, graph ~60% of process RSS.
+    for manifest in (
+        Path("deploy/kubernetes/deployment.yaml"),
+        Path("deploy/helm/values.yaml"),
+    ):
+        assert "memory: 6Gi" in manifest.read_text(encoding="utf-8"), manifest
+    graph_bytes_at_threshold = default * 2400
+    container_bytes = 6 * 1024**3
+    assert 0.4 <= graph_bytes_at_threshold / container_bytes <= 0.75, (
+        "graph.max_nodes no longer matches the shipped container limit"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint scheduling (Phase 35.4)
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_interval_follows_youngs_formula() -> None:
+    """`T = sqrt(2 * C * MTBF)` — the standard HPC/ML-training result.
+
+    The rule it replaced was `max(60s, last_save * 10)`, which held overhead at
+    a flat **10%** however large the graph got. Young's formula minimizes the
+    *sum* of overhead and post-crash rework instead of either alone, and lands
+    near 1% on pheasant's measured save costs.
+    """
+
+    import math
+
+    from pheasant.sync.engine import optimal_checkpoint_interval
+
+    for save in (0.13, 1.32, 6.71, 19.91):
+        interval = optimal_checkpoint_interval(
+            save, mtbf_seconds=86_400, floor_seconds=60, ceiling_seconds=100_000
+        )
+        assert abs(interval - math.sqrt(2 * save * 86_400)) < 1.0
+        # The property that matters: overhead is small at every scale, where
+        # the old rule pinned it at 10%.
+        assert save / interval < 0.05
+
+
+def test_a_shorter_mtbf_checkpoints_more_often() -> None:
+    """Spot/preemptible instances are interrupted more, so they should
+    checkpoint more — the formula must respond to that, not ignore it."""
+
+    from pheasant.sync.engine import optimal_checkpoint_interval
+
+    stable = optimal_checkpoint_interval(
+        10.0, mtbf_seconds=86_400, floor_seconds=60, ceiling_seconds=100_000
+    )
+    spot = optimal_checkpoint_interval(
+        10.0, mtbf_seconds=3_600, floor_seconds=60, ceiling_seconds=100_000
+    )
+    assert spot < stable
+
+
+def test_the_interval_is_bounded_at_both_ends() -> None:
+    """The floor keeps a trivially cheap save from checkpointing constantly;
+    the ceiling bounds how much indexing a crash can throw away."""
+
+    from pheasant.sync.engine import optimal_checkpoint_interval
+
+    assert (
+        optimal_checkpoint_interval(
+            0.001, mtbf_seconds=86_400, floor_seconds=60, ceiling_seconds=1_800
+        )
+        == 60
+    )
+    assert (
+        optimal_checkpoint_interval(
+            600.0, mtbf_seconds=86_400, floor_seconds=60, ceiling_seconds=1_800
+        )
+        == 1_800
+    )
+
+
+def test_it_degrades_to_the_pre_35_4_behaviour_when_it_cannot_compute() -> None:
+    """No measured save yet (the first checkpoint of a fresh graph), or MTBF
+    switched off, must fall back to the plain floor rather than to zero —
+    returning 0 would checkpoint on every artifact."""
+
+    from pheasant.sync.engine import optimal_checkpoint_interval
+
+    assert (
+        optimal_checkpoint_interval(
+            0.0, mtbf_seconds=86_400, floor_seconds=60, ceiling_seconds=1_800
+        )
+        == 60
+    )
+    assert (
+        optimal_checkpoint_interval(10.0, mtbf_seconds=0, floor_seconds=60, ceiling_seconds=1_800)
+        == 60
+    )
