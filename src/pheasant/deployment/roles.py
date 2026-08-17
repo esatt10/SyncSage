@@ -67,6 +67,15 @@ class RolePolicy:
     indexes_locally: bool
     #: Serve the bundled UI. False on roles nobody points a browser at.
     serves_ui: bool
+    #: Poll ``/state`` for a graph written by *another* process and reload it.
+    #:
+    #: Only ``api`` needs this, and it needs it badly: the graph is a file, a
+    #: process loads it once at startup, and the only existing reload happens
+    #: after a sync **this** process ran. An api replica never indexes, so
+    #: without polling it would serve graph queries against whatever the graph
+    #: was when the pod started — indefinitely, and silently, while text and
+    #: vector search stayed current from the shared database.
+    refreshes_graph: bool = False
 
     @property
     def name(self) -> str:
@@ -97,6 +106,7 @@ POLICIES: dict[Role, RolePolicy] = {
         drains_queue=False,
         indexes_locally=False,
         serves_ui=True,
+        refreshes_graph=True,
     ),
     Role.INDEXER: RolePolicy(
         role=Role.INDEXER,
@@ -169,4 +179,5 @@ def describe(policy: RolePolicy) -> dict[str, object]:
         "scheduler": policy.runs_scheduler,
         "drains_queue": policy.drains_queue,
         "indexes_locally": policy.indexes_locally,
+        "refreshes_graph": policy.refreshes_graph,
     }

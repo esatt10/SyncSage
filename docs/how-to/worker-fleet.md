@@ -190,6 +190,76 @@ sync:
 It buys fan-out, not correctness the local queue lacks — and it is one more
 thing to run.
 
+## Running the whole fleet
+
+The pieces above assemble into three tiers. Both runtimes ship a working
+version, and both are the *other* trade from the single container — take them
+only past the point where one container stops being enough
+([capacity planning](capacity-planning.md)).
+
+### Compose
+
+```bash
+export PHEASANT_INDEX_WORKER_TOKEN=$(openssl rand -hex 32)
+docker compose -f docker-compose.scale.yml up -d --scale worker=4
+```
+
+Postgres, one api, one indexer, four workers. Only `worker` is safe to scale
+here: `api` would need a load balancer Compose does not have, and a second
+`indexer` would spend its life losing lease races.
+
+### Kubernetes
+
+```bash
+kubectl apply -f deploy/kubernetes/namespace.yaml
+kubectl -n pheasant create secret generic pheasant-secrets \
+  --from-literal=PHEASANT_DATABASE_URL='postgresql://…' \
+  --from-literal=PHEASANT_INDEX_WORKER_TOKEN="$(openssl rand -hex 32)"
+kubectl apply -f deploy/kubernetes/scaled/
+```
+
+| Workload | Kind | Scales on |
+|---|---|---|
+| `pheasant-api` | Deployment | CPU (HPA) |
+| `pheasant-indexer` | StatefulSet, 1 replica | not autoscaled |
+| `pheasant-worker` | Deployment | `pheasant_index_queue_depth` (KEDA or HPA) |
+
+`deploy/kubernetes/scaled/README.md` lists what you must provide first. Two
+requirements are easy to miss and neither is optional:
+
+* **A ReadWriteMany volume for `/state`.** The knowledge graph is a file the
+  indexer writes and every api replica reads. With RWO the volume attaches to
+  one node, so api replicas scheduled elsewhere cannot read it at all. Most
+  default StorageClasses are RWO.
+* **Postgres.** SQLite permits one writer per file, and it is not one file
+  across pods.
+
+Api replicas poll the graph file every `server.api.graph_refresh_seconds`
+(30 s) and reload when it changes. Without that they would answer graph
+queries from whatever the graph was when the pod started — while text and
+vector search stayed current from the shared database, which is exactly what
+makes the staleness easy to miss.
+
+### Scale on the backlog, not on CPU
+
+CPU is a lagging signal for the worker tier: workers only get busy once the
+indexer is already sending them work, so a CPU-driven autoscaler adds capacity
+after the queue has built up. `pheasant_index_queue_depth` rises the moment
+sources are enqueued.
+
+```promql
+sum(pheasant_index_queue_depth) or vector(0)
+```
+
+`deploy/kubernetes/scaled/worker-hpa.yaml` ships both a KEDA `ScaledObject`
+(preferred — reads Prometheus directly and can scale to **zero**, which
+matters because idle workers are pure cost) and a plain HPA for clusters
+without it.
+
+The api tier scales on CPU with a five-minute scale-down window, because a new
+replica loads the whole graph into memory at startup: shedding a replica
+eagerly and adding it back pays that twice.
+
 ## Related
 
 - [Speed up indexing](indexing-performance.md) — worker counts and executors.

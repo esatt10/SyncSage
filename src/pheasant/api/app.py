@@ -27,6 +27,7 @@ from pheasant.config.profiles import profile_names
 from pheasant.config.schema import PheasantConfig, SourceConfig, SourceType
 from pheasant.deployment.roles import describe as describe_role
 from pheasant.deployment.roles import resolve_role, validate_role
+from pheasant.deployment.serving import RETRY_AFTER_SECONDS, ConcurrencyLimiter, DrainState
 from pheasant.graph.exporter import cytoscape, node_link
 from pheasant.graph.simple import SimpleMultiDiGraph
 from pheasant.ingestion.pipeline import read_text, utc_now
@@ -791,6 +792,20 @@ def create_app(
     async def lifespan(app: FastAPI):
         import asyncio
 
+        # Drain-on-SIGTERM is installed *here*, not before `uvicorn.run()`.
+        # uvicorn installs its own graceful-shutdown handler inside `run()`,
+        # so a handler installed earlier is simply replaced and never fires.
+        # Lifespan startup runs after `capture_signals()`, which is what lets
+        # this one chain to uvicorn's rather than clobber it.
+        drain_seconds = float(getattr(config.server.api, "drain_seconds", 0) or 0)
+        if drain_seconds > 0:
+            from pheasant.deployment.serving import install_drain_handler
+
+            try:
+                install_drain_handler(app.state.drain, drain_seconds)
+            except ValueError:  # pragma: no cover - not the main thread (TestClient)
+                logger.debug("drain handler not installed: not running in the main thread")
+
         startup_sources = [
             source.name for source in config.sources if source.enabled and source.sync.on_startup
         ]
@@ -876,6 +891,53 @@ def create_app(
         allow_headers=["*"],
     )
 
+    # Phase 35.6: shed rather than queue, and drain before dying. Both are
+    # replica behaviors — the limiter is off by default because with one
+    # process there is nowhere for a shed request to go, so waiting is the
+    # best available answer.
+    app.state.limiter = ConcurrencyLimiter(cors_settings.max_concurrent_requests)
+    app.state.drain = DrainState()
+    limiter: ConcurrencyLimiter = app.state.limiter
+    drain_state: DrainState = app.state.drain
+
+    @app.middleware("http")
+    async def bound_concurrency(request, call_next):  # type: ignore[no-untyped-def]
+        """Admit or refuse immediately; never block.
+
+        Blocking is the behavior being replaced. A fast 429 is what lets a
+        load balancer try another replica while the client is still waiting;
+        a slow one is just a timeout with extra steps.
+        """
+
+        path = request.url.path
+        if not limiter.acquire(path):
+            metrics.REGISTRY.inc("pheasant_requests_shed_total", path=_metric_path(path))
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "detail": (
+                        f"this replica is at its {limiter.limit}-request concurrency limit; "
+                        "retry, ideally against another replica"
+                    )
+                },
+                headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+            )
+        try:
+            return await call_next(request)
+        finally:
+            limiter.release(path)
+
+    def _metric_path(path: str) -> str:
+        """Collapse to the first segment: a label per artifact id is a leak.
+
+        Prometheus cardinality is the failure mode here — `/nodes/content` is
+        a useful label, `/nodes/content?id=<one of 600k>` is a memory leak in
+        the scrape target.
+        """
+
+        head = path.strip("/").split("/", 1)[0]
+        return f"/{head}" if head else "/"
+
     def audit(source_id: str | None, action: str, details: dict | None = None) -> None:
         created_at = utc_now()
         ordinal = len(state.list_source_audit_events(source_id, limit=10000))
@@ -933,6 +995,15 @@ def create_app(
             "knowledge_base": config.knowledge_base_id,
             **describe_role(role_policy),
         }
+        if drain_state.draining:
+            # SIGTERM has arrived. Reporting not-ready *before* the process
+            # stops accepting work is the entire drain mechanism: Kubernetes
+            # removes endpoints and sends SIGTERM concurrently, and endpoint
+            # propagation is not instant, so a process that exits promptly
+            # drops whatever was routed to it in the gap.
+            payload["status"] = "draining"
+            payload["draining_for_seconds"] = round(drain_state.draining_for, 1)
+            return JSONResponse(status_code=503, content=payload)  # type: ignore[return-value]
         try:
             state.rows("SELECT 1 AS ok", ())
         except Exception as exc:  # noqa: BLE001 - any failure means not ready
@@ -1070,6 +1141,8 @@ def create_app(
         sample: dict[str, object] = {
             "pheasant_graph_nodes": graph.number_of_nodes(),
             "pheasant_graph_edges": graph.number_of_edges(),
+            "pheasant_requests_inflight": limiter.inflight,
+            "pheasant_draining": 1.0 if drain_state.draining else 0.0,
         }
         sample.update(jobs.metrics_sample())
         # With the durable queue on, the backlog outlives this process, so

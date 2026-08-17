@@ -994,7 +994,7 @@ working, which is what holds the 5 MB end of the range.
 | 35.3 | Graph capacity measured; sharding chosen over a Postgres graph backend | done (2026-08-16) |
 | 35.4 | Multi-writer indexing: per-source leases + sharding | done (2026-08-16); durable queue deferred |
 | 35.5 | Durable worker dispatch, gRPC transport, and the durable index queue (NATS JetStream) | done (2026-08-16) |
-| 35.6 | Process roles, autoscaling, and the three runtimes | queued |
+| 35.6 | Process roles, serving durability, autoscaling and the three runtimes | done (2026-08-16) |
 | 35.7 | Measured capacity model and sizing guidance | queued |
 
 ### Step 35.0 — Remove the Obsidian exporter (done 2026-08-16)
@@ -1440,3 +1440,87 @@ load-bearing.
 **Not done, and deliberately:** the queue has no consumer role of its own yet
 (`sync_all` publishes and drains in one process), and nothing autoscales on the
 depth gauge. Both are 35.6.
+
+### Step 35.6 — Roles, serving durability, and the three runtimes (2026-08-16)
+
+**The gap.** `pheasant serve` does everything: API, MCP, UI, watcher,
+scheduler, indexing. Right for one container and wrong for several — and the
+reason is not performance. Three replicas of that process against one
+knowledge base all watch the same directories, all fire the same scheduled
+sync, and all try to index the same source. The 35.4 leases keep that from
+corrupting anything, but three processes taking turns to do one process's work
+is not horizontal scale.
+
+**Roles** (`deployment/roles.py`, `pheasant serve --role`) state which jobs a
+process has, as data with a test asserting the whole table. `all` is the
+default and is unchanged; `api` **never indexes** and publishes to the queue
+instead, which is the cell that makes the replica count free; `indexer` drains
+the queue; `worker` prepares. `all` deliberately does *not* drain — a single
+container turns the queue on for crash resumption, not to join a fleet.
+
+Because `api` publishes rather than runs, the queue is a hard requirement for
+it: `--role api` without `sync.queue.enabled` refuses at startup rather than
+accepting syncs that vanish, and a `wait: true` sync returns **409** naming
+the fix. Routes are deliberately *not* hidden per role: the Service selector
+is what keeps traffic off an indexer, and a role whose `/search` 404s is
+harder to debug than one with no clients.
+
+**A correctness gap the role split exposed, found by asking what an api
+replica actually reads.** The knowledge graph is a *file*. A process loads it
+once at startup, and the only reload path (`reload_graph`) runs after a sync
+**that process** performed — so an api replica, which never indexes, would
+answer graph queries from whatever the graph was when its pod started.
+Indefinitely, and silently: text and vector search read the shared database
+and stay current, which is exactly what makes it easy to miss. Api replicas
+now poll the file's mtime/size (`server.api.graph_refresh_seconds`, 30 s) and
+reload when it changes. Shipping fleet manifests without closing this would
+have shipped a fleet that quietly disagrees with itself.
+
+**Serving durability** (`deployment/serving.py`), both **off by default**
+because both are replica behaviors:
+
+* **Shed rather than queue.** With one process there is nowhere for a shed
+  request to go, so waiting is the best available answer and a 429 to the only
+  user is worse. With N replicas a fast 429 lets the load balancer try
+  another. `/health`, `/ready` and `/metrics` are never shed — a pod that 429s
+  its own liveness probe gets **restarted** by the thing protecting it, which
+  is strictly worse than the overload.
+* **Drain before dying.** Kubernetes removes endpoints and sends SIGTERM
+  *concurrently*, and propagation is not instant, so a process that exits
+  promptly drops what was routed to it in the gap. `drain_seconds` fails
+  readiness first, keeps serving, then shuts down. The handler **chains** to
+  uvicorn's rather than replacing it — replacing it would drain and never
+  exit — and is installed from the lifespan, because uvicorn installs its own
+  inside `run()` and a handler installed earlier is simply overwritten. A
+  second SIGTERM skips the wait.
+
+`stateless_http=True` is now pinned by a test. It is what makes MCP replicas
+safe — two requests from one agent may land on different replicas — and it was
+true and undocumented since the MCP server was written.
+
+**Manifests.** `deploy/kubernetes/scaled/` is a three-tier fleet: api
+Deployment (HPA on CPU, PDB `minAvailable: 1`), indexer StatefulSet (one
+replica, **not** autoscaled, PDB `minAvailable: 0` so node drains are not
+blocked forever), worker Deployment (KEDA on `pheasant_index_queue_depth`,
+scaling to **zero**; plain-HPA fallback included). `docker-compose.scale.yml`
+is the same shape with `--scale worker=N`. The single-container install and
+`docker-compose.yml` are untouched and still need no infrastructure.
+
+Two requirements are stated rather than assumed, because both would otherwise
+fail confusingly on someone else's cluster: **Postgres** (SQLite is one writer
+per file, and not one file across pods) and a **ReadWriteMany** `/state`
+volume (the graph is a file api replicas read; RWO attaches to one node).
+
+**Acceptance:** `tests/test_process_roles.py` (28),
+`tests/test_serving_durability.py` (20), `tests/test_fleet_manifests.py` (20).
+The manifest tests check the coupling nothing else would: that every `--role`
+in `args` is a role this code knows, that each embedded config passes the same
+`validate_role` the process runs at startup, that `drain_seconds` is shorter
+than `terminationGracePeriodSeconds` (two numbers in two files), that workers
+never receive the database DSN, and that the autoscaler's metric name still
+exists in the registry. `docker compose config` validates the Compose file.
+Mutation-tested **23/23 caught** across the three areas.
+
+**Not done, deliberately:** no `kubeconform`/cluster validation of the
+manifests (that belongs in CI with a schema bundle, not in an offline suite),
+and nothing here is measured under real load — 35.7 is where numbers belong.

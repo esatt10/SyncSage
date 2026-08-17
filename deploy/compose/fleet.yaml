@@ -1,0 +1,66 @@
+# Config for the api and indexer tiers of docker-compose.scale.yml.
+# The role is NOT set here — each service passes `--role` on the command
+# line, so one file describes one knowledge base rather than one process.
+pheasant:
+  name: compose-fleet
+  environment: compose
+  log_level: INFO
+  state_path: /state
+  workspace_root: /workspace
+  exports_path: /exports
+server:
+  host: 0.0.0.0
+  port: 8765
+  mcp:
+    enabled: true
+    transports:
+      stdio: false
+      streamable_http: true
+      sse: false
+  api:
+    enabled: true
+    openapi: true
+    cors_origins:
+      - http://localhost:8765
+      - http://127.0.0.1:8765
+    max_concurrent_requests: 64
+    drain_seconds: 10
+    graph_refresh_seconds: 15
+  ui:
+    enabled: true
+    graph_visualization: true
+storage:
+  # One writer per SQLite file, and it is not one file across containers.
+  # Only the env var NAME appears here; the DSN comes from the environment.
+  backend: postgres
+  dsn_env: PHEASANT_DATABASE_URL
+  pool_size: 10
+  graph_snapshots: true
+sync:
+  # The hand-off: api publishes, indexer drains.
+  queue:
+    enabled: true
+    backend: local
+    visibility_seconds: 300
+    max_attempts: 3
+  watcher:
+    enabled: true
+  scheduler:
+    enabled: true
+    interval_seconds: 900
+  concurrency:
+    max_parallel_sources: 4
+    max_parallel_files: 8
+    # `worker` is the Compose service name; DNS round-robins across the
+    # scaled replicas, so `--scale worker=8` needs no config change.
+    file_executor: remote
+    remote_worker_urls:
+      - http://worker:8765
+    remote_worker_token_env: PHEASANT_INDEX_WORKER_TOKEN
+    remote_worker_batch_size: 8
+    worker_transport: http
+security:
+  allow_workspace_roots:
+    - /workspace
+    - /state
+sources: []

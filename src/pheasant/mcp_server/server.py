@@ -37,8 +37,12 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         "pheasant",
         instructions=(
             "Use pheasant to sync configured knowledge sources, search indexed context, "
-            "inspect graph relationships, and export Obsidian-compatible notes."
+            "inspect graph relationships, and record or recall agent memory."
         ),
+        # Stateless by design, and load-bearing for horizontal scale (Phase
+        # 35.6): with no per-session server state, two requests from one agent
+        # may land on different replicas and both answer correctly. A sticky
+        # session would make the replica count a lie. Pinned by a test.
         stateless_http=True,
         json_response=True,
     )

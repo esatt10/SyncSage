@@ -52,6 +52,19 @@ server:
     # Restores the old `*` behavior. Only for deployments fronted by an
     # ingress that authenticates before the request reaches pheasant.
     cors_allow_all_origins: false
+    # Requests in flight before the surplus is refused with 429 +
+    # Retry-After. 0 disables it, which is right for one container: there is
+    # nowhere else for a shed request to go, so waiting beats refusing. Set
+    # it on replicas, where a fast 429 lets a load balancer try another one.
+    # /health, /ready and /metrics are never shed — a pod that 429s its own
+    # liveness probe gets restarted by the thing protecting it.
+    max_concurrent_requests: 0
+    # Seconds to keep serving after SIGTERM while /ready already reports 503.
+    # Kubernetes removes endpoints and sends SIGTERM concurrently, and
+    # endpoint propagation is not instant, so a process that exits promptly
+    # drops what was routed to it in the gap. Keep this comfortably shorter
+    # than terminationGracePeriodSeconds. 0 disables the delay.
+    drain_seconds: 0
   ui:
     enabled: true
     graph_visualization: true

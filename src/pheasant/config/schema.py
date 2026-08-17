@@ -224,6 +224,24 @@ class ApiSettings(ModelMixin):
     # Escape hatch for deployments that genuinely front this with their own
     # authenticating ingress and need `*` back. Opt-in, never the default.
     cors_allow_all_origins: bool = False
+    #: Requests allowed to be in flight at once before the surplus is refused
+    #: with 429 + Retry-After. **0 disables it**, which is the pre-35.6
+    #: behavior and the right answer for one container: a 429 to the only user
+    #: is worse than making them wait. Set it on replicas, where shedding lets
+    #: a load balancer retry elsewhere instead of every replica queueing.
+    max_concurrent_requests: int = 0
+    #: Seconds to keep serving after SIGTERM while `/ready` already reports
+    #: 503, so a load balancer stops sending new work before the process
+    #: stops accepting it. 0 disables the delay. Must be shorter than the
+    #: orchestrator's termination grace period or the pod is killed mid-drain.
+    drain_seconds: int = 0
+    #: Seconds between checks for a graph written by another process, for the
+    #: ``api`` role only. 30 by default because an api replica that never
+    #: re-reads the graph answers graph queries from whatever the graph was
+    #: when its pod started, forever and silently. 0 disables it; the other
+    #: roles ignore it, because they index their own graph and reload it
+    #: through the sync worker.
+    graph_refresh_seconds: int = 30
 
 
 @dataclass

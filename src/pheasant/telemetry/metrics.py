@@ -337,6 +337,13 @@ def register_default_metrics(version: str) -> None:
     )
 
     # Serving.
+    REGISTRY.counter(
+        "pheasant_requests_shed_total",
+        "Requests refused with 429 because this replica was at its concurrency limit.",
+        ("path",),
+    )
+    REGISTRY.gauge("pheasant_requests_inflight", "Requests currently being served.")
+    REGISTRY.gauge("pheasant_draining", "1 while this process is draining after SIGTERM.")
     REGISTRY.histogram("pheasant_search_duration_seconds", "Search latency.", ("mode",))
     REGISTRY.counter(
         "pheasant_search_total", "Searches answered, by mode and outcome.", ("mode", "outcome")

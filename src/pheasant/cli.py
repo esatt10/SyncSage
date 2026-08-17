@@ -98,17 +98,22 @@ def _serve_app(cfg, config_path: str, *, report_ui: bool = True, role: str | Non
         _report_ui(app_obj, cfg)
     watcher, scheduler = _sync_services(app_obj.state.engine, cfg, config_path=config_path)
     drainer = _queue_drainer(cfg, config_path, policy)
+    refresher = _graph_refresher(cfg, app_obj.state.engine, policy)
     if policy.runs_watcher:
         watcher.start()
     if policy.runs_scheduler:
         scheduler.start()
     if drainer is not None:
         drainer.start()
+    if refresher is not None:
+        refresher.start()
     if not policy.is_default:
         print(f"role: {policy.name}")
     try:
         uvicorn.run(app_obj, host=cfg.server.host, port=cfg.server.port)
     finally:
+        if refresher is not None:
+            refresher.stop()
         if drainer is not None:
             drainer.stop()
         scheduler.stop()
@@ -202,6 +207,82 @@ def _queue_drainer(cfg, config_path: str, policy):
     if not policy.drains_queue:
         return None
     return _QueueDrainer(cfg, config_path)
+
+
+class _GraphRefresher:
+    """Pick up a graph written by another process.
+
+    The graph is a file. A process loads it once at startup, and the only
+    existing reload path runs after a sync **that process** performed. Split
+    the roles and that stops being enough: an api replica never indexes, so
+    without this it answers graph queries from whatever the graph was when the
+    pod started — indefinitely, and silently, while text and vector search stay
+    current from the shared database. Shipping fleet manifests without closing
+    that would be shipping a fleet that quietly disagrees with itself.
+
+    Polling the file's mtime and size, rather than subscribing to anything:
+    the writer is a different pod on a shared volume, so there is no channel
+    between them, and a stat every 30 s costs nothing.
+    """
+
+    def __init__(self, engine, interval_seconds: float) -> None:
+        self.engine = engine
+        self.interval = max(1.0, float(interval_seconds))
+        self._stop = None
+        self._thread = None
+        self._seen = self._stamp()
+
+    def _stamp(self):
+        path = self.engine.graph_store.graph_path(self.engine.config.knowledge_base_id)
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def start(self) -> None:
+        import threading
+
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="pheasant-graph-refresh", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def check_once(self) -> bool:
+        """Reload if the file changed. Returns whether it did."""
+
+        stamp = self._stamp()
+        if stamp is None or stamp == self._seen:
+            return False
+        self._seen = stamp
+        self.engine.reload_graph()
+        return True
+
+    def _run(self) -> None:
+        import logging
+
+        log = logging.getLogger("pheasant.cli")
+        while not self._stop.wait(self.interval):
+            try:
+                self.check_once()
+            except Exception:  # noqa: BLE001 - a stale graph beats a dead thread
+                log.warning("graph refresh failed; will retry", exc_info=True)
+
+
+def _graph_refresher(cfg, engine, policy):
+    """The refresh loop, or ``None`` when this role indexes its own graph."""
+
+    interval = float(getattr(cfg.server.api, "graph_refresh_seconds", 0) or 0)
+    if not policy.refreshes_graph or interval <= 0:
+        return None
+    return _GraphRefresher(engine, interval)
 
 
 def _engine(config_path: Path):

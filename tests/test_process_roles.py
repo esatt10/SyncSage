@@ -105,7 +105,14 @@ def test_every_role_has_a_policy_and_describes_itself(role: Role) -> None:
     policy = POLICIES[role]
     described = describe(policy)
     assert described["role"] == role.value
-    assert set(described) == {"role", "watcher", "scheduler", "drains_queue", "indexes_locally"}
+    assert set(described) == {
+        "role",
+        "watcher",
+        "scheduler",
+        "drains_queue",
+        "indexes_locally",
+        "refreshes_graph",
+    }
 
 
 def test_only_the_indexer_drains_and_only_serving_roles_index() -> None:
@@ -358,6 +365,84 @@ def test_no_drainer_is_built_for_a_role_that_does_not_drain(tmp_path: Path) -> N
     assert _queue_drainer(config, "pheasant.yaml", resolve_role(config, "indexer")) is not None
 
 
+# --------------------------------------------------------------------------
+# The api role's graph refresh
+# --------------------------------------------------------------------------
+
+
+def test_only_the_api_role_refreshes_the_graph() -> None:
+    """The other roles index their own graph and reload through the worker."""
+
+    assert [role.value for role in Role if POLICIES[role].refreshes_graph] == ["api"]
+
+
+def test_an_api_replica_picks_up_a_graph_another_process_wrote(tmp_path: Path) -> None:
+    """The gap that made a role split quietly wrong.
+
+    A process loads the graph once at startup, and the only reload path runs
+    after a sync *that process* performed. An api replica never indexes, so
+    without this it would answer graph queries from whatever the graph was
+    when its pod started — indefinitely, and silently, while text and vector
+    search stayed current from the shared database.
+    """
+
+    from pheasant.cli import _GraphRefresher
+    from pheasant.sync.engine import SyncEngine
+
+    config = _config(tmp_path, state_name="refresh", sources=1, role="api", queue=True)
+
+    # The "indexer": a separate engine over the same /state that really syncs.
+    indexer = SyncEngine(config)
+    try:
+        indexer.sync_source("src0", "full")
+    finally:
+        indexer.close()
+
+    # The "api replica": a second engine, started before more content exists.
+    api = SyncEngine(config)
+    try:
+        refresher = _GraphRefresher(api, interval_seconds=1)
+        before = api.graph_builder.graph.number_of_nodes()
+        assert before > 0
+        assert refresher.check_once() is False, "nothing changed, yet it reloaded"
+
+        folder = Path(config.sources[0].path)
+        (folder / "second.md").write_text(
+            "# Second\n\nThe failover drill runs quarterly.\n", encoding="utf-8"
+        )
+        writer = SyncEngine(config)
+        try:
+            writer.sync_source("src0", "full")
+        finally:
+            writer.close()
+
+        assert refresher.check_once() is True, "a newer graph on disk was not picked up"
+        assert api.graph_builder.graph.number_of_nodes() > before
+        # Idempotent: a second check with nothing new does not reload again.
+        assert refresher.check_once() is False
+    finally:
+        api.close()
+
+
+def test_no_refresher_is_built_for_a_role_that_indexes(tmp_path: Path) -> None:
+    from pheasant.cli import _graph_refresher
+    from pheasant.sync.engine import SyncEngine
+
+    config = _config(tmp_path, state_name="norefresh", sources=1, queue=True)
+    engine = SyncEngine(config)
+    try:
+        for role in ("all", "indexer", "worker"):
+            assert _graph_refresher(config, engine, resolve_role(config, role)) is None
+        assert _graph_refresher(config, engine, resolve_role(config, "api")) is not None
+
+        # And it is switchable off, for a deployment where the graph is not
+        # shared between pods at all.
+        config.server.api.graph_refresh_seconds = 0
+        assert _graph_refresher(config, engine, resolve_role(config, "api")) is None
+    finally:
+        engine.close()
+
+
 def test_serve_refuses_a_misconfigured_role_at_the_cli(tmp_path: Path, capsys: Any) -> None:
     from pheasant.cli import main
 
@@ -415,6 +500,13 @@ def test_background_services_start_only_for_their_roles(tmp_path: Path, monkeypa
             "_queue_drainer",
             lambda cfg, path, policy: Recorder("drainer", bucket) if policy.drains_queue else None,
         )
+        monkeypatch.setattr(
+            cli,
+            "_graph_refresher",
+            lambda cfg, engine, policy: (
+                Recorder("refresher", bucket) if policy.refreshes_graph else None
+            ),
+        )
         monkeypatch.setattr(cli, "_report_ui", lambda app_obj, cfg: bucket.append("ui"))
         import uvicorn
 
@@ -423,7 +515,7 @@ def test_background_services_start_only_for_their_roles(tmp_path: Path, monkeypa
         return bucket
 
     assert sorted(run_for("all")) == ["scheduler", "ui", "watcher"]
-    assert sorted(run_for("api")) == ["ui"]
+    assert sorted(run_for("api")) == ["refresher", "ui"]
     assert sorted(run_for("indexer")) == ["drainer", "scheduler", "watcher"]
     assert sorted(run_for("worker")) == []
 

@@ -138,6 +138,41 @@ which is why it is separate from `/health`. It is deliberately **not** gated
 on the index being populated: a replica that stayed unready through a
 multi-hour first index would take the whole Service down for that time.
 
+### Serving durability (`server.api`)
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `max_concurrent_requests` | integer | `0` | In-flight requests before the surplus is refused with **429 + `Retry-After`**. `0` disables it. |
+| `drain_seconds` | integer | `0` | Seconds to keep serving after SIGTERM while `/ready` already reports 503. `0` disables the delay. |
+
+Both default off, and that is a decision rather than caution.
+
+**Shedding only makes sense when there is somewhere else to go.** With one
+process, a burst piles up behind the GIL and every request gets slower — but
+waiting is still the best available answer, and a 429 to the only user is
+worse. With N replicas behind a load balancer a fast 429 is strictly better
+than a request that sits for thirty seconds and times out anyway. So set this
+on replicas, not on a laptop.
+
+`/health`, `/ready` and `/metrics` are **never** shed. A pod that answers 429
+to its own liveness probe gets restarted by the thing meant to be protecting
+it, turning a busy replica into a crash-looping one.
+
+**Draining exists because Kubernetes does two things at once.** SIGTERM and
+endpoint removal happen concurrently, and endpoint propagation is not instant
+— kube-proxy on every node has to be told. A process that exits promptly
+therefore drops whatever was routed to it in the gap. `drain_seconds` fails
+readiness *first*, keeps serving for that long, and only then shuts down. Keep
+it comfortably shorter than the orchestrator's termination grace period, or
+the pod is killed mid-drain. A second SIGTERM skips the wait.
+
+Draining is "stop being sent work", not "stop doing work": a draining replica
+keeps answering requests normally.
+
+The MCP server is stateless (`stateless_http=True`), which is what makes
+replicas safe — two requests from one agent may land on different replicas and
+both answer correctly. That property is pinned by a test.
+
 ### MCP options (`server.mcp`)
 
 | Key | Type | Default | Notes |
