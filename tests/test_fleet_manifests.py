@@ -342,6 +342,65 @@ def test_workers_actually_enable_the_preparation_endpoints(scaled: list[dict[str
 
 
 # --------------------------------------------------------------------------
+# Schema validation, when a validator is available
+# --------------------------------------------------------------------------
+
+
+def _kubeconform() -> str | None:
+    import shutil
+
+    return shutil.which("kubeconform") or (
+        "/tmp/kubeconform" if Path("/tmp/kubeconform").exists() else None
+    )
+
+
+kubeconform = pytest.mark.skipif(
+    _kubeconform() is None,
+    reason="install kubeconform to validate manifests against Kubernetes schemas",
+)
+
+
+@kubeconform
+@pytest.mark.parametrize("directory", [BASE, SCALED], ids=["base", "scaled"])
+def test_manifests_validate_against_kubernetes_schemas(directory: Path) -> None:
+    """The check I previously said belonged in CI, run here when it can be.
+
+    The other tests in this file check the coupling to *pheasant* — that a
+    role exists, that a config passes `validate_role`. This one checks the
+    coupling to *Kubernetes*, which nothing in Python can: a misspelled field
+    or a wrong apiVersion is a `kubectl apply` failure on someone else's
+    cluster, and the offline tests would never see it.
+
+    `-ignore-missing-schemas` because ServiceMonitor and ScaledObject are CRDs
+    whose schemas ship with their operators; those four are skipped, and the
+    assertion below pins that number so a *core* resource silently becoming
+    unvalidatable is caught rather than absorbed.
+    """
+
+    import subprocess
+
+    binary = _kubeconform()
+    assert binary is not None
+    result = subprocess.run(
+        [binary, "-summary", "-strict", "-ignore-missing-schemas", *_manifest_paths(directory)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    summary = result.stdout.strip().splitlines()[-1]
+    assert "Invalid: 0" in summary, summary
+    assert "Errors: 0" in summary, summary
+    expected_skips = "Skipped: 4" if directory == SCALED else "Skipped: 0"
+    assert expected_skips in summary, f"unexpected skip count: {summary}"
+
+
+def _manifest_paths(directory: Path) -> list[str]:
+    return [str(path) for path in sorted(directory.glob("*.yaml"))]
+
+
+# --------------------------------------------------------------------------
 # Compose
 # --------------------------------------------------------------------------
 

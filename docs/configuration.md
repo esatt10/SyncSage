@@ -144,6 +144,7 @@ multi-hour first index would take the whole Service down for that time.
 |---|---|---|---|
 | `max_concurrent_requests` | integer | `0` | In-flight requests before the surplus is refused with **429 + `Retry-After`**. `0` disables it. |
 | `drain_seconds` | integer | `0` | Seconds to keep serving after SIGTERM while `/ready` already reports 503. `0` disables the delay. |
+| `graph_refresh_seconds` | integer | `30` | How often an **`api`-role** replica re-reads a graph written by the indexer. `0` disables it; the other roles ignore it. |
 
 Both default off, and that is a decision rather than caution.
 

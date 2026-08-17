@@ -65,6 +65,13 @@ server:
     # drops what was routed to it in the gap. Keep this comfortably shorter
     # than terminationGracePeriodSeconds. 0 disables the delay.
     drain_seconds: 0
+    # How often an `api`-role replica re-reads a graph the indexer wrote.
+    # The graph is a FILE: a process loads it once at startup, and the only
+    # other reload happens after a sync that same process ran. An api replica
+    # never indexes, so without this it answers graph queries from whatever
+    # the graph was when it started — silently, while text and vector search
+    # stay current from the shared database. Ignored by the other roles.
+    graph_refresh_seconds: 30
   ui:
     enabled: true
     graph_visualization: true

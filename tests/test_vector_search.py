@@ -613,9 +613,7 @@ def test_a_rate_limit_is_retried_and_honours_retry_after(monkeypatch) -> None:
     def limited(request, timeout=None):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise HTTPError(
-                "u", 429, "Too Many Requests", {"Retry-After": "2"}, None
-            )
+            raise HTTPError("u", 429, "Too Many Requests", {"Retry-After": "2"}, None)
         return _ok_response(1)
 
     monkeypatch.setattr(vector_store, "urlopen", limited)

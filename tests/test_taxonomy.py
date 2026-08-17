@@ -1224,7 +1224,9 @@ def test_omitting_the_section_is_unchanged(tmp_path: Path) -> None:
         "/search", json={"query": "breach", "mode": "hybrid", "section": None}
     ).json()
     assert without == explicit_none
-    blank = client.post("/search", json={"query": "breach", "mode": "hybrid", "section": "  "}).json()
+    blank = client.post(
+        "/search", json={"query": "breach", "mode": "hybrid", "section": "  "}
+    ).json()
     assert without == blank
 
 
@@ -1307,10 +1309,14 @@ def test_stored_source_config_carries_the_taxonomy_block(tmp_path: Path) -> None
 def test_editing_a_source_can_turn_the_toggle_off_and_on(tmp_path: Path) -> None:
     client = _sectioned_client(tmp_path)
     assert client.put("/sources/legal", json={"taxonomy": {"enabled": False}}).status_code == 200
-    off = json.loads(next(s for s in client.get("/sources").json() if s["name"] == "legal")["config_json"])
+    off = json.loads(
+        next(s for s in client.get("/sources").json() if s["name"] == "legal")["config_json"]
+    )
     assert off["taxonomy"]["enabled"] is False
     assert client.put("/sources/legal", json={"taxonomy": {"enabled": True}}).status_code == 200
-    on = json.loads(next(s for s in client.get("/sources").json() if s["name"] == "legal")["config_json"])
+    on = json.loads(
+        next(s for s in client.get("/sources").json() if s["name"] == "legal")["config_json"]
+    )
     assert on["taxonomy"]["enabled"] is True
 
 
@@ -1451,9 +1457,12 @@ def test_a_keyword_line_needs_a_real_ordinal_not_a_stray_word() -> None:
     # cannot catch — "1" is a perfectly good ordinal — so the keyword branch
     # also runs the same prose filter every other rule already used. It had
     # none before: only a line-length check, and this line is short enough.
-    assert detect_headings(
-        "Part 1 of the agreement shall be construed as follows, and the parties agree."
-    ) == []
+    assert (
+        detect_headings(
+            "Part 1 of the agreement shall be construed as follows, and the parties agree."
+        )
+        == []
+    )
 
 
 def test_the_real_agreement_outline_is_correct(tmp_path: Path) -> None:
@@ -1485,7 +1494,11 @@ def test_the_real_agreement_outline_is_correct(tmp_path: Path) -> None:
     # and the Articles jump I -> IV. Each is a genuine defect in the drafting
     # this document deliberately imitates, and each is found in a *different*
     # numbering series, which is what makes them independent evidence.
-    gaps = {(g["series"], g["after"], g["at"], tuple(g["missing"])) for g in document[0]["issues"] if g["kind"] == "gap"}
+    gaps = {
+        (g["series"], g["after"], g["at"], tuple(g["missing"]))
+        for g in document[0]["issues"]
+        if g["kind"] == "gap"
+    }
     assert gaps == {
         ("code", "§ 12.2", "§ 12.4", (3,)),
         ("article", "Article I", "Article IV", (2, 3)),
@@ -1498,7 +1511,10 @@ def test_the_real_agreement_is_searchable_by_section(tmp_path: Path) -> None:
 
     def sections(query: str, section: str) -> list[str]:
         body = {"query": query, "mode": "text", "max_results": 20, "section": section}
-        return [h["heading_path"].split(" > ")[-1] for h in client.post("/search", json=body).json()["results"]]
+        return [
+            h["heading_path"].split(" > ")[-1]
+            for h in client.post("/search", json=body).json()["results"]
+        ]
 
     assert sections("governing law jurisdiction", "§ 12.4") == ["§ 12.4 Governing Law"]
     # Naming the Article reaches a lettered sub-item nested two levels under it.

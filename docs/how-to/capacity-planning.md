@@ -87,6 +87,11 @@ seconds, and `pheasant scan` does that arithmetic for you.
     from a small corpus and multiplied up was extrapolating a curve as though
     it were a line.
 
+    **SQLite only.** The Postgres backend never had this: `chunks_fts` there
+    is an ordinary table with `idx_chunks_fts_artifact`, so the delete was
+    always indexed. If you were already on Postgres, the times above are the
+    ones you had.
+
 **Disk** tracks *content*, not file count: measured at **~4.0 bytes of
 `/state` per corpus byte**, flat to within 3% across the sweep, and dominated
 by SQLite storing every chunk's text again plus its FTS index. Embeddings add

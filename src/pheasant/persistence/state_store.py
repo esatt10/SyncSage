@@ -342,6 +342,18 @@ class StateStore:
         Same class as the ``graph_nodes_fts`` scan recorded in CLAUDE.md, and
         the same fix: do not ask an unindexed column a question whose answer
         is already known.
+
+        **SQLite only.** On Postgres ``chunks_fts`` is an ordinary table with
+        ``idx_chunks_fts_artifact``, so the delete was always indexed — the
+        bug is a property of FTS5's UNINDEXED columns, not of the query.
+
+        A sweep of every remaining FTS5 write (2026-08-16) found no other
+        unmitigated instance: ``delete_source_artifacts`` scans on
+        ``source_id`` but runs **once per sync** rather than once per
+        artifact and has to visit those rows to delete them anyway, and
+        ``graph_nodes_fts``'s batched delete is bounded by
+        ``SyncEngine._INDEX_REBUILD_THRESHOLD``, above which it rebuilds
+        wholesale instead.
         """
 
         with self.conn:

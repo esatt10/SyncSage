@@ -1819,6 +1819,13 @@ corpus — and on a *full* sync it scanned to delete **nothing**, because
 `graph_nodes_fts` scan recorded above, so it is worth treating "unindexed FTS5
 column in a WHERE clause" as a smell in this codebase.
 
+A sweep of every remaining FTS5 write closed the question rather than leaving
+it open: `delete_source_artifacts` scans on `source_id` but runs **once per
+sync**, not per artifact, and has to visit those rows anyway; `graph_nodes_fts`
+is bounded by `SyncEngine._INDEX_REBUILD_THRESHOLD`. **SQLite only** — on
+Postgres `chunks_fts` is an ordinary table with `idx_chunks_fts_artifact`, so
+the delete was always indexed.
+
 `src/pheasant/capacity.py` is now the single home for sizing coefficients, so
 `pheasant scan`, `pheasant shard plan` and the docs cannot disagree. Two
 values are deliberately **not** taken from the synthetic sweep and say so:
@@ -1839,6 +1846,16 @@ Three habits from this arc worth keeping:
    the wrong-artifact identity check). One survivor was *correct* to survive
    and is recorded as uncovered in the module docstring rather than papered
    over with a test that cannot fail.
+**Two long-standing items closed 2026-08-16.** `ruff check src tests` is now
+**clean** — the 5 `E501`s in `tests/test_taxonomy.py` that had been carried as
+"pre-existing, leave them" for six sessions are rewrapped. And the recorded
+"raw `wasmtime._trap.Trap` escaping `SandboxFuelExhausted`" bug is fixed at the
+root: `wasmtime.Trap` and `wasmtime.WasmtimeError` are **siblings**, not parent
+and child, so `except wasmtime.Trap` leaked a raw runtime type whenever the
+other one was raised. Both host paths now catch `guest_failures()`. It never
+reproduced on the installed wasmtime (47.0.1), which is precisely why it
+survived a year — the fixtures all happen to raise `Trap`.
+
 3. **Trust the mutation harness only after you have checked it.** A
    same-byte-length mutant (`1.5` → `0.5`) restored within one filesystem
    mtime tick left Python running the **mutated `__pycache__`** after the
