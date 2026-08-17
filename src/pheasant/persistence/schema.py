@@ -121,7 +121,7 @@ CREATE TABLE IF NOT EXISTS artifact_terms (
 -- 1.5+ hours.
 CREATE INDEX IF NOT EXISTS idx_artifact_terms_artifact_id
   ON artifact_terms(artifact_id);
--- Supports GraphBuilder.reconcile_concepts: `WHERE node_type='concept'
+-- Retained for the historical concept rows: `WHERE node_type='concept'
 -- GROUP BY node_id, ... COUNT(DISTINCT artifact_id)`. Without it, that
 -- query is an unindexed scan + sort over the whole table — measured at
 -- 10+ minutes and still not finished on a 1.27M-row table.

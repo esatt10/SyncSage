@@ -280,8 +280,6 @@ def test_the_all_role_still_indexes_in_process(tmp_path: Path) -> None:
 
 
 def _write_config_file(config: PheasantConfig, path: Path, *, role: str) -> Path:
-    # Written literally: the repo-root `yaml.py` shim shadows PyYAML from a
-    # checkout and does not round-trip a dump of this shape.
     lines = [
         "pheasant:",
         f"  name: {config.pheasant.name}",

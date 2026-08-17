@@ -168,6 +168,17 @@ class ModelMixin:
                 return str(v) if mode == "json" else v
             if isinstance(v, Enum):
                 return v.value
+            if isinstance(v, str) and type(v) is not str:
+                # A *subclass* of str — `PluginSourceType` is the one that
+                # occurs — is not plain data, and consumers that dispatch on
+                # the exact type refuse it. PyYAML's representer is one:
+                # `yaml.safe_dump` raises `RepresenterError("cannot represent
+                # an object")` for it, so `config_hash` crashed for any config
+                # using a connector plugin — which is every third-party
+                # connector and all five first-party SaaS ones. A dump is
+                # plain data in both modes; the loader re-creates the rich
+                # type on the way back in.
+                return str(v)
             if isinstance(v, ModelMixin):
                 return v.model_dump(mode=mode)
             if isinstance(v, list):
@@ -610,22 +621,8 @@ class SyncSettings(ModelMixin):
 
 @dataclass
 class GraphSettings(ModelMixin):
-    """How much graph the knowledge graph should actually keep.
+    """How much graph the knowledge graph should actually keep."""
 
-    ``concept_min_documents`` is the number of distinct documents that must
-    share a term before it becomes a concept *node*. A concept exists to link
-    the documents that share it, so one that links a single document is pure
-    weight: measured on microsoft/agent-framework, 74.5% of concept nodes were
-    mentioned by exactly one document, and concepts made up 96% of a
-    577k-node graph — memory, traversal budget and enrichment time spent
-    connecting nothing.
-
-    Nothing becomes unfindable: the term stays on the artifact's
-    ``concept_terms``, in ``artifact_terms``, and in the artifact's searchable
-    text. Set to 1 to keep every term as a node (the pre-2026-08 behavior).
-    """
-
-    concept_min_documents: int = 2
     #: Wire agent-memory records into the graph (Step 33.7): `about` edges to
     #: what a record refers to, plus `supersedes` between corrections. A no-op
     #: without a memory source, so turning it off only matters to a region that

@@ -38,9 +38,6 @@ config:
       scheduler:
         enabled: true
         interval_seconds: 900
-    obsidian:
-      enabled: true
-      note_root: pheasant
     sources: []
 
 persistence:

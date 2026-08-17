@@ -244,8 +244,7 @@ def fetch_container_versions(
                 auth_errors.append(f"{owner_scope}: HTTP {exc.code} {detail}")
                 continue
             raise SystemExit(
-                f"GitHub Packages query failed for {owner_scope}/{owner}: "
-                f"HTTP {exc.code} {detail}"
+                f"GitHub Packages query failed for {owner_scope}/{owner}: HTTP {exc.code} {detail}"
             ) from exc
 
     if auth_errors:
@@ -280,9 +279,7 @@ def check_image_version_increment(version: str, existing_tags: set[str]) -> None
         raise SystemExit(f"Container image tag already exists for version {version}")
 
     semver_tags = {
-        tag: parsed
-        for tag in existing_tags
-        if (parsed := parse_stable_semver_tag(tag)) is not None
+        tag: parsed for tag in existing_tags if (parsed := parse_stable_semver_tag(tag)) is not None
     }
     if not semver_tags:
         print(f"No prior stable semver image tags found; accepting {version}.")
@@ -328,9 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--owner", help="GitHub owner that owns the container package.")
     parser.add_argument("--package", default="pheasant", help="GitHub container package name.")
     parser.add_argument("--token", help="GitHub token for package tag lookup.")
-    parser.add_argument(
-        "--api-url", default="https://api.github.com", help="GitHub API base URL."
-    )
+    parser.add_argument("--api-url", default="https://api.github.com", help="GitHub API base URL.")
     args = parser.parse_args(argv)
 
     version = project_version()

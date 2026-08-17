@@ -42,7 +42,10 @@ jobs:
           python -m pip install -e ".[dev,mcp]"
 
       - name: Run ruff lint
-        run: python -m ruff check src tests scripts yaml.py sitecustomize.py --select F,B --no-cache
+        run: python -m ruff check src tests scripts --no-cache
+
+      - name: Check formatting
+        run: python -m ruff format --check src tests scripts
 
       - name: Check version alignment
         run: python scripts/sync_version.py --check

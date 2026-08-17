@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 def create_mcp_tools(config: PheasantConfig) -> PheasantTools:
     """Return a tool facade usable by MCP adapters or direct tests.
 
-    The optional official MCP SDK can wrap this facade at runtime; keeping the core
-    implementation dependency-light makes CLI/API tests deterministic.
+    The optional official MCP SDK can wrap this facade at runtime; keeping the
+    core implementation free of it makes CLI/API tests deterministic and lets a
+    core-only install use the same tools over HTTP.
     """
 
     return PheasantTools(config)

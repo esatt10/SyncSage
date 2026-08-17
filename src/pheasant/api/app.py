@@ -2938,15 +2938,8 @@ def create_app(
         return {**_rebuild_vectors(drop_existing=drop_existing), **_embeddings_status()}
 
     def _merge_into_config_file(patch: dict) -> bool:
-        """Deep-merge ``patch`` into the config file, preserving everything else.
-
-        Rendered the same way ``pheasant up`` renders configs: everything but
-        ``sources`` through the YAML dumper, then the sources list by hand —
-        ``safe_dump`` writes list-of-dict items in a shape the
-        dependency-light yaml shim cannot read back.
-        """
+        """Deep-merge ``patch`` into the config file, preserving everything else."""
         from pheasant.config.loader import deep_merge
-        from pheasant.quickstart import _render_sources_block
 
         path = Path(app.state.config_path)
         if not path.exists():
@@ -2964,12 +2957,8 @@ def create_app(
         if not isinstance(existing, dict):
             return False
         merged = deep_merge(existing, patch)
-        sources = merged.pop("sources", []) or []
-        rendered = dump_config_yaml(merged)
-        if sources:
-            rendered += _render_sources_block(sources)
         try:
-            path.write_text(rendered, encoding="utf-8")
+            path.write_text(dump_config_yaml(merged), encoding="utf-8")
         except OSError as exc:
             raise HTTPException(
                 status_code=409,

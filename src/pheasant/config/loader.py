@@ -28,6 +28,12 @@ REMOVED_SETTINGS: dict[str, str] = {
         "(/graph) replaces it. Indexing an Obsidian vault as a *source* "
         "(type: obsidian_vault) is unaffected."
     ),
+    "graph.concept_min_documents": (
+        "concept extraction was retired — it was 87% of graph nodes and 98.6% "
+        "of edges while failing every retrieval test set for it, so this knob "
+        "has had no effect since. Terms are still searchable; the corpus "
+        "vocabulary now comes from the full-text index. Delete the key."
+    ),
     "pheasant.vault_path": (
         "the Obsidian vault projection was removed, so pheasant no longer "
         "writes a vault. Delete the key, and drop any /vault mount. Files "
@@ -118,47 +124,24 @@ def render_init_config(profile: str = "quickstart") -> str:
 
 
 def dump_config_yaml(data: dict[str, Any]) -> str:
-    """Dump a config mapping so **both** YAML readers can load it back.
+    """Dump a config mapping as YAML people will actually read and edit.
 
-    pheasant ships a dependency-light YAML shim (``yaml.py`` at the repo root)
-    for installs without PyYAML, and it is stricter than PyYAML in two ways
-    that a plain ``yaml.safe_dump`` walks straight into:
+    One deviation from ``yaml.safe_dump``: block sequences are indented under
+    their key rather than sitting at the parent's indent, so a generated
+    ``pheasant.yaml`` looks like the hand-written one in
+    ``pheasant.example.yaml``. Every writer of config YAML goes through here,
+    so that shape is decided once.
 
-    1. **Sequences must be indented under their key.** PyYAML writes
-
-       .. code-block:: yaml
-
-           retrieval_modes:
-           - text
-
-       with the dash at the *parent's* indent; the shim requires ``+2`` and
-       fails with ``AttributeError: 'dict' object has no attribute 'append'``.
-       Every config ``pheasant up`` has ever written was unreadable by the
-       shim for exactly this reason — found by round-tripping a real generated
-       config through it rather than through whichever ``yaml`` the tests
-       happened to import.
-
-    2. **A list item containing ``:`` must be quoted**, or the shim splits it
-       into a mapping — which silently turned every entry of
-       ``cors_origins`` into ``{"http": "//localhost:5173"}``. Wrong data, no
-       error, on the setting that decides which browser origins may drive an
-       unauthenticated API.
-
-    Both are fixed here, once, for every path that writes config YAML.
+    Key order is preserved (``sort_keys=False``) because these files are
+    generated to be read: a config whose sections come out alphabetised is
+    harder to scan than one that follows the schema's own order.
     """
-    if not hasattr(yaml, "SafeDumper"):  # the shim: its own dumper is correct
-        return yaml.safe_dump(data, sort_keys=False)
 
     class _IndentingDumper(yaml.SafeDumper):
         def increase_indent(self, flow=False, indentless=False):  # noqa: ARG002
             # `indentless=True` is what un-indents block sequences.
             return super().increase_indent(flow, False)
 
-    def _represent_str(dumper, value):
-        style = '"' if ":" in value else None
-        return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
-
-    _IndentingDumper.add_representer(str, _represent_str)
     return yaml.dump(data, Dumper=_IndentingDumper, sort_keys=False, default_flow_style=False)
 
 

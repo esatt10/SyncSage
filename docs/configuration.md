@@ -626,7 +626,6 @@ lands in config or on disk.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `concept_min_documents` | integer | `2` | Distinct documents that must share a term before it becomes a `concept` node. A concept exists to link the documents that share it; one mentioned by a single document is pure weight — measured on a real corpus, 74.2% of concept nodes were single-document and concepts made up 87.2% of a bloated graph. Set to `1` to keep every term as a node (pre-2026-08 behavior). Nothing becomes unfindable at higher values: the term stays on `concept_terms`/`artifact_terms` and in searchable text either way. |
 | `memory_entity_bridging` | bool | `true` | Wire agent-memory records into the graph (`about` edges to what a record refers to, `supersedes` between corrections). A no-op without a memory source. |
 | `wasm_cross_source_resolution` | bool | `false` | Run `resolve_cross_source_edges` (import/link resolution across sources) through the vendored WASM accelerator (Synapse 34.5a) instead of pure Python. Needs the `[wasm]` extra; falls back to pure Python on any failure or if the extra is missing. Conditional win per the 34.4 benchmark — loses to Python below roughly 1,300-2,500 edges, wins modestly above it; opt in for large/growing multi-source graphs, leave off for small ones. **The Docker image turns this on** in a config it generates itself, on the assumption that a container's graph grows past the crossover; set it to `false` in your config if you are indexing a small, static corpus. |
 

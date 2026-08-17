@@ -45,10 +45,10 @@ Examples:
 
 ```text
 source:local-pheasant:pheasant-codebase
-file:pheasant-codebase:src/pheasant/main.py:branch=main
-chunk:pheasant-codebase:src/pheasant/main.py:sha256=abc123:chunk=0004
+file:pheasant-codebase:src/pheasant/cli.py:branch=main
+chunk:pheasant-codebase:src/pheasant/cli.py:sha256=abc123:chunk=0004
 heading:contracts:msa.pdf:sha256=1f4b2c9d0e7a3b58
-symbol:pheasant-codebase:src/pheasant/main.py:PheasantServer.start
+symbol:pheasant-codebase:src/pheasant/cli.py:PheasantCli.main
 commit:pheasant-codebase:6f2a9c1
 ```
 
@@ -61,7 +61,7 @@ Nodes and search results should record source ID, knowledge base ID, relative pa
 pheasant runs deterministic enrichment during sync:
 
 - Code pass: extracts Python imports, classes, functions, constants, and call targets.
-- Markdown/document pass: extracts headings, links, wiki links, URLs, citations, concepts, and named mentions.
+- Markdown/document pass: extracts headings, links, wiki links, URLs, citations and named mentions.
 - Internal reference resolution: a post-sync pass that turns a file's imports
   and document links into edges pointing at **the file they resolve to**,
   by longest-suffix path match (`agent_framework._workflows._checkpoint` →

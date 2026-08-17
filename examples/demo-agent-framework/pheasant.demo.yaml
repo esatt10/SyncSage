@@ -127,9 +127,6 @@ sync:
     max_parallel_files: 8
     lock_timeout_seconds: 120
 
-obsidian:
-  enabled: false
-
 security:
   allow_workspace_roots:
     - /workspace

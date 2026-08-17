@@ -45,14 +45,14 @@ def test_a_live_section_applies_to_the_running_process(loaded_config, config_pat
 
     response = client.patch(
         "/config/section/graph",
-        json={"values": {"concept_min_documents": 4}, "persist": False},
+        json={"values": {"memory_entity_bridging": False}, "persist": False},
     )
 
     assert response.status_code == 200
     body = response.json()
     assert body["applied"] is True
     assert body["restart_required"] is False
-    assert loaded_config.graph.concept_min_documents == 4
+    assert loaded_config.graph.memory_entity_bridging is False
 
 
 def test_a_non_live_section_is_written_but_reported_as_needing_a_restart(

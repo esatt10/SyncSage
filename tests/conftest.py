@@ -1,8 +1,8 @@
 """Shared acceptance-test fixtures for pheasant.
 
-These tests intentionally exercise public package/CLI/API seams described in
-``initial_build_prompt.md`` while remaining implementation-neutral enough to run
-against early versions of the project.
+These fixtures exercise the public package, CLI and HTTP seams — the surfaces
+other people build against — rather than internals, so a refactor behind them
+does not rewrite the suite.
 """
 
 from __future__ import annotations

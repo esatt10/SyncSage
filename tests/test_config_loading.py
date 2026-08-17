@@ -102,7 +102,7 @@ def test_graph_section_of_the_yaml_is_actually_applied() -> None:
 
     Regression test: `graph=build(GraphSettings, data.get("graph"))` was
     missing from `model_validate`'s constructor call, so ANY `graph:`
-    section in a config file — `concept_min_documents`,
+    section in a config file — `memory_entity_bridging`,
     `wasm_cross_source_resolution` — was silently discarded in favor of
     `GraphSettings()` defaults, with no error and no test catching it.
     Found live: `docker-compose`-deployed config showed
@@ -115,12 +115,12 @@ def test_graph_section_of_the_yaml_is_actually_applied() -> None:
         {
             "pheasant": {"name": "graph-section-regression"},
             "graph": {
-                "concept_min_documents": 5,
+                "memory_entity_bridging": False,
                 "wasm_cross_source_resolution": True,
             },
         }
     )
-    assert config.graph.concept_min_documents == 5
+    assert config.graph.memory_entity_bridging is False
     assert config.graph.wasm_cross_source_resolution is True
 
 
@@ -165,69 +165,13 @@ def test_example_config_declares_the_document_extractor() -> None:
     assert extractor.get("html_text") is False
 
 
-def test_yaml_shim_strips_trailing_comments_like_pyyaml() -> None:
-    """The dependency-light YAML shim must drop trailing `# ...` comments.
-
-    Regression test: it stripped whole-line comments but not trailing ones, so
-    every annotated value in `pheasant.example.yaml` parsed with the comment
-    glued on — `max_files: 50000  # ...` became a *string*, and
-    `follow_symlinks: false  # ...` became a non-empty (therefore **truthy**)
-    string, silently inverting a safety default wherever this shim stands in
-    for PyYAML.
-    """
-    import yaml
-
-    parsed = yaml.safe_load(
-        "limits:\n"
-        "  max_files: 50000        # matching files\n"
-        "  follow_symlinks: false  # links escape or loop\n"
-        "  label: red#1\n"
-        '  quoted: "has # inside"\n'
-    )
-    limits = parsed["limits"]
-    assert limits["max_files"] == 50000
-    assert limits["follow_symlinks"] is False
-    assert limits["label"] == "red#1"  # '#' without leading space is literal
-    assert limits["quoted"] == "has # inside"  # '#' inside quotes is literal
-
-
-def test_yaml_shim_keeps_urls_in_lists_as_strings_like_pyyaml() -> None:
-    """A colon only separates a YAML key when followed by space or EOL.
-
-    Regression test: the shim split list items on *any* colon, so
-    `- http://host:8765` parsed as `{"http": "//host:8765"}` — silently
-    turning every list-of-URL config into a list of dicts wherever this shim
-    stands in for PyYAML. `server.api.cors_origins` is the one that caught it
-    (a dict there breaks CORS *and* the MCP transport guard derived from it),
-    but the same shape appears anywhere a URL is listed.
-    """
-    import yaml
-
-    parsed = yaml.safe_load(
-        "server:\n"
-        "  api:\n"
-        "    cors_origins:\n"
-        "      - http://localhost:8765\n"
-        "      - https://pheasant.internal:443\n"
-        "sources:\n"
-        "  - name: repo\n"
-        "    type: git_repository\n"
-    )
-    assert parsed["server"]["api"]["cors_origins"] == [
-        "http://localhost:8765",
-        "https://pheasant.internal:443",
-    ]
-    # A genuine mapping item (colon *then space*) still parses as a mapping.
-    assert parsed["sources"] == [{"name": "repo", "type": "git_repository"}]
-
-
 def test_config_with_removed_obsidian_settings_still_loads(tmp_path: Path) -> None:
     """A pre-removal config must keep loading, not hard-fail.
 
     The Obsidian projection went away, but the YAML files describing it are
-    user data sitting on real disks. `model_validate` drops unknown keys, so
-    this would pass silently even without the shim — what the shim adds, and
-    what this pins, is that the removal is *reported* rather than ignored.
+    user data sitting on real disks. `model_validate` drops unknown keys on
+    its own, so what this pins is that the removal is *reported* rather than
+    silently ignored.
     """
 
     from pheasant.config.loader import (

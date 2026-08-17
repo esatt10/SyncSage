@@ -5,7 +5,6 @@ set -eu
 
 find /config -mindepth 1 -delete
 find /state -mindepth 1 -delete
-find /vault -mindepth 1 -delete
 find /exports -mindepth 1 -delete
 
 exec /app/docker-entrypoint.sh serve

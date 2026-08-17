@@ -524,19 +524,18 @@ def build_sections() -> list[Section]:
             id="graph",
             title="Knowledge graph",
             blurb=(
-                "Artifacts, chunks, symbols and concepts, wired by contains / "
-                "mentions / imports / references / similar_to edges. The one knob "
-                "worth thinking about is how many documents must share a term before "
-                "it earns a concept node — a concept that links one document is pure "
-                "weight."
+                "Artifacts, chunks, symbols, entities and headings, wired by "
+                "contains / has_chunk / has_heading / mentions / imports / "
+                "references edges. Memory bridging wires agent-memory records "
+                "into that graph; turn it off if you would rather keep "
+                "remembered facts out of it."
             ),
             covers=("graph",),
             questions=[
                 Question(
-                    key="graph.concept_min_documents",
-                    prompt="Documents that must share a term to make it a concept",
-                    kind="int",
-                    help="1 keeps every term (much larger graph).",
+                    key="graph.memory_entity_bridging",
+                    prompt="Link agent-memory records into the knowledge graph",
+                    kind="bool",
                 ),
             ],
         ),
@@ -1627,21 +1626,10 @@ def _wrap(text: str, width: int = 74) -> list[str]:
 
 
 def render_config_yaml(data: dict[str, Any]) -> str:
-    """YAML for a config mapping, sources rendered the way quickstart does.
-
-    ``yaml.safe_dump`` writes list-of-dict items in a shape the dependency-light
-    YAML shim in this repo cannot read back, so sources go through the same
-    hand-rolled renderer ``pheasant up`` uses.
-    """
+    """YAML for a config mapping, in the shape every pheasant writer emits."""
     from pheasant.config.loader import dump_config_yaml
-    from pheasant.quickstart import _render_sources_block
 
-    payload = dict(data)
-    sources = payload.pop("sources", None)
-    rendered = dump_config_yaml(payload)
-    if sources:
-        rendered += _render_sources_block(sources)
-    return rendered
+    return dump_config_yaml(data)
 
 
 _ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")

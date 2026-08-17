@@ -693,9 +693,6 @@ def test_the_queue_cli_reports_and_replays(tmp_path: Path, capsys: Any) -> None:
 
     config = _config(tmp_path, state_name="cli", sources=1, queue={"enabled": True})
     config_path = tmp_path / "pheasant.yaml"
-    # Written literally rather than with yaml.safe_dump: the repo root carries
-    # a `yaml.py` shim that shadows PyYAML from a checkout, and it does not
-    # round-trip a dump of this shape.
     config_path.write_text(
         "pheasant:\n"
         f"  name: {config.pheasant.name}\n"

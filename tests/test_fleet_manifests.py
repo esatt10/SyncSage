@@ -14,12 +14,11 @@ codebase, and that is what is here.
 
 from __future__ import annotations
 
-import importlib
-import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from pheasant.config.schema import PheasantConfig
 from pheasant.deployment.roles import Role, resolve_role, validate_role
@@ -27,31 +26,6 @@ from pheasant.deployment.roles import Role, resolve_role, validate_role
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCALED = REPO_ROOT / "deploy" / "kubernetes" / "scaled"
 BASE = REPO_ROOT / "deploy" / "kubernetes"
-
-
-def _real_yaml():
-    """Load the installed PyYAML rather than the repo-root shim.
-
-    `yaml.py` at the checkout root is a dependency-light stand-in, and it
-    shadows PyYAML for anything running from there — including pytest. It
-    parses the single-document configs it was written for and not much else;
-    a multi-document manifest with nested lists trips it. So these tests load
-    the real library by removing the root from `sys.path` for one import,
-    which is also the reason the same trick appears in the docs build.
-    """
-
-    saved = sys.modules.pop("yaml", None)
-    original = sys.path[:]
-    sys.path[:] = [entry for entry in sys.path if entry not in ("", ".", str(REPO_ROOT))]
-    try:
-        return importlib.import_module("yaml")
-    finally:
-        sys.path[:] = original
-        if saved is not None:
-            sys.modules["yaml"] = saved
-
-
-yaml = _real_yaml()
 
 
 def _documents(path: Path) -> list[dict[str, Any]]:

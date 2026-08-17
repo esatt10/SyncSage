@@ -1409,18 +1409,6 @@ class SyncEngine:
                 )
                 self.graph_builder.add_cross_source_edges()
                 self._bridge_memory()
-                pruned = self.graph_builder.reconcile_concepts(
-                    self.state,
-                    min_documents=int(self.config.graph.concept_min_documents),
-                    changed_ids=changed_ids,
-                )
-                if pruned["removed"] or pruned["restored"]:
-                    logger.info(
-                        "Concepts reconciled: kept=%s removed=%s restored=%s",
-                        pruned["kept"],
-                        pruned["removed"],
-                        pruned["restored"],
-                    )
 
             if self.vectors is not None:
                 # Finish provider work before advertising a saved, completed

@@ -49,10 +49,6 @@ data:
       scheduler:
         enabled: true
         interval_seconds: 900
-    obsidian:
-      enabled: true
-      note_root: pheasant
-      create_chunk_notes: false
     security:
       allow_workspace_roots:
         - /workspace

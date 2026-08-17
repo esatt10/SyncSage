@@ -414,8 +414,8 @@ def test_startup_commands_cover_every_deployment_target(tmp_path: Path) -> None:
     assert "docker compose up" in compose
 
 
-def test_generated_yaml_round_trips_through_the_dependency_light_shim(tmp_path: Path) -> None:
-    """The repo ships a minimal yaml shim; `sources:` must parse under it too."""
+def test_generated_yaml_round_trips(tmp_path: Path) -> None:
+    """A wizard-written config must reload with its lists intact."""
     wizard = Wizard(accept_defaults=True)
     wizard.run()
     wizard.sources = [
