@@ -1802,7 +1802,34 @@ New optional extras: `postgres`, `grpc`, `queue`. **All three defaults are
 unchanged** — SQLite, HTTP, no queue — and standalone was verified with
 `psycopg`, `grpc` and `nats` all blocked at import (rule 7).
 
-Two habits from this arc worth keeping:
+- **35.6** process roles (`serve --role api|indexer|worker|all`), serving
+  durability (shed with 429, drain before dying), and per-role manifests for
+  Kubernetes and Compose with autoscaling on `pheasant_index_queue_depth`.
+- **35.7** the measured capacity model — and the **O(N²) it uncovered**.
+
+**35.7 is the argument for measuring rather than assuming.** Sweeping corpus
+size showed indexing was superlinear (500 → 8,000 files went 1.9s → 164.7s,
+tripling per doubling, ~16 hours extrapolated at 250k files). Cause:
+`chunks_fts.artifact_id` is an **UNINDEXED** FTS5 column, so the per-artifact
+`DELETE FROM chunks_fts WHERE artifact_id=?` scanned a table growing with the
+corpus — and on a *full* sync it scanned to delete **nothing**, because
+`delete_source_artifacts` had already emptied the source before the loop.
+`replace_artifact_chunks(fresh=True)` skips the question; 8,000 files got
+**6.3x** faster and the curve became linear. Same class as the
+`graph_nodes_fts` scan recorded above, so it is worth treating "unindexed FTS5
+column in a WHERE clause" as a smell in this codebase.
+
+`src/pheasant/capacity.py` is now the single home for sizing coefficients, so
+`pheasant scan`, `pheasant shard plan` and the docs cannot disagree. Two
+values are deliberately **not** taken from the synthetic sweep and say so:
+`NODES_PER_FILE` stays at the live corpus's 6.3 rather than the fixture's 3.0
+(the fixture has no links, headings or symbols, so adopting it would halve
+every memory projection), and `EMBEDDING_TIME_MULTIPLIER` stays `None`
+because a network embedder's throughput is the provider's rate limit.
+`pheasant scan` projects RAM, disk and index time before a first index —
+validated at 6% error against a real 6,000-file corpus.
+
+Three habits from this arc worth keeping:
 
 1. **Run the real dependency.** A real Postgres cluster and a real NATS
    JetStream broker each found bugs a mock could not: the double-claim race
@@ -1812,6 +1839,13 @@ Two habits from this arc worth keeping:
    the wrong-artifact identity check). One survivor was *correct* to survive
    and is recorded as uncovered in the module docstring rather than papered
    over with a test that cannot fail.
+3. **Trust the mutation harness only after you have checked it.** A
+   same-byte-length mutant (`1.5` → `0.5`) restored within one filesystem
+   mtime tick left Python running the **mutated `__pycache__`** after the
+   revert — mtime and size both matched the mutant's compile, so the pyc was
+   never invalidated. That produced one false CAUGHT and half an hour spent
+   debugging correct source. Any mutation script here must `touch` the
+   restored file and purge `__pycache__`.
 
 **The sharpest bug of the arc**, because the fix follows from a fact that is
 easy to get backwards: `LocalQueue.claim` double-claimed on Postgres. Under

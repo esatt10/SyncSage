@@ -195,9 +195,174 @@ def run_benchmark(
         shutil.rmtree(root, ignore_errors=True)
 
 
+def _resident_bytes() -> int | None:
+    """Current RSS, or None where the platform will not say.
+
+    ``/proc`` first because it is exact and current; ``ru_maxrss`` is a
+    high-*water* mark, which for a sweep that grows monotonically is close
+    enough and is the only portable option.
+    """
+
+    try:
+        with open("/proc/self/status", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    try:
+        import resource
+        import sys
+
+        maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return int(maxrss) if sys.platform == "darwin" else int(maxrss) * 1024
+    except Exception:  # pragma: no cover - platform-specific
+        return None
+
+
+def _directory_bytes(root: Path) -> dict[str, int]:
+    """Bytes under /state, split by what actually holds them.
+
+    Split rather than totalled because the parts scale differently: the
+    database tracks *content* (it stores every chunk's text again, plus its
+    FTS index), the graph tracks *structure*, and vectors track chunks times
+    dimensions. A single total would hide which one is about to be the
+    problem.
+    """
+
+    buckets = {"database": 0, "graph": 0, "vectors": 0, "manifests": 0, "other": 0}
+    if not root.exists():
+        return buckets
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        size = path.stat().st_size
+        name = path.name
+        relative = str(path.relative_to(root))
+        if name.startswith("pheasant.db"):
+            buckets["database"] += size
+        elif "graph" in relative:
+            buckets["graph"] += size
+        elif "vector" in relative or path.suffix in {".lance", ".npy"}:
+            buckets["vectors"] += size
+        elif "manifest" in relative:
+            buckets["manifests"] += size
+        else:
+            buckets["other"] += size
+    return buckets
+
+
+def run_capacity(
+    *,
+    sizes: tuple[int, ...] = (250, 1000, 4000),
+    lines: int = 80,
+    embeddings: bool = False,
+    workers: int = 1,
+) -> dict[str, Any]:
+    """Sweep corpus *size* and record what each one costs (Phase 35.7).
+
+    A different axis from :func:`run_benchmark`, which sweeps worker counts at
+    one size. This one answers the sizing questions: how much RAM, how much
+    disk, how long — the coefficients in :mod:`pheasant.capacity`.
+
+    Each size gets its own process-lifetime measurement of RSS. That is the
+    honest caveat: RSS is measured in *this* process, which has already
+    imported everything and holds the previous size's garbage, so the reported
+    delta is a floor. `python -m pheasant.graph.capacity` isolates the graph
+    itself if you need the number without that noise.
+    """
+
+    from pheasant.capacity import (
+        BYTES_PER_CHUNK,
+        NODES_PER_FILE,
+        SECONDS_PER_1K_FILES,
+        STATE_BYTES_PER_CORPUS_BYTE,
+    )
+
+    root = Path(tempfile.mkdtemp(prefix="pheasant-capacity-"))
+    points: list[dict[str, Any]] = []
+    try:
+        for size in sorted(dict.fromkeys(max(1, int(value)) for value in sizes)):
+            workspace = _fixture(root / f"corpus-{size}", size, lines)
+            corpus_bytes = sum(path.stat().st_size for path in workspace.rglob("*.md"))
+            config = _config(root, workspace, workers, embeddings, "thread", f"cap-{size}")
+            state_root = Path(config.pheasant.state_path)
+
+            rss_before = _resident_bytes()
+            engine = SyncEngine(config)
+            started = time.perf_counter()
+            try:
+                result = engine.sync_source("corpus", "full")
+                elapsed = time.perf_counter() - started
+                chunk_rows = engine.state.rows("SELECT COUNT(*) AS c FROM chunks", ())
+                chunks = int(chunk_rows[0]["c"]) if chunk_rows else 0
+            finally:
+                engine.close()
+            rss_after = _resident_bytes()
+
+            state = _directory_bytes(state_root)
+            state_total = sum(state.values())
+            points.append(
+                {
+                    "files": size,
+                    "corpus_bytes": corpus_bytes,
+                    "corpus_mb": round(corpus_bytes / (1024 * 1024), 2),
+                    "seconds": round(elapsed, 3),
+                    "seconds_per_1k_files": round(elapsed / size * 1000, 2),
+                    "files_per_second": round(size / elapsed, 1),
+                    "graph_nodes": result.graph_nodes,
+                    "graph_edges": result.graph_edges,
+                    "nodes_per_file": round(result.graph_nodes / size, 3),
+                    "chunks": chunks,
+                    "chunks_per_file": round(chunks / size, 3),
+                    "bytes_per_chunk": round(corpus_bytes / chunks) if chunks else None,
+                    "state_bytes": state_total,
+                    "state_mb": round(state_total / (1024 * 1024), 2),
+                    "state_bytes_per_corpus_byte": (
+                        round(state_total / corpus_bytes, 3) if corpus_bytes else None
+                    ),
+                    "state_breakdown_bytes": state,
+                    "rss_bytes": rss_after,
+                    "rss_delta_bytes": (
+                        (rss_after - rss_before) if (rss_after and rss_before) else None
+                    ),
+                }
+            )
+        return {
+            "fixture": {"lines_per_file": lines, "workers": workers},
+            "embeddings": "stub" if embeddings else "disabled",
+            "points": points,
+            # The constants this run is meant to check. Printed beside the
+            # measurements so drift is visible without opening two files.
+            "model": {
+                "nodes_per_file": NODES_PER_FILE,
+                "bytes_per_chunk": BYTES_PER_CHUNK,
+                "state_bytes_per_corpus_byte": STATE_BYTES_PER_CORPUS_BYTE,
+                "seconds_per_1k_files": SECONDS_PER_1K_FILES,
+            },
+            "caveats": [
+                "RSS is process-lifetime, not per-size: earlier sizes' garbage is "
+                "included, so treat the value as a floor. Use "
+                "`python -m pheasant.graph.capacity` for the graph in isolation.",
+                "The fixture is uniform markdown. A real corpus of PDFs, code or "
+                "very large files will move seconds_per_1k_files most and "
+                "nodes_per_file least.",
+            ],
+        }
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode",
+        choices=("workers", "capacity"),
+        default="workers",
+        help="workers: throughput vs worker count. capacity: cost vs corpus size.",
+    )
     parser.add_argument("--files", type=int, default=200)
+    parser.add_argument("--sizes", default="250,1000,4000", help="capacity mode: corpus sizes")
     parser.add_argument("--lines", type=int, default=80)
     parser.add_argument("--workers", default="1,2,4,8")
     parser.add_argument("--embeddings", action="store_true")
@@ -205,20 +370,23 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
     worker_counts = tuple(max(1, int(value)) for value in args.workers.split(",") if value.strip())
-    print(
-        json.dumps(
-            run_benchmark(
-                files=max(1, args.files),
-                lines=max(1, args.lines),
-                workers=worker_counts,
-                embeddings=args.embeddings,
-                file_executor=args.executor,
-                repeats=max(1, args.repeats),
-            ),
-            indent=2,
-            sort_keys=True,
+    if args.mode == "capacity":
+        report = run_capacity(
+            sizes=tuple(int(value) for value in args.sizes.split(",") if value.strip()),
+            lines=max(1, args.lines),
+            embeddings=args.embeddings,
+            workers=worker_counts[0],
         )
-    )
+    else:
+        report = run_benchmark(
+            files=max(1, args.files),
+            lines=max(1, args.lines),
+            workers=worker_counts,
+            embeddings=args.embeddings,
+            file_executor=args.executor,
+            repeats=max(1, args.repeats),
+        )
+    print(json.dumps(report, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

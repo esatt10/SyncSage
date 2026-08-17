@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
+from pheasant.capacity import project as project_capacity
 from pheasant.config.schema import FILESYSTEM_SOURCE_TYPES, PheasantConfig, SourceConfig
 from pheasant.graph.builder import GraphBuilder
 from pheasant.ingestion.captioner import captioner_from_config, source_includes_images
@@ -1532,7 +1533,15 @@ class SyncEngine:
                         "scan": exc.report.as_dict(),
                     },
                 )
-            if mode == "full":
+            # A full sync empties the source here, so every artifact written
+            # below is known to be absent. That matters more than it sounds:
+            # `chunks_fts.artifact_id` is UNINDEXED, so the per-artifact
+            # DELETE that would otherwise run is a full scan of a table
+            # growing with the corpus, once per file — a measured O(N²) (Phase
+            # 35.7: 500 → 8,000 files went 1.9s → 164.7s). Telling the writer
+            # the rows cannot exist skips the question entirely.
+            cleared = mode == "full"
+            if cleared:
                 with self._sync_mutex:
                     self.state.delete_source_artifacts(source.name)
                     self.graph_builder.remove_source_content(source.name)
@@ -1636,7 +1645,7 @@ class SyncEngine:
                     for chunk in parsed.chunks
                 ]
                 with self._sync_mutex:
-                    self.state.replace_artifact_chunks(artifact_row, chunk_rows)
+                    self.state.replace_artifact_chunks(artifact_row, chunk_rows, fresh=cleared)
                     if self.vectors is not None:
                         # Chunk ids are content-addressed (text_hash in the id),
                         # so only new/changed chunk text reaches the embedder.
@@ -2082,6 +2091,20 @@ class SyncEngine:
             },
             "would_exceed": would_exceed,
             "would_sync": not would_exceed,
+            # Phase 35.7: the scan already has the two inputs the capacity
+            # model needs, so the projection costs nothing here — and this is
+            # the moment it matters, before anyone commits to a first index
+            # and learns the answer from an OOM kill mid-sync.
+            "projection": project_capacity(
+                report.file_count,
+                report.total_bytes,
+                embedding_dimensions=(
+                    self.config.search.embeddings.dimensions
+                    if self.config.search.embeddings.enabled
+                    else 0
+                ),
+                max_nodes_per_shard=self.config.graph.max_nodes or 1_500_000,
+            ).as_dict(),
         }
 
     def _source(self, name: str) -> SourceConfig:

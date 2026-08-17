@@ -41,6 +41,38 @@ def _print_scan(report: dict) -> None:
         print("  narrow with --depth / include / exclude, raise sync.limits, or use --full-scan")
     else:
         print("  within configured limits — sync would proceed")
+    _print_projection(report)
+
+
+def _print_projection(report: dict) -> None:
+    """Turn the scan's counts into a sizing answer (Phase 35.7).
+
+    `scan` already walks without reading and reports files and bytes. Those
+    are exactly the two inputs the capacity model needs, so the projection is
+    free here — and this is the moment it is useful, before anyone has
+    committed to a first index and discovered the answer by OOM.
+    """
+
+    from pheasant.capacity import project
+
+    projection = report.get("projection")
+    if not projection:
+        if not report.get("scannable"):
+            return
+        projection = project(
+            int(report.get("file_count") or 0),
+            int(report.get("total_bytes") or 0),
+        ).as_dict()
+    minutes = projection["projected_index_minutes"]
+    duration = f"{minutes:.1f} min" if minutes >= 1 else f"{projection['projected_index_seconds']}s"
+    print(
+        f"  projected: ~{projection['graph_nodes']:,} nodes, "
+        f"~{projection['projected_rss_gb']:.1f} GB RAM, "
+        f"~{projection['projected_state_gb']:.1f} GB in /state, ~{duration} to index"
+    )
+    print(f"  suggested container memory: {projection['recommended_memory']}")
+    for warning in projection.get("warnings") or []:
+        print(f"  ! {warning}")
 
 
 def _sync_services(engine, cfg, config_path=None):

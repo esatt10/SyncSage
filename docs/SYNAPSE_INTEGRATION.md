@@ -995,7 +995,7 @@ working, which is what holds the 5 MB end of the range.
 | 35.4 | Multi-writer indexing: per-source leases + sharding | done (2026-08-16); durable queue deferred |
 | 35.5 | Durable worker dispatch, gRPC transport, and the durable index queue (NATS JetStream) | done (2026-08-16) |
 | 35.6 | Process roles, serving durability, autoscaling and the three runtimes | done (2026-08-16) |
-| 35.7 | Measured capacity model and sizing guidance | queued |
+| 35.7 | Measured capacity model, sizing guidance, and the O(N²) it uncovered | done (2026-08-16) |
 
 ### Step 35.0 — Remove the Obsidian exporter (done 2026-08-16)
 
@@ -1524,3 +1524,94 @@ Mutation-tested **23/23 caught** across the three areas.
 **Not done, deliberately:** no `kubeconform`/cluster validation of the
 manifests (that belongs in CI with a schema bundle, not in an offline suite),
 and nothing here is measured under real load — 35.7 is where numbers belong.
+
+### Step 35.7 — The measured capacity model (2026-08-16)
+
+**What this step was for:** the user asked for provisioning guidance and none
+existed. What it actually produced was a **performance bug**, because
+measuring something is how you find out it is not shaped the way everyone
+assumed.
+
+**The finding.** `python -m pheasant.sync.benchmark --mode capacity` sweeps
+corpus *size* (a different axis from the existing worker-count benchmark) and
+records time, disk, nodes, chunks and RSS at each point. The first run:
+
+| files | seconds | s/1k files |
+|---|---|---|
+| 500 | 1.93 | 3.85 |
+| 1,000 | 5.17 | 5.17 |
+| 2,000 | 14.77 | 7.39 |
+| 4,000 | 48.86 | 12.22 |
+| 8,000 | 164.66 | 20.58 |
+
+Doubling the corpus **tripled** the time — ~O(n^1.7), extrapolating to about
+16 hours at 250,000 files. Profiling put 61% of a 2,000-file sync in
+`replace_artifact_chunks`, and the cause is that `chunks_fts.artifact_id` is
+an **UNINDEXED** FTS5 column: `DELETE FROM chunks_fts WHERE artifact_id=?` is
+a full scan of a table growing with the corpus, run once per artifact. On a
+*full* sync `delete_source_artifacts` has already emptied the source before
+the loop, so every one of those scans searched an ever-larger table **to
+delete nothing**.
+
+Same class as the `graph_nodes_fts` scan already recorded in CLAUDE.md, and
+the same fix: don't ask an unindexed column a question whose answer is known.
+`replace_artifact_chunks(..., fresh=True)` on the cleared path:
+
+| files | before | after | speedup |
+|---|---|---|---|
+| 500 | 1.93 | 1.41 | 1.37x |
+| 1,000 | 5.17 | 2.90 | 1.78x |
+| 2,000 | 14.77 | 5.81 | 2.54x |
+| 4,000 | 48.86 | 12.29 | 3.98x |
+| 8,000 | 164.66 | 26.22 | **6.28x** |
+
+And the shape is now linear: 2.06x / 2.01x / 2.12x / 2.13x per doubling.
+
+**The model** (`src/pheasant/capacity.py`) is one home for the coefficients so
+`scan`, `shard plan` and the docs cannot disagree. Three of my initial guesses
+were wrong and the measurements replaced them: state-bytes-per-corpus-byte
+3.0 → **4.0** (measured 3.95–4.09, flat to 3%); seconds-per-1k-files 12.0 →
+**3.3**; and chunks moved from a per-file constant to **bytes per chunk**
+(2,728 measured), because file size varies far more between corpora than
+chunk size does.
+
+One measurement was deliberately **not** adopted: the sweep reports 3.0
+nodes per file, and the model keeps **6.3** from the live 2,132-file demo
+corpus. The fixture is uniform markdown with no links, headings or symbols, so
+taking its figure would have halved every memory projection on the strength of
+a fixture that was never meant to be representative. `EMBEDDING_TIME_MULTIPLIER`
+is left `None` for the same kind of reason: a network embedder's throughput is
+the provider's rate limit, and a number derived from the stub would describe
+nothing.
+
+**`pheasant scan` now answers the sizing question**, which is the point — it
+already walks without reading and has both inputs, so the projection is free
+and arrives *before* anyone commits to a first index. Validated end to end on
+a real 6,000-file corpus the model had never seen: projected 19.8 s, actual
+21.0 s (**6%**), with `chunks == chunks_fts == 12,000` confirming the fast
+path duplicates nothing.
+
+**Two things that went wrong in the doing**, both worth recording:
+
+1. **My mutation harness produced a false result.** The C7 mutant changed
+   `1.5` to `0.5` — *same byte length* — and the restore (`mv` from a `cp`
+   backup) left an mtime within the same filesystem tick. Python's pyc
+   invalidation compares mtime and size, both of which now matched the
+   mutant's compile, so the tree kept running the **mutated bytecode** after
+   restore. It cost a confusing half hour chasing a "bug" in
+   `recommend_memory` whose source was correct all along. The harness now
+   touches the file and purges `__pycache__`; re-running with it fixed flipped
+   one verdict from CAUGHT to SURVIVED, which was a real uncovered case
+   (`scan`'s `projection` key) now tested.
+2. **A doc example I wrote by hand had the wrong output format** (thousands
+   separators the real `_print_scan` does not emit). Replaced with verbatim
+   output from a real run.
+
+**Acceptance:** `tests/test_capacity_model.py` (21). Half of it guards a
+*performance* fix, which is unusual and deliberate: a wrong `fresh=True` does
+not crash, it duplicates chunks and FTS rows, so the tests assert the absence
+of duplicates and — after mutation testing showed correctness tests cannot see
+an optimization being reverted — assert the mechanism directly. Mutation-tested
+**9/9 caught** with the fixed harness. Suite **1269 passed / 27 skipped**.
+
+**Phase 35 is complete.**

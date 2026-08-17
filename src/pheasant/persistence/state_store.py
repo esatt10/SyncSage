@@ -322,7 +322,28 @@ class StateStore:
         self,
         artifact: dict[str, Any],
         chunks: list[dict[str, Any]],
+        *,
+        fresh: bool = False,
     ) -> None:
+        """Write one artifact and its chunks, replacing whatever was there.
+
+        ``fresh`` says the caller has already cleared this source, so there is
+        nothing to replace. It exists because of a measured O(N²), found by
+        the Phase 35.7 capacity sweep: indexing 500 → 8,000 files took 1.9s →
+        164.7s, tripling for every doubling.
+
+        The cause is that ``chunks_fts.artifact_id`` is an **UNINDEXED** FTS5
+        column, so ``DELETE FROM chunks_fts WHERE artifact_id=?`` is a full
+        scan of a table that grows with the corpus — once per artifact. On a
+        *full* sync `delete_source_artifacts` has already emptied the source's
+        rows before the loop starts, so each of those scans searches an
+        ever-larger table in order to delete **nothing**.
+
+        Same class as the ``graph_nodes_fts`` scan recorded in CLAUDE.md, and
+        the same fix: do not ask an unindexed column a question whose answer
+        is already known.
+        """
+
         with self.conn:
             self.conn.execute(
                 """INSERT INTO artifacts(
@@ -348,10 +369,13 @@ class StateStore:
                     acl=excluded.acl""",
                 {"acl": None, **artifact},
             )
-            self.conn.execute("DELETE FROM chunks WHERE artifact_id=?", (artifact["id"],))
-            self.conn.execute("DELETE FROM chunks_fts WHERE artifact_id=?", (artifact["id"],))
-            self.conn.execute("DELETE FROM symbols WHERE artifact_id=?", (artifact["id"],))
-            self.conn.execute("DELETE FROM artifact_terms WHERE artifact_id=?", (artifact["id"],))
+            if not fresh:
+                self.conn.execute("DELETE FROM chunks WHERE artifact_id=?", (artifact["id"],))
+                self.conn.execute("DELETE FROM chunks_fts WHERE artifact_id=?", (artifact["id"],))
+                self.conn.execute("DELETE FROM symbols WHERE artifact_id=?", (artifact["id"],))
+                self.conn.execute(
+                    "DELETE FROM artifact_terms WHERE artifact_id=?", (artifact["id"],)
+                )
             for chunk in chunks:
                 self.conn.execute(
                     """INSERT INTO chunks(
