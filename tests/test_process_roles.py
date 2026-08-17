@@ -214,7 +214,15 @@ def test_the_api_role_publishes_a_sync_instead_of_running_it(tmp_path: Path) -> 
 
     response = client.post("/sync/src0", json={"mode": "full", "wait": False})
     assert response.status_code == 200
-    assert response.json()["status"] == "syncing"
+    body = response.json()
+    # "queued", not "syncing": nothing is indexing yet, and there is no local
+    # job to watch. The task id used to come back as `job_id`, so every caller
+    # polled GET /jobs/<task id> and got a 404 — the registry is in-process and
+    # the work belongs to an indexer in another pod.
+    assert body["status"] == "queued"
+    assert body["job_id"] is None
+    assert body["queued_tasks"] and all(t.startswith("idx-") for t in body["queued_tasks"])
+    assert client.get(f"/jobs/{body['queued_tasks'][0]}").status_code == 404
 
     engine = client.app.state.engine
     queue = LocalQueue(engine.state)
@@ -231,7 +239,11 @@ def test_the_api_role_deduplicates_a_double_click(tmp_path: Path) -> None:
     first = client.post("/sync/src0", json={"mode": "full", "wait": False}).json()
     second = client.post("/sync/src0", json={"mode": "full", "wait": False}).json()
 
-    assert first["job_id"] == second["job_id"]
+    # Compared on `queued_tasks`, not `job_id`: on this role `job_id` is None
+    # for both calls, so the original assertion held whether or not the two
+    # clicks deduplicated.
+    assert first["queued_tasks"], "nothing was published"
+    assert first["queued_tasks"] == second["queued_tasks"]
     assert LocalQueue(client.app.state.engine.state).depth()[PENDING] == 1
 
 

@@ -58,6 +58,17 @@ class StateBackend(ABC):
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         """Run one statement."""
 
+    def statement(self, sql: str, params: tuple[Any, ...] = ()) -> list[Row]:
+        """Run a statement that may write, returning any rows it produced.
+
+        Separate from :meth:`rows` because a backend may release a pooled
+        connection after a pure read but must not after a write — see
+        :meth:`PostgresBackend.statement`. Defaults to :meth:`rows`, which is
+        correct for a backend holding one connection per thread.
+        """
+
+        return self.rows(sql, params)
+
     @abstractmethod
     def executemany(self, sql: str, seq: list[tuple[Any, ...]]) -> None:
         """Run one statement over many parameter tuples."""
@@ -213,7 +224,8 @@ class _PgConnection:
         self._backend = backend
 
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> _PgResult:
-        return _PgResult(self._backend.rows(sql, params))
+        # `statement`, not `rows`: this is the write path.
+        return _PgResult(self._backend.statement(sql, params))
 
     def executemany(self, sql: str, seq: list[tuple[Any, ...]]) -> None:
         self._backend.executemany(sql, seq)
@@ -225,12 +237,17 @@ class _PgConnection:
         self._backend.commit()
 
     def rollback(self) -> None:
-        self._backend._conn().rollback()
+        self._backend._abort()
 
     def __enter__(self) -> _PgConnection:
+        # Pin the connection for the block: a read inside it must not hand the
+        # connection back mid-transaction, which is what `_finish` would
+        # otherwise do the moment a `with` block starts with a SELECT.
+        self._backend.enter_transaction()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
+        self._backend.exit_transaction()
         if exc_type is None:
             self.commit()
         else:
@@ -292,6 +309,15 @@ class PostgresBackend(StateBackend):
         statement: ``StateStore`` calls ``execute`` several times and then
         ``commit``, and a per-statement checkout would put those in different
         transactions — turning one atomic artifact replacement into several.
+
+        "Unit of work", not "life of the thread". The first version checked out
+        here and only ever returned the connection from ``close()``, so a pool
+        of ``pool_size`` (default 10) was exhausted by the eleventh *thread*
+        that touched the store — and Starlette runs sync endpoints on a 40-slot
+        threadpool, so ordinary traffic hit ``PoolTimeout``. The leases,
+        drainer, refresher and file workers each held one more, and all of them
+        sat idle-in-transaction pinning an MVCC snapshot. :meth:`_finish` now
+        returns the connection at every boundary where no work is pending.
         """
 
         conn = getattr(self._local, "conn", None)
@@ -300,35 +326,144 @@ class PostgresBackend(StateBackend):
             self._local.conn = conn
         return conn
 
+    @property
+    def _pending(self) -> bool:
+        """Whether this thread has uncommitted writes or an open ``with`` block."""
+
+        return bool(getattr(self._local, "dirty", False)) or int(
+            getattr(self._local, "depth", 0) or 0
+        )
+
+    def _finish(self) -> None:
+        """Return the connection if nothing is pending. Cheap and idempotent.
+
+        Called after every read and every commit. A read outside a transaction
+        owes the server nothing, so holding its connection is pure waste; a
+        write holds until ``commit`` because that is what makes
+        ``replace_artifact_chunks`` atomic.
+        """
+
+        if not self._pending:
+            self.release()
+
+    def _abort(self) -> None:
+        """Roll back and return the connection after a failed statement.
+
+        Without this, one failed statement leaves the connection in
+        ``INFAILEDTRANSACTION`` and **every subsequent statement on that
+        thread** raises until the process ends. That is not hypothetical:
+        ``SearchStore.search`` catches the FTS error and immediately runs its
+        LIKE fallback on the same connection, so the degraded path was dead on
+        Postgres — and the queue's own expected duplicate-key error poisoned
+        the connection before ``drain`` could claim anything.
+        """
+
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:  # pragma: no cover - already-broken connection
+                pass
+        self._local.dirty = False
+        self._local.depth = 0
+        self.release()
+
     def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[Row]:
         conn = self._conn()
-        with conn.cursor() as cursor:
-            cursor.execute(self.dialect.translate(sql), params or None)
-            if cursor.description is None:
-                return []
-            columns = [column.name for column in cursor.description]
-            return [Row(dict(zip(columns, values, strict=True))) for values in cursor.fetchall()]
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(self.dialect.translate(sql), params or None)
+                if cursor.description is None:
+                    result: list[Row] = []
+                else:
+                    columns = [column.name for column in cursor.description]
+                    result = [
+                        Row(dict(zip(columns, values, strict=True))) for values in cursor.fetchall()
+                    ]
+        except Exception:
+            self._abort()
+            raise
+        self._finish()
+        return result
+
+    def statement(self, sql: str, params: tuple[Any, ...] = ()) -> list[Row]:
+        """Run a statement that may write, returning any rows it produced.
+
+        Distinct from :meth:`rows` in exactly one way, and it is load-bearing:
+        this never auto-releases the connection. ``_PgConnection.execute`` —
+        the sqlite3-shaped path every ``with self.conn:`` block in
+        ``StateStore`` uses — is a *write* path, so releasing after it would
+        hand back the connection mid-transaction and discard the uncommitted
+        work. ``UPDATE ... RETURNING`` (the queue's claim) needs the same.
+        """
+
+        conn = self._conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(self.dialect.translate(sql), params or None)
+                if cursor.description is None:
+                    result: list[Row] = []
+                else:
+                    columns = [column.name for column in cursor.description]
+                    result = [
+                        Row(dict(zip(columns, values, strict=True))) for values in cursor.fetchall()
+                    ]
+        except Exception:
+            self._abort()
+            raise
+        self._local.dirty = True
+        return result
 
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         conn = self._conn()
-        with conn.cursor() as cursor:
-            cursor.execute(self.dialect.translate(sql), params or None)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(self.dialect.translate(sql), params or None)
+        except Exception:
+            self._abort()
+            raise
+        self._local.dirty = True
 
     def executemany(self, sql: str, seq: list[tuple[Any, ...]]) -> None:
         if not seq:
             return
         conn = self._conn()
-        with conn.cursor() as cursor:
-            cursor.executemany(self.dialect.translate(sql), seq)
+        try:
+            with conn.cursor() as cursor:
+                cursor.executemany(self.dialect.translate(sql), seq)
+        except Exception:
+            self._abort()
+            raise
+        self._local.dirty = True
 
     def executescript(self, script: str) -> None:
         conn = self._conn()
-        with conn.cursor() as cursor:
-            cursor.execute(script)
-        conn.commit()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(script)
+            conn.commit()
+        except Exception:
+            self._abort()
+            raise
+        self._local.dirty = False
+        self._finish()
 
     def commit(self) -> None:
-        self._conn().commit()
+        try:
+            self._conn().commit()
+        except Exception:
+            self._abort()
+            raise
+        self._local.dirty = False
+        self._finish()
+
+    def enter_transaction(self) -> None:
+        """A ``with conn:`` block opened — hold the connection until it exits."""
+
+        self._local.depth = int(getattr(self._local, "depth", 0) or 0) + 1
+
+    def exit_transaction(self) -> None:
+        self._local.depth = max(0, int(getattr(self._local, "depth", 0) or 0) - 1)
 
     def close(self) -> None:
         self.release()

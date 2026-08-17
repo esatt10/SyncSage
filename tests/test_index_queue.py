@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -430,6 +431,47 @@ def test_publishing_the_same_source_twice_does_not_duplicate_the_backlog(
     assert int(rows[0]["c"]) == 2
 
 
+def test_a_long_running_handler_keeps_its_claim(tmp_path: Path) -> None:
+    """`heartbeat` shipped on every backend with no caller.
+
+    Without one, a task is claimed for exactly `visibility_seconds` however
+    long the work takes — so a multi-minute source index gets redelivered to a
+    second worker while the first is still running it. That is the dead-worker
+    recovery path firing on a healthy worker.
+    """
+
+    config = _config(tmp_path, state_name="heartbeat", sources=1)
+    store = _store(config)
+    try:
+        queue = LocalQueue(store)
+        queue.publish(_task(id="slow"))
+
+        def visible_at() -> str:
+            return str(store.rows("SELECT visible_at FROM index_tasks WHERE id=?", ("slow",))[0][0])
+
+        extended: list[bool] = []
+        stolen: list[Any] = []
+
+        def handler(task: Any) -> None:
+            # Everything is asserted from *inside* the handler: once it
+            # returns, `ack` and `nack` both move `visible_at` themselves, so
+            # an assertion made afterwards passes whether or not a heartbeat
+            # ever ran. (It did, on the first draft of this test.)
+            first = visible_at()
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline and visible_at() == first:
+                time.sleep(0.05)
+            extended.append(visible_at() > first)
+            stolen.append(LocalQueue(store).claim("other-worker", visibility_seconds=3.0))
+
+        drain(queue, handler, visibility_seconds=3.0)
+
+        assert extended == [True], "the claim was never extended while the handler ran"
+        assert stolen == [None], "a second worker stole a task that was still being worked"
+    finally:
+        store.close()
+
+
 def test_completed_tasks_are_purged_but_failures_are_kept(tmp_path: Path) -> None:
     config = _config(tmp_path, state_name="purge", sources=1)
     store = _store(config)
@@ -695,6 +737,62 @@ def test_the_queue_cli_reports_and_replays(tmp_path: Path, capsys: Any) -> None:
     drained = capsys.readouterr().out
     assert "src0: healthy (2 indexed" in drained
     assert "drained 1 task(s)" in drained
+
+
+def test_the_queue_cli_talks_to_the_configured_backend(
+    tmp_path: Path, capsys: Any, monkeypatch: Any
+) -> None:
+    """`pheasant queue` built a LocalQueue directly, ignoring the config.
+
+    With `sync.queue.backend: nats` the tasks live in JetStream, so `status`
+    reported an empty queue on a backlog of thousands, `drain` drained nothing,
+    and `requeue-dead` silently did nothing to the queue actually holding the
+    dead letters — all three exiting 0, which is the worst way to be wrong.
+    Asserted through `queue_from_config`, so this holds for any backend without
+    needing a live broker.
+    """
+
+    from pheasant.cli import main
+    from pheasant.sync.queue import DEAD, DONE, INFLIGHT, PENDING
+
+    config = _config(tmp_path, state_name="cli-backend", sources=1, queue={"enabled": True})
+    config_path = tmp_path / "pheasant.yaml"
+    config_path.write_text(
+        "pheasant:\n"
+        f"  name: {config.pheasant.name}\n"
+        f"  state_path: {config.pheasant.state_path}\n"
+        f"  workspace_root: {config.pheasant.workspace_root}\n"
+        f"  exports_path: {config.pheasant.exports_path}\n"
+        "storage:\n"
+        "  graph_snapshots: false\n"
+        "sync:\n"
+        "  queue:\n"
+        "    enabled: true\n"
+        "sources:\n"
+        "  - name: src0\n"
+        "    type: markdown_folder\n"
+        f"    path: {config.sources[0].path}\n"
+        "    include:\n"
+        '      - "**/*.md"\n',
+        encoding="utf-8",
+    )
+
+    class _Sentinel:
+        closed = False
+
+        def depth(self) -> dict[str, int]:
+            return {PENDING: 7, INFLIGHT: 0, DONE: 0, DEAD: 0}
+
+        def close(self) -> None:
+            _Sentinel.closed = True
+
+    import pheasant.sync.queue as queue_module
+
+    monkeypatch.setattr(queue_module, "queue_from_config", lambda *_a, **_k: _Sentinel())
+
+    assert main(["queue", "status", "--config", str(config_path)]) == 0
+    assert "queued: 7" in capsys.readouterr().out, "the CLI read a queue the config did not name"
+    assert _Sentinel.closed, "the queue handle was never closed"
 
 
 # --------------------------------------------------------------------------

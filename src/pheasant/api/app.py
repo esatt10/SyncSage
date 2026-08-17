@@ -843,11 +843,20 @@ def create_app(
                 logger.info("Agent workflow ready (langgraph imported and graph compiled)")
 
         threading.Thread(target=_warm_workflows, name="pheasant-warm", daemon=True).start()
-        if mcp_asgi_app is None:
-            yield
-        else:
-            async with mcp_asgi_app.router.lifespan_context(app):
+        try:
+            if mcp_asgi_app is None:
                 yield
+            else:
+                async with mcp_asgi_app.router.lifespan_context(app):
+                    yield
+        finally:
+            held = getattr(app.state, "metrics_queue", None)
+            if held is not None:
+                app.state.metrics_queue = None
+                try:
+                    held.close()
+                except Exception:  # pragma: no cover - shutdown must not raise
+                    logger.debug("could not close the metrics queue handle", exc_info=True)
 
     app = FastAPI(title="pheasant", version=__version__, lifespan=lifespan)
     app.state.config = config
@@ -863,6 +872,8 @@ def create_app(
     # `sync_outcomes` dicts this replaced could only say "true" for however
     # many minutes a first index took, which is indistinguishable from a hang.
     app.state.sync_lock = threading.Lock()
+    app.state.metrics_queue = None
+    app.state.metrics_queue_lock = threading.Lock()
     app.state.jobs = JobRegistry()
     jobs = app.state.jobs
     # Content-addressed results for `/internal/indexing/prepare-batch`, so a
@@ -1122,6 +1133,23 @@ def create_app(
             "cache": {"hits": cache.hits, "misses": cache.misses, "size": len(cache)},
         }
 
+    def _metrics_queue():
+        """The scrape's queue handle, created once and reused.
+
+        Under a lock: two concurrent scrapes would otherwise each build one
+        and the loser's handle would leak — on `nats` that is a live
+        connection nothing ever closes.
+        """
+
+        with app.state.metrics_queue_lock:
+            queue = getattr(app.state, "metrics_queue", None)
+            if queue is None:
+                from pheasant.sync.queue import queue_from_config
+
+                queue = queue_from_config(config, state)
+                app.state.metrics_queue = queue
+            return queue
+
     @app.get("/metrics")
     def metrics_endpoint() -> PlainTextResponse:
         """Prometheus exposition text (Phase 35.1).
@@ -1150,14 +1178,17 @@ def create_app(
         # reading only it would see zero while a restarted fleet's rows sit
         # waiting. The queue's own depth wins where it exists (Phase 35.5).
         try:
-            from pheasant.sync.queue import DEAD, INFLIGHT, PENDING, queue_from_config
+            from pheasant.sync.queue import DEAD, INFLIGHT, PENDING
 
-            queue = queue_from_config(config, state)
+            # Held open across scrapes rather than built and closed per
+            # request. Prometheus scrapes every 15s by default, per replica,
+            # and on the `nats` backend building one meant a full TCP +
+            # JetStream connect and teardown each time — a broker connection
+            # storm proportional to fleet size, paid to read three integers.
+            # Closed by the lifespan's `finally`.
+            queue = _metrics_queue()
             if queue is not None:
-                try:
-                    depth = queue.depth()
-                finally:
-                    queue.close()
+                depth = queue.depth()
                 sample["pheasant_index_queue_depth"] = depth.get(PENDING, 0)
                 sample["pheasant_index_inflight"] = depth.get(INFLIGHT, 0)
                 sample["pheasant_index_dead_letters"] = depth.get(DEAD, 0)
@@ -1281,6 +1312,7 @@ def create_app(
         result = None
         syncing = False
         job_id = None
+        queued: list[str] = []
         if req.sync_now:
             if req.wait:
                 try:
@@ -1288,7 +1320,7 @@ def create_app(
                 except (KeyError, ValueError) as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
             else:
-                job_id = _start_background_sync(source.name, req.sync_mode)
+                job_id, queued = _start_background_sync(source.name, req.sync_mode)
                 syncing = True
         return {
             "status": "registered",
@@ -1297,6 +1329,7 @@ def create_app(
             "sync_result": result,
             "syncing": syncing,
             "job_id": job_id,
+            "queued_tasks": queued,
             "config_update_required": True,
         }
 
@@ -1529,9 +1562,28 @@ def create_app(
             },
         )
 
-    def _start_background_sync(source_name: str | None, mode: str) -> str | None:
-        """Start a background sync. Returns the job id, or None if one is
-        already running over the same source.
+    def _background_status(job_id: str | None, queued: list[str]) -> str:
+        """Three outcomes, three words — `syncing` used to cover all of them.
+
+        `queued` is not `syncing`: nothing is indexing yet, an indexer has to
+        claim the task first, and there is no local job to watch.
+        """
+
+        if job_id:
+            return "syncing"
+        return "queued" if queued else "already_syncing"
+
+    def _start_background_sync(source_name: str | None, mode: str) -> tuple[str | None, list[str]]:
+        """Start a background sync. Returns ``(job_id, queued_task_ids)``.
+
+        ``job_id`` is None when one is already running over the same source,
+        **and** when this process does not index: an ``api`` replica publishes
+        to the queue, and a queue task is not a job. Returning its id in the
+        ``job_id`` field made every caller poll ``GET /jobs/<task id>``, which
+        404s — the registry is in-process and the task belongs to an indexer
+        in another pod. The ids are reported separately, under their own name,
+        so the response says what actually happened instead of implying
+        progress the api role cannot observe.
 
         Refusing the overlap matters: found live, a source with
         `sync.on_startup: true` and no checkpoint yet (so every attempt does a
@@ -1545,11 +1597,11 @@ def create_app(
         """
         names = [source_name] if source_name else [s.name for s in config.sources if s.enabled]
         if not role_policy.indexes_locally:
-            return _publish_background_sync(names, mode)
+            return None, _publish_background_sync(names, mode)
         with app.state.sync_lock:
             to_start = [name for name in names if jobs.active_for(name) is None]
             if not to_start:
-                return None
+                return None, []
             job = jobs.create(
                 "sync",
                 f"Indexing {source_name}" if source_name else "Indexing all sources",
@@ -1561,9 +1613,9 @@ def create_app(
             name=f"pheasant-bgsync-{source_name or 'all'}",
             daemon=True,
         ).start()
-        return job.id
+        return job.id, []
 
-    def _publish_background_sync(names: list[str], mode: str) -> str | None:
+    def _publish_background_sync(names: list[str], mode: str) -> list[str]:
         """Hand the work to an indexer instead of running it here.
 
         This is what the ``api`` role *is*. Three api replicas that each
@@ -1607,15 +1659,16 @@ def create_app(
                     published.append(task.id)
         finally:
             queue.close()
-        return published[0] if len(published) == 1 else (published[0] if published else None)
+        return published
 
     @app.post("/sync")
     def sync_all(req: SyncRequest) -> dict:
         if not req.wait:
-            job_id = _start_background_sync(None, req.mode)
+            job_id, queued = _start_background_sync(None, req.mode)
             return {
-                "status": "syncing" if job_id else "already_syncing",
+                "status": _background_status(job_id, queued),
                 "job_id": job_id,
+                "queued_tasks": queued,
                 "sources": [s.name for s in config.sources if s.enabled],
             }
         try:
@@ -1640,10 +1693,11 @@ def create_app(
             )
             if not known:
                 raise HTTPException(status_code=404, detail=f"Unknown source: {source_id}")
-            job_id = _start_background_sync(source_id, mode)
+            job_id, queued = _start_background_sync(source_id, mode)
             return {
-                "status": "syncing" if job_id else "already_syncing",
+                "status": _background_status(job_id, queued),
                 "job_id": job_id,
+                "queued_tasks": queued,
                 "source_id": source_id,
             }
         try:
@@ -1732,6 +1786,7 @@ def create_app(
 
         syncing = False
         job_id = None
+        queued: list[str] = []
         sync_result = None
         if sync_now:
             if wait:
@@ -1740,8 +1795,8 @@ def create_app(
                 except (KeyError, ValueError) as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
             else:
-                job_id = _start_background_sync(name, "incremental")
-                syncing = job_id is not None
+                job_id, queued = _start_background_sync(name, "incremental")
+                syncing = job_id is not None or bool(queued)
         return {
             "status": "stored",
             "source_name": name,
@@ -1750,6 +1805,7 @@ def create_app(
             "rejected": rejected,
             "syncing": syncing,
             "job_id": job_id,
+            "queued_tasks": queued,
             "sync_result": sync_result,
         }
 
@@ -3450,6 +3506,7 @@ def create_app(
         results = []
         syncing: list[str] = []
         job_ids: list[str] = []
+        queued_tasks: list[str] = []
         if req.sync_now:
             if req.wait:
                 from dataclasses import asdict
@@ -3469,9 +3526,10 @@ def create_app(
                 # background; the caller gets sources back already
                 # registered and polls GET /sources' `syncing` field.
                 for entry in created:
-                    job_id = _start_background_sync(entry["name"], req.sync_mode)
+                    job_id, queued = _start_background_sync(entry["name"], req.sync_mode)
                     if job_id:
                         job_ids.append(job_id)
+                    queued_tasks.extend(queued)
                     syncing.append(entry["name"])
         return {
             "status": "registered",
@@ -3479,6 +3537,7 @@ def create_app(
             "sync_results": results,
             "syncing": syncing,
             "job_ids": job_ids,
+            "queued_tasks": queued_tasks,
         }
 
     # Mounted *before* the UI so the SPA catch-all cannot swallow /mcp.

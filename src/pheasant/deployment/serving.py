@@ -137,12 +137,20 @@ class DrainState:
             self._draining_since = None
 
 
+def _defer(seconds: float, callback) -> None:
+    """Run ``callback`` after ``seconds`` on a daemon timer thread."""
+
+    timer = threading.Timer(seconds, callback)
+    timer.daemon = True
+    timer.start()
+
+
 def install_drain_handler(
     state: DrainState,
     drain_seconds: float,
     *,
     signals: Iterable[int] | None = None,
-    sleep=time.sleep,
+    defer=_defer,
 ) -> None:
     """Fail readiness on SIGTERM, wait, then let the server shut down.
 
@@ -150,6 +158,16 @@ def install_drain_handler(
     its own graceful-shutdown handler — rather than replacing it. Replacing it
     would drain and then never exit, which reads as a hung pod and ends in
     SIGKILL: the same dropped requests, arrived at more slowly.
+
+    The wait is **deferred to a timer thread, never slept in the handler**.
+    Python runs signal handlers on the main thread, between bytecodes of
+    whatever it was doing — for an ASGI server that is the event loop itself.
+    Sleeping there stops the loop, so for the whole drain window the process
+    answers nothing: not the in-flight requests the drain exists to finish,
+    not `/ready` (whose flip to 503 is the signal the load balancer is waiting
+    for), not `/health` (so a liveness probe can conclude the pod is dead and
+    escalate to SIGKILL). It would have inverted the feature — a graceful
+    shutdown that drops strictly more requests than an abrupt one.
 
     A **second** SIGTERM skips the wait. An operator sending it twice is
     saying "stop now", and honouring the delay anyway would be ignoring them.
@@ -161,6 +179,13 @@ def install_drain_handler(
     for number in targets:
         previous = signal_module.getsignal(number)
 
+        def chain(signum, frame, _previous):  # type: ignore[no-untyped-def]
+            if callable(_previous):
+                _previous(signum, frame)
+            elif _previous == signal_module.SIG_DFL:  # pragma: no cover - no server attached
+                signal_module.signal(signum, signal_module.SIG_DFL)
+                signal_module.raise_signal(signum)
+
         def handler(signum, frame, _previous=previous):  # type: ignore[no-untyped-def]
             first = state.begin()
             if first and drain_seconds > 0:
@@ -168,13 +193,10 @@ def install_drain_handler(
                     "SIGTERM: reporting not-ready and draining for %.0fs before shutdown",
                     drain_seconds,
                 )
-                sleep(drain_seconds)
-            elif not first:
+                defer(drain_seconds, lambda: chain(signum, frame, _previous))
+                return
+            if not first:
                 logger.info("second termination signal: shutting down without draining")
-            if callable(_previous):
-                _previous(signum, frame)
-            elif _previous == signal_module.SIG_DFL:  # pragma: no cover - no server attached
-                signal_module.signal(signum, signal_module.SIG_DFL)
-                signal_module.raise_signal(signum)
+            chain(signum, frame, _previous)
 
         signal_module.signal(number, handler)

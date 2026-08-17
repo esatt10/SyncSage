@@ -60,17 +60,39 @@ class MigrationError(RuntimeError):
 
 
 def _copy_table(source: StateStore, target: StateStore, table: str) -> int:
-    rows = source.rows(f"SELECT * FROM {table}")
-    if not rows:
-        return 0
-    columns = list(rows[0].keys())
-    placeholders = ",".join("?" for _ in columns)
-    statement = f"INSERT INTO {table}({','.join(columns)}) VALUES({placeholders})"
-    payload = [tuple(row[column] for column in columns) for row in rows]
-    for start in range(0, len(payload), BATCH):
-        target.backend.executemany(statement, payload[start : start + BATCH])
-    target.conn.commit()
-    return len(payload)
+    """Stream one table across in ``BATCH``-row pages.
+
+    Streamed with ``fetchmany`` rather than ``SELECT *`` into a list. The whole
+    point of this command is corpora too big for one process, and the table it
+    exists to move is ``chunks`` — the largest by an order of magnitude, whose
+    every row carries the chunk's full text. Materializing it meant peak memory
+    proportional to the corpus, so the migration would OOM at exactly the size
+    that motivates migrating. A cursor holds one page.
+
+    The source is always SQLite here (that is the direction this command
+    supports), so its cursor is used directly rather than through ``rows``,
+    which is list-returning by contract.
+    """
+
+    cursor = source.conn.execute(f"SELECT * FROM {table}")
+    columns: list[str] | None = None
+    statement = ""
+    copied = 0
+    while True:
+        page = cursor.fetchmany(BATCH)
+        if not page:
+            break
+        if columns is None:
+            columns = [description[0] for description in cursor.description]
+            placeholders = ",".join("?" for _ in columns)
+            statement = f"INSERT INTO {table}({','.join(columns)}) VALUES({placeholders})"
+        target.backend.executemany(
+            statement, [tuple(row[column] for column in columns) for row in page]
+        )
+        copied += len(page)
+    if copied:
+        target.conn.commit()
+    return copied
 
 
 def _rebuild_fts(target: StateStore) -> int:
@@ -129,6 +151,7 @@ def migrate_sqlite_to_postgres(
         "tables": {},
         "skipped": [],
     }
+    skipped_counts: dict[str, int] = {}
     try:
         target.migrate()
         for table in TABLE_ORDER:
@@ -137,6 +160,13 @@ def migrate_sqlite_to_postgres(
             existing = target.rows(f"SELECT count(*) AS n FROM {table}")
             if existing and int(existing[0]["n"]) > 0:
                 report["skipped"].append(table)
+                # Remembered so verification can check it too. A table skipped
+                # as "already there" is exactly a table a previous run may have
+                # been interrupted part-way through, and those were the only
+                # tables the check did not look at — so the one shape that
+                # needs verifying most was the one that got a free pass, and
+                # then the original was renamed on the strength of it.
+                skipped_counts[table] = int(existing[0]["n"])
                 continue
             report["tables"][table] = _copy_table(source, target, table)
         report["chunks_fts"] = _rebuild_fts(target)
@@ -149,6 +179,14 @@ def migrate_sqlite_to_postgres(
             landed = int(target.rows(f"SELECT count(*) AS n FROM {table}")[0]["n"])
             if landed != copied:
                 mismatches.append(f"{table}: copied {copied}, found {landed}")
+        for table, landed in skipped_counts.items():
+            expected = int(source.rows(f"SELECT count(*) AS n FROM {table}")[0]["n"])
+            if landed != expected:
+                mismatches.append(
+                    f"{table}: skipped as already present with {landed} rows, "
+                    f"but the source has {expected} — a previous run was interrupted "
+                    f"part-way through this table; empty it and re-run"
+                )
         source_chunks = int(source.rows("SELECT count(*) AS n FROM chunks")[0]["n"])
         if report["chunks_fts"] != source_chunks:
             mismatches.append(

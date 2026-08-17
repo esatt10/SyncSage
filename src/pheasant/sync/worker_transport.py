@@ -60,6 +60,22 @@ IDEMPOTENCY_HEADER = "X-Pheasant-Idempotency-Key"
 USER_AGENT = "pheasant-index-coordinator/2"
 
 
+def _apply_socket_timeout(connection: Any, timeout: float) -> None:
+    """Push ``timeout`` onto the live socket, if there is one.
+
+    Best-effort: a connection that has not dialled yet has no ``sock``, and it
+    will pick the timeout up from ``connection.timeout`` when it does.
+    """
+
+    sock = getattr(connection, "sock", None)
+    if sock is None:
+        return
+    try:
+        sock.settimeout(timeout)
+    except OSError:  # pragma: no cover - a socket already being torn down
+        pass
+
+
 class HttpTransport:
     """Keep-alive HTTP/1.1 batch transport.
 
@@ -199,7 +215,15 @@ class HttpTransport:
         attempted_reuse = connection is not None
         if connection is None:
             connection = self._connect(url, timeout)
+        # `HTTPConnection.timeout` is only consulted by `connect()`, so on a
+        # *pooled* socket — already connected — assigning it does nothing and
+        # the connection keeps whatever timeout it was opened with. A batch
+        # given a short remaining deadline would then block for the original,
+        # much longer timeout, and deadline propagation silently stopped
+        # applying to exactly the reused connections the pool exists to
+        # provide. Setting it on the live socket is what actually takes effect.
         connection.timeout = timeout
+        _apply_socket_timeout(connection, timeout)
         try:
             connection.request("POST", path or "/", body=payload, headers=headers)
             response = connection.getresponse()
@@ -212,6 +236,7 @@ class HttpTransport:
             # exactly like a dead worker. Retry once on a fresh socket before
             # blaming the endpoint, or every idle timeout would trip a breaker.
             connection = self._connect(url, timeout)
+            _apply_socket_timeout(connection, timeout)
             connection.request("POST", path or "/", body=payload, headers=headers)
             response = connection.getresponse()
             raw = response.read()

@@ -294,6 +294,92 @@ def test_a_recovered_endpoint_closes_its_breaker(tmp_path: Path) -> None:
     assert pool.stats()[0]["circuit_open"] is False
 
 
+def test_a_cooled_down_endpoint_that_was_not_dispatched_to_stays_reachable(
+    tmp_path: Path,
+) -> None:
+    """The half-open flag must not survive the batch that set it.
+
+    Marking every cooled-down candidate as `probing` up front leaked: only the
+    endpoint actually dispatched to ever cleared it, so when an earlier one in
+    the rotation answered, the rest kept `probing=True` — and `available()` is
+    False while it is set, which excluded a perfectly healthy worker from the
+    pool for the rest of the process's life and reported it down to
+    `pheasant_worker_up`. The flag is held around the dispatch instead.
+    """
+
+    task = _task(tmp_path)
+    transport = FakeTransport(
+        {"https://a": [_Retryable("down")], "https://b": [_Retryable("down")]}
+    )
+    now = [100.0]
+    pool = WorkerPool(
+        ["https://a", "https://b"],
+        "token",
+        transport=transport,
+        sleep=lambda _s: None,
+        clock=lambda: now[0],
+    )
+
+    # Trip both, then let the cooldown expire so both are probe candidates.
+    for _ in range(3):
+        with pytest.raises(AllWorkersFailed):
+            pool.prepare_batch([task])
+    assert pool.endpoint_health() == {"https://a": False, "https://b": False}
+
+    now[0] += BREAKER_RESET_SECONDS + 1
+    transport.script = {"https://a": ["ok"], "https://b": ["ok"]}
+    pool.prepare_batch([task])  # one of them answers; the other is untouched
+
+    # Both must be reachable again. Before the fix exactly one was, and which
+    # one depended on the rotation cursor.
+    assert pool.endpoint_health() == {"https://a": True, "https://b": True}
+    served = set(transport.calls)
+    for _ in range(4):
+        pool.prepare_batch([task])
+        served |= set(transport.calls)
+    assert served >= {"https://a", "https://b"}, "an endpoint was permanently excluded"
+
+
+def test_a_transport_raising_something_other_than_a_worker_error_is_a_worker_failure(
+    tmp_path: Path,
+) -> None:
+    """Not every transport failure is a `RemoteWorkerError`.
+
+    A corrupt base64 payload raises `binascii.Error`, a truncated body raises
+    `json.JSONDecodeError`, and a gRPC channel raises `grpc.RpcError` — none of
+    them subclasses of the pool's own exception. Letting one out aborts the
+    whole sync over a single sick worker, which is the single point of failure
+    this pool exists to remove. It counts against the breaker instead, and the
+    fleet moves on.
+    """
+
+    import binascii
+
+    transport = FakeTransport(
+        {"https://bad": [binascii.Error("invalid padding")], "https://good": ["ok"]}
+    )
+    pool = WorkerPool(
+        ["https://bad", "https://good"], "token", transport=transport, sleep=lambda _s: None
+    )
+
+    # Several batches, because the rotation decides which endpoint is asked
+    # first — the point is that reaching the broken one is survivable, not
+    # which call reaches it.
+    task = _task(tmp_path)
+    for _ in range(3):
+        results = pool.prepare_batch([task])
+        assert len(results) == 1 and results[0] is not None
+    assert "https://bad" in transport.calls, "the broken endpoint was never tried"
+
+    # And when every endpoint is broken the caller gets the pool's own error —
+    # so the engine falls back to local preparation instead of the sync dying.
+    only_bad = FakeTransport({"https://bad": [ValueError("garbage on the wire")]})
+    pool = WorkerPool(["https://bad"], "token", transport=only_bad, sleep=lambda _s: None)
+    with pytest.raises(AllWorkersFailed) as caught:
+        pool.prepare_batch([_task(tmp_path)])
+    assert "ValueError" in str(caught.value)
+
+
 def test_a_refused_task_does_not_fail_over(tmp_path: Path) -> None:
     """Every worker runs the same refusal logic, so failing over buys nothing."""
 
@@ -396,6 +482,37 @@ def test_the_worker_stops_a_batch_whose_caller_gave_up(tmp_path: Path) -> None:
         prepare_batch_tasks([task, task, task], ["a", "b", "c"], deadline=lambda: next(budget))
 
     assert "after 2 of 3" in str(caught.value)
+
+
+def test_work_done_before_the_deadline_survives_in_the_cache(tmp_path: Path) -> None:
+    """The abort discards the *results*, not the *work*.
+
+    The response contract is one result per task — a short list is rejected as
+    malformed — so a partial batch cannot be returned. What must not happen is
+    the finished parses being thrown away too, which would make the retry
+    after a 408 cost exactly as much as the attempt that timed out.
+    """
+
+    task = _task(tmp_path)
+    cache = ResultCache(maxsize=8)
+    # Checked between tasks only, so the first call is the one before task 2.
+    budget = iter([-1.0])
+
+    with pytest.raises(DeadlineExceeded):
+        prepare_batch_tasks(
+            [task, task], ["first", "second"], cache=cache, deadline=lambda: next(budget)
+        )
+
+    found, cached = cache.get("first")
+    assert found and cached is not None, "the completed parse was discarded"
+    assert cache.get("second")[0] is False, "a task that never ran was cached anyway"
+
+    # And the retry is a lookup: the second attempt reuses it rather than
+    # re-parsing, which is the whole point of keeping it.
+    before = cache.hits
+    results = prepare_batch_tasks([task, task], ["first", "second"], cache=cache)
+    assert len(results) == 2
+    assert cache.hits == before + 1
 
 
 def test_idempotency_keys_are_content_addressed(tmp_path: Path) -> None:

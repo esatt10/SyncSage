@@ -1874,6 +1874,90 @@ is not, because this queue deliberately allows claiming an `inflight` row
 outside is what closes it. SQLite serializes writers, so the SQLite suite
 could not fail either way — which is why the Postgres test exists.
 
+### Review pass over the whole arc, 2026-08-17
+
+A read of everything Phase 35 landed. **Sixteen defects, all silent** — nothing
+raised, nothing logged, and the 1,342-test suite passed over every one.
+
+**Six that would have shipped a broken fleet.**
+
+1. **`pheasant queue` ignored `sync.queue.backend`.** It built a `LocalQueue`
+   directly, so with `nats` configured `status` reported an empty queue on a
+   backlog of thousands, `drain` drained nothing, and `requeue-dead` did
+   nothing to the queue holding the dead letters — all three exiting **0**.
+2. **The image could not run the manifests it ships.** `PHEASANT_EXTRAS`
+   defaulted to `mcp,agent,vector,wasm,a2a` while `deploy/kubernetes/scaled/`
+   selects `storage.backend: postgres`; every indexer would have raised
+   "psycopg is not installed". Now `postgres,grpc,queue` are in the default and
+   a mechanical test pins the manifests against the Dockerfile.
+3. **`corpus_vocabulary` was empty on Postgres.** It read `chunks_vocab`, an
+   `fts5vocab` virtual table only SQLite has, inside a bare
+   `except: return []`. Vocabulary is *the* field the router scores regions on,
+   so a Postgres region stayed healthy, kept answering searches, and was
+   **silently unroutable**. Ported to `ts_stat`; parity asserts non-emptiness
+   first, because equality alone passes on two empty lists.
+4. **`drain()` never heartbeat.** `heartbeat` shipped on all three backends
+   with **no caller**, so a task stayed claimed for exactly `visibility_seconds`
+   however long the work took — the dead-worker redelivery path firing on a
+   healthy worker mid-sync.
+5. **The api role handed out queue task ids as `job_id`.** Every caller then
+   polled `GET /jobs/<task id>` and got a 404: the registry is in-process and
+   the work belongs to an indexer in another pod. Responses now carry
+   `queued_tasks` and a `"queued"` status, and `job_id` is null when there is
+   no local job. The dedup test compared `job_id == job_id` — `None == None`,
+   true whether or not anything deduplicated.
+6. **The SIGTERM drain slept in the signal handler.** Python runs handlers on
+   the main thread, which for an ASGI server is the event loop — so for the
+   whole drain window the process answered nothing: not in-flight requests, not
+   the `/ready` 503 the load balancer waits for, not `/health`. A graceful
+   shutdown that drops *more* requests than an abrupt one. Deferred to a timer
+   thread.
+
+**A data race with two homes.** `_publish` serialized a live `Job` outside the
+lock while an indexing thread wrote to `job.sources` and `job.log`. The
+concurrency test written for it then failed *again* — `list()`, which the UI
+polls once a second, had the identical defect. Two sites, one cause;
+`RuntimeError: dictionary changed size during iteration` raised from inside a
+progress callback on the sync path.
+
+**Also fixed:** migration `_copy_table` materialized whole tables (it exists to
+move corpora too big for one process, and would OOM on `chunks`) and skipped
+tables were **excluded from verification**, so an interrupted run's partial copy
+was waved through and the original SQLite file renamed on the strength of a
+check that had skipped the one table at risk; `prepare_batch` caught only
+`RemoteWorkerError`, so a `binascii.Error` or `grpc.RpcError` from one sick
+worker aborted the whole sync; `HTTPConnection.timeout` is only read by
+`connect()`, so deadline propagation silently stopped applying to exactly the
+**pooled** sockets the pool exists to provide; IDF's `N` was a
+`(SELECT count(*) FROM chunks_fts)` per query — a full sequential scan on the
+backend chosen because the corpus is too big for SQLite — now `reltuples`;
+per-source gauges were merged, never cleared, so a finished source exported its
+last progress ratio forever as a *current* reading, indistinguishable from a
+stuck one; `list(enumerate(items))` was rebuilt per batch; `/metrics` built and
+closed a queue per scrape (a NATS connect storm proportional to fleet size, to
+read three integers); and `sharding.py` kept a second copy of the capacity
+coefficients while `engine.py` omitted the `GRAPH_SHARE_OF_RSS` divisor, so the
+same corpus got two different RAM projections depending on which surface asked.
+
+**One reported finding was stale and is recorded as such rather than "fixed":**
+`SourceLease._heartbeat_loop` does not leak a Postgres connection. Measured
+against the real server — `pool_available == pool_size` before, during and
+after three concurrently beating leases — because `commit()` runs `_finish()`,
+which releases. The finding describes the pre-`_finish()` backend, and that bug
+was already closed.
+
+**Mutation testing: 13 mutants, 5 initially survived, and every survivor was a
+real gap** — not a scoring artifact. Two were missing tests (nothing exercised
+the breaker's half-open probe leak; nothing raised a non-`RemoteWorkerError`
+from a transport), one was a missing test for the CLI backend selection, one
+was a race no test drove concurrently — and **one was a vacuous test of mine**:
+the migration test asserted `"chunks" in str(error)`, which the *pre-existing*
+`chunks_fts` row-count check also satisfies, so it passed with the fix mutated
+out. It now asserts the skipped-table message specifically. 13/13 after.
+
+Suite **1355 passed / 20 skipped / 0 failed** against a real Postgres 16 and a
+real NATS JetStream broker. `ruff check` and `ruff format --check` clean.
+
 ---
 
 ## 6. Pointers

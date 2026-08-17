@@ -13,6 +13,7 @@ what a scraper and a UI actually consume.
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -283,6 +284,80 @@ def test_metrics_sample_reports_queue_depth_and_drops_finished_work() -> None:
     done = jobs.metrics_sample()
     assert done["pheasant_index_inflight"] == 0
     assert done["pheasant_index_queue_depth"] == 0
+
+
+def test_publishing_a_snapshot_is_safe_while_the_job_is_being_written() -> None:
+    """`snapshot = job` is a reference, not a copy.
+
+    `_publish` serialized it outside the lock, so `as_dict` walked
+    `job.sources` and `job.log` while an indexing thread was adding to them.
+    That is a torn payload at best and `RuntimeError: dictionary changed size
+    during iteration` at worst — raised from inside a progress callback, on the
+    sync path, which is the one place `progress()` documents it must never
+    fail.
+    """
+
+    jobs = JobRegistry()
+    job = jobs.create("sync", "Indexing", ["src-0"])
+    errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def write(offset: int) -> None:
+        try:
+            for index in range(400):
+                jobs.progress(
+                    job.id,
+                    phase="preparing",
+                    current=index,
+                    total=400,
+                    detail=f"file-{index}",
+                    source=f"src-{offset}-{index % 40}",
+                )
+        except BaseException as exc:  # noqa: BLE001 - the point is that none escape
+            errors.append(exc)
+        finally:
+            stop.set()
+
+    def read() -> None:
+        try:
+            while not stop.is_set():
+                jobs.list()
+                jobs.get(job.id)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(n,)) for n in range(3)]
+    threads.append(threading.Thread(target=read))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not errors, f"a concurrent publish raised: {errors[:3]}"
+
+
+def test_a_finished_sources_gauge_stops_being_exported() -> None:
+    """A live gauge must not freeze at its last reading.
+
+    `render_with` merged each scrape's per-source values into whatever the
+    registry already held, so a source that finished — or was deleted — kept
+    exporting its final progress ratio forever, as a *current* reading.
+    Prometheus cannot distinguish that from a source genuinely stuck at 10%,
+    and the label set grows without bound as sources come and go.
+    """
+
+    jobs = JobRegistry()
+    job = jobs.create("sync", "Indexing", ["docs"])
+    jobs.progress(job.id, phase="preparing", current=1, total=10, source="docs")
+
+    first = metrics.render_with(jobs.metrics_sample())
+    assert 'pheasant_index_progress_ratio{source="docs"}' in first
+
+    jobs.finish(job.id, "succeeded")
+    after = metrics.render_with(jobs.metrics_sample())
+    assert 'pheasant_index_progress_ratio{source="docs"}' not in after, (
+        "a finished source is still exporting its last progress ratio"
+    )
 
 
 # ---------------------------------------------------------------------------

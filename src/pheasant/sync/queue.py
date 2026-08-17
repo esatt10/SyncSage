@@ -32,8 +32,10 @@ import json
 import logging
 import os
 import socket
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -181,12 +183,37 @@ class LocalQueue(TaskQueue):
         self.state = state
 
     def publish(self, task: IndexTask) -> IndexTask:
+        """Enqueue a task, or re-arm one that has already run.
+
+        The task id is content-addressed on (knowledge base, source, mode) so
+        that two replicas answering one user's double-click enqueue one task.
+        A plain ``INSERT`` turns that dedup into something much worse: once the
+        row reaches ``done`` it can never be inserted again, and the caller
+        swallows the primary-key error as "already queued". Every ``sync_all``
+        after the first then found nothing claimable and indexed **nothing**,
+        silently — including the scheduler beat, so a queue-enabled deployment
+        stopped re-indexing entirely after its first pass.
+
+        Dedup means "do not queue it twice while it is outstanding", not
+        "never queue it again". So a ``done`` row is re-armed; ``pending`` and
+        ``inflight`` rows are left alone (that is the dedup); and a ``dead``
+        row stays dead, because dead-lettering exists to stop a poison task
+        consuming the fleet and ``requeue-dead`` is how an operator overrides
+        that deliberately.
+        """
+
         now = _now()
         self.state.execute(
             "INSERT INTO index_tasks("
             "id, source_id, mode, payload, status, attempts, max_attempts, owner, "
             "visible_at, enqueued_at, updated_at, last_error"
-            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "status=excluded.status, attempts=0, owner=NULL, "
+            "payload=excluded.payload, max_attempts=excluded.max_attempts, "
+            "visible_at=excluded.visible_at, enqueued_at=excluded.enqueued_at, "
+            "updated_at=excluded.updated_at, last_error=NULL "
+            "WHERE index_tasks.status=?",
             (
                 task.id,
                 task.source_id,
@@ -200,6 +227,7 @@ class LocalQueue(TaskQueue):
                 _iso(now),
                 _iso(now),
                 None,
+                DONE,
             ),
         )
         return task
@@ -623,11 +651,50 @@ def drain(
             time.sleep(poll_interval)
             continue
         idle_since = None
-        try:
-            results.append(handler(task))
-        except Exception as exc:  # noqa: BLE001 - one bad source must not stop the rest
-            logger.exception("Index task %s for source %s failed", task.id, task.source_id)
-            queue.nack(task, f"{type(exc).__name__}: {exc}")
-            continue
+        with _keepalive(queue, task, visibility_seconds):
+            try:
+                results.append(handler(task))
+            except Exception as exc:  # noqa: BLE001 - one bad source must not stop the rest
+                logger.exception("Index task %s for source %s failed", task.id, task.source_id)
+                queue.nack(task, f"{type(exc).__name__}: {exc}")
+                continue
         queue.ack(task)
     return results
+
+
+@contextmanager
+def _keepalive(queue: TaskQueue, task: IndexTask, visibility_seconds: float):
+    """Extend the task's visibility for as long as the handler is running.
+
+    ``heartbeat`` existed on every backend and had **no caller**, so a task
+    stayed claimed for exactly ``visibility_seconds`` no matter how long the
+    work took. Indexing a real source is minutes to hours and the default
+    visibility is 300s, so the queue would hand the same source to a second
+    worker while the first was still mid-sync — the redelivery path built for
+    a *dead* worker, firing on a healthy one. Indexing is idempotent so the
+    result would still be correct, but two writers on one source is the
+    contention 35.4's per-source leases exist to prevent, and the wasted pass
+    is the throughput the whole phase is about.
+
+    A thread, because ``handler`` is an opaque blocking call. Failures are
+    logged and swallowed: a missed ping costs a redelivery, whereas raising
+    here would fail a sync that is going fine.
+    """
+
+    interval = max(1.0, visibility_seconds / 3.0)
+    done = threading.Event()
+
+    def beat() -> None:
+        while not done.wait(interval):
+            try:
+                queue.heartbeat(task, visibility_seconds=visibility_seconds)
+            except Exception:  # noqa: BLE001 - a missed ping costs a redelivery, not a sync
+                logger.debug("Heartbeat failed for index task %s", task.id, exc_info=True)
+
+    thread = threading.Thread(target=beat, name=f"pheasant-queue-heartbeat-{task.id}", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        done.set()
+        thread.join(timeout=5.0)

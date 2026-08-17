@@ -28,16 +28,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-#: Nodes per file, measured. See :mod:`pheasant.graph.capacity`.
-NODES_PER_FILE = 6.3
+from pheasant.capacity import GRAPH_SHARE_OF_RSS, NODES_PER_FILE, RSS_BYTES_PER_NODE
 
-#: Process RSS per graph node, measured flat across four scales.
-RSS_BYTES_PER_NODE = 2400
-
-#: The graph is roughly this share of process RSS; the rest is the interpreter,
-#: the search stores and whatever is being served. Used to size a container
-#: from a node count.
-GRAPH_SHARE_OF_RSS = 0.6
+# Re-exported, not redefined. These were a second copy of the same three
+# numbers, so `pheasant shard plan` and `pheasant scan` could be edited apart
+# and quietly disagree about how big the same corpus is — which is the whole
+# reason :mod:`pheasant.capacity` exists (Phase 35.7).
+__all__ = [
+    "GRAPH_SHARE_OF_RSS",
+    "NODES_PER_FILE",
+    "RSS_BYTES_PER_NODE",
+    "Shard",
+    "SourceSize",
+    "plan_shards",
+    "render_plan",
+]
 
 
 @dataclass

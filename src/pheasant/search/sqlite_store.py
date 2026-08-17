@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import math
 import re
 from typing import Any
 
 from pheasant.persistence.state_store import StateStore
+
+logger = logging.getLogger(__name__)
 
 # --- ranking -------------------------------------------------------------
 #
@@ -150,15 +153,42 @@ def _postgres_document_frequencies(state: Any, tokens: list[str]) -> tuple[int, 
     if not tokens:
         return 0, {}
     rows = state.rows(
-        "SELECT t.term AS term, count(f.chunk_id) AS df, "
-        "       (SELECT count(*) FROM chunks_fts) AS total "
+        "SELECT t.term AS term, count(f.chunk_id) AS df "
         "FROM unnest(?::text[]) AS t(term) "
         "LEFT JOIN chunks_fts f ON f.search_vector @@ to_tsquery('simple', t.term) "
         "GROUP BY t.term",
         (list(tokens),),
     )
-    total = int(rows[0]["total"]) if rows else 0
-    return total, {str(row["term"]): int(row["df"]) for row in rows}
+    return _postgres_total_chunks(state), {str(row["term"]): int(row["df"]) for row in rows}
+
+
+def _postgres_total_chunks(state: Any) -> int:
+    """Corpus size for IDF — from the planner's estimate, not ``count(*)``.
+
+    This was a correlated ``(SELECT count(*) FROM chunks_fts)`` inside the
+    per-query document-frequency lookup, so **every text search** paid a full
+    sequential scan of the largest table in the database. Postgres has no
+    SQLite-style O(1) count, so the cost grew linearly with the corpus — on
+    the exact backend chosen for corpora too big for SQLite.
+
+    ``reltuples`` is what the planner itself uses, maintained by autovacuum. It
+    is approximate, and that is fine *here specifically*: it feeds
+    ``ln(1 + (N - df + 0.5) / (df + 0.5))``, where a few percent of drift moves
+    every term's IDF by the same negligible amount and cannot reorder results.
+    A negative value means the table has never been analyzed (``-1`` is the
+    documented sentinel for "no statistics"), and a zero on a table with rows
+    would zero out every score, so both fall back to the real count — paid once
+    on a cold database rather than on every query forever.
+    """
+
+    rows = state.rows(
+        "SELECT reltuples AS estimate FROM pg_class WHERE oid = 'chunks_fts'::regclass"
+    )
+    estimate = int(rows[0]["estimate"]) if rows and rows[0]["estimate"] is not None else -1
+    if estimate > 0:
+        return estimate
+    exact = state.rows("SELECT count(*) AS n FROM chunks_fts")
+    return int(exact[0]["n"]) if exact else 0
 
 
 def _idf(total_docs: int, document_frequency: int) -> float:
@@ -543,14 +573,35 @@ def corpus_vocabulary(state: StateStore, limit: int = 64) -> list[tuple[str, int
     (not raw count) is deliberate: a term repeated 400 times in one file
     describes that file, while a term appearing once in 400 files describes
     the corpus.
+
+    On Postgres ``chunks_vocab`` does not exist — ``fts5vocab`` is an SQLite
+    virtual-table module — so the equivalent comes from ``ts_stat`` over the
+    same ``search_vector`` the queries run against. Without that branch the
+    ``except`` below swallowed a missing-relation error and every Postgres
+    region published a contract with an **empty vocabulary**, which is the one
+    field the router scores regions on: the region would have been silently
+    unroutable while looking healthy. ``ts_stat`` scans the index rather than
+    reading a maintained table, but this runs once per sync (contract
+    publication), not per query.
     """
+    postgres = bool(getattr(state, "dialect", None) and state.dialect.is_postgres)
     try:
-        rows = state.rows(
-            "SELECT term, doc FROM chunks_vocab WHERE length(term) > 3 "
-            "AND term NOT GLOB '*[0-9]*' ORDER BY doc DESC, term ASC LIMIT ?",
-            (limit * 4,),
-        )
+        if postgres:
+            rows = state.rows(
+                "SELECT word AS term, ndoc AS doc FROM "
+                "ts_stat('SELECT search_vector FROM chunks_fts') "
+                "WHERE length(word) > 3 AND word !~ '[0-9]' "
+                "ORDER BY ndoc DESC, word ASC LIMIT ?",
+                (limit * 4,),
+            )
+        else:
+            rows = state.rows(
+                "SELECT term, doc FROM chunks_vocab WHERE length(term) > 3 "
+                "AND term NOT GLOB '*[0-9]*' ORDER BY doc DESC, term ASC LIMIT ?",
+                (limit * 4,),
+            )
     except Exception:  # fts5vocab unavailable (older SQLite) — degrade quietly
+        logger.warning("Corpus vocabulary unavailable; publishing an empty one", exc_info=True)
         return []
     out: list[tuple[str, int]] = []
     for row in rows:

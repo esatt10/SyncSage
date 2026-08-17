@@ -893,7 +893,10 @@ class StateStore:
         at all, which is the one property the durable queue exists to have.
         """
 
-        result = self.backend.rows(sql, params)
+        # `statement`, not `rows`: on a pooled backend a read may hand the
+        # connection back, and the commit below would then land on a
+        # different connection — silently discarding the UPDATE.
+        result = self.backend.statement(sql, params)
         self.backend.commit()
         return result
 

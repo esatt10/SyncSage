@@ -5,7 +5,11 @@
 # 1. **Every optional code path is installed.** PHEASANT_EXTRAS defaults to all
 #    of them, so any config a user writes actually works — semantic search
 #    (lancedb), the agentic answer loop (langgraph), sandboxed connectors
-#    (wasmtime) and signed contracts (cryptography). The old default of "mcp"
+#    (wasmtime), signed contracts (cryptography), and the Phase-35 scale-out
+#    backends — Postgres state (psycopg), the gRPC worker transport and the
+#    NATS index queue. The scaled manifests under deploy/kubernetes/scaled/
+#    select all three, so leaving them out shipped an image that could not run
+#    the topology this repo publishes. The old default of "mcp"
 #    meant a perfectly valid pheasant.yaml could fail at runtime in the
 #    published image with a missing-extra error, which is a bad trade for an
 #    image size nobody was optimising anyway. Slim builds are still one flag:
@@ -60,7 +64,7 @@ RUN apt-get update \
 # Install from pyproject so the image's dependencies never drift from the
 # package's declared deps (a hand-maintained list previously omitted core deps
 # added later — numpy (21.4) and zstandard (21.6a) — breaking the smoke test).
-ARG PHEASANT_EXTRAS=mcp,agent,vector,wasm,a2a
+ARG PHEASANT_EXTRAS=mcp,agent,vector,wasm,a2a,postgres,grpc,queue
 COPY pyproject.toml README.md LICENSE /app/
 COPY src /app/src
 RUN pip install --no-cache-dir ".[${PHEASANT_EXTRAS}]"

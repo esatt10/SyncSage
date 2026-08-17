@@ -456,17 +456,26 @@ class JobRegistry:
             return job.as_dict() if job else None
 
     def list(self, *, active_only: bool = False, limit: int = 50) -> list[dict[str, Any]]:
-        """Newest first. Running jobs always sort ahead of finished ones."""
+        """Newest first. Running jobs always sort ahead of finished ones.
+
+        Serialization happens **inside** the lock, like :meth:`get`. Releasing
+        it first handed out live `Job` objects and rendered them afterwards, so
+        `as_dict` walked `job.sources` while an indexing thread was adding
+        entries — `RuntimeError: dictionary changed size during iteration`, on
+        a route the UI polls once a second during exactly the multi-source sync
+        that makes it happen. Found by the concurrency test written for the
+        identical defect in `_publish`; the two shared a cause, not a line.
+        """
         with self._lock:
             jobs = [self._jobs[job_id] for job_id in self._order if job_id in self._jobs]
-        if active_only:
-            jobs = [job for job in jobs if job.status not in TERMINAL]
-        jobs.sort(key=lambda job: (job.status in TERMINAL, job.started_at), reverse=False)
-        active = [job for job in jobs if job.status not in TERMINAL]
-        done = [job for job in jobs if job.status in TERMINAL]
-        active.reverse()
-        done.reverse()
-        return [job.as_dict() for job in (active + done)[:limit]]
+            if active_only:
+                jobs = [job for job in jobs if job.status not in TERMINAL]
+            jobs.sort(key=lambda job: (job.status in TERMINAL, job.started_at), reverse=False)
+            active = [job for job in jobs if job.status not in TERMINAL]
+            done = [job for job in jobs if job.status in TERMINAL]
+            active.reverse()
+            done.reverse()
+            return [job.as_dict() for job in (active + done)[:limit]]
 
     def active_for(self, target: str) -> Job | None:
         with self._lock:
@@ -593,8 +602,16 @@ class JobRegistry:
                 return items
 
     def _publish(self, job: Job) -> None:
-        payload = job.as_dict()
+        # Serialized **under** the lock. `snapshot = job` in the callers above
+        # is a reference, not a copy, so the job keeps mutating while it is
+        # being rendered: `as_dict` walks `job.sources` and `job.log`, both of
+        # which the indexing thread writes to on every artifact. That is a
+        # torn payload at best and `RuntimeError: dictionary changed size
+        # during iteration` — raised from inside a progress callback, on the
+        # sync path — at worst. Every call site releases the lock before
+        # calling this, so taking it here cannot deadlock.
         with self._lock:
+            payload = job.as_dict()
             subscribers = list(self._subscribers)
         for queue in subscribers:
             try:

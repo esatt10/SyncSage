@@ -319,40 +319,79 @@ def test_the_drain_handler_waits_then_chains_to_the_previous_handler() -> None:
     """
 
     state = DrainState()
-    slept: list[float] = []
+    waits: list[float] = []
     chained: list[int] = []
+    pending: list[Any] = []
 
     previous = signal.getsignal(signal.SIGUSR1)
     try:
         signal.signal(signal.SIGUSR1, lambda signum, frame: chained.append(signum))
         install_drain_handler(
-            state, 3.0, signals=[signal.SIGUSR1], sleep=lambda seconds: slept.append(seconds)
+            state,
+            3.0,
+            signals=[signal.SIGUSR1],
+            defer=lambda seconds, callback: (waits.append(seconds), pending.append(callback)),
         )
 
         signal.raise_signal(signal.SIGUSR1)
         time.sleep(0.05)
 
         assert state.draining is True
-        assert slept == [3.0]
+        assert waits == [3.0]
+        assert chained == [], "the handler chained immediately instead of after the drain"
+        pending[0]()
         assert chained == [signal.SIGUSR1], "the previous handler was replaced, not wrapped"
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+
+
+def test_the_drain_handler_returns_immediately_rather_than_sleeping() -> None:
+    """The wait belongs on a timer thread, not in the handler.
+
+    Signal handlers run on the main thread — for an ASGI server that is the
+    event loop. Sleeping there stops the process answering anything for the
+    whole drain window, including the `/ready` 503 the load balancer is
+    waiting for, which is strictly worse than not draining at all. The real
+    (non-injected) `defer` is used here, so this fails if the production path
+    ever goes back to sleeping.
+    """
+
+    state = DrainState()
+    chained = threading.Event()
+    previous = signal.getsignal(signal.SIGUSR1)
+    try:
+        signal.signal(signal.SIGUSR1, lambda signum, frame: chained.set())
+        install_drain_handler(state, 0.2, signals=[signal.SIGUSR1])
+
+        started = time.monotonic()
+        signal.raise_signal(signal.SIGUSR1)
+        handler_returned = time.monotonic() - started
+
+        assert handler_returned < 0.1, "the handler blocked for the drain window"
+        assert state.draining is True
+        assert not chained.is_set(), "shutdown was chained before the drain elapsed"
+        assert chained.wait(3.0), "the deferred chain never ran"
     finally:
         signal.signal(signal.SIGUSR1, previous)
 
 
 def test_a_second_signal_skips_the_wait() -> None:
     state = DrainState()
-    slept: list[float] = []
+    waits: list[float] = []
     previous = signal.getsignal(signal.SIGUSR1)
     try:
         signal.signal(signal.SIGUSR1, lambda signum, frame: None)
         install_drain_handler(
-            state, 5.0, signals=[signal.SIGUSR1], sleep=lambda seconds: slept.append(seconds)
+            state,
+            5.0,
+            signals=[signal.SIGUSR1],
+            defer=lambda seconds, callback: waits.append(seconds),
         )
         signal.raise_signal(signal.SIGUSR1)
         signal.raise_signal(signal.SIGUSR1)
         time.sleep(0.05)
 
-        assert slept == [5.0], "the second signal waited again"
+        assert waits == [5.0], "the second signal waited again"
     finally:
         signal.signal(signal.SIGUSR1, previous)
 

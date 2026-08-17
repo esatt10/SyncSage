@@ -49,6 +49,7 @@ import random
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -321,10 +322,36 @@ class WorkerPool:
             # MAX_ATTEMPTS round trips *per batch*, which is the exact expense
             # the breaker exists to stop. The caller prepares locally in the
             # meantime and the cooldown lets a probe through on its own.
-            for item in available:
-                if item.breaker.tripped:
-                    item.breaker.probing = True
+            # Deliberately does NOT set `probing` here. Marking every
+            # cooled-down candidate leaked the flag: only the endpoint
+            # actually dispatched to ever cleared it, so if an earlier one in
+            # the rotation answered, the rest kept `probing=True` forever —
+            # and `available()` returns False while it is set, so a recovered
+            # worker was excluded for the pool's lifetime and reported down by
+            # `pheasant_worker_up`. The flag is now set and cleared around the
+            # dispatch itself (`_probe`), which cannot leak.
             return available
+
+    @contextmanager
+    def _probe(self, endpoint: _Endpoint):
+        """Hold the half-open slot for exactly one dispatch.
+
+        A tripped endpoint admits one probe at a time, so a hundred concurrent
+        callers do not all rediscover that it is down. Paired in a
+        ``finally``, because every way out of the dispatch loop — success,
+        failure, the attempt budget, a deadline — has to release it.
+        """
+
+        with self._lock:
+            probing = endpoint.breaker.tripped
+            if probing:
+                endpoint.breaker.probing = True
+        try:
+            yield
+        finally:
+            if probing:
+                with self._lock:
+                    endpoint.breaker.probing = False
 
     def _record_success(self, endpoint: _Endpoint) -> None:
         with self._lock:
@@ -387,7 +414,8 @@ class WorkerPool:
                 attempt += 1
                 progressed = True
                 try:
-                    results = self._dispatch(endpoint, tasks, keys, remaining)
+                    with self._probe(endpoint):
+                        results = self._dispatch(endpoint, tasks, keys, remaining)
                 except TaskRejected:
                     self._record_success(endpoint)  # the worker is fine; the task is not
                     raise
@@ -400,6 +428,26 @@ class WorkerPool:
                 except RemoteWorkerError as exc:
                     self._record_failure(endpoint)
                     reasons[endpoint.label] = str(exc)
+                    continue
+                except Exception as exc:  # noqa: BLE001 - see below
+                    # A transport can fail in ways that are not
+                    # `RemoteWorkerError`: `binascii.Error` from a corrupt
+                    # base64 payload, `json.JSONDecodeError` from a truncated
+                    # body, `grpc.RpcError` from the gRPC channel. Letting any
+                    # of those out aborts the whole sync over one sick worker —
+                    # the exact single-point-of-failure this pool exists to
+                    # remove. A malformed answer is a failed endpoint, so it
+                    # counts against the breaker and the fleet moves on; if
+                    # every endpoint does it the caller still gets
+                    # `AllWorkersFailed` and prepares locally.
+                    self._record_failure(endpoint)
+                    reasons[endpoint.label] = f"{type(exc).__name__}: {exc}"
+                    logger.warning(
+                        "Remote preparation worker %s raised %s; treating it as a worker failure",
+                        endpoint.label,
+                        type(exc).__name__,
+                        exc_info=True,
+                    )
                     continue
                 self._record_success(endpoint)
                 return results

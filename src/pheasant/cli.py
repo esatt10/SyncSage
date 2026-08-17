@@ -1081,18 +1081,36 @@ def main(argv: list[str] | None = None) -> int:
             _print_scan(report)
         return 0
     if args.command == "queue":
-        from pheasant.sync.queue import DEAD, DONE, INFLIGHT, PENDING, LocalQueue, drain
+        from pheasant.sync.queue import (
+            DEAD,
+            DONE,
+            INFLIGHT,
+            PENDING,
+            LocalQueue,
+            drain,
+            queue_from_config,
+        )
 
         engine = _engine(Path(args.config))
+        queue = None
         try:
-            queue = LocalQueue(engine.state)
+            # Built from config, not hardcoded to LocalQueue: with
+            # `sync.queue.backend: nats` the tasks are in JetStream, and
+            # reaching for the SQLite table reported an empty queue on a
+            # backlog of thousands and drained nothing — while `requeue-dead`
+            # silently did nothing to the queue that actually held the dead
+            # letters. `queue_from_config` returns None when queueing is off.
+            queue = queue_from_config(engine.config, engine.state) or LocalQueue(engine.state)
             if args.queue_command == "status":
                 depth = queue.depth()
                 print(
                     f"queued: {depth[PENDING]}  in-flight: {depth[INFLIGHT]}  "
                     f"done: {depth[DONE]}  dead: {depth[DEAD]}"
                 )
-                if depth[DEAD]:
+                if depth[DEAD] and isinstance(queue, LocalQueue):
+                    # Per-task detail is a property of the local table; a
+                    # JetStream dead letter is terminated on the broker and
+                    # has no row here to read.
                     for row in engine.state.rows(
                         "SELECT source_id, attempts, last_error FROM index_tasks "
                         "WHERE status=? ORDER BY updated_at",
@@ -1104,7 +1122,15 @@ def main(argv: list[str] | None = None) -> int:
                     print("\nFix the cause, then: pheasant queue requeue-dead")
                 return 0
             if args.queue_command == "requeue-dead":
-                print(f"requeued {queue.requeue_dead()} dead-lettered task(s)")
+                requeue = getattr(queue, "requeue_dead", None)
+                if requeue is None:
+                    print(
+                        f"{type(queue).__name__} has no dead-letter replay; "
+                        "terminated messages are managed on the broker.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                print(f"requeued {requeue()} dead-lettered task(s)")
                 return 0
             if args.queue_command == "drain":
                 results = drain(
@@ -1126,6 +1152,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"drained {len(results)} task(s)")
                 return 0
         finally:
+            if queue is not None:
+                try:
+                    queue.close()
+                except Exception:  # pragma: no cover - shutdown must not raise
+                    pass
             engine.close()
         queue_p.print_help()
         return 2

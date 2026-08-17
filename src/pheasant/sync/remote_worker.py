@@ -195,9 +195,17 @@ def prepare_batch_tasks(
 
     ``deadline`` is a zero-argument callable returning the seconds remaining
     (or ``None`` for no budget). It is checked *between* tasks: a batch whose
-    caller has given up stops rather than finishing work nobody is waiting
-    for, and the tasks already done are still returned, so the coordinator's
-    retry is cheaper than the first attempt was.
+    caller has given up stops rather than finishing work nobody is waiting for.
+
+    **The completed tasks are not returned** — an earlier version of this
+    docstring said they were, and they never could be: the coordinator
+    requires one result per task (a short list is rejected as a malformed
+    answer), so a partial batch has nowhere to go on the wire. What survives
+    is the *work*, in ``cache``: each task is stored under its idempotency key
+    as it finishes, so the retry that follows the 408 is a lookup rather than
+    a second parse. That only holds when the caller supplies keys, which the
+    coordinator always does; without them a deadline abort really does discard
+    the finished work, and the loop below is where that would change.
     """
 
     supplied = list(keys or [])

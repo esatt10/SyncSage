@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
+from pheasant.capacity import GRAPH_SHARE_OF_RSS, RSS_BYTES_PER_NODE
 from pheasant.capacity import project as project_capacity
 from pheasant.config.schema import FILESYSTEM_SOURCE_TYPES, PheasantConfig, SourceConfig
 from pheasant.graph.builder import GraphBuilder
@@ -675,6 +676,8 @@ class SyncEngine:
         # calls while still allowing the source pipelines themselves to overlap.
         progress_lock = threading.Lock()
 
+        forward_meta = on_progress is not None and _hook_accepts_meta(on_progress)
+
         def progress_for(source_name: str) -> ProgressHook:
             def source_progress(
                 phase: str,
@@ -683,10 +686,21 @@ class SyncEngine:
                 detail: str,
                 meta: dict[str, Any] | None = None,
             ) -> None:
+                # Respect the caller's arity. Forwarding five positional
+                # arguments unconditionally defeated `_hook_accepts_meta`: a
+                # four-argument hook — the documented supported form, and what
+                # `sync/worker.py:_as_engine_hook` builds for the in-process
+                # path — raised TypeError on every update, which
+                # `_progress_reporter` swallows at debug level. The result was
+                # a job whose progress bar never moved whenever
+                # `max_parallel_sources > 1`, with nothing in the logs.
                 if on_progress is None:
                     return
                 with progress_lock:
-                    on_progress(phase, current, total, detail, meta)
+                    if forward_meta:
+                        on_progress(phase, current, total, detail, meta)
+                    else:
+                        on_progress(phase, current, total, detail)
 
             return source_progress
 
@@ -742,6 +756,8 @@ class SyncEngine:
         settings = self.config.sync.queue
         progress_lock = threading.Lock()
 
+        forward_meta = on_progress is not None and _hook_accepts_meta(on_progress)
+
         def progress_for(source_name: str) -> ProgressHook:
             def source_progress(
                 phase: str,
@@ -750,10 +766,21 @@ class SyncEngine:
                 detail: str,
                 meta: dict[str, Any] | None = None,
             ) -> None:
+                # Respect the caller's arity. Forwarding five positional
+                # arguments unconditionally defeated `_hook_accepts_meta`: a
+                # four-argument hook — the documented supported form, and what
+                # `sync/worker.py:_as_engine_hook` builds for the in-process
+                # path — raised TypeError on every update, which
+                # `_progress_reporter` swallows at debug level. The result was
+                # a job whose progress bar never moved whenever
+                # `max_parallel_sources > 1`, with nothing in the logs.
                 if on_progress is None:
                     return
                 with progress_lock:
-                    on_progress(phase, current, total, detail, meta)
+                    if forward_meta:
+                        on_progress(phase, current, total, detail, meta)
+                    else:
+                        on_progress(phase, current, total, detail)
 
             return source_progress
 
@@ -1183,9 +1210,13 @@ class SyncEngine:
 
         concurrency = self.config.sync.concurrency
         batch_size = max(1, int(concurrency.remote_worker_batch_size or 1))
+        # Enumerated once, then sliced. Building the full `list(enumerate(...))`
+        # inside the comprehension rebuilt it per batch — O(files²/batch_size)
+        # allocations, which on a 250k-file source is millions of tuples for a
+        # list that never changes. Identical output, same discovery order.
+        numbered = list(enumerate(items, start=1))
         batches = [
-            list(enumerate(items, start=1))[start : start + batch_size]
-            for start in range(0, len(items), batch_size)
+            numbered[start : start + batch_size] for start in range(0, len(numbered), batch_size)
         ]
         pool = WorkerPool(
             remote_urls,
@@ -1830,8 +1861,13 @@ class SyncEngine:
         nodes = self.graph_builder.graph.number_of_nodes()
         if nodes <= int(limit):
             return None
-        # ~2.4 KB of process RSS per node, flat across four measured scales.
-        projected_bytes = nodes * 2400
+        # ~2.4 KB of process RSS per node, flat across four measured scales —
+        # divided by the graph's share of RSS, because what an operator has to
+        # provision is the whole process, not the graph in isolation. Omitting
+        # that divisor under-reported by 40% against the identical projection
+        # `pheasant scan` and `pheasant shard plan` print, so the same corpus
+        # got two different answers depending on which surface asked.
+        projected_bytes = int(nodes * RSS_BYTES_PER_NODE / GRAPH_SHARE_OF_RSS)
         projected_gb = projected_bytes / 1e9
         notice = {
             "nodes": nodes,

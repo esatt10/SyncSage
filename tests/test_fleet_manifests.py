@@ -98,6 +98,43 @@ def test_every_manifest_parses(scaled: list[dict[str, Any]]) -> None:
         assert doc.get("metadata", {}).get("name")
 
 
+def test_the_image_installs_every_extra_the_manifests_configure(
+    scaled: list[dict[str, Any]],
+) -> None:
+    """The manifests and the image they run must agree.
+
+    `PHEASANT_EXTRAS` defaulted to `mcp,agent,vector,wasm,a2a` while the scaled
+    ConfigMaps select `storage.backend: postgres` — so the published image
+    could not run the topology this repo publishes: every indexer would have
+    come up and raised "psycopg is not installed". Mechanical, so adding a
+    backend without adding its extra fails here rather than in a cluster.
+    """
+
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(encoding="utf-8")
+    line = next(raw for raw in dockerfile.splitlines() if raw.startswith("ARG PHEASANT_EXTRAS="))
+    extras = {item.strip() for item in line.split("=", 1)[1].split(",")}
+
+    #: config value -> the extra that supplies it
+    needed = {
+        ("storage", "backend", "postgres"): "postgres",
+        ("sync", "queue", "nats"): "queue",
+        ("sync", "concurrency", "grpc"): "grpc",
+    }
+    required: set[str] = set()
+    for doc in _by_kind(scaled, "ConfigMap"):
+        blob = str(doc.get("data") or {})
+        for (_section, _key, value), extra in needed.items():
+            if f": {value}" in blob:
+                required.add(extra)
+
+    assert required, "no scale-out backend is configured in any manifest"
+    missing = required - extras
+    assert not missing, (
+        f"the manifests select {sorted(required)} but the image installs {sorted(extras)}; "
+        f"missing: {sorted(missing)}"
+    )
+
+
 def test_every_workload_passes_a_role_this_code_knows(scaled: list[dict[str, Any]]) -> None:
     """A role typo in `args` is a CrashLoopBackOff on someone else's cluster."""
 

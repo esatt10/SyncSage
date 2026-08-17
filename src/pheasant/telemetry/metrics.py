@@ -222,6 +222,21 @@ class MetricsRegistry:
             if isinstance(metric, _Series):
                 metric.values[key] = value
 
+    def replace(self, name: str, values: dict[str, float], *, label: str = "source") -> None:
+        """Set a single-label gauge's whole series, dropping absent labels.
+
+        The counterpart to :meth:`set` for gauges sampled at scrape time: what
+        is not in ``values`` no longer exists, and must stop being exported
+        rather than freeze at its last reading.
+        """
+
+        with self._lock:
+            metric = self._metrics.get(name)
+            if isinstance(metric, _Series):
+                metric.values = {
+                    _labels_to_key({label: key}): float(inner) for key, inner in values.items()
+                }
+
     def observe(self, name: str, value: float, **labels: str) -> None:
         key = _labels_to_key(labels)
         with self._lock:
@@ -389,8 +404,15 @@ def render_with(sample: dict[str, Any] | None = None) -> str:
         REGISTRY.set("pheasant_process_resident_bytes", rss)
     for name, value in (sample or {}).items():
         if isinstance(value, dict):
-            for label_value, inner in value.items():
-                REGISTRY.set(name, float(inner), source=str(label_value))
+            # Replaced wholesale, not merged. These are *live* gauges — the
+            # progress of jobs running right now — so a per-source series set
+            # once and never cleared kept reporting a finished (or deleted)
+            # source's last-known progress forever, as a current reading.
+            # Prometheus has no way to tell that apart from a genuinely stuck
+            # source, and the label set grows without bound as sources come and
+            # go. Counters, which must never go backwards, are not passed this
+            # way — they are incremented at their event site.
+            REGISTRY.replace(name, {str(k): float(v) for k, v in value.items()})
         elif value is not None:
             REGISTRY.set(name, float(value))
     return REGISTRY.render()
