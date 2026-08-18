@@ -341,6 +341,17 @@ Each of these cost real time. They are listed because the shape recurs.
   never existed. Pushing first inverts the failure into a harmless one: an
   unrecorded image is skipped, because the next increment is computed from
   `max(pyproject, highest published tag)`.
+- **A release covers every commit since the last one, not just the last PR.**
+  The increment was resolved from `workflow_run.head_sha` alone, so a merge
+  that a red CI left unpublished contributed nothing to the version even
+  though its code shipped in the next image — a `minor` silently became a
+  `patch`. The range is now every commit since the last `chore: release`, and
+  the strongest increment among those PRs wins.
+- **A skipped job is invisible; a failing one is not.** `container.yml` gated
+  its whole job on `workflow_run.conclusion == 'success'`, so a red CI on main
+  published nothing and reported it as a *skipped* run — indistinguishable
+  from having nothing to do. #52 sat live on main with no image for four days
+  behind that skip.
 
 ---
 

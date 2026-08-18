@@ -33,15 +33,39 @@ jobs:
   publish:
     name: Publish container image
     runs-on: ubuntu-latest
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push'
+    # Deliberately not gated on the CI conclusion: a merge that leaves main
+    # live with no matching image is exactly the event worth seeing, and as a
+    # skipped job it was invisible — #52 sat unpublished for four days that way.
+    # The first step below turns it into a red run that names the commit.
+    if: github.event.workflow_run.event == 'push'
 
     steps:
+      - name: Require a green CI run
+        shell: bash
+        run: |
+          conclusion="${{ github.event.workflow_run.conclusion }}"
+          sha="${{ github.event.workflow_run.head_sha }}"
+          if [ "$conclusion" = "success" ]; then
+            echo "CI succeeded for ${sha}; publishing."
+            exit 0
+          fi
+          {
+            echo "### No container published for \`${sha}\`"
+            echo
+            echo "CI concluded \`${conclusion}\`, so main is live at this commit"
+            echo "with no image that matches it. The next green merge publishes"
+            echo "main's head, and its increment covers this commit too."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::CI concluded '${conclusion}' for ${sha}; nothing was published."
+          exit 1
+
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           ref: main
+          # The release range is "every commit since the last `chore: release`",
+          # which a depth-1 checkout cannot see.
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -71,14 +95,39 @@ jobs:
       - name: Check version alignment
         run: python scripts/sync_version.py --check
 
+      # The increment must cover everything this image makes newly live, not
+      # just the PR that happened to merge last. A red CI leaves its merge on
+      # main unpublished; the next green release ships that code too, so a
+      # `minor` asked for by the skipped PR must not be demoted to the `patch`
+      # the latest PR asked for. The range is every commit since the last
+      # recorded release, and `chore: release` commits carry no PR of their own
+      # and drop out.
       - name: Resolve release increment
         id: release
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          last_release="$(git log --format='%H %s' | grep -m1 -F ' chore: release ' | cut -d' ' -f1 || true)"
+          if [ -n "$last_release" ]; then
+            range="${last_release}..HEAD"
+          else
+            range="HEAD"
+          fi
+          echo "Release range: ${range}"
+
+          sha_args=()
+          while read -r sha; do
+            [ -n "$sha" ] && sha_args+=(--sha "$sha")
+          done < <(git log --format=%H "$range")
+          if [ ${#sha_args[@]} -eq 0 ]; then
+            echo "::error::No commits in ${range}; nothing to release."
+            exit 1
+          fi
+
           python scripts/release_version.py merged-pr-bump \
             --repo "${GITHUB_REPOSITORY}" \
-            --sha "${{ github.event.workflow_run.head_sha }}" \
+            "${sha_args[@]}" \
             --owner "${GITHUB_REPOSITORY_OWNER}" \
             --package "${IMAGE_NAME}" \
             --token "${GITHUB_TOKEN}"

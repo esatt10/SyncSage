@@ -273,3 +273,47 @@ def test_the_release_commit_survives_main_moving_under_it() -> None:
     commit = _step(_publish_job(), "Commit release version to main")["run"]
     assert "git rebase origin/main" in commit
     assert "git fetch origin main" in commit
+
+
+# --------------------------------------------------------------------------
+# A merge always resolves to a container, or says why it did not
+# --------------------------------------------------------------------------
+
+
+def test_the_release_range_covers_every_commit_since_the_last_release() -> None:
+    """One `--sha` means one PR, and that is the bug.
+
+    A merge left unpublished by a red CI still ships in the next image, so the
+    increment has to be resolved from every commit since the last recorded
+    release — not from whichever PR merged most recently.
+    """
+
+    job = _publish_job()
+    resolve = _step(job, "Resolve release increment")["run"]
+
+    assert "chore: release " in resolve, "the range is not anchored to the last release"
+    assert 'git log --format=%H "$range"' in resolve
+    assert "sha_args" in resolve and "--sha" in resolve
+    assert "workflow_run.head_sha" not in resolve, "still resolving from a single commit"
+
+    checkout = _step(job, "Check out repository")
+    assert checkout["with"]["fetch-depth"] == 0, "a depth-1 checkout cannot see the range"
+
+
+def test_a_merge_that_publishes_nothing_is_not_a_silent_skip() -> None:
+    """The job's `if:` used to swallow a red CI on main.
+
+    A skipped workflow reads the same as one that had nothing to do, which is
+    how a merge sat on main for days with no image anyone had published.
+    """
+
+    workflow = yaml.safe_load((WORKFLOWS / "container.yml").read_text(encoding="utf-8"))
+    job = workflow["jobs"]["publish"]
+
+    assert "conclusion" not in str(job["if"]), "a failed CI still skips the job silently"
+    assert "workflow_run.event" in str(job["if"]), "the job must stay scoped to main pushes"
+
+    gate = _step(job, "Require a green CI run")["run"]
+    assert "workflow_run.conclusion" in gate
+    assert "exit 1" in gate, "an unpublished merge must fail rather than pass quietly"
+    assert "GITHUB_STEP_SUMMARY" in gate, "say which commit is live without an image"
