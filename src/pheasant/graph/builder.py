@@ -72,17 +72,53 @@ class GraphBuilder:
 
     def add_source(self, source: SourceConfig) -> str:
         node_id = f"source:{self.kb_id}:{source.name}"
+        source_type = source.type.value
         self.upsert_node(
             node_id,
             "source",
             source.name,
             {
                 "source_id": source.name,
-                "source_type": source.type.value,
+                "source_type": source_type,
                 "path": str(source.path),
             },
         )
         self.upsert_edge(self.kb_id, node_id, "contains", {"source_id": source.name})
+        self.add_source_type(source_type, node_id, source.name)
+        return node_id
+
+    def add_source_type(self, source_type: str, source_node: str, source_id: str) -> str:
+        """A hub node grouping every source of one kind.
+
+        The type was already an *attribute* of each source node, which meant it
+        could be read but never navigated: nothing in the graph connected the
+        two Confluence spaces to each other, so "show me everything that came
+        out of a wiki" was a question the picture could not answer. A hub makes
+        that a visible structure — one node, one hop from each source of that
+        kind — which is what the graph is for.
+
+        Hung off the knowledge base **alongside** sources rather than between
+        them: `kb contains source` stays exactly as it was, so a source is
+        still one hop from the root and nothing already on screen at the
+        default depth gets pushed past the horizon. The hub is a sibling, not
+        a new tier.
+
+        `contains` rather than a new edge type, because it is the same
+        structural grouping the graph already uses for kb→source,
+        directory→file and section→subsection — and because the assistant's
+        semantic walk deliberately skips the structural edges, which is right:
+        a type hub carries no content to retrieve.
+        """
+
+        node_id = f"source_type:{self.kb_id}:{source_type}"
+        self.upsert_node(
+            node_id,
+            "source_type",
+            source_type,
+            {"source_type": source_type},
+        )
+        self.upsert_edge(self.kb_id, node_id, "contains", {"source_type": source_type})
+        self.upsert_edge(node_id, source_node, "contains", {"source_id": source_id})
         return node_id
 
     def add_directory_chain(

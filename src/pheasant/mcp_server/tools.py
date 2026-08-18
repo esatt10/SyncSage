@@ -975,6 +975,14 @@ class PheasantTools:
                 if not matching_edges:
                     continue
                 next_depth = current_depth + 1
+                # One entry per node, not per edge into it — the same fix as
+                # `api.app.graph_neighbors`, which this mirrors. `visited`
+                # guarded the queue but not the append, so a node reachable by
+                # two paths came back twice and `get_graph_slice` built a
+                # duplicated `nodes` payload from it.
+                if target in visited:
+                    continue
+                visited.add(target)
                 edge_type_values = sorted(
                     {data.get("type") for data in matching_edges if data.get("type")}
                 )
@@ -987,9 +995,7 @@ class PheasantTools:
                         "node": dict(graph.nodes.get(target, {})),
                     }
                 )
-                if target not in visited:
-                    visited.add(target)
-                    queue.append((target, next_depth, [*path, target]))
+                queue.append((target, next_depth, [*path, target]))
         return {"node_id": node_id, "depth": depth, "neighbors": neighbors}
 
     def get_file_summary(

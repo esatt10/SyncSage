@@ -584,6 +584,19 @@ def graph_neighbors(
                 if target_type in exclude_node_types:
                     continue
             next_depth = current_depth + 1
+            # One entry per *node*, not per edge into it. `visited` guarded the
+            # queue but not the append, so a node reachable by two paths was
+            # listed twice — every consumer treats this as a node list, and
+            # `graph_slice` built its `nodes` payload straight off it, so the
+            # canvas received duplicate element ids. It also charged the same
+            # node to the budget twice, cutting a bounded slice short of the
+            # structure it was asked for. First sighting wins, which is BFS
+            # order and therefore the shortest path — the same rule `depths`
+            # applies. No edge is lost: `graph_slice` derives links from the
+            # graph itself, so both parents still draw.
+            if target in visited:
+                continue
+            visited.add(target)
             edge_type_values = sorted({data.get("type") for data in matching if data.get("type")})
             neighbors.append(
                 {
@@ -594,9 +607,7 @@ def graph_neighbors(
                     "node": dict(graph.nodes.get(target, {})),
                 }
             )
-            if target not in visited:
-                visited.add(target)
-                queue.append((target, next_depth, [*path, target]))
+            queue.append((target, next_depth, [*path, target]))
             # A single hub can have thousands of out-edges, so the budget has
             # to bind inside the fan-out, not just between hops.
             if max_nodes is not None and len(neighbors) >= max_nodes:

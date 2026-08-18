@@ -14,6 +14,10 @@ type CyStylesheet = Record<string, unknown>;
  */
 export const NODE_COLORS: Record<string, string> = {
   knowledge_base: "#8a6a2a",
+  // A hub grouping every source of one kind. Same family as `source` but a
+  // step cooler, so the two read as related without the hub competing with
+  // the sources hanging off it.
+  source_type: "#3f7f86",
   source: "#4a6a70",
   repository: "#4a6a70",
   directory: "#6f8b8e",
@@ -68,6 +72,9 @@ export type ShapeAlgorithm = "node_type" | "degree" | "uniform";
  */
 export const NODE_TYPE_SHAPES: Record<string, string> = {
   knowledge_base: "round-rectangle",
+  // Hexagon: the one hub shape in the graph, so a grouping node is
+  // distinguishable from the sources it groups at a glance.
+  source_type: "hexagon",
   source: "round-rectangle",
   repository: "round-rectangle",
   directory: "round-rectangle",
@@ -85,6 +92,8 @@ export const NODE_TYPE_SHAPES: Record<string, string> = {
 /** Base radius per type, so the graph has a visual hierarchy at rest. */
 const NODE_SIZES: Record<string, number> = {
   knowledge_base: 46,
+  // Between the root and a source: it sits under one and groups the other.
+  source_type: 40,
   source: 36,
   repository: 36,
   directory: 24,

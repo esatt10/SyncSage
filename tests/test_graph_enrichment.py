@@ -63,24 +63,36 @@ def test_graph_neighbors_honor_depth_and_edge_filters(
 ) -> None:
     run_sync(sync_engine, source_name="pheasant-repo", mode="full")
     tools = PheasantTools(loaded_config)
+    node_id = "file:pheasant-repo:pheasant/sync_engine.py:branch=none"
     result = tools.get_graph_neighbors(
         loaded_config.knowledge_base_id,
-        "file:pheasant-repo:pheasant/sync_engine.py:branch=none",
+        node_id,
         depth=2,
         edge_types=["mentions", "derived_from"],
     )
 
-    # Two hops still bridge documents, but through a *symbol* or *entity*
-    # rather than a concept: "these two files both use SyncEngine" instead of
-    # "these two files both contain the word 'limit'". Concept extraction was
-    # retired (graph.enrichment._add_concept), and this is the connectivity
-    # that replaced it — narrower, and worth traversing.
-    assert any(neighbor["depth"] == 2 for neighbor in result["neighbors"])
+    # A file reaches its symbols and entities in one hop, and those are the
+    # connectivity that replaced concept extraction (graph.enrichment
+    # ._add_concept) — narrower, and worth traversing.
     bridges = {
         neighbor["node"].get("type") for neighbor in result["neighbors"] if neighbor["depth"] == 1
     }
-    assert bridges <= {"symbol", "entity", "external_reference"}, bridges
+    assert bridges == {"symbol", "entity"}, bridges
     assert not any(neighbor["node"].get("type") == "concept" for neighbor in result["neighbors"])
+
+    # This used to assert `any(depth == 2)`, described as "two hops still
+    # bridge documents". It never did: every `derived_from` edge out of those
+    # symbols and entities points back at the file that defines them, so the
+    # depth-2 sighting was the walk returning to its own starting node. It
+    # passed only because the traversal appended a node once per edge into it
+    # rather than once per node, so the root was re-listed as a "neighbour" of
+    # itself. Deduplicating the walk removed the illusion.
+    #
+    # What the traversal must guarantee is asserted instead: a node appears at
+    # most once, and never the node you started from.
+    seen = [neighbor["node_id"] for neighbor in result["neighbors"]]
+    assert len(seen) == len(set(seen)), "the walk listed a node more than once"
+    assert node_id not in seen, "the walk returned its own starting node as a neighbour"
 
 
 def test_graph_terms_improve_cross_file_search(

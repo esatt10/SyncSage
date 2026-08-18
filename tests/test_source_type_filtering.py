@@ -359,3 +359,129 @@ def test_the_assistant_scope_reaches_every_search_in_one_answer(tmp_path: Path) 
         assert {p.source_id for p in passages} == {"handbook"}
     finally:
         tools.engine.close()
+
+
+# --------------------------------------------------------------------------
+# The graph: source type as a navigable hub, not just an attribute
+# --------------------------------------------------------------------------
+
+
+def _graph_of(tools: PheasantTools):
+    return tools.engine.graph_builder.graph
+
+
+def test_each_kind_of_source_gets_one_hub_node(tmp_path: Path) -> None:
+    """Two sources of one kind share a hub; a third kind gets its own.
+
+    The type was already an attribute of each source node — readable, never
+    navigable. Nothing in the graph connected two wikis to each other, so
+    "show me everything that came out of a wiki" was a question the picture
+    could not answer.
+    """
+
+    tools = _tools(tmp_path)
+    try:
+        graph = _graph_of(tools)
+        kb = tools.config.knowledge_base_id
+        hubs = {
+            node for node, attrs in graph.nodes(data=True) if attrs.get("type") == "source_type"
+        }
+        assert hubs == {
+            f"source_type:{kb}:markdown_folder",
+            f"source_type:{kb}:document_folder",
+        }
+    finally:
+        tools.engine.close()
+
+
+def test_the_hub_links_the_knowledge_base_to_its_sources(tmp_path: Path) -> None:
+    tools = _tools(tmp_path)
+    try:
+        graph = _graph_of(tools)
+        kb = tools.config.knowledge_base_id
+        hub = f"source_type:{kb}:markdown_folder"
+
+        def edges_between(source: str) -> list[tuple[str, str]]:
+            out = []
+            for _src, target, edge_map in graph.out_edges(source):
+                for data in edge_map.values():
+                    out.append((str(data.get("type")), target))
+            return out
+
+        assert ("contains", hub) in edges_between(kb)
+        assert ("contains", f"source:{kb}:handbook") in edges_between(hub)
+        # And the original kb -> source edge is untouched, so a source is
+        # still one hop from the root.
+        assert ("contains", f"source:{kb}:handbook") in edges_between(kb)
+    finally:
+        tools.engine.close()
+
+
+def test_the_hub_does_not_push_sources_past_the_default_horizon(tmp_path: Path) -> None:
+    """The canvas walks `depth` hops from the knowledge base, default 3.
+
+    A hub inserted *between* the root and its sources would cost every source
+    a hop and quietly drop the deepest tier off the screen. It is a sibling
+    instead, so the depth of everything that was already drawn is unchanged.
+    """
+
+    config = _config(tmp_path)
+    client = TestClient(create_app(config))
+    client.post("/sync", json={"mode": "full", "wait": True})
+
+    payload = client.get(
+        "/graph/slice",
+        params={"node_id": config.knowledge_base_id, "depth": 3, "limit": 500},
+    ).json()
+    depths = payload["depths"]
+    by_type: dict[str, set[int]] = {}
+    for node in payload["nodes"]:
+        by_type.setdefault(str(node["type"]), set()).add(int(depths[node["id"]]))
+
+    assert by_type["knowledge_base"] == {0}
+    assert by_type["source"] == {1}, "a source moved off its original hop"
+    assert by_type["source_type"] == {1}, "the hub is a sibling of sources, not a tier above"
+
+
+def test_a_graph_slice_lists_each_node_once(tmp_path: Path) -> None:
+    """The hub gives every source a second path from the root.
+
+    The traversal appended a node once per edge into it rather than once per
+    node, so that second path made `/graph/slice` return duplicate ids — which
+    the canvas rejects as duplicate elements, and which charged the same node
+    to the slice budget twice.
+    """
+
+    config = _config(tmp_path)
+    client = TestClient(create_app(config))
+    client.post("/sync", json={"mode": "full", "wait": True})
+
+    payload = client.get(
+        "/graph/slice",
+        params={"node_id": config.knowledge_base_id, "depth": 3, "limit": 500},
+    ).json()
+    ids = [node["id"] for node in payload["nodes"]]
+    assert len(ids) == len(set(ids)), "the slice returned the same node twice"
+
+    # Both parents still draw: deduping nodes must not drop an edge, or the
+    # hub would appear unconnected to the sources it groups.
+    links = {(link["source"], link["target"]) for link in payload["links"]}
+    kb = config.knowledge_base_id
+    hub = f"source_type:{kb}:markdown_folder"
+    assert (kb, f"source:{kb}:handbook") in links
+    assert (hub, f"source:{kb}:handbook") in links
+
+
+def test_re_syncing_does_not_multiply_the_hubs(tmp_path: Path) -> None:
+    """Rule 1: idempotent indexing. The hub is upserted like every other node."""
+
+    tools = _tools(tmp_path)
+    try:
+        before = _graph_of(tools).number_of_nodes(), _graph_of(tools).number_of_edges()
+        tools.sync_all(tools.config.knowledge_base_id, "full")
+        assert (
+            _graph_of(tools).number_of_nodes(),
+            _graph_of(tools).number_of_edges(),
+        ) == before
+    finally:
+        tools.engine.close()
