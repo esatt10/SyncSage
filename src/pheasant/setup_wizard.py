@@ -41,6 +41,7 @@ from typing import Any
 
 from pheasant.assistant.catalog import PROVIDERS, resolve_auto_provider
 from pheasant.config.schema import PheasantConfig
+from pheasant.mcp_client.vscode import DEFAULT_IMAGE
 
 #: Where an interrupted run leaves its answers, so a second invocation can
 #: pick up where it stopped rather than starting the interview again.
@@ -1714,13 +1715,19 @@ def ensure_gitignored(env_path: Path, repo_root: Path | None = None) -> str | No
 
 
 def startup_commands(config_path: Path, target: str, port: int) -> list[str]:
-    """The exact commands to run next, for the chosen deployment target."""
+    """The exact commands to run next, for the chosen deployment target.
+
+    The docker line pins the image to this package's version rather than
+    naming ``:latest``. The config it mounts was written by *this* version's
+    schema, and an image from a later release is the one arrangement where a
+    freshly generated config can fail to load.
+    """
     if target == "docker":
         return [
             f"docker run --rm -p {port}:8765 \\",
             f"  -v {config_path.resolve()}:/config/pheasant.yaml:ro \\",
             "  -v $PWD:/workspace:ro -v pheasant-state:/state \\",
-            "  ghcr.io/esatt10/pheasant:latest",
+            f"  {DEFAULT_IMAGE}",
         ]
     if target == "compose":
         return [

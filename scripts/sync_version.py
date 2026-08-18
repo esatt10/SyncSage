@@ -32,6 +32,11 @@ class Replacement:
     pattern: re.Pattern[str]
     replacement: str
     label: str
+    #: How many matches the pattern must have. 0 means "every match, and at
+    #: least one" — a file that names the image once per service (the compose
+    #: fleet names it three times) would otherwise be half-rewritten, which is
+    #: worse than not rewriting it at all.
+    occurrences: int = 1
 
 
 def project_version() -> str:
@@ -81,10 +86,17 @@ def bump(version: str, part: str) -> str:
     raise SystemExit(f"Unknown bump part: {part}")
 
 
-def replace_once(text: str, replacement: Replacement) -> tuple[str, bool]:
-    updated, count = replacement.pattern.subn(replacement.replacement, text, count=1)
-    if count != 1:
+def apply_replacement(text: str, replacement: Replacement) -> tuple[str, bool]:
+    updated, count = replacement.pattern.subn(
+        replacement.replacement, text, count=replacement.occurrences
+    )
+    if count == 0:
         raise SystemExit(f"Could not find {replacement.label} in {replacement.path}")
+    if replacement.occurrences and count != replacement.occurrences:
+        raise SystemExit(
+            f"Expected {replacement.occurrences} occurrence(s) of {replacement.label} "
+            f"in {replacement.path}, found {count}"
+        )
     return updated, updated != text
 
 
@@ -92,7 +104,7 @@ def set_pyproject_version(version: str) -> None:
     validate_semver(version)
     path = ROOT / "pyproject.toml"
     text = path.read_text(encoding="utf-8")
-    updated, changed = replace_once(
+    updated, changed = apply_replacement(
         text,
         Replacement(
             path=path.relative_to(ROOT),
@@ -107,6 +119,7 @@ def set_pyproject_version(version: str) -> None:
 
 def replacements(version: str) -> list[Replacement]:
     image = f"ghcr.io/esatt10/pheasant:{version}"
+    ui_image = f"ghcr.io/esatt10/pheasant-ui:{version}"
     return [
         Replacement(
             path=Path("deploy/helm/Chart.yaml"),
@@ -146,7 +159,7 @@ def replacements(version: str) -> list[Replacement]:
         Replacement(
             path=Path("docker-compose.yml"),
             pattern=re.compile(r"ghcr\.io/esatt10/pheasant-ui:[0-9A-Za-z._+-]+"),
-            replacement=f"ghcr.io/esatt10/pheasant-ui:{version}",
+            replacement=ui_image,
             label="Docker Compose UI image",
         ),
         Replacement(
@@ -157,7 +170,67 @@ def replacements(version: str) -> list[Replacement]:
             replacement=rf"\g<1>{version}",
             label="example compose image tag",
         ),
+        # Everything below names a published image in a file someone actually
+        # runs. They were unmanaged until docker-compose.fresh.yml was found
+        # three releases behind on 0.9.0 — a stale default tag is not a typo,
+        # it silently starts an old build that has none of the fixes the
+        # checkout it came with advertises.
+        *_image_reference_replacements(
+            version,
+            {
+                Path("docker-compose.fresh.yml"): 1,
+                Path("docker-compose.scale.yml"): 3,
+                Path("deploy/kubernetes/scaled/api-deployment.yaml"): 1,
+                Path("deploy/kubernetes/scaled/indexer-statefulset.yaml"): 1,
+                Path("deploy/kubernetes/scaled/worker-deployment.yaml"): 1,
+            },
+        ),
+        # Commented-out examples, but they are the values a user copies into a
+        # real .env — and a copied 0.8.0 pins them to 0.8.0.
+        Replacement(
+            path=Path(".env.example"),
+            pattern=re.compile(r"ghcr\.io/esatt10/pheasant:[0-9A-Za-z._+-]+"),
+            replacement=image,
+            label="example .env image",
+        ),
+        Replacement(
+            path=Path(".env.example"),
+            pattern=re.compile(r"ghcr\.io/esatt10/pheasant-ui:[0-9A-Za-z._+-]+"),
+            replacement=ui_image,
+            label="example .env UI image",
+        ),
     ]
+
+
+def _image_reference_replacements(version: str, paths: dict[Path, int]) -> list[Replacement]:
+    """One ``ghcr.io/esatt10/pheasant:<tag>`` rewrite per file.
+
+    The expected occurrence count is spelled out per file rather than inferred:
+    adding a service to the compose fleet without pinning its image would
+    otherwise pass silently, and an unpinned service is the one that drifts.
+    """
+    return [
+        Replacement(
+            path=path,
+            pattern=re.compile(r"ghcr\.io/esatt10/pheasant:[0-9A-Za-z._+-]+"),
+            replacement=f"ghcr.io/esatt10/pheasant:{version}",
+            label="published image reference",
+            occurrences=count,
+        )
+        for path, count in paths.items()
+    ]
+
+
+def managed_paths() -> list[str]:
+    """Every file a release rewrites, pyproject.toml included.
+
+    The publish workflow stages exactly this list. It used to hand-maintain
+    its own copy, which is the standing trap: a file added here but not there
+    is rewritten on the release runner, never committed, and fails the next
+    `--check` on main.
+    """
+    paths = {"pyproject.toml"} | {str(item.path) for item in replacements(project_version())}
+    return sorted(paths)
 
 
 def sync_generated_versions(version: str, write: bool) -> list[str]:
@@ -167,7 +240,7 @@ def sync_generated_versions(version: str, write: bool) -> list[str]:
     for replacement in replacements(version):
         path = ROOT / replacement.path
         original = writes.get(path, path.read_text(encoding="utf-8"))
-        updated, changed = replace_once(original, replacement)
+        updated, changed = apply_replacement(original, replacement)
         writes[path] = updated
         if changed:
             mismatches.append(str(replacement.path))
@@ -304,6 +377,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--check", action="store_true", help="Check generated version references.")
     parser.add_argument(
+        "--list-paths",
+        dest="list_paths",
+        action="store_true",
+        help="Print every file this script rewrites, one per line.",
+    )
+    parser.add_argument(
         "--write", action="store_true", help="Refresh generated version references."
     )
     parser.add_argument(
@@ -327,6 +406,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--token", help="GitHub token for package tag lookup.")
     parser.add_argument("--api-url", default="https://api.github.com", help="GitHub API base URL.")
     args = parser.parse_args(argv)
+
+    if args.list_paths:
+        for managed in managed_paths():
+            print(managed)
+        return 0
 
     version = project_version()
     if args.bump and args.set_version:

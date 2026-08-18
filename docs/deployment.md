@@ -139,7 +139,7 @@ Validation and publishing are intentionally split across workflows.
 - `.github/workflows/ci.yml`: runs ruff correctness lint, dependency checks, source compilation, pytest on Python 3.11 and 3.12, package build, Docker Compose validation, Docker image build, and image smoke tests.
 - `.github/workflows/release-version.yml`: runs from trusted base-branch code, comments on PRs with valid release increments, and defaults to `patch` / `3` unless a maintainer comments with `minor`, `major`, `2`, or `1`.
 - `.github/workflows/container.yml`: publishes after CI passes on a push to `main`; it reads the merged PR release increment, bumps `pyproject.toml` and generated deployment tags on `main`, then builds the image.
-- Merged PR to `main`: publishes `ghcr.io/esatt10/pheasant:<pyproject version>` and, from the same commit, the web UI sidecar as `ghcr.io/esatt10/pheasant-ui:<pyproject version>` plus `:latest`. The shared version tag is what lets compose files pin the API and UI together. Direct pushes to `main` are not releaseable because there is no PR release-increment comment to read.
+- Merged PR to `main`: publishes `ghcr.io/esatt10/pheasant:<pyproject version>` plus `:latest`, and from the same commit the web UI sidecar as `ghcr.io/esatt10/pheasant-ui:<pyproject version>` plus `:latest`. The shared version tag is what lets compose files pin the API and UI together; `latest` is what makes the untagged `docker run ghcr.io/esatt10/pheasant` in the README resolve. Generated files pin the version tag — nothing this repo writes depends on `latest`. Direct pushes to `main` are not releaseable because there is no PR release-increment comment to read.
 - The workflow uses repository `GITHUB_TOKEN` permissions with `packages: write`.
 
 For public local installs, make the package public from the GitHub package settings after the first image is published — **both** packages, `pheasant` and `pheasant-ui`, or the UI sidecar fails to pull for anyone who is not authenticated to the registry. To block merges without validation and a checked release increment, require the CI checks and the `Release version selection` status in branch protection for `main`.
@@ -147,6 +147,8 @@ For public local installs, make the package public from the GitHub package setti
 ## Version alignment
 
 `pyproject.toml` is the single source for the released semver. For local maintenance you can run `python scripts/sync_version.py --bump patch`, `--bump minor`, `--bump major`, or `--set 1.2.3` to update it and refresh generated deployment defaults. For PR releases, `patch` is selected by default; comment with a different release increment to override it and let the publish workflow update `main` before building the container.
+
+`--check` fails when any generated reference has drifted; `--write` fixes them; `--list-paths` prints every file the script rewrites, which is exactly what the publish workflow stages in the release commit. The managed set covers `pyproject.toml`, the Helm chart and values, every Kubernetes manifest that names an image, all four compose files and `.env.example` — if you add a file that pins `ghcr.io/esatt10/pheasant`, add it to `replacements()` in the same change or `tests/test_version_alignment.py` will fail.
 
 ## Probes and ports
 

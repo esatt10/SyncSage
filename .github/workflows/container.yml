@@ -102,12 +102,21 @@ jobs:
             --package "${IMAGE_NAME}" \
             --token "${GITHUB_TOKEN}"
 
+      # The staged list comes from the script that does the rewriting. It was
+      # hand-maintained, and a hand-maintained copy is the standing trap here:
+      # a file the script rewrites but the workflow never stages is left stale
+      # on main and fails the next `--check` — which is how the compose reset
+      # file ended up three releases behind.
       - name: Commit release version to main
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml deploy/helm/Chart.yaml deploy/helm/values.yaml deploy/kubernetes/deployment.yaml docker-compose.yml pheasant.example.yaml
+          # Assignment rather than a pipe into xargs: in a pipeline only the
+          # last exit code survives, so a failing script would stage nothing
+          # and the error would surface as a confusing empty commit.
+          release_paths="$(python scripts/sync_version.py --list-paths)"
+          git add -- $release_paths
           git commit -m "chore: release ${{ steps.version.outputs.version }} [skip ci]"
           git push origin HEAD:main
 
@@ -118,12 +127,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # `latest` alongside the version tag because the untagged reference in
+      # the README and the setup docs — `docker run … ghcr.io/esatt10/pheasant`
+      # — resolves to `:latest`, and nothing had ever pushed one, so the
+      # headline install command failed with `manifest unknown`. Generated
+      # artifacts still pin the version tag; `latest` exists for the copy-paste
+      # one-liner, not for anything that should be reproducible.
       - name: Push semver image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.image.outputs.ref }}:${{ steps.version.outputs.version }}
+          tags: |
+            ${{ steps.image.outputs.ref }}:${{ steps.version.outputs.version }}
+            ${{ steps.image.outputs.ref }}:latest
 
       # The UI sidecar, from the same commit and under the same version tag.
       # `latest` is pushed too so compose files from older releases (which
