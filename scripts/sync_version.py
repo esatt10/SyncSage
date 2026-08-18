@@ -4,6 +4,7 @@ import argparse
 import json
 import re
 import sys
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,11 @@ class Replacement:
     pattern: re.Pattern[str]
     replacement: str
     label: str
+    #: How many matches the pattern must have. 0 means "every match, and at
+    #: least one" — a file that names the image once per service (the compose
+    #: fleet names it three times) would otherwise be half-rewritten, which is
+    #: worse than not rewriting it at all.
+    occurrences: int = 1
 
 
 def project_version() -> str:
@@ -81,10 +87,17 @@ def bump(version: str, part: str) -> str:
     raise SystemExit(f"Unknown bump part: {part}")
 
 
-def replace_once(text: str, replacement: Replacement) -> tuple[str, bool]:
-    updated, count = replacement.pattern.subn(replacement.replacement, text, count=1)
-    if count != 1:
+def apply_replacement(text: str, replacement: Replacement) -> tuple[str, bool]:
+    updated, count = replacement.pattern.subn(
+        replacement.replacement, text, count=replacement.occurrences
+    )
+    if count == 0:
         raise SystemExit(f"Could not find {replacement.label} in {replacement.path}")
+    if replacement.occurrences and count != replacement.occurrences:
+        raise SystemExit(
+            f"Expected {replacement.occurrences} occurrence(s) of {replacement.label} "
+            f"in {replacement.path}, found {count}"
+        )
     return updated, updated != text
 
 
@@ -92,7 +105,7 @@ def set_pyproject_version(version: str) -> None:
     validate_semver(version)
     path = ROOT / "pyproject.toml"
     text = path.read_text(encoding="utf-8")
-    updated, changed = replace_once(
+    updated, changed = apply_replacement(
         text,
         Replacement(
             path=path.relative_to(ROOT),
@@ -107,6 +120,7 @@ def set_pyproject_version(version: str) -> None:
 
 def replacements(version: str) -> list[Replacement]:
     image = f"ghcr.io/esatt10/pheasant:{version}"
+    ui_image = f"ghcr.io/esatt10/pheasant-ui:{version}"
     return [
         Replacement(
             path=Path("deploy/helm/Chart.yaml"),
@@ -146,7 +160,7 @@ def replacements(version: str) -> list[Replacement]:
         Replacement(
             path=Path("docker-compose.yml"),
             pattern=re.compile(r"ghcr\.io/esatt10/pheasant-ui:[0-9A-Za-z._+-]+"),
-            replacement=f"ghcr.io/esatt10/pheasant-ui:{version}",
+            replacement=ui_image,
             label="Docker Compose UI image",
         ),
         Replacement(
@@ -157,7 +171,67 @@ def replacements(version: str) -> list[Replacement]:
             replacement=rf"\g<1>{version}",
             label="example compose image tag",
         ),
+        # Everything below names a published image in a file someone actually
+        # runs. They were unmanaged until docker-compose.fresh.yml was found
+        # three releases behind on 0.9.0 — a stale default tag is not a typo,
+        # it silently starts an old build that has none of the fixes the
+        # checkout it came with advertises.
+        *_image_reference_replacements(
+            version,
+            {
+                Path("docker-compose.fresh.yml"): 1,
+                Path("docker-compose.scale.yml"): 3,
+                Path("deploy/kubernetes/scaled/api-deployment.yaml"): 1,
+                Path("deploy/kubernetes/scaled/indexer-statefulset.yaml"): 1,
+                Path("deploy/kubernetes/scaled/worker-deployment.yaml"): 1,
+            },
+        ),
+        # Commented-out examples, but they are the values a user copies into a
+        # real .env — and a copied 0.8.0 pins them to 0.8.0.
+        Replacement(
+            path=Path(".env.example"),
+            pattern=re.compile(r"ghcr\.io/esatt10/pheasant:[0-9A-Za-z._+-]+"),
+            replacement=image,
+            label="example .env image",
+        ),
+        Replacement(
+            path=Path(".env.example"),
+            pattern=re.compile(r"ghcr\.io/esatt10/pheasant-ui:[0-9A-Za-z._+-]+"),
+            replacement=ui_image,
+            label="example .env UI image",
+        ),
     ]
+
+
+def _image_reference_replacements(version: str, paths: dict[Path, int]) -> list[Replacement]:
+    """One ``ghcr.io/esatt10/pheasant:<tag>`` rewrite per file.
+
+    The expected occurrence count is spelled out per file rather than inferred:
+    adding a service to the compose fleet without pinning its image would
+    otherwise pass silently, and an unpinned service is the one that drifts.
+    """
+    return [
+        Replacement(
+            path=path,
+            pattern=re.compile(r"ghcr\.io/esatt10/pheasant:[0-9A-Za-z._+-]+"),
+            replacement=f"ghcr.io/esatt10/pheasant:{version}",
+            label="published image reference",
+            occurrences=count,
+        )
+        for path, count in paths.items()
+    ]
+
+
+def managed_paths() -> list[str]:
+    """Every file a release rewrites, pyproject.toml included.
+
+    The publish workflow stages exactly this list. It used to hand-maintain
+    its own copy, which is the standing trap: a file added here but not there
+    is rewritten on the release runner, never committed, and fails the next
+    `--check` on main.
+    """
+    paths = {"pyproject.toml"} | {str(item.path) for item in replacements(project_version())}
+    return sorted(paths)
 
 
 def sync_generated_versions(version: str, write: bool) -> list[str]:
@@ -167,7 +241,7 @@ def sync_generated_versions(version: str, write: bool) -> list[str]:
     for replacement in replacements(version):
         path = ROOT / replacement.path
         original = writes.get(path, path.read_text(encoding="utf-8"))
-        updated, changed = replace_once(original, replacement)
+        updated, changed = apply_replacement(original, replacement)
         writes[path] = updated
         if changed:
             mismatches.append(str(replacement.path))
@@ -273,6 +347,34 @@ def container_tags(package_versions: list[dict]) -> set[str]:
     return tags
 
 
+#: Tags every published package is expected to carry besides its version.
+#: `latest` is what the untagged `docker run ghcr.io/esatt10/pheasant` in the
+#: README resolves to, so its absence is a broken front door, not a detail.
+REQUIRED_FLOATING_TAGS = ("latest",)
+
+
+def check_image_version_published(
+    version: str,
+    existing_tags: set[str],
+    package: str = "pheasant",
+    floating: tuple[str, ...] = REQUIRED_FLOATING_TAGS,
+) -> None:
+    """Assert the registry really holds what the release is about to record.
+
+    The inverse of :func:`check_image_version_increment`, and the reason the
+    release commit now happens last: main pins this version into every compose
+    file and manifest, so recording it before the push has landed is how a
+    checkout ends up referencing an image that does not exist.
+    """
+    missing = [tag for tag in (version, *floating) if tag not in existing_tags]
+    if missing:
+        raise SystemExit(
+            f"{package} is missing published tag(s) {missing} after the push; "
+            f"refusing to record {version} in main. Found: {sorted(existing_tags)[:10]}"
+        )
+    print(f"Verified published: {package}:{version} (and {', '.join(floating)}).")
+
+
 def check_image_version_increment(version: str, existing_tags: set[str]) -> None:
     current = stable_semver_tuple(version)
     if version in existing_tags or f"v{version}" in existing_tags:
@@ -304,6 +406,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--check", action="store_true", help="Check generated version references.")
     parser.add_argument(
+        "--list-paths",
+        dest="list_paths",
+        action="store_true",
+        help="Print every file this script rewrites, one per line.",
+    )
+    parser.add_argument(
         "--write", action="store_true", help="Refresh generated version references."
     )
     parser.add_argument(
@@ -322,11 +430,27 @@ def main(argv: list[str] | None = None) -> int:
             "GHCR semver tags."
         ),
     )
+    parser.add_argument(
+        "--require-ghcr-tags",
+        action="store_true",
+        help="Require the version (and latest) to already be published for --package.",
+    )
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=6,
+        help="Attempts for --require-ghcr-tags; the packages API can lag a push.",
+    )
     parser.add_argument("--owner", help="GitHub owner that owns the container package.")
     parser.add_argument("--package", default="pheasant", help="GitHub container package name.")
     parser.add_argument("--token", help="GitHub token for package tag lookup.")
     parser.add_argument("--api-url", default="https://api.github.com", help="GitHub API base URL.")
     args = parser.parse_args(argv)
+
+    if args.list_paths:
+        for managed in managed_paths():
+            print(managed)
+        return 0
 
     version = project_version()
     if args.bump and args.set_version:
@@ -356,6 +480,26 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--owner is required with --check-ghcr-tags")
         versions = fetch_container_versions(args.owner, args.package, args.token, args.api_url)
         check_image_version_increment(version, container_tags(versions))
+
+    if args.require_ghcr_tags:
+        if not args.owner:
+            raise SystemExit("--owner is required with --require-ghcr-tags")
+        # The packages API can trail a push by a few seconds, and a release
+        # that fails here has already published — so retry before concluding
+        # the push did not land.
+        for attempt in range(1, max(1, args.attempts) + 1):
+            tags = container_tags(
+                fetch_container_versions(args.owner, args.package, args.token, args.api_url)
+            )
+            if version in tags and all(tag in tags for tag in REQUIRED_FLOATING_TAGS):
+                break
+            if attempt < max(1, args.attempts):
+                print(
+                    f"{args.package}:{version} not visible yet (attempt {attempt}); retrying.",
+                    file=sys.stderr,
+                )
+                time.sleep(5)
+        check_image_version_published(version, tags, package=args.package)
     return 0
 
 

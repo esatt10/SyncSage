@@ -111,7 +111,7 @@ Useful flags:
 pheasant host ~/notes --ui-port 9090        # move the UI off 8080
 pheasant host ~/notes --no-ui               # API + MCP only
 pheasant host ~/notes --print-only          # write the compose file, run it yourself
-pheasant host ~/notes --ui-image ghcr.io/esatt10/pheasant-ui:0.5.1   # pin a published bundle
+pheasant host ~/notes --ui-image ghcr.io/esatt10/pheasant-ui:<version>  # pin a published bundle
 ```
 
 Which UI bundle you get:

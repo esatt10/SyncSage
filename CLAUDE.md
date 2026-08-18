@@ -319,6 +319,39 @@ Each of these cost real time. They are listed because the shape recurs.
 - **A live run finds what the suite cannot.** Container-only bugs have surfaced
   four separate times — read-only mounts, cross-process registry visibility,
   a crash on real-world malformed input. Run the real thing.
+- **Deleting a `sys.path` hack breaks whatever was quietly relying on it.**
+  The root `sitecustomize.py` put `src/` on the path for anything started from
+  a checkout, so CI's container job ran `python -m pheasant` without ever
+  installing the package. Removing the shim (right call) turned that into
+  "No module named pheasant" in a job whose name says *container*, and the
+  publish workflow then skipped silently because it only fires on green CI.
+- **A version reference nothing rewrites is a version reference that rots.**
+  `sync_version.py` rewrote the files it happened to list, so every compose
+  file and manifest added later started outside the net — `docker-compose.fresh.yml`
+  sat three releases behind on a tag users actually pulled. The list of files
+  to stage in the release commit is now derived from the script, not pasted
+  into the workflow, and `tests/test_version_alignment.py` scans the files
+  themselves rather than trusting either list.
+- **An image tag the docs name must be a tag something pushes.** The README's
+  headline `docker run … ghcr.io/esatt10/pheasant` means `:latest`, and only
+  the UI image had ever published one.
+- **Record a release only after the registry has it.** The publish job used to
+  commit the new version to `main` — into every compose file and manifest —
+  before logging in to GHCR, so a failed push left main naming an image that
+  never existed. Pushing first inverts the failure into a harmless one: an
+  unrecorded image is skipped, because the next increment is computed from
+  `max(pyproject, highest published tag)`.
+- **A release covers every commit since the last one, not just the last PR.**
+  The increment was resolved from `workflow_run.head_sha` alone, so a merge
+  that a red CI left unpublished contributed nothing to the version even
+  though its code shipped in the next image — a `minor` silently became a
+  `patch`. The range is now every commit since the last `chore: release`, and
+  the strongest increment among those PRs wins.
+- **A skipped job is invisible; a failing one is not.** `container.yml` gated
+  its whole job on `workflow_run.conclusion == 'success'`, so a red CI on main
+  published nothing and reported it as a *skipped* run — indistinguishable
+  from having nothing to do. #52 sat live on main with no image for four days
+  behind that skip.
 
 ---
 

@@ -33,15 +33,39 @@ jobs:
   publish:
     name: Publish container image
     runs-on: ubuntu-latest
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push'
+    # Deliberately not gated on the CI conclusion: a merge that leaves main
+    # live with no matching image is exactly the event worth seeing, and as a
+    # skipped job it was invisible — #52 sat unpublished for four days that way.
+    # The first step below turns it into a red run that names the commit.
+    if: github.event.workflow_run.event == 'push'
 
     steps:
+      - name: Require a green CI run
+        shell: bash
+        run: |
+          conclusion="${{ github.event.workflow_run.conclusion }}"
+          sha="${{ github.event.workflow_run.head_sha }}"
+          if [ "$conclusion" = "success" ]; then
+            echo "CI succeeded for ${sha}; publishing."
+            exit 0
+          fi
+          {
+            echo "### No container published for \`${sha}\`"
+            echo
+            echo "CI concluded \`${conclusion}\`, so main is live at this commit"
+            echo "with no image that matches it. The next green merge publishes"
+            echo "main's head, and its increment covers this commit too."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::CI concluded '${conclusion}' for ${sha}; nothing was published."
+          exit 1
+
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           ref: main
+          # The release range is "every commit since the last `chore: release`",
+          # which a depth-1 checkout cannot see.
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -71,14 +95,39 @@ jobs:
       - name: Check version alignment
         run: python scripts/sync_version.py --check
 
+      # The increment must cover everything this image makes newly live, not
+      # just the PR that happened to merge last. A red CI leaves its merge on
+      # main unpublished; the next green release ships that code too, so a
+      # `minor` asked for by the skipped PR must not be demoted to the `patch`
+      # the latest PR asked for. The range is every commit since the last
+      # recorded release, and `chore: release` commits carry no PR of their own
+      # and drop out.
       - name: Resolve release increment
         id: release
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          last_release="$(git log --format='%H %s' | grep -m1 -F ' chore: release ' | cut -d' ' -f1 || true)"
+          if [ -n "$last_release" ]; then
+            range="${last_release}..HEAD"
+          else
+            range="HEAD"
+          fi
+          echo "Release range: ${range}"
+
+          sha_args=()
+          while read -r sha; do
+            [ -n "$sha" ] && sha_args+=(--sha "$sha")
+          done < <(git log --format=%H "$range")
+          if [ ${#sha_args[@]} -eq 0 ]; then
+            echo "::error::No commits in ${range}; nothing to release."
+            exit 1
+          fi
+
           python scripts/release_version.py merged-pr-bump \
             --repo "${GITHUB_REPOSITORY}" \
-            --sha "${{ github.event.workflow_run.head_sha }}" \
+            "${sha_args[@]}" \
             --owner "${GITHUB_REPOSITORY_OWNER}" \
             --package "${IMAGE_NAME}" \
             --token "${GITHUB_TOKEN}"
@@ -102,15 +151,6 @@ jobs:
             --package "${IMAGE_NAME}" \
             --token "${GITHUB_TOKEN}"
 
-      - name: Commit release version to main
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml deploy/helm/Chart.yaml deploy/helm/values.yaml deploy/kubernetes/deployment.yaml docker-compose.yml pheasant.example.yaml
-          git commit -m "chore: release ${{ steps.version.outputs.version }} [skip ci]"
-          git push origin HEAD:main
-
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -118,12 +158,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # `latest` alongside the version tag because the untagged reference in
+      # the README and the setup docs — `docker run … ghcr.io/esatt10/pheasant`
+      # — resolves to `:latest`, and nothing had ever pushed one, so the
+      # headline install command failed with `manifest unknown`. Generated
+      # artifacts still pin the version tag; `latest` exists for the copy-paste
+      # one-liner, not for anything that should be reproducible.
       - name: Push semver image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.image.outputs.ref }}:${{ steps.version.outputs.version }}
+          tags: |
+            ${{ steps.image.outputs.ref }}:${{ steps.version.outputs.version }}
+            ${{ steps.image.outputs.ref }}:latest
 
       # The UI sidecar, from the same commit and under the same version tag.
       # `latest` is pushed too so compose files from older releases (which
@@ -136,3 +184,58 @@ jobs:
           tags: |
             ${{ steps.image.outputs.ui_ref }}:${{ steps.version.outputs.version }}
             ${{ steps.image.outputs.ui_ref }}:latest
+
+      # Read back what the registry actually holds before main is allowed to
+      # name it. `--check-ghcr-tags` above proved the version was free; this
+      # proves the push filled it, for both packages and for `latest` too.
+      - name: Verify the published tags are live
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for package in "${IMAGE_NAME}" "${UI_IMAGE_NAME}"; do
+            python scripts/sync_version.py \
+              --require-ghcr-tags \
+              --owner "${GITHUB_REPOSITORY_OWNER}" \
+              --package "${package}" \
+              --token "${GITHUB_TOKEN}"
+          done
+
+      # Last, and deliberately so. This commit pins the new version into every
+      # compose file and manifest on main, so it must not run until the images
+      # it names are live — a commit ahead of a failed push leaves main
+      # referencing a tag that never existed, in files people apply directly.
+      # The other order is safe to fail: an image published without its commit
+      # is simply skipped, because the next release increments from
+      # max(pyproject, highest published tag).
+      #
+      # The staged list comes from the script that does the rewriting. It was
+      # hand-maintained, and a hand-maintained copy is the standing trap here:
+      # a file the script rewrites but the workflow never stages is left stale
+      # on main and fails the next `--check` — which is how the compose reset
+      # file ended up three releases behind.
+      - name: Commit release version to main
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Assignment rather than a pipe into xargs: in a pipeline only the
+          # last exit code survives, so a failing script would stage nothing
+          # and the error would surface as a confusing empty commit.
+          release_paths="$(python scripts/sync_version.py --list-paths)"
+          git add -- $release_paths
+          git commit -m "chore: release ${{ steps.version.outputs.version }} [skip ci]"
+          # main can move while the images build, and that window is wider now
+          # that the push runs first. Abandoning the commit is not an option —
+          # the images are live, so main would keep naming the previous
+          # version — and rebasing is safe because the commit only touches
+          # version-reference files.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "main moved; rebasing the release commit (attempt ${attempt})"
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; exit 1; }
+          done
+          echo "could not push the release commit to main after 3 attempts"
+          exit 1

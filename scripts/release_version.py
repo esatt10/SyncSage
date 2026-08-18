@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -345,6 +345,43 @@ def validate_pr_selection(args: argparse.Namespace) -> int:
     return 0
 
 
+def strongest_bump(selections: Iterable[str]) -> str | None:
+    """The largest increment among several PRs.
+
+    A release covers every commit since the last one, which is usually a
+    single PR but is more whenever a red CI left an earlier merge unpublished.
+    Those changes ship in this image too, so a PR that asked for `minor` must
+    not be reduced to `patch` because the PR that happened to merge last only
+    asked for that.
+    """
+    ranked = [item for item in selections if item in BUMP_ORDER]
+    return min(ranked, key=BUMP_ORDER.index) if ranked else None
+
+
+def pr_release_selections(
+    repo: str,
+    shas: list[str],
+    token: str,
+    api_url: str,
+) -> dict[int, str]:
+    """The release increment each unpublished PR asked for, by PR number.
+
+    Commits with no associated pull request — the `chore: release` commits the
+    publish workflow itself pushes — contribute nothing and are skipped.
+    """
+    selections: dict[int, str] = {}
+    for sha in shas:
+        pr = merged_pr_for_commit(repo, sha, token, api_url)
+        if pr is None:
+            continue
+        number = int(pr["number"])
+        if number in selections:
+            continue
+        selected = selected_release_bump(comments_for_pr(repo, number, token, api_url))
+        selections[number] = selected[0] if selected else DEFAULT_BUMP
+    return selections
+
+
 def merged_pr_for_commit(repo: str, sha: str, token: str, api_url: str) -> dict[str, Any] | None:
     pulls = github_api(
         "GET",
@@ -358,27 +395,40 @@ def merged_pr_for_commit(repo: str, sha: str, token: str, api_url: str) -> dict[
 
 
 def print_merged_pr_bump(args: argparse.Namespace) -> int:
-    pr = merged_pr_for_commit(args.repo, args.sha, args.token, args.api_url)
-    if pr is None:
-        raise SystemExit(f"No pull request is associated with merge commit {args.sha}.")
-    number = int(pr["number"])
-    comments = comments_for_pr(args.repo, number, args.token, args.api_url)
+    """Resolve the increment for everything this release makes newly live.
+
+    ``--sha`` is repeatable and carries every commit since the last recorded
+    release, newest first. That is one PR on a healthy main; it is more when a
+    red CI left an earlier merge unpublished, and the image about to be built
+    contains those commits whether or not they ever got a release of their own.
+    """
+    shas = args.sha if isinstance(args.sha, list) else [args.sha]
+    selections = pr_release_selections(args.repo, shas, args.token, args.api_url)
+    if not selections:
+        raise SystemExit(f"No pull request is associated with any of: {', '.join(shas)}.")
+
+    bump_part = strongest_bump(selections.values())
+    if not bump_part:
+        raise SystemExit(f"No valid release increment for PR(s) {sorted(selections)}.")
+
     tags = container_tags(
         fetch_container_versions(args.owner, args.package, args.token, args.api_url)
     )
     options = release_options(tags)
-    bump_part, _defaulted = effective_release_bump(comments, options)
-    if not bump_part:
-        raise SystemExit(f"PR #{number} does not have a valid release increment.")
     if bump_part not in options:
-        raise SystemExit(f"Selected {bump_part} increment is no longer valid for PR #{number}.")
+        raise SystemExit(
+            f"Selected {bump_part} increment is no longer valid for PR(s) {sorted(selections)}."
+        )
     version = options[bump_part]
+
+    covered = ", ".join(f"#{number} ({part})" for number, part in sorted(selections.items()))
     if args.github_output:
         with Path(args.github_output).open("a", encoding="utf-8") as output:
             output.write(f"bump={bump_part}\n")
-            output.write(f"pr={number}\n")
+            output.write(f"pr={max(selections)}\n")
+            output.write(f"prs={','.join(str(number) for number in sorted(selections))}\n")
             output.write(f"version={version}\n")
-    print(f"Resolved release increment from PR #{number}: {bump_part} -> {version}")
+    print(f"Release covers {covered}; strongest increment {bump_part} -> {version}")
     return 0
 
 
@@ -396,7 +446,7 @@ def main(argv: list[str] | None = None) -> int:
 
     merged = sub.add_parser("merged-pr-bump")
     merged.add_argument("--repo", required=True)
-    merged.add_argument("--sha", required=True)
+    merged.add_argument("--sha", required=True, action="append")
     merged.add_argument("--owner", required=True)
     merged.add_argument("--package", default="pheasant")
     merged.add_argument("--token", required=True)
