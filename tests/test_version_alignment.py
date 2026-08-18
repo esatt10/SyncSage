@@ -16,7 +16,11 @@ from pathlib import Path
 
 import pytest
 import yaml
-from scripts.sync_version import check_image_version_increment, managed_paths
+from scripts.sync_version import (
+    check_image_version_increment,
+    check_image_version_published,
+    managed_paths,
+)
 
 from pheasant.version import __version__
 from tests.conftest import REPO_ROOT
@@ -217,3 +221,55 @@ def test_the_container_ci_job_installs_the_cli_it_runs() -> None:
     installs = [i for i, run in enumerate(scripts) if re.search(r"pip install\b.*\s\.", run)]
     assert installs, "the container job never installs the package"
     assert min(installs) < runs_cli, "the package is installed after the step that needs it"
+
+
+# --------------------------------------------------------------------------
+# The release records only what the registry actually holds
+# --------------------------------------------------------------------------
+
+
+def test_published_check_accepts_a_version_that_is_live() -> None:
+    check_image_version_published("1.2.3", {"1.2.3", "latest", "sha-deadbeef"})
+
+
+def test_published_check_rejects_a_version_the_push_never_landed() -> None:
+    with pytest.raises(SystemExit, match="missing published tag"):
+        check_image_version_published("1.2.3", {"1.2.2", "latest"})
+
+
+def test_published_check_rejects_a_missing_latest() -> None:
+    """`latest` is the tag the README's untagged `docker run` resolves to."""
+
+    with pytest.raises(SystemExit, match="missing published tag"):
+        check_image_version_published("1.2.3", {"1.2.3"})
+
+
+def test_the_release_commit_runs_only_after_the_images_are_live() -> None:
+    """main pins the new version into files people apply directly.
+
+    Recording it before the push has landed is what leaves every compose file
+    and manifest on main naming an image that does not exist. Publishing
+    without the commit is the recoverable direction: the next release
+    increments from max(pyproject, highest published tag), so an unrecorded
+    image is skipped rather than dangling.
+    """
+
+    names = [step.get("name") for step in _publish_job()["steps"]]
+    commit = names.index("Commit release version to main")
+    verify = names.index("Verify the published tags are live")
+
+    for pushing in ("Push semver image", "Push UI image"):
+        assert names.index(pushing) < commit, f"{pushing} must run before the release commit"
+    assert verify < commit, "the registry must be read back before main records the version"
+
+
+def test_the_release_commit_survives_main_moving_under_it() -> None:
+    """The images are already live by then, so giving up is not an option.
+
+    A dropped release commit leaves main naming the *previous* version while
+    the registry holds a newer one that nothing references.
+    """
+
+    commit = _step(_publish_job(), "Commit release version to main")["run"]
+    assert "git rebase origin/main" in commit
+    assert "git fetch origin main" in commit

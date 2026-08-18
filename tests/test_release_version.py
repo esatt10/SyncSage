@@ -3,10 +3,12 @@ from __future__ import annotations
 from scripts.release_version import (
     effective_release_bump,
     normalize_bump_selection,
+    release_base_version,
     release_options,
     render_prompt,
     selected_release_bump,
 )
+from scripts.sync_version import project_version
 
 
 def test_normalize_bump_selection_accepts_words_and_numbers() -> None:
@@ -60,3 +62,41 @@ def test_release_options_are_incremented_from_highest_existing_tag() -> None:
         "minor": "1.3.0",
         "patch": "1.2.4",
     }
+
+
+# --------------------------------------------------------------------------
+# The increment is anchored to whichever is further ahead
+# --------------------------------------------------------------------------
+
+
+def test_the_base_version_follows_the_registry_when_it_is_ahead() -> None:
+    """A published image main never recorded must not be handed out twice.
+
+    This is the direction that happens when the release commit fails after the
+    images are pushed — the order the publish workflow deliberately runs in.
+    """
+
+    ahead = _bumped_major(project_version())
+    assert release_base_version({ahead, "latest"}) == ahead
+    assert ahead not in set(release_options({ahead, "latest"}).values())
+
+
+def test_the_base_version_follows_pyproject_when_it_is_ahead() -> None:
+    """And this is the direction a partially-failed older release left behind.
+
+    pyproject ahead of the registry means a version was recorded but never
+    published; the next release must step past it rather than reissue it.
+    """
+
+    behind = "0.0.1"
+    assert release_base_version({behind, "latest"}) == project_version()
+
+
+def test_the_first_release_of_a_package_has_no_published_tags() -> None:
+    assert release_base_version(set()) == project_version()
+    assert release_options(set())["patch"] != project_version()
+
+
+def _bumped_major(version: str) -> str:
+    major, _, _ = version.split(".")
+    return f"{int(major) + 1}.0.0"

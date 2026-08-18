@@ -102,24 +102,6 @@ jobs:
             --package "${IMAGE_NAME}" \
             --token "${GITHUB_TOKEN}"
 
-      # The staged list comes from the script that does the rewriting. It was
-      # hand-maintained, and a hand-maintained copy is the standing trap here:
-      # a file the script rewrites but the workflow never stages is left stale
-      # on main and fails the next `--check` — which is how the compose reset
-      # file ended up three releases behind.
-      - name: Commit release version to main
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Assignment rather than a pipe into xargs: in a pipeline only the
-          # last exit code survives, so a failing script would stage nothing
-          # and the error would surface as a confusing empty commit.
-          release_paths="$(python scripts/sync_version.py --list-paths)"
-          git add -- $release_paths
-          git commit -m "chore: release ${{ steps.version.outputs.version }} [skip ci]"
-          git push origin HEAD:main
-
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -153,3 +135,58 @@ jobs:
           tags: |
             ${{ steps.image.outputs.ui_ref }}:${{ steps.version.outputs.version }}
             ${{ steps.image.outputs.ui_ref }}:latest
+
+      # Read back what the registry actually holds before main is allowed to
+      # name it. `--check-ghcr-tags` above proved the version was free; this
+      # proves the push filled it, for both packages and for `latest` too.
+      - name: Verify the published tags are live
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for package in "${IMAGE_NAME}" "${UI_IMAGE_NAME}"; do
+            python scripts/sync_version.py \
+              --require-ghcr-tags \
+              --owner "${GITHUB_REPOSITORY_OWNER}" \
+              --package "${package}" \
+              --token "${GITHUB_TOKEN}"
+          done
+
+      # Last, and deliberately so. This commit pins the new version into every
+      # compose file and manifest on main, so it must not run until the images
+      # it names are live — a commit ahead of a failed push leaves main
+      # referencing a tag that never existed, in files people apply directly.
+      # The other order is safe to fail: an image published without its commit
+      # is simply skipped, because the next release increments from
+      # max(pyproject, highest published tag).
+      #
+      # The staged list comes from the script that does the rewriting. It was
+      # hand-maintained, and a hand-maintained copy is the standing trap here:
+      # a file the script rewrites but the workflow never stages is left stale
+      # on main and fails the next `--check` — which is how the compose reset
+      # file ended up three releases behind.
+      - name: Commit release version to main
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Assignment rather than a pipe into xargs: in a pipeline only the
+          # last exit code survives, so a failing script would stage nothing
+          # and the error would surface as a confusing empty commit.
+          release_paths="$(python scripts/sync_version.py --list-paths)"
+          git add -- $release_paths
+          git commit -m "chore: release ${{ steps.version.outputs.version }} [skip ci]"
+          # main can move while the images build, and that window is wider now
+          # that the push runs first. Abandoning the commit is not an option —
+          # the images are live, so main would keep naming the previous
+          # version — and rebasing is safe because the commit only touches
+          # version-reference files.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "main moved; rebasing the release commit (attempt ${attempt})"
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; exit 1; }
+          done
+          echo "could not push the release commit to main after 3 attempts"
+          exit 1

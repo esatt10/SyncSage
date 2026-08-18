@@ -4,6 +4,7 @@ import argparse
 import json
 import re
 import sys
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -346,6 +347,34 @@ def container_tags(package_versions: list[dict]) -> set[str]:
     return tags
 
 
+#: Tags every published package is expected to carry besides its version.
+#: `latest` is what the untagged `docker run ghcr.io/esatt10/pheasant` in the
+#: README resolves to, so its absence is a broken front door, not a detail.
+REQUIRED_FLOATING_TAGS = ("latest",)
+
+
+def check_image_version_published(
+    version: str,
+    existing_tags: set[str],
+    package: str = "pheasant",
+    floating: tuple[str, ...] = REQUIRED_FLOATING_TAGS,
+) -> None:
+    """Assert the registry really holds what the release is about to record.
+
+    The inverse of :func:`check_image_version_increment`, and the reason the
+    release commit now happens last: main pins this version into every compose
+    file and manifest, so recording it before the push has landed is how a
+    checkout ends up referencing an image that does not exist.
+    """
+    missing = [tag for tag in (version, *floating) if tag not in existing_tags]
+    if missing:
+        raise SystemExit(
+            f"{package} is missing published tag(s) {missing} after the push; "
+            f"refusing to record {version} in main. Found: {sorted(existing_tags)[:10]}"
+        )
+    print(f"Verified published: {package}:{version} (and {', '.join(floating)}).")
+
+
 def check_image_version_increment(version: str, existing_tags: set[str]) -> None:
     current = stable_semver_tuple(version)
     if version in existing_tags or f"v{version}" in existing_tags:
@@ -401,6 +430,17 @@ def main(argv: list[str] | None = None) -> int:
             "GHCR semver tags."
         ),
     )
+    parser.add_argument(
+        "--require-ghcr-tags",
+        action="store_true",
+        help="Require the version (and latest) to already be published for --package.",
+    )
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=6,
+        help="Attempts for --require-ghcr-tags; the packages API can lag a push.",
+    )
     parser.add_argument("--owner", help="GitHub owner that owns the container package.")
     parser.add_argument("--package", default="pheasant", help="GitHub container package name.")
     parser.add_argument("--token", help="GitHub token for package tag lookup.")
@@ -440,6 +480,26 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--owner is required with --check-ghcr-tags")
         versions = fetch_container_versions(args.owner, args.package, args.token, args.api_url)
         check_image_version_increment(version, container_tags(versions))
+
+    if args.require_ghcr_tags:
+        if not args.owner:
+            raise SystemExit("--owner is required with --require-ghcr-tags")
+        # The packages API can trail a push by a few seconds, and a release
+        # that fails here has already published — so retry before concluding
+        # the push did not land.
+        for attempt in range(1, max(1, args.attempts) + 1):
+            tags = container_tags(
+                fetch_container_versions(args.owner, args.package, args.token, args.api_url)
+            )
+            if version in tags and all(tag in tags for tag in REQUIRED_FLOATING_TAGS):
+                break
+            if attempt < max(1, args.attempts):
+                print(
+                    f"{args.package}:{version} not visible yet (attempt {attempt}); retrying.",
+                    file=sys.stderr,
+                )
+                time.sleep(5)
+        check_image_version_published(version, tags, package=args.package)
     return 0
 
 

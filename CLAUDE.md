@@ -335,6 +335,12 @@ Each of these cost real time. They are listed because the shape recurs.
 - **An image tag the docs name must be a tag something pushes.** The README's
   headline `docker run … ghcr.io/esatt10/pheasant` means `:latest`, and only
   the UI image had ever published one.
+- **Record a release only after the registry has it.** The publish job used to
+  commit the new version to `main` — into every compose file and manifest —
+  before logging in to GHCR, so a failed push left main naming an image that
+  never existed. Pushing first inverts the failure into a harmless one: an
+  unrecorded image is skipped, because the next increment is computed from
+  `max(pyproject, highest published tag)`.
 
 ---
 
