@@ -1,0 +1,38 @@
+# Config for the worker tier. Separate from fleet.yaml for one reason that
+# matters: a worker must not carry the database DSN, the connector
+# credentials, or the source list. It receives a file's bytes and a
+# whitelisted parse config and returns chunks — that is the whole trust
+# boundary, and a config it does not need would widen it for free.
+pheasant:
+  name: compose-fleet-worker
+  environment: compose
+  log_level: INFO
+  # A worker never reads or writes authoritative state. These exist because
+  # the process expects the paths, not because anything durable lives here.
+  state_path: /state
+  workspace_root: /workspace
+  exports_path: /exports
+server:
+  host: 0.0.0.0
+  port: 8765
+  mcp:
+    enabled: false
+  api:
+    enabled: true
+    openapi: false
+    max_concurrent_requests: 32
+    drain_seconds: 5
+  ui:
+    enabled: false
+sync:
+  watcher:
+    enabled: false
+  scheduler:
+    enabled: false
+  concurrency:
+    # Without this the preparation routes 404 — and every batch would fall
+    # back to local parsing on the indexer, which still works and would make
+    # the whole worker tier a silent no-op.
+    remote_worker_enabled: true
+    remote_worker_token_env: PHEASANT_INDEX_WORKER_TOKEN
+sources: []

@@ -135,7 +135,7 @@ Two things worth knowing before you choose it:
 It is also not a speed penalty. The tokenizer is a tight byte loop, so the
 compiled guest is roughly **3x faster** than the pure-Python `builtin` reader
 on a typical document and ~11x faster on the scan itself. See the fidelity
-trade-off in [Configuration](../configuration.md#ingestionextractor-pdfdocx-text)
+trade-off in [Configuration](../configuration.md#ingestionextractor-document-text)
 — `sandboxed`/`builtin` do not handle encrypted PDFs or Type0/CID font CMaps.
 
 ## HTML

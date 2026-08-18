@@ -10,12 +10,12 @@ def test_layered_config_profile_and_overrides(config_path: Path) -> None:
     cfg = load_layered_config(
         config_path,
         profile="team",
-        overrides=parse_override_pairs(["server.port=9999", "obsidian.template_profile=research"]),
+        overrides=parse_override_pairs(["server.port=9999", "search.default_mode=vector"]),
     )
 
     assert cfg.server.port == 9999
     assert cfg.pheasant.environment == "team"
-    assert cfg.obsidian.template_profile == "research"
+    assert cfg.search.default_mode == "vector"
     assert {source.name for source in cfg.sources} == {
         "pheasant-repo",
         "architecture-notes",
@@ -27,7 +27,9 @@ def test_init_config_rendering_is_profile_aware() -> None:
     rendered = render_init_config("dev")
 
     assert "pheasant dev profile configuration" in rendered
-    assert "template_profile: engineering" in rendered
+    # Profile-specific values, not schema defaults: `dev` sets both of these.
+    assert "environment: dev" in rendered
+    assert "log_level: DEBUG" in rendered
     assert "sources: []" in rendered
 
 

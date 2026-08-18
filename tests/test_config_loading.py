@@ -27,7 +27,7 @@ def _source_names(config: object) -> set[str]:
 
 
 def test_config_loads_example_yaml_with_expected_sources(
-    loaded_config: object, state_path: Path, vault_path: Path
+    loaded_config: object, state_path: Path
 ) -> None:
     """The rendered example config should load and preserve configured paths/sources."""
 
@@ -41,9 +41,7 @@ def test_config_loads_example_yaml_with_expected_sources(
         _get(loaded_config, "pheasant") if isinstance(loaded_config, Mapping) else loaded_config
     )
     state_value = str(_get(settings, "state_path"))
-    vault_value = str(_get(settings, "vault_path"))
     assert str(state_path) in state_value
-    assert str(vault_path) in vault_value
 
 
 def test_config_validation_reports_missing_source_path(tmp_path: Path, config_path: Path) -> None:
@@ -104,7 +102,7 @@ def test_graph_section_of_the_yaml_is_actually_applied() -> None:
 
     Regression test: `graph=build(GraphSettings, data.get("graph"))` was
     missing from `model_validate`'s constructor call, so ANY `graph:`
-    section in a config file — `concept_min_documents`,
+    section in a config file — `memory_entity_bridging`,
     `wasm_cross_source_resolution` — was silently discarded in favor of
     `GraphSettings()` defaults, with no error and no test catching it.
     Found live: `docker-compose`-deployed config showed
@@ -117,12 +115,12 @@ def test_graph_section_of_the_yaml_is_actually_applied() -> None:
         {
             "pheasant": {"name": "graph-section-regression"},
             "graph": {
-                "concept_min_documents": 5,
+                "memory_entity_bridging": False,
                 "wasm_cross_source_resolution": True,
             },
         }
     )
-    assert config.graph.concept_min_documents == 5
+    assert config.graph.memory_entity_bridging is False
     assert config.graph.wasm_cross_source_resolution is True
 
 
@@ -167,57 +165,64 @@ def test_example_config_declares_the_document_extractor() -> None:
     assert extractor.get("html_text") is False
 
 
-def test_yaml_shim_strips_trailing_comments_like_pyyaml() -> None:
-    """The dependency-light YAML shim must drop trailing `# ...` comments.
+def test_config_with_removed_obsidian_settings_still_loads(tmp_path: Path) -> None:
+    """A pre-removal config must keep loading, not hard-fail.
 
-    Regression test: it stripped whole-line comments but not trailing ones, so
-    every annotated value in `pheasant.example.yaml` parsed with the comment
-    glued on — `max_files: 50000  # ...` became a *string*, and
-    `follow_symlinks: false  # ...` became a non-empty (therefore **truthy**)
-    string, silently inverting a safety default wherever this shim stands in
-    for PyYAML.
+    The Obsidian projection went away, but the YAML files describing it are
+    user data sitting on real disks. `model_validate` drops unknown keys on
+    its own, so what this pins is that the removal is *reported* rather than
+    silently ignored.
     """
-    import yaml
 
-    parsed = yaml.safe_load(
-        "limits:\n"
-        "  max_files: 50000        # matching files\n"
-        "  follow_symlinks: false  # links escape or loop\n"
-        "  label: red#1\n"
-        '  quoted: "has # inside"\n'
+    from pheasant.config.loader import (
+        REMOVED_SETTINGS,
+        load_config,
+        load_layered_config,
+        warn_on_removed_settings,
     )
-    limits = parsed["limits"]
-    assert limits["max_files"] == 50000
-    assert limits["follow_symlinks"] is False
-    assert limits["label"] == "red#1"  # '#' without leading space is literal
-    assert limits["quoted"] == "has # inside"  # '#' inside quotes is literal
 
-
-def test_yaml_shim_keeps_urls_in_lists_as_strings_like_pyyaml() -> None:
-    """A colon only separates a YAML key when followed by space or EOL.
-
-    Regression test: the shim split list items on *any* colon, so
-    `- http://host:8765` parsed as `{"http": "//host:8765"}` — silently
-    turning every list-of-URL config into a list of dicts wherever this shim
-    stands in for PyYAML. `server.api.cors_origins` is the one that caught it
-    (a dict there breaks CORS *and* the MCP transport guard derived from it),
-    but the same shape appears anywhere a URL is listed.
-    """
-    import yaml
-
-    parsed = yaml.safe_load(
-        "server:\n"
-        "  api:\n"
-        "    cors_origins:\n"
-        "      - http://localhost:8765\n"
-        "      - https://pheasant.internal:443\n"
-        "sources:\n"
-        "  - name: repo\n"
-        "    type: git_repository\n"
+    config_path = tmp_path / "legacy.yaml"
+    config_path.write_text(
+        "pheasant:\n"
+        "  name: legacy-kb\n"
+        f"  state_path: {tmp_path / 'state'}\n"
+        f"  vault_path: {tmp_path / 'vault'}\n"
+        f"  exports_path: {tmp_path / 'exports'}\n"
+        f"  workspace_root: {tmp_path}\n"
+        "obsidian:\n"
+        "  enabled: true\n"
+        "  template_profile: engineering\n"
+        "sources: []\n",
+        encoding="utf-8",
     )
-    assert parsed["server"]["api"]["cors_origins"] == [
-        "http://localhost:8765",
-        "https://pheasant.internal:443",
-    ]
-    # A genuine mapping item (colon *then space*) still parses as a mapping.
-    assert parsed["sources"] == [{"name": "repo", "type": "git_repository"}]
+
+    config = load_config(config_path)
+    assert config.pheasant.name == "legacy-kb"
+    assert not hasattr(config, "obsidian")
+    assert not hasattr(config.pheasant, "vault_path")
+
+    # Both loaders report both removed keys, and every key carries guidance.
+    raw = {"pheasant": {"vault_path": "/vault"}, "obsidian": {"enabled": True}}
+    assert sorted(warn_on_removed_settings(raw)) == ["obsidian", "pheasant.vault_path"]
+    assert all(REMOVED_SETTINGS[key] for key in REMOVED_SETTINGS)
+
+    layered = load_layered_config(config_path, profile="dev", overrides={})
+    assert layered.pheasant.name == "legacy-kb"
+
+
+def test_removed_setting_warning_is_logged_once_per_process(tmp_path: Path, caplog: object) -> None:
+    """Config is re-read constantly; a notice that repeats gets filtered out."""
+
+    import logging
+
+    from pheasant.config import loader as loader_module
+
+    loader_module._WARNED.discard("obsidian")
+    raw = {"obsidian": {"enabled": True}}
+    with caplog.at_level(logging.WARNING, logger="pheasant.config.loader"):  # type: ignore[attr-defined]
+        loader_module.warn_on_removed_settings(raw)
+        loader_module.warn_on_removed_settings(raw)
+
+    obsidian_warnings = [r for r in caplog.records if "obsidian" in r.getMessage()]  # type: ignore[attr-defined]
+    assert len(obsidian_warnings) == 1
+    assert "graph workspace" in obsidian_warnings[0].getMessage()

@@ -3,7 +3,6 @@ deployment:
     image_repository: ghcr.io/esatt10/pheasant
     image_tag: 0.9.3
     workspace_path: .
-    vault_path: ./vault
 
 pheasant:
   name: local-pheasant
@@ -11,13 +10,23 @@ pheasant:
   environment: local
   log_level: INFO
   state_path: /state
-  vault_path: /vault
   workspace_root: /workspace
   exports_path: /exports
 
 server:
   host: 0.0.0.0
   port: 8765
+  # Which jobs this process takes on. `all` is the default and is what a
+  # single container should stay on. In a fleet, split them so N serving
+  # replicas do not each watch the same directories and each try to index the
+  # same source:
+  #   all      — serve, watch, schedule, index (one container)
+  #   api      — serve only; publishes index work instead of running it, so
+  #              it REQUIRES sync.queue.enabled and an indexer on that queue
+  #   indexer  — watch, schedule and drain the queue (one per shard)
+  #   worker   — preparation only (see sync.concurrency.remote_worker_enabled)
+  # `pheasant serve --role <name>` overrides this.
+  role: all
   mcp:
     enabled: true
     transports:
@@ -43,6 +52,26 @@ server:
     # Restores the old `*` behavior. Only for deployments fronted by an
     # ingress that authenticates before the request reaches pheasant.
     cors_allow_all_origins: false
+    # Requests in flight before the surplus is refused with 429 +
+    # Retry-After. 0 disables it, which is right for one container: there is
+    # nowhere else for a shed request to go, so waiting beats refusing. Set
+    # it on replicas, where a fast 429 lets a load balancer try another one.
+    # /health, /ready and /metrics are never shed — a pod that 429s its own
+    # liveness probe gets restarted by the thing protecting it.
+    max_concurrent_requests: 0
+    # Seconds to keep serving after SIGTERM while /ready already reports 503.
+    # Kubernetes removes endpoints and sends SIGTERM concurrently, and
+    # endpoint propagation is not instant, so a process that exits promptly
+    # drops what was routed to it in the gap. Keep this comfortably shorter
+    # than terminationGracePeriodSeconds. 0 disables the delay.
+    drain_seconds: 0
+    # How often an `api`-role replica re-reads a graph the indexer wrote.
+    # The graph is a FILE: a process loads it once at startup, and the only
+    # other reload happens after a sync that same process ran. An api replica
+    # never indexes, so without this it answers graph queries from whatever
+    # the graph was when it started — silently, while text and vector search
+    # stay current from the shared database. Ignored by the other roles.
+    graph_refresh_seconds: 30
   ui:
     enabled: true
     graph_visualization: true
@@ -112,8 +141,6 @@ graph:
   # or growing multi-source graph. The Docker image turns it ON, on the
   # assumption a container's graph grows past that crossover.
   wasm_cross_source_resolution: false
-  # Minimum documents a concept must appear in to be kept.
-  concept_min_documents: 2
 
 sync:
   # Guardrails on how much one filesystem source may pull in. A source may
@@ -161,7 +188,43 @@ sync:
     remote_worker_enabled: false
     remote_worker_token_env: PHEASANT_INDEX_WORKER_TOKEN
     remote_worker_timeout_seconds: 120
+    # Files per request to a worker. A batch amortizes request overhead and
+    # carries one deadline for the group, but every task in it holds its
+    # file's bytes in memory on both sides — a memory knob as much as a
+    # throughput one.
+    remote_worker_batch_size: 8
+    # http (stdlib, no extra) | grpc (needs the [grpc] extra; carries file
+    # bytes raw instead of base64, and streams results so one refused file
+    # does not fail the batch). Retry, failover, circuit breakers, deadlines
+    # and idempotency keys are transport-independent — this changes only the
+    # bytes on the wire.
+    worker_transport: http
     lock_timeout_seconds: 120
+
+  # The durable index work queue. OFF by default: with it off, a sync holds
+  # its remaining sources in a Python list, which is fine for one container
+  # indexing a few folders. Turn it on when the backlog needs to outlive the
+  # process holding it — a sync killed nine sources into ten then resumes on
+  # the tenth, the depth becomes a number an HPA/KEDA can scale on, and a
+  # source that keeps failing is dead-lettered instead of retried forever.
+  #
+  # At-least-once delivery is safe because indexing is already idempotent by
+  # design (content sha256 + stable IDs): a redelivered task re-indexes to
+  # identical state.
+  #
+  #   pheasant queue status / drain / requeue-dead
+  queue:
+    enabled: false
+    backend: local          # local (this KB's own database, no broker to run)
+                            #   | nats (JetStream; needs the [queue] extra)
+    visibility_seconds: 300 # how long a claimed task is invisible to other
+                            #   workers; heartbeats extend it, so this bounds
+                            #   SILENCE from a claimer, not work
+    max_attempts: 3         # then dead-lettered — kept, never deleted
+    nats_servers: []        # e.g. ["nats://nats:4222"]
+    nats_stream: PHEASANT_INDEX
+    nats_subject: pheasant.index.tasks
+    nats_durable: pheasant-indexers
 
 # Turning binary/markup files into indexable text. Every handler here is
 # opt-in by file extension: a source whose `include` globs admit only code and
@@ -199,33 +262,9 @@ ingestion:
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
 
-obsidian:
-  enabled: true
-  write_mode: upsert
-  note_root: pheasant
-  template_profile: engineering
-  create_index_notes: true
-  create_source_notes: true
-  create_file_notes: true
-  create_chunk_notes: true
-  create_canvas: true
-  frontmatter:
-    include_source_id: true
-    include_hash: true
-    include_last_indexed: true
-    include_graph_node_id: true
-  backlinks:
-    enabled: true
-    style: wikilink
-  tags:
-    base:
-      - pheasant
-    by_source_type: true
-
 security:
   allow_workspace_roots:
     - /workspace
-    - /vault
     - /exports
     # Extra mount for local files that live outside ./workspace. Point the
     # PHEASANT_DATA_PATH env var (docker-compose.yml) at any host directory and
@@ -362,7 +401,6 @@ sources:
       - "docs/**"
       - "exports/**"
       - "state/**"
-      - "vault/**"
       - "workspace/**"
     repo:
       branch_policy: current
@@ -387,7 +425,7 @@ sources:
 
   - name: existing-obsidian-vault
     type: obsidian_vault
-    path: /vault
+    path: /workspace/my-vault
     description: Optional existing Obsidian vault to index as a source
     enabled: false
     include:

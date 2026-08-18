@@ -1,118 +1,105 @@
 # CLAUDE.md — pheasant
 
-Primary context hand-off for any Claude agent working on this repository.
-Read it first; it is intentionally dense. Anything not here should be
-derivable from the code, `docs/`, or a single grep.
+Context hand-off for any agent working on this repository. Read it first; it is
+intentionally dense. It describes the system **as it is now**. Anything not
+here should be derivable from the code, `docs/`, or a single grep — and where
+docs and code disagree, **the code is authoritative**.
 
 ---
 
 ## 1. What this project is
 
-**pheasant** is a Docker-first, local-first **MCP context server** that
-turns configured sources (git repositories, folders, single files,
-Obsidian vaults, web collections, experimental API/S3) into a queryable
-**knowledge graph** with hybrid self-search, for agents and humans.
+**pheasant** is a Docker-first, local-first **MCP context server** that turns
+configured sources (git repositories, folders, single files, Obsidian vaults,
+web collections, SaaS connectors, API/S3) into a queryable **knowledge graph**
+with hybrid self-search, for agents and humans.
 
-Design pillars (do not violate):
+Design pillars — these are product guarantees, not preferences:
 
-- **Idempotent indexing** — re-syncing unchanged content produces the
-  same state (content sha256 + stable IDs).
-- **Incremental-by-default** — connector checkpoints + manifests skip
-  unchanged artifacts.
-- **Deterministic parsing** — no LLM calls in the indexing path; all
-  enrichment is rule-based and reproducible. (The only sanctioned network
-  call at sync time is the optional embedding provider, Phase 21.4, which
-  must keep a stub/offline path.)
-- **Persistence split** — `/state` (operational truth: SQLite + graph
-  JSON + manifests), `/vault` (human-readable Obsidian projection),
-  `/exports` (regenerable payloads). State dirs are **user data**:
-  migrations must be one-shot, idempotent, and preserve originals.
+1. **Idempotent indexing** — re-syncing unchanged content produces the same
+   state (content sha256 + stable IDs).
+2. **Incremental by default** — connector checkpoints and manifests skip
+   unchanged artifacts. A second sync of an untouched corpus does no work.
+3. **Deterministic parsing** — no LLM calls in the indexing path; all
+   enrichment is rule-based and reproducible. The only sanctioned network calls
+   at sync time are the optional embedder, captioner and transcriber, and each
+   keeps a stub/offline path so `pytest` stays network-free.
+4. **Persistence split** — `/state` (operational truth: SQLite or Postgres,
+   graph, manifests) and `/exports` (regenerable payloads). State dirs are
+   **user data**.
 
 ### 1.1 pheasant's second role: a Synapse brain region
 
-Since 2026-06-10, pheasant is also the **region** component of
-**Synapse** — a federated knowledge-base system whose router (the
-"nervous system") lives in the sibling **pheasant-flock** repo.
-Each pheasant container publishes a **semantic contract** derived from
-its own content; the router scores contracts to decide which regions to
-query and fans out to each region's self-search. Read
-`docs/SYNAPSE_INTEGRATION.md` before doing any Synapse-related work here.
-Two iron rules: (1) the contract schema is canonical in
-pheasant-flock — this repo only vendors the exported JSON Schema +
-fixtures under `contracts/`; (2) **no Python dependency between the
-repos** — the boundary is contract JSON + HTTP, and a router-less
-pheasant must keep working unchanged.
+pheasant is also the **region** component of **Synapse**, a federated
+knowledge-base system whose router lives in the sibling **pheasant-flock** repo.
+Each container publishes a **semantic contract** derived from its own content;
+the router scores contracts to decide which regions to query and fans out to
+each region's self-search.
 
-> **The router repo was renamed 2026-08-06**: `subjective-retrieval` →
-> **pheasant-flock** (import root `pheasant_flock`, CLI `pflock`). Nothing in
-> this repo's own code changed — only references to the sibling. That rename
-> *did* move the vendored contract bytes for the first time: the schema's
-> `$id` carries the router's repo URL, so `contracts/semantic_contract.v1.schema.json`
-> and `contracts/PARITY.json` were re-vendored. **The wire format is
-> unchanged** — contract instances never embed `$id`, so both fixtures stayed
-> byte-identical and the signed one still verifies. The sibling checkout the
-> parity test looks for is now `../pheasant-flock`.
+Two iron rules: the contract schema is canonical in pheasant-flock — this repo
+only vendors the exported JSON Schema and fixtures under `contracts/` — and
+there is **no Python dependency between the repos**. The boundary is contract
+JSON over HTTP, and a router-less pheasant must keep working unchanged. See
+`docs/SYNAPSE_INTEGRATION.md`.
 
 ---
 
 ## 2. Repository layout
 
 ```
-pheasant/
-├── CLAUDE.md                  ← you are here
-├── README.md
-├── pyproject.toml             ← extras: [mcp], [dev]; (Phase 21.4 adds [vector]);
-│                                core deps include numpy + zstandard (21.6A snapshots/backup)
-├── pheasant.example.yaml      ← reference config (all sections)
-├── Dockerfile                 ← python:3.12-slim, port 8765, /config/pheasant.yaml
-├── docker-compose.yml         ← pheasant + optional pheasant-ui sidecar
-├── deploy/                    ← kubernetes/ manifests, helm/ skeleton
-├── docs/
-│   ├── architecture.md        ← component overview
-│   ├── graph_model.md         ← node/edge taxonomy + stable-ID grammar
-│   ├── configuration.md       ← config reference
-│   ├── mcp_tools.md / mcp_client.md
-│   ├── deployment.md / security.md / troubleshooting.md
-│   └── SYNAPSE_INTEGRATION.md ← region-side Synapse spec + Phase 21 plan
-├── agent/                     ← legacy role prompts from the initial build
-│                                (superseded for Synapse work by this file)
+pheasant-kb/
+├── CLAUDE.md · AGENTS.md      ← agent hand-off (this file is canonical)
+├── README.md                  ← product front door
+├── pyproject.toml             ← extras: mcp, vector, agent, a2a, wasm,
+│                                postgres, grpc, queue, docs, dev
+├── pheasant.example.yaml      ← reference config, every section
+├── Dockerfile                 ← one universal image: API + MCP + UI, port 8765
+├── docker-compose*.yml        ← default / override / fresh reset / scaled
+├── contracts/                 ← VENDORED Synapse schema + fixtures (never edit)
+├── deploy/                    ← kubernetes/ (+ scaled/), helm/, compose/
+├── docs/                      ← MkDocs Material site (see mkdocs.yml nav)
+├── examples/                  ← demo-agent-framework, vscode MCP config
+├── scripts/                   ← release_version.py, sync_version.py
 ├── src/pheasant/
-│   ├── cli.py                 ← Typer CLI: init/start/serve/validate/doctor/
-│   │                            sync/repair/mcp/client-config/compose-env/config
+│   ├── cli.py                 ← up/host/setup/mount/start/serve/worker/sync/
+│   │                            scan/queue/shard/migrate/backup/restore/mcp/…
+│   ├── setup_wizard.py        ← `pheasant setup`, defaults read off the schema
+│   ├── quickstart.py          ← `pheasant up` config generation
+│   ├── capacity.py            ← the one home for sizing coefficients
+│   ├── sharding.py            ← `pheasant shard plan`
+│   ├── jobs.py                ← per-source progress: phase, rate, ETA, stalled
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
-│   │                            (quickstart/dev/team/cloud-hybrid), defaults
-│   ├── sync/                  ← engine.py (SyncEngine), connectors.py
-│   │                            (Filesystem/Web/API/S3), watcher.py,
-│   │                            scheduler.py, git_monitor.py, debounce.py, locks.py
-│   ├── ingestion/             ← pipeline.py (parse/hash/git-meta), chunking.py,
-│   │                            content_types.py (py/md/txt/pdf/docx/html/xml/configs)
-│   ├── graph/                 ← model.py, simple.py (SimpleMultiDiGraph +
-│   │                            node-link JSON), builder.py (GraphBuilder),
-│   │                            enrichment.py (Code/Markdown/Similarity passes)
-│   ├── search/                ← sqlite_store.py (FTS5+BM25+term expansion),
-│   │                            graph_search.py, hybrid.py (text|graph|hybrid)
-│   ├── persistence/           ← state_store.py (SQLite SCHEMA), graph_store.py,
-│   │                            manifest.py, paths.py
-│   ├── registry/              ← source + knowledge-base registries
-│   ├── mcp_server/            ← server.py (FastMCP), tools.py (PheasantTools),
-│   │                            resources.py, prompts.py, contracts.py
-│   ├── api/app.py             ← FastAPI: /health /ready /sources /sync /search
-│   │                            /graph /relevant-files /files /nodes /repos
-│   │                            /config /obsidian /fs /sync/status|history
-│   ├── obsidian/              ← exporter, templates, frontmatter, backlinks, canvas
-│   ├── security/path_policy.py
-│   ├── telemetry/  deployment/
-├── ui/                        ← React+Vite: Cytoscape graph workspace, source
-│                                mgmt, config editor (form+YAML+diff), search
-└── tests/                     ← pytest; fixtures under tests/fixtures/ (sample
-                                 workspace: notes, docs, mock repo)
+│   ├── sync/                  ← engine, connectors, watcher, scheduler, locks,
+│   │                            queue, worker_pool, worker_transport, grpc
+│   ├── connectors/            ← first-party SDK plugins: notion, gdrive,
+│   │                            slack, confluence, imap
+│   ├── ingestion/             ← pipeline, chunking, content_types, taxonomy,
+│   │                            extractor (7 doc formats), captioner,
+│   │                            transcriber, office, msdoc
+│   ├── graph/                 ← model, simple, builder, enrichment, capacity
+│   ├── search/                ← sqlite_store (FTS5/tsvector + BM25),
+│   │                            graph_search, hybrid (RRF), criteria, vector
+│   ├── memory/                ← store, projection, policy, steering, salience,
+│   │                            bridge, maintenance, benchmark
+│   ├── persistence/           ← state_store, backends (sqlite|postgres),
+│   │                            schema, graph_store, manifest, migrate, paths
+│   ├── mcp_server/            ← server.py (FastMCP), tools.py (PheasantTools)
+│   ├── api/app.py             ← the HTTP surface
+│   ├── assistant/             ← grounded answering + workflows
+│   ├── sandbox/               ← WASM runtime, sandboxed connector, accel/
+│   ├── deployment/            ← roles, serving durability, mounts, host
+│   ├── security/              ← path_policy, acl, idp
+│   ├── synapse/               ← contract publisher, events, signing
+│   └── telemetry/metrics.py   ← Prometheus exposition
+├── ui/                        ← React + Vite workspace (baked into the image)
+└── tests/                     ← 87 pytest modules, offline by design
 ```
 
-Key entities: **knowledge base** (`kb_id` = `pheasant.name`) → **sources**
-→ **artifacts** (stable ID `file:{source}:{relpath}:branch={b}`) →
-**chunks** (+ FTS5) and graph nodes (**symbol/entity/concept/
-external_reference**) with edges (contains/indexes/has_chunk/mentions/
-references/imports/calls/similar_to). Stable-ID grammar and full taxonomy:
+Key entities: **knowledge base** (`kb_id` = `pheasant.name`) → **sources** →
+**artifacts** (stable ID `file:{source}:{relpath}:branch={b}`) → **chunks**
+(+ full-text index) and graph nodes (symbol / entity / heading / memory_record /
+external_reference) with edges (contains / has_chunk / has_heading / mentions /
+references / imports / calls / similar_to / supersedes / about). Full grammar:
 `docs/graph_model.md`.
 
 ---
@@ -121,1663 +108,229 @@ references/imports/calls/similar_to). Stable-ID grammar and full taxonomy:
 
 ```bash
 pip install -e ".[dev,mcp]"
-pytest -q                                  # full suite, offline by design
+pytest -q                                  # offline by design
 ruff check src tests && ruff format --check src tests
+mkdocs build --strict                      # needs the [docs] extra
 
-pheasant up [PATH] [--no-serve]            # zero-config quickstart: detect
-                                           #   (.obsidian/.git/folder) → generate
-                                           #   config → index → serve (Step 30.1)
-pheasant setup [--advanced|--accept-defaults|--answers F]  # interactive,
-                                           #   sectioned wizard → pheasant.yaml
-                                           #   + a 0600 .env + startup commands
-pheasant mount <host-path> [--at /data/x]  # bind-mount a host dir into the
-                                           #   container + allow-list it
-pheasant init --profile quickstart         # generate starter pheasant.yaml
-pheasant validate && pheasant doctor       # config + environment checks
-pheasant sync --progress                   # NDJSON progress lines on stdout
-pheasant start                             # HTTP API + MCP on :8765
+pheasant up [PATH...]                      # detect → config → index → serve
+pheasant setup [--advanced|--accept-defaults|--answers F]
+pheasant host ~/notes                      # config + compose file, then run it
+pheasant mount <host-path> [--at /data/x]  # bind-mount + allow-list it
+pheasant scan                              # project RAM/disk/time before indexing
+pheasant validate && pheasant doctor
 pheasant sync --source <name> --mode incremental|full|validate_only|repair
-pheasant mcp --transport stdio             # standalone MCP server
-pheasant client-config claude-code|cursor|vscode   # emit MCP client config
-                                           #   (agents: --mode local|docker-exec|
-                                           #    docker-run; Step 30.5)
+pheasant serve --role api|indexer|worker|all
+pheasant worker                            # stateless preparation worker
+pheasant queue status|drain|requeue-dead
+pheasant shard plan                        # split a corpus across regions
+pheasant migrate --to postgres             # one-shot, verified, preserves original
+pheasant backup|restore
+pheasant mcp --transport stdio
+pheasant client-config claude-code|cursor|vscode
 pheasant config show                       # resolved config after profile+YAML+--set
-docker compose up                          # container + optional UI sidecar
+
+docker compose up                          # container + optional UI profile
+docker compose -f docker-compose.scale.yml up --scale worker=3
 ```
 
 ---
 
-## 4. Rules for Claude
+## 4. Rules
 
-1. **Never put an LLM call in the indexing path.** Determinism is a
-   product guarantee. Optional embeddings (21.4) must have a stub path so
-   `pytest` stays network-free.
+1. **Never put an LLM call in the indexing path.** Determinism is a product
+   guarantee. The optional embedder, captioner and transcriber must each keep a
+   stub path so the suite stays network-free.
 2. **Treat `/state` as user data.** Schema/layout changes ship a one-shot
-   idempotent migration that preserves originals (`*.migrated` rename,
-   never delete).
+   idempotent migration that preserves originals (`*.migrated` rename, never
+   delete). New tables arrive via `CREATE TABLE IF NOT EXISTS` in `SCHEMA`.
 3. **Stable IDs are contracts.** Changing the ID grammar in
-   `docs/graph_model.md` breaks every persisted graph — needs migration +
-   explicit decision note in `docs/SYNAPSE_INTEGRATION.md` or a dated
-   entry in the other repo's `docs/DECISIONS.md` if Synapse-relevant.
-4. **Idempotency tests are the spine.** `tests/test_sync_idempotency.py`
-   must stay green; any sync change adds cases there.
-5. **Keep house style:** Typer CLI, dataclass config schema, ruff
-   format+lint, pytest, Python ≥ 3.11, type hints.
-6. **Never import pheasant-flock.** The Synapse boundary is
-   contract JSON + HTTP (see §1.1). Never hand-edit vendored files under
-   `contracts/`.
-7. **Standalone mode is sacred.** Every change must leave a router-less
-   pheasant fully functional; Synapse features no-op when
-   `synapse.router_url` is unset.
-8. **MCP tool surface is public API.** Renaming/removing tools in
-   `mcp_server/tools.py` breaks deployed agents — additive evolution only,
-   deprecate before remove.
-9. **Cross-repo work** (anything marked [x-repo] in
-   `docs/SYNAPSE_INTEGRATION.md`) follows the `pheasant-coordinator`
-   skill in the pheasant-flock repo: identical branch names in both
-   repos, contract fixture parity (sha256), both test suites green before
-   either push.
-10. **Scope each session to one Phase-21 step** (or one bugfix). Write
-    `runs/<ts>-synapse-<step>/SUMMARY.md` per the framework conventions.
+   `docs/graph_model.md` breaks every persisted graph — it needs a migration
+   and an explicit decision note.
+4. **Idempotency tests are the spine.** `tests/test_sync_idempotency.py` must
+   stay green; any sync change adds cases there.
+5. **Keep house style:** argparse CLI, dataclass config schema, ruff
+   format + lint, pytest, Python ≥ 3.11, type hints.
+6. **Never import pheasant-flock.** The Synapse boundary is contract JSON over
+   HTTP. Never hand-edit vendored files under `contracts/`.
+7. **Standalone mode is sacred.** Every change must leave a router-less,
+   infrastructure-free pheasant fully functional. Postgres, gRPC, the broker
+   and the role split are *selectable backends*; SQLite, HTTP, no queue and
+   `--role all` are the defaults, and each seam owes a test asserting the
+   no-infrastructure path is unchanged.
+8. **The MCP tool surface is public API.** Renaming or removing a tool breaks
+   deployed agents — additive evolution only, deprecate before remove. One
+   sanctioned exception to date: `export_obsidian_notes` was removed outright
+   when the exporter behind it was deleted, because there was nothing left for
+   the tool to do. That is a precedent for "the feature is gone", not for
+   renames.
+9. **Cross-repo work** (anything the Synapse spec marks `[x-repo]`) uses
+   identical branch names in both repos, contract fixture parity (sha256), and
+   both test suites green before either push.
+10. **Verify against the real thing.** Postgres, NATS, wasmtime and a real
+    container have each caught bugs a mock could not. When a change touches a
+    backend, run that backend. When it touches the image, build the image.
 11. **Config-schema changes owe the config surface an update.** Adding a
-    *top-level* section to `src/pheasant/config/schema.py` needs three
-    things: a mention in `docs/configuration.md`, a `Section` (or a
-    question) covering it in `src/pheasant/setup_wizard.py`, and an entry
-    in `LIVE_APPLICABLE_SECTIONS` (`api/app.py`) saying whether a running
-    server can pick the change up. `tests/test_config_surface_freshness.py`
-    fails CI on all three — mechanically (a section named nowhere), not on
-    prose accuracy. **Individual field defaults need no second edit:**
-    `pheasant setup` reads them off the live dataclasses via
-    `schema_default()`, which is what replaced the prose wizard and its
-    rot-detector.
+    *top-level* section to `src/pheasant/config/schema.py` needs three things:
+    a mention in `docs/configuration.md`, a `Section` in
+    `src/pheasant/setup_wizard.py`, and an entry in `LIVE_APPLICABLE_SECTIONS`
+    (`api/app.py`) saying whether a running server can pick the change up.
+    `tests/test_config_surface_freshness.py` fails CI on all three,
+    mechanically. **Individual field defaults need no second edit** — the
+    wizard reads them off the live dataclasses.
 
 ---
 
-## 5. Current Synapse work queue (Phase 21 — region hardening)
+## 5. How the system works now
 
-**Phase 21 region hardening is complete (2026-06-18).** Remaining Synapse work
-lives in the sibling pheasant-flock repo (Phase 22 finish — Step 22.5 —
-plus Phases 23–26).
+### Ingestion
 
-**Step 24.4 (A2A + Ed25519-signed contracts) landed here 2026-06-20 [x-repo].**
-The publisher now **optionally signs** the contract's `integrity.signature`
-(Ed25519) when `synapse.signing_key_ref` is set (a secret *reference* —
-`env://NAME` or a bare env var name — resolving to a base64 32-byte Ed25519
-seed; the plaintext key never lands in config or on disk). Unset → unsigned,
-`integrity.signature: null`, and a **standalone pheasant is unchanged**. New
-`src/pheasant/synapse/signing.py` (`sign_body`/`signing_bytes`/`content_hash`/
-`resolve_signing_key_ref`/`public_key_b64`); the `cryptography` import is gated
-behind the new optional **`[a2a]` extra** (a region without `signing_key_ref`
-needs no crypto dep; offline tests `importorskip("cryptography")`). The
-signature covers byte-identical canonical body bytes to `_content_hash`, so the
-router's `SemanticContract.verify_signature` accepts it — **out-of-band public
-key** decision: the router carries the kb_id→pubkey trust store in *its* config,
-so the contract wire format / vendored schema are **unchanged** (no re-vendor;
-schema export asserted byte-identical in Flock). A new vendored
-`contracts/fixtures/signed-demo-region.v1.contract.json` (+ PARITY.json sha256
-both repos) is the cross-repo signing-parity guard
-(`tests/test_contract_signing.py` + `tests/test_contract_parity.py`). Suite:
-**128 passed** (+7).
+A connector lists items and reads their bytes; the engine skips anything whose
+sha256 is unchanged **before** reading it, which is what makes a re-sync free.
+Text is parsed by content type, chunked, and written to the state store and the
+full-text index; the graph builder adds nodes and edges; enrichment resolves
+cross-source references.
 
-**Step 25.4 session A (multi-modal: IMAGE ingest) landed here 2026-06-21 [x-repo].**
-A region ingests images (`.png/.jpg/.jpeg/.webp/.gif`) by **captioning** them
-into indexable text that flows through the normal chunk→embed→graph path
-(architecture §8: project into the *one* fleet-pinned text space; CLIP-style
-modality-native vectors stay region-local, out of scope). New
-`src/pheasant/ingestion/captioner.py`: `StubCaptioner` (deterministic, offline,
-**default** — caption = template over file name + blake2b digest of bytes; an
-authored `<image>.caption.txt` sidecar wins) + `OpenAISpecVisionCaptioner`
-(gated — OpenAI-spec `chat/completions` with an `image_url` part). Captioning is
-the only sanctioned indexing-path network call besides the 21.4 embedder and
-keeps the stub path (tests network-free). Config
-`ingestion.captioner.{provider,model,base_url,api_key_env,prompt}`
-(`stub`|`openai-spec`); the captioner is **only built when a source's `include`
-globs admit an image extension**, so a text-only / standalone region is
-byte-identical to pre-25.4. **Idempotent:** the engine's pre-read sha256 skip
-never re-captions an unchanged image (zero-work, like 21.4's zero re-embed). The
-21.5 publisher's `_capabilities()` appends `"image"` to `capabilities.modalities`
-when an image source is configured, so the router's `--modality image` filter
-(22.1) routes only to image-capable regions. **`modalities` is existing contract
-data → wire format / vendored schema UNCHANGED** (no schema bump, no re-vendor,
-parity test green). Tiny PNG fixture +
-`tests/fixtures/sample_workspace/images/diagram.png.caption.txt`;
-`tests/test_image_ingestion.py`. Suite: **135 passed** (+7).
+**Seven document formats** extract real text: `.pdf`, `.docx`, `.pptx`,
+`.xlsx`, `.doc`, `.rtf`, `.epub`. Providers are `auto` (default), `native`,
+`builtin` (stdlib only) and `sandboxed` (the PDF tokenizer inside a WASM guest
+with no host imports). `DOCUMENT_EXTENSIONS` and `EXTRACTED_EXTENSIONS` are
+asserted set-equal — that drift is exactly how a format gets accepted and then
+silently indexed as nothing.
 
-**Step 25.4 session B (multi-modal: AUDIO ingest) landed here 2026-06-21 [x-repo] —
-COMPLETES Step 25.4 and Phase 25.** A region ingests audio
-(`.wav/.mp3/.m4a/.flac/.ogg`) by **transcribing** it into indexable text that
-flows through the normal chunk→embed→graph path — the audio twin of session A's
-image captioning (architecture §8: project into the *one* fleet-pinned text
-space). New `src/pheasant/ingestion/transcriber.py`: `StubTranscriber`
-(deterministic, offline, **default** — transcript = template over file name +
-blake2b digest of bytes; an authored `<audio>.transcript.txt` sidecar wins;
-**no network / no audio decoder / no ASR model / no audio library**) +
-`OpenAISpecTranscriber` (gated — OpenAI-spec `POST {base_url}/audio/transcriptions`
-stdlib-urllib multipart upload, transcript from response `text`). A tiny additive
-helper `src/pheasant/ingestion/_modal.py` (`sidecar_text` + `stub_fingerprint`)
-now backs both the captioner and the transcriber (session A behavior unchanged).
-Config `ingestion.transcriber.{provider,model,base_url,api_key_env}`
-(`stub`|`openai-spec`, default `whisper-1`); the transcriber is **only built
-when a source's `include` globs admit an audio extension**, so a text-only /
-standalone region is byte-identical to pre-25.4. **Idempotent:** the engine's
-pre-read sha256 skip never re-transcribes an unchanged audio file (zero-work,
-like 21.4's zero re-embed). The 21.5 publisher's `_capabilities()` appends
-`"audio"` to `capabilities.modalities` when an audio source is configured, so the
-router's `--modality audio` filter (22.1) routes only to audio-capable regions.
-**`modalities` is existing contract data → wire format / vendored schema
-UNCHANGED** (no schema bump, no re-vendor, parity test green). Tiny WAV fixture +
-`tests/fixtures/sample_workspace/audio/briefing.wav.transcript.txt`;
-`tests/test_audio_ingestion.py`. Suite: **142 passed** (+7). **Phase 25 complete.**
+**Images and audio** are captioned/transcribed into indexable text that flows
+through the normal path. Both default to a deterministic offline stub, and an
+authored `<file>.caption.txt` / `.transcript.txt` sidecar always wins.
 
-**Step 33.1 (agent memory as a region) landed here 2026-07-16.** Memory
-records are **source content**: `memory/store.py` appends one frontmatter
-Markdown file per record (`schema_version: 1`, deterministic
-`mem-<instant>-<blake2b8>` ids, append-only, `<scope>/` dirs) into a new
-built-in `SourceType.memory` filesystem source; indexing is the normal
-deterministic pipeline (no second path, no LLM). Write surfaces
-(additive): MCP `memory_write` (`PheasantTools` + server tool) and
-`POST/GET /memory` — `sync=true` default → read-your-writes via ordinary
-`search_context`; recall IS search. Publisher advertises `"memory"` in
-`capabilities.modalities` (25.4 precedent — wire format unchanged, parity
-green). Acceptance: `tests/test_memory_region.py`. Docs:
-`docs/how-to/agent-memory.md`, contracts in Flock `PRODUCT_FRAMEWORK.md` §3c.
+**Structural taxonomy** (`ingestion/taxonomy.py`) is opt-in per source. Six
+rules detect headings across mixed conventions, ordinals are parsed and
+reconciled so a document's two spellings of "four" are one number, and chunks
+are cut at section boundaries so one chunk is one section.
 
-**Step 33.2 (memory validity + consolidation) landed here 2026-07-16.**
-Supersedes chains resolve across scopes (`list_records(current_only=True)`
-/ `GET /memory?current_only=true` filter live). Consolidation is a pure
-content operation: superseded + per-scope-TTL-expired records are archived
-(`<id>.md.archived` rename in place — bytes preserved, never deleted — so
-the `**/*.md` include glob stops matching), then a **full** re-sync of the
-small memory source prunes them from index/graph/vectors through the
-ordinary pipeline (incremental never prunes). Runs on the 21.1 scheduler
-beat (`memory/maintenance.run_memory_maintenance`) + on demand
-(`memory_consolidate` MCP tool, `POST /memory/consolidate`). New config
-block `memory.{consolidation_enabled, session_ttl_days, user_ttl_days,
-org_ttl_days}` (TTLs opt-in `None`, consolidation on by default).
-Deterministic in `now`, idempotent second pass.
-`tests/test_memory_region.py` (15 total).
+**Connectors** resolve by `sources[].type` through entry points, so a
+third-party plugin needs no dispatch code here. Five ship first-party: Notion,
+Google Drive, Slack, Confluence, IMAP. `pheasant.testing.ConnectorConformance`
+is the public quality bar.
 
-**Step 33.4 (memory-recall benchmark) landed here 2026-07-16 — Phase 33
-complete.** `memory/benchmark.py` (`python -m pheasant.memory.benchmark`):
-LongMemEval-style, deterministic, offline, through the real
-`memory_write`→index→`search_context` path. Recorded: recall@5 **1.000**,
-update_accuracy **1.000**, stale_leak **0.000**, abstention **1.000**
-(30/120/10/10, k=5; canonical numbers in Flock `docs/RESULTS.md` §9d). The
-bench exposed + drove **two self-search fixes** in
-`search/sqlite_store.py`: (1) NL questions zeroed out on FTS5
-implicit-AND → MATCH is now an OR of sanitized `_query_tokens` ranked by
-BM25; (2) `1/(1+|bm25|)` inverted relevance in hybrid merges → monotone
-mapping (LIKE-fallback rows keep 1.0). Gate:
-`tests/test_memory_benchmark.py`. Suite: **202 passed** (+4).
+### Retrieval
 
-**Steps 33.8–33.11 landed here 2026-08-11 — the memory-steered-retrieval arc
-(33.5–33.11) is complete.** Four steps in one session at the user's request,
-departing from rule 10's one-step norm.
+Three arms — text (BM25 over an FTS5 or `tsvector` index), vector (LanceDB),
+and graph — fused by **reciprocal rank fusion**, because the arms score on
+incomparable scales and raw-score merging silently degraded to text-only.
 
-**33.8 retrieval steering** — `kind` becomes load-bearing. New
-`memory/steering.py` turns a record's text into a ranking rule: `alias`
-(`router -> pheasant-flock`) expands the query, `preference`
-(`when: deploy -> prefer: docs/`) adds a path term to `_STRUCTURAL_PRIOR`,
-`exclusion` (`never: vendor/**`) suppresses. This is the half that changes
-queries returning **no memory at all**. Two design bugs the tests found:
-`memory: "off"` was disabling steering outright (mode is about *result
-composition*, not rule validity — a caller who wants no remembered passages
-still wants the remembered vocabulary; scope/subject/validity still apply), and
-a hyphenated trigger never fired because `_query_tokens` splits
-`pheasant-flock` into two tokens (triggers now match the tokenized query, **all
-parts required**). Also wired the deferred `memory.default_policy`.
-**8/8 mutants**, `tests/test_memory_steering.py` (23).
+Ranking carries deliberate structure: `chunks_fts.title` holds the file's
+**basename** with BM25 column weights `8/3/2/1`, and structural priors divide
+by path depth and by tests/samples membership. Query expansion drops framing
+stopwords. Criteria (`source_name`, `exclude_sources`, `node_types`,
+`min_score`, `section`, `principal`) are available identically on MCP and HTTP.
 
-**33.9 salience + bounded growth** — `memory/salience.py`: recency (90-day half
-life) × use (`log1p`, diminishing returns) × scope weight. `uses` is counted
-**after truncation**, so a record is credited for being *served*, not
-considered. `memory.max_records` archives the least salient via consolidation's
-existing `.md.archived` rename; salience is written back so a prune is
-explainable. `usage_tracking`/`max_records` default off/unbounded.
-**10/10 mutants**, `tests/test_memory_salience.py` (15) — after fixing another
-vacuous test of mine (the `salience` column defaults to 1.0, so a range
-assertion passed whether or not anything was written).
+Concept extraction was **retired**: it was 87% of nodes and 98.6% of edges and
+failed every test set for it. `graph.enrichment._add_concept` is a no-op whose
+docstring carries the measurements.
 
-**33.10 front end** — the `/memory` endpoints had existed since 33.1 with
-**zero UI callers**. New `/memory` page (grouped by subject; corrections go
-through *superseding*, never editing, because the chain is what `as_of` reads),
-a `use memory` chat toggle posting the same field MCP and the router send
-(threaded `ChatRequest.memory` → `answer_question` → `PheasantRetriever`, held
-on the retriever so an answering loop cannot half-honour it, and part of the
-memo key so two turns cannot share cached passages), citation chips that say
-when a passage was remembered, plus client/types/nav/styles.
+### Memory
 
-**33.11 isolation, benchmark, docs** — **the ACL leak is closed**:
-`normalize_acl` gains a `memory` rule keyed on **scope** (`org` shared,
-`user`/`session` readable only by their writer), read from the record file
-because the ACL is computed inside the artifact loop before the projection
-exists. Before this, `acl_enforced` filtered every corpus document by principal
-while leaving one agent's private notes readable by every other agent.
-Benchmark keys on the typed `memory.record_id` (retiring the pre-33.6
-substring hack) and gains contradiction rate, staleness p50/p95, bytes/record
-and **measured** latency — recall@5 **1.000**, update **1.000**, stale_leak
-**0.000**, abstention **1.000**, 212.9 B/record, 4.51 ms write, 11.83 ms
-search. Docs: `configuration.md` §memory, the first `memory:` block in
-`pheasant.example.yaml`, `how-to/agent-memory.md` (query-time control,
-steering, salience, UI, isolation), `mcp_tools.md`, five wizard questions.
+Memory records are **source content** — one frontmatter Markdown file per
+record, indexed by the ordinary pipeline. Recall *is* search. On top of that:
 
-**Completion pass (same session).** The first pass implemented every step's
-mechanism but left a tail of surface items, and I wrongly reported the arc
-complete. Then closed: **`POST /memory/enable`** + an Enable-memory button
-(`SourceType.memory` stays out of the generic picker, but "not in the picker"
-had come to mean *unreachable*), **`MemoryPanel.tsx`** in Settings,
-**`pheasant://…/memory` MCP resource** (`current_only` defaults True there —
-corrected records without their chain are worse than none),
-`docs/reference/http-api.md`, and the two config flags the plan named but
-nothing had: **`graph.memory_entity_bridging`** and
-**`memory.about_max_targets`**. Two test gaps closed: **`prefer` had zero
-tests** despite being documented, and **the vector arm had never run under a
-memory policy** (every fixture had embeddings off — the same blind spot that
-hid the 33.7 graph-arm leak); now asserted with exact counts.
-**Real bug found:** `/memory/enable` resolved its relative path through
-`_resolve_source_path`, which anchors to the **process CWD** — the memory
-folder landed wherever the server started, and in development a record was
-written into the repo checkout. Now anchored to `pheasant.workspace_root`;
-mutation testing showed my first test would not have caught it (status codes
-only, never the path).
+- **Validity** — a correction supersedes rather than overwrites, and validity
+  is filtered at query time. `as_of` deliberately brings the old record back.
+- **Policy** — one `MemoryPolicy` (`mode`, `scopes`, `subject`, `current_only`,
+  `as_of`, `max_results`, `include_rules`) spelled identically on MCP and HTTP,
+  with `sql_predicate` and `admits` as two encodings of one rule.
+- **Steering** — `alias`, `preference` and `exclusion` records change ranking
+  for queries that return no memory at all. Steering records are excluded from
+  result lists by default: an agent asking for code should not get a line of
+  rule syntax dressed as retrieved knowledge.
+- **Isolation** — `normalize_acl` keys on scope: `org` is shared, `user` and
+  `session` are readable only by their writer.
+- **Graph** — records get `memory_record` nodes, `supersedes` edges, and
+  `about` edges via a precedence ladder (reference → symbol → heading →
+  entity), capped at three targets.
 
-Suite **1052 passed / 8 failed / 6 skipped** (+73; same 8 pre-existing).
-Mutation **26/26 caught** across three batches, after fixing four vacuous tests
-the mutants exposed. **`tsc -b && vite build` passes** — run in a throwaway
-`node:22-alpine` container (no local npm, the same route the 2026-08-04 UI
-change took): `tsc -b` reports zero type errors and vite transforms 132 modules
-to an 883.94 kB bundle (281.90 kB gzipped), up from 847 kB, with only the
-pre-existing >500 kB chunk-size advisory. **Live-validated 2026-08-12** in a real
-container (self-contained: pheasant's own docs + `src/pheasant/memory` as the
-corpus, stub embedder, since the demo overlay needs an absent third-party clone
-and a paid key). It found **three bugs the 1052-test suite did not** — the
-fourth time a live run has done that here:
-(1) **`/memory/enable` provisioned memory under `workspace_root`, which every
-container mounts read-only** — enabling returned 200 and the first write
-returned a bare 500; the default is now `<state_path>/memory` and enable
-**probes writability before registering**;
-(2) **memory enabled via the API was invisible to every other process** — a
-runtime-registered source only reaches `config.sources` in its creating process,
-so a fresh MCP server / sync worker / restarted container reported
-`enabled: false` seconds after enabling succeeded; `memory_source()` now takes
-an optional state store and falls back to the registry, mirroring
-`SyncEngine._source`;
-(3) **half the `about` edge budget pointed at the `external_reference` stub**
-rather than the resolved file, because a markdown link produces two `references`
-edges and rung 1 took both.
-All three are pinned by tests. Live checks then passed end to end: off/auto/only
-policies (superseded record absent under `auto`, visible under
-`current_only: false`), `describe_retrieval` from a fresh process, steering in
-force, `about → file:guides:setup.md` in one hop plus a `supersedes` edge, and
-the benchmark unchanged. Suite **1054 passed / 8 failed / 6 skipped**. Detail:
-`runs/2026-08-12-memory-live/SUMMARY.md`. Still unmeasured: bridge and vector
-behaviour at 2,000-file scale with a real embedder. Note `ruff check src tests` is **red on
-HEAD** from 5 pre-existing E501s in `tests/test_taxonomy.py` (verified against
-the committed file); a repo-wide `ruff format` swept them up and I reverted
-that to keep this change set scoped. Full detail:
-`runs/2026-08-11-memory-33.8-33.11/SUMMARY.md`.
+### Scale
 
-**Step 33.7 (memory in the knowledge graph) landed here 2026-08-11.** Memory
-stops being a graph island. New `memory_record` node type (stable ID unchanged
-— rule 3 protects the grammar, not the type attribute; SQLite `artifacts.type`
-agrees), `supersedes` edges finally **emitted** between records (a documented
-edge type nothing had ever drawn, so a correction existed only as a frontmatter
-string), and a new `memory/bridge.py` drawing `about` edges from a record to
-what it is about. **`entity` cannot be the bridge on its own** — entity
-extraction runs only for `.md/.txt/.html/.xml`, so all seven extracted document
-formats produce **zero** entity nodes and Python yields them only for class
-names; an entity-only bridge looks fine on Markdown and is a silent no-op on
-PDFs or non-Python code. So it is a precedence ladder — **reference** (already
-drawn by `resolve_cross_source_edges`; needed no new matching code) →
-**symbol** → **heading** → **entity** — first rung wins, capped at 3 targets
-per record. The lexical/BM25 rung is deliberately **not** materialized: the
-search index answers it at query time, and materializing it is how the concept
-layer reached 98.6% of all edges. Coverage is **reported, not silent**:
-`describe_retrieval`'s memory block gains `graph:{records,bridged,unbridged,
-by_signal}`, computed live. Also consolidated `ARTIFACT_TYPES` into **one**
-definition in `ingestion/content_types.py` — four modules had independently
-hard-coded `{"file","markdown_note","document"}`. **The 33.6 entity residual is
-closed**: `_node_result` now exposes the `artifact_id` that chunk/symbol/entity
-nodes always carried, and `policy.resolve` resolves a *relationship* hit
-through either endpoint; the test that asserted the residual existed went red
-as designed and was replaced by its positive form.
+One container until it shouldn't be. Then three independent axes:
 
-**Two pre-existing defects found by building it:** entity labels **spanned line
-breaks** (`\s+` matches newlines, so a heading fused with the next paragraph
-into `"Runbook\r\n\r\nThe Kestrel Gateway"` — junk that could never match
-anything by name; now `[ \t]+`, mirrored in the bridge), and a **leading
-article split one entity in two** (corpus *The Kestrel Gateway* vs memory
-*Kestrel Gateway*; `normalize_label` drops `the`/`a`/`an`, with a test that it
-is not over-eager). **Ordering bug caught by the tests:** the bridge ran with
-the other global passes, *before* `_project_memory_records`, so on the memory
-source's own sync it saw zero records — the projection now runs right after the
-artifact loop. **Deviation:** the plan's rung-4 "merge and drop the duplicate
-entity" was **not** implemented — deleting the memory-local entity destroys the
-`artifact_id` provenance that closes the 33.6 residual, so it would have
-reintroduced the leak; acceptance is ≤2-hop reachability via `GET /graph/path`
-(both directions) rather than a node-count drop. Mutation-tested **12/12
-caught**. Acceptance: `tests/test_memory_graph.py` (23) — per corpus type
-(markdown / python / opaque), not in aggregate, because that is exactly what an
-entity-only bridge would have passed. Suite **1002 passed / 8 failed / 6
-skipped** (same 8 pre-existing). UI legend updated but `vite build` not run (no
-local npm). Full detail: `runs/2026-08-11-memory-33.7/SUMMARY.md`. Next:
-**33.8**, retrieval steering.
+| Axis | Mechanism | Scales on |
+|---|---|---|
+| Request traffic | `serve --role api` replicas; publish instead of index | CPU / RPS |
+| Ingest throughput | `--role indexer` claiming from a durable queue, `--role worker` preparing | `pheasant_index_queue_depth` |
+| Corpus size | `pheasant shard plan` packs **whole sources** per region | graph nodes |
 
-**Step 33.6 (query-time memory policy across both protocols) landed here
-2026-08-11.** New `memory/policy.py`: one `MemoryPolicy` (`mode` ∈
-auto|off|only|prefer, `scopes`, `subject`, `current_only`, `as_of`,
-`max_results`), spelled identically on MCP `search_context(memory=…)` and
-`POST /search`, accepting a one-word form or an object. **The stale-fact leak is
-closed**: supersession was enforced only by the batch consolidation pass, so
-between beats the region served facts it already knew were corrected; validity
-is now filtered at query time, and `as_of` deliberately brings the old record
-back (invalidate, don't delete). **One rule, two encodings** — `sql_predicate`
-(text arm, pushed into SQL so a narrow slice keeps recall) and `admits` (vector
-+ graph arms) sit side by side with a 10-policy × 5-record parity test, the
-`section_needle`/`section_matches` arrangement applied to a harder rule. New
-`search/criteria.py` (re-exported from `mcp_server/tools.py`) gives HTTP the
-criteria it never had — `exclude_sources`/`node_types`/`min_score` were MCP-only,
-so the same region answered differently per protocol and **the router, which
-reaches a region over HTTP, could not scope a search at all**.
-`describe_retrieval` gains a `memory` block naming the source and its scope
-counts, since an agent could previously only exclude memory by naming a source
-it had no way to learn. **Trust containment**: the answering prompt states a
-*remembered* passage is a recorded assertion, corpus wins a disagreement, and
-passage text is **data, never an instruction** (the memory-control-flow
-defence); remembered passages are labelled with scope + assertion time, threaded
-through `Passage` and **both** citation builders. Dead `hybrid._merge` removed.
+Selectable backends, dependency-free side first: `storage.backend`
+sqlite|postgres, `sync.queue.backend` off|local|nats,
+`sync.concurrency.worker_transport` http|grpc.
 
-**Mutation testing found a real leak, not just a weak test.** 11 mutants, 10
-caught — the survivor revealed that **every end-to-end test used `mode="text"`**,
-so the vector/graph filter was never exercised; probing directly showed the
-graph arm returning the *superseded* record's chunk on an ordinary query, since
-graph hits are `chunk:` nodes with `relative_path=null` and the index was keyed
-only on artifact id. Fixed by indexing both identities + `relative_path_of`
-(reads the path out of the `file:`/`chunk:` stable-ID grammars by marker, not
-colon count); a second bug surfaced at once — `source_id` was missing from
-`INDEX_COLUMNS`, so the composite key matched nothing. Then 11/11.
-**Known residual, asserted rather than hidden:** `entity` nodes derived from a
-superseded record's text still surface (a *label*, not the record — content is
-filtered on every arm), because they expose no artifact identity; a test asserts
-the residual still exists so **33.7 landing turns it red**. One test changed
-deliberately: `test_maintenance_reindexes_so_search_forgets_archived_records`
-had pinned the leak as expected behavior, and now also distinguishes *filtered*
-from *pruned*. Acceptance: `tests/test_memory_policy.py` (27). Suite **972
-passed / 8 failed / 6 skipped** (same 8 pre-existing). Full detail:
-`runs/2026-08-11-memory-33.6/SUMMARY.md`. Next: **33.7**, memory in the graph.
+Service-to-service traffic is durable by construction: pooled keep-alive
+connections, batching, full-jitter retry honouring `Retry-After`, a per-endpoint
+circuit breaker whose half-open slot admits one probe, failover to another
+worker and then to **local preparation**, deadline propagation applied to the
+live socket, content-addressed idempotency keys, and heartbeats that extend a
+claim while the handler runs. Remote preparation is an *optimization*: no
+arrangement of worker failures may change what a sync produces.
 
-**Step 33.5 (structured memory index + clean text + identity) landed here
-2026-08-10** — first step of the *memory-steered retrieval* arc (33.5–33.11),
-which turns memory from a second corpus into a retrieval instrument. Memory
-records stay source content; what changes is that their metadata stops being
-prose. New **`memory_records` projection table** (`persistence/state_store.py`,
-`CREATE TABLE IF NOT EXISTS` in `SCHEMA` — the `idp_groups` pattern, idempotent
-by construction) carrying scope/subject/kind/asserted_at/valid_from/valid_until/
-supersedes/tags/written_by plus salience/uses/last_used_at reserved for 33.9;
-`memory/projection.py` derives every row from the files, so losing the table
-costs a re-sync, never data. **Record schema 2** adds `kind`/`written_by`/
-`valid_from`/`valid_until` with **nothing on disk rewritten** — v1 files load
-forever, keep reporting v1, and `_digest_input` only extends the hashed string
-for values v1 could not express, so **every v1 record id is reproduced
-byte-identically** (asserted, not assumed). `valid_until` is **derived, never
-double-stored**: a correction ends the original's validity at its own
-`asserted_at`, earliest correction wins, and a declared expiry wins when
-earlier. **Frontmatter is no longer indexed as prose** (memory sources only, so
-no existing vault/docs index shifts), with chunk lines corrected back to
-absolute. The one-shot re-read needs **no bespoke migration**: a `text_pipeline`
-marker in `source_fingerprint` (memory-scoped — adding it unconditionally would
-invalidate every fingerprint in every deployment) makes the existing "config
-changed → escalate to full" path do it. Additive `principal`/`kind`/
-`valid_until` on MCP `memory_write` + `POST /memory` (rule 8); `written_by` is
-in the digest, so two principals asserting the same sentence in the same second
-get two records — load-bearing for 33.11. `POST /memory` is now audited (only
-MCP was), and `POST /memory/consolidate` returns `200 {"skipped": …}` instead of
-`400`, matching MCP.
+Serving durability: bounded request concurrency answering `429` +
+`Retry-After` under saturation, and a SIGTERM drain that fails readiness and
+keeps serving on a timer thread — never by sleeping on the event loop.
 
-**Three bugs caught by the tests, all mine:** only `parse_file` was patched
-while the engine goes through `parse_connector_payload` (both now route through
-one helper); the frontmatter regex was `\n`-only while `Path.write_text` stores
-CRLF on Windows, so the strip silently failed on the platform the records were
-written on; and clearing the projection in `delete_source_artifacts` would have
-reset earned counters on **every full sync**, which is the path consolidation
-takes after each archive. **The documented dedup flake is fixed at the root**:
-content identity is the *digest*, not the timestamp — matching on the full path
-made "an identical write returns the stored record" true only within one
-wall-clock second (measured 1-in-3 failures on clean HEAD, 3-of-3 with this
-step's slower sync). Mutation-tested 9 mutants: **8 caught, 1 survived**, and
-the survivor was a vacuous test of mine (stale rows satisfied the assertion even
-when the projection aborted entirely) — fixed, then 9/9. Acceptance:
-`tests/test_memory_projection.py` (17). Suite **945 passed / 8 failed / 6
-skipped**; the 8 are pre-existing and environmental (Windows `0o600`, Windows
-mount-path dedup, CRLF-checkout contract parity — **note that guard is inert on
-Windows**, so contract safety was verified via `git status contracts/` — and a
-raw `wasmtime._trap.Trap` escaping `SandboxFuelExhausted`, a **real pre-existing
-bug**). Full detail: `runs/2026-08-10-memory-33.5/SUMMARY.md`. Next: **33.6**,
-query-time memory policy + the stale-leak fix.
+`src/pheasant/capacity.py` is the single home for sizing coefficients so
+`pheasant scan`, `pheasant shard plan` and the docs cannot disagree.
 
-**Steps 32.1+32.2+32.6 (ACL persistence, principal filtering, leak gate)
-landed here 2026-07-17 [x-repo] — Phase 32 core.** Artifacts gain an `acl`
-column (one-shot idempotent additive migration in `StateStore.migrate`;
-NULL = pre-32 semantics). `security/acl.py`: per-connector `normalize_acl`
-→ canonical `{"allow": ["user:…","group:…"], "public": bool}` (notion
-creators, gdrive owners, slack privacy, confluence space+creator, imap
-from/to/cc, canonical passthrough otherwise; unreadable ACLs fail closed);
-the engine stores it on every indexed artifact. `search_context` accepts
-`principal`/`principal_groups` and, under `security.acl_enforced: true`
-(**default false — pre-32 byte-identical**), over-fetches candidates and
-filters against artifact ACLs BEFORE merge/return (graph nodes without an
-artifact row conservatively denied; un-ACL'd artifacts follow
-`security.default_visibility`, `groups:` config maps principals→groups —
-IdP sync loop = 32.4). Threaded through MCP `search_context` + HTTP
-`/search` (router forwards the principal; the region enforces). Leak gate:
-`tests/test_acl_enforcement.py` (adversarial cross-user, anonymous
-public-only, group via param + config, enforcement-off parity,
-normalization rules, fail-closed). Suite: **253 passed** (+5). Router-side
-32.3 + deferred 32.4/32.5 live in Flock (`PRODUCT_FRAMEWORK.md` §3d).
+### Sandboxing
 
-**Step 32.4 (external-IdP group sync + staleness SLA) landed here 2026-07-18
-[x-repo] — completes the pheasant side of Phase 32.** The 32.2 config-mapped
-`security.groups` stays the deterministic core; `security/idp.py` adds a
-*synced* principal→groups mapping from a SCIM 2.0 `/Groups` directory
-(`fetch_scim_groups` — paginated ListResponse, token from
-`security.idp.api_key_env`, one monkeypatch-friendly module-level HTTP fn,
-stdlib urllib, zero new deps). Persistence is SQLite: additive `idp_groups` +
-`idp_sync_meta` tables in `StateStore.migrate` (CREATE IF NOT EXISTS —
-idempotent, user data preserved); `replace_idp_groups` is transactional and
-row-stable on an unchanged directory while `synced_at` bumps every successful
-pass (the heartbeat IS the SLA clock). Enforcement: the `search_context` ACL
-path unions **fresh** IdP groups into the identity set; the **staleness SLA
-fails closed** — a mapping older than `security.idp.staleness_max_minutes`
-(default 1440) grants NOTHING until the next successful sync (config +
-param groups unaffected). Refresh rides the 21.1 scheduler beat
-(`run_idp_maintenance` — due-interval check, fetch failures reported never
-raised, so the beat survives and the mapping just ages toward the SLA) +
-on-demand `POST /security/idp/sync` and `GET /security/idp/status`. Config
-`security.idp.{enabled=false, provider=scim, base_url, api_key_env,
-sync_interval_minutes=60, staleness_max_minutes=1440}` — **disabled by
-default: byte-identical 32.2 behavior**. Docs: `docs/security.md`.
-Acceptance: `tests/test_idp_sync.py` (7 — paginated fetch, idempotent
-re-sync + heartbeat, fresh-grant vs stale-fail-closed e2e, maintenance due
-logic + error resilience, HTTP round-trip, disabled no-ops). Suite:
-**260 passed / 2 skipped** (+7). Router-side 32.5 (OIDC bearer→principal +
-audit) lands in Flock the same day — **Phase 32 complete**.
-
-**Steps 31.3–31.7 (GDrive/Slack/Confluence/IMAP + certification) landed
-here 2026-07-16 — Phase 31 complete.** Four more first-party SDK plugins in
-`src/pheasant/connectors/` (entry points in pyproject; zero new deps —
-stdlib urllib/imaplib, bs4 already core): version-proxy sha256 pre-read
-skips, per-item incremental cursors (imap = exact UID high-watermark, a
-second sync lists nothing), deterministic rendering, `connector.api_key_env`
-secrets, Phase-32 ACL capture. 31.7: certified-connectors table + recipe in
-`docs/reference/connector-sdk.md`; the example package now ships the
-certification test (`tests/fixtures/pheasant-connector-example/tests/`),
-fixture suites excluded via pytest `norecursedirs`.
-`tests/test_saas_connectors.py` (34). Suite: **248 passed** (+34).
-
-**Step 31.2 (Notion connector) landed here 2026-07-16.** First-party SDK
-plugin dogfooding 31.1: `src/pheasant/connectors/notion.py` under the
-`pheasant.connectors` entry-point group in this repo's own `pyproject.toml`
-(config `type: notion`, zero new dispatch code). Paginated `POST /v1/search`
-listing; block tree → deterministic Markdown (nested to depth 3, no LLM);
-`item.sha256` = `(page_id, last_edited_time)` proxy → pre-read skip;
-per-page edit-time cursor → `read_item` `ItemNotModified` on incremental;
-token via new generic `sources[].connector.api_key_env` (default
-`NOTION_TOKEN`); `metadata["acl"]` carries created_by/last_edited_by
-(Phase 32 reserved). Offline recorded fixtures `tests/fixtures/notion/`;
-`tests/test_notion_connector.py` (12) incl. engine-e2e idempotent +
-incremental (zero block fetches on unchanged) + conformance + entry-point
-guard. Suite: **214 passed** (+12).
-
-**Step 31.1 (Connector SDK) landed here 2026-07-15.** Third-party connector
-plugins resolve by `sources[].type` name via `importlib.metadata` entry
-points (group `pheasant.connectors`, `sync/connector_registry.py`) or
-programmatic `register_connector_class`; unknown config type strings load
-as `PluginSourceType` (a `str` with a `.value` property — existing
-`source.type.value` call sites untouched, no workspace anchoring) and
-resolve at dispatch (`connector_for_source` falls through to the registry
-after the hardcoded built-ins, so the zero-plugin path is byte-identical;
-missing plugin → error naming type + installed plugins). Public quality
-bar: `pheasant.testing.ConnectorConformance` (subclass + one
-`make_connector` factory) — FilesystemConnector passes the same harness.
-Canonical third-party shape: `tests/fixtures/pheasant-connector-example/`
-(`StaticDirConnector`), engine-e2e + idempotent second sync in
-`tests/test_connector_sdk.py`. Docs: `docs/reference/connector-sdk.md`.
-Suite: **183 passed** (+19). Steps 31.2–31.6 (Notion/GDrive/Slack/
-Confluence/IMAP) build on this, one per session; contracts in the Flock
-repo's `docs/PRODUCT_FRAMEWORK.md` §3.
-
-**Retrieval + graph overhaul landed 2026-08-03.** Driven by a concrete
-failure: asking the demo corpus to "locate readme" returned Python source
-while the repository's own `README.md` sat at rank 125.
-
-*Ranking* (`search/sqlite_store.py`, `search/hybrid.py`): query expansion now
-drops framing stopwords (a rare verb like "locate" — 15 chunks — outscored
-"readme" — 724 — because BM25 weights by rarity); `chunks_fts.title` holds the
-**basename** instead of a second copy of `path`, with BM25 column weights
-`8/3/2/1`; structural priors divide the score by path depth and by
-tests/samples membership; and hybrid merges by **Reciprocal Rank Fusion**
-instead of raw score — the three arms scored on incomparable scales (text
-0.86-0.92, vector 0.667-0.674, graph a flat 0.60), so hybrid had silently
-degraded to text-only while paying for all three. Measured MRR 0.230 → 0.594
-on the live 2,132-file corpus. One-shot idempotent FTS rebuild in
-`StateStore._migrate_fts_titles` — no re-index needed.
-
-*Concept extraction retired* (`graph.enrichment._add_concept`, now a no-op
-with the measurements in its docstring). It was 87.2% of nodes and 98.6% of
-edges and failed every test: the retrieval expansion path never fired, the
-facts panel filled with "limit"/"request info", and `similar_to` emitted zero
-edges. Result: sync 1.5h → **2m53s**, graph 915 MB → 2.3 MB, DB 1.4 GB → 321 MB.
-The Synapse contract's vocabulary moved to `fts5vocab` with the **wire format
-unchanged** — see the 2026-08-03 decision note in `docs/SYNAPSE_INTEGRATION.md`.
-
-*Internal reference resolution*: `resolve_cross_source_edges` no longer skips
-same-source targets, so imports/links resolve to the **file** they name
-(2,903 edges on the demo corpus). This is the file→file connectivity the graph
-advertised and never had.
-
-*Assistant*: answers are built from whole files reassembled from their chunks
-with metadata (`retrieval.documents`), not 500-char previews; questions are
-classified `knowledge` vs `procedural` and drive retrieval breadth-vs-depth,
-the sufficiency bar and the answering prompt; workflows are
-`knowledge-summary | agentic | simple`. Nested `workflow_options` (documented
-and previously ignored outright) now works.
-
-Full step contracts with acceptance criteria: `docs/SYNAPSE_INTEGRATION.md` §2.
-
-| Step | What | Fixes | Status |
-|---|---|---|---|
-| 21.1 | Real watcher + scheduler (watchdog + interval loop) | stub `sync/watcher.py`, `sync/scheduler.py` | done (2026-06-10) |
-| 21.2 | WAL + single-writer lease + manifests→SQLite | crash/concurrency safety; loose-JSON manifests | done (2026-06-10) |
-| 21.3 | True incremental web/API/S3 (ETag/cursor/watermark) | connectors ignore their checkpoints | done (2026-06-10) |
-| 21.4 | Per-region vector index (lancedb, `[vector]` extra) + OpenAI-spec embedder, `mode="vector"` in hybrid search **[x-repo]** | dead `search.embeddings`/`vector_store` config | done (2026-06-13) |
-| 21.5 | Semantic-contract publisher + NDJSON event stream + router webhook **[x-repo]** | no sync-completion signal; no contract | done (2026-06-14) |
-| 21.6 | Graph snapshots (zstd) + retention + backup/restore; cross-source edges + concept normalization | dead storage config; no backup; no cross-source links | done (session A 2026-06-18; session B 2026-06-18) — Phase 21 complete |
-
-**Phase 34 (WASM sandboxing & selective acceleration) queued 2026-08-03.**
-Full step contracts in `docs/SYNAPSE_INTEGRATION.md` §5. Not
-Synapse-contract work — no wire-format impact, no `[x-repo]` obligation.
-Anchored on two confirmed, unmitigated gaps found by reading the hot paths
-directly (judged against what's left *after* the 2026-08-03 concept-extraction
-retirement above, not against that already-solved cost): (1) third-party
-connector plugins run fully-trusted, unsandboxed Python in-process
-(`sync/connector_registry.py`'s `ep.load()`, ambient secrets via
-`os.environ`); (2) two O(graph) hot loops that scale with multi-source
-growth — `graph/builder.py:add_cross_source_edges` (every sync, can't be
-`changed_ids`-gated like `add_similarity_edges` because references need both
-sides indexed) and `search/graph_search.py:_scan_edges` (every relationship
-query, no FTS5-style prefilter unlike node search). Sandboxing
-(`wasmtime`/WASI, new `[wasm]` extra, opt-in `connector.runtime: sandboxed`
-tier alongside native) and speed work (WASM-accelerated cross-source
-resolution + relationship search, gated on a benchmark spike) are independent
-tracks; mono-container-per-KB architecture is unchanged. Steps 34.1-34.7, one
-per session, `runs/<ts>-synapse-34.N/SUMMARY.md` each.
-
-**Step 34.1 (host harness) landed here 2026-08-03.** New
-`src/pheasant/sandbox/wasm_runtime.py`: `WasmSandbox` wraps one `wasmtime`
-guest instance — deterministic fuel metering (`Config.consume_fuel` +
-`Store.set_fuel`, not a wall-clock timeout), a per-instance linear-memory cap
-(`Store.set_limits`), and a capability-scoped `host_fetch_len`/
-`host_fetch_read` import pair gated by `HostCapabilities.allowed_hosts` (no
-ambient WASI env/fs/net; reuses `sync/connectors.py`'s `require_fetchable_url`
-rather than reimplementing scheme checks). Traps translate to typed
-exceptions (`SandboxFuelExhausted`, `SandboxMemoryLimitExceeded`,
-`SandboxCapabilityDenied`, `SandboxTrapped`); a region without the new
-`[wasm]` extra (`wasmtime>=20`) stays byte-identical
-(`WasmRuntimeUnavailable` raised only on actual use, never on import).
-**Toolchain note:** no Rust/TinyGo toolchain was available in this
-environment, so guest fixtures are hand-authored WAT text compiled by
-`wasmtime.Module`'s built-in WAT parser — no external compiler needed for
-the reference/test guests; a real toolchain is still expected for
-third-party connector authors (unchanged from the plan).
-`tests/test_wasm_harness.py` (6 tests): hello-wasm runs, fuel exhaustion and
-memory-cap overrun both fail closed, a `host_fetch` round trip succeeds for
-an allowlisted host and is denied otherwise, gated-import guarantee holds.
-Suite: **516 passed, 7 skipped** (+6).
-
-**Step 34.2 (reference sandboxed connector) landed here 2026-08-03.** New
-`src/pheasant/sandbox/connector.py`: `SandboxedConnector` ports
-`StaticDirConnector`'s shape — lists/reads `*.txt` files host-side (guarded
-by `security/path_policy.resolve_under`, reused not duplicated) and runs
-each file's bytes through a bundled WASM guest's `normalize()` export
-(CRLF→LF) inside the 34.1 harness before hashing/storing.
-`connector_for_source` (`sync/connectors.py`) now checks
-`source.connector.runtime == "sandboxed"` before its `source.type` dispatch
-(new `SourceConnectorSettings.{runtime, allowed_hosts, wasm_module_path}`,
-all additive, `runtime` default `"native"` — an untouched source is
-byte-identical to pre-34.1). **Deviation from the plan text:** listing/read
-stays host-side rather than the guest doing its own WASI
-`fd_readdir`/`path_open` syscalls — hand-authoring WASI preview1's
-filesystem ABI in raw WAT (no Rust/TinyGo toolchain available, per 34.1) was
-judged too easy to get subtly wrong without a way to validate it; the guest
-still processes real untrusted per-item bytes under the fuel/memory cap,
-which is the actual threat-model target (Confluence's in-process
-BeautifulSoup parse of untrusted remote XHTML is the named example) — full
-rationale in the run summary. `pheasant.testing.ConnectorConformance`
-needed **no code changes** — it was already connector-agnostic, so the
-sandboxed connector gets the identical bar for free via a new subclass.
-`tests/test_sandboxed_connector.py` (9 tests, +9). Suite: **525 passed, 7
-skipped**.
-
-**Step 34.3 (adversarial limit enforcement) landed here 2026-08-03.**
-`WasmSandbox.__init__` now wraps `linker.instantiate`: a guest declaring an
-import the sandbox never wires (e.g. `wasi_snapshot_preview1.environ_get` —
-no ambient WASI env is ever provided) fails to **load at all**, surfaced as
-`SandboxCapabilityDenied` rather than a raw `wasmtime.WasmtimeError`.
-`tests/test_wasm_adversarial.py` (5 tests) proves all four named adversarial
-shapes fail closed with the specific properties the step calls for: unbounded
-memory / infinite loop both raise their typed exception inside a wall-clock
-bound (no hang); ambient env read is denied before any guest code runs; two
-SSRF-shaped host_fetch attempts (`file:///etc/passwd` scheme disguise, a
-`169.254.169.254` metadata-endpoint host) are both denied with the fetcher
-asserted **never invoked** (no secret leak) and the guest's result buffer
-staying all-zero (no partial write). New fixtures:
-`tests/fixtures/wasm/{wasi_env_leak,host_fetch_ssrf}.wat`. Suite: **530
-passed, 7 skipped** (+5). **Scope note:** the plan's broader manual
-end-to-end check (malicious connector wired into a live `pheasant sync`,
-confirming the parent API server keeps serving via `sync/worker.py`'s
-pre-existing child-process isolation) is left as a documented follow-up —
-34.3's own acceptance is fully covered by the automated suite, and that
-check exercises Phase 21.1 process isolation rather than anything new here.
-This **closes the sandboxing arc (34.1-34.3)**. Next: Step 34.4 (benchmark
-spike — no production code expected, numbers only).
-
-**Live validation against the real demo-agent-framework corpus, 2026-08-04.**
-Rebuilt `examples/demo-agent-framework/` with `PHEASANT_EXTRAS=mcp,agent,
-wasm` and both 34.5 flags on, ran a real full sync (2,132 files → 22,683
-nodes / 54,406 edges). Found and fixed a real bug in the process: `graph:`
-config sections were silently discarded entirely —
-`PheasantConfig.model_validate`'s constructor call was missing
-`graph=build(GraphSettings, data.get("graph"))`, so `concept_min_documents`
-was ALSO never configurable via YAML, not just the new WASM flag; no test
-caught it because none exercised the `graph:` section. Fixed in
-`config/schema.py`; regression test in `tests/test_config_loading.py`.
-Both accelerators then confirmed correct on the real corpus (WASM AOT
-cache file appeared exactly at sync completion; a direct in-container
-check found `_scan_edges` producing identical hits — 10,861 — between
-Python and WASM). **Revised finding:** real-world `_scan_edges` speedup was
-only ~1.13x (1.278s → 1.130s), far below the 34.4 synthetic benchmark's
-~5x at comparable edge counts — the synthetic fixture's short placeholder
-strings understated real marshal cost; the scaling *shape* held, the
-*magnitude* did not transfer. Full detail:
-`runs/2026-08-04-synapse-34-live-validation/SUMMARY.md`.
-
-**Step 34.4 (benchmark spike) partially landed here 2026-08-03 — blocked on
-a toolchain decision.** `runs/2026-08-03-synapse-34.4/benchmark.py` measures
-the pure-Python baseline for both named hot loops at 6 scale points each:
-`resolve_cross_source_edges` is confirmed genuinely O(V+E) (flat ~5-6
-μs/edge, 2→64 sources) when relative paths are globally unique, but a
-previously-undocumented **O(sources²)** degenerate case was found when N
-sources share the same relative-path layout (a single `by_path` bucket fans
-out to N candidates — `enrichment.py:346-354`, not a WASM problem, an
-algorithmic fix if ever addressed). `graph_search._scan_edges` is confirmed
-O(edges) (~10-14 μs/edge, 500→16,000 edges) but lands on the **query path**
-with no index prefilter — ~225ms at 16k edges, extrapolating to ~2.2s at
-160k, the stronger practical case for acceleration. **No WASM comparison arm
-was produced**: a faithful port needs a hash-map-backed path index +
-Python-identical string-matching rules (far more code than the 34.1-34.3
-fixtures), and this repo still has no Rust/TinyGo toolchain — hand-authoring
-that logic in raw WAT risks a silent wrong-answer bug (unlike a sandboxing
-fixture, there's no fail-closed trap to catch it), so it was not attempted
-without a toolchain decision. User chose: install a real toolchain. `rustup` (GNU host, no MSVC
-dependency) + `wasm32-unknown-unknown` installed and verified end-to-end
-(smoke-test crate: Rust → wasm → wasmtime → correct result) before writing
-the real port.
-
-**Step 34.4 completed here 2026-08-03 (for (a)/(b) — (c)/(d) deferred per
-the plan's own priority order).** `runs/2026-08-03-synapse-34.4/wasm_bench/`
-(a spike-only Rust crate, not shipped under `src/pheasant`) ports
-`resolve_cross_source_edges`'s `python_import` path and the full
-`_scan_edges` scoring logic to `wasm32-unknown-unknown`. Every one of 12
-tested scale points asserts the WASM output is byte-for-byte identical to
-the Python reference before any timing counts — correctness parity-verified,
-not assumed. **Finding #1 (implementation-critical):** a naive
-per-call-compiled sandbox makes WASM 5-20x *slower* than Python at every
-scale (`WasmSandbox.__init__` JIT-compiles the module every construction) —
-any real integration must compile the module once at startup and reuse it;
-a steady-state harness (module precompiled, fresh `Store`/`Instance` per
-call) is the number that actually matters. **Finding #2 — the two loops
-diverge sharply:** `_scan_edges` steady-state WASM is a consistent, growing
-2-8x win at every scale tested (500→64,000 edges) — highest-confidence part
-of the spike, on the query-latency-sensitive function with no existing
-mitigation. `resolve_cross_source_edges` steady-state WASM **loses to
-Python below ~1,300-2,500 edges** and only starts winning above that — and
-today's actual demo corpus (2,903 cross-source edges, per this file's
-2026-08-03 retrieval-overhaul entry) sits almost exactly at that breakeven
-point. **Go/no-go: 34.5b is a GO; 34.5a is a CONDITIONAL GO** (recommend
-pairing with a marshal-format optimization — string-interning repeated
-paths/source-ids instead of repeating them per edge — which would likely
-lower the crossover and widen the margin, not just shift it). No production
-code changed this step (git-confirmed); benchmark scripts + Rust crate live
-under `runs/2026-08-03-synapse-34.4/` (gitignored). Next: Step 34.5,
-34.5b prioritized over 34.5a, both compiling their guest module once at
-startup per Finding #1.
-
-**Step 34.5 (WASM-accelerated cross-source resolution + relationship
-search) landed here 2026-08-03.** Solved Finding #1 (naive per-call
-compile) with `wasmtime`'s AOT module serialization: a fresh `Config`+
-`Engine`+`deserialize` (fully matching a cold `sync/worker.py` subprocess —
-`subprocess.run`, one call per process lifetime, no second call to
-amortize an in-process compile against) loads a precompiled artifact in
-under 1ms vs. ~103ms to JIT-compile from raw `.wasm` bytes. New
-`src/pheasant/sandbox/accel/`: a production Rust crate
-(vendored compiled `accel.wasm`, 112KB) + `loader.py` (process-wide
-singleton, machine-local `.cwasm` cache under the OS temp dir — deliberately
-**not** under any KB's `/state`, since the compiled binary is
-knowledge-base-**independent** by design: same binary for every KB, graph
-data is a call argument, never baked into the module; the cache is a
-build-cache-for-a-generic-binary, not KB state — directly answers the
-deployment-genericity question raised before this step). **Correctness
-scope note:** 34.5a is a **full** port of
-`resolve_cross_source_edges` — both `python_import` *and*
-`document_link`/`url` reference-type paths, unlike the 34.4 spike which
-only covered the former; shipping a partial port behind a config flag would
-have silently broken markdown/document-link cross-source edges, not just
-changed performance. A subtle catch during the port: Python's
-`str.lstrip("./")` strips a *character set* (every leading `.` or `/`), not
-the two-char literal `"./"` once — a naive `trim_start_matches("./")` would
-have silently under-stripped `"../../foo.md"`-shaped links; caught by the
-parity tests before it shipped. Both accelerators are wired opt-in
-(`graph.wasm_cross_source_resolution`, `search.wasm_relationship_search`,
-both default **off**) with a broad `except Exception` → pure-Python
-fallback + logged warning at every call site — acceleration is a
-performance path, never a correctness dependency, verified by dedicated
-failure-injection tests (monkeypatch the WASM wrapper to raise, confirm the
-end-to-end result is still correct). `tests/test_wasm_accel.py` (8, function
-parity incl. edge cases the 34.4 spike never exercised),
-`tests/test_wasm_accel_integration.py` (5, flag on/off byte-identical
-through a real sync/search + fallback-under-failure),
-`tests/test_wasm_accel_loader.py` (4, the AOT cache mechanism itself,
-including proving a "fresh process" loads from cache rather than
-recompiling by patching `Module.__init__` to raise if called). Suite:
-**547 passed, 7 skipped** (+17).
-
-**Steps 34.6 and 34.7 evaluated and closed here 2026-08-03 — both NO-GO,
-neither implemented, completing Phase 34.** Ran the missing 34.4c/34.4d
-benchmark slices rather than skip straight to implementation:
-
-- **34.4c / 34.6 (chunking):** `chunk_text` runs once per **file**, not
-  once per sync — the "small units, called often" shape the plan already
-  flagged as weak. Measured: Python chunks a 2 KB file in 35 μs, a 10 KB
-  file in 219 μs, a 50 KB file in 2,865 μs; the bare fixed cost of a WASM
-  Store+Instance (no marshal, no compute) is 115 μs. WASM loses outright
-  on typical small files before doing any work, and only large files leave
-  enough headroom to plausibly win — while every file, regardless of size,
-  pays the call. No Rust port was written: the numbers already answer it,
-  and a faithful port has a real correctness hazard 34.5 didn't (Python's
-  `text[start:end]` slices by Unicode code point; a naive byte-oriented
-  Rust port would silently mis-chunk any non-ASCII content).
-- **34.4d / 34.7 (packed graph representation):** measured live (uncompressed,
-  in-process) `SimpleMultiDiGraph` memory via `tracemalloc` at the actual
-  demo-corpus scale (2,132 files → 13,503 nodes/13,502 edges) and a 10x
-  stress scale (21,320 files → 135K/135K): **20.5 MB and 205 MB**
-  respectively. Not a memory problem at either scale by any reasonable
-  container budget — the plan's own "2.3 MB compressed" reference
-  undersold how small this already is once measured live rather than
-  assumed. No implementation attempted; touching `SimpleMultiDiGraph`
-  (the core structure the whole indexing/search/enrichment pipeline reads
-  and writes) isn't justified without a real constraint to fix.
-
-Both write-ups are full run summaries with the reasoning and numbers, not
-just a one-line "skipped" — the plan explicitly wanted the spike's answer
-recorded even when the answer is no. **Phase 34 (WASM sandboxing &
-selective acceleration) is complete**: 34.1-34.3 shipped (sandboxing),
-34.4 shipped (benchmark data + the toolchain), 34.5 shipped (both
-accelerated hot loops, production-wired, opt-in), 34.6-34.7 evaluated and
-correctly not built.
+Third-party connector plugins can run under `connector.runtime: sandboxed`:
+one wasmtime guest per instance with deterministic fuel metering, a
+linear-memory cap, and a capability-scoped host-fetch pair. A guest declaring an
+import the sandbox never wires fails to **load at all**. Two hot loops
+(`resolve_cross_source_edges`, `_scan_edges`) have opt-in WASM accelerators that
+fall back to pure Python on any error — acceleration is a performance path,
+never a correctness dependency.
 
 ---
 
-## Setup simplification, 2026-08-07 — the agentic config wizard removed
+## 6. Traps this codebase has already fallen into
 
-The 2026-08-06 "startup overhaul" (#42) tried to solve onboarding by handing it
-to a coding agent: a 449-line prose operating procedure
-(`agent/config_wizard_prompt.md`) plus four per-tool adapters (Claude, Codex,
-Gemini, VS Code) that each said "read that file and follow it", guarded by a CI
-freshness test to stop the prose rotting against the schema. **All of it is
-deleted.** It was non-deterministic (same answers, different YAML, depending on
-which agent ran it), unreachable without an agent, duplicated the schema in
-prose — and the hard parts of setup were never the questions.
+Each of these cost real time. They are listed because the shape recurs.
 
-What replaced it, feature by feature:
-
-**`pheasant setup` — a real interactive wizard** (`src/pheasant/setup_wizard.py`).
-Deterministic, offline, no LLM. Fifteen sections, each explaining its area
-before asking; every question carries a working default so Enter-through is a
-supported path. **Every default is read off the live dataclasses**
-(`schema_default()` walks a default `PheasantConfig`), so a changed default
-cannot go stale here — that property is what let the old rot-detector die.
-Secrets go to a `0600` `.env`, merged not clobbered, `.gitignore` checked and
-fixed; only the env-var *name* ever reaches YAML, and a variable already set in
-the environment is not asked about. `--advanced` / `--accept-defaults` /
-`--answers FILE`; `Ctrl-C` checkpoints to `.pheasant-setup.json` (secrets
-deliberately excluded). The old freshness test is replaced by
-`tests/test_config_surface_freshness.py`, which checks live code — every
-top-level section reachable from the wizard, documented, and declared in
-`LIVE_APPLICABLE_SECTIONS`.
-
-**Documents uploaded through the UI** (`POST /sources/upload`,
-`api/uploads.py`, `ui/src/components/UploadDrop.tsx`). Files land under
-`/state/uploads/<name>/`, registered as an ordinary `document_folder` source —
-same connector→chunk→graph pipeline, **no second ingestion path**. The module
-owns only filename safety. One bug caught by its own tests: the first
-implementation used an allowlist (`[A-Za-z0-9._ -]`) which mangles every
-non-English filename (`Übersicht.pdf` → `_bersicht.pdf`, `会議メモ.md` → `___.md`)
-while defending against nothing a denylist does not; and the length cap counted
-characters, not the bytes filesystems actually limit.
-
-**Any local directory, not just a container subdirectory**
-(`deployment/mounts.py`, `GET /fs/host-path`, `pheasant mount`). Parses the
-container's own `/proc/self/mountinfo` (octal-escape decoding included) and
-answers the real question — "you typed a path I cannot see" — with the compose
-volume, the `docker run` flag *and* the `allow_workspace_roots` entry, because
-a mount without the allow-list entry is a half-fix. `pheasant mount` writes
-both, merging into any existing override file. A Windows path is matched
-against **all four** shapes Docker Desktop has used for a drive
-(`/c/…`, `/host_mnt/c/…`, `/run/desktop/mnt/host/c/…`, drive-less), because
-picking one silently tells half of Windows their mounted directory is not
-mounted.
-
-**Retrieval tuning as typed config** (`assistant.retrieval` /
-`RetrievalSettings`). These knobs existed only as untyped `workflow_options`
-keys documented in a workflow module's `DEFAULTS`. Precedence is deliberately
-**low** — merged *under* `workflow_options`, itself under per-request
-`options` — so an existing config is completely unaffected; a `None` field is
-not merged at all. `GET`/`PUT /assistant/retrieval` + a Settings panel.
-
-**One universal image.** Multi-stage `Dockerfile`: a node stage builds
-`ui/dist`, the runtime installs **all** extras by default
-(`mcp,agent,vector,wasm,a2a` — the old `mcp`-only default meant a valid
-`pheasant.yaml` could fail at runtime in the published image) and serves API +
-MCP + UI on one port. `docker-entrypoint.sh` generates a config via
-`pheasant setup --accept-defaults` when `/config` is empty, so
-`docker run -v $PWD:/workspace ghcr.io/esatt10/pheasant` works with no config
-at all. `docker-compose.yml` is one service; the UI sidecar moved behind a
-`--profile ui`.
-
-**Editing the live knowledge base** (`GET /config/sections`,
-`PATCH /config/section/{section}`, `GET`/`PUT /knowledge-base`). One section at
-a time, validated against the *whole* config (sections are not independent),
-hot-applied where safe and reported **honestly** where not (`applied` vs
-`restart_required`) — a UI that says "saved" for a value the process is still
-ignoring has lied. A KB rename is allowed but reports the full re-index it
-implies rather than silently orphaning the graph (rule 3: `kb_id` is the graph
-root and every stable-ID prefix).
-
-**Background job progress** (`src/pheasant/jobs.py`, `/jobs`, `/jobs/stream`,
-`ui/src/components/JobsTray.tsx`). Replaces the `syncing_sources`/
-`sync_outcomes` dicts, whose only vocabulary was a boolean held for however
-many minutes a first index took — indistinguishable from a hang.
-`SyncEngine.sync_source(on_progress=…)` rides the *existing* per-artifact
-`serve_yield()` point (no new traversal); `pheasant sync --progress` emits
-throttled NDJSON; `sync/worker.py` switched `subprocess.run` → `Popen` line
-streaming so the parent sees movement *during* the sync. A marker key
-distinguishes progress lines from the final JSON report on the same stdout.
-**Bug caught by a hanging test:** the SSE handler was a sync generator blocking
-on `queue.get(timeout=…)` — Starlette runs those in a threadpool it cannot
-interrupt, so every disconnected browser would have leaked a thread forever. It
-is an async generator polling a queue now, and `JobRegistry.stream()` was
-replaced by a non-blocking `drain()` so the pattern cannot be reintroduced.
-
-**Full-screen graph workspace** (`/graph` route, `GraphPage.tsx`,
-`GET /graph/diagnostics`, `GET /graph/path`). Hubs by degree, orphan count,
-edge/node histograms, density — and a shortest-path finder, the one question a
-canvas structurally cannot answer because two nodes six hops apart are never on
-screen together. Bidirectional BFS over edges treated as **undirected**
-(relatedness is not about which way an import points), bounded by depth and
-visit budget. Diagnostics use the copy-free `iter_edges()`/`node_map()`
-lock-held iterators.
-
-**MCP retrieval criteria** (additive only, rule 8). `search_context` gains
-`source_name`/`exclude_sources`/`node_types`/`min_score`, over-fetching so
-`max_results` still means what it says; filters are pure post-filters that never
-re-rank. Two new tools: `describe_retrieval` (what this region is configured to
-do and what is tunable — `vector` is not advertised without a built index) and
-`preview_retrieval` (run criteria, report the delta against the standing
-config, persist nothing), so an agent can test a configuration before anyone
-writes it into YAML.
-
-`python-multipart` became a core dependency — FastAPI needs it for `UploadFile`
-and it previously arrived only through the optional `[mcp]` extra, so a core
-install would have 500'd on a core route.
-
-Suite: **646 passed, 25 skipped** (+120). `tsc -b && vite build` clean.
-
-**Known pre-existing flake, not introduced here:**
-`test_memory_write_is_searchable_immediately_and_resync_is_zero_work` asserts a
-re-written identical memory record is deduplicated, which only holds if both
-writes land in the same second — `MemoryStore.append` embeds a
-second-granularity timestamp in the record id. Passes in isolation and on
-repeated full runs; left alone because fixing it means deciding whether
-"identical assertion a second later" is a new record, which is a memory-semantics
-call, not a setup one.
+- **An UNINDEXED FTS5 column in a `WHERE` clause is a full table scan.** A
+  per-artifact `DELETE FROM chunks_fts WHERE artifact_id=?` made indexing
+  O(N²); 8,000 files got 6.3× faster once it was skipped on full syncs. Treat
+  the pattern as a smell.
+- **Under Postgres READ COMMITTED only the *outer* `WHERE` is re-evaluated**
+  after a blocking UPDATE's winner commits — not the subquery. The outer clause
+  must be a predicate the winner's own write falsifies.
+- **`wasmtime.Trap` and `wasmtime.WasmtimeError` are siblings**, not parent and
+  child. Catch `guest_failures()`.
+- **A mutation harness must `touch` the restored file and purge
+  `__pycache__`.** A same-byte-length mutant restored within one mtime tick
+  leaves Python running the mutated bytecode, producing a false CAUGHT.
+- **A mutant that survives is a question, not a score.** Most survivors here
+  turned out to be real test gaps or vacuous tests. One was correct to survive
+  and is recorded as uncovered in its module docstring.
+- **Test the parser you ship.** A hand-rolled `yaml.py` at the repo root
+  shadowed the declared PyYAML for anything run from a checkout, so the suite
+  validated against a different parser than the image used. It concealed four
+  bugs before it was deleted.
+- **`model_dump(mode="json")` must emit plain types.** A `str` *subclass*
+  (`PluginSourceType`) is not plain data, and PyYAML's representer dispatches on
+  the exact type.
+- **Signal handlers run on the event loop.** Sleeping in one stops the process
+  answering anything, including the readiness probe the drain exists to flip.
+- **A live run finds what the suite cannot.** Container-only bugs have surfaced
+  four separate times — read-only mounts, cross-process registry visibility,
+  a crash on real-world malformed input. Run the real thing.
 
 ---
 
-## Dogfooding fallout, 2026-08-04 — background sync, graph UI cleanup, a live crash fix
-
-Not Phase-34 scoped — a follow-up UI/UX + bugfix session prompted by
-actually using the demo-agent-framework deployment (adding a second real
-source, mlflow, through the UI) rather than only curling the API.
-
-**Sync no longer blocks the request that started it — `wait: false`.**
-Adding a source through the UI's quick-add hit a **504** on a repo the size
-of mlflow: `POST /sources/quick-add` (and `POST /sources` with
-`sync_now`, and `POST /sync/{id}`) ran the sync *inside* the request/
-response cycle, so a first index that takes minutes outlives what a
-browser tab or reverse proxy holds a connection open for — even though the
-sync went on to succeed server-side, the client only ever saw a timeout.
-Fixed with a new `wait: bool` field on all three endpoints (default
-`true` — the original blocking contract, still what `pheasant up`/CLI
-callers and the existing `test_quick_add_registers_and_syncs_a_pasted_path`
-test get). `wait: false` hands the sync to a background thread (the same
-`sync/worker.py` subprocess `_index` already used, not a new path) and
-returns immediately; `app.state.syncing_sources`/`sync_outcomes`
-(lock-guarded, process-lifetime, in-memory) track it, surfaced as
-`syncing`/`sync_error` on every source in `GET /sources` and `GET
-/overview`. The UI's quick-add, "Advanced…" wizard, and both sync buttons
-(Sources page + the Notebook sources rail) all set `wait: false` now and
-poll (`refetchInterval`, active only while something is syncing) instead
-of blocking their own form/button on the result — the reported "stuck at
-the form, have to scroll back up to where I was" complaint was really "the
-form can't return until a multi-minute sync finishes," which no scroll fix
-could have addressed.
-
-**Regression caught by the live demo, not by the unit tests first
-written:** the `wait: false` validation checked `source_id` against
-`config.sources` only. A source registered at runtime (quick-add) lives in
-the state registry immediately but only reaches *that process's*
-`config.sources` — `SyncEngine._source` already has a state-registry
-fallback for exactly this (a second process, e.g. the sync worker, reading
-a source the YAML never mentioned), and the new validation had to check
-the same place or a perfectly good source 404s the instant a fresh process
-(here: this container after a rebuild/restart) is asked to sync it in the
-background. Reproduced with a two-`TestClient`-same-`/state` regression
-test before trusting the fix
-(`test_sync_source_with_wait_false_accepts_a_source_known_only_to_the_state_registry`).
-
-**A second live-only bug, found once the sync actually ran to completion
-on mlflow's real content:** `graph/enrichment.py`'s `_reference_label`
-(a cosmetic display label over a reference string — node identity comes
-from `_node_id`, unaffected) called `urlparse(value)` unguarded.
-`urllib.parse` raises `ValueError: Invalid IPv6 URL` — not a graceful
-"can't parse, return unparsed" the way it handles other malformed
-input — for a netloc-position string starting with `[` and never closing
-it (minimal repro: `"//[foo"`), which crashed the entire sync the moment
-mlflow's real markdown produced one. Fixed with a narrow `try/except
-ValueError: return value` (fail open to the raw string, exactly what
-every other branch of this function already does for "didn't parse as a
-URL"). Regression tests at both the unit level and a full `sync_source`
-end-to-end call with the crashing shape actually indexed.
-
-**Graph canvas cleanup, reported live as "Kamada-Kawai breaks the UI" +
-"entity/external_reference should be hidden by default":** removed the
-`kamada-kawai` layout option (ELK's `stress` algorithm via
-`cytoscape-elk` — the package's only caller) from `GraphCanvas.tsx` and
-`state/session.tsx`'s `GRAPH_LAYOUTS`, and dropped the now-unused
-`cytoscape-elk` dependency — regenerating `package-lock.json` via a
-throwaway `node:22-alpine` container (no local npm here) and confirming
-`npm ci` still resolves cleanly. Side effect: the UI's production JS
-bundle shrank from **2,309 kB to 847 kB** (ELK.js is large). Added
-`"entity"` and `"external_reference"` to `NOISY_NODE_TYPES` — the existing
-default-hidden-legend-types mechanism (`chunk`/`concept` were already in
-it) — so both hide by default in a fresh session, matching the other two
-noisy-by-volume types already there; a browser with prior localStorage
-keeps whatever it already had toggled, which is the correct behavior for
-a default change, not a bug.
-
-**Chat scroll-jump fix (from the immediately preceding turn, same
-session):** `ChatPanel.tsx`'s post-answer effect scrolled the whole
-conversation pane to its absolute bottom on every turn update. For an
-answer longer than a screenful this put the viewport at the *end* of the
-answer, with the user's own question — and the start of the answer —
-scrolled out of view above, needing a manual scroll back up to resume
-reading. Replaced with `scrollIntoView({block: "start"})` on the latest
-turn's own element (tracked per-turn-id in a `Map` ref, since the same
-turn re-renders in place when its answer arrives), pinning the question to
-the top of the viewport instead of chasing the bottom of whatever text
-just arrived.
-
-Full suite: **554 passed, 7 skipped** (+7 over the Phase 34 total: 4
-background-sync tests, 1 state-registry-fallback regression, 2
-`_reference_label`/urlparse tests). `tsc -b && vite build` clean. All
-changes verified live against the running demo-agent-framework stack
-(rebuild → real sync → real 404/500 → fix → rebuild → real success), not
-just unit-tested in isolation — both live-only bugs above would not have
-been caught by the pre-existing test suite alone.
-
----
-
-## Document text extraction (PDF/DOCX/HTML), 2026-08-06
-
-Not Phase-scoped — closing a gap found by asking pheasant about its own
-codebase. **`.pdf`/`.docx` were accepted by the ingestion pipeline and then
-silently produced no text**: `parse_file`/`parse_connector_payload` admitted
-both, `artifact_type` labelled them `document`, and `read_text` /
-`read_text_bytes` hard-returned `""` — so a PDF got an artifact row, a sha256
-and a graph node while contributing **zero chunks**. Findable by path,
-invisible by content (verified live: a real text PDF → 0 chars). Two things the
-original report missed: **`pymupdf>=1.24` and `python-docx>=1.1` were already
-*core* deps in `pyproject.toml`, imported nowhere** — every deployment was
-carrying both wheels for nothing; and **HTML/XML is a second, milder gap** —
-`.html`/`.xml` sit in `TEXT_EXTENSIONS` and index as *raw markup* (tags,
-`<script>`, CSS as prose). `.pptx/.xlsx/.doc/.rtf/.epub` are in no extension
-set at all — never accepted, so not a broken promise and out of scope.
-
-New `src/pheasant/ingestion/extractor.py` follows the 25.4 captioner/
-transcriber shape exactly (Protocol + provider selection + authored
-`<file>.extract.txt` sidecar wins + built **only** when a source's `include`
-globs admit `.pdf`/`.docx` + `_modal.py` helper reuse), so this is the third
-instance of one pattern, not a new one. It differs in a way that is strictly
-*better*: captioning/transcription need a model to invent text that isn't in
-the bytes, document extraction doesn't — so **every provider is offline and
-deterministic** and rule 1 holds by construction, with no network path to gate.
-Providers: `auto` (default — `pymupdf`/`python-docx`, else builtin, keeping
-whichever yields text; never raises into a sync), `native`, `builtin`
-(**stdlib only** — `zlib` + PDF content-stream operator scan; `zipfile` +
-`xml.etree` over `word/document.xml`, which is not a fidelity compromise since
-that IS where DOCX text lives), and `sandboxed`. `ingestion.extractor.
-{provider, html_text}`; `html_text` defaults **false** because `.html`/`.xml`
-have always indexed as raw markup and stripping changes existing chunk
-boundaries. Publisher advertises `"document"` in `capabilities.modalities`
-(25.4 precedent — **wire format unchanged**, parity green). Idempotent: the
-engine's pre-read sha256 skip never re-extracts an unchanged document.
-**Flock reuse:** its `corpus/loaders/local_files.py` `_read_pdf` (pdfminer) +
-`_read_html` contributed the *shape* — lazy per-format import, graceful
-degradation, never raise — not the code (pheasant ships pymupdf, and nothing
-was imported across the repo boundary).
-
-**WASM — my initial prediction was wrong, and the measurement says so.** I
-expected acceleration to be a NO-GO by analogy to 34.6 (WASM chunking, which
-lost to a ~115 µs fixed instance cost). It does not transfer. With the module
-AOT-precompiled (34.4 Finding #1), `sandboxed` beats the pure-Python `builtin`
-at every size above ~1 KB: **0.50x at 100 lines, 0.30x at 8,000** (129 ms →
-38 ms), and the tokenizer alone is **11.4x** (91.8 ms → 8.0 ms on a 585 KB
-stream); fixed cost per guest call 0.22 ms, crossover ~30-50 lines. Why 34.6's
-logic didn't carry: what matters is **work per call**, not calls per sync —
-chunking's 35-219 µs is the same order as the overhead, PDF tokenizing's
-1.5-130 ms is 7-600x it. So the sandbox is **not a tax**, and `builtin` vs
-`sandboxed` is purely a fidelity/isolation choice. `native` stays the default
-regardless: it does full page layout analysis and handles encrypted PDFs,
-LZW/CCITT and Type0/CID CMaps that the tokenizer does not. AOT cache
-re-verified for this path (JIT 52.8 ms → **0.87 ms**), distinct `extract-`
-cache prefix so the trusted accelerator and untrusted-input path never share an
-artifact.
-
-Sandboxing is the right framing because 34.2's docstring already named the
-target ("Confluence's in-process BeautifulSoup parse of untrusted remote
-XHTML") and PDF is its sharper form: connector PDFs (Drive/Slack/Confluence/
-IMAP) are attacker-influenced bytes parsed with the sync worker's ambient
-authority — every connector token in `os.environ`, writable `/state`, egress.
-New `pdf_scan_text` export on the **existing** vendored Rust crate (re-vendored
-`accel.wasm`, 112→120 KB; the toolchain reproduces the old binary
-byte-identically, sha `f664fa78…`, before any edit) + `ingestion/
-extractor_sandbox.py` running it under a fuel cap, memory cap and an **empty
-`Linker`** (zero host imports, asserted). Three honest limits, all in the
-module docstring: **partial sandbox** (host still inflates via `zlib`, bounded
-against bombs; the guest runs the tokenizer, which is where hostile bytes drive
-unbounded loops — deliberate split, 34.2-style recorded deviation); **PDF only**
-(DOCX/HTML keep memory-safe Python parsers); and it **fails loudly** — missing
-`wasmtime` under `provider: sandboxed` raises with a pip hint rather than
-silently extracting unsandboxed, inverting 34.5's fallback policy on purpose
-because this is a security property, not a performance path (per-*file*
-failures still never abort a sync). A sandbox cannot catch a **wrong answer**,
-so `pdf_scan_text` is asserted byte-identical to `scan_pdf_content_stream` per
-stream, per document, and over 120 randomized adversarial streams. The port's
-real hazard, caught by deriving tables from CPython rather than assuming:
-**65 byte values above 0x7F satisfy Python's `chr(b).isalpha()`** — an
-`is_ascii_alphabetic()` port would silently drop text (same class as 34.5's
-`str.lstrip("./")` catch); cp1252's five undefined bytes are transcribed too.
-
-**Two pre-existing bugs found and fixed** (both surfaced by touching the
-reference config, both verified before fixing, both regression-tested):
-(1) **`pheasant.example.yaml` had two top-level `sync:` keys** — YAML keeps the
-last, so the whole documented `sync.limits` guardrail block (the "I accidentally
-indexed my home directory" protection) was **silently discarded**; proven with
-real PyYAML, then merged. (2) **`yaml.py` never stripped trailing comments** —
-it skips whole-line ones only, so in the dependency-light environment
-`max_files: 50000  # ...` parsed as a *string* and `follow_symlinks: false # ...`
-became a **truthy** string, inverting a safety default; fixed with quote-aware
-stripping matching PyYAML. Note this shim shadows real PyYAML from the repo
-root, which is also why `mkdocs` must build with `-f` from outside the checkout.
-
-`pheasant.example.yaml` gained its **first `ingestion:` block** (captioner/
-transcriber were never in it either) and `docs/configuration.md` its first
-`## ingestion` section, closing pre-existing 25.4 doc drift. New
-`docs/how-to/document-ingest.md` (in the nav). Acceptance:
-`tests/test_document_extraction.py` (30) + 4 config tests —
-**mutation-tested, not trusted**: disabling `extractor_from_config` fails 5
-tests across every acceptance path, and search precision was checked directly
-(each marker query returns exactly its one document; a nonsense query returns
-`[]`) so the assertions aren't vacuous. Suite: **592 passed / 18 skipped**
-(baseline 521/24; the skip drop is `wasmtime` un-skipping 6 module-level
-guards — 34 genuinely new tests). Full detail:
-`runs/2026-08-06-pdf-extraction/SUMMARY.md`.
-
-### Five more formats, 2026-08-06 — `.pptx/.xlsx/.doc/.rtf/.epub`
-
-The first pass ruled these out as "in no extension set, so not a broken
-promise". Asked to include them, they now extract too. `DOCUMENT_EXTENSIONS`
-grows to **seven** formats, and `EXTRACTED_EXTENSIONS` in `extractor.py` is
-asserted **set-equal** to it — the accept-list and the extractor-build gate
-drifting apart is precisely how the original bug would come back one format at
-a time (a source carrying only `.pptx` would accept the files and build no
-extractor → zero chunks). `extract_builtin(kind, content)` is now the single
-format→reader map that all four providers share.
-
-New `ingestion/office.py` (PPTX/XLSX/EPUB/RTF) + `ingestion/msdoc.py` (legacy
-binary DOC), both **pure stdlib**. Notable behaviors, each chosen over an
-easier wrong one: PPTX walks `<a:p>` paragraphs (not a flat `<a:t>` sweep, which
-runs bullets together) and **indexes speaker notes**, located via each slide's
-own `_rels` rather than assuming `notesSlideN`↔`slideN`; XLSX resolves
-`sharedStrings` and maps sheet names through `workbook.xml.rels`, emitting
-tab-separated rows; EPUB reads in **OPF spine order** (filename order scrambles
-most real books — guard test with deliberately anti-alphabetical names); RTF
-skips ignorable destinations (`\fonttbl`/`\colortbl`/`\stylesheet`/`\info`,
-whose `\'hh` escapes would otherwise decode into mojibake) and honours
-`\ucN` so `\uN` fallback characters don't double every non-ASCII char. Every
-element match is on **local name**, not a hard-coded namespace URI. `native`
-now reads EPUB via pymupdf (a real upgrade — MuPDF walks reading order); for
-PPTX/XLSX/RTF/DOC `native` is honestly the *same code path* as `builtin`, since
-no third-party reader for them exists in the dep tree and the builtin readers
-are complete.
-
-**`.doc` is the one that needed real work.** It is an OLE2 Compound File
-(a small FAT filesystem) whose text is not contiguous: the `WordDocument`
-stream holds character data and a **piece table** in `0Table`/`1Table` says
-which byte ranges form the document and whether each piece is single-byte
-cp1252 or UTF-16. So `msdoc.py` implements a CFB reader (header/DIFAT/FAT/
-miniFAT/directory) plus a FIB walk — `fcClx` is pair index 33 of `FibRgFcLcb`,
-reached by *walking* `csw`/`cslw`/`cbRgFcLcb` since the FIB is variable-length,
-not by a hard-coded offset. Pre-Word-97 layouts are **refused** (`cbRgFcLcb <
-34`) rather than read at index 33 anyway, which would yield confident garbage.
-Field ranges are handled: text between `0x13`/`0x14` is the field *instruction*
-(`HYPERLINK "http://…"`) and is dropped, `0x14`/`0x15` is the *result* and is
-kept — skipping that distinction is why naive extractors emit link machinery
-mid-sentence. Bounded throughout (visited-set chain walks so a cyclic FAT
-terminates, caps on stream/piece/text size); Python's bounds-checked slicing
-means hostile offsets raise rather than corrupt, which is also why `.doc`
-doesn't get a WASM guest — it's the most attacker-facing format here, but the
-failure mode is already an exception, not memory corruption.
-
-**LibreOffice Writer/Calc/Impress were installed to generate the fixtures**, so
-all five are **producer-generated, not hand-authored** — decisive for `.doc`,
-where a hand-crafted CFB would only prove the reader agrees with its own
-author's reading of the spec. The container layer is additionally cross-checked
-byte-for-byte against **olefile** (an independent implementation, deliberately
-*not* a dependency — `importorskip`). Two branches the fixtures can't reach are
-unit-tested with the reason recorded: **compressed cp1252 pieces** (LibreOffice
-always writes UTF-16; real Word prefers compressed, and that path has the
-unusual `fc // 2`) and field-instruction ranges.
-
-**Two real bugs caught during development, both by markers deliberately planted
-in the fixtures.** (1) The `.doc` control-code drop set included `0x28/0x3C/
-0x3E` on the mistaken belief they were Word markers — they are printable ASCII
-`(`, `<`, `>`, so **every** extracted document silently lost its parentheses
-and angle brackets. Now `_DROP` carries an assertion that every entry is below
-`0x20`, plus a regression test. (2) A non-RTF file named `.rtf` decoded its raw
-bytes as latin-1 prose; RTF has no structural gate of its own, so the `{\rtf`
-signature is now required — mojibake in the index is worse than no text,
-because it is unfindable *and* pollutes scoring.
-
-Acceptance: `tests/test_office_extraction.py` (54). Mutation-tested: narrowing
-`source_includes_documents` back to PDF+DOCX fails **10** tests; stubbing
-`extract_builtin`'s pptx/doc arms fails **6**. Search precision checked
-directly (a nonsense query returns `[]`). Suite: **646 passed / 18 skipped**
-(+54). Docs: `configuration.md` §ingestion.extractor (seven-format table),
-`how-to/document-ingest.md` (retitled, per-format gotchas). Router side needs
-nothing new — `"document"` already covers all seven.
-
----
-
-## Structural taxonomy extraction, 2026-08-06 — chapters, sections, § codes
-
-Asked for, for "documents and books and other highly structured documentation
-like procedures, and legal documents": extract a taxonomy by chapter / section /
-code, **toggleable on source registration**. It turned out to be three dormant
-pieces that were already specified, not a new subsystem:
-
-1. **`TextChunk.heading_path` was never populated.** It is a field, a `chunks`
-   column, *and* a `chunks_fts` column at **BM25 weight 2.0 — double the body
-   text**. `chunks_for_source` simply never passed one, so it was `NULL` for
-   every chunk ever indexed (verified: 0 of 3 on a real sync).
-2. **`heading` node type and `has_heading` edge type are documented in
-   `docs/graph_model.md`** (lines 13/24) and `grep` found **zero** emissions
-   anywhere in the code.
-3. **The one heading detector that existed was dead code.** `enrichment.py:218`
-   regexes Markdown headings into `_add_concept`, which returns early since the
-   2026-08-03 concept retirement — it runs the regex and discards the result.
-
-New `src/pheasant/ingestion/taxonomy.py`: rule-based, deterministic, offline
-(no model, no network — rule 1 by construction). Six rules, each with its own
-natural depth so a document may **mix conventions** and still nest —
-`ARTICLE IV` → `4.1` → `(a)` works, as does `# Title` → `1. Scope`: `markdown`
-(1-6), `keyword` (PART/TITLE/BOOK/DIVISION/SCHEDULE/APPENDIX/ANNEX/EXHIBIT=1,
-CHAPTER/SUBPART=2, ARTICLE/SECTION/RULE=3, CLAUSE/STEP/PARAGRAPH=4), `code`
-(`§ 12.3`), `numbered` (`1.2.3`), `lettered` (`(a)`/`(iv)`), `caps`. Nesting is
-a stack walk; `number` is kept separate from `title` so a section is findable by
-its **citation**. A **bare citation takes its caption from the next line**
-(`ARTICLE IV\nTerm and Termination` → `Article IV Term and Termination`) —
-without it, standard legal drafting loses the words a searcher would actually
-use.
-
-**Chunks are cut at section boundaries** (`split_on_sections`, on by default
-once taxonomy is on). This was a deliberate change of mind mid-build: labelling
-alone is nearly decorative, because a whole contract fits in one 4000-char chunk
-and gets one `heading_path` (its first heading), and a chunk straddling three
-sections is labelled with only the first — *misleading*, not merely coarse. Now
-one chunk is one section, subdivided only when a section exceeds
-`chunking.max_chars` (all pieces sharing the path), with absolute line numbers
-and a single ascending index run so chunk IDs stay stable.
-
-**Heading node IDs key on the section breadcrumb, hashed — deliberately not on
-the line number.** A line-numbered ID churns the whole graph on any edit:
-inserting one paragraph shifts every heading below it, dropping and re-creating
-sections that did not change. Asserted by a test that inserts a line and
-compares ID sets. Accepted trade-off: two byte-identical breadcrumbs in one
-document collapse to one node.
-
-**Search now says which section matched.** `heading_path` was already selected
-by the search SQL and dropped when the result dict was built; it is now on the
-result, its `chunks[]` entry and `provenance` — added **only when non-empty**, so
-a corpus without taxonomy returns the exact payload it did before.
-
-**Toggle lives at source registration**, matching the request: per-source
-`sources[].taxonomy.{enabled,max_depth,detect,graph_nodes,split_on_sections}`
-(default **off**), threaded through `POST /sources` + `PATCH` (dict, exactly like
-`chunking`/`sync`/`connector`), `POST /sources/quick-add` (plain bool, it is the
-one-field surface) and MCP `register_source(taxonomy=True)` (additive optional
-param — rule 8). New `GET /taxonomy?source=&path=` renders the outline per
-document as a nested tree, read from the emitted `heading` nodes rather than
-re-parsing.
-
-**Off by default and per-source for a stated reason**, not caution: the
-numbering rules are genuinely ambiguous on prose — `1. Introduction` in a
-standard is a section, `1. Buy milk` in a note is a list item, and nothing in
-the line distinguishes them. Length/punctuation filters (≤120 chars, ≤10 words
-chosen against real headings, no mid-sentence punctuation) catch the long cases;
-short list items still match. Enabling per source is how the operator says "this
-corpus really is structured". Two further limits documented rather than hidden:
-a document mixing two **independent** numbering series can mis-parent one under
-the other (`§ 12.3` under `ARTICLE IV`) — the breadcrumb still carries the right
-citation so search is unaffected, only the parent link is wrong; and `caps` is
-the noisiest rule, first to drop from `detect`.
-
-`docs/graph_model.md` now records that `heading`/`has_heading` went **unemitted
-from the initial build until 2026-08-06**, so a graph written earlier contains
-none — that matters for anyone reading the taxonomy as a contract (rule 3).
-Docs: `configuration.md` §`sources[].taxonomy`, new
-`docs/how-to/structured-documents.md` (in the nav), first per-source `taxonomy:`
-block in `pheasant.example.yaml`. Acceptance: `tests/test_taxonomy.py` (40) —
-**mutation-tested**: disabling detection fails 12, dropping the graph nodes 5,
-re-dropping `heading_path` from search results 1, turning off section splitting
-4. Suite: **686 passed / 18 skipped** (+40). No wire-format change (the Synapse
-contract is untouched; parity green), no new dependency.
-
-### Ordinal detection + reconciliation, 2026-08-06
-
-The follow-up the entry above listed as not-done, and it **removes the
-documented mis-parenting limitation**. `parse_ordinal` turns a heading's own
-number into a comparable `Ordinal` — decimal paths (`4.2.1` → `(4,2,1)`), roman
-numerals (`IV` → `(4,)`), letters, inserted-section suffixes (`§ 12A`),
-parenthesised sub-items — and `_reconcile` then decides parentage from the
-**number** rather than the pattern depth, in three passes: prefix match →
-compatibility walk → level nesting.
-
-What that buys, each asserted: `4.1` attaches to `ARTICLE IV` because `IV`
-parses to `(4,)` — **the document's two spellings of "four" are recognised as
-one number**; `§ 12.3` refuses `ARTICLE IV` (`(4,)` is not a prefix of
-`(12,3)`) and climbs to the unnumbered title, which is the bug that was
-previously documented as permanent; `§ 12A` is a **sibling** of `§ 12`, since
-inserting a section is not nesting one; and a numbering that **resumes after an
-interruption** rejoins its own parent, which the ancestor walk alone cannot do
-(that last case is what makes the prefix pass load-bearing — see below).
-`SectionHeading.level` is now the reconciled depth and `pattern_level` keeps the
-rule's natural depth, which is what `max_depth` filters on.
-
-`reconcile_issues` is the second half: gaps (with the `missing` numbers),
-duplicates and out-of-order numbering, grouped per parent and series. For a
-contract or a procedure "is anything missing?" is the question people actually
-ask, and it is nearly free once ordinals are parsed. Only gaps *between observed
-siblings* are reported — a series starting at 3 is an excerpt, not a defect —
-and a suffixed insert never creates one. Surfaced per document in
-`GET /taxonomy` (`issues`, `issue_count`); `heading` nodes persist
-`ordinal_parts`/`ordinal_series`/`ordinal_suffix` so a section is queryable by
-citation.
-
-**Two bugs and one piece of dead code found by testing, all mine:**
-(1) `(c)` parsed as **roman 100** instead of letter 3 — seven letters are also
-roman numerals. Resolved by convention rather than guesswork: multi-character
-roman is a numeral; a lone `c`/`d`/`l`/`m` is a letter (no roman sub-list starts
-at 100) while a lone `i`/`v`/`x` is a numeral. Both `(a)(b)(c)(d)` and
-`(i)(ii)(iii)(iv)` now count 1,2,3,4 with zero spurious issues. The residual
-ambiguity (a letter list reaching `(i)`) is bounded because lettered ordinals
-are `relative` and never decide hierarchy. (2) The sibling test compared an
-ancestor's **reconciled** level against the candidate's **pattern** level —
-different scales — so `(b)` looked deeper than its sibling `(a)` and nested
-inside it. Caught by a duplicate-`(b)` case. (3) **Mutation testing proved
-`_series_compatible` inert**: forcing it to always return True changed no test,
-because the compatibility walk does not check series and re-made the identical
-attachment — and that attachment was *correct* (`SECTION 4.1` genuinely is
-within `CHAPTER 4`). Removed rather than kept with a docstring claiming a
-protection it never provided; what actually keeps `CHAPTER 4` and `ARTICLE 4`
-apart is that neither has a prefix for the other to match. Mutation testing also
-showed the prefix pass was uncovered, which is what prompted the
-resumes-after-interruption test.
-
-Acceptance: 24 more tests in `tests/test_taxonomy.py` (64 total). Suite:
-**710 passed / 18 skipped**. Docs updated to describe reconciliation and to
-**delete the mis-parenting limitation** rather than leave a stale warning.
-
-### Finishing the taxonomy/ordinal work, 2026-08-07
-
-Closes the five items the previous run summary listed as not done. Only
-**taxonomy on the Synapse contract** stays out, on the original reasoning: the
-outline is region-local retrieval structure, not routing signal, so publishing it
-would be a wire-format change for no routing gain.
-
-**`(i)` now reads as 9 when it follows `(h)`.** `_disambiguate_lettered`
-re-reads a one-character sub-item label using the run it sits in: both readings
-are computed and whichever *continues* the previous item wins — `(h)(i)` is 8,9;
-`(iv)(v)` is 4,5; `(u)(v)` is 21,22 (which the old per-character convention
-always got wrong); and `(b)` then `(i)` continues neither, so a nested list still
-opens at roman 1. `parse_ordinal` on an isolated heading is unchanged.
-
-**A numbering series is identified by its number, not by where it landed.**
-`reconcile_issues` grouped by resolved parent, so an unnumbered heading between
-`§ 12.2` and `§ 12.4` re-parented the tail and hid the gap. Now a non-empty
-prefix identifies the series wherever its members sit; **top-level** numbering
-has no prefix so it stays grouped by parent, which is what keeps a per-part
-restart legal. Writing that rule exposed that `PART I` **did not actually parent
-its sections** (verified pre-existing): both numbers are "one", neither a prefix
-of the other, so the conflicting-series rule flattened the section out of its
-Part. `_contains_a_fresh_series` fixes it on a principle — `PART`/`BOOK`/`TITLE`/
-`DIVISION` and the `SCHEDULE`/`APPENDIX`/`ANNEX`/`EXHIBIT` family are
-**containers**, existing to hold a numbering they do not participate in, so they
-may parent a *different* series but never their own. `CHAPTER 4` still does not
-contain `ARTICLE 4`.
-
-**Retrieval can be restricted to one section.** `section` on `POST /search` and
-MCP `search_context(section=...)`, substring against the breadcrumb so `§ 12.3`,
-`Article IV` or a section's wording all reach it and naming a parent returns the
-subtree. Pushed into **SQL** for the text arm, because post-filtering a
-globally-ranked page can return nothing from a narrow section while its chunks
-sit just past the cut; the vector arm is filtered in Python, with
-`section_needle`/`section_matches` holding the one normalization rule so the two
-cannot drift. Graph hits are dropped under the filter — a `heading` node has a
-label but no breadcrumb, so matching it would return an Article's node and not
-its subsections', inconsistent with chunks. `/search?section=` selects content;
-`GET /taxonomy` browses the outline.
-
-**UI** (untouched by taxonomy until now, including the registration toggle the
-original request actually asked for): the Advanced source form gained the toggle
-plus the two sub-switches that change indexing; citation chips name the section a
-passage came from (needed `heading_path` on `Passage` and on **both** citation
-builders — the model already saw the heading in its prompt, only the UI could
-not); and the Sources page gained an outline panel over `GET /taxonomy` with the
-numbering defects above it. `tsc` caught that `SourceWritePayload` had no
-`taxonomy` field, so the form would have posted a key the client type refused.
-
-**Live validation on a producer-generated PDF found two bugs.**
-`tests/fixtures/structured/agreement.pdf` (authored as HTML, converted by
-LibreOffice, source kept beside it) has real PDF line layout and real kerning —
-what text authored in a test file cannot imitate.
-
-1. **A mid-sentence line became a heading, and a parent.** The extractor renders
-   "of" as "o f", PDF text arrives pre-broken into layout lines, and one began
-   `Section o f this Agreement unless stated otherwise.` The keyword pattern is
-   case-insensitive, so its single-letter ordinal alternative read `o` as ordinal
-   15 — and the invented heading then **re-parented genuine sections**. Fixed by
-   `_plausible_citation` (a letter-only citation is capitalised in every real
-   document — `PART A`, `ANNEX B`, `ARTICLE IV` — and prose words are not) plus
-   running the keyword branch through the same prose filter every other rule
-   already used; it had **none**, only a length check. That second half looked
-   inert until tested — it is what catches `Part 1 of the agreement shall be
-   construed as follows…`, where the ordinal is a perfectly good `1`.
-2. **Runtime-registered sources extracted nothing at all.** The same PDF gave 19
-   chunks via `SyncEngine` and **0 through the HTTP API**.
-   `extractor_from_config` runs once in `SyncEngine.__init__` and asks whether
-   *any configured* source admits a document extension — a source added via
-   `POST /sources` (the UI's add-source flow, and how most sources actually
-   arrive) did not exist yet, so no extractor was built and its PDFs indexed with
-   **no text at all**: the exact silent-empty-content failure this PR exists to
-   fix, on the path most people use. `_ensure_modal_handlers(source)` tops the
-   handlers up in `sync_source` where the source is known, which is also more
-   precise than the constructor's check. The captioner/transcriber share that
-   check and had the same gap with a milder symptom — `caption_to_text` falls
-   back to a filename caption, so images were never *empty*, which meant the
-   obvious `chunk_count > 0` assertion passed with the fix reverted; those tests
-   assert the stub's content **fingerprint** instead. Mutation testing found
-   that; the first two versions of those tests were worthless and looked fine.
-
-Acceptance: `tests/test_taxonomy.py` 64 → **91**, `tests/test_document_extraction.py`
-30 → **33**. Suite **746 passed / 18 skipped**. Every change mutation-tested;
-**two mutants survived and were acted on** rather than filed — no test ran a
-sectioned *hybrid* search (one added), and the keyword prose filter was inert
-until the numeric-citation case was written. Full detail:
-`runs/2026-08-07-taxonomy-finish/SUMMARY.md`.
-
----
-
-## Memory at scale on microsoft/vscode + MCP A/B evaluation, 2026-08-12
-
-A fresh full image (all extras, WASM on) with memory enabled, OpenAI
-`text-embedding-3-small` + `gpt-5.6-luna`, indexing **microsoft/vscode**, then an
-evaluation driven through the **real MCP surface** (`search_context` over stdio,
-a fresh `pheasant mcp` process per arm — not a Python import of the search code).
-Three suites, because memory cannot improve recall of what it does not know and
-one blended score would hide both the win and the regression:
-**corpus** MRR 0.462 → **0.495** (memory is not a tax), **memory-only** 0.000 →
-**1.000**, **steering** 0.167 → 0.250. Separately, the config-level steering
-ablation: team-vocabulary queries **0.029 → 0.467 (+0.438)** while control
-queries move **+0.000** — 33.8's acceptance criterion genuinely met, and it was
-**not** met before this run though the suite said it was.
-
-**Seven bugs, six of which the 1,067-test suite passes straight over.**
-(1) The embedder had **no retry** — one `SSLV3_ALERT_BAD_RECORD_MAC`, then a
-`429`, each killed the whole multi-hour index; `_post_with_retry` with bounded
-backoff + `Retry-After`. (2) `busy_timeout` 5s → **60s**; real
-sync/API/scheduler contention at this size hit "database is locked".
-(3) **`serve` advertised `streamable_http_url: <base>/mcp` and never mounted
-it** — 404/405 to every agent it told to connect. Three things had to be right:
-mount it; **run its lifespan** (`app.mount()` does not, and FastMCP without it
-raises "Task group is not initialized" on every request); and the
-**DNS-rebinding guard**, whose localhost-only default 421s the container
-hostname this normally runs behind — now derived from `server.api.cors_origins`
-rather than a second allow-list, widening only to hosts already admitted. Plus a
-**307** (never 302) redirect for the slash-less form, since Starlette's `Mount`
-only matches paths continuing past the prefix. (4) A pre-existing **`yaml.py`
-shim** bug — it split list items on *any* colon, so `- http://host:8765` became
-`{"http": "//host:8765"}`, corrupting `cors_origins` and anything else listing a
-URL; now YAML's real rule (colon + whitespace/EOL). Third in that shim's family.
-(5) **`pheasant mcp`/`serve` ignored `PHEASANT_CONFIG`** although the Dockerfile
-sets it, the docs say to check it, and **pheasant's own generated MCP client
-configs put it in the agent's environment** — so an agent pointed at another
-config silently searched the **wrong knowledge base and reported it as the right
-one**. (6) **Multi-word alias triggers never fired**: `Steering.expand()` looked
-up `aliases[token]` one token at a time, so `filewatch daemon -> …` parsed,
-loaded, was reported in force by `describe_retrieval`, and never once fired —
-`prefers()` directly below it already had the fix and a docstring explaining it.
-Every alias fixture in the suite was single-word (`router -> flock`). This is
-what turned steering from inert into +0.438 MRR.
-
-**The evaluation's own finding — steering rules were being returned as search
-results.** `memory=auto` first *dropped* corpus MRR to 0.335. Not crowding-out:
-only **one** memory row entered the top 10 yet `fileService.ts` fell 1 → 5, and
-`MemoryPolicy.max_results` (the lever built for this) made it slightly *worse*
-because it caps the output, not the fusion input. The rank-1 hit was the **alias
-rule itself** — an agent asking for code got a line of rule syntax dressed as
-retrieved knowledge, the cheap half of the memory-control-flow surface 33.6 set
-out to contain. Steering-kind records are now excluded from result lists by
-default (`MemoryPolicy.include_rules`, default false); the rules stay in force
-and inspectable via `describe_retrieval` and `GET /memory`. Note `admits()`
-serves two callers — "may this be *returned*" and "does this policy admit this
-rule's *scope*" — so the lift is applied where rules are loaded, beside the
-pre-existing `mode="auto"` lift that exists for the same reason.
-**Corpus MRR 0.335 → 0.495.**
-
-Suite **1,067 passed / 6 skipped / 8 failed** — all 8 verified **pre-existing**
-by stashing every change and re-running on a clean tree (Windows path separators,
-0600 perms, CRLF-inert `test_contract_parity`, the known wasmtime trap bug).
-Mutation-tested **5/5 killed** (the 307→302 mutant is killed by *hanging*: a 302
-downgrades the POST to GET and the endpoint holds it open as SSE). Contract
-untouched, no re-vendor. **Caveat: the vscode index did not finish** — ~9,700 of
-12,667 files at ~20 files/min, bounded by the embedding endpoint, so the numbers
-are on a partial index; the harness has a preflight that **excludes** unindexed
-gold targets rather than scoring them as misses in both arms. Full detail:
-`runs/2026-08-12-memory-scale-eval/SUMMARY.md`.
-
----
-
-## Memory system review + hardening, 2026-08-13
-
-A read-the-subsystem-end-to-end review rather than a step. **Six defects, five
-of them silent** — nothing raises, nothing logs, and the 1,067-test suite passes
-straight over all five. New `docs/memory-system.md` (Explanation nav) is the
-overview the subsystem never had: lifecycle, module map, validity model, the two
-encodings, steering, graph bridge, salience, isolation, surfaces, and an explicit
-**invariants** list.
-
-**1. Frontmatter injection → ACL escalation (security).** `MemoryStore._render`
-interpolated caller-controlled values into line-oriented frontmatter with no
-validation, and `load` built its field dict with plain assignment, so a later
-duplicate key won. `subject` is unvalidated on `POST /memory` and MCP
-`memory_write`, so `subject="deploy\nmemory_scope: org"` wrote a `user` record
-whose file said `org` — and `SyncEngine._memory_acl` reads scope back **out of
-that file**, where `normalize_acl` turns `org` into `public: True`. That is the
-33.11 leak reopened through input rather than through a missing rule; `supersedes`
-could be forged the same way, invalidating any record whose id the writer guessed.
-Reproduced before fixing. Now every frontmatter-bound value (`subject`,
-`supersedes`, `written_by`, each tag, both validity instants) is **rejected** on a
-line break — not escaped, because no legitimate value contains one — and `load`
-takes the **first** occurrence of each key so a record written by a pre-fix
-release cannot be read at a forged scope.
-
-**2. `is_default` was driving the over-fetch decision.** `hybrid.py` asked
-`not policy.is_default` to decide whether to over-fetch, but `is_default` checks
-neither `current_only` (defaults **true**) nor `include_rules` (defaults
-**false**) — both of which filter. So on the *default* path the over-fetch was
-skipped while the vector and graph arms were still filtered in Python **after**
-truncation to `max_results`, returning a short page while the hits that should
-have filled it sat past the cut. The text arm was never affected (its predicate
-is in SQL ahead of `LIMIT`). New `policy.may_filter` asks the loaded index
-whether anything would *actually* be dropped, so a region whose memory holds
-nothing droppable still pays nothing. `is_default` keeps its meaning and gains a
-docstring saying it is not the same question.
-
-**3. The multi-word alias fix was one character class short.** `expand`/`prefers`
-split triggers on `[\s_\-]+` while `_query_tokens` splits on `[_\W]+`, so
-`ci/cd`, `fs.watch` and `api:gateway` parsed, loaded, reported themselves in
-force via `describe_retrieval` — and never fired. Same failure the 2026-08-12
-multi-word fix was written for. One `_trigger_fires` helper now backs both
-methods, splitting on `[^A-Za-z0-9]+`, with all-parts-required preserved.
-
-**4. `GROUP_CONCAT` reassembled rule text in unspecified order.** SQLite does not
-guarantee the order an aggregate sees its input, so a rule spanning two chunks
-could come back reversed — parsing differently, or not at all, between two runs
-over identical content. A determinism break (rule 1) on the one path whose job is
-to be reproducible, and silent: the rule just stops being in force. Now
-`ORDER BY m.record_id, c.chunk_index` with the join done in Python. The mutation
-run printed the reversed text (`-> pheasant-flock, flock router`) directly.
-
-**5. Capacity pruning could archive a steering rule.** `_prune_to_capacity`
-ranked by salience with no `kind` awareness, so crossing `memory.max_records`
-could silently switch off an `exclusion` — changing ranking for every future
-query with no signal anywhere. Steering records are now exempt in both
-directions (they neither consume slots nor get archived); `MAX_RULES` already
-bounds what is in force. `memory_salience_rows` gained `kind`.
-
-**6. `valid_until` was never validated.** Compared lexicographically everywhere
-downstream, so `"soon"` sorts above every real instant and silently means "never
-expires". Both validity instants must now parse as ISO-8601.
-
-Acceptance: `tests/test_memory_hardening.py` (26). **Mutation-tested per fix**,
-not in aggregate — four reverts (store / hybrid call site / steering / maintenance
-+ state_store), each failing exactly the tests written for it and nothing else.
-Suite **1093 passed / 8 failed / 6 skipped** (+26; same 8 pre-existing, verified
-unchanged against the baseline run). `ruff check` clean on every touched file
-(the 5 `test_taxonomy.py` E501s remain pre-existing and untouched). Fresh
-`--no-cache` image rebuilt and smoke-tested live: all five extras import, UI
-bundle serves, and a real MCP `initialize` handshake round-trips through the
-newly-mounted `/mcp` (307 → session manager → JSON-RPC result). Docs:
-`docs/memory-system.md`, plus `how-to/agent-memory.md`, `reference/http-api.md`
-and `mcp_tools.md` updated for `include_rules`, the field rules and the pruning
-exemption. Full detail: `runs/2026-08-13-memory-hardening/SUMMARY.md`.
-
-**Container WASM defaults, same session.** A container that generates its own
-config now enables the two accelerators (`search.wasm_relationship_search`,
-`graph.wasm_cross_source_resolution`). They are opt-in in the *schema* — a
-source install may not have the `[wasm]` extra — but the image always installs
-it and ships the precompiled guest, so a fresh container was leaving switched
-off exactly what it was built with. Supplied through `pheasant setup --answers`
-rather than by post-editing YAML, so `docker-entrypoint.sh` keeps one code path
-for "what does a default config look like". Gated on `import wasmtime` actually
-succeeding: both accelerators fall back to pure Python silently, so enabling
-them without the extra would be *correct* but would log a warning per call and
-mean nothing. **`ingestion.extractor.provider: sandboxed` is deliberately NOT
-swept in** — that is a fidelity trade, not an acceleration one (the default
-`auto` reads encrypted PDFs, LZW/CCITT and Type0/CID CMaps the sandboxed
-tokenizer cannot), and a test asserts the answers file contains exactly the two
-accelerator keys. **Honest caveat recorded in `configuration.md`:**
-`wasm_cross_source_resolution` *loses* to Python below ~1,300-2,500 cross-source
-edges per the 34.4 benchmark, which is where a brand-new container starts; it is
-on anyway on the assumption a container's graph grows past the crossover, with
-the escape hatch documented. Verified in a real container **both ways** —
-wasmtime present → both flags true and the guest instantiates exporting
-`scan_edges`/`resolve_cross_source`; wasmtime shadowed by a raising stub →
-flags absent and the gate logs why. Tests driven through the **real wizard**
-rather than string-matching the script, because a schema-key rename would
-otherwise leave a green test while the container silently generated a config
-with acceleration off. `tests/test_fresh_ui_compose.py` (+4).
-
-**Not fixed, recorded instead:** `supersedes` is still not
-authorization-checked — injection can no longer forge it, but the API accepts it
-as a legitimate parameter, so any writer may correct any record whose id it
-knows. That is a design decision (does a region want cross-principal
-correction?), not a bug to quietly close.
-
-### 2026-08-13 — indexing concurrency now changes throughput, not just status
-
-The scheduling fields introduced with background MCP jobs are now implemented.
-`SyncEngine` discovers work once, prepares independent files through a bounded
-thread/process/remote worker window, and applies SQLite/vector/graph/manifest
-mutations in stable discovery order under the shared writer lock. `sync_all`
-uses `max_parallel_sources`; file preparation uses `max_parallel_files`; and
-embedding transport uses ordered provider-sized batches bounded by
-`max_parallel_embeddings`. Filesystem discovery no longer hashes every file
-serially: preparation reads and hashes each file once, and unchanged files skip
-parse, chunk, and embedding work. Canonical graph serialization keeps persisted
-bytes stable across worker counts.
-
-Remote workers expose one opt-in, bearer-authenticated internal preparation
-endpoint. They receive immutable file bytes plus a whitelisted parse config and
-cannot write coordinator state or receive connector credentials. Local commit
-remains centralized deliberately; remote mode scales parse/chunk preparation,
-not authoritative state writes. See `docs/how-to/indexing-performance.md` and
-`runs/2026-08-13-indexing-parallelization/SUMMARY.md` for configuration,
-security limits, tests, and benchmark data.
-
-Acceptance: the regression suite excluding the seven already-recorded Windows
-baseline failures is **1023 passed / 31 skipped / 7 deselected**. Strict MkDocs,
-targeted Ruff checks, conflict-marker and whitespace checks pass. The warm
-100-file/80-line offline stub-embedding benchmark measured 1/2/4/8 file workers
-at 138.93/139.51/148.17/154.65 files/s (up to 1.113x); the immediate unchanged
-run indexed zero artifacts and made zero embedding calls. This small fixture is
-commit-dominated, so worker counts are capacity controls rather than a blanket
-speedup promise; use the checked-in benchmark against representative content.
-
----
-
-## 6. Pointers
-
-- **Region-side Synapse spec:** `docs/SYNAPSE_INTEGRATION.md`
-- **System architecture + framework (other repo):**
-  `pheasant-flock/docs/SYNAPSE_ARCHITECTURE.md`,
-  `…/docs/SYNAPSE_FRAMEWORK.md`, ADR 2026-06-10 in `…/docs/DECISIONS.md`
-- **Graph taxonomy:** `docs/graph_model.md` · **Config:** `docs/configuration.md`
-- **Setup (all three routes):** `docs/how-to/setup.md` · the interactive
-  wizard is `src/pheasant/setup_wizard.py` (`pheasant setup`)
-- **MCP:** `docs/mcp_tools.md`, `docs/mcp_client.md`
+## 7. Pointers
+
+- **Architecture:** `docs/architecture.md` · **Graph taxonomy:**
+  `docs/graph_model.md` · **Config:** `docs/configuration.md`
+- **Setup:** `docs/how-to/setup.md` (the wizard is `src/pheasant/setup_wizard.py`)
+- **MCP:** `docs/mcp_tools.md`, `docs/mcp_client.md` ·
+  **HTTP:** `docs/reference/http-api.md`
+- **Scale:** `docs/how-to/capacity-planning.md`,
+  `docs/how-to/worker-fleet.md`, `docs/how-to/indexing-performance.md`
+- **Memory:** `docs/memory-system.md`, `docs/how-to/agent-memory.md`
+- **Synapse region spec:** `docs/SYNAPSE_INTEGRATION.md`
 - **Deployment:** `docs/deployment.md`, `deploy/kubernetes/`
-
-If docs drift from code, **the code is authoritative** — flag the drift in
-`docs/SYNAPSE_INTEGRATION.md` (Synapse scope) or the relevant doc.

@@ -99,3 +99,63 @@ def test_denied_fetch_leaves_no_partial_data_in_guest_memory() -> None:
     # The guest checks the negative host_fetch_len result and returns early
     # (fetch_echo.wat's ABI), so no bytes were ever copied into its memory.
     assert sandbox.read_memory(100, len(b"secret-bytes")) == b"\x00" * len(b"secret-bytes")
+
+
+def test_a_wasmtime_error_is_translated_like_a_trap() -> None:
+    """The recorded "raw wasmtime type escapes" bug, closed and pinned.
+
+    `wasmtime.Trap` and `wasmtime.WasmtimeError` are **siblings** —
+    `issubclass(Trap, WasmtimeError)` is False — so a host that catches only
+    `Trap` leaks a raw runtime type whenever wasmtime reports a failure as the
+    other one. CLAUDE.md recorded exactly that on 2026-08-10 as a real
+    pre-existing bug and it stayed open, because nothing exercised the case:
+    the fixtures all happen to raise `Trap` on the installed version.
+
+    So this test forces the other sibling. The point is not which exception
+    wasmtime picks today — it is that the module's contract (*guest failures
+    are SandboxError*) does not depend on that choice.
+    """
+
+    import wasmtime
+
+    from pheasant.sandbox.wasm_runtime import SandboxError, guest_failures, translate_trap
+
+    assert not issubclass(wasmtime.Trap, wasmtime.WasmtimeError), (
+        "wasmtime changed its hierarchy; re-check that both are still caught"
+    )
+    assert set(guest_failures()) == {wasmtime.Trap, wasmtime.WasmtimeError}
+
+    # A WasmtimeError has no trap_code, so it must degrade to SandboxTrapped
+    # rather than raising AttributeError inside the translator.
+    translated = translate_trap(wasmtime.WasmtimeError("guest exploded"), "some_export")
+    assert isinstance(translated, SandboxError)
+    assert "some_export" in str(translated)
+    assert "guest exploded" in str(translated)
+
+
+def test_a_guest_call_never_leaks_a_raw_wasmtime_exception() -> None:
+    """End to end: whatever the export raises, the caller sees SandboxError."""
+
+    import wasmtime
+
+    from pheasant.sandbox.wasm_runtime import SandboxError
+
+    sandbox = WasmSandbox(_wat("hello.wat"))
+
+    for raised in (wasmtime.WasmtimeError("boom"), wasmtime.Trap("boom")):
+
+        class Exploding:
+            def __init__(self, exc: BaseException) -> None:
+                self.exc = exc
+
+            def get(self, _name: str):
+                def call(*_args, **_kwargs):
+                    raise self.exc
+
+                return call
+
+        sandbox._instance = type(
+            "Stub", (), {"exports": lambda _self, _store, box=Exploding(raised): box}
+        )()
+        with pytest.raises(SandboxError):
+            sandbox.call("hello")

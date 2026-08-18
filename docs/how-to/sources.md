@@ -109,7 +109,7 @@ sources:
   [Multi-modal ingest](multimodal-ingest.md).
 
 The reference `pheasant.example.yaml` ships a thorough `exclude` list (`.git`,
-`node_modules`, `dist`, `build`, virtualenvs, state/vault/exports) — copy it as
+`node_modules`, `dist`, `build`, virtualenvs, state/exports) — copy it as
 a baseline.
 
 ## Sync modes

@@ -42,6 +42,10 @@ dependencies = [
 [project.optional-dependencies]
 mcp = ["mcp>=1.27,<2"]
 vector = ["lancedb>=0.6"]
+# Phase 35.2: the Postgres state backend. Gated so a standalone region —
+# which is every default install — carries no database driver and the
+# offline suite runs without one.
+postgres = ["psycopg[binary,pool]>=3.2"]
 # Synapse 24.4: optional Ed25519 contract signing. Gated so a region that
 # never sets synapse.signing_key_ref needs no crypto dep and the offline
 # suite passes without it.
@@ -55,6 +59,18 @@ agent = ["langgraph>=0.2", "langchain-core>=0.3"]
 # connector.runtime=sandboxed needs no wasmtime dep and the offline suite
 # passes without it.
 wasm = ["wasmtime>=20"]
+# Phase 35.5: gRPC transport for remote preparation workers. Gated so a
+# region using the default HTTP transport — which is every default install —
+# carries no gRPC stack. grpcio-tools is a *runtime* dep of this extra on
+# purpose: the .proto is compiled at import time rather than shipped as
+# checked-in gencode, which would pin every installer to the exact protobuf
+# release the stubs were generated against.
+grpc = ["grpcio>=1.62", "grpcio-tools>=1.62", "protobuf>=5"]
+# Phase 35.5: NATS JetStream as the index work queue, for a fleet that has
+# outgrown one database. Gated because the default queue is the state store
+# itself, which needs no broker — and because the queue is off entirely
+# unless sync.queue.enabled is set.
+queue = ["nats-py>=2.7"]
 # Documentation site (MkDocs Material). Build with: mkdocs build --strict
 docs = ["mkdocs-material>=9.5"]
 dev = [

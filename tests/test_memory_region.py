@@ -35,7 +35,6 @@ def _write_config(tmp_path: Path, *, include_memory: bool = True) -> Path:
         f"""pheasant:
   name: memory-test
   state_path: {tmp_path / ".pheasant" / "state"}
-  vault_path: {tmp_path / ".pheasant" / "vault"}
   exports_path: {tmp_path / ".pheasant" / "exports"}
   workspace_root: {tmp_path}
 sync:

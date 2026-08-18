@@ -141,14 +141,38 @@ def _trap_exception_map() -> dict[str, type[SandboxError]]:
     return _TRAP_EXCEPTIONS
 
 
+def guest_failures() -> tuple[type[BaseException], ...]:
+    """Every wasmtime exception a guest call can raise.
+
+    ``Trap`` and ``WasmtimeError`` are **siblings**, not parent and child —
+    ``issubclass(wasmtime.Trap, wasmtime.WasmtimeError)`` is False. So catching
+    only ``Trap`` lets a raw ``wasmtime`` type escape whenever the runtime
+    reports a limit as a ``WasmtimeError`` instead, which is exactly the
+    "raw ``wasmtime._trap.Trap`` escaping ``SandboxFuelExhausted``" recorded
+    in CLAUDE.md on 2026-08-10 and left open since.
+
+    Catching the pair keeps this module's contract — *guest failures are
+    ``SandboxError``* — true regardless of which sibling a given wasmtime
+    version chooses, which is the part a caller depends on.
+    """
+
+    if wasmtime is None:  # pragma: no cover - no [wasm] extra installed
+        return ()
+    return (wasmtime.Trap, wasmtime.WasmtimeError)
+
+
 def translate_trap(trap: Any, export_name: str) -> SandboxError:
-    """Map a ``wasmtime.Trap`` onto this module's typed exceptions.
+    """Map a wasmtime guest failure onto this module's typed exceptions.
 
     Shared by :meth:`WasmSandbox.call` and any other host that instantiates a
     guest directly (e.g. the sandboxed document extractor, which reuses a
     precompiled module and so cannot go through ``WasmSandbox``). Keeping one
     mapping means fuel exhaustion and memory-cap overruns surface as the same
     typed failure whichever host path ran the guest.
+
+    Accepts a ``WasmtimeError`` as readily as a ``Trap``: it has no
+    ``trap_code``, so it falls through to :class:`SandboxTrapped`, which is
+    the honest answer — the guest failed and we cannot say more.
     """
     code = getattr(trap, "trap_code", None)
     name = code.name if code is not None else None
@@ -251,7 +275,7 @@ class WasmSandbox:
             raise SandboxError(f"guest module has no export {export_name!r}")
         try:
             return func(self._store, *args)
-        except wasmtime.Trap as trap:
+        except guest_failures() as trap:
             raise translate_trap(trap, export_name) from trap
 
     def read_memory(self, offset: int, length: int) -> bytes:

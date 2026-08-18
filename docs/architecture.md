@@ -1,6 +1,6 @@
 # Architecture
 
-pheasant is a Docker-first MCP server with an admin API, source registry, sync engine, parsing pipeline, graph/search stores, and optional Obsidian export.
+pheasant is a Docker-first MCP server with an admin API, source registry, sync engine, parsing pipeline, and graph/search stores.
 
 ## Runtime flow
 
@@ -10,14 +10,14 @@ pheasant is a Docker-first MCP server with an admin API, source registry, sync e
 4. Run startup validation and repair missing graph/search state.
 5. Start file watchers, git state checks, and scheduled fallback sync.
 6. Expose MCP tools/resources/prompts and HTTP health/admin endpoints.
-7. Persist graph, manifest, SQLite, export, and Obsidian projection updates.
+7. Persist graph, manifest, SQLite, and export updates.
 
 ## Logical components
 
 | Component | Responsibility |
 |---|---|
 | MCP server | Agent-facing tools, resources, and prompts. |
-| Admin API | Health, readiness, source, sync, search, graph, and Obsidian endpoints. |
+| Admin API | Health, readiness, source, sync, search, and graph endpoints. |
 | Source registry | Configured and runtime-registered source metadata, lifecycle state, and audit history. |
 | Sync engine | Connector-backed startup validation, incremental sync, scheduled sync, manual sync, and repair orchestration. It pipelines discovery → bounded immutable preparation → bounded batched embedding → ordered commits → global enrichment/finalization. |
 | Watcher service | Debounced filesystem events for configured paths. |
@@ -25,12 +25,10 @@ pheasant is a Docker-first MCP server with an admin API, source registry, sync e
 | Ingestion pipeline | Repository, Markdown, document, HTML/XML, and web artifact parsing. |
 | Graph builder | Stable node/edge upserts plus code, document, and similarity enrichment. |
 | Search indexer | SQLite FTS/path/hybrid indexing with graph-term expansion and optional vector embeddings (shipped — `search.embeddings`/`search.vector_store`, `numpy` or `lancedb`, `mode="vector"`/`"hybrid"`). |
-| Obsidian exporter | Previewable Markdown projection with template profiles, source/concept/file/chunk notes, and optional canvas files. |
 
 ## Persistence split
 
 - `/state` is the operational source of truth for SQLite, manifests, graph JSON, snapshots, locks, logs, and cache.
-- `/vault` is a human-readable projection for Obsidian and should stay concise.
 - `/exports` contains graph JSON and visualization payloads that can be regenerated.
 
 ## Design constraints
@@ -38,7 +36,6 @@ pheasant is a Docker-first MCP server with an admin API, source registry, sync e
 - Keep v0.1 local-first and inspectable.
 - Use deterministic parsing, stable IDs, and content hashes for idempotency.
 - Do not execute code from indexed repositories.
-- Keep Obsidian optional; pheasant must work without it.
 - Prefer one isolated state volume per pheasant instance.
 
 ## Indexing concurrency

@@ -15,6 +15,7 @@ from pheasant.memory.policy import (
     resolve,
     utc_now_iso,
 )
+from pheasant.search.criteria import source_type_map, stamp_source_types
 from pheasant.search.graph_search import search_graph
 from pheasant.search.sqlite_store import SearchStore, section_matches, section_needle
 from pheasant.search.vector_store import VectorSearcher
@@ -255,6 +256,13 @@ class HybridSearch:
             text_results, vector_results, graph_results = _prefer_memory(
                 text_results, vector_results, graph_results, memory_index, max_results
             )
+
+        # Record which *kind* of source each hit came from, before the merge so
+        # every arm is covered and before any caller-side criteria run. One
+        # lookup per search, shared by all three arms.
+        source_types = source_type_map(getattr(self.store, "state", None))
+        for group in (text_results, vector_results, graph_results):
+            stamp_source_types(group, source_types)
 
         results = _merge_rrf(text_results, vector_results, graph_results, max_results)
         if memory_index:

@@ -6,7 +6,7 @@ config if none exists, then hand off to the ordinary sync engine and
 server. Everything here is config plumbing — indexing and serving reuse
 the exact code paths behind ``pheasant sync`` and ``pheasant start``.
 
-Generated configs anchor all state under ``.pheasant/{state,vault,exports}``
+Generated configs anchor all state under ``.pheasant/{state,exports}``
 next to the config file (absolute paths, so later invocations from another
 working directory keep hitting the same state). An existing config file is
 never rewritten — re-running ``up`` reuses it unchanged.
@@ -20,14 +20,6 @@ from typing import Any
 
 import yaml
 
-try:  # the dependency-light shim exposes the same predicate it dumps with
-    from yaml import _needs_quotes  # type: ignore[attr-defined]
-except ImportError:  # PyYAML
-
-    def _needs_quotes(text: str) -> bool:
-        return ":" in text or text[:1] in tuple("*&!%@`[{|>-?#,'\"") or text != text.strip()
-
-
 from pheasant.config.loader import deep_merge, dump_config_yaml
 from pheasant.config.profiles import profile_data
 from pheasant.config.schema import PheasantConfig, SourceType
@@ -38,10 +30,9 @@ STATE_DIRNAME = ".pheasant"
 def _scrub(obj: Any) -> Any:
     """Drop ``None`` values and empty containers from a config dict.
 
-    ``model_validate`` refills every dropped key with its default, and the
-    dependency-light ``yaml`` shim used in offline test environments cannot
-    round-trip ``None`` (it reloads as the string ``"None"``) or empty
-    blocks — so the generated file simply omits them.
+    ``model_validate`` refills every dropped key with its default, so a
+    generated config carries only what someone might want to change rather
+    than a wall of ``null``s and empty blocks.
     """
     if isinstance(obj, dict):
         cleaned = {k: _scrub(v) for k, v in obj.items() if v is not None}
@@ -49,51 +40,6 @@ def _scrub(obj: Any) -> Any:
     if isinstance(obj, list):
         return [_scrub(v) for v in obj if v is not None]
     return obj
-
-
-def _render_sources_block(entries: list[dict[str, Any]]) -> str:
-    """Render ``sources:`` by hand in the inline-first-key list style.
-
-    The yaml shim's ``safe_dump`` writes list-of-dict items as a bare ``-``
-    line it cannot itself re-read; both it and PyYAML parse this shape.
-    List values (``include``, ``urls``) render as nested block sequences,
-    which both parsers also handle.
-    """
-    lines = ["sources:"]
-    for entry in entries:
-        prefix = "  - "
-        for key, value in entry.items():
-            if isinstance(value, list):
-                lines.append(f"{prefix}{key}:")
-                prefix = "    "
-                for item in value:
-                    lines.append(f"      - {_quote(item)}")
-                continue
-            if isinstance(value, dict):
-                lines.append(f"{prefix}{key}:")
-                prefix = "    "
-                for sub_key, sub_value in value.items():
-                    lines.append(f"      {sub_key}: {_quote(sub_value)}")
-                continue
-            lines.append(f"{prefix}{key}: {_quote(value)}")
-            prefix = "    "
-    return "\n".join(lines) + "\n"
-
-
-def _quote(value: Any) -> str:
-    """Quote a scalar when YAML would otherwise mis-read it.
-
-    Glob patterns start with ``*`` (an alias anchor to YAML) and URLs carry
-    a ``:`` — both need quoting; plain words must stay bare so the existing
-    generated configs are unchanged.
-    """
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    text = str(value)
-    if text == "" or _needs_quotes(text):
-        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
-    return text
 
 
 def detect_source_type(path: Path) -> SourceType:
@@ -111,7 +57,7 @@ def slugify(name: str) -> str:
 
 
 def state_root(config_path: Path) -> Path:
-    """Where a generated config anchors its state/vault/exports/clones."""
+    """Where a generated config anchors its state/exports/clones."""
     return (config_path.resolve().parent / STATE_DIRNAME).resolve()
 
 
@@ -187,7 +133,6 @@ def render_up_config(
             "name": kb_name,
             "description": f"Personal knowledge base over {origin}",
             "state_path": str(local / "state"),
-            "vault_path": str(local / "vault"),
             "exports_path": str(local / "exports"),
             "workspace_root": str(workspace),
         }
@@ -201,19 +146,18 @@ def render_up_config(
     # host); it is compose that publishes them to 127.0.0.1.
     data["server"]["host"] = "127.0.0.1"
     roots = [str(workspace)]
-    for candidate in [*(str(p) for p in local_paths), str(local / "vault"), str(local / "exports")]:
+    for candidate in [*(str(p) for p in local_paths), str(local / "exports")]:
         if candidate not in roots:
             roots.append(candidate)
     data["security"]["allow_workspace_roots"] = roots
-    data.pop("sources", None)
-    sources_block = _render_sources_block([t.to_source_dict() for t in targets])
+    data["sources"] = [target.to_source_dict() for target in targets]
 
     header_lines = [f"# Generated by `pheasant up` ({len(targets)} source(s))"]
     for entry in targets:
         header_lines.append(f"#   {entry.name}: {entry.type} <- {entry.path}")
     header_lines.append("# Edit freely — `pheasant up` never overwrites an existing config.")
     header = "\n".join(header_lines) + "\n"
-    return header + dump_config_yaml(_scrub(data)) + sources_block
+    return header + dump_config_yaml(_scrub(data))
 
 
 def ensure_up_config(
@@ -311,9 +255,8 @@ def _append_missing_sources(target: Any, config_path: Path) -> list[str]:
     if roots:
         security["allow_workspace_roots"] = roots
 
-    existing.pop("sources", None)
-    rendered = dump_config_yaml(existing) + _render_sources_block(sources)
-    config_path.write_text(rendered, encoding="utf-8")
+    existing["sources"] = sources
+    config_path.write_text(dump_config_yaml(existing), encoding="utf-8")
     return added
 
 

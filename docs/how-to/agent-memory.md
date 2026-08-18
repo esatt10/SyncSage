@@ -22,7 +22,7 @@ sources:
 ```
 
 A `memory` source is a filesystem source: the watcher, scheduler, include
-globs, backups, and the Obsidian projection all treat it like any folder
+globs and backups all treat it like any folder
 of Markdown.
 
 ## 2. Write memories
@@ -65,7 +65,7 @@ graph. `GET /memory?scope=org` lists raw records for inspection.
 ## What a record looks like on disk
 
 Append-only Markdown, one file per record, deterministic id — greppable,
-diffable, Obsidian-friendly, and versioned:
+diffable, human-readable, and versioned:
 
 ```markdown
 ---

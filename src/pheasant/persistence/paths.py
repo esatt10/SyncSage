@@ -16,7 +16,6 @@ class StatePaths:
     locks: Path
     logs: Path
     cache: Path
-    vault: Path
     exports: Path
 
     @classmethod
@@ -31,7 +30,6 @@ class StatePaths:
             locks=state / "locks",
             logs=state / "logs",
             cache=state / "cache",
-            vault=config.pheasant.vault_path,
             exports=config.pheasant.exports_path,
         )
 
@@ -44,7 +42,6 @@ class StatePaths:
             self.locks,
             self.logs,
             self.cache,
-            self.vault,
             self.exports,
         ]:
             path.mkdir(parents=True, exist_ok=True)

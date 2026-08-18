@@ -211,7 +211,6 @@ docker compose --env-file .pheasant/compose.env up -d --build
 | `PHEASANT_CONFIG_PATH` | `./pheasant.example.yaml` | Config mounted at `/config/pheasant.yaml`. |
 | `PHEASANT_WORKSPACE_PATH` | `.` | Mounted read-only at `/workspace`. |
 | `PHEASANT_DATA_PATH` | `./data` | Extra read-only mount at `/data`. |
-| `PHEASANT_VAULT_PATH` | `./vault` | Obsidian projection output. |
 
 Both ports publish to **loopback only** by default. The API is unauthenticated,
 so only set `PHEASANT_BIND=0.0.0.0` behind an authenticating ingress — Docker's

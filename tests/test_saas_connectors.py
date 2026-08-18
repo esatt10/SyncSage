@@ -65,7 +65,6 @@ def _engine_sync_twice(
             f"""pheasant:
   name: {type_name}-test
   state_path: {tmp_path / "state-dir"}
-  vault_path: {tmp_path / "vault"}
   exports_path: {tmp_path / "exports"}
   workspace_root: {tmp_path}
 sources:

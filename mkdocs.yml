@@ -78,9 +78,11 @@ nav:
       - Multi-modal ingest: how-to/multimodal-ingest.md
       - Vector self-search: how-to/vector-search.md
       - Speed up indexing: how-to/indexing-performance.md
+      - Monitor indexing: how-to/monitor-indexing.md
+      - Running a worker fleet: how-to/worker-fleet.md
+      - Capacity planning: how-to/capacity-planning.md
       - Attach to a Synapse fleet: how-to/attach-to-synapse.md
       - Backup & restore: how-to/backup-restore.md
-      - Obsidian integration: obsidian_integration.md
       - MCP for agents: mcp_client.md
   - Reference:
       - Configuration: configuration.md
@@ -95,9 +97,5 @@ nav:
       - Architecture: architecture.md
       - The memory system: memory-system.md
       - Troubleshooting: troubleshooting.md
-  - Contributor / internal:
-      - pheasant as a Synapse region (internal spec): SYNAPSE_INTEGRATION.md
-      - Roadmap — context & knowledge management (region side): ROADMAP_CONTEXT_KNOWLEDGE_MGMT.md
-      - Agentic workflows: agentic_workflows.md
-      - UI recommendation: ui_recommendation.md
-      - Gap analysis & plan: development_patches/gap_analysis_and_plan.md
+  - Contributor:
+      - pheasant as a Synapse region (spec): SYNAPSE_INTEGRATION.md

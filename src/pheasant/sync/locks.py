@@ -7,7 +7,7 @@ import socket
 import threading
 import time
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -253,3 +253,169 @@ class EngineLease:
                 self._write()
             except OSError as exc:  # pragma: no cover - disk-failure path
                 logger.warning("Failed to refresh engine lease %s: %s", self.path, exc)
+
+
+class SourceLeaseError(RuntimeError):
+    """Another live writer holds this source's lease."""
+
+
+#: How often a holder refreshes its lease, and how stale one must be before
+#: another process may take it. The gap between them is deliberate: a writer
+#: that misses two heartbeats in a row has almost certainly died, while one
+#: that is merely slow has three chances to prove otherwise.
+SOURCE_HEARTBEAT_SECONDS = 10.0
+SOURCE_STALE_SECONDS = 45.0
+
+
+class SourceLease:
+    """A per-**source** write lease, held in the state database (Phase 35.4).
+
+    :class:`EngineLease` permits exactly one writer process per ``/state``
+    directory. That is correct for SQLite — which serializes writers anyway —
+    and it is the ceiling Phase 35 exists to lift: with several indexers
+    available, two different *sources* have no reason to wait for each other.
+
+    So on a shared backend the unit of exclusion becomes the source. Two
+    indexers can commit ``docs`` and ``code`` concurrently; two indexers can
+    never both commit ``docs``, because a source's artifacts, chunks, graph
+    nodes and manifest are one consistent set.
+
+    Exclusion is a single conditional ``UPDATE``: a row is claimed only if it
+    is unheld, already ours, or provably stale. The database decides, so two
+    processes racing cannot both win — a read-then-write would let them.
+
+    **This does not replace ``EngineLease`` on SQLite.** There, one writer per
+    file is the honest model and the whole-state lease still enforces it.
+    """
+
+    def __init__(
+        self,
+        state: Any,
+        source_id: str,
+        *,
+        owner: str | None = None,
+        heartbeat_interval_s: float = SOURCE_HEARTBEAT_SECONDS,
+        stale_after_s: float = SOURCE_STALE_SECONDS,
+    ):
+        self.state = state
+        self.source_id = source_id
+        self.owner = owner or f"{socket.gethostname()}:{os.getpid()}"
+        self.heartbeat_interval_s = heartbeat_interval_s
+        self.stale_after_s = stale_after_s
+        self._held = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def held(self) -> bool:
+        return self._held
+
+    def _now(self) -> str:
+        return datetime.now(UTC).isoformat()
+
+    def _stale_before(self) -> str:
+        return (datetime.now(UTC) - timedelta(seconds=self.stale_after_s)).isoformat()
+
+    def try_acquire(self) -> bool:
+        """Claim the lease if it is free, ours, or dead. One statement."""
+
+        now = self._now()
+        # One statement, and `RETURNING` is what makes it safe. An earlier
+        # version ran the conditional INSERT and then a separate SELECT to see
+        # who owned the row; between those two statements another writer can
+        # take the lease, so both callers could observe themselves as the
+        # owner. A concurrency test caught exactly that — six threads, two
+        # winners.
+        #
+        # With RETURNING there is no window: the row comes back only if *this*
+        # statement wrote it. A conflicting row that fails the WHERE produces
+        # no row at all, which is the loss signal.
+        #
+        # The WHERE clause is the whole exclusion: an existing lease yields
+        # only if it is already ours or its heartbeat has aged out. ISO-8601
+        # strings compare lexicographically in chronological order, which is
+        # why every timestamp in this codebase is written that way.
+        result = self.state.conn.execute(
+            "INSERT INTO source_leases(source_id, owner, acquired_at, heartbeat_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET "
+            "owner=excluded.owner, acquired_at=excluded.acquired_at, "
+            "heartbeat_at=excluded.heartbeat_at "
+            "WHERE source_leases.owner=excluded.owner "
+            "OR source_leases.heartbeat_at < ? "
+            "RETURNING owner",
+            (self.source_id, self.owner, now, now, self._stale_before()),
+        )
+        rows = list(result)
+        self.state.conn.commit()
+        won = bool(rows) and str(rows[0]["owner"]) == self.owner
+        if won and not self._held:
+            self._held = True
+            self._start_heartbeat()
+        return won
+
+    def acquire(self, wait_timeout_s: float = 0.0) -> None:
+        deadline = time.monotonic() + max(0.0, wait_timeout_s)
+        while True:
+            if self.try_acquire():
+                return
+            if time.monotonic() >= deadline:
+                holder = self.state.rows(
+                    "SELECT owner, heartbeat_at FROM source_leases WHERE source_id=?",
+                    (self.source_id,),
+                )
+                who = dict(holder[0]) if holder else {}
+                raise SourceLeaseError(
+                    f"another writer holds the lease for source {self.source_id!r} "
+                    f"(owner={who.get('owner')}, heartbeat_at={who.get('heartbeat_at')}). "
+                    f"It goes stale after {self.stale_after_s:.0f}s if that writer died."
+                )
+            time.sleep(0.25)
+
+    def release(self) -> None:
+        """Drop the lease so the next writer need not wait it out."""
+
+        if not self._held:
+            return
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.heartbeat_interval_s * 2))
+            self._thread = None
+        self._held = False
+        try:
+            # Only ever delete our own row: a lease we already lost to a
+            # takeover belongs to someone else now, and removing it would
+            # hand a third process a source two writers are using.
+            self.state.conn.execute(
+                "DELETE FROM source_leases WHERE source_id=? AND owner=?",
+                (self.source_id, self.owner),
+            )
+            self.state.conn.commit()
+        except Exception as exc:  # pragma: no cover - shutdown must not raise
+            logger.warning("Could not release lease for %s: %s", self.source_id, exc)
+
+    def _start_heartbeat(self) -> None:
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name=f"pheasant-source-lease-{self.source_id}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop.wait(self.heartbeat_interval_s):
+            try:
+                self.state.conn.execute(
+                    "UPDATE source_leases SET heartbeat_at=? WHERE source_id=? AND owner=?",
+                    (self._now(), self.source_id, self.owner),
+                )
+                self.state.conn.commit()
+            except Exception as exc:  # pragma: no cover - disk/network blip
+                logger.warning("Lease heartbeat failed for %s: %s", self.source_id, exc)
+
+    def __enter__(self) -> SourceLease:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.release()

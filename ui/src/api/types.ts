@@ -83,6 +83,8 @@ export interface SourceRecord {
   sync_error?: string | null;
   /** The running job behind `syncing`, with its phase and counter. */
   job?: JobRecord | null;
+  /** This source's own slice of that job — its counter, not the whole run's. */
+  progress?: SourceProgress | null;
   [key: string]: unknown;
 }
 
@@ -147,8 +149,19 @@ export interface ConfigResponse {
 
 export type SearchMode = "hybrid" | "text" | "graph" | "vector";
 
+/** Where a hit came from. `source_type` is the *kind* of source, not its name. */
+export interface HitProvenance {
+  source_id?: string;
+  source_type?: string;
+  path?: string;
+  relative_path?: string;
+  heading_path?: string;
+  [key: string]: unknown;
+}
+
 export interface SearchResultItem {
   node_id?: string;
+  provenance?: HitProvenance;
   kind?: "node" | "relationship" | "chunk";
   type?: string;
   title?: string;
@@ -482,12 +495,48 @@ export interface JobProgress {
   fraction: number | null;
 }
 
+/**
+ * One source's slice of a job (Phase 35.1).
+ *
+ * A `sync_all` over eight sources used to be one job with one counter, so the
+ * one source that was stuck looked exactly like the seven that were fine.
+ * Throughput and ETA are observed server-side from update timings, not
+ * reported by the indexer, so they exist even for callers that emit neither.
+ */
+export interface SourceProgress {
+  source: string;
+  phase: string;
+  current: number;
+  /** null until the connector has finished listing. A made-up denominator lies. */
+  total: number | null;
+  detail: string;
+  status: string;
+  active: boolean;
+  fraction: number | null;
+  indexed: number;
+  skipped: number;
+  failed: number;
+  bytes_done: number;
+  files_per_second: number | null;
+  eta_seconds: number | null;
+  /** Always present, so a UI can say "last update 4s ago" during healthy work. */
+  seconds_since_progress: number;
+  /** Only true after the server-side stall window — slow is not stuck. */
+  stalled: boolean;
+  started_at: string;
+  last_progress_at: string;
+  finished_at: string | null;
+  phase_seconds: Record<string, number>;
+  failures: { path: string; error: string }[];
+}
+
 export interface JobRecord {
   id: string;
   kind: string;
   label: string;
   targets: string[];
   status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  /** Rollup across `sources`. Kept for callers that predate the per-source split. */
   progress: JobProgress;
   started_at: string;
   finished_at: string | null;
@@ -495,6 +544,9 @@ export interface JobRecord {
   result: Record<string, unknown> | null;
   log: string[];
   active: boolean;
+  sources: SourceProgress[];
+  stalled: boolean;
+  failed_files: number;
 }
 
 // ---------------------------------------------------------------------------

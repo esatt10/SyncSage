@@ -259,7 +259,7 @@ def test_cli_mount_writes_the_override_and_allowlists_the_path(tmp_path: Path) -
     roots = yaml.safe_load(config.read_text())["security"]["allow_workspace_roots"]
     assert "/data/notes" in roots
     # The defaults survive — replacing them with one entry would lock the user
-    # out of /workspace and /vault.
+    # out of /workspace.
     assert "/workspace" in roots
 
 

@@ -1,6 +1,6 @@
-"""Product Framework Step 30.1 — ``pheasant up`` personal quickstart.
+"""``pheasant up`` — the one-command personal quickstart.
 
-Acceptance (see docs/ROADMAP_CONTEXT_KNOWLEDGE_MGMT.md §2b):
+What it must guarantee:
 
 1. In a fixture workspace, ``pheasant up --no-serve`` writes a config that
    ``load_config`` round-trips, indexes > 0 artifacts, and creates state
@@ -166,7 +166,6 @@ def test_up_adds_a_new_target_to_an_existing_config(tmp_path: Path) -> None:
         json.dumps(
             {
                 "pheasant.state_path": str(tmp_path / "state"),
-                "pheasant.vault_path": str(tmp_path / "vault"),
                 "pheasant.exports_path": str(tmp_path / "exports"),
             }
         ),

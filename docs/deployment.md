@@ -10,7 +10,7 @@ Create local config first:
 cp pheasant.example.yaml pheasant.yaml
 ```
 
-`pheasant.yaml` is ignored by git. Edit source paths so they point at container paths under `/workspace` or `/vault`, and edit `deployment.compose` if your host workspace or vault lives somewhere else.
+`pheasant.yaml` is ignored by git. Edit source paths so they point at container paths under `/workspace`, and edit `deployment.compose` if your host workspace lives somewhere else.
 
 ```bash
 docker run --rm \
@@ -18,7 +18,6 @@ docker run --rm \
   -p 8765:8765 \
   -v "$PWD/pheasant.yaml:/config/pheasant.yaml:ro" \
   -v "$HOME/projects:/workspace:ro" \
-  -v "$HOME/pheasant-vault:/vault" \
   -v pheasant-state:/state \
   ghcr.io/esatt10/pheasant:<pyproject-version>
 ```
@@ -45,7 +44,6 @@ non-Docker path, live in [Run the web UI](how-to/run-the-ui.md).
 | selected config path | `/config/pheasant.yaml` | Runtime config, read-only. |
 | `deployment.compose.workspace_path` | `/workspace` | Indexed repositories and documents, read-only. |
 | `deployment.compose.data_path` | `/data` | Extra local files that live **outside** the workspace, read-only. |
-| `deployment.compose.vault_path` | `/vault` | Generated Obsidian notes, read/write. |
 | `pheasant-state` volume | `/state` | SQLite, manifests, graph snapshots. |
 | `pheasant-exports` volume | `/exports` | JSON/canvas exports. |
 

@@ -1,0 +1,288 @@
+# How big can one region get?
+
+Every scaling decision in pheasant comes back to one number: **how many nodes
+the knowledge graph has**. The graph is held in memory during a sync and
+written out as one compressed blob, so it sets the container's RAM, the time
+each checkpoint costs, and how long a restart takes before it can serve.
+
+The numbers below are **measured, not modelled** — `python -m
+pheasant.graph.capacity` builds a real `SimpleMultiDiGraph` with realistic
+attribute payloads at each scale and reports what it cost. Re-run it on your
+own hardware; the shape will hold, the constants will move.
+
+## Measured cost
+
+Four scale points, on one container. Node and edge counts come from the ratio a
+real corpus produces (~6.3 nodes and ~6.3 edges per file, taken from the live
+2,132-file demo corpus at 13,503 nodes / 13,502 edges).
+
+| Corpus | Nodes | Process RSS | Checkpoint write | Restart load | Edge scan |
+|---|---|---|---|---|---|
+| 2,000 files | 12.6k | **34 MB** | 0.13 s | 0.10 s | 1.8 ms |
+| 20,000 files | 126k | **314 MB** | 1.3 s | 0.9 s | 16 ms |
+| 100,000 files | 630k | **1.5 GB** | 6.7 s | 4.6 s | 95 ms |
+| 250,000 files | 1.58M | **4.3 GB** | 19.9 s | 11.2 s | 240 ms |
+
+Cost per node is flat across all four (~2.4 KB of RSS), so this is linear and
+you can interpolate. Do **not** extrapolate far past the top row: a linear
+projection to 250k files predicted 3.8 GB and the measured answer was 4.3 GB,
+12% high.
+
+## Sizing a region
+
+| Corpus | Give the container | Notes |
+|---|---|---|
+| < 5,000 files | 512 MB, 1 CPU | |
+| 5,000–25,000 | 1 GB, 2 CPU | |
+| 25,000–75,000 | 2 GB, 2–4 CPU | |
+| 75,000–150,000 | 4 GB, 4 CPU | |
+| 150,000–240,000 | **6 GB, 4 CPU** | The shipped default. |
+| 240,000–500,000 | 8–16 GB | Fine in the cloud; `graph.max_nodes` warns. |
+| **> 500,000** | **Shard** | One container stops being sensible. |
+
+These are per **region**, and linear — a cloud deployment can go well past the
+bottom row on a single node. Sharding is about operational sanity (parallel
+indexing, independent re-indexes, blast radius) more than about a hard wall.
+
+!!! note "The shipped Kubernetes manifest allows 6 GB"
+
+    `deploy/kubernetes/deployment.yaml` and the Helm chart limit memory to
+    **6 Gi**, which covers roughly **350,000 files** on the table above. It was
+    1 Gi (about 65,000 files) until 2026-08-16; a corpus past that was
+    OOM-killed mid-sync and it presented as an unexplained restart rather than
+    as a capacity problem. Raise it further for a cloud deployment — the
+    numbers above are per-region and linear.
+
+## How long the first index takes
+
+Measured by `python -m pheasant.sync.benchmark --mode capacity`, one worker,
+embeddings off, on uniform markdown:
+
+| Corpus | Time | Files/s | /state |
+|---|---|---|---|
+| 500 files | 1.4 s | 356 | 3 MB |
+| 1,000 | 2.9 s | 345 | 5 MB |
+| 2,000 | 5.8 s | 344 | 11 MB |
+| 4,000 | 12.3 s | 326 | 87 MB |
+| 8,000 | 26.2 s | 305 | 173 MB |
+
+**Linear** — each doubling of the corpus roughly doubles the time (measured
+2.06x, 2.01x, 2.12x, 2.13x). So `files ÷ 300` is a usable first estimate in
+seconds, and `pheasant scan` does that arithmetic for you.
+
+!!! warning "This was superlinear until 2026-08-16"
+
+    The same sweep on the previous release went 1.9 s → 164.7 s over the same
+    range — **tripling** for every doubling, an ~O(n^1.7) curve that
+    extrapolated to about 16 hours at 250,000 files.
+
+    The cause: `chunks_fts.artifact_id` is an UNINDEXED FTS5 column, so the
+    per-artifact `DELETE FROM chunks_fts WHERE artifact_id=?` was a full scan
+    of a table growing with the corpus — and on a *full* sync it was scanning
+    to delete nothing, because the source had already been emptied before the
+    loop. Skipping a question whose answer is already known made an
+    8,000-file index **6.3x** faster.
+
+    If you have an older recorded timing, discard it. A per-file figure taken
+    from a small corpus and multiplied up was extrapolating a curve as though
+    it were a line.
+
+    **SQLite only.** The Postgres backend never had this: `chunks_fts` there
+    is an ordinary table with `idx_chunks_fts_artifact`, so the delete was
+    always indexed. If you were already on Postgres, the times above are the
+    ones you had.
+
+**Disk** tracks *content*, not file count: measured at **~4.0 bytes of
+`/state` per corpus byte**, flat to within 3% across the sweep, and dominated
+by SQLite storing every chunk's text again plus its FTS index. Embeddings add
+`chunks × dimensions × 4` bytes on top.
+
+**Embedding time is not projected.** A network embedder's throughput is the
+provider's rate limit, not pheasant's — the 2026-08-12 vscode run measured
+~20 files/min against a real endpoint, two orders of magnitude below the
+offline figures above, and that number describes the provider. Benchmark your
+own, and note that the [worker fleet](worker-fleet.md) does not help here:
+embedding is a network wait, not CPU.
+
+## Checkpoint cost, and why it is no longer the ceiling
+
+A checkpoint serializes the entire graph, so its cost grows with the index. The
+interval is **derived from that cost**, not fixed — pheasant uses Young's
+formula (`T = sqrt(2 x C x MTBF)`), the standard HPC/ML-training result, which
+minimizes the *sum* of checkpoint overhead and work redone after a crash rather
+than either alone:
+
+| Corpus | Checkpoint cost | Interval | Overhead | Worst-case rework |
+|---|---|---|---|---|
+| 2,000 files | 0.13 s | 150 s | 0.1% | 2.5 min |
+| 20,000 files | 1.3 s | 8 min | 0.3% | 8 min |
+| 100,000 files | 6.7 s | 18 min | 0.6% | 18 min |
+| 250,000 files | 19.9 s | 31 min | 1.1% | 31 min |
+
+Overhead stays around 1% at every size. The trade is bounded rework — at most
+one interval of indexing is lost to a crash — capped by
+`storage.graph_checkpoint_max_seconds` (30 min).
+
+```yaml
+storage:
+  checkpoint_mtbf_seconds: 86400      # expected time between interruptions
+  graph_checkpoint_max_seconds: 1800  # ceiling on lost work
+```
+
+Lower `checkpoint_mtbf_seconds` on spot or preemptible instances: interruptions
+are more frequent there, and the formula responds by checkpointing more often —
+which is exactly when that pays for itself.
+
+So checkpoint cost is **not** what limits one region. RAM is, and it grows
+linearly — the table at the top is the guide.
+
+pheasant warns once per sync when the graph passes `graph.max_nodes` (default
+**1.5M nodes**, ≈240,000 files — the point at which the shipped 6 Gi container
+is genuinely full). It is a notice, not a refusal: by the time it can fire the
+index already exists, and discarding it would help nobody. Raise it *and* the
+container limit together, or shard.
+
+```yaml
+graph:
+  max_nodes: 1500000   # null disables the warning
+```
+
+## When you cross the line: shard
+
+Split the corpus across several pheasant regions and let the
+[Synapse router](attach-to-synapse.md) fan out across them. Each region is an
+ordinary container with its own `/state`, so:
+
+* memory and checkpoint cost divide by the number of shards, and both are the
+  constraints above;
+* regions index **in parallel**, so wall-clock time to first index divides too;
+* a region can be re-indexed or replaced without touching the others.
+
+Shard along a boundary that matches how people search — per repository, per
+team, per document collection — rather than by hashing paths. Retrieval quality
+depends on related content living in the same graph: splitting one repository
+across two regions breaks the cross-source edges that make
+`get_graph_neighbors` useful, while splitting *between* repositories costs
+nothing, because those edges were never going to exist.
+
+Sizing a fleet is the single-region table divided by the shard count. 600,000
+files across 6 regions is six containers of the 100,000-file row — 1.5 GB and a
+6.7 s checkpoint each — indexing in parallel, instead of one 10 GB container
+indexing serially.
+
+### Let pheasant propose the split
+
+```bash
+pheasant shard plan -c pheasant.yaml            # fewest regions that fit
+pheasant shard plan -c pheasant.yaml --shards 4 # exactly four
+```
+
+It scans each source (a directory walk, not an index), packs whole sources
+largest-first, and prints which sources go where with a memory request per
+region:
+
+```text
+600,000 files across 3 region(s) (~3,780,000 graph nodes)
+
+  shard-1: 220,000 files, ~1,386,000 nodes, ~5.5 GB RSS -> request 8Gi
+      - platform-monorepo
+  shard-2: 200,000 files, ~1,260,000 nodes, ~5.0 GB RSS -> request 8Gi
+      - docs-site
+      - runbooks
+```
+
+The count defaults to the fewest regions that keep every shard under
+`graph.max_nodes`, so the planner and the runtime warning agree about what "too
+big" means. A single source over budget on its own is reported rather than
+split — no arrangement of whole sources fixes that, and the honest answers are
+more memory for that region or a narrower `include`/`exclude`.
+
+### Writing to one knowledge base from several indexers
+
+Separate from sharding, and only on Postgres: the write lease is **per source**
+there rather than per state directory, so two indexers can commit two different
+sources concurrently. On SQLite the whole-state lease remains, because SQLite
+genuinely permits one writer per file — that is an accurate model, not a
+limitation to route around.
+
+## Which storage backend
+
+Independent of the graph, and a different question:
+
+| | SQLite (default) | Postgres |
+|---|---|---|
+| Setup | none | a database to run |
+| Writers | **one process per knowledge base** | **one per source** — several indexers at once |
+| Read replicas | one container | many |
+| Ranking | BM25 | see [configuration](../configuration.md#where-state-lives-storagebackend) |
+
+Use SQLite unless you need several processes writing one knowledge base, or
+several replicas serving it. It is not slower for a single container, and it is
+one fewer thing to operate. Postgres is what lifts the one-writer limit; it does
+**not** change the graph numbers above, because the graph is held in memory
+either way.
+
+## Ask pheasant instead of reading the table
+
+`pheasant scan` walks a source without reading it, so every number above can
+be projected **before** you commit to a first index — which is the moment it
+is useful, rather than after an OOM kill:
+
+```console
+$ pheasant scan -c pheasant.yaml
+platform-monorepo (/workspace/platform)
+  would index 6000 files, 27.93 MB (scanned 6003 entries, pruned 0 directories)
+  largest subtrees: services (13 MB), web (9 MB), docs (4 MB)
+  within configured limits — sync would proceed
+  projected: ~37,800 nodes, ~0.1 GB RAM, ~0.1 GB in /state, ~19.8s to index
+  suggested container memory: 0.5Gi
+```
+
+The projection reflects *your* config — enabling embeddings adds the vector
+store to the disk figure — and warns when a corpus needs sharding rather than
+a bigger container. `--json` includes it as a `projection` object.
+
+## Sizing a fleet
+
+Past one container, the shape is
+[three tiers](worker-fleet.md#running-the-whole-fleet). What the file count
+predicts:
+
+| Corpus | Shards | Indexers | API replicas | Workers | Memory each |
+|---|---|---|---|---|---|
+| < 25,000 | 1 | 1 | — single container | 0 | 0.5–1 Gi |
+| 75,000 | 1 | 1 | 2 | 3 | 1 Gi |
+| 150,000 | 1 | 1 | 2 | 6 | 2 Gi |
+| 250,000 | 2 | 2 | 2 | 16 | 4 Gi |
+| 600,000 | 3 | 3 | 3 | 24 | 8 Gi |
+
+Two of those columns are honest guesses and it is worth saying which:
+**api replicas** track request traffic, which a file count cannot predict —
+two is a floor so a rollout is not an outage. **Workers** are one per ~25,000
+files per shard, capped at 8, because the 2026-08-13 benchmark measured 8 file
+workers buying only 1.113x on a commit-dominated fixture; the tier helps when
+parsing is expensive (PDFs, large documents), not uniformly.
+
+Only **shards** and **memory** come straight from measurement.
+
+## Measure your own
+
+```bash
+python -m pheasant.sync.benchmark --mode capacity --sizes 500,2000,8000
+python -m pheasant.graph.capacity --files 2000,20000,100000
+python -m pheasant.sync.benchmark --workers 1,2,4,8
+```
+
+The first is what produced the tables above; it prints its own coefficients
+beside the measurements so drift is visible. Its fixture is uniform markdown,
+which is the caveat that matters most: a real corpus of PDFs or code moves
+seconds-per-file a long way and nodes-per-file hardly at all. That is also why
+the model's `nodes_per_file` comes from a **live** 2,132-file corpus (6.3) and
+not from the synthetic sweep (3.0) — the fixture has no links, headings or
+symbols, so adopting its figure would have halved every memory projection.
+
+## Related
+
+- [Monitor indexing](monitor-indexing.md) — throughput, ETA and stall detection.
+- [Speed up indexing](indexing-performance.md) — worker counts and executors.
+- [Attach to a Synapse fleet](attach-to-synapse.md) — running several regions.

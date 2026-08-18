@@ -41,6 +41,38 @@ def _print_scan(report: dict) -> None:
         print("  narrow with --depth / include / exclude, raise sync.limits, or use --full-scan")
     else:
         print("  within configured limits — sync would proceed")
+    _print_projection(report)
+
+
+def _print_projection(report: dict) -> None:
+    """Turn the scan's counts into a sizing answer (Phase 35.7).
+
+    `scan` already walks without reading and reports files and bytes. Those
+    are exactly the two inputs the capacity model needs, so the projection is
+    free here — and this is the moment it is useful, before anyone has
+    committed to a first index and discovered the answer by OOM.
+    """
+
+    from pheasant.capacity import project
+
+    projection = report.get("projection")
+    if not projection:
+        if not report.get("scannable"):
+            return
+        projection = project(
+            int(report.get("file_count") or 0),
+            int(report.get("total_bytes") or 0),
+        ).as_dict()
+    minutes = projection["projected_index_minutes"]
+    duration = f"{minutes:.1f} min" if minutes >= 1 else f"{projection['projected_index_seconds']}s"
+    print(
+        f"  projected: ~{projection['graph_nodes']:,} nodes, "
+        f"~{projection['projected_rss_gb']:.1f} GB RAM, "
+        f"~{projection['projected_state_gb']:.1f} GB in /state, ~{duration} to index"
+    )
+    print(f"  suggested container memory: {projection['recommended_memory']}")
+    for warning in projection.get("warnings") or []:
+        print(f"  ! {warning}")
 
 
 def _sync_services(engine, cfg, config_path=None):
@@ -86,23 +118,203 @@ def _report_ui(app_obj, cfg) -> None:
         )
 
 
-def _serve_app(cfg, config_path: str, *, report_ui: bool = True) -> None:
+def _serve_app(cfg, config_path: str, *, report_ui: bool = True, role: str | None = None) -> None:
     import uvicorn
 
     from pheasant.api.app import create_app
+    from pheasant.deployment.roles import resolve_role
 
-    app_obj = create_app(cfg, config_path=config_path)
-    if report_ui:
+    policy = resolve_role(cfg, role)
+    app_obj = create_app(cfg, config_path=config_path, role=policy.name)
+    if report_ui and policy.serves_ui:
         _report_ui(app_obj, cfg)
     watcher, scheduler = _sync_services(app_obj.state.engine, cfg, config_path=config_path)
-    watcher.start()
-    scheduler.start()
+    drainer = _queue_drainer(cfg, config_path, policy)
+    refresher = _graph_refresher(cfg, app_obj.state.engine, policy)
+    if policy.runs_watcher:
+        watcher.start()
+    if policy.runs_scheduler:
+        scheduler.start()
+    if drainer is not None:
+        drainer.start()
+    if refresher is not None:
+        refresher.start()
+    if not policy.is_default:
+        print(f"role: {policy.name}")
     try:
         uvicorn.run(app_obj, host=cfg.server.host, port=cfg.server.port)
     finally:
+        if refresher is not None:
+            refresher.stop()
+        if drainer is not None:
+            drainer.stop()
         scheduler.stop()
         watcher.stop()
         app_obj.state.engine.close()
+
+
+class _QueueDrainer:
+    """Claim and run index tasks for as long as this process serves.
+
+    A background thread rather than a second process: the sync it runs already
+    goes to a child through ``WorkerBackedEngine``, so the drain loop itself is
+    only waiting, and giving it its own process would buy nothing but a second
+    thing to supervise.
+
+    The loop lives here rather than in ``SyncEngine`` because it is a
+    *deployment* behavior — it exists only for the indexer role, and an engine
+    that drained a queue on its own would do it inside the CLI, the tests, and
+    every embedded caller too.
+    """
+
+    def __init__(self, cfg, config_path: str) -> None:
+        self.cfg = cfg
+        self.config_path = config_path
+        self._stop = None
+        self._thread = None
+
+    def start(self) -> None:
+        import threading
+
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="pheasant-drainer", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            # Bounded: a task in flight finishes, but a shutdown must not wait
+            # out a multi-hour index. The visibility timeout hands an
+            # unfinished task to the next indexer, which is exactly the
+            # mechanism that makes an abrupt stop safe.
+            self._thread.join(timeout=10)
+
+    def _run(self) -> None:
+        import logging
+
+        from pheasant.sync.queue import drain, owner_id, queue_from_config
+
+        log = logging.getLogger("pheasant.cli")
+        engine = _engine(Path(self.config_path))
+        queue = queue_from_config(self.cfg, engine.state)
+        if queue is None:
+            log.warning("role 'indexer' has no queue configured; nothing will be drained")
+            engine.close()
+            return
+        from pheasant.sync.worker import WorkerBackedEngine
+
+        worker = WorkerBackedEngine(engine, self.config_path)
+        owner = owner_id()
+        visibility = float(self.cfg.sync.queue.visibility_seconds or 300)
+        log.info("draining index queue as %s", owner)
+        try:
+            while not self._stop.is_set():
+                # A short idle timeout rather than a long block: `drain`
+                # returns when the backlog clears, and the outer loop is what
+                # notices the stop event. Blocking inside `drain` for minutes
+                # would make SIGTERM take minutes.
+                drain(
+                    queue,
+                    lambda task: worker.sync_source(
+                        task.source_id,
+                        task.mode,
+                        max_depth=task.max_depth,
+                        full_scan=task.full_scan,
+                    ),
+                    owner=owner,
+                    idle_timeout=2.0,
+                    visibility_seconds=visibility,
+                )
+        except Exception:  # noqa: BLE001 - a drainer that dies silently is worse
+            log.exception("index queue drainer stopped")
+        finally:
+            queue.close()
+            engine.close()
+
+
+def _queue_drainer(cfg, config_path: str, policy):
+    """The drain loop, or ``None`` when this role does not claim tasks."""
+
+    if not policy.drains_queue:
+        return None
+    return _QueueDrainer(cfg, config_path)
+
+
+class _GraphRefresher:
+    """Pick up a graph written by another process.
+
+    The graph is a file. A process loads it once at startup, and the only
+    existing reload path runs after a sync **that process** performed. Split
+    the roles and that stops being enough: an api replica never indexes, so
+    without this it answers graph queries from whatever the graph was when the
+    pod started — indefinitely, and silently, while text and vector search stay
+    current from the shared database. Shipping fleet manifests without closing
+    that would be shipping a fleet that quietly disagrees with itself.
+
+    Polling the file's mtime and size, rather than subscribing to anything:
+    the writer is a different pod on a shared volume, so there is no channel
+    between them, and a stat every 30 s costs nothing.
+    """
+
+    def __init__(self, engine, interval_seconds: float) -> None:
+        self.engine = engine
+        self.interval = max(1.0, float(interval_seconds))
+        self._stop = None
+        self._thread = None
+        self._seen = self._stamp()
+
+    def _stamp(self):
+        path = self.engine.graph_store.graph_path(self.engine.config.knowledge_base_id)
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def start(self) -> None:
+        import threading
+
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="pheasant-graph-refresh", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def check_once(self) -> bool:
+        """Reload if the file changed. Returns whether it did."""
+
+        stamp = self._stamp()
+        if stamp is None or stamp == self._seen:
+            return False
+        self._seen = stamp
+        self.engine.reload_graph()
+        return True
+
+    def _run(self) -> None:
+        import logging
+
+        log = logging.getLogger("pheasant.cli")
+        while not self._stop.wait(self.interval):
+            try:
+                self.check_once()
+            except Exception:  # noqa: BLE001 - a stale graph beats a dead thread
+                log.warning("graph refresh failed; will retry", exc_info=True)
+
+
+def _graph_refresher(cfg, engine, policy):
+    """The refresh loop, or ``None`` when this role indexes its own graph."""
+
+    interval = float(getattr(cfg.server.api, "graph_refresh_seconds", 0) or 0)
+    if not policy.refreshes_graph or interval <= 0:
+        return None
+    return _GraphRefresher(engine, interval)
 
 
 def _engine(config_path: Path):
@@ -114,7 +326,7 @@ def _engine(config_path: Path):
     cfg = load_config(config_path)
     paths = StatePaths.from_config(cfg)
     paths.ensure()
-    state = StateStore(paths.sqlite)
+    state = StateStore.from_config(cfg, paths.sqlite)
     state.migrate()
     return SyncEngine(cfg, paths, state)
 
@@ -138,14 +350,29 @@ def _progress_emitter():
     """
     import time as _time
 
-    last = {"emitted": 0.0, "current": 0, "phase": ""}
+    # Throttle per source, not globally: with `max_parallel_sources > 1` a
+    # single counter meant a fast source could suppress every update from a
+    # slow one, which is precisely the source a watcher cares about.
+    last: dict[str, dict[str, float | int | str]] = {}
 
-    def emit(phase: str, current: int, total: int | None, detail: str) -> None:
+    def emit(
+        phase: str,
+        current: int,
+        total: int | None,
+        detail: str,
+        meta: dict | None = None,
+    ) -> None:
+        source = str((meta or {}).get("source") or "")
         now = _time.monotonic()
-        changed_phase = phase != last["phase"]
-        if not changed_phase and current - last["current"] < 25 and now - last["emitted"] < 1.0:
+        seen = last.setdefault(source, {"emitted": 0.0, "current": 0, "phase": ""})
+        changed_phase = phase != seen["phase"]
+        if (
+            not changed_phase
+            and current - int(seen["current"]) < 25
+            and now - float(seen["emitted"]) < 1.0
+        ):
             return
-        last.update({"emitted": now, "current": current, "phase": phase})
+        seen.update({"emitted": now, "current": current, "phase": phase})
         line = json.dumps(
             {
                 "marker": PROGRESS_MARKER,
@@ -153,6 +380,7 @@ def _progress_emitter():
                 "current": current,
                 "total": total,
                 "detail": detail,
+                "meta": meta or {},
             }
         )
         print(line, flush=True)
@@ -288,7 +516,7 @@ def _run_mount(args) -> int:
         roots = list(security.get("allow_workspace_roots") or [])
         if container not in roots:
             # Keep the defaults: replacing the field wholesale with one entry
-            # would lock the user out of /workspace and /vault.
+            # would lock the user out of /workspace.
             if not roots:
                 from pheasant.config.schema import SecuritySettings
 
@@ -502,6 +730,26 @@ def main(argv: list[str] | None = None) -> int:
     server_config_default = os.environ.get("PHEASANT_CONFIG", "/config/pheasant.yaml")
     serve_p = sub.add_parser("serve")
     serve_p.add_argument("--config", "-c", default=server_config_default)
+    serve_p.add_argument(
+        "--role",
+        choices=("all", "api", "indexer", "worker"),
+        default=None,
+        help="Which jobs this process takes on. Default: server.role, or 'all'.",
+    )
+    worker_p = sub.add_parser(
+        "worker",
+        help="Run a stateless preparation worker for a remote coordinator.",
+    )
+    worker_p.add_argument("--config", "-c", default=server_config_default)
+    worker_p.add_argument(
+        "--transport",
+        choices=("grpc",),
+        default="grpc",
+        help="HTTP workers are served by `pheasant serve`; this runs the gRPC one.",
+    )
+    worker_p.add_argument("--host", default="0.0.0.0")  # noqa: S104 - addressed from other pods
+    worker_p.add_argument("--port", type=int, default=8766)
+    worker_p.add_argument("--max-workers", type=int, default=8)
     mcp_p = sub.add_parser("mcp")
     mcp_p.add_argument("--config", "-c", default=server_config_default)
     mcp_p.add_argument("--transport", choices=("stdio", "streamable-http", "sse"), default="stdio")
@@ -530,6 +778,46 @@ def main(argv: list[str] | None = None) -> int:
     compose_env_p.add_argument("--output", "-o")
     repair_p = sub.add_parser("repair")
     repair_p.add_argument("--config", "-c", default="pheasant.example.yaml")
+    queue_p = sub.add_parser("queue", help="Inspect the durable index work queue.")
+    queue_sub = queue_p.add_subparsers(dest="queue_command")
+    queue_status_p = queue_sub.add_parser("status", help="Backlog, in-flight and dead letters.")
+    queue_status_p.add_argument("--config", "-c", default="pheasant.yaml")
+    queue_drain_p = queue_sub.add_parser("drain", help="Index everything currently queued.")
+    queue_drain_p.add_argument("--config", "-c", default="pheasant.yaml")
+    queue_drain_p.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=0.0,
+        help="Keep waiting this many seconds for new work before exiting (0 = drain and stop).",
+    )
+    queue_requeue_p = queue_sub.add_parser(
+        "requeue-dead", help="Replay dead-lettered tasks after fixing the cause."
+    )
+    queue_requeue_p.add_argument("--config", "-c", default="pheasant.yaml")
+    shard_p = sub.add_parser("shard", help="Plan a multi-region split of this corpus.")
+    shard_sub = shard_p.add_subparsers(dest="shard_command", required=True)
+    shard_plan_p = shard_sub.add_parser("plan", help="Propose which sources go to which region.")
+    shard_plan_p.add_argument("--config", "-c", default="pheasant.yaml")
+    shard_plan_p.add_argument("--shards", type=int, help="Split into exactly this many regions.")
+    shard_plan_p.add_argument("--json", action="store_true")
+    migrate_p = sub.add_parser(
+        "migrate", help="Copy SQLite state into the configured Postgres backend."
+    )
+    migrate_p.add_argument("--config", "-c", default="pheasant.yaml")
+    migrate_p.add_argument(
+        "--to", choices=("postgres",), default="postgres", help="Target backend."
+    )
+    migrate_p.add_argument(
+        "--sqlite-path",
+        help="Source database. Defaults to the state path in the config.",
+    )
+    migrate_p.add_argument(
+        "--keep-original",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Rename the SQLite file to *.migrated instead of leaving it in place.",
+    )
+    migrate_p.add_argument("--json", action="store_true")
     backup_p = sub.add_parser("backup")
     backup_p.add_argument("output")
     backup_p.add_argument("--config", "-c", default="pheasant.example.yaml")
@@ -684,7 +972,6 @@ def main(argv: list[str] | None = None) -> int:
         errors = validate_source_paths(cfg, require_exists=not args.no_require_paths)
         for path in [
             cfg.pheasant.state_path,
-            cfg.pheasant.vault_path,
             cfg.pheasant.exports_path,
         ]:
             try:
@@ -793,6 +1080,164 @@ def main(argv: list[str] | None = None) -> int:
         for report in reports:
             _print_scan(report)
         return 0
+    if args.command == "queue":
+        from pheasant.sync.queue import (
+            DEAD,
+            DONE,
+            INFLIGHT,
+            PENDING,
+            LocalQueue,
+            drain,
+            queue_from_config,
+        )
+
+        engine = _engine(Path(args.config))
+        queue = None
+        try:
+            # Built from config, not hardcoded to LocalQueue: with
+            # `sync.queue.backend: nats` the tasks are in JetStream, and
+            # reaching for the SQLite table reported an empty queue on a
+            # backlog of thousands and drained nothing — while `requeue-dead`
+            # silently did nothing to the queue that actually held the dead
+            # letters. `queue_from_config` returns None when queueing is off.
+            queue = queue_from_config(engine.config, engine.state) or LocalQueue(engine.state)
+            if args.queue_command == "status":
+                depth = queue.depth()
+                print(
+                    f"queued: {depth[PENDING]}  in-flight: {depth[INFLIGHT]}  "
+                    f"done: {depth[DONE]}  dead: {depth[DEAD]}"
+                )
+                if depth[DEAD] and isinstance(queue, LocalQueue):
+                    # Per-task detail is a property of the local table; a
+                    # JetStream dead letter is terminated on the broker and
+                    # has no row here to read.
+                    for row in engine.state.rows(
+                        "SELECT source_id, attempts, last_error FROM index_tasks "
+                        "WHERE status=? ORDER BY updated_at",
+                        (DEAD,),
+                    ):
+                        print(
+                            f"  ! {row['source_id']} failed {row['attempts']}x: {row['last_error']}"
+                        )
+                    print("\nFix the cause, then: pheasant queue requeue-dead")
+                return 0
+            if args.queue_command == "requeue-dead":
+                requeue = getattr(queue, "requeue_dead", None)
+                if requeue is None:
+                    print(
+                        f"{type(queue).__name__} has no dead-letter replay; "
+                        "terminated messages are managed on the broker.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                print(f"requeued {requeue()} dead-lettered task(s)")
+                return 0
+            if args.queue_command == "drain":
+                results = drain(
+                    queue,
+                    lambda task: engine.sync_source(
+                        task.source_id,
+                        task.mode,
+                        max_depth=task.max_depth,
+                        full_scan=task.full_scan,
+                    ),
+                    idle_timeout=float(args.idle_timeout or 0.0),
+                )
+                for result in results:
+                    print(
+                        f"{result.source_id}: {result.status} "
+                        f"({result.indexed_artifacts} indexed, "
+                        f"{result.skipped_artifacts} skipped)"
+                    )
+                print(f"drained {len(results)} task(s)")
+                return 0
+        finally:
+            if queue is not None:
+                try:
+                    queue.close()
+                except Exception:  # pragma: no cover - shutdown must not raise
+                    pass
+            engine.close()
+        queue_p.print_help()
+        return 2
+    if args.command == "shard":
+        from pheasant.config.loader import load_config
+        from pheasant.sharding import SourceSize, plan_shards, render_plan
+
+        cfg = load_config(Path(args.config))
+        engine = _engine(Path(args.config))
+        sizes = []
+        try:
+            for source in cfg.sources:
+                if not source.enabled:
+                    continue
+                # `scan` walks without reading, so planning a split of a corpus
+                # you have not indexed yet costs a directory walk, not an index.
+                try:
+                    report = engine.scan_source(source.name)
+                except Exception as exc:  # an unwalkable source is not fatal
+                    print(f"WARNING: could not scan {source.name}: {exc}", file=sys.stderr)
+                    continue
+                if not report.get("scannable"):
+                    print(
+                        f"WARNING: skipping {source.name}: {report.get('reason')}",
+                        file=sys.stderr,
+                    )
+                    continue
+                sizes.append(
+                    SourceSize(
+                        name=source.name,
+                        files=int(report.get("file_count") or 0),
+                        bytes_=int(report.get("total_bytes") or 0),
+                    )
+                )
+        finally:
+            engine.close()
+        plan = plan_shards(
+            sizes,
+            shards=args.shards,
+            max_nodes_per_shard=int(getattr(cfg.graph, "max_nodes", None) or 1_500_000),
+        )
+        print(json.dumps(plan, indent=2, sort_keys=True) if args.json else render_plan(plan))
+        return 0
+    if args.command == "migrate":
+        from pheasant.config.loader import load_config
+        from pheasant.persistence.migrate import MigrationError, migrate_sqlite_to_postgres
+        from pheasant.persistence.paths import StatePaths
+        from pheasant.persistence.secrets import DsnUnavailable, resolve_dsn
+
+        cfg = load_config(Path(args.config))
+        sqlite_path = args.sqlite_path or StatePaths.from_config(cfg).sqlite
+        try:
+            dsn = resolve_dsn(cfg.storage)
+        except DsnUnavailable as exc:
+            # The DSN comes from the environment by design, so the most likely
+            # mistake is a config that still says `backend: sqlite`.
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        try:
+            report = migrate_sqlite_to_postgres(
+                sqlite_path,
+                dsn,
+                pool_size=int(getattr(cfg.storage, "pool_size", 10) or 10),
+                keep_original=bool(args.keep_original),
+            )
+        except MigrationError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print(f"Migrated {report['source']} -> {report['target']}")
+            for table, count in sorted(report["tables"].items()):
+                print(f"  {table}: {count} row(s)")
+            if report["skipped"]:
+                print(f"  already populated, left alone: {', '.join(report['skipped'])}")
+            print(f"  chunks_fts: rebuilt {report['chunks_fts']} row(s) for this dialect")
+            if report.get("original_renamed_to"):
+                print(f"  original kept at {report['original_renamed_to']}")
+            print("Set storage.backend: postgres in your config and restart.")
+        return 0
     if args.command == "repair":
         from pheasant.sync.locks import EngineLeaseError
 
@@ -836,11 +1281,46 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "serve":
         from pheasant.config.loader import load_config
+        from pheasant.deployment.roles import RoleConfigurationError
 
         cfg = load_config(Path(args.config))
         # `serve` is the container entrypoint, where the UI is a separate
         # sidecar workload — an npm hint in the image's logs would be noise.
-        _serve_app(cfg, args.config, report_ui=False)
+        try:
+            _serve_app(cfg, args.config, report_ui=False, role=args.role)
+        except RoleConfigurationError as exc:
+            print(str(exc))
+            return 1
+        return 0
+    if args.command == "worker":
+        from pheasant.config.loader import load_config
+        from pheasant.sync.grpc_worker import GrpcUnavailable
+        from pheasant.sync.grpc_worker import serve as serve_grpc_worker
+        from pheasant.version import __version__
+
+        cfg = load_config(Path(args.config))
+        if not cfg.sync.concurrency.remote_worker_enabled:
+            print(
+                "Refusing to start: sync.concurrency.remote_worker_enabled is false.\n"
+                "A worker accepts parse work from a coordinator, so it is opt-in.",
+            )
+            return 1
+        try:
+            server = serve_grpc_worker(
+                cfg,
+                host=args.host,
+                port=args.port,
+                max_workers=args.max_workers,
+                version=__version__,
+            )
+        except GrpcUnavailable as exc:
+            print(str(exc))
+            return 1
+        print(f"pheasant preparation worker (grpc) on {args.host}:{args.port}")
+        try:
+            server.wait_for_termination()
+        except KeyboardInterrupt:
+            server.stop(grace=5).wait()
         return 0
     if args.command == "mcp":
         from pheasant.config.loader import load_config

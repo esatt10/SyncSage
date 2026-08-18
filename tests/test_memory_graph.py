@@ -68,7 +68,6 @@ def _config(tmp_path: Path, *, corpus: str, include_memory: bool = True) -> Path
         f"""pheasant:
   name: memory-graph
   state_path: {tmp_path / ".pheasant" / "state"}
-  vault_path: {tmp_path / ".pheasant" / "vault"}
   exports_path: {tmp_path / ".pheasant" / "exports"}
   workspace_root: {tmp_path}
 sync:

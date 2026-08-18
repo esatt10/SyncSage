@@ -633,9 +633,7 @@ def _disambiguate_lettered(candidates: list[_Candidate]) -> list[_Candidate]:
             elif roman == previous + 1:
                 chosen = roman
         if chosen is not None and chosen != (candidate.ordinal.parts or (None,))[0]:
-            candidate = replace(
-                candidate, ordinal=replace(candidate.ordinal, parts=(chosen,))
-            )
+            candidate = replace(candidate, ordinal=replace(candidate.ordinal, parts=(chosen,)))
         resolved.append(candidate)
         previous = chosen
     return resolved

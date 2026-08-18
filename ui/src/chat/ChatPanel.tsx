@@ -45,7 +45,7 @@ export function ChatPanel({
   // store, so leaving for Sources or Settings and coming back finds the thread
   // exactly where it was — including a half-typed question.
   const { state, dispatch } = useSession();
-  const { turns, draft, sourceFilter, workflow } = state;
+  const { turns, draft, sourceFilter, sourceTypeFilter, workflow } = state;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Keyed by turn id rather than a single ref: the effect below always needs
   // *the newest turn's* element, and turns re-render with new array
@@ -68,6 +68,7 @@ export function ChatPanel({
           question,
           session_id: sessionId,
           source_name: sourceFilter,
+          source_types: sourceTypeFilter ? [sourceTypeFilter] : null,
           workflow,
           memory: useMemory ? null : "off",
         },
@@ -199,7 +200,11 @@ export function ChatPanel({
             rows={1}
             value={draft}
             placeholder={
-              sourceFilter ? `Ask about ${sourceFilter}…` : "Ask anything about your sources…"
+              sourceFilter
+                ? `Ask about ${sourceFilter}…`
+                : sourceTypeFilter
+                  ? `Ask about your ${sourceTypeFilter} sources…`
+                  : "Ask anything about your sources…"
             }
             onChange={(event) => {
               dispatch({ type: "set-draft", text: event.target.value });
@@ -222,6 +227,9 @@ export function ChatPanel({
         </div>
         <div className="composer__hint">
           {sourceFilter ? <span className="pill pill--accent">scoped to {sourceFilter}</span> : null}
+          {sourceTypeFilter ? (
+            <span className="pill pill--accent">only {sourceTypeFilter}</span>
+          ) : null}
           <label className="composer__memory" title="Let remembered assertions inform the answer">
             <input
               type="checkbox"

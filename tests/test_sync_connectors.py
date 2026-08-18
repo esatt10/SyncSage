@@ -557,7 +557,6 @@ def _config(tmp_path: Path, source: SourceConfig) -> PheasantConfig:
         pheasant=PheasantSettings(
             name="connector-tests",
             state_path=tmp_path / "state",
-            vault_path=tmp_path / "vault",
             workspace_root=tmp_path,
             exports_path=tmp_path / "exports",
         ),

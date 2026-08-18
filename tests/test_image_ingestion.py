@@ -46,7 +46,6 @@ def _make_image_engine(tmp_path: Path, *, with_embeddings: bool = False) -> Sync
             "pheasant": {
                 "name": "image-acceptance",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "workspace"),
                 "exports_path": str(tmp_path / "exports"),
             },
@@ -138,7 +137,6 @@ def test_text_only_region_builds_no_captioner(tmp_path: Path) -> None:
             "pheasant": {
                 "name": "text-only",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "workspace"),
                 "exports_path": str(tmp_path / "exports"),
             },
@@ -174,7 +172,6 @@ def test_contract_modalities_omit_image_for_text_region(tmp_path: Path) -> None:
             "pheasant": {
                 "name": "text-only",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "workspace"),
                 "exports_path": str(tmp_path / "exports"),
             },

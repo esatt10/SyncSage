@@ -1,0 +1,47 @@
+# /state: SQLite (unused here — this fleet is on Postgres), the knowledge
+# graph, manifests, snapshots and vectors.
+#
+# ReadWriteMany is a HARD requirement, not a preference. The graph is a file
+# the indexer writes and every api replica reads; with ReadWriteOnce the
+# volume attaches to one node, so api replicas scheduled elsewhere cannot
+# read it at all. EFS, Azure Files, CephFS and NFS qualify — most default
+# StorageClasses do not.
+#
+# If your cluster genuinely has no RWX class, the honest alternatives are:
+#   * run the single-container install (deploy/kubernetes/) and scale up
+#     rather than out; or
+#   * pin the api replicas to the indexer's node with affinity, which caps
+#     the serving tier at one node's capacity.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pheasant-state
+  namespace: pheasant
+  labels:
+    app.kubernetes.io/name: pheasant
+spec:
+  accessModes:
+    - ReadWriteMany
+  # storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 50Gi
+---
+# /workspace: the corpus. Read-only in every pod, so RWX here is about
+# sharing, not contention — and unlike /state it is often better supplied by
+# a git clone init-container or an object-store sync, in which case drop this
+# PVC and mount whatever produces the files.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pheasant-workspace
+  namespace: pheasant
+  labels:
+    app.kubernetes.io/name: pheasant
+spec:
+  accessModes:
+    - ReadWriteMany
+  # storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 100Gi

@@ -11,17 +11,3 @@ spec:
   resources:
     requests:
       storage: 10Gi
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: pheasant-vault
-  namespace: pheasant
-  labels:
-    app.kubernetes.io/name: pheasant
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 5Gi

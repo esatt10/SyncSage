@@ -1,0 +1,85 @@
+# Config shared by the api and indexer roles. The role itself is NOT set here
+# — each workload passes `--role` on the command line, so one ConfigMap
+# describes one knowledge base rather than one process.
+#
+# The Postgres DSN is deliberately absent: `storage.dsn_env` names an
+# environment variable, and the value comes from a Secret. Only the variable's
+# NAME ever appears in config.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pheasant-fleet-config
+  namespace: pheasant
+  labels:
+    app.kubernetes.io/name: pheasant
+data:
+  pheasant.yaml: |
+    pheasant:
+      name: k8s-pheasant
+      environment: kubernetes
+      log_level: INFO
+      state_path: /state
+      workspace_root: /workspace
+      exports_path: /exports
+    server:
+      host: 0.0.0.0
+      port: 8765
+      mcp:
+        enabled: true
+        transports:
+          stdio: false
+          streamable_http: true
+          sse: false
+      api:
+        enabled: true
+        openapi: true
+        cors_origins:
+          - http://localhost:8765
+        # Replicas shed rather than queue: a fast 429 lets the Service try
+        # another pod, where a slow response is just a timeout with extra
+        # steps. Probe routes are never shed.
+        max_concurrent_requests: 64
+        # Fail readiness on SIGTERM, keep serving for 15s while endpoints
+        # propagate, then shut down. Must stay under
+        # terminationGracePeriodSeconds (30 below).
+        drain_seconds: 15
+        # Pick up a graph the indexer wrote. Ignored by roles that index.
+        graph_refresh_seconds: 30
+      ui:
+        enabled: true
+        graph_visualization: true
+    storage:
+      # One writer per SQLite file, and it is not one file across pods.
+      backend: postgres
+      dsn_env: PHEASANT_DATABASE_URL
+      pool_size: 10
+      graph_snapshots: true
+    sync:
+      # The hand-off between api (publishes) and indexer (drains).
+      queue:
+        enabled: true
+        backend: local
+        visibility_seconds: 300
+        max_attempts: 3
+      scheduler:
+        enabled: true
+        interval_seconds: 900
+      watcher:
+        enabled: true
+      concurrency:
+        max_parallel_sources: 4
+        max_parallel_files: 8
+        # Point the indexer at the worker Service; requests are load-balanced
+        # across its endpoints, and the coordinator's circuit breakers take a
+        # dead one out of rotation.
+        file_executor: remote
+        remote_worker_urls:
+          - http://pheasant-worker:8765
+        remote_worker_token_env: PHEASANT_INDEX_WORKER_TOKEN
+        remote_worker_batch_size: 8
+        worker_transport: http
+    security:
+      allow_workspace_roots:
+        - /workspace
+        - /state
+    sources: []

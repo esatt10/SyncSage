@@ -12,7 +12,6 @@ data:
       environment: kubernetes
       log_level: INFO
       state_path: /state
-      vault_path: /vault
       workspace_root: /workspace
       exports_path: /exports
     server:
@@ -50,13 +49,8 @@ data:
       scheduler:
         enabled: true
         interval_seconds: 900
-    obsidian:
-      enabled: true
-      note_root: pheasant
-      create_chunk_notes: false
     security:
       allow_workspace_roots:
         - /workspace
-        - /vault
       read_only_sources: true
     sources: []

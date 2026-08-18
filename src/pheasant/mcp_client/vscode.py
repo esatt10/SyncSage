@@ -44,7 +44,6 @@ def docker_run_stdio_config(
     image: str | None = None,
     config_mount: str = "${workspaceFolder}/pheasant.yaml",
     workspace_mount: str = "${workspaceFolder}",
-    vault_mount: str = "${workspaceFolder}/vault",
     state_volume: str = "pheasant-state",
     exports_volume: str = "pheasant-exports",
 ) -> dict[str, Any]:
@@ -67,8 +66,6 @@ def docker_run_stdio_config(
                     f"{config_mount}:/config/pheasant.yaml:ro",
                     "-v",
                     f"{workspace_mount}:/workspace:ro",
-                    "-v",
-                    f"{vault_mount}:/vault",
                     "-v",
                     f"{state_volume}:/state",
                     "-v",

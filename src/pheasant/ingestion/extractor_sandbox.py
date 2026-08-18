@@ -89,6 +89,7 @@ from pheasant.ingestion.extractor import (
 from pheasant.sandbox.wasm_runtime import (
     SandboxError,
     WasmRuntimeUnavailable,
+    guest_failures,
     translate_trap,
 )
 
@@ -197,7 +198,9 @@ def scan_pdf_content_stream_wasm(stream: bytes) -> str:
             "<I", bytes(exports["memory"].read(store, out_len_ptr, out_len_ptr + 4))
         )
         raw = bytes(exports["memory"].read(store, out_ptr, out_ptr + out_len))
-    except wasmtime.Trap as trap:
+    except guest_failures() as trap:
+        # Trap and WasmtimeError are siblings in wasmtime's hierarchy, so
+        # catching only Trap lets a raw runtime type escape into a sync.
         raise translate_trap(trap, "pdf_scan_text") from trap
     return raw.decode("utf-8", errors="replace")
 

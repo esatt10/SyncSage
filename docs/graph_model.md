@@ -8,6 +8,7 @@ pheasant uses a directed multi-graph model, compatible with `networkx.MultiDiGra
 |---|---|
 | `knowledge_base` | Root graph node for one pheasant instance/config domain. |
 | `source` | Configured source root. |
+| `source_type` | A hub grouping every source of one kind — `repository`, `notion`, `slack`, `document_folder`. The type was always an *attribute* of each source node, which meant it could be read but never navigated: nothing connected two Confluence spaces to each other. The hub makes that a structure you can see and walk. Hung off the knowledge base **alongside** sources (`kb contains source_type contains source`), never between them, so a source stays one hop from the root and nothing already visible at the default depth is pushed past the horizon. Attributes: `source_type`. |
 | `repository`, `branch`, `commit` | Git-aware repository context. |
 | `directory`, `file`, `document`, `markdown_note` | Indexed filesystem artifacts. |
 | `memory_record` | One agent-memory record (Step 33.7). Still an ordinary Markdown artifact indexed by the ordinary pipeline — the type exists because the graph previously could not say which of its notes an agent had *remembered*. Attributes: `scope`, `subject`, `asserted_at`, `kind`. Its stable ID is unchanged (`file:{source}:{relpath}:branch=none`); only the type attribute is new, so a graph written before 2026-08-11 types these `markdown_note` until its next sync. |
@@ -30,7 +31,8 @@ pheasant uses a directed multi-graph model, compatible with `networkx.MultiDiGra
 | `links_to`, `tagged_with` | Optional Markdown/document relationships. |
 | `about` | What an agent-memory record is *about* (Step 33.7): the record to the corpus artifact, symbol, heading or entity it refers to. Attributes: `record_id`, `match_signal` (`reference` \| `symbol` \| `heading` \| `entity`, strongest first — a record takes the first that fires), `matched` (what actually matched) and `confidence`. Capped per record, so total `about` edges stay bounded by `records x targets`. A lexical/BM25 rung was deliberately **not** materialized: the search index answers that at query time, and materializing it is how the concept layer reached 98.6% of all edges. |
 | `belongs_to_branch`, `at_commit`, `supersedes` | Git and version lineage. `supersedes` was documented from the initial build but **unemitted until 2026-08-11**, when Step 33.7 began drawing it between agent-memory records — before that a correction existed only as a frontmatter string resolved in Python, and the graph could not answer "what replaced this". |
-| `generated_note`, `retrieved_by`, `modified_by` | Obsidian projection and agent audit. |
+| ~~`generated_note`~~ | **Retired 2026-08-16** with the Obsidian projection it described. Like `heading`/`has_heading` before 2026-08-06, it was documented from the initial build and **never emitted** — no graph written by any release contains one. |
+| `retrieved_by`, `modified_by` | Agent audit. |
 
 ## Stable IDs
 
@@ -43,11 +45,12 @@ Stable IDs must include source identity and enough path/hash/context to support 
 Examples:
 
 ```text
+source_type:local-pheasant:repository
 source:local-pheasant:pheasant-codebase
-file:pheasant-codebase:src/pheasant/main.py:branch=main
-chunk:pheasant-codebase:src/pheasant/main.py:sha256=abc123:chunk=0004
+file:pheasant-codebase:src/pheasant/cli.py:branch=main
+chunk:pheasant-codebase:src/pheasant/cli.py:sha256=abc123:chunk=0004
 heading:contracts:msa.pdf:sha256=1f4b2c9d0e7a3b58
-symbol:pheasant-codebase:src/pheasant/main.py:PheasantServer.start
+symbol:pheasant-codebase:src/pheasant/cli.py:PheasantCli.main
 commit:pheasant-codebase:6f2a9c1
 ```
 
@@ -60,7 +63,7 @@ Nodes and search results should record source ID, knowledge base ID, relative pa
 pheasant runs deterministic enrichment during sync:
 
 - Code pass: extracts Python imports, classes, functions, constants, and call targets.
-- Markdown/document pass: extracts headings, links, wiki links, URLs, citations, concepts, and named mentions.
+- Markdown/document pass: extracts headings, links, wiki links, URLs, citations and named mentions.
 - Internal reference resolution: a post-sync pass that turns a file's imports
   and document links into edges pointing at **the file they resolve to**,
   by longest-suffix path match (`agent_framework._workflows._checkpoint` →

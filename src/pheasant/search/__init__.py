@@ -11,7 +11,7 @@ from pheasant.search.vector_store import vector_searcher_from_config
 class SearchEngine(HybridSearch):
     def __init__(self, config: PheasantConfig):
         paths = StatePaths.from_config(config)
-        state = StateStore(paths.sqlite)
+        state = StateStore.from_config(config, paths.sqlite)
         state.migrate()
         super().__init__(SearchStore(state), vector=vector_searcher_from_config(config, state))
         self.config = config

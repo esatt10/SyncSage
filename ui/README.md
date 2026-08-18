@@ -3,8 +3,9 @@
 A React + Vite front end for pheasant: a three-pane research workspace over
 your indexed knowledge base. It is a **separate workload** — it builds to a
 static bundle and talks to the pheasant container purely over its HTTP API, so
-the indexing container is unchanged (see
-[`docs/ui_recommendation.md`](../docs/ui_recommendation.md)).
+the indexing container is unchanged. The published image bakes this bundle in
+and serves it on the same port; this directory is the source for that build and
+for the optional standalone `pheasant-ui` image.
 
 ```
 ┌──────────┬──────────────────────────┬──────────────────────┐

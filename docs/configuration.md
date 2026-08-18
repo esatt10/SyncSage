@@ -37,7 +37,6 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 | `ingestion` | Turning binary/markup files (documents, images, audio) into indexable text. | Optional |
 | `sync` | Watcher, git polling, schedule, idempotency, and concurrency behavior. | Yes |
 | `graph` | Knowledge-graph density (concept-node threshold, WASM acceleration). | Optional |
-| `obsidian` | Export controls for notes/canvas/frontmatter/backlinks/tags. | Optional |
 | `security` | Path allowlisting, source-read protections, and ACL enforcement. | Strongly recommended |
 | `synapse` | Federation into a Synapse fleet (contract publishing, signing). | Optional, standalone-safe |
 | `memory` | Agent-memory consolidation policy (TTL decay, supersede archiving). | Optional |
@@ -63,7 +62,6 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 | `image_repository` | string | `ghcr.io/esatt10/pheasant` | Container image registry/repository for Compose-based runs. |
 | `image_tag` | string | `0.1.3` | Image version tag used by deployment helpers. |
 | `workspace_path` | path-like string | `./workspace` | Host path mounted to pheasant `workspace_root`. |
-| `vault_path` | path-like string | `./vault` | Host path mounted to pheasant `vault_path`. |
 
 ---
 
@@ -76,7 +74,6 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 | `environment` | string | `local` | Label (for example `local`, `dev`, `staging`, `prod`). |
 | `log_level` | string | `INFO` | Typical values: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
 | `state_path` | absolute path | `/state` | Base path for sqlite, graph snapshots, and manifests. |
-| `vault_path` | absolute path | `/vault` | Output vault root for Obsidian exports. |
 | `workspace_root` | absolute path | `/workspace` | Root path sources should live under. |
 | `exports_path` | absolute path | `/exports` | Additional output path for generated artifacts. |
 
@@ -90,9 +87,92 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 |---|---|---|---|
 | `host` | string | `0.0.0.0` | Bind address. `pheasant up` generates `127.0.0.1`; containers keep `0.0.0.0` (loopback inside a container is unreachable from the host) and compose publishes them to `127.0.0.1` instead. |
 | `port` | integer | `8765` | Primary service port. |
+| `role` | string | `all` | Which jobs this process takes on. `pheasant serve --role` overrides it. See below. |
 
 The API is unauthenticated, so the bind address is a security control, not
 just a networking detail — see [security.md](security.md#trust-model-for-the-http-api).
+
+### Process roles (`server.role`)
+
+One process doing everything is right for one container and wrong for a
+fleet — not for performance reasons, but because of replicas. Run three
+copies of the default process against one knowledge base and all three watch
+the same directories, all three fire the same scheduled sync, and all three
+try to index the same source. Roles say which jobs a process has:
+
+| Role | Watches | Schedules | Drains the queue | Indexes | Typical deployment |
+|---|---|---|---|---|---|
+| `all` | yes | yes | no | in-process | one container — **the default** |
+| `api` | no | no | no | **never** | N replicas behind a Service |
+| `indexer` | yes | yes | yes | in-process | one per shard |
+| `worker` | no | no | no | no | M replicas, autoscaled |
+
+```bash
+pheasant serve                     # all — unchanged
+pheasant serve --role api          # serve; publish index work
+pheasant serve --role indexer      # watch, schedule, drain
+pheasant worker --transport grpc   # preparation only
+```
+
+`all` deliberately does **not** drain the queue: a single container turns the
+queue on for [crash resumption](#the-index-work-queue-syncqueue), not to
+become a fleet member, and `sync_all` already drains what it publishes.
+
+**`api` requires the queue.** It publishes index work rather than running it,
+so without `sync.queue.enabled: true` and an indexer on the same queue a sync
+request would be accepted and then go nowhere. `pheasant serve --role api`
+refuses to start in that case rather than letting you find out later. A
+blocking sync (`wait: true`) against an api replica returns **409** with the
+fix, because publishing is a different promise from "run this and return the
+result".
+
+Routes are *not* hidden per role. What keeps search traffic off an indexer is
+the Service selector in front of it; a role whose `/search` returned 404 would
+be much harder to debug than one that simply has no clients. What a role
+changes is what the process does **on its own**.
+
+`GET /health` and `GET /ready` both report the role, so a pod can be
+identified from a probe response. `/ready` returns 503 when the state store is
+unreachable — that should take a replica out of the Service, not restart it,
+which is why it is separate from `/health`. It is deliberately **not** gated
+on the index being populated: a replica that stayed unready through a
+multi-hour first index would take the whole Service down for that time.
+
+### Serving durability (`server.api`)
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `max_concurrent_requests` | integer | `0` | In-flight requests before the surplus is refused with **429 + `Retry-After`**. `0` disables it. |
+| `drain_seconds` | integer | `0` | Seconds to keep serving after SIGTERM while `/ready` already reports 503. `0` disables the delay. |
+| `graph_refresh_seconds` | integer | `30` | How often an **`api`-role** replica re-reads a graph written by the indexer. `0` disables it; the other roles ignore it. |
+
+Both default off, and that is a decision rather than caution.
+
+**Shedding only makes sense when there is somewhere else to go.** With one
+process, a burst piles up behind the GIL and every request gets slower — but
+waiting is still the best available answer, and a 429 to the only user is
+worse. With N replicas behind a load balancer a fast 429 is strictly better
+than a request that sits for thirty seconds and times out anyway. So set this
+on replicas, not on a laptop.
+
+`/health`, `/ready` and `/metrics` are **never** shed. A pod that answers 429
+to its own liveness probe gets restarted by the thing meant to be protecting
+it, turning a busy replica into a crash-looping one.
+
+**Draining exists because Kubernetes does two things at once.** SIGTERM and
+endpoint removal happen concurrently, and endpoint propagation is not instant
+— kube-proxy on every node has to be told. A process that exits promptly
+therefore drops whatever was routed to it in the gap. `drain_seconds` fails
+readiness *first*, keeps serving for that long, and only then shuts down. Keep
+it comfortably shorter than the orchestrator's termination grace period, or
+the pod is killed mid-drain. A second SIGTERM skips the wait.
+
+Draining is "stop being sent work", not "stop doing work": a draining replica
+keeps answering requests normally.
+
+The MCP server is stateless (`stateless_http=True`), which is what makes
+replicas safe — two requests from one agent may land on different replicas and
+both answer correctly. That property is pinned by a test.
 
 ### MCP options (`server.mcp`)
 
@@ -135,6 +215,53 @@ just a networking detail — see [security.md](security.md#trust-model-for-the-h
 > - If `sqlite_path`, `graph_path`, or `manifest_path` are omitted, they are derived from `pheasant.state_path`.
 
 ---
+
+### Where state lives (`storage.backend`)
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `backend` | `sqlite` \| `postgres` | `sqlite` | SQLite is a file and permits **one writer process per knowledge base** — pheasant's hard scaling ceiling. Postgres lifts it. |
+| `dsn_env` | string | `PHEASANT_DATABASE_URL` | Name of the environment variable holding the libpq DSN. Only the variable *name* goes in YAML — a DSN carries a password, and there is deliberately no field to paste one into. |
+| `pool_size` | integer | `10` | Server-side connections this process may hold. Unlike a SQLite file handle, each is a real process on the database. |
+
+Postgres needs the extra: `pip install 'pheasant-kb[postgres]'` (the published
+image already has it).
+
+```yaml
+storage:
+  backend: postgres
+  dsn_env: PHEASANT_DATABASE_URL
+  pool_size: 10
+```
+
+**The default needs no infrastructure and is unchanged.** Leaving `backend`
+alone gives you exactly the SQLite deployment you had.
+
+#### Moving existing state across
+
+```bash
+export PHEASANT_DATABASE_URL='postgresql://pheasant:...@db:5432/pheasant'
+pheasant migrate --to postgres -c pheasant.yaml
+```
+
+Copies every table, rebuilds `chunks_fts` for the target dialect, verifies the
+row counts, and only then renames the SQLite file to `*.migrated` — it is never
+deleted. Re-running is safe: a table that already holds rows is left alone.
+Stable IDs carry over byte-identically, so no re-index is needed.
+
+#### One difference worth knowing about
+
+Ranking is not identical between the two. SQLite ranks with FTS5's `bm25()`;
+Postgres uses `ts_rank_cd`, which has no inverse document frequency and no
+term-frequency saturation of its own. pheasant supplies both — the rank is a
+sum over query terms of `IDF x saturated rank`, and titles/paths are tokenized
+the way FTS5's `unicode61` does so a search for `deploy` still matches
+`deploy-gateway.md`. What remains is that BM25 normalizes each column by *that
+column's* length while `ts_rank_cd` normalizes the whole vector once, so the
+two can disagree about ranks 2-3 when a title match on a common word competes
+with body matches on rare ones. The top hit agrees on the gold set;
+`tests/test_backend_parity.py` is the gate.
+
 
 ## `search` (retrieval behavior)
 
@@ -286,8 +413,66 @@ standing behavior of a scheduled one.
 | `concurrency.remote_worker_urls` | list[string] | `[]` | Worker base URLs used round-robin when `file_executor: remote`. The coordinator reads the connector payload, then sends that immutable text payload for parsing/chunking. |
 | `concurrency.remote_worker_enabled` | bool | `false` | Expose this instance's authenticated `POST /internal/indexing/prepare` worker endpoint. It never writes SQLite, graph, manifests or vectors. |
 | `concurrency.remote_worker_token_env` | string | `PHEASANT_INDEX_WORKER_TOKEN` | Environment variable containing the shared bearer token. Required on coordinators and workers; the token is never stored in config or task bodies. |
-| `concurrency.remote_worker_timeout_seconds` | integer | `120` | Per-task remote-worker HTTP timeout. |
+| `concurrency.remote_worker_timeout_seconds` | integer | `120` | Per-task remote-worker timeout, and the deadline sent with the request so the worker declines work whose caller has already given up. |
+| `concurrency.remote_worker_batch_size` | integer | `8` | Files per request. A batch amortizes request overhead and carries one deadline for the group, but every task in it holds its file's bytes in memory on both sides — so treat this as a memory knob as much as a throughput one. |
+| `concurrency.worker_transport` | string | `http` | `http` (stdlib, no extra) or `grpc` (needs the `[grpc]` extra). Changes only the wire format: retry, failover, breakers, deadlines and idempotency are transport-independent. |
 | `concurrency.lock_timeout_seconds` | integer | `120` | How long an in-process sync waits for an already-active lock on the same source. The interactive engine lease remains fail-fast; server-owned subprocess workers use their existing explicit lease wait. |
+
+### Worker durability
+
+`file_executor: remote` used to pick a worker with `position % len(urls)` and
+send one request per file, so a single dead worker failed its share of *every*
+sync. Dispatch is now pooled and durable, and none of it is configurable
+because none of it should be a decision an operator has to get right:
+
+* keep-alive connections, reused for the whole source;
+* bounded retry with full jitter, honouring `Retry-After`;
+* a circuit breaker per endpoint — three consecutive failures take it out of
+  rotation for 30 s, so a dead worker costs three requests rather than a share
+  of every file;
+* failover to another endpoint, then to **local preparation**. Remote
+  preparation is a throughput optimization, so it can never fail a sync: with
+  every worker down, the index is byte-identical, only slower;
+* a `pheasant_worker_up{endpoint}` gauge per endpoint;
+* content-addressed idempotency keys, so a retry after a timeout is answered
+  from the worker's bounded cache instead of re-parsed.
+
+A worker that predates the batch route answers 404 once and the coordinator
+falls back to the single-task path, so a coordinator upgraded ahead of its
+fleet keeps working.
+
+Run a gRPC worker with `pheasant worker --transport grpc --port 8766`
+(HTTP workers are served by `pheasant serve` with
+`concurrency.remote_worker_enabled: true`). gRPC carries file content as raw
+bytes rather than base64 — a flat 33% saving on the only large field — and
+streams results, so one refused file no longer fails the whole batch.
+
+### The index work queue (`sync.queue`)
+
+| Key | Type | Example | Notes |
+|---|---|---|---|
+| `queue.enabled` | bool | `false` | Off by default. With it off, `sync_all` keeps its sources in an in-process list exactly as before. |
+| `queue.backend` | string | `local` | `local` is the state store itself — no broker, works on SQLite and Postgres. `nats` needs the `[queue]` extra. |
+| `queue.visibility_seconds` | integer | `300` | How long a claimed task is invisible to other workers. Heartbeats extend it, so this bounds *silence* from a claimer, not work. |
+| `queue.max_attempts` | integer | `3` | Attempts before a task is dead-lettered. A dead task is kept, never deleted. |
+| `queue.nats_servers` | list[string] | `[]` | JetStream URLs, e.g. `nats://nats:4222`. |
+| `queue.nats_stream` / `nats_subject` / `nats_durable` | string | `PHEASANT_INDEX` / `pheasant.index.tasks` / `pheasant-indexers` | Stream, subject and durable consumer names. |
+
+Turn it on when a backlog needs to outlive the process holding it. Three
+things follow that a list cannot give: a sync killed nine sources into ten
+resumes on the tenth, `pheasant_index_queue_depth` becomes a number other
+processes (and an HPA or KEDA) can read, and a source that keeps failing is
+dead-lettered instead of retried forever.
+
+At-least-once delivery is safe here because indexing is already idempotent by
+design — content sha256 plus stable IDs — so a redelivered task re-indexes to
+identical state.
+
+```bash
+pheasant queue status         # backlog, in-flight, dead letters and why
+pheasant queue drain          # index everything currently queued
+pheasant queue requeue-dead   # replay dead letters after fixing the cause
+```
 
 `max_parallel_sources` overlaps independent connectors and preparation. Shared
 state commits and global graph enrichment remain serialized, so the setting is
@@ -441,41 +626,38 @@ lands in config or on disk.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `concept_min_documents` | integer | `2` | Distinct documents that must share a term before it becomes a `concept` node. A concept exists to link the documents that share it; one mentioned by a single document is pure weight — measured on a real corpus, 74.2% of concept nodes were single-document and concepts made up 87.2% of a bloated graph. Set to `1` to keep every term as a node (pre-2026-08 behavior). Nothing becomes unfindable at higher values: the term stays on `concept_terms`/`artifact_terms` and in searchable text either way. |
 | `memory_entity_bridging` | bool | `true` | Wire agent-memory records into the graph (`about` edges to what a record refers to, `supersedes` between corrections). A no-op without a memory source. |
 | `wasm_cross_source_resolution` | bool | `false` | Run `resolve_cross_source_edges` (import/link resolution across sources) through the vendored WASM accelerator (Synapse 34.5a) instead of pure Python. Needs the `[wasm]` extra; falls back to pure Python on any failure or if the extra is missing. Conditional win per the 34.4 benchmark — loses to Python below roughly 1,300-2,500 edges, wins modestly above it; opt in for large/growing multi-source graphs, leave off for small ones. **The Docker image turns this on** in a config it generates itself, on the assumption that a container's graph grows past the crossover; set it to `false` in your config if you are indexing a small, static corpus. |
 
 ---
 
-## `obsidian` (output options)
-
-| Key | Type | Default / Example | Notes |
-|---|---|---|---|
-| `enabled` | bool | `true` | Master toggle for Obsidian exports. |
-| `write_mode` | string | `upsert` | Export strategy (`upsert`, etc.). |
-| `note_root` | string | `pheasant` | Top-level folder/note namespace in the vault. |
-| `template_profile` | string | `engineering` | One of `engineering`, `research`, or `project-ops`. |
-| `create_index_notes` | bool | `true` | Generate index/navigation notes. |
-| `create_source_notes` | bool | `true` | Generate one note per source. |
-| `create_file_notes` | bool | `true` | Generate one note per file artifact. |
-| `create_chunk_notes` | bool | `false` | Generate chunk-level notes. |
-| `create_canvas` | bool | `true` | Generate canvas graph views. |
-| `frontmatter.include_source_id` | bool | `true` | Include source identifier in note frontmatter. |
-| `frontmatter.include_hash` | bool | `true` | Include content hash in frontmatter. |
-| `frontmatter.include_last_indexed` | bool | `true` | Include index timestamp metadata. |
-| `frontmatter.include_graph_node_id` | bool | `true` | Include graph node IDs in metadata. |
-| `backlinks.enabled` | bool | `true` | Generate backlinks. |
-| `backlinks.style` | string | `wikilink` | Backlink rendering style. |
-| `tags.base` | list[string] | `[pheasant]` | Base tags appended to generated notes. |
-| `tags.by_source_type` | bool | `true` | Add tags based on source type. |
 
 ---
+
+### `graph.max_nodes` — when one region is no longer enough
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `max_nodes` | integer \| null | `1500000` | Warn once per sync past this many graph nodes (~240,000 files — a full 6 Gi container). `null` disables. |
+
+A **notice, not a refusal**: unlike `sync.limits`, which stops a source before
+any work happens, by the time this can fire the index already exists and
+discarding it would help nobody. The sync still returns `healthy`, with the
+advice under `details.capacity`.
+
+The default is measured rather than chosen. `python -m pheasant.graph.capacity`
+reports ~2.4 KB of process RSS per node, flat across four scales; the graph is
+roughly 60% of process RSS, so 1.5M nodes is a full 6 Gi container — the limit
+the shipped manifests now set. See
+[capacity planning](how-to/capacity-planning.md) for the full table and when to
+shard into several regions.
+
 
 ## `security`
 
 | Key | Type | Example | Notes |
 |---|---|---|---|
-| `allow_workspace_roots` | list[path] | `[/workspace, /vault]` | Allowed root prefixes for registered source paths. |
+| `allow_workspace_roots` | list[path] | `[/workspace, /exports]` | Allowed root prefixes for registered source paths. |
 | `read_only_sources` | bool | `true` | Prevent source mutation operations. |
 | `deny_path_traversal` | bool | `true` | Block `..` traversal and unsafe resolution. |
 | `allow_user_selected_source_paths` | bool | `true` | Let a source name any readable path, not just one under `allow_workspace_roots`. This is what makes "point it at anything" work; see the security notes on what compensates for it. |
@@ -830,14 +1012,12 @@ deployment:
     image_repository: ghcr.io/esatt10/pheasant
     image_tag: 0.1.3
     workspace_path: ./workspace
-    vault_path: ./vault
 
 pheasant:
   environment: local
   log_level: INFO
   state_path: /state
   workspace_root: /workspace
-  vault_path: /vault
 
 server:
   host: 0.0.0.0
@@ -875,7 +1055,6 @@ server:
 security:
   allow_workspace_roots:
     - /workspace
-    - /vault
     - /exports
   allow_user_selected_source_paths: true
   read_only_sources: true
@@ -883,33 +1062,14 @@ security:
   default_exclude_secrets: true
 ```
 
-### 3) Obsidian-first personal knowledge vault
+### 3) Indexing an existing Obsidian vault
 
-Use this when export quality to vault notes/canvas/backlinks is your top priority.
+pheasant reads an Obsidian vault as an ordinary Markdown source: wikilinks
+resolve as references, and `.obsidian/` metadata is excluded. (pheasant no
+longer *writes* a vault — the graph workspace at `/graph` in the UI replaced
+that projection.)
 
 ```yaml
-obsidian:
-  enabled: true
-  write_mode: upsert
-  note_root: pheasant
-  create_index_notes: true
-  create_source_notes: true
-  create_file_notes: true
-  create_chunk_notes: false
-  create_canvas: true
-  frontmatter:
-    include_source_id: true
-    include_hash: true
-    include_last_indexed: true
-    include_graph_node_id: true
-  backlinks:
-    enabled: true
-    style: wikilink
-  tags:
-    base:
-      - pheasant
-    by_source_type: true
-
 sources:
   - name: existing-obsidian-vault
     type: obsidian_vault

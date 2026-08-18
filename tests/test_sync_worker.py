@@ -25,7 +25,6 @@ def _render_config(tmp_path: Path, name: str, workspace: Path) -> Path:
     rendered = CONFIG_TEMPLATE.read_text(encoding="utf-8").format(
         workspace_path=workspace.as_posix(),
         state_path=(base / "state").as_posix(),
-        vault_path=(base / "vault").as_posix(),
         exports_path=(base / "exports").as_posix(),
     )
     config_file = base / "pheasant.yaml"

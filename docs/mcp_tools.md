@@ -39,6 +39,21 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 
 ## Tools
 
+!!! warning "Removed in 0.10.0: `export_obsidian_notes`"
+
+    The Obsidian vault projection was removed, and with it the
+    `export_obsidian_notes` tool and the `POST /obsidian/export` endpoint. The
+    UI's graph workspace (`/graph`) covers what the vault was used for.
+
+    This is a **breaking change to the MCP tool surface**, which is otherwise
+    evolved additively — an agent still calling `export_obsidian_notes` will
+    get an unknown-tool error rather than a deprecation warning. It was
+    removed outright rather than deprecated because, with the exporter gone,
+    there is nothing left for the tool to do.
+
+    Indexing an Obsidian vault as a **source** (`type: obsidian_vault`) is
+    unaffected and remains fully supported.
+
 | Tool | Purpose |
 |---|---|
 | `list_knowledge_bases` | Return registered knowledge bases and status. |
@@ -54,7 +69,7 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 | `sync_all` | Trigger sync for all enabled sources. |
 | `memory_write` | Append one agent-memory record (`session`/`user`/`org` scope, optional `subject`/`supersedes`/`tags`) to the configured `type: memory` source and, by default, index it immediately — the memory is retrievable via `search_context` in the same session. Recall is ordinary search; there is no separate read path. |
 | `memory_consolidate` | Run one consolidation pass now: archive superseded and TTL-expired memory records (files renamed `.md.archived`, never deleted) and re-sync the memory source so they leave the index. The scheduler runs this automatically; this is the on-demand edge. |
-| `search_context` | Search graph/search state in `text` (SQLite full-text over chunk content and paths), `graph` (node/relationship labels, types and attribute values), `vector` (embedding similarity; requires `search.embeddings.enabled`, otherwise contributes nothing), or `hybrid` (merged and re-ranked) mode. Also accepts **retrieval criteria** an agent can set per call instead of relying on how the region was configured: `source_name`, `exclude_sources`, `node_types`, `min_score`. All optional and additive — an existing caller is unaffected. |
+| `search_context` | Search graph/search state in `text` (SQLite full-text over chunk content and paths), `graph` (node/relationship labels, types and attribute values), `vector` (embedding similarity; requires `search.embeddings.enabled`, otherwise contributes nothing), or `hybrid` (merged and re-ranked) mode. Also accepts **retrieval criteria** an agent can set per call instead of relying on how the region was configured: `source_name`, `source_types`, `exclude_source_types`, `exclude_sources`, `node_types`, `min_score`. `source_types` scopes by the *kind* of source (`repository`, `notion`, `slack`, …) rather than by name, which is what you want when you do not already know every source in the region; every hit reports its own as `provenance.source_type`, and `describe_retrieval` lists the types present. All optional and additive — an existing caller is unaffected. |
 | `describe_retrieval` | Report how this knowledge base retrieves and what an agent may override per call: default mode and result count, which modes actually work here (`vector` is only offered when a vector index exists), the sources present, the `assistant.retrieval` settings, and one line of help per knob. Call this before guessing at parameters for an unfamiliar region. |
 | `preview_retrieval` | Run retrieval criteria and report how they differ from the standing configuration — both result sets plus the delta (added / dropped / kept). Lets an agent test a setting against real content before anyone writes it into `pheasant.yaml`. Read-only: nothing is persisted. |
 | `get_relevant_files` | Return files likely needed for a coding task. |
@@ -62,7 +77,6 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 | `get_file_summary` | Return a compact summary and provenance for a file. |
 | `get_repo_map` | Return repository structure, important modules, and dependencies. |
 | `explain_node` | Explain a graph node and why it matters. |
-| `export_obsidian_notes` | Preview or write Obsidian notes for a knowledge base or source. |
 | `get_sync_status` | Return queue, lock, error, freshness, and connector checkpoint status. |
 | `get_sync_history` | Return runtime registration, sync, promotion, disable, and removal audit events. |
 

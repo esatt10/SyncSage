@@ -172,11 +172,10 @@ def build_sections() -> list[Section]:
             id="paths",
             title="Where things live on disk",
             blurb=(
-                "pheasant splits its storage three ways: /state is operational truth "
-                "(SQLite, the graph, manifests) and is user data — back it up; /vault "
-                "is the human-readable Obsidian projection; /exports holds regenerable "
-                "payloads. The defaults are the container paths; running outside "
-                "Docker you probably want local directories."
+                "pheasant splits its storage two ways: /state is operational truth "
+                "(SQLite, the graph, manifests) and is user data — back it up; "
+                "/exports holds regenerable payloads. The defaults are the container "
+                "paths; running outside Docker you probably want local directories."
             ),
             covers=("storage",),
             questions=[
@@ -185,11 +184,6 @@ def build_sections() -> list[Section]:
                     prompt="State directory",
                     kind="path",
                     help="SQLite + graph + manifests. Treat as user data.",
-                ),
-                Question(
-                    key="pheasant.vault_path",
-                    prompt="Vault directory (Obsidian projection)",
-                    kind="path",
                 ),
                 Question(
                     key="pheasant.exports_path",
@@ -496,25 +490,52 @@ def build_sections() -> list[Section]:
                     kind="int",
                     advanced=True,
                 ),
+                Question(
+                    key="sync.queue.enabled",
+                    prompt="Keep the index backlog in a durable queue?",
+                    kind="bool",
+                    help="Off, a sync holds its remaining sources in memory: a "
+                    "process killed nine sources into ten loses the tenth. On, "
+                    "the backlog is rows, so a restart resumes, the depth is a "
+                    "number a scaler can read, and a source that keeps failing "
+                    "is set aside instead of retried forever.",
+                    advanced=True,
+                ),
+                Question(
+                    key="sync.queue.backend",
+                    prompt="Queue backend (local | nats)",
+                    kind="str",
+                    help="'local' is this knowledge base's own database — no "
+                    "broker to run. 'nats' needs the [queue] extra and is for a "
+                    "fleet that has outgrown one database.",
+                    when=lambda a: bool(a.get("sync.queue.enabled")),
+                    advanced=True,
+                ),
+                Question(
+                    key="sync.queue.max_attempts",
+                    prompt="Attempts before a source is set aside",
+                    kind="int",
+                    when=lambda a: bool(a.get("sync.queue.enabled")),
+                    advanced=True,
+                ),
             ],
         ),
         Section(
             id="graph",
             title="Knowledge graph",
             blurb=(
-                "Artifacts, chunks, symbols and concepts, wired by contains / "
-                "mentions / imports / references / similar_to edges. The one knob "
-                "worth thinking about is how many documents must share a term before "
-                "it earns a concept node — a concept that links one document is pure "
-                "weight."
+                "Artifacts, chunks, symbols, entities and headings, wired by "
+                "contains / has_chunk / has_heading / mentions / imports / "
+                "references edges. Memory bridging wires agent-memory records "
+                "into that graph; turn it off if you would rather keep "
+                "remembered facts out of it."
             ),
             covers=("graph",),
             questions=[
                 Question(
-                    key="graph.concept_min_documents",
-                    prompt="Documents that must share a term to make it a concept",
-                    kind="int",
-                    help="1 keeps every term (much larger graph).",
+                    key="graph.memory_entity_bridging",
+                    prompt="Link agent-memory records into the knowledge graph",
+                    kind="bool",
                 ),
             ],
         ),
@@ -587,6 +608,17 @@ def build_sections() -> list[Section]:
             questions=[
                 Question(key="server.port", prompt="Port", kind="int"),
                 Question(
+                    key="server.role",
+                    prompt="Process role (all | api | indexer | worker)",
+                    kind="str",
+                    help="'all' is right for one container. Split roles only in a "
+                    "fleet, where several serving replicas must not each watch the "
+                    "same directories and each index the same source. 'api' "
+                    "publishes index work instead of running it, so it needs the "
+                    "durable queue and an indexer draining it.",
+                    advanced=True,
+                ),
+                Question(
                     key="server.host",
                     prompt="Bind address",
                     help="0.0.0.0 inside a container is correct; publish the port to "
@@ -633,23 +665,6 @@ def build_sections() -> list[Section]:
                     prompt="Enforce per-principal ACLs on retrieval?",
                     kind="bool",
                     advanced=True,
-                ),
-            ],
-        ),
-        Section(
-            id="obsidian",
-            title="Obsidian projection",
-            blurb=(
-                "Optionally mirror the index into a human-readable Obsidian vault: "
-                "one note per source and file, with backlinks and a canvas. Purely "
-                "additive — nothing else reads it."
-            ),
-            covers=("obsidian",),
-            questions=[
-                Question(
-                    key="obsidian.enabled",
-                    prompt="Write the Obsidian vault projection?",
-                    kind="bool",
                 ),
             ],
         ),
@@ -780,8 +795,8 @@ def build_phases(sections: list[Section] | None = None) -> list[Phase]:
         Phase(
             "sources-content",
             "Sources & content",
-            "What to index, how documents are extracted, and the Obsidian projection.",
-            ("sources", "ingestion", "obsidian"),
+            "What to index and how documents are extracted.",
+            ("sources", "ingestion"),
         ),
         Phase(
             "search-graph",
@@ -1561,9 +1576,8 @@ class GuidedWizard(Wizard):
         env_output_path = getattr(self, "env_output_path", ".env")
         lines = [
             f"Output: {output_path}; secrets: {env_output_path} (values hidden)",
-            f"Paths: state={pheasant.get('state_path')}; vault={pheasant.get('vault_path')}",
-            "       exports="
-            f"{pheasant.get('exports_path')}; workspace={pheasant.get('workspace_root')}",
+            f"Paths: state={pheasant.get('state_path')}; exports={pheasant.get('exports_path')}",
+            f"       workspace={pheasant.get('workspace_root')}",
             f"Sources: {len(self.sources)} configured",
             f"Search: {search.get('default_mode')} | embedding model: {embedding_model}",
             f"Assistant: {provider_text} | workflow={assistant.get('workflow')}",
@@ -1612,21 +1626,10 @@ def _wrap(text: str, width: int = 74) -> list[str]:
 
 
 def render_config_yaml(data: dict[str, Any]) -> str:
-    """YAML for a config mapping, sources rendered the way quickstart does.
-
-    ``yaml.safe_dump`` writes list-of-dict items in a shape the dependency-light
-    YAML shim in this repo cannot read back, so sources go through the same
-    hand-rolled renderer ``pheasant up`` uses.
-    """
+    """YAML for a config mapping, in the shape every pheasant writer emits."""
     from pheasant.config.loader import dump_config_yaml
-    from pheasant.quickstart import _render_sources_block
 
-    payload = dict(data)
-    sources = payload.pop("sources", None)
-    rendered = dump_config_yaml(payload)
-    if sources:
-        rendered += _render_sources_block(sources)
-    return rendered
+    return dump_config_yaml(data)
 
 
 _ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")

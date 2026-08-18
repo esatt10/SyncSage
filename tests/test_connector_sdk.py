@@ -49,14 +49,11 @@ def example_connector_class():
 
 
 def _write_config(tmp_path: Path, source_type: str, content_dir: Path) -> Path:
-    # Hand-rendered in the inline-first-key list style both PyYAML and the
-    # dependency-light yaml shim parse (same shape `pheasant up` generates).
     config_path = tmp_path / "pheasant.yaml"
     config_path.write_text(
         f"""pheasant:
   name: sdk-test
   state_path: {tmp_path / "state"}
-  vault_path: {tmp_path / "vault"}
   exports_path: {tmp_path / "exports"}
   workspace_root: {tmp_path}
 sources:

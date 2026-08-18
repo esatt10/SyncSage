@@ -15,7 +15,6 @@ from pheasant.config.loader import dump_config_yaml
 from pheasant.config.schema import PheasantConfig, SourceConfig, SourceType
 from pheasant.ingestion.pipeline import utc_now
 from pheasant.jobs import JobRegistry
-from pheasant.obsidian.exporter import ObsidianExporter
 from pheasant.persistence.paths import StatePaths
 from pheasant.persistence.state_store import StateStore
 from pheasant.registry.knowledge_base_registry import KnowledgeBaseRegistry
@@ -63,7 +62,7 @@ class PheasantTools:
         self.config = config
         self.paths = StatePaths.from_config(config)
         self.paths.ensure()
-        self.state = StateStore(self.paths.sqlite)
+        self.state = StateStore.from_config(config, self.paths.sqlite)
         self.state.migrate()
         self.engine = SyncEngine(config, self.paths, self.state)
         # MCP and A2A callers cannot consume the HTTP server's in-process job
@@ -113,7 +112,6 @@ class PheasantTools:
                 path,
                 [
                     self.config.pheasant.workspace_root,
-                    self.config.pheasant.vault_path,
                     self.config.pheasant.exports_path,
                     *self.config.security.allow_workspace_roots,
                 ],
@@ -546,6 +544,8 @@ class PheasantTools:
         node_types: list[str] | None = None,
         min_score: float | None = None,
         memory: Any = None,
+        source_types: list[str] | None = None,
+        exclude_source_types: list[str] | None = None,
     ) -> dict:
         """Retrieve passages for a query.
 
@@ -556,6 +556,14 @@ class PheasantTools:
         region's agent memory participates. All are optional and default to the
         pre-existing behavior, so an existing caller is unaffected
         (CLAUDE.md §4 rule 8: additive only).
+
+        ``source_types``/``exclude_source_types`` scope by the *kind* of
+        source — ``repository``, ``notion``, ``slack``, ``markdown_folder`` and
+        so on — rather than by name. Scoping by name means knowing every source
+        in the region first; scoping by type is the question an agent usually
+        has ("only what came from our wikis"). Every hit reports its own under
+        ``provenance.source_type``, and ``describe_retrieval`` lists the types
+        this region actually holds.
 
         ``section`` matches the heading breadcrumb, so "§ 12.3", "Article IV"
         or a section's wording all reach it and naming a parent returns
@@ -576,7 +584,9 @@ class PheasantTools:
         # Over-fetch when a filter will drop rows, so `max_results` still
         # means "give me this many" rather than "look at this many and give me
         # whatever survives" — the latter silently returns short answers.
-        filtering = criteria_active(exclude_sources, node_types, min_score)
+        filtering = criteria_active(
+            exclude_sources, node_types, min_score, source_types, exclude_source_types
+        )
         fetch = max_results * 4 if filtering else max_results
         payload = self.searcher.search_context(
             knowledge_base or self.config.knowledge_base_id,
@@ -598,9 +608,17 @@ class PheasantTools:
                 exclude_sources=exclude_sources,
                 node_types=node_types,
                 min_score=min_score,
+                source_types=source_types,
+                exclude_source_types=exclude_source_types,
             )[:max_results]
             payload["criteria"] = criteria_dict(
-                source_name, exclude_sources, node_types, min_score, memory
+                source_name,
+                exclude_sources,
+                node_types,
+                min_score,
+                memory,
+                source_types,
+                exclude_source_types,
             )
         return payload
 
@@ -621,6 +639,15 @@ class PheasantTools:
         has_vectors = self.engine.vectors is not None
         modes = ["text", "graph", "hybrid"] + (["vector"] if has_vectors else [])
         rows = self.state.rows("SELECT DISTINCT source_id FROM artifacts ORDER BY source_id")
+        # What kinds of source this region actually holds, so an agent can pick
+        # a `source_types` filter without first listing every source and
+        # inspecting each one. Read from the registry, not from config, so a
+        # source registered at runtime is included.
+        from pheasant.search.criteria import source_type_map
+
+        types = source_type_map(self.state)
+        indexed = [str(row["source_id"]) for row in rows]
+        source_types = sorted({types[name] for name in indexed if name in types})
         return {
             "knowledge_base": knowledge_base or self.config.knowledge_base_id,
             "default_mode": self.config.search.default_mode,
@@ -631,7 +658,8 @@ class PheasantTools:
                 "built": has_vectors,
                 "provider": self.config.search.embeddings.provider,
             },
-            "sources": [str(row["source_id"]) for row in rows],
+            "sources": indexed,
+            "source_types": source_types,
             "memory": self._describe_memory(),
             "retrieval": settings.model_dump(mode="json"),
             "workflow": self.config.assistant.workflow,
@@ -642,6 +670,8 @@ class PheasantTools:
                     "max_results",
                     "source_name",
                     "exclude_sources",
+                    "source_types",
+                    "exclude_source_types",
                     "node_types",
                     "min_score",
                     "memory",
@@ -764,6 +794,8 @@ class PheasantTools:
         node_types: list[str] | None = None,
         min_score: float | None = None,
         memory: Any = None,
+        source_types: list[str] | None = None,
+        exclude_source_types: list[str] | None = None,
     ) -> dict:
         """Run retrieval criteria and report how they differ from the config.
 
@@ -798,6 +830,8 @@ class PheasantTools:
             node_types=node_types,
             min_score=min_score,
             memory=memory,
+            source_types=source_types,
+            exclude_source_types=exclude_source_types,
         )
 
         def keys(payload: dict) -> list[str]:
@@ -851,6 +885,8 @@ class PheasantTools:
         principal: str | None = None,
         principal_groups: list[str] | None = None,
         options: dict | None = None,
+        source_types: list[str] | None = None,
+        exclude_source_types: list[str] | None = None,
     ) -> dict:
         """Answer a question from the knowledge base, with citations and graph facts.
 
@@ -881,6 +917,8 @@ class PheasantTools:
             principal_groups=principal_groups,
             workflow=workflow,
             options=options,
+            source_types=source_types,
+            exclude_source_types=exclude_source_types,
         )
 
     def get_relevant_files(
@@ -937,6 +975,14 @@ class PheasantTools:
                 if not matching_edges:
                     continue
                 next_depth = current_depth + 1
+                # One entry per node, not per edge into it — the same fix as
+                # `api.app.graph_neighbors`, which this mirrors. `visited`
+                # guarded the queue but not the append, so a node reachable by
+                # two paths came back twice and `get_graph_slice` built a
+                # duplicated `nodes` payload from it.
+                if target in visited:
+                    continue
+                visited.add(target)
                 edge_type_values = sorted(
                     {data.get("type") for data in matching_edges if data.get("type")}
                 )
@@ -949,9 +995,7 @@ class PheasantTools:
                         "node": dict(graph.nodes.get(target, {})),
                     }
                 )
-                if target not in visited:
-                    visited.add(target)
-                    queue.append((target, next_depth, [*path, target]))
+                queue.append((target, next_depth, [*path, target]))
         return {"node_id": node_id, "depth": depth, "neighbors": neighbors}
 
     def get_file_summary(
@@ -993,21 +1037,6 @@ class PheasantTools:
             "explanation": f"{node.get('label')} is a {node.get('type')} node indexed by pheasant.",
             "provenance": node.get("provenance"),
         }
-
-    def export_obsidian_notes(
-        self,
-        knowledge_base: str,
-        source_name: str | None = None,
-        scope: str = "knowledge_base",
-        preview: bool = False,
-        template_profile: str | None = None,
-    ) -> dict:
-        self._require_knowledge_base(knowledge_base)
-        return ObsidianExporter(self.config, self.state).export(
-            source_name,
-            preview=preview,
-            template_profile=template_profile,
-        )
 
     def get_sync_status(self, knowledge_base: str) -> dict:
         self._require_knowledge_base(knowledge_base)

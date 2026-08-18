@@ -69,6 +69,11 @@ class Passage:
     # is what lets a citation say *which section* answered rather than only
     # which file.
     heading_path: str | None = None
+    # The *kind* of source this evidence came from (repository, notion, …),
+    # carried for the same reason as heading_path: a citation that can only
+    # name a file cannot say whether the claim came out of the codebase or out
+    # of a Slack thread, and that is usually what decides how much to trust it.
+    source_type: str | None = None
     # Set when this evidence is a remembered assertion rather than a document
     # (Step 33.6). Carried here for the same reason as heading_path: the
     # answering prompt and the citation both need to say so, and neither can
@@ -400,6 +405,8 @@ class PheasantRetriever:
         state: Any = None,
         config: Any = None,
         memory: Any = None,
+        source_types: list[str] | None = None,
+        exclude_source_types: list[str] | None = None,
     ) -> None:
         self.search_engine = search
         self.knowledge_base = knowledge_base
@@ -411,6 +418,14 @@ class PheasantRetriever:
         # searches and every one of them must see the same policy, or a chat
         # turn could half-honour a toggle the user set.
         self.memory = memory
+        # Scope this answer to (or away from) kinds of source — the same
+        # reasoning as `memory` above: an answering loop issues many searches
+        # and every one of them has to see the same scope, or a single turn
+        # could half-honour it. Applied in `search`, so every workflow and
+        # every `multi_search` fan-out inherits it without threading a
+        # parameter through each call signature.
+        self.source_types = list(source_types) if source_types else None
+        self.exclude_source_types = list(exclude_source_types) if exclude_source_types else None
         # Per-request memo: an agent loop re-issues overlapping queries, and
         # paying twice for the identical (query, mode, limit, source) tuple is
         # pure waste — pheasant's index does not change mid-answer.
@@ -433,7 +448,16 @@ class PheasantRetriever:
         if not query:
             return []
         mode = mode if mode in VALID_MODES else "hybrid"
-        cache_key = (query, mode, limit, source_name, principal, str(self.memory))
+        cache_key = (
+            query,
+            mode,
+            limit,
+            source_name,
+            principal,
+            str(self.memory),
+            tuple(self.source_types or ()),
+            tuple(self.exclude_source_types or ()),
+        )
         if cache_key in self._cache:
             return self._cache[cache_key]
 
@@ -449,7 +473,16 @@ class PheasantRetriever:
             security=getattr(self.config, "security", None),
             memory=self.memory,
         )
-        passages = [self._passage(item, mode) for item in payload.get("results", [])]
+        hits = payload.get("results", [])
+        if self.source_types or self.exclude_source_types:
+            from pheasant.search.criteria import apply_retrieval_criteria
+
+            hits = apply_retrieval_criteria(
+                hits,
+                source_types=self.source_types,
+                exclude_source_types=self.exclude_source_types,
+            )
+        passages = [self._passage(item, mode) for item in hits]
         self._cache[cache_key] = passages
         return passages
 
@@ -549,6 +582,7 @@ class PheasantRetriever:
             snippet=snippet[:900],
             mode=mode,
             heading_path=(item.get("heading_path") or provenance.get("heading_path")) or None,
+            source_type=(item.get("source_type") or provenance.get("source_type")) or None,
             memory=item.get("memory") or None,
             raw=item,
         )

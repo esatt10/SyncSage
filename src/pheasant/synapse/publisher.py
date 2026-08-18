@@ -405,7 +405,7 @@ class ContractPublisher:
         # data — no schema bump (the 25.4 image/audio precedent).
         from pheasant.memory.store import memory_source
 
-        if memory_source(self.config, getattr(self, 'state', None)) is not None:
+        if memory_source(self.config, getattr(self, "state", None)) is not None:
             modalities.append("memory")
         # Document extraction: advertise "document" when a source is configured
         # to ingest PDF/DOCX, so the router's `--modality document` filter
@@ -419,6 +419,23 @@ class ContractPublisher:
             "search_modes": search_modes,
             "granularities": ["summaries", "chunks", "graph"],
             "modalities": modalities,
+            # What *kinds* of source this region is built from — repository,
+            # notion, slack, markdown_folder and so on. `modalities` says what
+            # media the region can answer about; this says where the content
+            # came from, which is the question a router gets asked ("who has
+            # our Confluence?") and could not previously answer without
+            # querying every region. Additive wire data: `capabilities` sets no
+            # `additionalProperties`, so the vendored schema accepts it with no
+            # bump and no re-vendor, and a router that ignores the key behaves
+            # exactly as it did — the same call the 25.4 image/audio and 33.1
+            # memory modality additions made.
+            "source_types": sorted(
+                {
+                    getattr(source.type, "value", str(source.type))
+                    for source in self.config.sources
+                    if source.enabled
+                }
+            ),
             "returns_vectors": bool(vector_on),
             "auth": "none",
             "api_version": "v1",

@@ -30,7 +30,6 @@ services:
     volumes:
       - ./examples/demo-agent-framework/pheasant.demo.yaml:/config/pheasant.yaml:ro
       - ${AGENT_FRAMEWORK_PATH:?set AGENT_FRAMEWORK_PATH in .env to your clone of microsoft/agent-framework}:/workspace:ro
-      - ${PHEASANT_VAULT_PATH:-./vault}:/vault
       - pheasant-demo-state:/state
       - pheasant-demo-exports:/exports
 

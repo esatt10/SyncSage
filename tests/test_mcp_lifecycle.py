@@ -7,9 +7,9 @@ from pheasant.mcp_server.tools import PheasantTools
 
 def test_runtime_source_lifecycle_sync_query_and_promote(
     loaded_config: object,
-    vault_path: Path,
+    tmp_path: Path,
 ) -> None:
-    runtime_root = vault_path / "runtime-context"
+    runtime_root = tmp_path / "runtime-context"
     runtime_root.mkdir()
     (runtime_root / "context.md").write_text(
         "# Runtime Context\n\nRuntime promoted source contains durable configuration notes.\n",

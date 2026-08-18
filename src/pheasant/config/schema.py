@@ -168,6 +168,17 @@ class ModelMixin:
                 return str(v) if mode == "json" else v
             if isinstance(v, Enum):
                 return v.value
+            if isinstance(v, str) and type(v) is not str:
+                # A *subclass* of str — `PluginSourceType` is the one that
+                # occurs — is not plain data, and consumers that dispatch on
+                # the exact type refuse it. PyYAML's representer is one:
+                # `yaml.safe_dump` raises `RepresenterError("cannot represent
+                # an object")` for it, so `config_hash` crashed for any config
+                # using a connector plugin — which is every third-party
+                # connector and all five first-party SaaS ones. A dump is
+                # plain data in both modes; the loader re-creates the rich
+                # type on the way back in.
+                return str(v)
             if isinstance(v, ModelMixin):
                 return v.model_dump(mode=mode)
             if isinstance(v, list):
@@ -186,7 +197,6 @@ class PheasantSettings(ModelMixin):
     environment: str = "local"
     log_level: str = "INFO"
     state_path: Path = Path("/state")
-    vault_path: Path = Path("/vault")
     workspace_root: Path = Path("/workspace")
     exports_path: Path = Path("/exports")
 
@@ -225,6 +235,24 @@ class ApiSettings(ModelMixin):
     # Escape hatch for deployments that genuinely front this with their own
     # authenticating ingress and need `*` back. Opt-in, never the default.
     cors_allow_all_origins: bool = False
+    #: Requests allowed to be in flight at once before the surplus is refused
+    #: with 429 + Retry-After. **0 disables it**, which is the pre-35.6
+    #: behavior and the right answer for one container: a 429 to the only user
+    #: is worse than making them wait. Set it on replicas, where shedding lets
+    #: a load balancer retry elsewhere instead of every replica queueing.
+    max_concurrent_requests: int = 0
+    #: Seconds to keep serving after SIGTERM while `/ready` already reports
+    #: 503, so a load balancer stops sending new work before the process
+    #: stops accepting it. 0 disables the delay. Must be shorter than the
+    #: orchestrator's termination grace period or the pod is killed mid-drain.
+    drain_seconds: int = 0
+    #: Seconds between checks for a graph written by another process, for the
+    #: ``api`` role only. 30 by default because an api replica that never
+    #: re-reads the graph answers graph queries from whatever the graph was
+    #: when its pod started, forever and silently. 0 disables it; the other
+    #: roles ignore it, because they index their own graph and reload it
+    #: through the sync worker.
+    graph_refresh_seconds: int = 30
 
 
 @dataclass
@@ -237,6 +265,12 @@ class UiSettings(ModelMixin):
 class ServerSettings(ModelMixin):
     host: str = "0.0.0.0"
     port: int = 8765
+    #: Which jobs this process takes on: ``all`` (the default and today's
+    #: behavior), ``api`` (serve only — publishes index work instead of
+    #: running it), ``indexer`` (watch, schedule and drain the queue) or
+    #: ``worker`` (preparation only). `pheasant serve --role` overrides this.
+    #: See :mod:`pheasant.deployment.roles`.
+    role: str = "all"
     mcp: McpSettings = field(default_factory=McpSettings)
     api: ApiSettings = field(default_factory=ApiSettings)
     ui: UiSettings = field(default_factory=UiSettings)
@@ -266,11 +300,39 @@ class StorageSettings(ModelMixin):
     graph_snapshots: bool = True
     graph_snapshot_interval_seconds: int = 900
     graph_checkpoint_seconds: int = 60
+    #: Expected seconds between interruptions — a container restart, a
+    #: redeploy, an OOM kill. This is the one number an operator actually
+    #: knows, and it is what sets the checkpoint interval (see
+    #: ``optimal_checkpoint_interval``). 24h suits a normally-running
+    #: deployment; lower it on spot/preemptible instances, which is exactly
+    #: the case where more frequent checkpoints pay for themselves.
+    checkpoint_mtbf_seconds: int = 86_400
+    #: Ceiling on the derived interval, so worst-case rework stays bounded no
+    #: matter what the formula returns. 30 minutes of lost indexing is
+    #: recoverable; an unbounded interval on a very large graph is not.
+    graph_checkpoint_max_seconds: int = 1_800
     compression: str = "zstd"
     sqlite_path: Path | None = None
     graph_path: Path | None = None
     manifest_path: Path | None = None
     max_state_size_gb: float = 10
+
+    # -- Phase 35.2: where state actually lives -------------------------------
+    #: ``sqlite`` (default) or ``postgres``. SQLite is a file and permits one
+    #: writer process per knowledge base, which is pheasant's hard scaling
+    #: ceiling; Postgres is what lets 35.4 give each *source* its own lease so
+    #: several indexers can commit at once. Leaving this alone keeps a region
+    #: byte-identical to pre-35.2 and needing no infrastructure at all.
+    backend: str = "sqlite"
+    #: Name of the environment variable holding the libpq DSN. A DSN carries a
+    #: password, so — like every other credential in pheasant — only the
+    #: variable *name* is ever written to YAML. There is deliberately no field
+    #: to paste the DSN itself into.
+    dsn_env: str = "PHEASANT_DATABASE_URL"
+    #: Server-side connections this process may hold. Unlike a SQLite file
+    #: handle a Postgres connection is a server process, so this is a real
+    #: resource on the database, not just on the client.
+    pool_size: int = 10
 
 
 @dataclass
@@ -503,7 +565,48 @@ class SyncConcurrencySettings(ModelMixin):
     remote_worker_enabled: bool = False
     remote_worker_token_env: str = "PHEASANT_INDEX_WORKER_TOKEN"
     remote_worker_timeout_seconds: int = 120
+    #: Files per request to a remote worker. A batch amortizes the request
+    #: overhead and carries one deadline for the group, but every task in it
+    #: holds its file's bytes in memory on both sides — so this is a memory
+    #: knob as much as a throughput one. Eight is small enough that the
+    #: default 25 MB file limit cannot surprise a worker.
+    remote_worker_batch_size: int = 8
+    #: ``http`` (stdlib, no extra) or ``grpc`` (needs the ``[grpc]`` extra).
+    #: Retry, failover, breakers and deadlines are transport-independent, so
+    #: this changes bytes on the wire and nothing about durability.
+    worker_transport: str = "http"
     lock_timeout_seconds: int = 120
+
+
+@dataclass
+class SyncQueueSettings(ModelMixin):
+    """The durable index work queue (Phase 35.5).
+
+    Off by default, and that is a design decision rather than caution: with
+    it off, ``sync_all`` keeps its remaining sources in a Python list exactly
+    as it always has, so a single container indexing a folder needs no queue
+    to do it. Turning it on buys three things a list cannot give: a backlog
+    that survives a restart, a depth other processes can read (and a
+    scheduler can scale on), and a source that keeps failing being
+    dead-lettered instead of retried forever.
+
+    ``local`` is the state store itself — no broker to run, and it works on
+    both SQLite and Postgres. ``nats`` is for a fleet that has outgrown one
+    database; it does not buy correctness the local queue lacks.
+    """
+
+    enabled: bool = False
+    backend: str = "local"
+    #: Seconds a claimed task stays invisible to other workers. Heartbeats
+    #: extend it, so this bounds *silence* from a claimer, not work.
+    visibility_seconds: int = 300
+    #: Attempts before a task is dead-lettered. A dead task is kept, never
+    #: deleted, so it can be replayed once the cause is fixed.
+    max_attempts: int = 3
+    nats_servers: list[str] = field(default_factory=list)
+    nats_stream: str = "PHEASANT_INDEX"
+    nats_subject: str = "pheasant.index.tasks"
+    nats_durable: str = "pheasant-indexers"
 
 
 @dataclass
@@ -513,26 +616,13 @@ class SyncSettings(ModelMixin):
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
     limits: SyncLimitsSettings = field(default_factory=SyncLimitsSettings)
     concurrency: SyncConcurrencySettings = field(default_factory=SyncConcurrencySettings)
+    queue: SyncQueueSettings = field(default_factory=SyncQueueSettings)
 
 
 @dataclass
 class GraphSettings(ModelMixin):
-    """How much graph the knowledge graph should actually keep.
+    """How much graph the knowledge graph should actually keep."""
 
-    ``concept_min_documents`` is the number of distinct documents that must
-    share a term before it becomes a concept *node*. A concept exists to link
-    the documents that share it, so one that links a single document is pure
-    weight: measured on microsoft/agent-framework, 74.5% of concept nodes were
-    mentioned by exactly one document, and concepts made up 96% of a
-    577k-node graph — memory, traversal budget and enrichment time spent
-    connecting nothing.
-
-    Nothing becomes unfindable: the term stays on the artifact's
-    ``concept_terms``, in ``artifact_terms``, and in the artifact's searchable
-    text. Set to 1 to keep every term as a node (the pre-2026-08 behavior).
-    """
-
-    concept_min_documents: int = 2
     #: Wire agent-memory records into the graph (Step 33.7): `about` edges to
     #: what a record refers to, plus `supersedes` between corrections. A no-op
     #: without a memory source, so turning it off only matters to a region that
@@ -547,18 +637,21 @@ class GraphSettings(ModelMixin):
     # modestly above that. Opt in for large/growing multi-source graphs.
     wasm_cross_source_resolution: bool = False
 
-
-@dataclass
-class ObsidianSettings(ModelMixin):
-    enabled: bool = True
-    write_mode: str = "upsert"
-    note_root: str = "pheasant"
-    template_profile: str = "engineering"
-    create_index_notes: bool = True
-    create_source_notes: bool = True
-    create_file_notes: bool = True
-    create_chunk_notes: bool = False
-    create_canvas: bool = True
+    # -- Phase 35.3: the in-RAM graph has a measured ceiling ------------------
+    #: Warn once per sync when the graph passes this many nodes. **Not a
+    #: refusal** — unlike `sync.limits`, which stops a source before any work
+    #: happens, by the time this trips the graph already exists and refusing
+    #: would throw away a completed index.
+    #:
+    #: The default is derived from measurement, not taste. `graph/capacity.py`
+    #: measured a real-shaped graph at four scales and found a flat ~2.4 KB of
+    #: process RSS per node. The shipped container limit is 6 Gi, and the graph
+    #: is roughly 60% of process RSS, so ~1.5M nodes (~240k files) is where a
+    #: default container is genuinely full — past that it is OOM-killed
+    #: mid-sync, which presents as an unexplained restart rather than as a
+    #: capacity problem. Raise both together for a larger container; shard once
+    #: raising them stops being comfortable. Set to None to disable.
+    max_nodes: int | None = 1_500_000
 
 
 @dataclass
@@ -741,7 +834,7 @@ class IdPSettings(ModelMixin):
 @dataclass
 class SecuritySettings(ModelMixin):
     allow_workspace_roots: list[Path] = field(
-        default_factory=lambda: [Path("/workspace"), Path("/vault"), Path("/exports")]
+        default_factory=lambda: [Path("/workspace"), Path("/exports")]
     )
     # Step 32.2 — principal-aware retrieval. Off by default: a standalone /
     # single-user region behaves byte-identically to pre-32. When enforced,
@@ -899,7 +992,6 @@ class PheasantConfig(ModelMixin):
     ingestion: IngestionSettings = field(default_factory=IngestionSettings)
     sync: SyncSettings = field(default_factory=SyncSettings)
     graph: GraphSettings = field(default_factory=GraphSettings)
-    obsidian: ObsidianSettings = field(default_factory=ObsidianSettings)
     security: SecuritySettings = field(default_factory=SecuritySettings)
     synapse: SynapseSettings = field(default_factory=SynapseSettings)
     memory: MemorySettings = field(default_factory=MemorySettings)
@@ -912,7 +1004,7 @@ class PheasantConfig(ModelMixin):
             raw = raw or {}
             _coerce_scalar_fields(dc, raw)
             if dc is PheasantSettings:
-                for key in ("state_path", "vault_path", "workspace_root", "exports_path"):
+                for key in ("state_path", "workspace_root", "exports_path"):
                     if key in raw:
                         raw[key] = Path(raw[key])
             if dc is StorageSettings:
@@ -962,6 +1054,8 @@ class PheasantConfig(ModelMixin):
                     raw["limits"] = build(SyncLimitsSettings, raw["limits"])
                 if "concurrency" in raw and isinstance(raw["concurrency"], dict):
                     raw["concurrency"] = build(SyncConcurrencySettings, raw["concurrency"])
+                if "queue" in raw and isinstance(raw["queue"], dict):
+                    raw["queue"] = build(SyncQueueSettings, raw["queue"])
             return dc(**{k: v for k, v in raw.items() if k in dc.__dataclass_fields__})
 
         cfg = cls(
@@ -972,7 +1066,6 @@ class PheasantConfig(ModelMixin):
             ingestion=build(IngestionSettings, data.get("ingestion")),
             sync=build(SyncSettings, data.get("sync")),
             graph=build(GraphSettings, data.get("graph")),
-            obsidian=build(ObsidianSettings, data.get("obsidian")),
             security=build(SecuritySettings, data.get("security")),
             synapse=build(SynapseSettings, data.get("synapse")),
             memory=build(MemorySettings, data.get("memory")),
@@ -1074,7 +1167,3 @@ class PheasantConfig(ModelMixin):
     @property
     def state_path(self) -> Path:
         return self.pheasant.state_path
-
-    @property
-    def vault_path(self) -> Path:
-        return self.pheasant.vault_path

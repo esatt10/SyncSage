@@ -31,7 +31,6 @@ def _config(
             "pheasant": {
                 "name": "parallel-acceptance",
                 "state_path": str(tmp_path / state_name),
-                "vault_path": str(tmp_path / f"{state_name}-vault"),
                 "workspace_root": str(workspace),
                 "exports_path": str(tmp_path / f"{state_name}-exports"),
             },
@@ -284,24 +283,39 @@ def test_remote_executor_dispatches_immutable_tasks(
     config.sources[0].connector.headers = {"Authorization": "must-not-leak"}
     monkeypatch.setenv("PHEASANT_INDEX_WORKER_TOKEN", "test-token")
 
-    from pheasant.sync import remote_worker
+    config.sync.concurrency.remote_worker_batch_size = 1
+
+    from pheasant.sync import remote_worker, worker_transport
 
     endpoints: list[str] = []
 
-    def local_protocol_probe(
-        endpoint: str,
-        token: str,
-        task: dict[str, Any],
-        *,
-        timeout: float,
-    ) -> Any:
-        endpoints.append(endpoint)
-        assert token == "test-token"
-        assert timeout == 120
-        assert "connector" not in task["source"]
-        return remote_worker.parsed_from_wire(remote_worker.prepare_task(task))
+    class LocalProtocolProbe:
+        """Speak the batch protocol without a socket, and check the boundary."""
 
-    monkeypatch.setattr(remote_worker, "prepare_remote", local_protocol_probe)
+        def post(
+            self,
+            connection: Any,
+            url: str,
+            tasks: list[dict[str, Any]],
+            keys: list[str],
+            *,
+            token: str,
+            timeout: float,
+            deadline_seconds: float | None,
+        ) -> Any:
+            endpoints.append(url)
+            assert token == "test-token"
+            assert timeout <= 120
+            assert deadline_seconds is not None and deadline_seconds <= 120
+            assert len(keys) == len(tasks)
+            for task in tasks:
+                assert "connector" not in task["source"]
+            return {"results": remote_worker.prepare_batch_tasks(tasks, keys)}, None
+
+        def discard(self, connection: Any) -> None:  # pragma: no cover - no sockets here
+            pass
+
+    monkeypatch.setattr(worker_transport, "HttpTransport", LocalProtocolProbe)
     engine = SyncEngine(config)
     try:
         result = engine.sync_source("docs", "full")

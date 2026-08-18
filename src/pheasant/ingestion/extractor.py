@@ -41,10 +41,8 @@ Providers
   text-showing operators. DOCX: it is a ZIP, so ``zipfile`` +
   ``xml.etree`` over ``word/document.xml``. HTML: BeautifulSoup when
   present (already a core dep), else a regex strip. This exists because
-  the repo ships a dependency-light shim environment (root ``yaml.py``,
-  the ``pheasant/`` path bridge) in which ``pymupdf`` may be absent — and
-  because a text extractor that dies when an optional import is missing
-  would take the whole sync down with it.
+  a text extractor that dies when an optional import is missing would
+  take the whole sync down with it.
 - :class:`NativeExtractor` — ``pymupdf`` for PDF and ``python-docx`` for
   DOCX (both already core deps), with higher fidelity than the builtin on
   hard PDFs: CID/Type0 fonts, custom encodings, complex layouts. Falls
@@ -436,8 +434,8 @@ def extract_html_text(content: bytes) -> str:
     """Strip markup so HTML/XML indexes its prose, not its tags.
 
     ``bs4`` is already a core dependency (the Confluence connector uses it),
-    but a regex strip stands in when it is missing so the dependency-light
-    environment still degrades to something useful.
+    but a regex strip stands in when it is missing, so a partial install
+    degrades to something useful rather than indexing raw markup.
     """
     raw = content.decode("utf-8", errors="ignore")
     try:

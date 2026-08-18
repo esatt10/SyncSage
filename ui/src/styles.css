@@ -2223,6 +2223,94 @@ select.text-input {
   color: var(--danger);
 }
 
+/* --------------------------------------------------------------------------
+   Per-source indexing progress (Phase 35.1).
+
+   A `sync_all` over eight sources was one bar over one counter, so the source
+   that was stuck rendered identically to the seven that were fine. These are
+   the per-source rows that replace that, shared by the jobs tray and the
+   Sources page so the two can never disagree about what "stalled" looks like.
+   -------------------------------------------------------------------------- */
+
+.job__bar--compact {
+  height: 3px;
+}
+
+/* Stalled is a *warning*, not a failure: the pass may still recover, and
+   colouring it like an error trains people to ignore real ones. */
+.job__bar--stalled .job__bar-fill,
+.job-source--stalled .job__bar-fill,
+.source-progress--stalled .job__bar-fill {
+  background: var(--warn);
+}
+
+.job__sources {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+}
+
+.job-source__head,
+.source-progress__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+
+.job-source__name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-source__meta,
+.source-progress__meta {
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jobs-tray--stalled .jobs-tray__toggle,
+.thinking--stalled {
+  color: var(--warn);
+}
+
+.row--progress > td {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.source-progress {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm, 6px);
+  background: var(--bg-active);
+}
+
+.source-progress--stalled {
+  background: var(--warn-soft);
+}
+
+.source-progress__phase {
+  font-weight: 600;
+}
+
+.source-progress__failures {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--danger);
+}
+
+.source-progress__failures code {
+  color: inherit;
+}
+
 /* ==========================================================================
    Upload drop zone.
    ========================================================================== */
@@ -2558,6 +2646,35 @@ select.text-input {
 .memory-card__chain {
   opacity: 0.6;
 }
+/* Base `.badge`. The modifiers below only ever set a background, so without
+   this every badge rendered as default-coloured text on a dark fill — the
+   memory page's "corrected" chip included. Found while adding `--warn`. */
+.badge {
+  display: inline-block;
+  padding: 0.1em 0.45em;
+  border-radius: 4px;
+  background: var(--bg-active);
+  color: var(--text);
+  font-size: 0.75em;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+  vertical-align: baseline;
+}
+
+/* The coloured modifiers are dark fills, so they carry light text. */
+.badge--org,
+.badge--user,
+.badge--session,
+.badge--stale {
+  color: #fff;
+}
+
+.badge--warn {
+  background: var(--warn);
+  color: #fff;
+}
+
 .badge--org {
   background: #3c4a63;
 }
@@ -2585,4 +2702,37 @@ select.text-input {
   align-items: center;
   font-size: 0.8em;
   opacity: 0.8;
+}
+
+/* Source-type filter chips in the Sources rail. Scoping by kind of source is
+   the control that stays usable once a knowledge base has more sources than
+   fit on one screen. */
+.source-types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px 4px;
+}
+
+.chip {
+  padding: 2px 9px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-soft);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.chip:hover {
+  color: var(--text);
+  border-color: var(--accent-border);
+}
+
+.chip--active {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+  color: var(--accent-text);
 }

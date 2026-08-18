@@ -35,8 +35,6 @@ spec:
               readOnly: true
             - name: state
               mountPath: /state
-            - name: vault
-              mountPath: /vault
             - name: workspace
               mountPath: /workspace
               readOnly: true
@@ -76,11 +74,11 @@ spec:
             failureThreshold: 5
           resources:
             requests:
-              cpu: 100m
-              memory: 256Mi
-            limits:
-              cpu: "1"
+              cpu: 500m
               memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 6Gi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -94,9 +92,6 @@ spec:
         - name: state
           persistentVolumeClaim:
             claimName: pheasant-state
-        - name: vault
-          persistentVolumeClaim:
-            claimName: pheasant-vault
         - name: workspace
           emptyDir: {}
         - name: exports

@@ -15,7 +15,6 @@ config:
       name: helm-pheasant
       environment: kubernetes
       state_path: /state
-      vault_path: /vault
       workspace_root: /workspace
       exports_path: /exports
     server:
@@ -39,26 +38,20 @@ config:
       scheduler:
         enabled: true
         interval_seconds: 900
-    obsidian:
-      enabled: true
-      note_root: pheasant
     sources: []
 
 persistence:
   state:
     enabled: true
     size: 10Gi
-  vault:
-    enabled: true
-    size: 5Gi
 
 resources:
   requests:
-    cpu: 100m
-    memory: 256Mi
-  limits:
-    cpu: "1"
+    cpu: 500m
     memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 6Gi
 
 securityContext:
   runAsNonRoot: true

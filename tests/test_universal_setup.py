@@ -680,6 +680,10 @@ def test_sync_source_with_wait_false_does_not_start_a_second_overlapping_sync(
         "status": "already_syncing",
         # No second job was created — the refusal is the point.
         "job_id": None,
+        # Empty on this role: an `all`/`indexer` process indexes locally, so
+        # nothing is published. The field exists because an `api` replica has
+        # no local job to report and returns its queue task ids here instead.
+        "queued_tasks": [],
         "source_id": "pasted-notes-bg4",
     }
     settled = _wait_until_not_syncing(client, "pasted-notes-bg4")

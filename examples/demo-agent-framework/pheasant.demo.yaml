@@ -21,7 +21,6 @@ pheasant:
   environment: local
   log_level: INFO
   state_path: /state
-  vault_path: /vault
   workspace_root: /workspace
   exports_path: /exports
 
@@ -128,13 +127,9 @@ sync:
     max_parallel_files: 8
     lock_timeout_seconds: 120
 
-obsidian:
-  enabled: false
-
 security:
   allow_workspace_roots:
     - /workspace
-    - /vault
     - /exports
   allow_user_selected_source_paths: true
   read_only_sources: true

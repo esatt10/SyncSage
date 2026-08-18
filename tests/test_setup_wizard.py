@@ -197,9 +197,16 @@ def test_embedding_env_question_rejects_a_pasted_secret() -> None:
 def test_bool_questions_accept_yes_and_no_and_reject_prose() -> None:
     prompter = ScriptedPrompter(["maybe", "no"])
     wizard = Wizard(prompter=prompter)
-    section = next(s for s in build_sections() if s.id == "obsidian")
-    wizard._ask(section.questions[0])
-    assert wizard.answers["obsidian.enabled"] is False
+    # Any plain (non-advanced) bool question will do — an advanced one would
+    # short-circuit to its default without ever consulting the prompter.
+    question = next(
+        q
+        for section in build_sections()
+        for q in section.questions
+        if q.kind == "bool" and not q.advanced and q.when is None
+    )
+    wizard._ask(question)
+    assert wizard.answers[question.key] is False
 
 
 def test_sources_resolve_through_the_same_detection_as_pheasant_up() -> None:
@@ -407,8 +414,8 @@ def test_startup_commands_cover_every_deployment_target(tmp_path: Path) -> None:
     assert "docker compose up" in compose
 
 
-def test_generated_yaml_round_trips_through_the_dependency_light_shim(tmp_path: Path) -> None:
-    """The repo ships a minimal yaml shim; `sources:` must parse under it too."""
+def test_generated_yaml_round_trips(tmp_path: Path) -> None:
+    """A wizard-written config must reload with its lists intact."""
     wizard = Wizard(accept_defaults=True)
     wizard.run()
     wizard.sources = [

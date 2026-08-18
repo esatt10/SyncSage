@@ -341,7 +341,6 @@ def _steer_config(tmp_path: Path, *, steering: bool, max_records: int | None = N
         f"""pheasant:
   name: harden-test
   state_path: {tmp_path / ".pheasant" / "state"}
-  vault_path: {tmp_path / ".pheasant" / "vault"}
   exports_path: {tmp_path / ".pheasant" / "exports"}
   workspace_root: {tmp_path}
 sync:

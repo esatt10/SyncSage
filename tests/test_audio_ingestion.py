@@ -48,7 +48,6 @@ def _make_audio_engine(tmp_path: Path, *, with_embeddings: bool = False) -> Sync
             "pheasant": {
                 "name": "audio-acceptance",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "workspace"),
                 "exports_path": str(tmp_path / "exports"),
             },
@@ -140,7 +139,6 @@ def test_text_only_region_builds_no_transcriber(tmp_path: Path) -> None:
             "pheasant": {
                 "name": "text-only-audio",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "workspace"),
                 "exports_path": str(tmp_path / "exports"),
             },
@@ -176,7 +174,6 @@ def test_contract_modalities_omit_audio_for_text_region(tmp_path: Path) -> None:
             "pheasant": {
                 "name": "text-only-audio",
                 "state_path": str(tmp_path / "state"),
-                "vault_path": str(tmp_path / "vault"),
                 "workspace_root": str(tmp_path / "workspace"),
                 "exports_path": str(tmp_path / "exports"),
             },

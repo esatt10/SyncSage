@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
+import math
 import re
 from typing import Any
 
 from pheasant.persistence.state_store import StateStore
+
+logger = logging.getLogger(__name__)
 
 # --- ranking -------------------------------------------------------------
 #
@@ -16,6 +20,39 @@ from pheasant.persistence.state_store import StateStore
 # most often in a short body — untuned, a filename match was worth exactly one
 # body word, and BM25's length normalization then ranked by body brevity.
 _BM25_WEIGHTS = "0.0, 0.0, 0.0, 8.0, 3.0, 2.0, 1.0"
+
+# The same four weights for Postgres. `ts_rank_cd` takes exactly four weight
+# classes and its array is ordered {D, C, B, A} — the reverse of how the
+# columns read above — so this is 1/2/3/8 written backwards and normalized onto
+# ts_rank_cd's 0-1 scale (divide by 8, the title weight). Four BM25 columns
+# mapping onto exactly four tsvector weight classes is luck, not design; it is
+# what makes the port preserve the *ordering* of field importance rather than
+# having to collapse two fields together.
+_TS_RANK_WEIGHTS = "0.125, 0.25, 0.375, 1.0"
+
+# ts_rank_cd's normalization flag. **32 = rank / (rank + 1)** — term-frequency
+# *saturation*, applied per term.
+#
+# This is the second half of making Postgres rank like BM25, and it is not a
+# tuning knob. BM25 scores a term as `IDF x tf/(tf + k1)`: the tenth occurrence
+# of a word is worth almost nothing more than the third. `ts_rank_cd` grows
+# roughly linearly with occurrences, so without saturation a long document that
+# repeats a common query word outranks the short document actually about the
+# rare one — even once IDF is applied, because linear growth outruns a 2.6x
+# weight difference.
+#
+# Measured on the parity corpus, summing IDF-weighted per-term ranks for
+# "gateway restarts nightly" (correct answer: runbook.md):
+#
+#   flag  0 (none)          notes.md 1.50   > runbook.md 0.375   WRONG
+#   flag  1 (log length)    notes.md 0.199  > runbook.md 0.132   WRONG
+#   flag 33 (1|32)          notes.md 0.145  > runbook.md 0.127   WRONG
+#   flag 32 (saturation)    runbook.md 0.368 > notes.md 0.323    correct
+#
+# Length normalization is deliberately *not* combined in (33 above): saturation
+# already defuses repetition, and dividing by document length on top penalizes
+# the document that matched two of the three query terms.
+_TS_RANK_NORMALIZATION = 32
 
 # Structural priors, applied as a DIVISOR on the (negative) BM25 cost, so they
 # scale a match rather than displacing it: a strong deep hit still beats a weak
@@ -64,11 +101,19 @@ _PREFER_BONUS = 0.35
 _PRIOR_FLOOR = 0.25
 
 
-def _structural_prior(steering: Any, tokens: list[str]) -> tuple[str, list[object]]:
+def _structural_prior(
+    steering: Any, tokens: list[str], *, postgres: bool = False
+) -> tuple[str, list[object]]:
     """The ranking divisor, plus any `preference` bonus in force.
 
     Returns SQL and its params, because a preference is a per-query LIKE
     pattern and cannot live in the module-level constant.
+
+    ``MAX(a, b)`` is a *scalar* two-argument function in SQLite and an
+    *aggregate* in Postgres, where the scalar spelling is ``GREATEST``. Left
+    untranslated this raises rather than silently mis-ranking, but only for
+    callers who have a `preference` rule in force — which is a narrow enough
+    path that it could sit broken for a long time unnoticed.
     """
     if not steering:
         return _STRUCTURAL_PRIOR, []
@@ -77,8 +122,10 @@ def _structural_prior(steering: Any, tokens: list[str]) -> tuple[str, list[objec
         return _STRUCTURAL_PRIOR, []
     cases = " ".join("WHEN artifacts.relative_path LIKE ? THEN 1 " for _ in prefixes)
     params: list[object] = [f"{prefix.rstrip('/*')}%" for prefix in prefixes]
+    greatest = "GREATEST" if postgres else "MAX"
     return (
-        f"MAX({_PRIOR_FLOOR}, {_STRUCTURAL_PRIOR} - {_PREFER_BONUS} * (CASE {cases} ELSE 0 END))",
+        f"{greatest}({_PRIOR_FLOOR}, "
+        f"{_STRUCTURAL_PRIOR} - {_PREFER_BONUS} * (CASE {cases} ELSE 0 END))",
         params,
     )
 
@@ -92,6 +139,110 @@ def _exclusion_sql(steering: Any) -> tuple[str, list[object]]:
     )
     params: list[object] = [f"%{pattern.strip('*').strip('/')}%" for pattern in steering.exclusions]
     return clauses, params
+
+
+def _postgres_document_frequencies(state: Any, tokens: list[str]) -> tuple[int, dict[str, int]]:
+    """``(total chunks, {term: how many chunks contain it})`` in one round trip.
+
+    Computed per query rather than maintained in a table. It is a GIN index
+    probe per query term — a handful of terms, all indexed — and it is always
+    correct, where a cached table is a second thing to invalidate on every
+    write and a silent source of stale ranking when it drifts.
+    """
+
+    if not tokens:
+        return 0, {}
+    rows = state.rows(
+        "SELECT t.term AS term, count(f.chunk_id) AS df "
+        "FROM unnest(?::text[]) AS t(term) "
+        "LEFT JOIN chunks_fts f ON f.search_vector @@ to_tsquery('simple', t.term) "
+        "GROUP BY t.term",
+        (list(tokens),),
+    )
+    return _postgres_total_chunks(state), {str(row["term"]): int(row["df"]) for row in rows}
+
+
+def _postgres_total_chunks(state: Any) -> int:
+    """Corpus size for IDF — from the planner's estimate, not ``count(*)``.
+
+    This was a correlated ``(SELECT count(*) FROM chunks_fts)`` inside the
+    per-query document-frequency lookup, so **every text search** paid a full
+    sequential scan of the largest table in the database. Postgres has no
+    SQLite-style O(1) count, so the cost grew linearly with the corpus — on
+    the exact backend chosen for corpora too big for SQLite.
+
+    ``reltuples`` is what the planner itself uses, maintained by autovacuum. It
+    is approximate, and that is fine *here specifically*: it feeds
+    ``ln(1 + (N - df + 0.5) / (df + 0.5))``, where a few percent of drift moves
+    every term's IDF by the same negligible amount and cannot reorder results.
+    A negative value means the table has never been analyzed (``-1`` is the
+    documented sentinel for "no statistics"), and a zero on a table with rows
+    would zero out every score, so both fall back to the real count — paid once
+    on a cold database rather than on every query forever.
+    """
+
+    rows = state.rows(
+        "SELECT reltuples AS estimate FROM pg_class WHERE oid = 'chunks_fts'::regclass"
+    )
+    estimate = int(rows[0]["estimate"]) if rows and rows[0]["estimate"] is not None else -1
+    if estimate > 0:
+        return estimate
+    exact = state.rows("SELECT count(*) AS n FROM chunks_fts")
+    return int(exact[0]["n"]) if exact else 0
+
+
+def _idf(total_docs: int, document_frequency: int) -> float:
+    """BM25's inverse document frequency, the +1 variant.
+
+    ``ln(1 + (N - df + 0.5) / (df + 0.5))`` — the form Lucene and SQLite's
+    FTS5 both use, chosen over the classic ``ln((N - df + 0.5)/(df + 0.5))``
+    because that one goes *negative* for a term appearing in more than half
+    the corpus, which would make a common word actively push documents down
+    the ranking rather than merely counting for little.
+    """
+
+    df = max(0, int(document_frequency))
+    n = max(df, int(total_docs))
+    return math.log(1.0 + (n - df + 0.5) / (df + 0.5))
+
+
+def _postgres_rank_expression(state: Any, tokens: list[str]) -> tuple[str, list[object]]:
+    """A BM25-shaped ranking expression for Postgres.
+
+    ``ts_rank_cd`` has **no inverse document frequency**: it accumulates cover
+    density, so a long document repeating a common query word outranks the
+    short one that is actually about the rare term. That is not a tuning miss
+    — no normalization flag fixes it, because normalization is about document
+    *length* and the missing ingredient is corpus-wide *term rarity*. Measured
+    directly: for "gateway restarts nightly", plain ``ts_rank_cd`` put a decoy
+    repeating "gateway" six times above the one runbook containing "restarts".
+
+    So the expression is built the way BM25 is: a **sum over query terms** of
+    that term's rank times its IDF. The IDFs are computed here and inlined as
+    float literals (they are ours, not user input); the terms themselves stay
+    bound parameters.
+
+    Falls back to a single un-weighted ``ts_rank_cd`` when the corpus is empty,
+    where every IDF would be identical anyway.
+    """
+
+    total, frequencies = _postgres_document_frequencies(state, tokens)
+    if not tokens or not total:
+        return (
+            f"ts_rank_cd('{{{_TS_RANK_WEIGHTS}}}', chunks_fts.search_vector, "
+            f"query_ts, {_TS_RANK_NORMALIZATION})",
+            [],
+        )
+    terms: list[str] = []
+    params: list[object] = []
+    for token in dict.fromkeys(tokens):
+        weight = _idf(total, frequencies.get(token, 0))
+        terms.append(
+            f"{weight:.6f} * ts_rank_cd('{{{_TS_RANK_WEIGHTS}}}', chunks_fts.search_vector, "
+            f"to_tsquery('simple', ?), {_TS_RANK_NORMALIZATION})"
+        )
+        params.append(token)
+    return "(" + " + ".join(terms) + ")", params
 
 
 class SearchStore:
@@ -140,9 +291,20 @@ class SearchStore:
         # Params are positional, so they must be assembled in the order the
         # placeholders appear in the final SQL: the ranking expression sits in
         # the SELECT, ahead of every WHERE clause.
-        prior_sql, prior_params = _structural_prior(steering, tokens)
-        params: list[object] = [*prior_params, match_expr]
-        where = "chunks_fts MATCH ?"
+        postgres = bool(getattr(self.state, "dialect", None) and self.state.dialect.is_postgres)
+        prior_sql, prior_params = _structural_prior(steering, tokens, postgres=postgres)
+        rank_sql, rank_params = "", []
+        if postgres:
+            match_expr = " | ".join(dict.fromkeys(tokens)) if tokens else query
+            rank_sql, rank_params = _postgres_rank_expression(self.state, tokens)
+        # Params are positional, so they must be assembled in the order the
+        # placeholders appear in the final SQL. On Postgres the ranking
+        # expression (`-{rank_sql}`) precedes the divisor (`/ {prior_sql}`),
+        # which precedes the CROSS JOIN's tsquery, which precedes every WHERE
+        # clause. On SQLite `bm25(...)` takes no parameters, so `prior_params`
+        # is still first and this is the order it always was.
+        params: list[object] = [*rank_params, *prior_params, match_expr]
+        where = "search_vector @@ query_ts" if postgres else "chunks_fts MATCH ?"
         exclusion_where, exclusion_params = _exclusion_sql(steering)
         if source_name:
             where += " AND source_id = ?"
@@ -166,19 +328,47 @@ class SearchStore:
         where += exclusion_where
         params.extend(exclusion_params)
         params.append(max_results)
-        sql = f"""
-        SELECT chunks_fts.chunk_id, chunks_fts.source_id, chunks_fts.artifact_id,
-               chunks_fts.path, chunks_fts.heading_path, chunks.text,
-               chunks.start_line, chunks.end_line, artifacts.path AS absolute_path,
-               artifacts.relative_path,
-               bm25(chunks_fts, {_BM25_WEIGHTS}) / {prior_sql} AS rank_score
-        FROM chunks_fts
-        JOIN chunks ON chunks.id = chunks_fts.chunk_id
-        JOIN artifacts ON artifacts.id = chunks_fts.artifact_id
-        {memory_join}
-        WHERE {where}
-        ORDER BY rank_score LIMIT ?
-        """
+        if postgres:
+            # `ts_rank_cd` is positive-better; `bm25()` is negative-better and
+            # everything downstream — the ORDER BY, and the `raw < 0` score
+            # mapping below — is built around that. Negating here preserves
+            # both, so the result-processing loop is shared rather than forked.
+            #
+            # The weight array is ordered {D,C,B,A}. It carries the measured
+            # 8/3/2/1 column weights from the 2026-08-03 retrieval overhaul,
+            # normalized onto ts_rank_cd's 0-1 scale: title A, path B,
+            # heading_path C, text D. This preserves the *ordering* of the four
+            # fields' importance. It does not reproduce BM25's arithmetic, and
+            # `tests/test_backend_parity.py` gates on measured retrieval
+            # quality rather than on the two backends agreeing on a number.
+            sql = f"""
+            SELECT chunks_fts.chunk_id, chunks_fts.source_id, chunks_fts.artifact_id,
+                   chunks_fts.path, chunks_fts.heading_path, chunks.text,
+                   chunks.start_line, chunks.end_line, artifacts.path AS absolute_path,
+                   artifacts.relative_path,
+                   -{rank_sql} / {prior_sql} AS rank_score
+            FROM chunks_fts
+            JOIN chunks ON chunks.id = chunks_fts.chunk_id
+            JOIN artifacts ON artifacts.id = chunks_fts.artifact_id
+            CROSS JOIN to_tsquery('simple', ?) AS query_ts
+            {memory_join}
+            WHERE {where}
+            ORDER BY rank_score LIMIT ?
+            """
+        else:
+            sql = f"""
+            SELECT chunks_fts.chunk_id, chunks_fts.source_id, chunks_fts.artifact_id,
+                   chunks_fts.path, chunks_fts.heading_path, chunks.text,
+                   chunks.start_line, chunks.end_line, artifacts.path AS absolute_path,
+                   artifacts.relative_path,
+                   bm25(chunks_fts, {_BM25_WEIGHTS}) / {prior_sql} AS rank_score
+            FROM chunks_fts
+            JOIN chunks ON chunks.id = chunks_fts.chunk_id
+            JOIN artifacts ON artifacts.id = chunks_fts.artifact_id
+            {memory_join}
+            WHERE {where}
+            ORDER BY rank_score LIMIT ?
+            """
         try:
             rows = self.state.rows(sql, tuple(params))
         except Exception:
@@ -383,14 +573,35 @@ def corpus_vocabulary(state: StateStore, limit: int = 64) -> list[tuple[str, int
     (not raw count) is deliberate: a term repeated 400 times in one file
     describes that file, while a term appearing once in 400 files describes
     the corpus.
+
+    On Postgres ``chunks_vocab`` does not exist — ``fts5vocab`` is an SQLite
+    virtual-table module — so the equivalent comes from ``ts_stat`` over the
+    same ``search_vector`` the queries run against. Without that branch the
+    ``except`` below swallowed a missing-relation error and every Postgres
+    region published a contract with an **empty vocabulary**, which is the one
+    field the router scores regions on: the region would have been silently
+    unroutable while looking healthy. ``ts_stat`` scans the index rather than
+    reading a maintained table, but this runs once per sync (contract
+    publication), not per query.
     """
+    postgres = bool(getattr(state, "dialect", None) and state.dialect.is_postgres)
     try:
-        rows = state.rows(
-            "SELECT term, doc FROM chunks_vocab WHERE length(term) > 3 "
-            "AND term NOT GLOB '*[0-9]*' ORDER BY doc DESC, term ASC LIMIT ?",
-            (limit * 4,),
-        )
+        if postgres:
+            rows = state.rows(
+                "SELECT word AS term, ndoc AS doc FROM "
+                "ts_stat('SELECT search_vector FROM chunks_fts') "
+                "WHERE length(word) > 3 AND word !~ '[0-9]' "
+                "ORDER BY ndoc DESC, word ASC LIMIT ?",
+                (limit * 4,),
+            )
+        else:
+            rows = state.rows(
+                "SELECT term, doc FROM chunks_vocab WHERE length(term) > 3 "
+                "AND term NOT GLOB '*[0-9]*' ORDER BY doc DESC, term ASC LIMIT ?",
+                (limit * 4,),
+            )
     except Exception:  # fts5vocab unavailable (older SQLite) — degrade quietly
+        logger.warning("Corpus vocabulary unavailable; publishing an empty one", exc_info=True)
         return []
     out: list[tuple[str, int]] = []
     for row in rows:

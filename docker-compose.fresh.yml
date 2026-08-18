@@ -32,10 +32,9 @@ services:
     volumes:
       - "pheasant-config:/config"
       - "pheasant-state:/state"
-      - "pheasant-vault:/vault"
       - "pheasant-exports:/exports"
     # Recreating this service is the reset operation. Targets are explicit and
-    # restricted to the four named-volume mount points above.
+    # restricted to the three named-volume mount points above.
     entrypoint: ["/app/docker-fresh-entrypoint.sh"]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health || exit 1"]
@@ -47,5 +46,4 @@ services:
 volumes:
   pheasant-config:
   pheasant-state:
-  pheasant-vault:
   pheasant-exports:

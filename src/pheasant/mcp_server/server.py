@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 def create_mcp_tools(config: PheasantConfig) -> PheasantTools:
     """Return a tool facade usable by MCP adapters or direct tests.
 
-    The optional official MCP SDK can wrap this facade at runtime; keeping the core
-    implementation dependency-light makes CLI/API tests deterministic.
+    The optional official MCP SDK can wrap this facade at runtime; keeping the
+    core implementation free of it makes CLI/API tests deterministic and lets a
+    core-only install use the same tools over HTTP.
     """
 
     return PheasantTools(config)
@@ -37,8 +38,12 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         "pheasant",
         instructions=(
             "Use pheasant to sync configured knowledge sources, search indexed context, "
-            "inspect graph relationships, and export Obsidian-compatible notes."
+            "inspect graph relationships, and record or recall agent memory."
         ),
+        # Stateless by design, and load-bearing for horizontal scale (Phase
+        # 35.6): with no per-session server state, two requests from one agent
+        # may land on different replicas and both answer correctly. A sticky
+        # session would make the replica count a lie. Pinned by a test.
         stateless_http=True,
         json_response=True,
     )
@@ -255,6 +260,8 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         node_types: list[str] | None = None,
         min_score: float | None = None,
         memory: dict | str | None = None,
+        source_types: list[str] | None = None,
+        exclude_source_types: list[str] | None = None,
     ) -> dict:
         """Search indexed context and return compact results with provenance.
 
@@ -265,6 +272,11 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         taxonomy, matched against the breadcrumb — "§ 12.3", "Article IV" or a
         section's wording all work, and naming a parent returns everything
         nested under it. Only meaningful for sources with taxonomy enabled.
+
+        source_types/exclude_source_types scope by the kind of source —
+        repository, notion, slack, markdown_folder — rather than by name, which
+        is usually what you want when you do not already know every source in
+        the region. Every hit reports its own under provenance.source_type.
 
         source_name/exclude_sources/node_types/min_score are retrieval
         criteria you can set per call instead of relying on how the region
@@ -295,6 +307,8 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             node_types=node_types,
             min_score=min_score,
             memory=memory,
+            source_types=source_types,
+            exclude_source_types=exclude_source_types,
         )
 
     @mcp.tool()
@@ -322,6 +336,8 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         node_types: list[str] | None = None,
         min_score: float | None = None,
         memory: dict | str | None = None,
+        source_types: list[str] | None = None,
+        exclude_source_types: list[str] | None = None,
     ) -> dict:
         """Try retrieval criteria and see how they differ from the configuration.
 
@@ -341,6 +357,8 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             node_types=node_types,
             min_score=min_score,
             memory=memory,
+            source_types=source_types,
+            exclude_source_types=exclude_source_types,
         )
 
     @mcp.tool()
@@ -354,6 +372,8 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         principal: str | None = None,
         principal_groups: list[str] | None = None,
         options: dict | None = None,
+        source_types: list[str] | None = None,
+        exclude_source_types: list[str] | None = None,
     ) -> dict:
         """Answer a question from the knowledge base, with citations and graph facts.
 
@@ -372,6 +392,8 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             principal=principal,
             principal_groups=principal_groups,
             options=options,
+            source_types=source_types,
+            exclude_source_types=exclude_source_types,
         )
 
     @mcp.tool()
@@ -426,24 +448,6 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         """Explain what an indexed graph node represents."""
 
         return tools.explain_node(knowledge_base, node_id)
-
-    @mcp.tool()
-    def export_obsidian_notes(
-        knowledge_base: str,
-        source_name: str | None = None,
-        scope: str = "knowledge_base",
-        preview: bool = False,
-        template_profile: str | None = None,
-    ) -> dict:
-        """Write or update Obsidian-compatible Markdown notes."""
-
-        return tools.export_obsidian_notes(
-            knowledge_base,
-            source_name,
-            scope,
-            preview,
-            template_profile,
-        )
 
     @mcp.tool()
     def get_sync_status(knowledge_base: str) -> dict:

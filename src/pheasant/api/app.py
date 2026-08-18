@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Annotated
 import yaml
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from pheasant.assistant.credentials import SessionKeyStore
@@ -23,11 +25,13 @@ from pheasant.config.loader import (
 )
 from pheasant.config.profiles import profile_names
 from pheasant.config.schema import PheasantConfig, SourceConfig, SourceType
+from pheasant.deployment.roles import describe as describe_role
+from pheasant.deployment.roles import resolve_role, validate_role
+from pheasant.deployment.serving import RETRY_AFTER_SECONDS, ConcurrencyLimiter, DrainState
 from pheasant.graph.exporter import cytoscape, node_link
 from pheasant.graph.simple import SimpleMultiDiGraph
 from pheasant.ingestion.pipeline import read_text, utc_now
 from pheasant.jobs import JobRegistry
-from pheasant.obsidian.exporter import ObsidianExporter
 from pheasant.persistence.paths import StatePaths
 from pheasant.persistence.state_store import StateStore
 from pheasant.registry.knowledge_base_registry import KnowledgeBaseRegistry
@@ -41,6 +45,8 @@ from pheasant.security.path_policy import (
 )
 from pheasant.sync.engine import SyncEngine
 from pheasant.sync.fingerprint import EMBEDDING_SCOPE, embedding_fingerprint
+from pheasant.sync.remote_worker import ResultCache
+from pheasant.telemetry import metrics
 from pheasant.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -113,6 +119,12 @@ class SearchRequest(BaseModel):
     exclude_sources: list[str] | None = None
     node_types: list[str] | None = None
     min_score: float | None = None
+    # Scope by the *kind* of source (repository, notion, slack, ...) rather
+    # than by name. A caller that does not already know every source in the
+    # region can still say "only our wikis" or "nothing from git". Each hit
+    # reports its own under `provenance.source_type`.
+    source_types: list[str] | None = None
+    exclude_source_types: list[str] | None = None
     # How this region's agent memory takes part: "auto" (default), "off",
     # "only", "prefer", or an object with scopes/subject/current_only/as_of.
     memory: dict | str | None = None
@@ -163,12 +175,6 @@ class SyncRequest(BaseModel):
     # "sync now" button) sets this false and polls `GET /sources`'
     # `syncing`/`sync_error` fields instead.
     wait: bool = True
-
-
-class ObsidianExportRequest(BaseModel):
-    source_name: str | None = None
-    preview: bool = False
-    template_profile: str | None = None
 
 
 class RegisterSourceRequest(BaseModel):
@@ -232,6 +238,10 @@ class ChatRequest(BaseModel):
     mode: str = "hybrid"
     max_results: int | None = None
     source_name: str | None = None
+    # Scope the answer to (or away from) kinds of source. Same axis as
+    # `POST /search`'s, applied to every retrieval the answering loop runs.
+    source_types: list[str] | None = None
+    exclude_source_types: list[str] | None = None
     principal: str | None = None
     principal_groups: list[str] = []
     # Override assistant.workflow for this one question ("simple",
@@ -329,6 +339,30 @@ class RemotePrepareRequest(BaseModel):
     git_metadata: list[str | bool | None] | None = None
 
 
+#: Tasks a worker will accept in one batch. Every task holds its file's bytes
+#: in memory, so this is a memory bound, not a politeness limit: at the
+#: 25 MB-per-file default a 64-task batch is already a 1.6 GB worst case, and
+#: the coordinator's own default batch is far smaller.
+MAX_PREPARE_BATCH = 64
+
+#: Entries in the per-worker idempotency cache.
+PREPARE_CACHE_SIZE = 256
+
+
+class RemotePrepareBatchRequest(BaseModel):
+    """Several preparation tasks in one request (Phase 35.5).
+
+    ``idempotency_keys`` is content-addressed by the coordinator, so a retry
+    after a timeout carries the same keys and is answered from cache instead
+    of re-parsed. ``deadline_seconds`` is the caller's remaining budget: the
+    worker stops rather than finishing a batch nobody is waiting for.
+    """
+
+    tasks: list[RemotePrepareRequest]
+    idempotency_keys: list[str] | None = None
+    deadline_seconds: float | None = None
+
+
 #: One line per retrieval knob, so a UI (or an agent reading
 #: ``describe_retrieval``) can explain a setting without the caller having to
 #: go and read the workflow module's docstring.
@@ -357,7 +391,6 @@ LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
     "search": True,
     "assistant": True,
     "graph": True,
-    "obsidian": True,
     "memory": True,
     "ingestion": False,  # captioner/transcriber are wired at engine construction
     "sync": False,  # watcher/scheduler services are started at boot
@@ -376,7 +409,6 @@ def _allowed_roots(config: PheasantConfig) -> list[Path]:
     """
     roots = [
         config.pheasant.workspace_root,
-        config.pheasant.vault_path,
         config.pheasant.exports_path,
         *config.security.allow_workspace_roots,
     ]
@@ -401,7 +433,6 @@ def _configured_roots(config: PheasantConfig) -> list[Path]:
     """
     roots = [
         config.pheasant.workspace_root,
-        config.pheasant.vault_path,
         config.pheasant.exports_path,
         *config.security.allow_workspace_roots,
     ]
@@ -427,7 +458,6 @@ def _config_write_roots(config: PheasantConfig) -> list[Path]:
     """
     roots = [
         config.pheasant.workspace_root,
-        config.pheasant.vault_path,
         config.pheasant.exports_path,
         *config.security.allow_workspace_roots,
     ]
@@ -554,6 +584,19 @@ def graph_neighbors(
                 if target_type in exclude_node_types:
                     continue
             next_depth = current_depth + 1
+            # One entry per *node*, not per edge into it. `visited` guarded the
+            # queue but not the append, so a node reachable by two paths was
+            # listed twice — every consumer treats this as a node list, and
+            # `graph_slice` built its `nodes` payload straight off it, so the
+            # canvas received duplicate element ids. It also charged the same
+            # node to the budget twice, cutting a bounded slice short of the
+            # structure it was asked for. First sighting wins, which is BFS
+            # order and therefore the shortest path — the same rule `depths`
+            # applies. No edge is lost: `graph_slice` derives links from the
+            # graph itself, so both parents still draw.
+            if target in visited:
+                continue
+            visited.add(target)
             edge_type_values = sorted({data.get("type") for data in matching if data.get("type")})
             neighbors.append(
                 {
@@ -564,9 +607,7 @@ def graph_neighbors(
                     "node": dict(graph.nodes.get(target, {})),
                 }
             )
-            if target not in visited:
-                visited.add(target)
-                queue.append((target, next_depth, [*path, target]))
+            queue.append((target, next_depth, [*path, target]))
             # A single hub can have thousands of out-edges, so the budget has
             # to bind inside the fan-out, not just between hops.
             if max_nodes is not None and len(neighbors) >= max_nodes:
@@ -732,6 +773,7 @@ def graph_slice(
 def create_app(
     config: PheasantConfig | None = None,
     config_path: str | Path | None = None,
+    role: str | None = None,
 ) -> FastAPI:
     resolved_config_path = (
         str(config_path)
@@ -740,9 +782,14 @@ def create_app(
     )
     if config is None:
         config = load_config(resolved_config_path)
+    # Phase 35.6: which jobs this process takes on. `all` is the default and
+    # is byte-identical to pre-roles behavior; the one that changes anything
+    # here is `api`, which publishes index work instead of running it.
+    role_policy = resolve_role(config, role)
+    validate_role(role_policy, config)
     paths = StatePaths.from_config(config)
     paths.ensure()
-    state = StateStore(paths.sqlite)
+    state = StateStore.from_config(config, paths.sqlite)
     state.migrate()
     SourceRegistry(config, state).initialize()
     engine = SyncEngine(config, paths, state)
@@ -765,6 +812,20 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         import asyncio
+
+        # Drain-on-SIGTERM is installed *here*, not before `uvicorn.run()`.
+        # uvicorn installs its own graceful-shutdown handler inside `run()`,
+        # so a handler installed earlier is simply replaced and never fires.
+        # Lifespan startup runs after `capture_signals()`, which is what lets
+        # this one chain to uvicorn's rather than clobber it.
+        drain_seconds = float(getattr(config.server.api, "drain_seconds", 0) or 0)
+        if drain_seconds > 0:
+            from pheasant.deployment.serving import install_drain_handler
+
+            try:
+                install_drain_handler(app.state.drain, drain_seconds)
+            except ValueError:  # pragma: no cover - not the main thread (TestClient)
+                logger.debug("drain handler not installed: not running in the main thread")
 
         startup_sources = [
             source.name for source in config.sources if source.enabled and source.sync.on_startup
@@ -803,11 +864,20 @@ def create_app(
                 logger.info("Agent workflow ready (langgraph imported and graph compiled)")
 
         threading.Thread(target=_warm_workflows, name="pheasant-warm", daemon=True).start()
-        if mcp_asgi_app is None:
-            yield
-        else:
-            async with mcp_asgi_app.router.lifespan_context(app):
+        try:
+            if mcp_asgi_app is None:
                 yield
+            else:
+                async with mcp_asgi_app.router.lifespan_context(app):
+                    yield
+        finally:
+            held = getattr(app.state, "metrics_queue", None)
+            if held is not None:
+                app.state.metrics_queue = None
+                try:
+                    held.close()
+                except Exception:  # pragma: no cover - shutdown must not raise
+                    logger.debug("could not close the metrics queue handle", exc_info=True)
 
     app = FastAPI(title="pheasant", version=__version__, lifespan=lifespan)
     app.state.config = config
@@ -823,8 +893,16 @@ def create_app(
     # `sync_outcomes` dicts this replaced could only say "true" for however
     # many minutes a first index took, which is indistinguishable from a hang.
     app.state.sync_lock = threading.Lock()
+    app.state.metrics_queue = None
+    app.state.metrics_queue_lock = threading.Lock()
     app.state.jobs = JobRegistry()
     jobs = app.state.jobs
+    # Content-addressed results for `/internal/indexing/prepare-batch`, so a
+    # coordinator's retry after a timeout is a lookup rather than a second
+    # parse. Bounded and LRU: a worker serving a 50k-file source must not
+    # accumulate 50k parse results.
+    app.state.prepare_cache = ResultCache(PREPARE_CACHE_SIZE)
+    metrics.register_default_metrics(__version__)
 
     # The web UI is a separate workload that talks to this API over HTTP, so the
     # browser origin differs in development — but this API is unauthenticated,
@@ -844,6 +922,53 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Phase 35.6: shed rather than queue, and drain before dying. Both are
+    # replica behaviors — the limiter is off by default because with one
+    # process there is nowhere for a shed request to go, so waiting is the
+    # best available answer.
+    app.state.limiter = ConcurrencyLimiter(cors_settings.max_concurrent_requests)
+    app.state.drain = DrainState()
+    limiter: ConcurrencyLimiter = app.state.limiter
+    drain_state: DrainState = app.state.drain
+
+    @app.middleware("http")
+    async def bound_concurrency(request, call_next):  # type: ignore[no-untyped-def]
+        """Admit or refuse immediately; never block.
+
+        Blocking is the behavior being replaced. A fast 429 is what lets a
+        load balancer try another replica while the client is still waiting;
+        a slow one is just a timeout with extra steps.
+        """
+
+        path = request.url.path
+        if not limiter.acquire(path):
+            metrics.REGISTRY.inc("pheasant_requests_shed_total", path=_metric_path(path))
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "detail": (
+                        f"this replica is at its {limiter.limit}-request concurrency limit; "
+                        "retry, ideally against another replica"
+                    )
+                },
+                headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+            )
+        try:
+            return await call_next(request)
+        finally:
+            limiter.release(path)
+
+    def _metric_path(path: str) -> str:
+        """Collapse to the first segment: a label per artifact id is a leak.
+
+        Prometheus cardinality is the failure mode here — `/nodes/content` is
+        a useful label, `/nodes/content?id=<one of 600k>` is a memory leak in
+        the scrape target.
+        """
+
+        head = path.strip("/").split("/", 1)[0]
+        return f"/{head}" if head else "/"
 
     def audit(source_id: str | None, action: str, details: dict | None = None) -> None:
         created_at = utc_now()
@@ -871,25 +996,64 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict:
-        return {"status": "ok", "service": "pheasant"}
+        """Liveness: is this process running at all.
+
+        Carries the role so a pod can be identified from a probe response —
+        "which of these five containers is the indexer" is otherwise a
+        question you answer by reading manifests.
+        """
+
+        return {"status": "ok", "service": "pheasant", "role": role_policy.name}
 
     @app.get("/ready")
     def ready() -> dict:
-        return {"status": "ready", "knowledge_base": config.knowledge_base_id}
+        """Readiness: can this process do its role's job.
 
-    @app.post("/internal/indexing/prepare")
-    def remote_prepare(
-        req: RemotePrepareRequest,
-        authorization: Annotated[str | None, Header()] = None,
-    ) -> dict:
-        """Stateless authenticated parse/chunk worker for remote coordinators."""
+        Distinct from `/health` on purpose, because Kubernetes uses them for
+        different things: a failing liveness probe restarts the pod, a failing
+        readiness probe takes it out of the Service. A process whose state
+        store has gone away should stop receiving traffic, not be restarted
+        into the same problem.
+
+        Deliberately **not** gated on the index being populated. An empty
+        knowledge base still answers searches correctly (with nothing), and a
+        replica that stayed unready through a multi-hour first index would
+        take the whole Service down for that time — which is the opposite of
+        what the readiness probe is for.
+        """
+
+        payload: dict[str, object] = {
+            "status": "ready",
+            "knowledge_base": config.knowledge_base_id,
+            **describe_role(role_policy),
+        }
+        if drain_state.draining:
+            # SIGTERM has arrived. Reporting not-ready *before* the process
+            # stops accepting work is the entire drain mechanism: Kubernetes
+            # removes endpoints and sends SIGTERM concurrently, and endpoint
+            # propagation is not instant, so a process that exits promptly
+            # drops whatever was routed to it in the gap.
+            payload["status"] = "draining"
+            payload["draining_for_seconds"] = round(drain_state.draining_for, 1)
+            return JSONResponse(status_code=503, content=payload)  # type: ignore[return-value]
+        try:
+            state.rows("SELECT 1 AS ok", ())
+        except Exception as exc:  # noqa: BLE001 - any failure means not ready
+            logger.warning("readiness probe failed: %s", exc)
+            payload["status"] = "not_ready"
+            payload["reason"] = "state store unreachable"
+            return JSONResponse(status_code=503, content=payload)  # type: ignore[return-value]
+        return payload
+
+    def _authorize_worker(authorization: str | None) -> None:
+        """Gate + constant-time token check shared by both worker routes."""
 
         concurrency = config.sync.concurrency
         if not concurrency.remote_worker_enabled:
             raise HTTPException(status_code=404, detail="remote indexing worker is disabled")
         import hmac
 
-        from pheasant.sync.remote_worker import RemoteWorkerError, configured_token, prepare_task
+        from pheasant.sync.remote_worker import RemoteWorkerError, configured_token
 
         try:
             expected = configured_token(concurrency.remote_worker_token_env)
@@ -898,19 +1062,163 @@ def create_app(
         scheme, _, supplied = (authorization or "").partition(" ")
         if scheme.lower() != "bearer" or not hmac.compare_digest(supplied, expected):
             raise HTTPException(status_code=401, detail="invalid indexing worker token")
+
+    def _check_task_size(payload: dict) -> None:
         max_mb = config.sync.limits.max_file_size_mb
-        encoded = str(req.payload.get("content_base64") or "")
+        encoded = str(payload.get("content_base64") or "")
         if max_mb is not None and len(encoded) > int(max_mb) * 1024 * 1024 * 4 // 3 + 4:
             raise HTTPException(status_code=413, detail="indexing task exceeds max_file_size_mb")
+
+    @app.post("/internal/indexing/prepare")
+    def remote_prepare(
+        req: RemotePrepareRequest,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict:
+        """Stateless authenticated parse/chunk worker for remote coordinators."""
+
+        from pheasant.sync.remote_worker import RemoteWorkerError, prepare_task
+
+        _authorize_worker(authorization)
+        _check_task_size(req.payload)
         try:
             parsed = prepare_task(req.model_dump())
         except (KeyError, TypeError, ValueError, RemoteWorkerError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"parsed": parsed}
 
+    @app.post("/internal/indexing/prepare-batch")
+    def remote_prepare_batch(
+        req: RemotePrepareBatchRequest,
+        authorization: Annotated[str | None, Header()] = None,
+        x_pheasant_deadline_seconds: Annotated[str | None, Header()] = None,
+    ) -> dict:
+        """Prepare several tasks in one request (Phase 35.5).
+
+        The value is not the round trips saved — though on a large source that
+        is most of the transport cost. It is that a batch carries the caller's
+        remaining deadline and a content address per task, so a worker can
+        decline work whose caller has given up and answer a duplicate from
+        cache. Those two together are what make at-least-once retry cheap
+        enough to actually do.
+        """
+
+        import time
+
+        from pheasant.sync.remote_worker import (
+            DeadlineExceeded,
+            RemoteWorkerError,
+            prepare_batch_tasks,
+        )
+
+        _authorize_worker(authorization)
+        if not req.tasks:
+            return {"results": []}
+        if len(req.tasks) > MAX_PREPARE_BATCH:
+            raise HTTPException(
+                status_code=413,
+                detail=f"batch of {len(req.tasks)} exceeds the {MAX_PREPARE_BATCH}-task limit",
+            )
+        for task in req.tasks:
+            _check_task_size(task.payload)
+
+        budget = req.deadline_seconds
+        if budget is None:
+            try:
+                budget = float(x_pheasant_deadline_seconds or "")
+            except ValueError:
+                budget = None
+        if budget is not None and budget <= 0:
+            raise HTTPException(status_code=408, detail="caller deadline already passed")
+        started = time.monotonic()
+
+        def remaining() -> float | None:
+            return None if budget is None else budget - (time.monotonic() - started)
+
+        try:
+            results = prepare_batch_tasks(
+                [task.model_dump() for task in req.tasks],
+                list(req.idempotency_keys or []),
+                cache=app.state.prepare_cache,
+                deadline=remaining,
+            )
+        except DeadlineExceeded as exc:
+            raise HTTPException(status_code=408, detail=str(exc)) from exc
+        except (KeyError, TypeError, ValueError, RemoteWorkerError) as exc:
+            # One bad task fails the batch: the coordinator's fallback is to
+            # prepare locally, which handles every task the remote path
+            # refuses, so isolating the offender would buy nothing.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        cache = app.state.prepare_cache
+        return {
+            "results": results,
+            "cache": {"hits": cache.hits, "misses": cache.misses, "size": len(cache)},
+        }
+
+    def _metrics_queue():
+        """The scrape's queue handle, created once and reused.
+
+        Under a lock: two concurrent scrapes would otherwise each build one
+        and the loser's handle would leak — on `nats` that is a live
+        connection nothing ever closes.
+        """
+
+        with app.state.metrics_queue_lock:
+            queue = getattr(app.state, "metrics_queue", None)
+            if queue is None:
+                from pheasant.sync.queue import queue_from_config
+
+                queue = queue_from_config(config, state)
+                app.state.metrics_queue = queue
+            return queue
+
     @app.get("/metrics")
-    def metrics() -> str:
-        return "pheasant_up 1\n"
+    def metrics_endpoint() -> PlainTextResponse:
+        """Prometheus exposition text (Phase 35.1).
+
+        Named ``metrics_endpoint``, not ``metrics``: every route in this module
+        is a closure over ``create_app``, so a local named ``metrics`` would
+        shadow the imported :mod:`pheasant.telemetry.metrics` for *every other
+        route in the file* — the search handler would raise ``AttributeError``
+        on ``metrics.REGISTRY`` and only at request time.
+
+        Graph size and job state are sampled here rather than tracked
+        incrementally: both are cheap to read, and a gauge updated from a
+        write path drifts the moment any path forgets to update it.
+        """
+
+        graph = engine.graph_builder.graph
+        sample: dict[str, object] = {
+            "pheasant_graph_nodes": graph.number_of_nodes(),
+            "pheasant_graph_edges": graph.number_of_edges(),
+            "pheasant_requests_inflight": limiter.inflight,
+            "pheasant_draining": 1.0 if drain_state.draining else 0.0,
+        }
+        sample.update(jobs.metrics_sample())
+        # With the durable queue on, the backlog outlives this process, so
+        # the in-memory job registry is no longer the whole truth — an HPA
+        # reading only it would see zero while a restarted fleet's rows sit
+        # waiting. The queue's own depth wins where it exists (Phase 35.5).
+        try:
+            from pheasant.sync.queue import DEAD, INFLIGHT, PENDING
+
+            # Held open across scrapes rather than built and closed per
+            # request. Prometheus scrapes every 15s by default, per replica,
+            # and on the `nats` backend building one meant a full TCP +
+            # JetStream connect and teardown each time — a broker connection
+            # storm proportional to fleet size, paid to read three integers.
+            # Closed by the lifespan's `finally`.
+            queue = _metrics_queue()
+            if queue is not None:
+                depth = queue.depth()
+                sample["pheasant_index_queue_depth"] = depth.get(PENDING, 0)
+                sample["pheasant_index_inflight"] = depth.get(INFLIGHT, 0)
+                sample["pheasant_index_dead_letters"] = depth.get(DEAD, 0)
+        except Exception:  # pragma: no cover - a scrape must never 500
+            logger.debug("could not sample index queue depth", exc_info=True)
+        return PlainTextResponse(
+            metrics.render_with(sample),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     @app.get("/contract")
     def contract() -> dict:
@@ -942,6 +1250,11 @@ def create_app(
         instant a job completes, which is exactly when a caller most wants to
         know whether it succeeded. `job` adds the phase and counter behind
         that boolean, which is what turns a spinner into a progress bar.
+
+        `progress` (Phase 35.1) narrows that to *this* source's slice of the
+        job. `job` is the whole run, so under `sync_all` every source in the
+        list showed the same aggregate counter and the one source that was
+        stuck looked exactly like the seven that were fine.
         """
         for record in records:
             name = record.get("name")
@@ -952,6 +1265,7 @@ def create_app(
             record["syncing"] = active is not None
             record["sync_error"] = last.error if last else None
             record["job"] = active.as_dict() if active else None
+            record["progress"] = jobs.source_progress(name)
         return records
 
     @app.get("/sources")
@@ -1019,6 +1333,7 @@ def create_app(
         result = None
         syncing = False
         job_id = None
+        queued: list[str] = []
         if req.sync_now:
             if req.wait:
                 try:
@@ -1026,7 +1341,7 @@ def create_app(
                 except (KeyError, ValueError) as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
             else:
-                job_id = _start_background_sync(source.name, req.sync_mode)
+                job_id, queued = _start_background_sync(source.name, req.sync_mode)
                 syncing = True
         return {
             "status": "registered",
@@ -1035,6 +1350,7 @@ def create_app(
             "sync_result": result,
             "syncing": syncing,
             "job_id": job_id,
+            "queued_tasks": queued,
             "config_update_required": True,
         }
 
@@ -1180,7 +1496,22 @@ def create_app(
         The server deliberately does not index in-process: that work is
         CPU-bound Python and, under the GIL, it starves the very requests this
         API exists to answer. See :mod:`pheasant.sync.worker`.
+
+        A role that does not index refuses here rather than silently doing it
+        anyway. `wait: true` asks this process to run a sync and return the
+        result, and an api replica cannot honour that — it can only publish,
+        which is a different promise. Saying so with a 409 and the fix is
+        better than either lying or quietly changing the contract.
         """
+
+        if not role_policy.indexes_locally:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"role '{role_policy.name}' does not index; retry with wait=false to "
+                    "queue this sync for an indexer to run"
+                ),
+            )
 
         from pheasant.sync.worker import WorkerBackedEngine
 
@@ -1208,12 +1539,15 @@ def create_app(
         from pheasant.sync.worker import WorkerBackedEngine
 
         def forward(event: dict) -> None:
+            meta = event.get("meta") or {}
             jobs.progress(
                 job_id,
                 phase=event.get("phase"),
                 current=event.get("current"),
                 total=event.get("total"),
                 detail=event.get("detail"),
+                source=meta.get("source") or None,
+                stats=meta,
             )
 
         try:
@@ -1249,9 +1583,28 @@ def create_app(
             },
         )
 
-    def _start_background_sync(source_name: str | None, mode: str) -> str | None:
-        """Start a background sync. Returns the job id, or None if one is
-        already running over the same source.
+    def _background_status(job_id: str | None, queued: list[str]) -> str:
+        """Three outcomes, three words — `syncing` used to cover all of them.
+
+        `queued` is not `syncing`: nothing is indexing yet, an indexer has to
+        claim the task first, and there is no local job to watch.
+        """
+
+        if job_id:
+            return "syncing"
+        return "queued" if queued else "already_syncing"
+
+    def _start_background_sync(source_name: str | None, mode: str) -> tuple[str | None, list[str]]:
+        """Start a background sync. Returns ``(job_id, queued_task_ids)``.
+
+        ``job_id`` is None when one is already running over the same source,
+        **and** when this process does not index: an ``api`` replica publishes
+        to the queue, and a queue task is not a job. Returning its id in the
+        ``job_id`` field made every caller poll ``GET /jobs/<task id>``, which
+        404s — the registry is in-process and the task belongs to an indexer
+        in another pod. The ids are reported separately, under their own name,
+        so the response says what actually happened instead of implying
+        progress the api role cannot observe.
 
         Refusing the overlap matters: found live, a source with
         `sync.on_startup: true` and no checkpoint yet (so every attempt does a
@@ -1264,10 +1617,12 @@ def create_app(
         racing in before the first thread has even started.
         """
         names = [source_name] if source_name else [s.name for s in config.sources if s.enabled]
+        if not role_policy.indexes_locally:
+            return None, _publish_background_sync(names, mode)
         with app.state.sync_lock:
             to_start = [name for name in names if jobs.active_for(name) is None]
             if not to_start:
-                return None
+                return None, []
             job = jobs.create(
                 "sync",
                 f"Indexing {source_name}" if source_name else "Indexing all sources",
@@ -1279,15 +1634,62 @@ def create_app(
             name=f"pheasant-bgsync-{source_name or 'all'}",
             daemon=True,
         ).start()
-        return job.id
+        return job.id, []
+
+    def _publish_background_sync(names: list[str], mode: str) -> list[str]:
+        """Hand the work to an indexer instead of running it here.
+
+        This is what the ``api`` role *is*. Three api replicas that each
+        indexed on request would put three processes on one source; publishing
+        means whichever indexer is free picks it up, exactly once, and the
+        caller still gets an id to poll.
+
+        Task ids are content-addressed on (knowledge base, source, mode) —
+        the same rule ``sync_all`` uses — so two replicas answering the same
+        user's double-click enqueue one task, not two.
+        """
+
+        import hashlib
+
+        from pheasant.sync.queue import IndexTask, queue_from_config
+
+        queue = queue_from_config(config, state)
+        if queue is None:  # pragma: no cover - validate_role refuses this at startup
+            raise HTTPException(
+                status_code=503,
+                detail="this process does not index and no queue is configured",
+            )
+        published: list[str] = []
+        try:
+            for name in names:
+                digest = hashlib.sha256(
+                    f"{config.knowledge_base_id}\0{name}\0{mode}".encode()
+                ).hexdigest()[:24]
+                task = IndexTask(
+                    id=f"idx-{digest}",
+                    source_id=name,
+                    mode=str(mode),
+                    payload={"max_depth": None, "full_scan": False},
+                    max_attempts=max(1, int(config.sync.queue.max_attempts or 1)),
+                )
+                try:
+                    queue.publish(task)
+                    published.append(task.id)
+                except Exception as exc:  # noqa: BLE001 - already queued is not an error
+                    logger.debug("Index task for %s already queued (%s)", name, exc)
+                    published.append(task.id)
+        finally:
+            queue.close()
+        return published
 
     @app.post("/sync")
     def sync_all(req: SyncRequest) -> dict:
         if not req.wait:
-            job_id = _start_background_sync(None, req.mode)
+            job_id, queued = _start_background_sync(None, req.mode)
             return {
-                "status": "syncing" if job_id else "already_syncing",
+                "status": _background_status(job_id, queued),
                 "job_id": job_id,
+                "queued_tasks": queued,
                 "sources": [s.name for s in config.sources if s.enabled],
             }
         try:
@@ -1312,10 +1714,11 @@ def create_app(
             )
             if not known:
                 raise HTTPException(status_code=404, detail=f"Unknown source: {source_id}")
-            job_id = _start_background_sync(source_id, mode)
+            job_id, queued = _start_background_sync(source_id, mode)
             return {
-                "status": "syncing" if job_id else "already_syncing",
+                "status": _background_status(job_id, queued),
                 "job_id": job_id,
+                "queued_tasks": queued,
                 "source_id": source_id,
             }
         try:
@@ -1404,6 +1807,7 @@ def create_app(
 
         syncing = False
         job_id = None
+        queued: list[str] = []
         sync_result = None
         if sync_now:
             if wait:
@@ -1412,8 +1816,8 @@ def create_app(
                 except (KeyError, ValueError) as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
             else:
-                job_id = _start_background_sync(name, "incremental")
-                syncing = job_id is not None
+                job_id, queued = _start_background_sync(name, "incremental")
+                syncing = job_id is not None or bool(queued)
         return {
             "status": "stored",
             "source_name": name,
@@ -1422,6 +1826,7 @@ def create_app(
             "rejected": rejected,
             "syncing": syncing,
             "job_id": job_id,
+            "queued_tasks": queued,
             "sync_result": sync_result,
         }
 
@@ -1772,20 +2177,38 @@ def create_app(
 
         # Over-fetch when a post-filter will drop rows, so `max_results` keeps
         # meaning "give me this many" — the same bookkeeping the MCP tool does.
-        filtering = criteria_active(req.exclude_sources, req.node_types, req.min_score)
-        payload = search.search_context(
-            req.knowledge_base or config.knowledge_base_id,
-            req.query,
-            req.mode,
-            req.max_results * 4 if filtering else req.max_results,
-            req.source_name,
-            graph=engine.graph_builder.graph,
-            principal=req.principal,
-            principal_groups=req.principal_groups,
-            security=config.security,
-            section=req.section,
-            memory=req.memory,
+        filtering = criteria_active(
+            req.exclude_sources,
+            req.node_types,
+            req.min_score,
+            req.source_types,
+            req.exclude_source_types,
         )
+        started = time.perf_counter()
+        try:
+            payload = search.search_context(
+                req.knowledge_base or config.knowledge_base_id,
+                req.query,
+                req.mode,
+                req.max_results * 4 if filtering else req.max_results,
+                req.source_name,
+                graph=engine.graph_builder.graph,
+                principal=req.principal,
+                principal_groups=req.principal_groups,
+                security=config.security,
+                section=req.section,
+                memory=req.memory,
+            )
+        except Exception:
+            metrics.REGISTRY.inc("pheasant_search_total", mode=req.mode, outcome="error")
+            raise
+        finally:
+            # Timed around retrieval only. Wrapping the post-filter too would
+            # fold criteria bookkeeping into what reads as retrieval latency.
+            metrics.REGISTRY.observe(
+                "pheasant_search_duration_seconds", time.perf_counter() - started, mode=req.mode
+            )
+        metrics.REGISTRY.inc("pheasant_search_total", mode=req.mode, outcome="ok")
         if filtering:
             payload = dict(payload)
             payload["results"] = apply_retrieval_criteria(
@@ -1793,6 +2216,8 @@ def create_app(
                 exclude_sources=req.exclude_sources,
                 node_types=req.node_types,
                 min_score=req.min_score,
+                source_types=req.source_types,
+                exclude_source_types=req.exclude_source_types,
             )[: req.max_results]
             payload["criteria"] = criteria_dict(
                 req.source_name,
@@ -1800,6 +2225,8 @@ def create_app(
                 req.node_types,
                 req.min_score,
                 req.memory,
+                req.source_types,
+                req.exclude_source_types,
             )
         return payload
 
@@ -2542,15 +2969,8 @@ def create_app(
         return {**_rebuild_vectors(drop_existing=drop_existing), **_embeddings_status()}
 
     def _merge_into_config_file(patch: dict) -> bool:
-        """Deep-merge ``patch`` into the config file, preserving everything else.
-
-        Rendered the same way ``pheasant up`` renders configs: everything but
-        ``sources`` through the YAML dumper, then the sources list by hand —
-        ``safe_dump`` writes list-of-dict items in a shape the
-        dependency-light yaml shim cannot read back.
-        """
+        """Deep-merge ``patch`` into the config file, preserving everything else."""
         from pheasant.config.loader import deep_merge
-        from pheasant.quickstart import _render_sources_block
 
         path = Path(app.state.config_path)
         if not path.exists():
@@ -2568,12 +2988,8 @@ def create_app(
         if not isinstance(existing, dict):
             return False
         merged = deep_merge(existing, patch)
-        sources = merged.pop("sources", []) or []
-        rendered = dump_config_yaml(merged)
-        if sources:
-            rendered += _render_sources_block(sources)
         try:
-            path.write_text(rendered, encoding="utf-8")
+            path.write_text(dump_config_yaml(merged), encoding="utf-8")
         except OSError as exc:
             raise HTTPException(
                 status_code=409,
@@ -2727,14 +3143,6 @@ def create_app(
         except ConfigError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.post("/obsidian/export")
-    def obsidian_export(req: ObsidianExportRequest | None = None) -> dict:
-        return ObsidianExporter(config, state).export(
-            req.source_name if req else None,
-            preview=req.preview if req else False,
-            template_profile=req.template_profile if req else None,
-        )
-
     # ------------------------------------------------------------------
     # Overview — one call that tells the UI whether there is anything to
     # show yet, and what shape it is. Drives the onboarding empty state.
@@ -2867,6 +3275,8 @@ def create_app(
             mode=req.mode,
             max_results=req.max_results,
             source_name=req.source_name,
+            source_types=req.source_types,
+            exclude_source_types=req.exclude_source_types,
             principal=req.principal,
             principal_groups=req.principal_groups,
             workflow=req.workflow,
@@ -2918,6 +3328,8 @@ def create_app(
                     mode=req.mode,
                     max_results=req.max_results,
                     source_name=req.source_name,
+                    source_types=req.source_types,
+                    exclude_source_types=req.exclude_source_types,
                     principal=req.principal,
                     principal_groups=req.principal_groups,
                     workflow=req.workflow,
@@ -3118,6 +3530,7 @@ def create_app(
         results = []
         syncing: list[str] = []
         job_ids: list[str] = []
+        queued_tasks: list[str] = []
         if req.sync_now:
             if req.wait:
                 from dataclasses import asdict
@@ -3137,9 +3550,10 @@ def create_app(
                 # background; the caller gets sources back already
                 # registered and polls GET /sources' `syncing` field.
                 for entry in created:
-                    job_id = _start_background_sync(entry["name"], req.sync_mode)
+                    job_id, queued = _start_background_sync(entry["name"], req.sync_mode)
                     if job_id:
                         job_ids.append(job_id)
+                    queued_tasks.extend(queued)
                     syncing.append(entry["name"])
         return {
             "status": "registered",
@@ -3147,6 +3561,7 @@ def create_app(
             "sync_results": results,
             "syncing": syncing,
             "job_ids": job_ids,
+            "queued_tasks": queued_tasks,
         }
 
     # Mounted *before* the UI so the SPA catch-all cannot swallow /mcp.

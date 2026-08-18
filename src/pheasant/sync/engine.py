@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -9,10 +11,13 @@ import uuid
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
+from pheasant.capacity import GRAPH_SHARE_OF_RSS, RSS_BYTES_PER_NODE
+from pheasant.capacity import project as project_capacity
 from pheasant.config.schema import FILESYSTEM_SOURCE_TYPES, PheasantConfig, SourceConfig
 from pheasant.graph.builder import GraphBuilder
 from pheasant.ingestion.captioner import captioner_from_config, source_includes_images
@@ -57,18 +62,50 @@ from pheasant.sync.fingerprint import (
     embedding_fingerprint,
     source_fingerprint,
 )
-from pheasant.sync.locks import EngineLease, source_lock
+from pheasant.sync.locks import EngineLease, SourceLease, source_lock
 from pheasant.sync.pacing import serve_yield
+from pheasant.sync.queue import queue_from_config
 
 logger = logging.getLogger(__name__)
 
 SyncMode = Literal["incremental", "full", "validate_only", "repair"]
 SYNC_MODES = {"incremental", "full", "validate_only", "repair"}
 
-#: ``(phase, current, total, detail)`` — everything a progress bar needs.
+#: ``(phase, current, total, detail)``, optionally followed by a ``meta``
+#: mapping (Phase 35.1) carrying ``source`` plus whatever counters the
+#: emitting pass has — ``indexed``, ``skipped``, ``bytes_done``.
 #: ``total`` is None until the connector has finished listing, because it is
 #: not known before then and a made-up denominator is worse than none.
-ProgressHook = Callable[[str, int, int | None, str], None]
+#: Four-argument callbacks stay supported: :func:`_hook_accepts_meta` decides
+#: by signature which form to call, so an existing caller is unaffected.
+ProgressHook = Callable[..., None]
+
+
+def _hook_accepts_meta(hook: ProgressHook) -> bool:
+    """Does this callback take the Phase-35.1 ``meta`` argument?
+
+    Determined once per wrap, by signature, rather than by catching
+    ``TypeError`` around the call — a ``TypeError`` raised *inside* a
+    four-argument hook would otherwise be misread as "wrong arity" and the
+    hook silently re-invoked with different arguments.
+    """
+
+    try:
+        signature = inspect.signature(hook)
+    except (TypeError, ValueError):  # builtins, C callables
+        return False
+    positional = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            continue
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional += 1
+    return positional >= 5
 
 
 def _progress_reporter(hook: ProgressHook | None, source_name: str):
@@ -78,23 +115,82 @@ def _progress_reporter(hook: ProgressHook | None, source_name: str):
     a closed queue, an evicted job, a typo — must cost a log line, not an
     index. Returns a no-op when there is no hook, so the un-instrumented path
     stays exactly as cheap as it was.
+
+    Every event carries its ``source`` in ``meta`` (Phase 35.1). Before this,
+    ``sync_all`` prefixed the source name into the human-readable ``detail``
+    string and nothing could tell the eight sources of one job apart without
+    parsing prose back out of it.
     """
 
     if hook is None:
         return lambda *_args, **_kwargs: None
+
+    wants_meta = _hook_accepts_meta(hook)
 
     def report(
         phase: str,
         current: int = 0,
         total: int | None = None,
         detail: str = "",
+        **stats: Any,
     ) -> None:
         try:
-            hook(phase, current, total, detail)
+            if wants_meta:
+                hook(phase, current, total, detail, {"source": source_name, **stats})
+            else:
+                hook(phase, current, total, detail)
         except Exception:  # pragma: no cover - progress is never load-bearing
             logger.debug("progress hook failed for %s", source_name, exc_info=True)
 
     return report
+
+
+def optimal_checkpoint_interval(
+    save_seconds: float,
+    *,
+    mtbf_seconds: float,
+    floor_seconds: float,
+    ceiling_seconds: float,
+) -> float:
+    """How long to wait between graph checkpoints — Young's formula.
+
+    The previous rule was ``max(60s, last_save * 10)``: space checkpoints at
+    ten times what one costs, holding overhead near **10%**. That is stable
+    and far too expensive. Checkpointing is a solved problem in HPC and ML
+    training, and the standard result is Young's (later Daly's) formula:
+
+        T_opt = sqrt(2 * C * MTBF)
+
+    where ``C`` is what a checkpoint costs and ``MTBF`` is the expected time
+    between interruptions. It minimizes *total* expected time — the sum of
+    checkpoint overhead and the work redone after a crash — rather than
+    either one alone, which is why it is not simply "checkpoint less often".
+
+    On pheasant's measured save costs, against a 24h MTBF:
+
+        corpus        C        old interval / overhead    Young / overhead
+        2,000        0.13s      60s   /  0.2%             150s  / 0.1%
+        20,000       1.32s      60s   /  2.2%             478s  / 0.3%
+        100,000      6.71s      67s   / 10.0%            1077s  / 0.6%
+        250,000     19.91s     199s   / 10.0%            1855s  / 1.1%
+
+    An order of magnitude less overhead, and the cost is bounded rework: at
+    most one interval of indexing is lost, which the ceiling caps at 30
+    minutes by default. On a sync that runs for hours at those sizes, that is
+    the right trade — and it is the trade the formula is choosing, not a
+    guess.
+
+    Degrades sensibly: with no measured save yet (the first checkpoint of a
+    fresh graph) or no MTBF configured, it returns the floor, which is the
+    pre-35.4 behaviour.
+    """
+
+    if save_seconds <= 0 or mtbf_seconds <= 0:
+        return floor_seconds
+    interval = math.sqrt(2.0 * save_seconds * mtbf_seconds)
+    if ceiling_seconds > 0:
+        interval = min(interval, ceiling_seconds)
+    return max(floor_seconds, interval)
 
 
 def _restore_iso_ts(filename_ts: str) -> str:
@@ -221,7 +317,7 @@ class SyncEngine:
         self.config = config
         self.paths = paths or StatePaths.from_config(config)
         self.paths.ensure()
-        self.state = state or StateStore(self.paths.sqlite)
+        self.state = state or StateStore.from_config(self.config, self.paths.sqlite)
         self.state.migrate()
         # Single-writer lease (Synapse 21.2): acquired lazily on the first
         # sync so read-only engines (e.g. docker-exec MCP stdio beside a
@@ -402,15 +498,16 @@ class SyncEngine:
         """
 
         self._graph_dirty = True
-        interval = float(getattr(self.config.storage, "graph_checkpoint_seconds", 0) or 0)
-        if interval <= 0:
+        storage = self.config.storage
+        floor = float(getattr(storage, "graph_checkpoint_seconds", 0) or 0)
+        if floor <= 0:
             return
-        # Self-throttling: a checkpoint costs whatever the graph costs to
-        # serialize, and that grows with the index. Spacing checkpoints at
-        # ten times the last save keeps their overhead near 10% of the sync
-        # no matter how large the graph gets — a fixed interval eventually
-        # means a sync that spends most of its time saving.
-        interval = max(interval, self._last_save_seconds * 10)
+        interval = optimal_checkpoint_interval(
+            self._last_save_seconds,
+            mtbf_seconds=float(getattr(storage, "checkpoint_mtbf_seconds", 0) or 0),
+            floor_seconds=floor,
+            ceiling_seconds=float(getattr(storage, "graph_checkpoint_max_seconds", 0) or 0),
+        )
         if time.monotonic() - self._last_checkpoint < interval:
             return
         try:
@@ -546,6 +643,23 @@ class SyncEngine:
             len(sources),
             max(1, int(self.config.sync.concurrency.max_parallel_sources or 1)),
         )
+        queue = queue_from_config(self.config, self.state)
+        if queue is not None:
+            try:
+                return self._sync_all_queued(
+                    queue,
+                    sources,
+                    mode,
+                    workers=workers,
+                    max_depth=max_depth,
+                    full_scan=full_scan,
+                    on_progress=on_progress,
+                )
+            finally:
+                # This call built the queue, so this call closes it. A no-op
+                # for the local queue; for a broker it is the difference
+                # between one connection per sync and a leak per sync.
+                queue.close()
         if workers == 1:
             return [
                 self.sync_source(
@@ -562,17 +676,31 @@ class SyncEngine:
         # calls while still allowing the source pipelines themselves to overlap.
         progress_lock = threading.Lock()
 
+        forward_meta = on_progress is not None and _hook_accepts_meta(on_progress)
+
         def progress_for(source_name: str) -> ProgressHook:
             def source_progress(
                 phase: str,
                 current: int,
                 total: int | None,
                 detail: str,
+                meta: dict[str, Any] | None = None,
             ) -> None:
+                # Respect the caller's arity. Forwarding five positional
+                # arguments unconditionally defeated `_hook_accepts_meta`: a
+                # four-argument hook — the documented supported form, and what
+                # `sync/worker.py:_as_engine_hook` builds for the in-process
+                # path — raised TypeError on every update, which
+                # `_progress_reporter` swallows at debug level. The result was
+                # a job whose progress bar never moved whenever
+                # `max_parallel_sources > 1`, with nothing in the logs.
                 if on_progress is None:
                     return
                 with progress_lock:
-                    on_progress(phase, current, total, f"[{source_name}] {detail}")
+                    if forward_meta:
+                        on_progress(phase, current, total, detail, meta)
+                    else:
+                        on_progress(phase, current, total, detail)
 
             return source_progress
 
@@ -594,6 +722,115 @@ class SyncEngine:
             # Preserve configured source order in the public result even when
             # a later source finishes first.
             return [future.result() for future in futures]
+
+    def _sync_all_queued(
+        self,
+        queue: Any,
+        sources: list[SourceConfig],
+        mode: SyncMode,
+        *,
+        workers: int,
+        max_depth: int | None,
+        full_scan: bool,
+        on_progress: ProgressHook | None,
+    ) -> list[SyncResult]:
+        """Publish one task per source, then drain.
+
+        The difference from the in-memory path is what survives a kill: a
+        process stopped nine sources into ten leaves the tenth *queued*, so
+        the next run finishes it instead of starting over. Publishing is
+        idempotent — the task id is derived from the knowledge base, source
+        and mode, so re-running does not duplicate a backlog.
+
+        Ordering is by enqueue time, so with one worker the results come back
+        in configured source order exactly as before. With several the
+        interleaving is the same non-determinism the thread pool already had:
+        commit order *within* a source is what stable IDs and deterministic
+        graph bytes depend on, and that is untouched (rule 3, rule 4).
+        """
+
+        import hashlib
+
+        from pheasant.sync.queue import IndexTask, drain, owner_id
+
+        settings = self.config.sync.queue
+        progress_lock = threading.Lock()
+
+        forward_meta = on_progress is not None and _hook_accepts_meta(on_progress)
+
+        def progress_for(source_name: str) -> ProgressHook:
+            def source_progress(
+                phase: str,
+                current: int,
+                total: int | None,
+                detail: str,
+                meta: dict[str, Any] | None = None,
+            ) -> None:
+                # Respect the caller's arity. Forwarding five positional
+                # arguments unconditionally defeated `_hook_accepts_meta`: a
+                # four-argument hook — the documented supported form, and what
+                # `sync/worker.py:_as_engine_hook` builds for the in-process
+                # path — raised TypeError on every update, which
+                # `_progress_reporter` swallows at debug level. The result was
+                # a job whose progress bar never moved whenever
+                # `max_parallel_sources > 1`, with nothing in the logs.
+                if on_progress is None:
+                    return
+                with progress_lock:
+                    if forward_meta:
+                        on_progress(phase, current, total, detail, meta)
+                    else:
+                        on_progress(phase, current, total, detail)
+
+            return source_progress
+
+        published = 0
+        for source in sources:
+            digest = hashlib.sha256(
+                f"{self.config.knowledge_base_id}\0{source.name}\0{mode}".encode()
+            ).hexdigest()[:24]
+            task = IndexTask(
+                id=f"idx-{digest}",
+                source_id=source.name,
+                mode=str(mode),
+                payload={"max_depth": max_depth, "full_scan": bool(full_scan)},
+                max_attempts=max(1, int(settings.max_attempts or 1)),
+            )
+            try:
+                queue.publish(task)
+                published += 1
+            except Exception as exc:  # noqa: BLE001 - an existing task is not an error
+                logger.debug("Index task for %s already queued (%s)", source.name, exc)
+        logger.info("Queued %d of %d source(s) for indexing", published, len(sources))
+
+        def run(task: Any) -> SyncResult:
+            return self.sync_source(
+                task.source_id,
+                task.mode,  # type: ignore[arg-type]
+                max_depth=task.max_depth,
+                full_scan=task.full_scan,
+                on_progress=progress_for(task.source_id),
+            )
+
+        visibility = float(settings.visibility_seconds or 300)
+        if workers <= 1:
+            results = drain(queue, run, visibility_seconds=visibility)
+        else:
+            # Each drain loop is its own claimant, so two never hold the same
+            # task — the visibility timeout is doing the mutual exclusion that
+            # the thread pool got for free from having one list.
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="pheasant-source"
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        drain, queue, run, owner=owner_id(), visibility_seconds=visibility
+                    )
+                    for _ in range(workers)
+                ]
+                results = [item for future in futures for item in future.result()]
+        order = {source.name: position for position, source in enumerate(sources)}
+        return sorted(results, key=lambda result: order.get(result.source_id, len(order)))
 
     def _prepare_item(
         self,
@@ -680,58 +917,60 @@ class SyncEngine:
             fetched=True,
         )
 
-    def _prepare_item_remote(
+    def _remote_precheck(
         self,
         connector: Any,
         source: SourceConfig,
         mode: SyncMode,
         artifacts: dict[str, Any],
-        git_metadata: tuple[str | None, str | None, bool] | None,
         position: int,
         item: ConnectorItem,
-        endpoint: str,
-        token: str,
-    ) -> _PreparedItem:
-        """Read locally, prepare on an authenticated stateless worker."""
+    ) -> tuple[_PreparedItem | None, Any]:
+        """Everything that must happen locally before a task can be dispatched.
+
+        Returns ``(finished_item, payload)``: exactly one is not ``None``. The
+        skips are decided coordinator-side on purpose — an unchanged file
+        never becomes a request at all, which is what keeps a re-sync of a
+        large source close to zero remote work.
+        """
 
         previous = artifacts.get(item.relative_path)
         if self._can_skip_before_read(mode, previous, item):
             return _PreparedItem(
-                position,
-                item,
-                previous,
-                skipped=True,
-                transfer_skipped=True,
-            )
+                position, item, previous, skipped=True, transfer_skipped=True
+            ), None
         try:
             payload = connector.read_item(item)
         except ItemNotModified:
             return _PreparedItem(
-                position,
-                item,
-                previous,
-                skipped=True,
-                transfer_skipped=True,
-            )
+                position, item, previous, skipped=True, transfer_skipped=True
+            ), None
         content_hash = payload.sha256 or item.sha256 or sha256_bytes(payload.content)
         if mode == "incremental" and previous and previous.get("sha256") == content_hash:
-            return _PreparedItem(
-                position,
-                item,
-                previous,
-                fetched=True,
-                skipped=True,
-            )
+            return _PreparedItem(position, item, previous, fetched=True, skipped=True), None
         if payload.sha256 != content_hash:
             payload = replace(payload, sha256=content_hash)
-        from pheasant.sync.remote_worker import prepare_remote, task_payload
+        return None, payload
 
-        parsed = prepare_remote(
-            endpoint,
-            token,
-            task_payload(source, item, payload, git_metadata),
-            timeout=float(self.config.sync.concurrency.remote_worker_timeout_seconds or 120),
-        )
+    def _finish_remote(
+        self,
+        source: SourceConfig,
+        mode: SyncMode,
+        artifacts: dict[str, Any],
+        position: int,
+        item: ConnectorItem,
+        payload: Any,
+        parsed: Any,
+    ) -> _PreparedItem:
+        """Validate a worker's answer and turn it into a prepared item.
+
+        The two identity checks are not defensive padding: a worker is another
+        process reached over the network, and an answer for the wrong file
+        would be committed under this item's stable ID. Content-addressing the
+        request is what makes them checkable at all.
+        """
+
+        previous = artifacts.get(item.relative_path)
         if parsed is None:
             return _PreparedItem(position, item, previous, fetched=True)
         if parsed.source_id != source.name or parsed.relative_path != item.relative_path:
@@ -746,14 +985,77 @@ class SyncEngine:
             )
         if mode == "incremental" and previous and previous.get("sha256") == parsed.sha256:
             return _PreparedItem(
-                position,
-                item,
-                previous,
-                parsed=parsed,
-                fetched=True,
-                skipped=True,
+                position, item, previous, parsed=parsed, fetched=True, skipped=True
             )
         return _PreparedItem(position, item, previous, parsed=parsed, fetched=True)
+
+    def _prepare_batch_remote(
+        self,
+        pool: Any,
+        connector: Any,
+        source: SourceConfig,
+        mode: SyncMode,
+        artifacts: dict[str, Any],
+        git_metadata: tuple[str | None, str | None, bool] | None,
+        batch: list[tuple[int, ConnectorItem]],
+    ) -> list[_PreparedItem]:
+        """Prepare one batch remotely, falling back to local preparation.
+
+        Remote preparation is a throughput optimization, so it must never be
+        able to fail a sync. When the fleet cannot answer — every endpoint
+        down, a rolling deploy, a deadline — the bytes are already in hand and
+        parsing them here costs one CPU-bound parse, which is exactly what the
+        non-remote executors do all the time. The same policy Phase 34.5
+        applied to the WASM accelerators.
+        """
+
+        from pheasant.sync.remote_worker import task_payload
+        from pheasant.sync.worker_pool import AllWorkersFailed, TaskRejected
+
+        finished: dict[int, _PreparedItem] = {}
+        pending: list[tuple[int, ConnectorItem, Any]] = []
+        for position, item in batch:
+            done, payload = self._remote_precheck(
+                connector, source, mode, artifacts, position, item
+            )
+            if done is not None:
+                finished[position] = done
+            else:
+                pending.append((position, item, payload))
+
+        if pending:
+            tasks = [
+                task_payload(source, item, payload, git_metadata)
+                for _position, item, payload in pending
+            ]
+            timeout = float(self.config.sync.concurrency.remote_worker_timeout_seconds or 120)
+            try:
+                parsed_results = pool.prepare_batch(tasks, deadline=time.monotonic() + timeout)
+            except (AllWorkersFailed, TaskRejected) as exc:
+                logger.warning(
+                    "Preparing %d file(s) of source %s locally: %s",
+                    len(pending),
+                    source.name,
+                    exc,
+                )
+                parsed_results = [
+                    parse_connector_payload(
+                        source,
+                        item,
+                        payload,
+                        git_metadata,
+                        captioner=self.captioner,
+                        transcriber=self.transcriber,
+                        extractor=self.extractor,
+                    )
+                    for _position, item, payload in pending
+                ]
+            for (position, item, payload), parsed in zip(pending, parsed_results, strict=True):
+                finished[position] = self._finish_remote(
+                    source, mode, artifacts, position, item, payload, parsed
+                )
+
+        return [finished[position] for position, _item in batch]
 
     def _prepared_items(
         self,
@@ -824,6 +1126,20 @@ class SyncEngine:
                 "taxonomy/repair); using thread workers",
                 source.name,
             )
+        if remote_safe:
+            yield from self._prepared_items_remote(
+                connector,
+                source,
+                mode,
+                artifacts,
+                git_metadata,
+                items,
+                remote_urls,
+                remote_token,
+                workers,
+            )
+            return
+
         executor_type = ProcessPoolExecutor if process_safe else ThreadPoolExecutor
         if process_safe:
             workers = min(workers, _process_cpu_capacity())
@@ -846,20 +1162,6 @@ class SyncEngine:
                         item,
                         artifacts.get(item.relative_path),
                     )
-                if remote_safe:
-                    endpoint = remote_urls[(position - 1) % len(remote_urls)]
-                    return executor.submit(
-                        self._prepare_item_remote,
-                        connector,
-                        source,
-                        mode,
-                        artifacts,
-                        git_metadata,
-                        position,
-                        item,
-                        endpoint,
-                        remote_token,
-                    )
                 return executor.submit(
                     self._prepare_item,
                     connector,
@@ -881,6 +1183,95 @@ class SyncEngine:
                 except StopIteration:
                     continue
                 pending.append(submit(position, item))
+
+    def _prepared_items_remote(
+        self,
+        connector: Any,
+        source: SourceConfig,
+        mode: SyncMode,
+        artifacts: dict[str, Any],
+        git_metadata: tuple[str | None, str | None, bool] | None,
+        items: list[ConnectorItem],
+        remote_urls: list[str],
+        remote_token: str,
+        workers: int,
+    ):
+        """Yield prepared items in discovery order, prepared by a worker fleet.
+
+        A separate generator from the thread/process path rather than another
+        branch inside it, because the unit of work is different: a *batch*, so
+        that a request carries several files, one deadline and one connection.
+        Discovery order is preserved exactly as before — batches are contiguous
+        runs of positions and the look-ahead window is FIFO — so committing
+        stays deterministic and stable IDs are unaffected (rule 3).
+        """
+
+        from pheasant.sync.worker_pool import WorkerPool
+
+        concurrency = self.config.sync.concurrency
+        batch_size = max(1, int(concurrency.remote_worker_batch_size or 1))
+        # Enumerated once, then sliced. Building the full `list(enumerate(...))`
+        # inside the comprehension rebuilt it per batch — O(files²/batch_size)
+        # allocations, which on a 250k-file source is millions of tuples for a
+        # list that never changes. Identical output, same discovery order.
+        numbered = list(enumerate(items, start=1))
+        batches = [
+            numbered[start : start + batch_size] for start in range(0, len(numbered), batch_size)
+        ]
+        pool = WorkerPool(
+            remote_urls,
+            remote_token,
+            timeout=float(concurrency.remote_worker_timeout_seconds or 120),
+            transport_name=str(concurrency.worker_transport or "http"),
+        )
+        try:
+            pool.publish_health()
+            with ThreadPoolExecutor(
+                max_workers=max(1, min(workers, len(batches))),
+                thread_name_prefix=f"pheasant-remote-{source.name}",
+            ) as executor:
+                pending: deque[Future[list[_PreparedItem]]] = deque()
+                iterator = iter(batches)
+
+                def submit(batch: list[tuple[int, ConnectorItem]]) -> Future[list[_PreparedItem]]:
+                    return executor.submit(
+                        self._prepare_batch_remote,
+                        pool,
+                        connector,
+                        source,
+                        mode,
+                        artifacts,
+                        git_metadata,
+                        batch,
+                    )
+
+                for _ in range(min(len(batches), max(1, workers) * 2)):
+                    try:
+                        pending.append(submit(next(iterator)))
+                    except StopIteration:
+                        break
+                while pending:
+                    yield from pending.popleft().result()
+                    try:
+                        batch = next(iterator)
+                    except StopIteration:
+                        continue
+                    pending.append(submit(batch))
+        finally:
+            # Health is published again on the way out so the gauge reflects
+            # what this sync actually observed, not what it assumed at the
+            # start — a breaker that tripped mid-run is the interesting case.
+            pool.publish_health()
+            for entry in pool.stats():
+                if entry["failures"]:
+                    logger.info(
+                        "Remote worker %s: %d ok, %d failed%s",
+                        entry["endpoint"],
+                        entry["successes"],
+                        entry["failures"],
+                        " (circuit open)" if entry["circuit_open"] else "",
+                    )
+            pool.close()
 
     def _ensure_modal_handlers(self, source: Any) -> None:
         """Build the caption/transcribe/extract handlers this source needs.
@@ -1018,18 +1409,6 @@ class SyncEngine:
                 )
                 self.graph_builder.add_cross_source_edges()
                 self._bridge_memory()
-                pruned = self.graph_builder.reconcile_concepts(
-                    self.state,
-                    min_documents=int(self.config.graph.concept_min_documents),
-                    changed_ids=changed_ids,
-                )
-                if pruned["removed"] or pruned["restored"]:
-                    logger.info(
-                        "Concepts reconciled: kept=%s removed=%s restored=%s",
-                        pruned["kept"],
-                        pruned["removed"],
-                        pruned["restored"],
-                    )
 
             if self.vectors is not None:
                 # Finish provider work before advertising a saved, completed
@@ -1097,16 +1476,10 @@ class SyncEngine:
                 mode,
             )
             mode = "full"
-        with self._lease_mutex:
-            self.lease.acquire()
         # Test-only hook (Synapse 21.2 crash-safety tests): widens the window
         # between per-artifact writes so a kill -9 can land mid-sync.
         slow_sync_s = float(os.environ.get("PHEASANT_TEST_SLOW_SYNC_MS", "0") or 0) / 1000.0
-        with source_lock(
-            self.paths.locks,
-            source.name,
-            timeout_s=float(self.config.sync.concurrency.lock_timeout_seconds or 0),
-        ):
+        with self._source_write_lock(source.name):
             connector = connector_for_source(source, self.state)
             if mode == "validate_only":
                 health = connector.validate()
@@ -1179,7 +1552,15 @@ class SyncEngine:
                         "scan": exc.report.as_dict(),
                     },
                 )
-            if mode == "full":
+            # A full sync empties the source here, so every artifact written
+            # below is known to be absent. That matters more than it sounds:
+            # `chunks_fts.artifact_id` is UNINDEXED, so the per-artifact
+            # DELETE that would otherwise run is a full scan of a table
+            # growing with the corpus, once per file — a measured O(N²) (Phase
+            # 35.7: 500 → 8,000 files went 1.9s → 164.7s). Telling the writer
+            # the rows cannot exist skips the question entirely.
+            cleared = mode == "full"
+            if cleared:
                 with self._sync_mutex:
                     self.state.delete_source_artifacts(source.name)
                     self.graph_builder.remove_source_content(source.name)
@@ -1190,6 +1571,7 @@ class SyncEngine:
             fetched = 0
             transfer_skipped = 0
             embedded_chunks = 0
+            indexed_bytes = 0
             changed_ids: set[str] = set()
             git_metadata = git_state(source.path) if source.type.value == "repository" else None
             # The denominator only exists now — listing is what produced it.
@@ -1221,7 +1603,15 @@ class SyncEngine:
                 fetched += int(prepared.fetched)
                 skipped += int(prepared.skipped)
                 transfer_skipped += int(prepared.transfer_skipped)
-                report("preparing", position, total_items, item.relative_path)
+                report(
+                    "preparing",
+                    position,
+                    total_items,
+                    item.relative_path,
+                    indexed=indexed,
+                    skipped=skipped,
+                    bytes_done=indexed_bytes,
+                )
                 parsed = prepared.parsed
                 if prepared.skipped or parsed is None:
                     continue
@@ -1274,7 +1664,7 @@ class SyncEngine:
                     for chunk in parsed.chunks
                 ]
                 with self._sync_mutex:
-                    self.state.replace_artifact_chunks(artifact_row, chunk_rows)
+                    self.state.replace_artifact_chunks(artifact_row, chunk_rows, fresh=cleared)
                     if self.vectors is not None:
                         # Chunk ids are content-addressed (text_hash in the id),
                         # so only new/changed chunk text reaches the embedder.
@@ -1304,8 +1694,25 @@ class SyncEngine:
                 # Compatibility phase retained for existing CLI/API/MCP
                 # progress consumers; ``committing`` is the more precise new
                 # phase for callers that understand the staged pipeline.
-                report("indexing", position, total_items, parsed.relative_path)
-                report("committing", position, total_items, parsed.relative_path)
+                indexed_bytes += int(parsed.size_bytes or 0)
+                report(
+                    "indexing",
+                    position,
+                    total_items,
+                    parsed.relative_path,
+                    indexed=indexed,
+                    skipped=skipped,
+                    bytes_done=indexed_bytes,
+                )
+                report(
+                    "committing",
+                    position,
+                    total_items,
+                    parsed.relative_path,
+                    indexed=indexed,
+                    skipped=skipped,
+                    bytes_done=indexed_bytes,
+                )
                 # Let anything waiting on the API get a turn before the next
                 # file. Without this a long index makes the UI unusable.
                 serve_yield()
@@ -1373,6 +1780,9 @@ class SyncEngine:
             # Still inside the writer lock + per-source lock; fail-soft so a
             # publish/webhook hiccup never fails the sync.
             self._publish_after_sync(source.name, mode, started_at, now, indexed, skipped)
+            capacity = self._graph_capacity_notice()
+            if capacity:
+                details_extra = {**details_extra, "capacity": capacity}
             return SyncResult(
                 source.name,
                 indexed,
@@ -1388,6 +1798,88 @@ class SyncEngine:
                     **details_extra,
                 },
             )
+
+    @contextmanager
+    def _source_write_lock(self, source_name: str):
+        """Hold everything needed to write one source, then release it.
+
+        Exclusion is per **source** on a shared backend and per **process** on
+        SQLite. Postgres arbitrates concurrent writers itself, so two indexers
+        can commit two different sources at once — which is the point of the
+        35.2 seam. SQLite genuinely permits one writer per file, so the
+        whole-state :class:`EngineLease` there is an accurate model rather than
+        a limitation to route around.
+
+        The on-disk ``source_lock`` is held in both cases: it excludes two
+        *threads* of one process, which no database lease addresses.
+        """
+
+        timeout = float(self.config.sync.concurrency.lock_timeout_seconds or 0)
+        lease = None
+        if self.state.dialect.is_postgres:
+            lease = SourceLease(self.state, source_name)
+            lease.acquire(wait_timeout_s=timeout)
+        else:
+            with self._lease_mutex:
+                self.lease.acquire()
+        try:
+            with source_lock(self.paths.locks, source_name, timeout_s=timeout):
+                yield
+        finally:
+            if lease is not None:
+                lease.release()
+
+    def _graph_capacity_notice(self) -> dict[str, Any] | None:
+        """Say something once a graph outgrows one container (Phase 35.3).
+
+        Deliberately a *notice*, not a refusal. `sync.limits` can refuse
+        because it checks before any work happens; by the time this can fire,
+        the index exists and throwing it away would help nobody.
+
+        The threshold is measured, not guessed — see `graph/capacity.py`. The
+        binding constraint is not RAM but checkpoint serialization: at 1.58M
+        nodes one `graph.latest.json.zst` write takes ~20s against a default
+        60s `storage.graph_checkpoint_seconds`, so a third of a long sync goes
+        on writing the graph out, and it gets worse linearly.
+        """
+
+        limit = getattr(self.config.graph, "max_nodes", None)
+        if not limit:
+            return None
+        nodes = self.graph_builder.graph.number_of_nodes()
+        if nodes <= int(limit):
+            return None
+        # ~2.4 KB of process RSS per node, flat across four measured scales —
+        # divided by the graph's share of RSS, because what an operator has to
+        # provision is the whole process, not the graph in isolation. Omitting
+        # that divisor under-reported by 40% against the identical projection
+        # `pheasant scan` and `pheasant shard plan` print, so the same corpus
+        # got two different answers depending on which surface asked.
+        projected_bytes = int(nodes * RSS_BYTES_PER_NODE / GRAPH_SHARE_OF_RSS)
+        projected_gb = projected_bytes / 1e9
+        notice = {
+            "nodes": nodes,
+            "max_nodes": int(limit),
+            # Exact bytes as well as the rounded figure: at a low threshold the
+            # GB value rounds to 0.0, and a capacity notice reporting "0.0 GB"
+            # reads as a bug rather than as a small graph.
+            "projected_rss_bytes": projected_bytes,
+            "projected_rss_gb": round(projected_gb, 2),
+            "advice": (
+                "This graph has outgrown what one region holds comfortably. Split the "
+                "corpus across several pheasant regions and let the router fan out "
+                "(see docs/how-to/capacity-planning.md); raising graph.max_nodes "
+                "silences this without changing the cost."
+            ),
+        }
+        logger.warning(
+            "Graph is %d nodes, past graph.max_nodes=%d (~%.1f GB RSS). %s",
+            nodes,
+            int(limit),
+            projected_gb,
+            notice["advice"],
+        )
+        return notice
 
     @property
     def stats(self) -> dict[str, int]:
@@ -1417,21 +1909,6 @@ class SyncEngine:
             self.config.knowledge_base_id,
             query,
             max_results=max_results,
-        )
-
-    def export_obsidian_notes(
-        self,
-        vault_path=None,
-        preview: bool = False,
-        template_profile: str | None = None,
-    ) -> dict:
-        from pheasant.obsidian.exporter import ObsidianExporter
-
-        if vault_path is not None:
-            self.config.pheasant.vault_path = vault_path
-        return ObsidianExporter(self.config, self.state).export(
-            preview=preview,
-            template_profile=template_profile,
         )
 
     def _snapshot_after_sync(self) -> None:
@@ -1638,6 +2115,20 @@ class SyncEngine:
             },
             "would_exceed": would_exceed,
             "would_sync": not would_exceed,
+            # Phase 35.7: the scan already has the two inputs the capacity
+            # model needs, so the projection costs nothing here — and this is
+            # the moment it matters, before anyone commits to a first index
+            # and learns the answer from an OOM kill mid-sync.
+            "projection": project_capacity(
+                report.file_count,
+                report.total_bytes,
+                embedding_dimensions=(
+                    self.config.search.embeddings.dimensions
+                    if self.config.search.embeddings.enabled
+                    else 0
+                ),
+                max_nodes_per_shard=self.config.graph.max_nodes or 1_500_000,
+            ).as_dict(),
         }
 
     def _source(self, name: str) -> SourceConfig:

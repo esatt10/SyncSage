@@ -227,9 +227,7 @@ def render_prompt(
         if (version := options.get(part))
     )
     if selection and defaulted:
-        selected_line = (
-            f"\nCurrent selection: `3` / `patch` (default) -> `{options[selection]}`\n"
-        )
+        selected_line = f"\nCurrent selection: `3` / `patch` (default) -> `{options[selection]}`\n"
     elif selection:
         selected_line = f"\nCurrent selection: `{selection}` -> `{options[selection]}`\n"
     else:

@@ -110,7 +110,6 @@ def test_mcp_and_serve_honour_the_pheasant_config_env_var(tmp_path, monkeypatch)
         f"""pheasant:
   name: relocated-kb
   state_path: {tmp_path / "state"}
-  vault_path: {tmp_path / "vault"}
   exports_path: {tmp_path / "exports"}
   workspace_root: {tmp_path}
 sync:

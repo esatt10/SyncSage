@@ -11,10 +11,11 @@ The routes below are the consolidated surface defined in
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Liveness probe. |
-| GET | `/ready` | Readiness probe. |
-| GET | `/metrics` | Operational metrics. |
+| GET | `/health` | Liveness probe. Reports `role`, so a pod can be identified from the response. Stays 200 when the state store is unreachable — restarting a pod does not bring a database back. |
+| GET | `/ready` | Readiness probe. Reports the role and what it does (`watcher`, `scheduler`, `drains_queue`, `indexes_locally`), and returns **503** when the state store is unreachable so the replica leaves the Service without being restarted. Deliberately not gated on the index being populated: a replica held unready through a multi-hour first index would take the whole Service down for that time. |
+| GET | `/metrics` | Prometheus exposition text — index queue depth, per-source throughput/ETA/stall, search latency, graph size. See [Monitor indexing](../how-to/monitor-indexing.md). |
 | POST | `/internal/indexing/prepare` | Opt-in stateless remote preparation worker. Disabled unless `sync.concurrency.remote_worker_enabled`; requires `Authorization: Bearer` matching the environment variable named by `remote_worker_token_env`. Intended for pheasant coordinators, not public clients. |
+| POST | `/internal/indexing/prepare-batch` | Several preparation tasks in one request. Same gate and token as above. Honours `deadline_seconds` (or the `X-Pheasant-Deadline-Seconds` header) by stopping between tasks rather than finishing work whose caller has given up, and answers a repeated `idempotency_keys` entry from a bounded cache instead of re-parsing. `408` when the deadline has already passed, `413` over `MAX_PREPARE_BATCH` tasks or the per-file size limit, `422` when a task is unacceptable (the coordinator then prepares it locally). A worker predating this route returns `404`, and the coordinator falls back to the single-task path. |
 
 ## Synapse region
 
@@ -73,17 +74,21 @@ still valid here, resolved through the same state-registry fallback
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/jobs` | Every job, newest first; running ones sort ahead of finished. `?active=true` for running only. |
-| GET | `/jobs/{job_id}` | One job: phase, counter, log tail, terminal outcome. |
+| GET | `/jobs/{job_id}` | One job: phase, counter, log tail, terminal outcome, and a `sources[]` breakdown. |
 | GET | `/jobs/stream` | Server-sent events, one per job update, primed with current state on connect. |
 
-Every source row (`/sources`, `/overview`) also carries `syncing`, `sync_error`
-and `job` — the live job behind the boolean, with its phase and counter.
+Every source row (`/sources`, `/overview`) also carries `syncing`, `sync_error`,
+`job` — the live job behind the boolean — and `progress`, **this source's own
+slice** of that job: phase, counter, observed throughput, ETA, `stalled`, and
+the indexed/unchanged counts. Under a `sync_all` the job-level counter is an
+aggregate over every source, so `progress` is what tells you which one is
+actually behind. See [Monitor indexing](../how-to/monitor-indexing.md).
 
 ## Search & retrieval
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/search` | Search (`mode`: `text` / `graph` / `vector` / `hybrid`). Also takes `source_name`, `exclude_sources`, `node_types`, `min_score`, `section` and `memory`. |
+| POST | `/search` | Search (`mode`: `text` / `graph` / `vector` / `hybrid`). Also takes `source_name`, `source_types`, `exclude_source_types`, `exclude_sources`, `node_types`, `min_score`, `section` and `memory`. Every hit reports `provenance.source_type` — the kind of source it came from. |
 | POST | `/relevant-files` | Rank relevant files for a task/query. |
 | GET | `/files/summary` | Summarize a file node. |
 | GET | `/nodes/content` | Fetch a node's content. |
@@ -178,24 +183,10 @@ See [Vector self-search](../how-to/vector-search.md).
 | GET | `/config/effective` | Resolved config after profile + YAML + overrides. |
 | PUT | `/config` | Update config. |
 
-## Obsidian
-
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/obsidian/export` | Export (or preview, with `{"preview": true}`) the Obsidian vault projection. |
-
 ## Example: search
 
 ```bash
 curl -X POST http://localhost:8765/search \
   -H "content-type: application/json" \
   -d '{"query": "billing owner", "mode": "hybrid", "max_results": 5}'
-```
-
-## Example: preview an Obsidian export
-
-```bash
-curl -X POST http://localhost:8765/obsidian/export \
-  -H "content-type: application/json" \
-  -d '{"preview": true, "template_profile": "engineering"}'
 ```
