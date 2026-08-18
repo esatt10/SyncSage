@@ -260,6 +260,8 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         node_types: list[str] | None = None,
         min_score: float | None = None,
         memory: dict | str | None = None,
+        source_types: list[str] | None = None,
+        exclude_source_types: list[str] | None = None,
     ) -> dict:
         """Search indexed context and return compact results with provenance.
 
@@ -270,6 +272,11 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         taxonomy, matched against the breadcrumb — "§ 12.3", "Article IV" or a
         section's wording all work, and naming a parent returns everything
         nested under it. Only meaningful for sources with taxonomy enabled.
+
+        source_types/exclude_source_types scope by the kind of source —
+        repository, notion, slack, markdown_folder — rather than by name, which
+        is usually what you want when you do not already know every source in
+        the region. Every hit reports its own under provenance.source_type.
 
         source_name/exclude_sources/node_types/min_score are retrieval
         criteria you can set per call instead of relying on how the region
@@ -300,6 +307,8 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             node_types=node_types,
             min_score=min_score,
             memory=memory,
+            source_types=source_types,
+            exclude_source_types=exclude_source_types,
         )
 
     @mcp.tool()
@@ -327,6 +336,8 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         node_types: list[str] | None = None,
         min_score: float | None = None,
         memory: dict | str | None = None,
+        source_types: list[str] | None = None,
+        exclude_source_types: list[str] | None = None,
     ) -> dict:
         """Try retrieval criteria and see how they differ from the configuration.
 
@@ -346,6 +357,8 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             node_types=node_types,
             min_score=min_score,
             memory=memory,
+            source_types=source_types,
+            exclude_source_types=exclude_source_types,
         )
 
     @mcp.tool()
@@ -359,6 +372,8 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         principal: str | None = None,
         principal_groups: list[str] | None = None,
         options: dict | None = None,
+        source_types: list[str] | None = None,
+        exclude_source_types: list[str] | None = None,
     ) -> dict:
         """Answer a question from the knowledge base, with citations and graph facts.
 
@@ -377,6 +392,8 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             principal=principal,
             principal_groups=principal_groups,
             options=options,
+            source_types=source_types,
+            exclude_source_types=exclude_source_types,
         )
 
     @mcp.tool()

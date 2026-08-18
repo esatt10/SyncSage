@@ -22,6 +22,8 @@ def apply_retrieval_criteria(
     exclude_sources: list[str] | None = None,
     node_types: list[str] | None = None,
     min_score: float | None = None,
+    source_types: list[str] | None = None,
+    exclude_source_types: list[str] | None = None,
 ) -> list[dict]:
     """Filter search hits by caller-supplied criteria. Order is preserved.
 
@@ -32,12 +34,24 @@ def apply_retrieval_criteria(
     """
     excluded = {str(name) for name in (exclude_sources or [])}
     wanted_types = {str(name) for name in (node_types or [])}
+    # Source *type* (repository, notion, slack, ...) is a different axis from
+    # node type (chunk, symbol, entity) and from source *name*. Scoping by name
+    # needs you to know every source in the region; scoping by type is the
+    # question an agent actually has — "only what came out of our wikis".
+    wanted_source_types = {str(name) for name in (source_types or [])}
+    excluded_source_types = {str(name) for name in (exclude_source_types or [])}
     kept: list[dict] = []
     for item in results:
         if excluded and source_of(item) in excluded:
             continue
         if wanted_types and str(item.get("type") or "") not in wanted_types:
             continue
+        if wanted_source_types or excluded_source_types:
+            source_type = type_of(item)
+            if wanted_source_types and source_type not in wanted_source_types:
+                continue
+            if source_type and source_type in excluded_source_types:
+                continue
         if min_score is not None:
             try:
                 if float(item.get("score") or 0.0) < min_score:
@@ -67,13 +81,21 @@ def criteria_active(
     exclude_sources: list[str] | None,
     node_types: list[str] | None,
     min_score: float | None,
+    source_types: list[str] | None = None,
+    exclude_source_types: list[str] | None = None,
 ) -> bool:
     """Whether any post-filter will run, and therefore whether to over-fetch.
 
     Over-fetching matters: without it `max_results` quietly degrades from "give
     me this many" to "look at this many and return whatever survives".
     """
-    return bool(exclude_sources or node_types or min_score is not None)
+    return bool(
+        exclude_sources
+        or node_types
+        or min_score is not None
+        or source_types
+        or exclude_source_types
+    )
 
 
 def criteria_dict(
@@ -82,6 +104,8 @@ def criteria_dict(
     node_types: list[str] | None,
     min_score: float | None,
     memory: Any = None,
+    source_types: list[str] | None = None,
+    exclude_source_types: list[str] | None = None,
 ) -> dict[str, Any]:
     """The echo of what was applied, reported back on a filtered payload."""
     return {
@@ -90,4 +114,59 @@ def criteria_dict(
         "node_types": node_types,
         "min_score": min_score,
         "memory": memory,
+        "source_types": source_types,
+        "exclude_source_types": exclude_source_types,
     }
+
+
+def source_type_map(state: Any) -> dict[str, str]:
+    """``{source name: configured type}`` for every registered source.
+
+    One query per search rather than a join per arm: the vector and graph arms
+    do not go through SQL at all, so a join would only ever have annotated the
+    text arm — and a filter that silently applies to one third of a hybrid
+    result set is worse than no filter. Failures return ``{}``, which makes
+    the type simply absent rather than failing the search.
+    """
+
+    if state is None:
+        return {}
+    try:
+        rows = state.rows("SELECT name, type FROM sources")
+    except Exception:  # pragma: no cover - a store without the table yet
+        return {}
+    return {str(row["name"]): str(row["type"]) for row in rows if row["name"]}
+
+
+def stamp_source_types(results: list[dict], types: dict[str, str]) -> None:
+    """Record each hit's *source type* alongside its source id, in place.
+
+    Provenance carried ``source_id`` — which source — but never what **kind**
+    of source that was, so no caller could tell a hit from a git repository
+    from one out of Slack without separately fetching the source list and
+    joining by hand. Every modality reads provenance, so writing it here
+    surfaces the type on MCP, HTTP, the UI and the assistant at once.
+    """
+
+    if not types:
+        return
+    for item in results:
+        provenance = item.get("provenance")
+        if not isinstance(provenance, dict):
+            continue
+        source_type = types.get(str(provenance.get("source_id") or ""))
+        if source_type:
+            provenance["source_type"] = source_type
+
+
+def type_of(item: dict) -> str:
+    """The configured type of the source a hit came from.
+
+    Reads the same ``provenance`` block :func:`source_of` does, and tolerates
+    an already-flattened row for the same reason.
+    """
+
+    provenance = item.get("provenance")
+    if isinstance(provenance, dict) and provenance.get("source_type"):
+        return str(provenance["source_type"])
+    return str(item.get("source_type") or "")

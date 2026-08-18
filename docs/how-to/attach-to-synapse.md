@@ -86,6 +86,13 @@ Confirm `capabilities.modalities` reflects what you index — it auto-includes
 is configured (see [Multi-modal ingest](multimodal-ingest.md)), so a router can
 route `--modality image` / `--modality audio` queries to you.
 
+`capabilities.source_types` lists the *kinds* of source this region is built
+from — `repository`, `notion`, `slack`, `confluence` and so on. Where
+`modalities` says what media the region can answer about, this says where its
+content came from, which is the question a fleet operator actually asks ("who
+has our Confluence?"). It is derived from the enabled sources, so it stays
+correct as sources are added and removed.
+
 ## Step 4 — agree on the embedding space
 
 The fleet compares contracts in one embedding space, so every region must use
@@ -137,6 +144,7 @@ to register the region and run global queries across the fleet.
 - [x] With `router_url` set, the router shows the region registered (check the
       router's `GET /v1/synapse/kbs`).
 - [x] `capabilities.modalities` lists `image`/`audio` if you index them.
+- [x] `capabilities.source_types` lists the connectors this region indexes.
 - [x] If signing, the router accepts the contract under its trust store.
 
 ## Standalone is never harmed

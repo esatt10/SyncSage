@@ -378,6 +378,7 @@ def passages_to_citations(passages: list, limit: int) -> list[dict]:
                 # or reached by walking the graph out of one.
                 "retrieved_by": passage.mode,
                 **({"heading_path": passage.heading_path} if passage.heading_path else {}),
+                **({"source_type": passage.source_type} if passage.source_type else {}),
                 **({"memory": passage.memory} if passage.memory else {}),
                 "used": False,
             }
@@ -731,6 +732,8 @@ def answer_question(
     options: dict | None = None,
     on_step: Any = None,
     memory: Any = None,
+    source_types: list[str] | None = None,
+    exclude_source_types: list[str] | None = None,
 ) -> dict:
     """Answer ``question`` from the knowledge base, with citations and facts.
 
@@ -763,6 +766,8 @@ def answer_question(
         state=state,
         config=config,
         memory=memory,
+        source_types=source_types,
+        exclude_source_types=exclude_source_types,
     )
 
     name = resolve_workflow_name(

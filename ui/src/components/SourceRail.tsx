@@ -14,17 +14,29 @@ import { colorForNode } from "../graph/graphStyles";
 export function SourceRail({
   sources,
   selected,
+  selectedType,
   onSelect,
+  onSelectType,
   onChanged,
   onCollapse,
 }: {
   sources: SourceRecord[];
   selected: string | null;
+  selectedType: string | null;
   onSelect: (name: string | null) => void;
+  onSelectType: (type: string | null) => void;
   onChanged: () => void;
   onCollapse?: () => void;
 }) {
   const [adding, setAdding] = useState(false);
+
+  // Every kind of source present, in a stable order. Rendered only when there
+  // is more than one — with a single kind the chips would be a row that can
+  // only ever say what the list already says.
+  const types = Array.from(new Set(sources.map((source) => source.type).filter(Boolean))).sort();
+  const visible = selectedType
+    ? sources.filter((source) => source.type === selectedType)
+    : sources;
 
   const sync = useMutation({
     mutationFn: (name: string) => api.syncSource(name, "incremental"),
@@ -56,6 +68,27 @@ export function SourceRail({
         </div>
       </header>
       <div className="pane__body">
+        {types.length > 1 ? (
+          <div className="source-types" role="group" aria-label="Filter sources by type">
+            <button
+              className={`chip${selectedType === null ? " chip--active" : ""}`}
+              onClick={() => onSelectType(null)}
+              title="Every kind of source"
+            >
+              all types
+            </button>
+            {types.map((type) => (
+              <button
+                key={type}
+                className={`chip${selectedType === type ? " chip--active" : ""}`}
+                onClick={() => onSelectType(selectedType === type ? null : type)}
+                title={`Ask only what came from ${type} sources`}
+              >
+                {type}
+              </button>
+            ))}
+          </div>
+        ) : null}
         <div className="source-list">
           <button
             className={`source-item${selected === null ? " active" : ""}`}
@@ -65,10 +98,12 @@ export function SourceRail({
               <span className="source-dot" style={{ background: colorForNode("knowledge_base") }} />
               <span className="source-item__name">All sources</span>
             </div>
-            <span className="source-item__meta">{sources.length} indexed</span>
+            <span className="source-item__meta">
+              {selectedType ? `${visible.length} ${selectedType}` : `${sources.length} indexed`}
+            </span>
           </button>
 
-          {sources.map((source) => (
+          {visible.map((source) => (
             // The row is a plain container holding two siblings — selecting the
             // source and syncing it are separate actions, so nesting the sync
             // button inside the select button would be invalid markup and would

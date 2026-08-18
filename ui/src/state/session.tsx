@@ -26,6 +26,14 @@ export interface ChatTurn {
 export interface SessionState {
   /** Restrict retrieval + graph to one source, or null for everything. */
   sourceFilter: string | null;
+  /**
+   * Restrict retrieval to one *kind* of source (repository, notion, slack…),
+   * or null for every kind. Independent of `sourceFilter`: picking a type
+   * narrows which sources are in play without committing to one of them,
+   * which is the useful control once a knowledge base has more sources than
+   * fit on a screen.
+   */
+  sourceTypeFilter: string | null;
   hiddenTypes: string[];
   panelTab: PanelTab;
   selectedId: string | null;
@@ -60,6 +68,7 @@ export const MAX_DEPTH = 6;
 
 const INITIAL: SessionState = {
   sourceFilter: null,
+  sourceTypeFilter: null,
   hiddenTypes: NOISY_NODE_TYPES,
   panelTab: "graph",
   selectedId: null,
@@ -84,6 +93,7 @@ const INITIAL: SessionState = {
 
 export type SessionAction =
   | { type: "filter-source"; source: string | null }
+  | { type: "filter-source-type"; sourceType: string | null }
   | { type: "toggle-type"; nodeType: string }
   | { type: "open-tab"; tab: PanelTab }
   | { type: "select-node"; nodeId: string | null }
@@ -127,6 +137,10 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
   switch (action.type) {
     case "filter-source":
       return { ...state, sourceFilter: action.source };
+    case "filter-source-type":
+      // Selecting a type clears a source selected under a different one, so
+      // the two controls cannot contradict each other on screen.
+      return { ...state, sourceTypeFilter: action.sourceType };
     case "toggle-type":
       return {
         ...state,
@@ -270,6 +284,7 @@ const STORAGE_KEY = "pheasant.workspace.v1";
  */
 const PERSISTED_KEYS = [
   "sourceFilter",
+  "sourceTypeFilter",
   "hiddenTypes",
   "depth",
   "panelTab",
@@ -286,6 +301,7 @@ function hydrate(): SessionState {
     return {
       ...INITIAL,
       sourceFilter: saved.sourceFilter ?? INITIAL.sourceFilter,
+      sourceTypeFilter: saved.sourceTypeFilter ?? INITIAL.sourceTypeFilter,
       hiddenTypes: Array.isArray(saved.hiddenTypes) ? saved.hiddenTypes : INITIAL.hiddenTypes,
       depth: clampDepth(saved.depth ?? DEFAULT_DEPTH),
       panelTab: saved.panelTab ?? INITIAL.panelTab,

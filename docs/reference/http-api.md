@@ -88,7 +88,7 @@ actually behind. See [Monitor indexing](../how-to/monitor-indexing.md).
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/search` | Search (`mode`: `text` / `graph` / `vector` / `hybrid`). Also takes `source_name`, `exclude_sources`, `node_types`, `min_score`, `section` and `memory`. |
+| POST | `/search` | Search (`mode`: `text` / `graph` / `vector` / `hybrid`). Also takes `source_name`, `source_types`, `exclude_source_types`, `exclude_sources`, `node_types`, `min_score`, `section` and `memory`. Every hit reports `provenance.source_type` — the kind of source it came from. |
 | POST | `/relevant-files` | Rank relevant files for a task/query. |
 | GET | `/files/summary` | Summarize a file node. |
 | GET | `/nodes/content` | Fetch a node's content. |

@@ -141,7 +141,9 @@ export function Notebook() {
           onCollapse={() => dispatch({ type: "toggle-rail" })}
           sources={overview.data?.sources ?? []}
           selected={state.sourceFilter}
+          selectedType={state.sourceTypeFilter}
           onSelect={(source) => dispatch({ type: "filter-source", source })}
+          onSelectType={(sourceType) => dispatch({ type: "filter-source-type", sourceType })}
           onChanged={() => overview.refetch()}
         />
         )}

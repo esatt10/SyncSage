@@ -200,10 +200,15 @@ export const api = {
   fsList: (path?: string) => request<FsListing>(`/fs/list${qs({ path })}`),
 
   // Search
-  search: (query: string, mode: SearchMode = "hybrid", maxResults = 10) =>
+  search: (
+    query: string,
+    mode: SearchMode = "hybrid",
+    maxResults = 10,
+    criteria: { source_name?: string | null; source_types?: string[] | null } = {},
+  ) =>
     request<SearchResponse>("/search", {
       method: "POST",
-      body: JSON.stringify({ query, mode, max_results: maxResults }),
+      body: JSON.stringify({ query, mode, max_results: maxResults, ...criteria }),
     }),
 
   // Assistant (grounded chat)
@@ -255,6 +260,9 @@ export const api = {
       mode?: string;
       max_results?: number;
       source_name?: string | null;
+      /** Scope the answer to these kinds of source (repository, notion, …). */
+      source_types?: string[] | null;
+      exclude_source_types?: string[] | null;
       workflow?: string | null;
       options?: Record<string, unknown>;
       memory?: string | null;

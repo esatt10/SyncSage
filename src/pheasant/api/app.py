@@ -119,6 +119,12 @@ class SearchRequest(BaseModel):
     exclude_sources: list[str] | None = None
     node_types: list[str] | None = None
     min_score: float | None = None
+    # Scope by the *kind* of source (repository, notion, slack, ...) rather
+    # than by name. A caller that does not already know every source in the
+    # region can still say "only our wikis" or "nothing from git". Each hit
+    # reports its own under `provenance.source_type`.
+    source_types: list[str] | None = None
+    exclude_source_types: list[str] | None = None
     # How this region's agent memory takes part: "auto" (default), "off",
     # "only", "prefer", or an object with scopes/subject/current_only/as_of.
     memory: dict | str | None = None
@@ -232,6 +238,10 @@ class ChatRequest(BaseModel):
     mode: str = "hybrid"
     max_results: int | None = None
     source_name: str | None = None
+    # Scope the answer to (or away from) kinds of source. Same axis as
+    # `POST /search`'s, applied to every retrieval the answering loop runs.
+    source_types: list[str] | None = None
+    exclude_source_types: list[str] | None = None
     principal: str | None = None
     principal_groups: list[str] = []
     # Override assistant.workflow for this one question ("simple",
@@ -2156,7 +2166,13 @@ def create_app(
 
         # Over-fetch when a post-filter will drop rows, so `max_results` keeps
         # meaning "give me this many" — the same bookkeeping the MCP tool does.
-        filtering = criteria_active(req.exclude_sources, req.node_types, req.min_score)
+        filtering = criteria_active(
+            req.exclude_sources,
+            req.node_types,
+            req.min_score,
+            req.source_types,
+            req.exclude_source_types,
+        )
         started = time.perf_counter()
         try:
             payload = search.search_context(
@@ -2189,6 +2205,8 @@ def create_app(
                 exclude_sources=req.exclude_sources,
                 node_types=req.node_types,
                 min_score=req.min_score,
+                source_types=req.source_types,
+                exclude_source_types=req.exclude_source_types,
             )[: req.max_results]
             payload["criteria"] = criteria_dict(
                 req.source_name,
@@ -2196,6 +2214,8 @@ def create_app(
                 req.node_types,
                 req.min_score,
                 req.memory,
+                req.source_types,
+                req.exclude_source_types,
             )
         return payload
 
@@ -3244,6 +3264,8 @@ def create_app(
             mode=req.mode,
             max_results=req.max_results,
             source_name=req.source_name,
+            source_types=req.source_types,
+            exclude_source_types=req.exclude_source_types,
             principal=req.principal,
             principal_groups=req.principal_groups,
             workflow=req.workflow,
@@ -3295,6 +3317,8 @@ def create_app(
                     mode=req.mode,
                     max_results=req.max_results,
                     source_name=req.source_name,
+                    source_types=req.source_types,
+                    exclude_source_types=req.exclude_source_types,
                     principal=req.principal,
                     principal_groups=req.principal_groups,
                     workflow=req.workflow,

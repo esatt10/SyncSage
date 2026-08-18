@@ -149,8 +149,19 @@ export interface ConfigResponse {
 
 export type SearchMode = "hybrid" | "text" | "graph" | "vector";
 
+/** Where a hit came from. `source_type` is the *kind* of source, not its name. */
+export interface HitProvenance {
+  source_id?: string;
+  source_type?: string;
+  path?: string;
+  relative_path?: string;
+  heading_path?: string;
+  [key: string]: unknown;
+}
+
 export interface SearchResultItem {
   node_id?: string;
+  provenance?: HitProvenance;
   kind?: "node" | "relationship" | "chunk";
   type?: string;
   title?: string;

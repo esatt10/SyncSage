@@ -2703,3 +2703,36 @@ select.text-input {
   font-size: 0.8em;
   opacity: 0.8;
 }
+
+/* Source-type filter chips in the Sources rail. Scoping by kind of source is
+   the control that stays usable once a knowledge base has more sources than
+   fit on one screen. */
+.source-types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px 4px;
+}
+
+.chip {
+  padding: 2px 9px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-soft);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.chip:hover {
+  color: var(--text);
+  border-color: var(--accent-border);
+}
+
+.chip--active {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+  color: var(--accent-text);
+}
