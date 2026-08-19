@@ -1304,6 +1304,13 @@ select.text-input {
   font-size: 11.5px;
   color: var(--text-soft);
   flex: none;
+  /* The canvas shell is `position: absolute` (it has to be, for Cytoscape to
+     size against the pane rather than its own content), so on the Graph page
+     the legend is the *only* in-flow child of the column and lands at the top
+     — under the overlay controls. Pushing it to the end restores the bottom
+     strip the border-top is drawn for; where a flexing sibling already does
+     that (the Notebook's graph pane), this changes nothing. */
+  margin-top: auto;
 }
 
 .legend-entry {
