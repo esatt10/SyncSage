@@ -21,6 +21,7 @@ ones most likely to earn their keep:
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -518,6 +519,48 @@ def test_cli_lists_exportable_tables(capsys: pytest.CaptureFixture) -> None:
     listing = capsys.readouterr().out
     for table in analytics.EXPORTABLE:
         assert table in listing
+
+
+# --- opening state, on whichever backend ------------------------------------
+
+
+def test_open_state_names_a_missing_sqlite_file(tmp_path: Path) -> None:
+    """On SQLite, "which file did you mean" is the whole question."""
+
+    config = _config(tmp_path)
+    with pytest.raises(analytics.StateUnavailable, match="Run `pheasant sync` first"):
+        analytics.open_state(config, tmp_path / "state" / "nothing-here.db")
+
+
+def test_open_state_rejects_an_empty_database(tmp_path: Path) -> None:
+    """A file that exists but holds no pheasant tables is "not synced yet",
+    not "no such table: chunks" from inside the Parquet writer."""
+
+    empty = tmp_path / "empty.db"
+    empty.parent.mkdir(parents=True, exist_ok=True)
+    sqlite3.connect(empty).close()
+    with pytest.raises(analytics.StateUnavailable, match="no pheasant tables yet"):
+        analytics.open_state(_config(tmp_path), empty)
+
+
+def test_open_state_explains_a_missing_postgres_dsn(tmp_path: Path) -> None:
+    """The most common Postgres misconfiguration, and it must not arrive as a
+    traceback four frames inside `resolve_dsn`. Runs without Postgres: no DSN
+    is exactly the condition under test."""
+
+    config = _config(tmp_path)
+    config.storage.backend = "postgres"
+    config.storage.dsn_env = "PHEASANT_TEST_DSN_THAT_IS_NOT_SET"
+    with pytest.raises(analytics.StateUnavailable, match="PHEASANT_TEST_DSN_THAT_IS_NOT_SET"):
+        analytics.open_state(config, tmp_path / "unused.db")
+
+
+def test_open_state_returns_a_usable_store(indexed: Any, tmp_path: Path) -> None:
+    state = analytics.open_state(indexed.config, indexed.state.path)
+    try:
+        assert state.rows("SELECT count(*) AS n FROM artifacts")[0]["n"] > 0
+    finally:
+        state.close()
 
 
 # --- the schema is a published contract ------------------------------------

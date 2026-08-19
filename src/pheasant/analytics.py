@@ -231,6 +231,10 @@ class AnalyticsUnavailable(RuntimeError):
     """DuckDB is not installed, so there is nothing to write Parquet with."""
 
 
+class StateUnavailable(RuntimeError):
+    """The configured state store could not be read, and why."""
+
+
 class QueryError(RuntimeError):
     """The SQL handed to :func:`query` did not run.
 
@@ -256,6 +260,53 @@ def duckdb_module() -> Any:
             "extra: pip install 'pheasant-kb[analytics]'"
         ) from exc
     return duckdb
+
+
+def open_state(config: Any, sqlite_path: Any) -> Any:
+    """Open the configured state store for reading, or say why not.
+
+    Exports run unattended — a cron entry, a CI step, a sidecar that ships
+    `/exports` somewhere — so every failure has to arrive as a sentence an
+    operator can act on rather than as a traceback from inside a driver.
+
+    A Postgres-backed region has three failure modes SQLite does not, and all
+    three surfaced raw before this existed: no DSN in the environment
+    (``DsnUnavailable`` from four frames down), a database that is up but has
+    never been synced (``psycopg.errors.UndefinedTable: relation "sources"
+    does not exist``), and a database that is not reachable at all
+    (``PoolTimeout`` after the pool's 30-second wait).
+
+    The "has this been synced" probe is ``table_columns('sources')`` because
+    it is the one existence check both backends already answer: SQLite swallows
+    the error and returns an empty set, Postgres asks ``information_schema``.
+    """
+
+    from pheasant.persistence.secrets import DsnUnavailable
+    from pheasant.persistence.state_store import StateStore
+
+    backend = str(getattr(getattr(config, "storage", None), "backend", "sqlite") or "sqlite")
+    if backend.lower() != "postgres" and not Path(sqlite_path).exists():
+        # Name the path: on SQLite "which file did you mean" is the whole
+        # question, and it is more use than "there are no tables".
+        raise StateUnavailable(f"no indexed state at {sqlite_path}. Run `pheasant sync` first.")
+    try:
+        state = StateStore.from_config(config, sqlite_path)
+    except DsnUnavailable as exc:
+        raise StateUnavailable(str(exc)) from exc
+    try:
+        synced = bool(state.backend.table_columns("sources"))
+    except Exception as exc:
+        # Anything the driver raises reaching the database at all — refused,
+        # timed out, authentication rejected. The driver's own text is kept
+        # because it names which of those it was.
+        state.close()
+        raise StateUnavailable(f"could not read {backend} state: {exc}") from exc
+    if not synced:
+        state.close()
+        raise StateUnavailable(
+            f"the configured {backend} state has no pheasant tables yet. Run `pheasant sync` first."
+        )
+    return state
 
 
 @dataclass(frozen=True)

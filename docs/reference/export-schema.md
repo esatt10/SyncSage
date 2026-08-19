@@ -308,8 +308,13 @@ for diagnostics. Join on the columns.
 - **`*_json` and `attributes` are VARCHAR** holding JSON text.
 - **Row order is the primary key's**, because the export streams by keyset
   pagination on it. Do not rely on it meaning anything else.
-- Both state backends export identically — same columns, same stable IDs. The
-  manifest records which one produced the file.
+- Both state backends export identically — same columns, same types, same
+  stable IDs, same values; only run timestamps differ, because two indexing
+  runs are two moments. Row *order* follows the database's collation
+  (SQLite compares bytes, Postgres uses its configured collation), which is
+  why order is not a contract. `export.json`'s `state_backend` records which
+  backend produced the file. See
+  [On Postgres](../how-to/parquet-exports.md#on-postgres).
 
 ## What is not in an export
 

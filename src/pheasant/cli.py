@@ -1326,10 +1326,12 @@ def main(argv: list[str] | None = None) -> int:
             GRAPH_TABLES,
             AnalyticsUnavailable,
             QueryError,
+            StateUnavailable,
             export_dir_for,
             export_parquet,
             export_schema,
             format_rows,
+            open_state,
             query,
             render_schema,
             resolve_tables,
@@ -1350,12 +1352,16 @@ def main(argv: list[str] | None = None) -> int:
             if args.config:
                 from pheasant.config.loader import load_config
                 from pheasant.persistence.paths import StatePaths
-                from pheasant.persistence.state_store import StateStore
 
                 cfg = load_config(Path(args.config))
                 paths = StatePaths.from_config(cfg)
-                if cfg.storage.backend.lower() == "postgres" or paths.sqlite.exists():
-                    state = StateStore.from_config(cfg, paths.sqlite)
+                try:
+                    state = open_state(cfg, paths.sqlite)
+                except StateUnavailable as exc:
+                    # Printing the declared schema is still useful — the point
+                    # of --schema is usually "what will I get", asked before
+                    # there is any state to read.
+                    print(f"WARNING: {exc} Showing the declared schema.", file=sys.stderr)
             try:
                 report = export_schema(state)
             finally:
@@ -1373,40 +1379,41 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.export_command == "parquet":
             from pheasant.persistence.graph_store import GraphStore
-            from pheasant.persistence.state_store import StateStore
 
             try:
                 selected = resolve_tables(args.tables)
             except ValueError as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)
                 return 1
-            # The export reads state; it never creates it. Without this a fresh
-            # checkout gets "no such table: chunks" from deep inside DuckDB,
-            # when the real answer is "nothing has been indexed yet".
-            if cfg.storage.backend.lower() != "postgres" and not paths.sqlite.exists():
-                print(
-                    f"ERROR: no indexed state at {paths.sqlite}. Run `pheasant sync` first.",
-                    file=sys.stderr,
-                )
+            # The export reads state; it never creates it. `open_state` turns
+            # every way that can fail — missing file, absent DSN, unreachable
+            # or never-synced database — into one actionable line instead of a
+            # traceback out of sqlite3 or psycopg.
+            try:
+                state = open_state(cfg, paths.sqlite)
+            except StateUnavailable as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
                 return 1
             out = Path(args.out) if args.out else export_dir_for(paths.exports, kb_id)
-            # Only pay for loading the graph when a graph table was asked for.
-            graph = (
-                GraphStore(paths.graphs).load(kb_id)
-                if any(name in GRAPH_TABLES for name in selected)
-                else None
-            )
-            if graph is not None and not graph.number_of_nodes():
-                # An empty graph exports as an empty file, which reads as "this
-                # corpus has no structure" rather than "the graph was not where
-                # I looked". Say which it is.
-                print(
-                    f"WARNING: no graph found under {paths.graphs / kb_id}; "
-                    "graph_nodes/graph_edges will be empty.",
-                    file=sys.stderr,
-                )
-            state = StateStore.from_config(cfg, paths.sqlite)
             try:
+                # Only pay for loading the graph when a graph table was asked
+                # for. Inside the try so a failure here still returns the
+                # state store's connection — on Postgres that is a pooled
+                # server-side process, not just a file handle.
+                graph = (
+                    GraphStore(paths.graphs).load(kb_id)
+                    if any(name in GRAPH_TABLES for name in selected)
+                    else None
+                )
+                if graph is not None and not graph.number_of_nodes():
+                    # An empty graph exports as an empty file, which reads as
+                    # "this corpus has no structure" rather than "the graph was
+                    # not where I looked". Say which it is.
+                    print(
+                        f"WARNING: no graph found under {paths.graphs / kb_id}; "
+                        "graph_nodes/graph_edges will be empty.",
+                        file=sys.stderr,
+                    )
                 report = export_parquet(
                     state,
                     out_dir=out,

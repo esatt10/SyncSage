@@ -346,6 +346,70 @@ services:
 0 4 * * *  docker compose exec -T pheasant pheasant export parquet -c /config/pheasant.yaml
 ```
 
+## On Postgres
+
+Nothing changes. The export reads through the same dialect-translated
+statements every other query in pheasant uses, so `storage.backend: postgres`
+needs no flag and no different command:
+
+```bash
+export PHEASANT_DATABASE_URL='postgresql://user:password@host:5432/pheasant'
+pheasant export parquet -c pheasant.yaml
+```
+
+The two backends produce **the same export** — same files, same columns, same
+types, same stable IDs, same values. Verified by indexing one workspace into
+both and diffing every table: the only differences are the columns that record
+*when a run happened* (`last_indexed_at`, `created_at`, and the `updated_at`
+inside the graph attribute bags), because two indexing runs are two moments.
+`tests/test_backend_parity.py` asserts it against a real Postgres.
+
+`export.json` records `state_backend`, so a consumer holding several exports
+can tell which came from where.
+
+Two differences worth knowing, neither of them about content:
+
+- **Row order follows the database's collation.** The export is ordered by
+  primary key, and SQLite compares text as bytes while Postgres uses its
+  configured collation, so the row *order* inside a file can differ. Order was
+  never a contract — sort in your query if you need one.
+- **Reads are pooled, not held.** Each page of the keyset scan is its own
+  statement, so an export does not pin a long transaction on the server. The
+  cost is that an export is not a single snapshot on either backend, which
+  matters only if a sync is running underneath it. Keyset pagination is what
+  makes that benign: concurrent inserts may or may not appear, but no existing
+  row is skipped or duplicated.
+
+### When it cannot reach the database
+
+Every failure gives one line and a non-zero exit, because exports run
+unattended:
+
+| Situation | What you get |
+|---|---|
+| `dsn_env` unset | `ERROR: storage.backend is 'postgres' but environment variable 'PHEASANT_DATABASE_URL' is empty or unset…` |
+| Database up, never synced | `ERROR: the configured postgres state has no pheasant tables yet. Run `pheasant sync` first.` |
+| Database unreachable | `ERROR: could not read postgres state: couldn't get a connection after 30.00 sec` |
+| SQLite file missing | ``ERROR: no indexed state at /state/pheasant.db. Run `pheasant sync` first.`` |
+
+`pheasant export tables --schema` degrades instead of failing: it warns and
+prints the declared schema, since the usual reason to ask is "what will I get"
+before any state exists.
+
+### Querying needs no database at all
+
+`pheasant export query` reads Parquet, so once an export exists the analytics
+surface is independent of the backend that produced it — no DSN, no server, no
+connection:
+
+```console
+$ env -u PHEASANT_DATABASE_URL pheasant export query -c pheasant.yaml \
+    "SELECT scope, count(*) FROM memory_records GROUP BY 1"
+```
+
+That is the property that makes an export an integration surface rather than a
+second front door onto the database.
+
 ## Limits worth knowing
 
 - **The export is derived data.** It is a snapshot of `/state`, not a backup of
