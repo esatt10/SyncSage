@@ -294,19 +294,50 @@ def open_state(config: Any, sqlite_path: Any) -> Any:
     except DsnUnavailable as exc:
         raise StateUnavailable(str(exc)) from exc
     try:
-        synced = bool(state.backend.table_columns("sources"))
+        # `SELECT 1` before asking about tables, and the order is the point.
+        # `table_columns` *swallows* a driver error and answers with an empty
+        # set, so probing it first reports a database that cannot be opened at
+        # all as one that has never been synced — a confident, wrong, and very
+        # hard-to-argue-with diagnosis. This statement succeeds on any state
+        # that can be read, so a failure here is unambiguous.
+        state.backend.rows("SELECT 1 AS ok")
     except Exception as exc:
-        # Anything the driver raises reaching the database at all — refused,
-        # timed out, authentication rejected. The driver's own text is kept
-        # because it names which of those it was.
         state.close()
-        raise StateUnavailable(f"could not read {backend} state: {exc}") from exc
-    if not synced:
+        raise StateUnavailable(_unreadable(backend, sqlite_path, exc)) from exc
+    if not state.backend.table_columns("sources"):
         state.close()
         raise StateUnavailable(
             f"the configured {backend} state has no pheasant tables yet. Run `pheasant sync` first."
         )
     return state
+
+
+def _unreadable(backend: str, sqlite_path: Any, exc: Exception) -> str:
+    """Why the state could not be read, said usefully.
+
+    The SQLite branch exists because of a failure that looks like a permissions
+    bug and is not: **SQLite cannot read a WAL database on a read-only
+    filesystem at all.** It needs to create the ``-wal`` and ``-shm`` sidecars
+    even to read, so a `/state:ro` mount — exactly what
+    ``docker-compose.scale.yml`` gives the api replicas — fails with "unable to
+    open database file" while the tables sit right there.
+
+    ``?immutable=1`` does open such a file, and is deliberately not used: it
+    asserts the database cannot change, and in the one topology where this
+    arises the indexer is writing it through another mount. Trading a correct
+    error for possibly-torn data is not a trade this export makes.
+    """
+
+    if backend.lower() == "postgres":
+        # Refused, timed out, authentication rejected. The driver's own text
+        # names which, so it is passed through rather than summarized.
+        return f"could not read postgres state: {exc}"
+    return (
+        f"could not open the SQLite state at {sqlite_path}: {exc}. "
+        "If /state is mounted read-only, that is the cause — SQLite needs to "
+        "write alongside the database file even to read it. Run the export "
+        "where /state is writable, or copy the state directory first."
+    )
 
 
 @dataclass(frozen=True)

@@ -543,6 +543,28 @@ def test_open_state_rejects_an_empty_database(tmp_path: Path) -> None:
         analytics.open_state(_config(tmp_path), empty)
 
 
+def test_open_state_distinguishes_unreadable_from_unsynced(tmp_path: Path) -> None:
+    """ "Cannot open this at all" must not be reported as "nothing indexed yet".
+
+    `SqliteBackend.table_columns` swallows a driver error and answers with an
+    empty set, so a probe built on it turns an unopenable database into a
+    confident, wrong diagnosis. The live case is a read-only `/state`: SQLite
+    needs to create its `-wal`/`-shm` sidecars even to read, so a `:ro` mount
+    fails with "unable to open database file" while the tables sit right
+    there. A directory in the database's place reproduces the same error
+    portably, without needing a mount.
+    """
+
+    unopenable = tmp_path / "state" / "pheasant.db"
+    unopenable.mkdir(parents=True)
+    with pytest.raises(analytics.StateUnavailable) as raised:
+        analytics.open_state(_config(tmp_path), unopenable)
+    message = str(raised.value)
+    assert "could not open the SQLite state" in message
+    assert "read-only" in message, "the likeliest cause has to be named"
+    assert "no pheasant tables yet" not in message
+
+
 def test_open_state_explains_a_missing_postgres_dsn(tmp_path: Path) -> None:
     """The most common Postgres misconfiguration, and it must not arrive as a
     traceback four frames inside `resolve_dsn`. Runs without Postgres: no DSN

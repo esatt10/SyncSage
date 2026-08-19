@@ -32,6 +32,10 @@ services:
     volumes:
       - "pheasant-config:/config"
       - "pheasant-state:/state"
+      # The Parquet extract, and the one volume meant to be read by
+      # something that is not pheasant. Swap the named volume for a host
+      # path to hand it straight to an outside service:
+      #   - ${PHEASANT_EXPORTS_PATH:-./exports}:/exports
       - "pheasant-exports:/exports"
     # Recreating this service is the reset operation. Targets are explicit and
     # restricted to the three named-volume mount points above.

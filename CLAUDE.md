@@ -383,6 +383,8 @@ Each of these cost real time. They are listed because the shape recurs.
   `docs/how-to/worker-fleet.md`, `docs/how-to/indexing-performance.md`
 - **Analytics/exports:** `docs/how-to/parquet-exports.md`,
   `docs/reference/export-schema.md` (the contract an outside reader gets)
+  — `/exports` is a PVC/named volume an outside reader mounts; nothing is
+  served over HTTP
 - **Memory:** `docs/memory-system.md`, `docs/how-to/agent-memory.md`
 - **Synapse region spec:** `docs/SYNAPSE_INTEGRATION.md`
 - **Deployment:** `docs/deployment.md`, `deploy/kubernetes/`

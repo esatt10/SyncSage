@@ -320,6 +320,175 @@ SELECT event_type, status, count(*) AS n,
 FROM sync_events GROUP BY 1, 2 ORDER BY n DESC;
 ```
 
+## Reaching an export from outside
+
+The integration is a **file copy**. pheasant writes `/exports`; anything that
+can read that directory is a consumer — no API, no client library, no pheasant
+process on the reader's side. Which means the whole question is "how do I get
+at that volume", and it has a different answer per runtime.
+
+One rule spans all of them: **the producer needs state access, the reader does
+not.** Running the export requires a writable `/state` (SQLite) or the DSN
+(Postgres). Reading the result requires `/exports` and nothing else. Keeping
+those separate is why `/exports` is its own volume rather than a directory
+inside `/state`.
+
+!!! warning "The volume's access *is* the access control"
+
+    An export enforces nothing — memory scope isolation and `artifacts.acl` are
+    exported as data. Mounting `/exports` into a service grants it the union of
+    every principal's access to the corpus. Mount it only where you would hand
+    over the whole knowledge base. See
+    [Parquet export schema](../reference/export-schema.md).
+
+### Docker Compose
+
+`/exports` is a named volume (`pheasant-exports`). Three ways out, easiest
+first:
+
+=== "Bind-mount a host path"
+
+    Swap the named volume for a directory your other service already reads —
+    the compose files carry this as a commented line:
+
+    ```yaml
+    volumes:
+      - ${PHEASANT_EXPORTS_PATH:-./exports}:/exports
+    ```
+
+    ```bash
+    PHEASANT_EXPORTS_PATH=/srv/analytics/pheasant docker compose up -d
+    ```
+
+=== "Mount the volume from another container"
+
+    Any container on the same host can attach it read-only:
+
+    ```bash
+    docker run --rm -v pheasant-exports:/in:ro python:3.12-slim \
+      sh -c "pip install -q duckdb && python -c \"
+    import duckdb
+    print(duckdb.sql(\\\"SELECT count(*) FROM '/in/parquet/my-kb/chunks.parquet'\\\")) \""
+    ```
+
+    As a long-lived sibling service, in the same compose file:
+
+    ```yaml
+    services:
+      analytics:
+        image: your/loader
+        volumes:
+          - pheasant-exports:/exports:ro
+    ```
+
+=== "Copy it out"
+
+    ```bash
+    docker compose cp pheasant:/exports/parquet/my-kb ./my-kb
+    ```
+
+Produce the export on a schedule from the host's cron:
+
+```bash
+0 4 * * *  docker compose exec -T pheasant pheasant export parquet -c /config/pheasant.yaml
+```
+
+### Kubernetes
+
+`/exports` is a `PersistentVolumeClaim` named `pheasant-exports`, and
+`deploy/kubernetes/scaled/exports-cronjob.yaml` fills it nightly. A consumer
+mounts the same claim read-only:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: warehouse-load
+  namespace: pheasant
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: load
+          image: your/loader
+          volumeMounts:
+            - name: exports
+              mountPath: /exports
+              readOnly: true
+      volumes:
+        - name: exports
+          persistentVolumeClaim:
+            claimName: pheasant-exports
+```
+
+The claim is **ReadWriteMany** in the scaled fleet for the same reason `/state`
+is: with ReadWriteOnce the volume attaches to one node, so a reader scheduled
+elsewhere cannot mount it at all. If your cluster has no RWX StorageClass, give
+the claim RWO and run the reader as a sidecar or a same-node job — or push the
+files to object storage instead (below). Losing the volume costs a re-export,
+never data.
+
+For a one-off, `kubectl cp` works:
+
+```bash
+kubectl -n pheasant cp "$(kubectl -n pheasant get pod -l app.kubernetes.io/component=indexer \
+  -o jsonpath='{.items[0].metadata.name}')":/exports/parquet/my-kb ./my-kb
+```
+
+With Helm, point the chart at a claim your consumer already mounts rather than
+letting it create one:
+
+```yaml
+persistence:
+  exports:
+    enabled: true
+    existingClaim: analytics-shared
+```
+
+### Object storage, for a consumer outside the cluster
+
+The usual answer when the reader is a warehouse, a notebook, or another team.
+Add a sync step after the export — same CronJob, or a sidecar:
+
+```bash
+pheasant export parquet -c /config/pheasant.yaml \
+  && aws s3 sync /exports/parquet/my-kb "s3://my-bucket/pheasant/my-kb/" --delete
+```
+
+Parquet in object storage is directly queryable — DuckDB, Athena, BigQuery,
+Snowflake and Spark all read it in place, so the consumer never mounts
+anything:
+
+```sql
+SELECT count(*) FROM 's3://my-bucket/pheasant/my-kb/chunks.parquet';
+```
+
+### Not over HTTP
+
+pheasant does not serve `/exports` from its API, deliberately. An export
+flattens the ACL model, so a route would hand every principal's memory records
+and every ACL-restricted artifact to any caller who can reach it. If you want
+HTTP delivery, put your own authenticated static file server or object-store
+presign in front of the volume — that keeps the authorization decision
+somewhere it can actually be made.
+
+### One constraint worth knowing before you design around it
+
+On **SQLite**, the export must run where `/state` is writable. SQLite creates
+its `-wal` and `-shm` sidecars even to read, so a read-only `/state` — which is
+what `docker-compose.scale.yml` gives the api replicas — fails outright:
+
+```
+ERROR: could not open the SQLite state at /state/pheasant.db: unable to open
+database file. If /state is mounted read-only, that is the cause…
+```
+
+Run the export from the container that owns `/state` (the indexer, or the
+single-container install), or copy the state directory somewhere writable
+first. On **Postgres** it does not arise: the tables come from the database, so
+`/state` is read-only-mountable and the shipped CronJob does exactly that.
+
 ## Keep exports fresh
 
 An export is a snapshot. Re-run it after a sync — the command is idempotent, so
@@ -328,87 +497,6 @@ re-running over an existing directory just replaces the files:
 ```bash
 pheasant sync --all -c pheasant.yaml && pheasant export parquet -c pheasant.yaml
 ```
-
-In a container, `/exports` is a volume; mount it somewhere your analysis tools
-can see and run the export on a cron:
-
-```yaml
-services:
-  pheasant:
-    image: ghcr.io/esatt10/pheasant
-    volumes:
-      - pheasant-state:/state
-      - ./exports:/exports
-```
-
-```bash
-# nightly, after the index has settled
-0 4 * * *  docker compose exec -T pheasant pheasant export parquet -c /config/pheasant.yaml
-```
-
-## On Postgres
-
-Nothing changes. The export reads through the same dialect-translated
-statements every other query in pheasant uses, so `storage.backend: postgres`
-needs no flag and no different command:
-
-```bash
-export PHEASANT_DATABASE_URL='postgresql://user:password@host:5432/pheasant'
-pheasant export parquet -c pheasant.yaml
-```
-
-The two backends produce **the same export** — same files, same columns, same
-types, same stable IDs, same values. Verified by indexing one workspace into
-both and diffing every table: the only differences are the columns that record
-*when a run happened* (`last_indexed_at`, `created_at`, and the `updated_at`
-inside the graph attribute bags), because two indexing runs are two moments.
-`tests/test_backend_parity.py` asserts it against a real Postgres.
-
-`export.json` records `state_backend`, so a consumer holding several exports
-can tell which came from where.
-
-Two differences worth knowing, neither of them about content:
-
-- **Row order follows the database's collation.** The export is ordered by
-  primary key, and SQLite compares text as bytes while Postgres uses its
-  configured collation, so the row *order* inside a file can differ. Order was
-  never a contract — sort in your query if you need one.
-- **Reads are pooled, not held.** Each page of the keyset scan is its own
-  statement, so an export does not pin a long transaction on the server. The
-  cost is that an export is not a single snapshot on either backend, which
-  matters only if a sync is running underneath it. Keyset pagination is what
-  makes that benign: concurrent inserts may or may not appear, but no existing
-  row is skipped or duplicated.
-
-### When it cannot reach the database
-
-Every failure gives one line and a non-zero exit, because exports run
-unattended:
-
-| Situation | What you get |
-|---|---|
-| `dsn_env` unset | `ERROR: storage.backend is 'postgres' but environment variable 'PHEASANT_DATABASE_URL' is empty or unset…` |
-| Database up, never synced | `ERROR: the configured postgres state has no pheasant tables yet. Run `pheasant sync` first.` |
-| Database unreachable | `ERROR: could not read postgres state: couldn't get a connection after 30.00 sec` |
-| SQLite file missing | ``ERROR: no indexed state at /state/pheasant.db. Run `pheasant sync` first.`` |
-
-`pheasant export tables --schema` degrades instead of failing: it warns and
-prints the declared schema, since the usual reason to ask is "what will I get"
-before any state exists.
-
-### Querying needs no database at all
-
-`pheasant export query` reads Parquet, so once an export exists the analytics
-surface is independent of the backend that produced it — no DSN, no server, no
-connection:
-
-```console
-$ env -u PHEASANT_DATABASE_URL pheasant export query -c pheasant.yaml \
-    "SELECT scope, count(*) FROM memory_records GROUP BY 1"
-```
-
-That is the property that makes an export an integration surface rather than a
-second front door onto the database.
 
 ## Limits worth knowing
 

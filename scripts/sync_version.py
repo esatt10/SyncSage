@@ -184,6 +184,7 @@ def replacements(version: str) -> list[Replacement]:
                 Path("deploy/kubernetes/scaled/api-deployment.yaml"): 1,
                 Path("deploy/kubernetes/scaled/indexer-statefulset.yaml"): 1,
                 Path("deploy/kubernetes/scaled/worker-deployment.yaml"): 1,
+                Path("deploy/kubernetes/scaled/exports-cronjob.yaml"): 1,
             },
         ),
         # Commented-out examples, but they are the values a user copies into a

@@ -32,11 +32,24 @@ something in pheasant's design, so they are stated with the reason:
    read the database and are always current, which is exactly what makes the
    staleness easy to miss.
 
-3. **The durable queue** (`sync.queue.enabled: true`). An api replica
+3. **A volume for `/exports`**, if anything outside pheasant consumes the
+   corpus. `exports-cronjob.yaml` writes the Parquet extract there nightly and
+   readers mount the same claim read-only — a warehouse loader, an analytics
+   job, an object-store sync. It is RWX for the same reason `/state` is: a
+   reader scheduled on another node cannot mount an RWO claim. It was an
+   `emptyDir`, which meant the indexer's export landed somewhere the api
+   replicas could not see and vanished on restart.
+
+   The export reads `/state` read-only, which works *because* this fleet is on
+   Postgres — the tables come from the database and only the graph file is read
+   from disk. Losing this volume costs a re-export, never data. See
+   [Parquet exports](../../../docs/how-to/parquet-exports.md).
+
+4. **The durable queue** (`sync.queue.enabled: true`). An api replica
    publishes index work rather than running it; without a queue it would
    accept syncs that go nowhere, and `--role api` refuses to start.
 
-4. **A metrics adapter**, if you want the worker HPA. Scaling on
+5. **A metrics adapter**, if you want the worker HPA. Scaling on
    `pheasant_index_queue_depth` needs [prometheus-adapter] or [KEDA] to expose
    it; `worker-hpa.yaml` ships the KEDA form and the CPU fallback.
 

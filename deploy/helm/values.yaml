@@ -44,6 +44,21 @@ persistence:
   state:
     enabled: true
     size: 10Gi
+    # storageClass: ""
+  # /exports: the Parquet extract, and the only volume meant to be read by
+  # something that is not pheasant. A durable claim by default — as an
+  # emptyDir it died with the pod and nothing outside the pod could reach it,
+  # which is the whole point of the directory.
+  exports:
+    enabled: true
+    size: 5Gi
+    # ReadWriteMany when the consumer runs in its own pod; ReadWriteOnce is
+    # right for a sidecar or a job scheduled on the same node.
+    accessMode: ReadWriteOnce
+    # storageClass: ""
+    # Mount a claim you already have — e.g. the one your warehouse loader
+    # reads — instead of letting the chart create one.
+    existingClaim: ""
 
 resources:
   requests:

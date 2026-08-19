@@ -60,6 +60,10 @@ services:
       # polls the graph file and reloads it when the indexer rewrites it.
       - pheasant-state:/state:ro
       - ${PHEASANT_WORKSPACE_PATH:-.}:/workspace:ro
+      # The Parquet extract, and the one volume meant to be read by
+      # something that is not pheasant. Swap the named volume for a host
+      # path to hand it straight to an outside service:
+      #   - ${PHEASANT_EXPORTS_PATH:-./exports}:/exports
       - pheasant-exports:/exports
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health || exit 1"]

@@ -45,3 +45,36 @@ spec:
   resources:
     requests:
       storage: 100Gi
+---
+# /exports: the Parquet extract, and the one volume that exists to be read by
+# something that is not pheasant.
+#
+# It was an `emptyDir` in every workload here, which failed the purpose three
+# ways at once: an emptyDir dies with its pod, it cannot be mounted by anything
+# outside that pod, and — because each workload declared its own — the
+# indexer's export landed in a directory the api replicas could not see. Three
+# empty directories all called /exports.
+#
+# ReadWriteMany for the same reason /state needs it: whoever runs the export
+# writes here and every reader mounts the same claim. On a cluster with no RWX
+# class, give this claim RWO and mount it only where the export runs, then move
+# the files off with a sidecar or an object-store sync — the export is a
+# regenerable payload, so losing the volume costs a re-run, never data.
+#
+# Sized well under /state: a Parquet export of a corpus compresses to a small
+# fraction of the state directory it came from.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pheasant-exports
+  namespace: pheasant
+  labels:
+    app.kubernetes.io/name: pheasant
+    app.kubernetes.io/component: exports
+spec:
+  accessModes:
+    - ReadWriteMany
+  # storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 20Gi
