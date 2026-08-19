@@ -78,7 +78,7 @@ same evidence comes back synthesised into prose, with the same citations.
 heading, entity and memory record is a node with a stable, documented ID; hubs,
 orphans and shortest paths are how you audit what a retrieval will walk through.
 
-![The graph explorer, showing the knowledge base, its sources and their files](docs/assets/ui/graph.png)
+![The graph explorer, showing the knowledge base, its sources and the files under them](docs/assets/ui/graph.png)
 
 **Memory you can read, and correct.** Everything an agent has asserted, by scope
 and subject — with the record it replaced shown underneath, because a correction
@@ -90,7 +90,7 @@ supersedes rather than overwrites.
 the rest; each source syncs, promotes into `pheasant.yaml`, or goes away, on its
 own schedule.
 
-![The sources page, listing a memory source and two indexed folders](docs/assets/ui/sources.png)
+![The sources page, listing an indexed git repository and its memory source](docs/assets/ui/sources.png)
 
 **Then hand it to an agent.** One command writes the MCP client config for
 Claude Code, Cursor or VS Code; an attached agent gets the whole tool surface —
