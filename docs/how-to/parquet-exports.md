@@ -353,6 +353,96 @@ services:
   same columns and the same stable IDs, and the manifest records which one the
   export came from.
 
+## What it costs
+
+Measured on a 4-core machine, exporting synthetic corpora of increasing size.
+
+### When you are not exporting: nothing
+
+DuckDB is imported lazily, inside the functions that need it. Nothing else
+pulls it in — verified against `sys.modules`, not assumed:
+
+| Process | DuckDB loaded? |
+|---|---|
+| `pheasant serve` / the API app | no |
+| `pheasant sync` / the indexer | no |
+| `pheasant --help`, `validate`, `config show` | no |
+| `pheasant export tables` | no |
+| `pheasant export parquet` / `query` | yes |
+
+So a running region pays **zero** — no memory, no latency, no import. The CLI
+pays about 7 ms and 1.7 MB to build its argument parser (the `analytics`
+module itself, stdlib only); on any command that loads the sync engine that is
+lost in the noise.
+
+### Exporting
+
+| Corpus | Export | Peak RSS | Parquet out |
+|---|---|---|---|
+| 250 files (0.8 MB) | 0.2 s | 76 MB | 0.1 MB |
+| 1,000 files (3.2 MB) | 0.3 s | 103 MB | 0.3 MB |
+| 4,000 files (12.6 MB) | 0.8 s | 178 MB | 1.3 MB |
+| 16,000 files (50.6 MB) | 1.8 s | 461 MB | 5.1 MB |
+
+For scale: indexing that 16,000-file corpus took **203 s at 254 MB peak**. The
+export is under 1% of the sync's time, and it runs on a container already
+sized for the sync.
+
+The fixed floor is ~23 MB for Python and pheasant plus ~33 MB for DuckDB
+itself. Past that, two things drive the numbers:
+
+- **The graph tables dominate at scale**, and that cost is pheasant's existing
+  in-memory graph, not DuckDB. On the 16,000-file corpus: `chunks` alone is
+  0.7 s / 246 MB, all six SQL tables are 0.9 s / 273 MB, and adding
+  `graph_nodes` + `graph_edges` takes it to 1.8 s / 461 MB — the graph has to
+  be loaded whole to be walked. Deselect it when you only want the tables:
+
+    ```bash
+    pheasant export parquet --table artifacts --table chunks --table symbols
+    ```
+
+- **Memory is flat, not proportional.** DuckDB is given a 512 MB buffer-pool
+  limit and spills to `.pheasant-export-tmp/` inside the export directory
+  rather than growing. On a fixture of unique, incompressible text the peak is
+  585 MB at 100k rows, 707 MB at 400k and 646 MB at 1M — no trend across a 10×
+  range. Without the limit the same three sizes climb 696 → 1,238 → 1,805 MB
+  and keep going.
+
+### Querying
+
+Query latency is set by the Parquet files, not by the corpus behind them, and
+it did not move across the sweep:
+
+| Operation | Latency |
+|---|---|
+| Cold start (open DuckDB, register every view) | ~50 ms |
+| `SELECT count(*) FROM chunks` | ~16 ms |
+| `artifacts ⨝ chunks`, group and sort | ~22 ms |
+
+Add ~60 ms of process start if you are measuring `pheasant export query` from a
+shell rather than the library.
+
+### Disk
+
+The Parquet output is small — on this repository's own index, 309 files and
+1,077 chunks come to 1.5 MB total, against 195 MB of `/state` for the larger
+sweep corpus. Two transient costs during a run, both deleted before the command
+returns:
+
+- a per-table NDJSON staging file, roughly the size of that table's raw
+  content — bounded by the **largest single table**, not by all of them, since
+  it is removed as soon as that table's Parquet lands;
+- DuckDB's spill directory, bounded by how far the working set exceeds the
+  512 MB limit.
+
+### Concurrency
+
+The export issues only `SELECT` and takes no lease, so on SQLite it is a WAL
+reader beside the indexer's writer and on Postgres an ordinary read-only
+session. It does not block a sync, and a sync does not block it — though an
+export taken mid-sync is a snapshot of a moving corpus, which is a consistency
+question rather than a performance one.
+
 ## Why DuckDB is here and not in `/state`
 
 DuckDB is a Parquet writer and a query engine in pheasant — never a state

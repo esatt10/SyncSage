@@ -36,11 +36,24 @@ obvious answer and is quadratic — the same shape as the O(N²) FTS delete this
 codebase already paid for once. Keyset paging rides the primary-key index on
 both backends and, as a side effect, makes row order deterministic.
 
-The scratch database is a **file**, not ``:memory:``. DuckDB buffers a table
-before ``COPY`` can write it out, so an in-memory scratch database would put
-the whole of ``chunks`` in RAM and undo the streaming above. A file-backed
-one spills through DuckDB's own buffer manager, and it is deleted on the way
-out — success or failure.
+Rows reach DuckDB as **newline-delimited JSON**, not as bound parameters, and
+that is worth more than it looks: DuckDB's Python parameter binder costs about
+100 microseconds *per value*, so a 13-column table ran at 1.9 ms per row —
+40 seconds for 20,000 rows, and it made the export slower than the sync that
+produced the data. Staging the same rows as NDJSON and letting ``read_json``
+parse them measured **48 microseconds per row on identical output**, a 40x
+difference that is entirely DuckDB's binding path and not the writes. JSON
+rather than CSV because it carries real nulls, real numbers and correct
+escaping for the quotes, newlines and unicode that live in chunk text — a CSV
+staging file would need a quoting scheme, and getting that subtly wrong
+corrupts the export silently.
+
+Nothing is staged in a DuckDB *table*: the ``COPY`` reads the NDJSON and
+writes the Parquet in one streaming statement, so there is no scratch
+database, no spill directory, and no second copy of the corpus in RAM. The
+staging file is written per table and deleted as soon as that table's Parquet
+lands, so transient disk is bounded by the largest single table rather than by
+all of them.
 """
 
 from __future__ import annotations
@@ -78,9 +91,42 @@ EXPORT_SUBDIR = "parquet"
 #: The manifest written beside the Parquet files.
 MANIFEST_NAME = "export.json"
 
-#: Scratch database, removed on the way out. Dot-prefixed so a glob of
-#: ``*.parquet`` — or of the directory — never picks it up.
-_SCRATCH_NAME = ".pheasant-export.duckdb"
+#: Rows the Parquet writer buffers before flushing a row group.
+#:
+#: DuckDB's default is 122,880, which on ``chunks`` — whose rows carry the full
+#: chunk text — is a third of a gigabyte of buffer per writer thread, and it is
+#: **unspillable**: the memory limit below cannot page it out, so a large
+#: default here is what turns a low limit into an out-of-memory error rather
+#: than a spill. At 5,000 the buffer is ~13 MB per thread. Measured on a real
+#: 16,000-file corpus, 5,000 beat 20,000 on peak RSS at every memory limit
+#: (226-260 MB against 277-319 MB) and was never slower.
+_ROW_GROUP_SIZE = 5_000
+
+#: What DuckDB may hold before it spills to :data:`_TEMP_DIRNAME`.
+#:
+#: **This is what makes the export's memory flat instead of proportional.**
+#: Left at DuckDB's default (80% of system RAM) the COPY grows with the table:
+#: 696 MB at 100k rows, 1,238 MB at 400k, 1,805 MB at 1M, still climbing. With
+#: this limit the same three sizes peak at 585 MB, 707 MB and 646 MB — no trend
+#: across a 10x range — on a fixture whose every row is unique incompressible
+#: text. On a real corpus, where chunks share vocabulary, a 16,000-file export
+#: peaks at 258 MB. A container sized for the sync can therefore always run the
+#: export, at any corpus size.
+#:
+#: 512 MB and not lower: 128 MB measured beautifully on a synthetic fixture and
+#: then **failed outright on real data** with
+#: ``OutOfMemoryException: failed to allocate 48.4 MiB (75.3/122.0 MiB used)``.
+#: The fixture repeated one string, so dictionary encoding crushed the writer's
+#: working set and understated it by roughly 3x. This codebase has the rule
+#: already — a live run finds what the suite cannot — and this is the constant
+#: that proves it. Re-measure on real content before touching it.
+_MEMORY_LIMIT = "512MB"
+
+#: Where DuckDB spills when it hits :data:`_MEMORY_LIMIT`. Inside the export
+#: directory so the spill lands on the volume the operator sized for exports
+#: rather than on whatever ``/tmp`` happens to be — which in a container is
+#: often a small tmpfs, i.e. RAM, which would defeat the point.
+_TEMP_DIRNAME = ".pheasant-export-tmp"
 
 #: State tables that are exported, and what each one is for.
 #:
@@ -419,12 +465,16 @@ def export_parquet(
 
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    scratch = directory / _SCRATCH_NAME
-    _remove_scratch(scratch)
 
     written: list[TableExport] = []
-    connection = duckdb.connect(str(scratch))
+    # In-memory: the connection only parses NDJSON and writes Parquet, so it
+    # holds no table and needs no file of its own.
+    connection = duckdb.connect(":memory:")
+    spill = directory / _TEMP_DIRNAME
     try:
+        spill.mkdir(exist_ok=True)
+        connection.execute(f"SET memory_limit = {_sql_literal(_MEMORY_LIMIT)}")
+        connection.execute(f"SET temp_directory = {_sql_literal(str(spill))}")
         for table in selected:
             written.append(
                 _export_one(
@@ -439,7 +489,9 @@ def export_parquet(
             )
     finally:
         connection.close()
-        _remove_scratch(scratch)
+        # DuckDB clears its own spill on a clean close; this covers the crash
+        # that did not get one.
+        shutil.rmtree(spill, ignore_errors=True)
 
     manifest = {
         "kb_id": kb_id,
@@ -516,7 +568,7 @@ def _export_one(
     compression: str,
     batch: int,
 ) -> TableExport:
-    """Load one table into the scratch database and COPY it out as Parquet."""
+    """Stage one table as NDJSON, then COPY it straight out as Parquet."""
 
     if table == "graph_nodes":
         columns = _GRAPH_NODE_COLUMNS
@@ -528,21 +580,34 @@ def _export_one(
         columns = export_columns(state, table)
         pages = _stream_table(state, table, columns, batch)
 
-    definition = ", ".join(f"{_quote(name)} {_DUCKDB_TYPES[kind]}" for name, kind in columns)
-    connection.execute(f"CREATE OR REPLACE TABLE {_quote(table)} ({definition})")
-    placeholders = ", ".join("?" for _ in columns)
-    insert = f"INSERT INTO {_quote(table)} VALUES ({placeholders})"
-    rows = 0
-    for page in pages:
-        connection.executemany(insert, page)
-        rows += len(page)
-
     final = directory / f"{table}.parquet"
     tmp = final.with_suffix(".parquet.tmp")
+    # Dot-prefixed so a directory glob for `*.parquet` — or a reader listing
+    # the export — never sees the staging file even mid-run.
+    stage = directory / f".{table}.jsonl.tmp"
+    names = [name for name, _ in columns]
+    rows = 0
     try:
+        with stage.open("w", encoding="utf-8") as handle:
+            for page in pages:
+                # One write per page rather than per row: the join is cheap and
+                # it keeps the syscall count proportional to pages, not rows.
+                handle.write(
+                    "".join(
+                        json.dumps(
+                            dict(zip(names, row, strict=True)),
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                        + "\n"
+                        for row in page
+                    )
+                )
+                rows += len(page)
         connection.execute(
-            f"COPY {_quote(table)} TO {_sql_literal(str(tmp))} "
-            f"(FORMAT PARQUET, COMPRESSION {compression.upper()})"
+            f"COPY ({_source_select(stage, columns, rows)}) TO {_sql_literal(str(tmp))} "
+            f"(FORMAT PARQUET, COMPRESSION {compression.upper()}, "
+            f"ROW_GROUP_SIZE {_ROW_GROUP_SIZE})"
         )
         os.replace(tmp, final)
     except BaseException:
@@ -551,26 +616,41 @@ def _export_one(
         # tmp+rename write in this codebase does.
         tmp.unlink(missing_ok=True)
         raise
-    # Drop as we go: the scratch database would otherwise hold every table at
-    # once, which on a large corpus is a second copy of the whole corpus.
-    connection.execute(f"DROP TABLE {_quote(table)}")
+    finally:
+        stage.unlink(missing_ok=True)
     logger.info("Exported %s: %d row(s) -> %s", table, rows, final)
     return TableExport(table=table, path=final, rows=rows, bytes_=final.stat().st_size)
 
 
-def _remove_scratch(scratch: Path) -> None:
-    """Delete the scratch database and everything DuckDB puts beside it.
+def _source_select(stage: Path, columns: list[tuple[str, str]], rows: int) -> str:
+    """The SELECT the Parquet COPY reads from.
 
-    Three artifacts, not one: the database file, its write-ahead log, and the
-    ``<db>.tmp/`` directory DuckDB spills to when a table outgrows the buffer
-    pool — which on the corpus this streaming exists for is exactly the case
-    that will happen. Leaving that directory behind would put a second copy of
-    ``chunks`` in `/exports` under a name nothing ever cleans up.
+    With rows, that is the staging file read under an explicit column spec —
+    explicit so the Parquet schema is the schema pheasant declares rather than
+    whatever DuckDB infers from the first few JSON objects, which for an
+    all-null column would be a guess.
+
+    With no rows it is a typed empty projection instead. An empty table still
+    owes the export a file: a reader joining against a `memory_records.parquet`
+    that does not exist gets an error, where one with zero rows gets the right
+    answer.
     """
 
-    shutil.rmtree(scratch.with_suffix(scratch.suffix + ".tmp"), ignore_errors=True)
-    scratch.unlink(missing_ok=True)
-    scratch.with_suffix(scratch.suffix + ".wal").unlink(missing_ok=True)
+    if not rows:
+        return (
+            "SELECT "
+            + ", ".join(
+                f"CAST(NULL AS {_DUCKDB_TYPES[kind]}) AS {_quote(name)}" for name, kind in columns
+            )
+            + " WHERE false"
+        )
+    spec = ", ".join(
+        f"{_sql_literal(name)}: {_sql_literal(_DUCKDB_TYPES[kind])}" for name, kind in columns
+    )
+    return (
+        f"SELECT * FROM read_json({_sql_literal(str(stage))}, "
+        f"columns = {{{spec}}}, format = 'newline_delimited')"
+    )
 
 
 def _version() -> str:

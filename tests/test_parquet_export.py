@@ -239,6 +239,85 @@ def test_a_partial_export_still_describes_the_whole_directory(indexed: Any, tmp_
     assert listed["artifacts"]["rows"] > 0
 
 
+def test_staging_files_never_survive_the_export(indexed: Any, tmp_path: Path) -> None:
+    """Rows reach DuckDB through a per-table NDJSON staging file. One left
+    behind is a second, uncompressed copy of the corpus sitting in `/exports`
+    under a name nothing ever cleans up."""
+
+    out = tmp_path / "out"
+    _export(indexed, out)
+
+    assert not list(out.glob("*.jsonl*")), "staging file survived a successful export"
+    assert not list(out.glob(".*")), "hidden working file survived a successful export"
+    assert not list(out.glob("*.tmp"))
+    # And nothing that is not an export artifact at all.
+    assert {path.name for path in out.iterdir()} == {
+        f"{table}.parquet" for table in analytics.DEFAULT_TABLES
+    } | {analytics.MANIFEST_NAME}
+
+
+def test_a_failed_export_leaves_no_debris(indexed: Any, tmp_path: Path) -> None:
+    """A crash mid-COPY must not leave a partial `.parquet` that reads as real,
+    nor the staging file that fed it."""
+
+    out = tmp_path / "out"
+
+    class Boom(Exception):
+        pass
+
+    real_export_one = analytics._export_one
+
+    def fail_on_chunks(connection, state, graph, table, directory, **kwargs):
+        if table == "chunks":
+            raise Boom("COPY failed")
+        return real_export_one(connection, state, graph, table, directory, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(analytics, "_export_one", fail_on_chunks)
+        with pytest.raises(Boom):
+            _export(indexed, out, tables=["artifacts", "chunks"])
+
+    assert not list(out.glob("*.jsonl*"))
+    assert not list(out.glob("*.tmp"))
+    assert not (out / "chunks.parquet").exists()
+
+
+def test_an_empty_table_still_gets_a_typed_file(indexed: Any, tmp_path: Path) -> None:
+    """A reader joining against a file that does not exist gets an error; one
+    with zero rows gets the right answer. So an empty table owes a file, and
+    that file owes the right schema."""
+
+    out = tmp_path / "out"
+    _export(indexed, out, tables=["memory_records"])
+
+    assert (out / "memory_records.parquet").exists()
+    assert _rows(out, "SELECT count(*) FROM memory_records")[0][0] == 0
+    declared = {name for name, _ in columns_of("memory_records")}
+    assert {row[0] for row in _rows(out, "DESCRIBE memory_records")} >= declared
+    types = {row[0]: row[1] for row in _rows(out, "DESCRIBE memory_records")}
+    assert types["salience"] == "DOUBLE"
+    assert types["uses"] == "BIGINT"
+
+
+def test_text_with_quotes_newlines_and_unicode_survives(indexed: Any, tmp_path: Path) -> None:
+    """The staging format has to carry chunk text intact. A CSV staging file
+    would need a quoting scheme, and getting that subtly wrong corrupts the
+    export silently — which is why the staging format is JSON."""
+
+    hostile = "He said \"hi\" 'twice'\nthen \\ left — ünïcode, \ttabbed\r\n"
+    artifact = indexed.state.rows("SELECT id, source_id FROM artifacts LIMIT 1")[0]
+    indexed.state.rows(
+        "UPDATE chunks SET text = ? WHERE artifact_id = ?", (hostile, artifact["id"])
+    )
+    indexed.state.backend.commit()
+
+    out = tmp_path / "out"
+    _export(indexed, out, tables=["chunks"])
+
+    texts = {row[0] for row in _rows(out, "SELECT text FROM chunks")}
+    assert hostile in texts
+
+
 # --- the query surface -----------------------------------------------------
 
 
