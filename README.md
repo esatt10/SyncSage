@@ -46,9 +46,8 @@ rewrite — see
 
 ### Memory is part of the knowledge base, not a log beside it
 
-Human knowledge isn't a transcript you replay. It grows, it gets corrected, and
-almost none of it is present when you think about any one thing. pheasant treats
-agent memory the same way:
+Human knowledge is stateful. It grows, it gets corrected, and it is influenced by memories.
+pheasant treats agent memory the same way:
 
 - **A memory is a file in your corpus.** Each record is one frontmatter Markdown
   file, indexed by the ordinary pipeline — so **recall is just search**. What
