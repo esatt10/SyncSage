@@ -4,27 +4,40 @@
 
 # pheasant
 
-pheasant is a local-first MCP context server that turns project sources into a queryable knowledge graph for agents and humans. It syncs configured repositories, folders, files, Obsidian vaults, web collections, and experimental API/S3 sources; enriches them into graph relationships; exposes retrieval and lifecycle operations through MCP and HTTP; and can project the result into a navigable Obsidian vault.
+Give pheasant the places where your useful context lives. It indexes them once,
+keeps up as they change, and gives agents (or you) one place to search the lot.
+Repositories, loose folders, Obsidian vaults, docs sites, images, audio: they all
+end up in the same local knowledge graph, available over MCP, HTTP, and a web UI.
 
-The project is still an active prototype, but the current architecture is intentionally shaped around production concerns: connector boundaries, idempotent sync, persistent checkpoints, graph-derived search, runtime source lifecycle management, and inspectable configuration.
+The important bit is that it stays yours. pheasant is local-first, does no LLM
+work while indexing, and can run perfectly well without a router or a cloud
+service. It is still an active prototype — I use it, I change it, and I would
+rather say that plainly than dress it up as finished enterprise software.
 
-> **Part of the [Synapse Suite](https://esatt10.github.io/pheasant-flock/):** pheasant is the *region* component of **Synapse** — a hyperfast federated knowledge-base system in which each pheasant container is a self-searching "brain region" that publishes a **semantic contract**, and the [pheasant-flock](https://github.com/esatt10/pheasant-flock) router (the "nervous system") routes global queries across regions. The **suite front door** (whole-system view) is the [Synapse Suite site](https://esatt10.github.io/pheasant-flock/); this repo is the region/KB half. Attaching to a fleet is opt-in and standalone-safe — see the consumer guide [Attach to a Synapse fleet](docs/how-to/attach-to-synapse.md). Region-side spec: `docs/SYNAPSE_INTEGRATION.md`; system design lives in the pheasant-flock repo (`docs/SYNAPSE_ARCHITECTURE.md`).
+pheasant is also the region half of
+[Synapse](https://esatt10.github.io/pheasant-flock/). One container is one
+self-searching "brain region"; [pheasant-flock](https://github.com/esatt10/pheasant-flock)
+routes a question across as many regions as you choose to connect. That part is
+entirely opt-in. A lone pheasant remains a useful pheasant. If you do want a
+fleet, start with [Attach to a Synapse fleet](docs/how-to/attach-to-synapse.md).
 
-> **📖 Documentation site:** Full consumer docs (tutorials, how-to guides, reference, explanation) are published as a [MkDocs Material](https://www.mkdocs.org/) site — see the [Documentation](#documentation) section below. Build locally with `pip install -e ".[docs]" && mkdocs build --strict`.
+## What you get
 
-> **Multi-modal ingest:** pheasant indexes **images** (`.png/.jpg/.jpeg/.webp/.gif`, captioned) and **audio** (`.wav/.mp3/.m4a/.flac/.ogg`, transcribed) alongside text. Both ship with a deterministic **offline stub** by default (no API keys, no model downloads) and support authored `.caption.txt`/`.transcript.txt` sidecars. See [Multi-modal ingest](docs/how-to/multimodal-ingest.md).
+- Incremental, repeatable sync. Unchanged files do not get pointlessly re-read.
+- Text, graph, vector, and hybrid search over the same material.
+- MCP tools for agents, an HTTP API, and a three-pane web UI for humans.
+- Runtime source management without turning every small change into YAML work.
+- A navigable Obsidian projection if that is where you prefer to think.
+- Image captioning and audio transcription, with deterministic offline stubs by
+  default and authored sidecars when you want exact text.
+- State you can inspect and back up: SQLite, manifests, checkpoints, graph
+  snapshots, and audit history all live under `/state`.
 
-## What pheasant Does
+There is a proper [documentation site](#documentation) when you need the whole
+reference. This README is here to get you oriented and running, not make you
+read the manual twice.
 
-- Ingests local and connector-backed sources through a `SourceConnector` abstraction.
-- Maintains SQLite search state, source manifests, connector checkpoints, graph snapshots, and audit history under `/state`.
-- Builds an enriched graph with sources, artifacts, chunks, symbols, entities, concepts, external references, and cross-artifact relationships.
-- Serves MCP tools/resources for source registration, sync, search, graph traversal, source lifecycle operations, and Obsidian export.
-- Provides HTTP endpoints for health, readiness, source status, sync, search, graph export, and Obsidian export.
-- Generates previewable Obsidian notes using workflow profiles for engineering, research, and project operations.
-- Supports layered configuration: base defaults + profile + YAML + CLI overrides.
-
-## Architecture at a Glance
+## The shape of it
 
 ```text
 YAML/profile config
@@ -36,7 +49,7 @@ YAML/profile config
   -> MCP tools/resources, HTTP API, Obsidian projection
 ```
 
-Core components:
+Under those arrows:
 
 | Component | Role |
 |---|---|
@@ -49,9 +62,9 @@ Core components:
 | MCP server | Provides the primary agent interface for retrieval, sync, graph navigation, and source lifecycle operations. |
 | Obsidian exporter | Creates previewable source, concept, file, and optional chunk notes with graph-driven links. |
 
-## Quick Start
+## Start here
 
-**One line, any target.** `pheasant up` detects what you point it at — a folder,
+`pheasant up` works out what you pointed it at — a folder,
 an Obsidian vault, a git repo (local or a URL it clones), a docs site, an S3
 bucket, or a connector — writes a config, indexes it, and serves the API + MCP:
 
@@ -70,7 +83,7 @@ A private GitHub repo needs `GITHUB_TOKEN` (or `GH_TOKEN`) set — see
 `.env.example` — or the clone fails with an authentication error; a public
 repo needs nothing.
 
-**One line to host it.** `pheasant host` does the same detection, then writes a
+If you want containers, `pheasant host` does the same detection, writes a
 compose file (mounting each local source read-only at `/sources/<name>`) and
 brings the stack up:
 
@@ -84,9 +97,10 @@ Open <http://localhost:8080> for the web UI, or <http://localhost:8765> for the
 API and MCP endpoint. Trouble getting the UI up, or seeing a stale one? →
 **[Run the web UI](docs/how-to/run-the-ui.md)**.
 
-### The longer way
+### If you want to see every knob
 
-Prefer to be walked through every option instead of hand-editing YAML?
+Do not hand-write a config from examples and hope it is current. Let the live
+schema walk you through it:
 
 ```bash
 pheasant setup            # sectioned interview; Enter accepts every default
@@ -99,7 +113,7 @@ and ends with a ready-to-run `pheasant.yaml`, a `0600` `.env` for any secrets
 (only the env-var *name* ever reaches the YAML), and the startup commands for
 your deployment target. See **[Set pheasant up](docs/how-to/setup.md)**.
 
-Or generate a starter config yourself:
+If you really just want a starter file:
 
 ```bash
 pheasant init --profile quickstart --output pheasant.yaml
@@ -141,7 +155,7 @@ curl http://localhost:8765/ready
 
 Local `pheasant.yaml`, `.pheasant/compose.env`, `.vscode/mcp.json`, state, and vault output are ignored by git.
 
-## Configuration Model
+## How configuration works
 
 pheasant resolves config in this order:
 
@@ -167,7 +181,7 @@ pheasant doctor --profile dev --config pheasant.yaml
 
 See [docs/configuration.md](docs/configuration.md).
 
-## Source Sync
+## Keeping sources in sync
 
 Configured sources are listed under `sources:` in YAML and can also be registered at runtime through MCP.
 
@@ -198,9 +212,10 @@ pheasant sync --config pheasant.yaml --source pheasant-repo --mode incremental
 pheasant sync --config pheasant.yaml --all --mode full
 ```
 
-## Knowledge Graph and Search
+## Search, with structure
 
-pheasant stores a directed multi-graph. Core nodes include:
+pheasant stores a directed multi-graph rather than flattening everything into a
+bag of chunks. The main nodes are:
 
 - `knowledge_base`, `source`, `file`, `document`, `markdown_note`, `chunk`
 - `symbol`, `entity`, `concept`, `external_reference`
@@ -210,19 +225,29 @@ Core edges include:
 - `contains`, `indexes`, `has_chunk`
 - `mentions`, `derived_from`, `references`, `imports`, `calls`, `similar_to`
 
-Enrichment passes extract:
+From the source material it derives:
 
 - Python imports, classes, functions, constants, and call targets.
 - Markdown/document headings, links, wiki links, URLs, citations, concepts, and named mentions.
 - Lightweight cross-artifact similarity based on shared concepts.
 
-Search spans the whole knowledge graph. Four modes are available: `text` (SQLite full-text over chunk content and paths), `graph` (matches node labels, types and attribute values plus relationship types/endpoints), `vector` (embedding similarity — opt-in, see [Vector self-search](docs/how-to/vector-search.md)), and `hybrid` (the default — merges and re-ranks every available signal, de-duplicating by node). This surfaces concepts, symbols, entities and references that never appear verbatim in chunk text, and helps relate files even when no single chunk contains every query term. Both the retrieval mode and the result count are adjustable. Graph traversal honors depth and optional edge filters.
+Search uses that whole graph. `text` is SQLite full-text search, `graph` matches
+nodes and relationships, and opt-in `vector` search handles semantic similarity.
+`hybrid` is the default and combines whatever is available without returning
+the same node three times. The practical payoff: symbols, concepts, entities,
+and references can turn up even when no chunk contains the exact words you used.
 
-**Asking, not just searching.** `POST /assistant/chat`, the MCP tool `ask_knowledge_base`, and the UI's chat pane all run the same *agent workflow* over that search surface: retrieve, cite the passages, surface graph facts around them, then have a model write the answer from those passages alone. The default workflow (with `pip install 'pheasant-kb[agent]'`) is a LangGraph state graph that plans sub-queries, fans out across modes, walks the graph for material lexical search missed, grades its own evidence and loops when it is thin, then verifies its citations. It is fully customizable, and third-party workflows register under the `pheasant.agent_workflows` entry-point group — see [Customize the answering workflow](docs/how-to/agent-workflows.md). **No LLM ever runs during indexing**; with no provider reachable, answers degrade to extractive (top passages, citations and facts intact) rather than failing.
+You can ask questions too, rather than only search. `POST /assistant/chat`, the
+`ask_knowledge_base` MCP tool, and the UI all use the same workflow: retrieve
+evidence, pull in useful graph facts, and answer from those passages with
+citations. Install `pheasant-kb[agent]` for the LangGraph workflow, or register
+your own under `pheasant.agent_workflows`; the [workflow guide](docs/how-to/agent-workflows.md)
+has the details. No model is involved in indexing, and if the answering model is
+unavailable you still get the retrieved passages, citations, and facts.
 
 See [docs/graph_model.md](docs/graph_model.md).
 
-## MCP Interface
+## Giving an agent access
 
 Start MCP over stdio inside the running container:
 
@@ -236,7 +261,8 @@ Generate VS Code MCP config:
 pheasant client-config vscode --output .vscode/mcp.json
 ```
 
-Primary MCP tools:
+The MCP surface is deliberately fairly boring: tools do one thing, and their
+names say what that thing is. The ones you will use most are:
 
 - `list_knowledge_bases`
 - `register_source`
@@ -256,7 +282,7 @@ Primary MCP tools:
 - `get_sync_status`
 - `get_sync_history`
 
-Runtime lifecycle flow:
+The usual runtime flow is:
 
 1. Register a source through MCP.
 2. Sync it.
@@ -266,9 +292,10 @@ Runtime lifecycle flow:
 
 See [docs/mcp_tools.md](docs/mcp_tools.md) and [docs/mcp_client.md](docs/mcp_client.md).
 
-## Obsidian Projection
+## Taking the graph back to Obsidian
 
-pheasant can export a human-readable vault projection under `/vault/pheasant` by default.
+The graph does not have to stay hidden in a database. pheasant can project it
+into a human-readable vault under `/vault/pheasant` by default.
 
 Preview without writing:
 
@@ -305,9 +332,10 @@ The exporter creates source -> concept -> file -> chunk navigation when the inde
 
 See [docs/obsidian_integration.md](docs/obsidian_integration.md).
 
-## HTTP API
+## The HTTP side
 
-Important endpoints:
+These are the useful landmarks; the [HTTP reference](docs/reference/http-api.md)
+has the complete list.
 
 - `GET /health`, `GET /ready`, `GET /overview`
 - `GET /sources`, `GET /sources/types`, `POST /sources`, `POST /sources/quick-add`
@@ -319,30 +347,23 @@ Important endpoints:
 - `GET /mcp/info`
 - `POST /obsidian/export`
 
-Full list: [docs/reference/http-api.md](docs/reference/http-api.md).
-
 ## Web UI
 
-A light React front end lives in [`ui/`](ui). It is a separate workload that
-talks to the pheasant HTTP API, so the indexing container is unchanged: a
-three-pane workspace with sources on the left, chat in the middle, and the
-knowledge graph on the right. Asking a question outlines the cited nodes on the
-canvas and lists the graph facts behind the answer, so the reasoning and the
-structure stay side by side.
+A small React front end lives in [`ui/`](ui). Sources sit on the left, chat in
+the middle, and the knowledge graph on the right. Ask something and the cited
+nodes light up on the canvas beside the graph facts used in the answer. That is
+more useful than another chat box that asks you to trust it.
 
-The UI is meant to reach everything the API does, for low-code users and
-developers alike: quick source setup from a single field *and* a form covering
-the whole source schema (including installed connector plugins), the agent
-workflow picker with its tuning options, semantic-search configuration with
-coverage and a rebuild that never re-reads a source file, an MCP connection
-panel, and a configuration editor (form + raw YAML + diff preview). What a
-given deployment can offer is read from the server rather than baked into the
-bundle. Routes are defined in `src/pheasant/api/app.py`.
+It is not a cut-down demo. You can add sources, choose and tune an answering
+workflow, configure semantic search, inspect MCP connection details, and edit
+config as either a form or raw YAML with a diff before saving. Installed
+connector plugins appear automatically because the UI asks the server what it
+supports instead of baking that answer into the JavaScript bundle.
 
-### Running it
+### Run it
 
-There are three supported ways to get the UI in front of you. Full
-instructions, including how to be sure you are looking at the *current* bundle:
+Pick whichever route matches how you are already running pheasant. Full
+instructions — including the easy-to-miss stale-image problem — are in
 **[Run the web UI](docs/how-to/run-the-ui.md)**.
 
 ```bash
@@ -365,9 +386,9 @@ The UI and pheasant images are published from the same commit under the same
 version tag, so upgrading one upgrades the other. See
 [ui/README.md](ui/README.md) for build variables and design notes.
 
-## Deployment
+## Where it runs
 
-Supported deployment paths:
+Today that means:
 
 - Local CLI process
 - Docker
@@ -377,31 +398,22 @@ Supported deployment paths:
 
 See [docs/deployment.md](docs/deployment.md).
 
-## Development and Verification
+## Working on pheasant
 
-Run tests:
+The normal checks are intentionally unsurprising:
 
 ```bash
 python -m pytest
-```
-
-Run focused lint:
-
-```bash
 python -m ruff check src tests
-```
-
-Version references are synchronized from `pyproject.toml`:
-
-```bash
 python scripts/sync_version.py --check
 ```
 
 ## Documentation
 
 The full documentation is a [MkDocs Material](https://squidfunk.github.io/mkdocs-material/)
-site under [`docs/`](docs), organized Diátaxis-style (tutorials / how-to /
-reference / explanation). Build and serve it locally:
+site under [`docs/`](docs). Tutorials get you moving, how-to guides solve a
+specific problem, and the reference is there when you really do need every
+field. To read it locally:
 
 ```bash
 pip install -e ".[docs]"
@@ -433,6 +445,6 @@ It is published to GitHub Pages by `.github/workflows/docs.yml` on pushes to `ma
 - [Troubleshooting](docs/troubleshooting.md)
 - [pheasant as a Synapse region](docs/SYNAPSE_INTEGRATION.md)
 
-## License
+## License, because there has to be a last section
 
 pheasant is licensed under Apache-2.0. See [LICENSE](LICENSE).
