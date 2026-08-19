@@ -8,12 +8,12 @@
   <em>Context, memory and knowledge for you and your agents — in one container you run yourself.</em>
 </p>
 
-Reasoning keeps getting better. Knowing things hasn't kept up. You already have
+AI Reasoning keeps getting better, but AI ready knowledge struggles to keep up. You already have
 the knowledge — it's in a repo, a folder of notes, a stack of PDFs, an Obsidian
 vault, a Notion workspace, a Slack channel you keep meaning to clean up. The hard
 part was never having it. It's getting the right piece of it in front of an agent
 at the moment that agent needs it, without pasting half your corpus into every
-prompt and hoping.
+prompt and hoping, or building an overly complex harness that breaks down the next model update..
 
 **pheasant is a Docker-first, local-first MCP context server.** Point it at what
 you already have — folders, git repositories, PDFs and Office documents, Obsidian
@@ -39,7 +39,7 @@ That is the whole setup. No config file, no database, no broker, no API key —
 the container writes its own config, indexes `/workspace`, and serves the API,
 the MCP endpoint and the web UI on one port.
 
-It's a starting point, not a ceiling. Each of those absences is a backend you can
+Each component is a backend you can
 select the day your corpus or your traffic asks for one, and none of them is a
 rewrite — see
 [Simple by default, serious when you need it](#simple-by-default-serious-when-you-need-it).
@@ -47,7 +47,7 @@ rewrite — see
 ### Memory is part of the knowledge base, not a log beside it
 
 Human knowledge is stateful. It grows, it gets corrected, and it is influenced by memories.
-pheasant treats agent memory the same way:
+pheasant treats memories as part of the knowledge base, not the agent, to mimic this:
 
 - **A memory is a file in your corpus.** Each record is one frontmatter Markdown
   file, indexed by the ordinary pipeline — so **recall is just search**. What
