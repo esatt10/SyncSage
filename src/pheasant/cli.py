@@ -818,6 +818,62 @@ def main(argv: list[str] | None = None) -> int:
         help="Rename the SQLite file to *.migrated instead of leaving it in place.",
     )
     migrate_p.add_argument("--json", action="store_true")
+    # Imported at parser-build time so `--help` can enumerate the tables from
+    # the one place they are declared. Safe on every other command too:
+    # `pheasant.analytics` pulls in stdlib and the schema module only —
+    # DuckDB itself is imported lazily, inside the functions that need it.
+    from pheasant.analytics import EXPORTABLE
+
+    export_p = sub.add_parser(
+        "export", help="Write Parquet exports of indexed state, and query them."
+    )
+    export_sub = export_p.add_subparsers(dest="export_command", required=True)
+    export_tables_p = export_sub.add_parser(
+        "tables", help="List what can be exported, and what each table holds."
+    )
+    export_tables_p.add_argument("--json", action="store_true")
+    export_parquet_p = export_sub.add_parser(
+        "parquet", help="Export state tables and the knowledge graph as Parquet files."
+    )
+    export_parquet_p.add_argument("--config", "-c", default="pheasant.yaml")
+    export_parquet_p.add_argument(
+        "--out", help="Output directory. Defaults to <exports_path>/parquet/<kb_id>."
+    )
+    export_parquet_p.add_argument(
+        "--table",
+        action="append",
+        dest="tables",
+        metavar="NAME",
+        help=(
+            "Export only this table; repeat for several. "
+            f"One of: {', '.join(sorted(EXPORTABLE))}. "
+            "Defaults to everything but artifact_terms."
+        ),
+    )
+    export_parquet_p.add_argument(
+        "--compression",
+        choices=("zstd", "snappy", "gzip", "uncompressed"),
+        default="zstd",
+        help="Parquet codec. zstd is the smallest and what every reader supports.",
+    )
+    export_parquet_p.add_argument("--json", action="store_true")
+    export_query_p = export_sub.add_parser(
+        "query", help="Run SQL over an export directory (one view per Parquet file)."
+    )
+    export_query_p.add_argument("sql", help="A SQL statement, e.g. 'SELECT * FROM artifacts'.")
+    export_query_p.add_argument("--config", "-c", default="pheasant.yaml")
+    export_query_p.add_argument(
+        "--dir", help="Export directory. Defaults to <exports_path>/parquet/<kb_id>."
+    )
+    export_query_p.add_argument(
+        "--format", choices=("table", "json", "csv"), default="table", help="Output rendering."
+    )
+    export_query_p.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Cap the result set (0 removes the cap). Applied around your statement.",
+    )
     backup_p = sub.add_parser("backup")
     backup_p.add_argument("output")
     backup_p.add_argument("--config", "-c", default="pheasant.example.yaml")
@@ -1251,6 +1307,110 @@ def main(argv: list[str] | None = None) -> int:
             engine.close()
         print("Repair complete")
         return 0
+    if args.command == "export":
+        from pheasant.analytics import (
+            EXPORTABLE,
+            GRAPH_TABLES,
+            AnalyticsUnavailable,
+            QueryError,
+            export_dir_for,
+            export_parquet,
+            format_rows,
+            query,
+            resolve_tables,
+        )
+
+        if args.export_command == "tables":
+            if args.json:
+                print(json.dumps(EXPORTABLE, indent=2, sort_keys=True))
+                return 0
+            width = max(len(name) for name in EXPORTABLE)
+            for name in sorted(EXPORTABLE):
+                print(f"{name.ljust(width)}  {EXPORTABLE[name]}")
+            return 0
+
+        from pheasant.config.loader import load_config
+        from pheasant.persistence.paths import StatePaths
+
+        cfg = load_config(Path(args.config))
+        paths = StatePaths.from_config(cfg)
+        kb_id = cfg.knowledge_base_id
+
+        if args.export_command == "parquet":
+            from pheasant.persistence.graph_store import GraphStore
+            from pheasant.persistence.state_store import StateStore
+
+            try:
+                selected = resolve_tables(args.tables)
+            except ValueError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 1
+            # The export reads state; it never creates it. Without this a fresh
+            # checkout gets "no such table: chunks" from deep inside DuckDB,
+            # when the real answer is "nothing has been indexed yet".
+            if cfg.storage.backend.lower() != "postgres" and not paths.sqlite.exists():
+                print(
+                    f"ERROR: no indexed state at {paths.sqlite}. Run `pheasant sync` first.",
+                    file=sys.stderr,
+                )
+                return 1
+            out = Path(args.out) if args.out else export_dir_for(paths.exports, kb_id)
+            # Only pay for loading the graph when a graph table was asked for.
+            graph = (
+                GraphStore(paths.graphs).load(kb_id)
+                if any(name in GRAPH_TABLES for name in selected)
+                else None
+            )
+            if graph is not None and not graph.number_of_nodes():
+                # An empty graph exports as an empty file, which reads as "this
+                # corpus has no structure" rather than "the graph was not where
+                # I looked". Say which it is.
+                print(
+                    f"WARNING: no graph found under {paths.graphs / kb_id}; "
+                    "graph_nodes/graph_edges will be empty.",
+                    file=sys.stderr,
+                )
+            state = StateStore.from_config(cfg, paths.sqlite)
+            try:
+                report = export_parquet(
+                    state,
+                    out_dir=out,
+                    kb_id=kb_id,
+                    graph=graph,
+                    tables=selected,
+                    compression=args.compression,
+                    backend=state.dialect.name,
+                )
+            except AnalyticsUnavailable as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 1
+            finally:
+                state.close()
+            if args.json:
+                print(json.dumps(report, indent=2, sort_keys=True))
+            else:
+                print(f"Exported {kb_id} -> {report['directory']}")
+                for entry in report["tables"]:
+                    print(f"  {entry['file']}: {entry['rows']} row(s), {entry['bytes']} bytes")
+                print("  export.json: manifest")
+                print('Query it with: pheasant export query "SELECT * FROM artifacts"')
+            return 0
+
+        if args.export_command == "query":
+            directory = Path(args.dir) if args.dir else export_dir_for(paths.exports, kb_id)
+            try:
+                columns, rows = query(directory, args.sql, limit=args.limit or None)
+            except AnalyticsUnavailable as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 1
+            except FileNotFoundError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 1
+            except QueryError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 1
+            print(format_rows(columns, rows, args.format))
+            return 0
     if args.command == "backup":
         from pheasant.config.loader import load_config
         from pheasant.persistence.backup import create_backup

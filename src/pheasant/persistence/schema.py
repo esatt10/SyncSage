@@ -26,6 +26,8 @@ measured retrieval quality rather than on scores matching.
 
 from __future__ import annotations
 
+import re
+
 from pheasant.persistence.sql import Dialect
 
 #: Tables and indexes, shared by every backend.
@@ -339,3 +341,95 @@ def schema_for(dialect: Dialect) -> str:
         body = body.replace(source, target)
     extras = POSTGRES_EXTRAS if dialect.is_postgres else SQLITE_EXTRAS
     return body + extras
+
+
+#: One ``CREATE TABLE IF NOT EXISTS <name> ( … );`` block in :data:`CORE_SCHEMA`.
+#: Every block in that string ends on its own ``);`` line, which is what makes
+#: the non-greedy body match unambiguous.
+_CREATE_TABLE = re.compile(
+    r"CREATE TABLE IF NOT EXISTS\s+(\w+)\s*\((.*?)\n\);", re.DOTALL | re.IGNORECASE
+)
+
+#: A ``--`` comment, stripped before a table body is split on commas so a
+#: comma inside prose cannot look like a column boundary.
+_SQL_COMMENT = re.compile(r"--[^\n]*")
+
+#: Table-level constraints, which are entries in the comma-separated body but
+#: are not columns.
+_CONSTRAINT_KEYWORDS = frozenset({"FOREIGN", "PRIMARY", "UNIQUE", "CHECK", "CONSTRAINT"})
+
+
+def _split_top_level(body: str) -> list[str]:
+    """Split a table body on commas that are not inside parentheses.
+
+    ``PRIMARY KEY (principal, group_name)`` is one entry, not two — and a
+    naive ``body.split(",")`` would silently invent a ``group_name)`` column.
+    """
+
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for character in body:
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        if character == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(character)
+    parts.append("".join(current))
+    return parts
+
+
+def columns_of(table: str) -> list[tuple[str, str]]:
+    """``[(column, portable type)]`` for a core table, in declaration order.
+
+    Read off :data:`CORE_SCHEMA` rather than from a live database, for two
+    reasons. Order: ``StateBackend.table_columns`` answers with a *set*,
+    which is the right shape for the additive migrations that ask it "does
+    this column exist yet" and the wrong shape for anything that has to
+    produce a stable column layout. Availability: a caller can ask what a
+    table looks like without opening a connection at all.
+
+    The type is the portable spelling (``TEXT`` / ``INTEGER`` / ``REAL``),
+    before :func:`schema_for` substitutes the dialect's own. Returns an empty
+    list for a table that is not in the shared schema — ``chunks_fts`` and
+    ``chunks_vocab`` live in the per-dialect extras and genuinely have no one
+    portable definition.
+    """
+
+    for name, body in _CREATE_TABLE.findall(CORE_SCHEMA):
+        if name.lower() != table.lower():
+            continue
+        columns: list[tuple[str, str]] = []
+        for entry in _split_top_level(_SQL_COMMENT.sub("", body)):
+            tokens = entry.split()
+            if not tokens or tokens[0].upper() in _CONSTRAINT_KEYWORDS:
+                continue
+            columns.append((tokens[0], tokens[1].upper() if len(tokens) > 1 else "TEXT"))
+        return columns
+    return []
+
+
+def primary_key_of(table: str) -> str | None:
+    """The single-column primary key of a core table, or ``None``.
+
+    ``None`` covers both "no primary key" and a *composite* one
+    (``idp_groups``), because the caller this exists for — keyset pagination
+    in :mod:`pheasant.analytics` — needs one orderable column and a composite
+    key is not that.
+    """
+
+    for name, body in _CREATE_TABLE.findall(CORE_SCHEMA):
+        if name.lower() != table.lower():
+            continue
+        for entry in _split_top_level(_SQL_COMMENT.sub("", body)):
+            tokens = entry.split()
+            if not tokens or tokens[0].upper() in _CONSTRAINT_KEYWORDS:
+                continue
+            if "PRIMARY KEY" in " ".join(tokens[1:]).upper():
+                return tokens[0]
+        return None
+    return None

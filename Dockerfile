@@ -64,7 +64,7 @@ RUN apt-get update \
 # Install from pyproject so the image's dependencies never drift from the
 # package's declared deps (a hand-maintained list previously omitted core deps
 # added later — numpy (21.4) and zstandard (21.6a) — breaking the smoke test).
-ARG PHEASANT_EXTRAS=mcp,agent,vector,wasm,a2a,postgres,grpc,queue
+ARG PHEASANT_EXTRAS=mcp,agent,vector,wasm,a2a,postgres,grpc,queue,analytics
 COPY pyproject.toml README.md LICENSE /app/
 COPY src /app/src
 RUN pip install --no-cache-dir ".[${PHEASANT_EXTRAS}]"
