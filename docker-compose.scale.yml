@@ -41,7 +41,7 @@ services:
       retries: 10
 
   api:
-    image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.10.0}
+    image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.10.1}
     build:
       context: .
     restart: unless-stopped
@@ -73,7 +73,7 @@ services:
       start_period: 30s
 
   indexer:
-    image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.10.0}
+    image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.10.1}
     build:
       context: .
     restart: unless-stopped
@@ -98,7 +98,7 @@ services:
       start_period: 30s
 
   worker:
-    image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.10.0}
+    image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.10.1}
     build:
       context: .
     restart: unless-stopped
