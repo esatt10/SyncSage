@@ -95,4 +95,5 @@ spec:
         - name: workspace
           emptyDir: {}
         - name: exports
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: pheasant-exports

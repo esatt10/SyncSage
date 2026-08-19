@@ -62,10 +62,12 @@ pheasant-kb/
 ├── scripts/                   ← release_version.py, sync_version.py
 ├── src/pheasant/
 │   ├── cli.py                 ← up/host/setup/mount/start/serve/worker/sync/
-│   │                            scan/queue/shard/migrate/backup/restore/mcp/…
+│   │                            scan/queue/shard/migrate/backup/restore/
+│   │                            export/mcp/…
 │   ├── setup_wizard.py        ← `pheasant setup`, defaults read off the schema
 │   ├── quickstart.py          ← `pheasant up` config generation
 │   ├── capacity.py            ← the one home for sizing coefficients
+│   ├── analytics.py           ← Parquet exports + the DuckDB query surface
 │   ├── sharding.py            ← `pheasant shard plan`
 │   ├── jobs.py                ← per-source progress: phase, rate, ETA, stalled
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
@@ -125,6 +127,9 @@ pheasant queue status|drain|requeue-dead
 pheasant shard plan                        # split a corpus across regions
 pheasant migrate --to postgres             # one-shot, verified, preserves original
 pheasant backup|restore
+pheasant export parquet [--table NAME]      # /exports/parquet/<kb_id>/*.parquet
+pheasant export query "SELECT …"            # SQL over an export directory
+pheasant export tables [--schema]           # what is exportable; --schema for columns
 pheasant mcp --transport stdio
 pheasant client-config claude-code|cursor|vscode
 pheasant config show                       # resolved config after profile+YAML+--set
@@ -177,6 +182,18 @@ docker compose -f docker-compose.scale.yml up --scale worker=3
     `tests/test_config_surface_freshness.py` fails CI on all three,
     mechanically. **Individual field defaults need no second edit** — the
     wizard reads them off the live dataclasses.
+12. **DuckDB is read-side only.** `src/pheasant/analytics.py` uses it as a
+    Parquet writer and a query engine over `/exports`; it must never become a
+    `storage.backend` or appear on the sync path. Three reasons, each measured
+    or documented: the write path is single-row OLTP (per-artifact `DELETE` +
+    re-`INSERT`, conditional-`UPDATE` lease claims, `UPDATE … RETURNING` queue
+    claims), which is a bulk-columnar engine's worst case; DuckDB's FTS index
+    is rebuilt wholesale rather than maintained, which would break pillar 2;
+    and its exclusive *file* lock blocks other processes from opening the
+    database at all, where SQLite's WAL is what lets `docker-compose.scale.yml`
+    mount `/state:ro` on the API replicas while the indexer writes. The export
+    takes no lease and issues nothing but `SELECT`, which is what makes it safe
+    to run during a sync.
 
 ---
 
@@ -364,6 +381,10 @@ Each of these cost real time. They are listed because the shape recurs.
   **HTTP:** `docs/reference/http-api.md`
 - **Scale:** `docs/how-to/capacity-planning.md`,
   `docs/how-to/worker-fleet.md`, `docs/how-to/indexing-performance.md`
+- **Analytics/exports:** `docs/how-to/parquet-exports.md`,
+  `docs/reference/export-schema.md` (the contract an outside reader gets)
+  — `/exports` is a PVC/named volume an outside reader mounts; nothing is
+  served over HTTP
 - **Memory:** `docs/memory-system.md`, `docs/how-to/agent-memory.md`
 - **Synapse region spec:** `docs/SYNAPSE_INTEGRATION.md`
 - **Deployment:** `docs/deployment.md`, `deploy/kubernetes/`

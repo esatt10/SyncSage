@@ -75,7 +75,7 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 | `log_level` | string | `INFO` | Typical values: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
 | `state_path` | absolute path | `/state` | Base path for sqlite, graph snapshots, and manifests. |
 | `workspace_root` | absolute path | `/workspace` | Root path sources should live under. |
-| `exports_path` | absolute path | `/exports` | Additional output path for generated artifacts. |
+| `exports_path` | absolute path | `/exports` | Output path for generated artifacts, including [Parquet exports](how-to/parquet-exports.md) under `parquet/<kb_id>/`. |
 
 ---
 

@@ -82,6 +82,7 @@ nav:
       - Running a worker fleet: how-to/worker-fleet.md
       - Capacity planning: how-to/capacity-planning.md
       - Attach to a Synapse fleet: how-to/attach-to-synapse.md
+      - Export a corpus as Parquet: how-to/parquet-exports.md
       - Backup & restore: how-to/backup-restore.md
       - MCP for agents: mcp_client.md
   - Reference:
@@ -91,6 +92,7 @@ nav:
       - HTTP API: reference/http-api.md
       - MCP tools & resources: mcp_tools.md
       - Graph model: graph_model.md
+      - Parquet export schema: reference/export-schema.md
       - Security: security.md
       - Deployment: deployment.md
   - Explanation:

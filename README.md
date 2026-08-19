@@ -94,6 +94,14 @@ on the left, chat in the middle, and the graph lighting up the nodes each answer
 cited. Also a full-screen graph explorer with hub, orphan and shortest-path
 tools, a config editor, and live indexing progress.
 
+**From SQL.** `pheasant export parquet` writes the corpus — artifacts, chunks,
+symbols, memory records and the graph as nodes and edges — to `/exports` as
+Parquet, and `pheasant export query "SELECT …"` runs SQL over it. Search
+answers "what is relevant to this question"; this answers "what is *in* this
+corpus", with a `GROUP BY`. The files outlive the region: DuckDB, pandas,
+polars and Spark read them with no pheasant process running. See
+[Export a corpus as Parquet](docs/how-to/parquet-exports.md).
+
 ## Scaling
 
 pheasant runs as one container until it shouldn't. Past that, three axes scale

@@ -62,4 +62,9 @@ spec:
         - name: workspace
           emptyDir: {}
         - name: exports
+{{- if .Values.persistence.exports.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.exports.existingClaim | default (printf "%s-exports" (include "pheasant.fullname" .)) }}
+{{- else }}
           emptyDir: {}
+{{- end }}

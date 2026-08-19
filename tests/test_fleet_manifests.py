@@ -25,6 +25,8 @@ from pheasant.deployment.roles import Role, resolve_role, validate_role
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCALED = REPO_ROOT / "deploy" / "kubernetes" / "scaled"
+KUBERNETES = REPO_ROOT / "deploy" / "kubernetes"
+HELM = REPO_ROOT / "deploy" / "helm"
 BASE = REPO_ROOT / "deploy" / "kubernetes"
 
 
@@ -230,6 +232,75 @@ def test_the_shared_state_volume_is_readwritemany(scaled: list[dict[str, Any]]) 
 
     claims = {doc["metadata"]["name"]: doc for doc in _by_kind(scaled, "PersistentVolumeClaim")}
     assert claims["pheasant-state"]["spec"]["accessModes"] == ["ReadWriteMany"]
+
+
+def test_the_exports_volume_is_durable_and_shared(scaled: list[dict[str, Any]]) -> None:
+    """`/exports` exists to be read by something that is not pheasant.
+
+    It was an `emptyDir` in all three workloads, which failed that purpose
+    three ways at once: an emptyDir dies with its pod, nothing outside the pod
+    can mount it, and — because each workload declared its own — the export
+    the indexer wrote landed somewhere the api replicas could not see. Three
+    empty directories all called `/exports`.
+    """
+
+    claims: set[str] = set()
+    for workload in _workloads(scaled):
+        volumes = {volume["name"]: volume for volume in _pod_spec(workload)["volumes"]}
+        exports = volumes["exports"]
+        name = workload["metadata"]["name"]
+        assert "emptyDir" not in exports, (
+            f"{name} backs /exports with an emptyDir: it dies with the pod and "
+            "nothing outside the pod can read it"
+        )
+        assert "persistentVolumeClaim" in exports, name
+        claims.add(exports["persistentVolumeClaim"]["claimName"])
+
+    assert len(claims) == 1, (
+        f"the workloads mount different export claims ({sorted(claims)}); whoever "
+        "runs the export must write where the readers look"
+    )
+    declared = {doc["metadata"]["name"] for doc in _by_kind(scaled, "PersistentVolumeClaim")}
+    assert claims <= declared, f"{claims - declared} is mounted but never declared"
+
+
+def test_the_shared_exports_volume_is_readwritemany(scaled: list[dict[str, Any]]) -> None:
+    """Same argument as `/state`: RWO attaches to one node, so a reader pod
+    scheduled elsewhere cannot mount the export at all."""
+
+    claims = {doc["metadata"]["name"]: doc for doc in _by_kind(scaled, "PersistentVolumeClaim")}
+    assert claims["pheasant-exports"]["spec"]["accessModes"] == ["ReadWriteMany"]
+
+
+def test_the_single_container_deployment_persists_exports() -> None:
+    """The plain install has the same requirement for the same reason, minus
+    the sharing: an export nothing can reach is an export nobody has."""
+
+    docs = _all_documents(KUBERNETES)
+    deployment = next(iter(_workloads(docs)))
+    volumes = {volume["name"]: volume for volume in _pod_spec(deployment)["volumes"]}
+    assert "persistentVolumeClaim" in volumes["exports"]
+    claim = volumes["exports"]["persistentVolumeClaim"]["claimName"]
+    assert claim in {doc["metadata"]["name"] for doc in _by_kind(docs, "PersistentVolumeClaim")}
+
+
+def test_the_helm_chart_can_persist_exports_and_defaults_to_doing_so() -> None:
+    """The chart's own values, since the chart is not rendered here.
+
+    Checked rather than assumed because the failure is silent: a chart that
+    quietly falls back to an emptyDir produces exports that look fine inside
+    the pod and are unreachable from anywhere else.
+    """
+
+    values = yaml.safe_load((HELM / "values.yaml").read_text(encoding="utf-8"))
+    exports = values["persistence"]["exports"]
+    assert exports["enabled"] is True
+    assert exports["accessMode"] in {"ReadWriteOnce", "ReadWriteMany"}
+    assert "existingClaim" in exports, "operators must be able to point at their own claim"
+
+    template = (HELM / "templates" / "deployment.yaml").read_text(encoding="utf-8")
+    assert "persistence.exports.enabled" in template
+    assert "existingClaim" in template
 
 
 # --------------------------------------------------------------------------

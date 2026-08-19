@@ -71,6 +71,12 @@ grpc = ["grpcio>=1.62", "grpcio-tools>=1.62", "protobuf>=5"]
 # itself, which needs no broker — and because the queue is off entirely
 # unless sync.queue.enabled is set.
 queue = ["nats-py>=2.7"]
+# Columnar (Parquet) exports of indexed state, plus the SQL surface over
+# them (`pheasant export`). DuckDB is a read-side tool here and nothing on the
+# sync path may depend on it — it is a Parquet writer and a query engine, not
+# a state backend, for the reasons in src/pheasant/analytics.py. Gated because
+# a region that never exports should not carry a 20 MB wheel.
+analytics = ["duckdb>=1.0"]
 # Documentation site (MkDocs Material). Build with: mkdocs build --strict
 docs = ["mkdocs-material>=9.5"]
 dev = [
@@ -79,6 +85,12 @@ dev = [
   "httpx>=0.27,<1",
   "jsonschema>=4.22",
   "ruff>=0.5",
+  # Not every extra is in `dev` — lancedb, wasmtime and psycopg each want a
+  # runtime or a server, so their tests skip in CI. DuckDB wants neither: it
+  # is a wheel with no service behind it, so including it here is what makes
+  # `tests/test_parquet_export.py` actually run on every PR instead of
+  # skipping quietly, which is how an export format rots.
+  "duckdb>=1.0",
 ]
 
 [project.entry-points."pheasant.connectors"]

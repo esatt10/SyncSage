@@ -25,6 +25,8 @@ network-free (CLAUDE.md pillar 3). Point it at a throwaway database:
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -537,3 +539,139 @@ def test_a_half_copied_table_fails_verification_instead_of_being_skipped(tmp_pat
     assert "skipped as already present" in str(caught.value), str(caught.value)
     assert "chunks:" in str(caught.value)
     assert parked.exists(), "the original was renamed despite a failed verification"
+
+
+# --- the Parquet export (Phase: analytics) ---------------------------------
+
+
+def _export(root: Path, workspace: Path, backend: str) -> Path:
+    """Index this corpus into ``backend`` and export it. Returns the directory."""
+
+    from pheasant import analytics
+
+    config = _config(root, workspace, backend)
+    out = root / f"export-{backend}"
+    engine = SyncEngine(config)
+    try:
+        engine.sync_source("docs", "full")
+        analytics.export_parquet(
+            engine.state,
+            out_dir=out,
+            kb_id=config.knowledge_base_id,
+            graph=engine.graph_builder.graph,
+            backend=engine.state.dialect.name,
+        )
+    finally:
+        engine.close()
+    return out
+
+
+#: Columns that record *when a run happened* rather than what it produced. Two
+#: indexing runs are two moments, so these differ between any two runs of the
+#: same corpus on the same backend — excluding them is what makes the rest an
+#: equality assertion instead of an approximate one.
+_RUN_TIMESTAMPS = {
+    "last_indexed_at",
+    "mtime",
+    "created_at",
+    "updated_at",
+    "started_at",
+    "finished_at",
+    "details_json",
+    "last_used_at",
+    "attributes",  # graph attribute bags carry `updated_at` inside the JSON
+}
+
+
+@postgres
+def test_the_parquet_export_is_identical_on_both_backends(tmp_path: Path) -> None:
+    """An export is consumed by systems that do not know which backend wrote
+    it, so "same knowledge base" has to extend to the files that leave.
+
+    Asserted on one shared workspace, deliberately: an earlier run of this
+    comparison used two copies of the corpus at different paths and the only
+    reported difference was the absolute path inside the graph attribute bag —
+    a property of the fixture, not of the backends.
+    """
+
+    duckdb = pytest.importorskip("duckdb", reason="the analytics extra is not installed")
+
+    workspace = _corpus(tmp_path)
+    sqlite_dir = _export(tmp_path, workspace, "sqlite")
+    postgres_dir = _export(tmp_path, workspace, "postgres")
+
+    connection = duckdb.connect(":memory:")
+    tables = ["sources", "artifacts", "chunks", "symbols", "memory_records", "graph_nodes"]
+    for table in tables:
+        left, right = f"{sqlite_dir}/{table}.parquet", f"{postgres_dir}/{table}.parquet"
+        schema_left = connection.execute(f"DESCRIBE SELECT * FROM '{left}'").fetchall()
+        schema_right = connection.execute(f"DESCRIBE SELECT * FROM '{right}'").fetchall()
+        assert [(c[0], c[1]) for c in schema_left] == [(c[0], c[1]) for c in schema_right], table
+
+        columns = [c[0] for c in schema_left if c[0] not in _RUN_TIMESTAMPS]
+        projection = ", ".join(f'"{column}"' for column in columns)
+        difference = connection.execute(
+            f"SELECT count(*) FROM ("
+            f"  (SELECT {projection} FROM '{left}' EXCEPT SELECT {projection} FROM '{right}')"
+            f"  UNION ALL"
+            f"  (SELECT {projection} FROM '{right}' EXCEPT SELECT {projection} FROM '{left}'))"
+        ).fetchone()[0]
+        assert difference == 0, f"{table} differs between backends"
+
+    # Edges are compared as a set of (endpoints, relation): the row order of
+    # parallel edges is not a contract, their presence is.
+    edges = connection.execute(
+        f"SELECT count(*) FROM ("
+        f"  (SELECT from_node, to_node, type, confidence FROM '{sqlite_dir}/graph_edges.parquet'"
+        f"   EXCEPT SELECT from_node, to_node, type, confidence FROM"
+        f"   '{postgres_dir}/graph_edges.parquet')"
+        f"  UNION ALL"
+        f"  (SELECT from_node, to_node, type, confidence FROM '{postgres_dir}/graph_edges.parquet'"
+        f"   EXCEPT SELECT from_node, to_node, type, confidence FROM"
+        f"   '{sqlite_dir}/graph_edges.parquet'))"
+    ).fetchone()[0]
+    assert edges == 0, "the graph edge set differs between backends"
+    connection.close()
+
+    # And the manifest says which backend produced it, so a consumer holding
+    # two exports can tell them apart.
+    for directory, expected in ((sqlite_dir, "sqlite"), (postgres_dir, "postgres")):
+        manifest = json.loads((directory / "export.json").read_text(encoding="utf-8"))
+        assert manifest["state_backend"] == expected
+
+
+@postgres
+def test_export_reports_an_unsynced_postgres_database_actionably(tmp_path: Path) -> None:
+    """The failure an operator hits when the export runs before the sync.
+
+    Without this the error is ``psycopg.errors.UndefinedTable: relation
+    "sources" does not exist``, raised four frames inside the driver — which
+    is a true statement about a database and a useless one about pheasant.
+    """
+
+    from pheasant.analytics import StateUnavailable, open_state
+
+    # A config pointing at a database this test never syncs. Reusing the same
+    # DSN is safe: the tables are dropped and recreated per run by _index, and
+    # this only reads.
+    config = _config(tmp_path, tmp_path / "docs", "postgres")
+    with psycopg_dropped_tables(config):
+        with pytest.raises(StateUnavailable, match="Run `pheasant sync` first"):
+            open_state(config, tmp_path / "unused.db")
+
+
+@contextlib.contextmanager
+def psycopg_dropped_tables(config: Any):
+    """Drop pheasant's tables for the duration of the block, then leave them
+    dropped — the next test that needs them calls ``migrate()`` itself."""
+
+    from pheasant.persistence.state_store import StateStore
+
+    state = StateStore.from_config(config, None)
+    try:
+        for table in ("chunks_fts", "chunks", "artifacts", "sources", "knowledge_bases"):
+            state.backend.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+        state.backend.commit()
+    finally:
+        state.close()
+    yield
