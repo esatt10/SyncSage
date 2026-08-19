@@ -51,12 +51,22 @@ CORPUS = {
 }
 
 
-def _config(tmp_path: Path) -> PheasantConfig:
+def _config(tmp_path: Path, *, memory: bool = False) -> PheasantConfig:
     workspace = tmp_path / "workspace"
     for name, body in CORPUS.items():
         path = workspace / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body, encoding="utf-8")
+    sources: list[dict[str, Any]] = [
+        {
+            "name": "docs",
+            "type": "repository",
+            "path": str(workspace),
+            "include": ["**/*.md", "**/*.py"],
+        }
+    ]
+    if memory:
+        sources.append({"name": "agent-memory", "type": "memory", "path": str(tmp_path / "memory")})
     return PheasantConfig.model_validate(
         {
             "pheasant": {
@@ -66,14 +76,7 @@ def _config(tmp_path: Path) -> PheasantConfig:
                 "exports_path": str(tmp_path / "exports"),
             },
             "storage": {"graph_snapshots": False},
-            "sources": [
-                {
-                    "name": "docs",
-                    "type": "repository",
-                    "path": str(workspace),
-                    "include": ["**/*.md", "**/*.py"],
-                }
-            ],
+            "sources": sources,
         }
     )
 
@@ -515,3 +518,145 @@ def test_cli_lists_exportable_tables(capsys: pytest.CaptureFixture) -> None:
     listing = capsys.readouterr().out
     for table in analytics.EXPORTABLE:
         assert table in listing
+
+
+# --- the schema is a published contract ------------------------------------
+
+
+SCHEMA_DOC = Path(__file__).resolve().parents[1] / "docs" / "reference" / "export-schema.md"
+
+
+def test_every_exported_table_and_column_is_documented(indexed: Any) -> None:
+    """PR gate, in the shape `test_config_surface_freshness.py` uses.
+
+    An export is consumed by systems that are not pheasant and cannot read the
+    source. A column added to a state table therefore appears in exports —
+    `export_columns` unions the live table — and is invisible to every reader
+    until someone writes it down. This makes that a CI failure rather than a
+    support question.
+    """
+
+    doc = SCHEMA_DOC.read_text(encoding="utf-8")
+    missing: list[str] = []
+    for table in analytics.EXPORTABLE:
+        if f"`{table}.parquet`" not in doc and f"{table}.parquet" not in doc:
+            missing.append(table)
+        for column, _type in analytics.schema_of(table, indexed.state):
+            if f"`{column}`" not in doc:
+                missing.append(f"{table}.{column}")
+    assert not missing, "docs/reference/export-schema.md does not document: " + ", ".join(
+        sorted(set(missing))
+    )
+
+
+def test_documented_joins_hold_in_a_real_export(indexed: Any, tmp_path: Path) -> None:
+    """Every foreign key the schema advertises must actually join.
+
+    The export is a set of files, so nothing enforces referential integrity —
+    a join documented wrongly fails silently, as an outside reader quietly
+    losing rows. So assert it on real data instead of asserting the map
+    against itself.
+    """
+
+    out = tmp_path / "out"
+    _export(indexed, out)
+    exported = set(analytics.parquet_files(out))
+
+    checked = 0
+    for (table, column), target in analytics.FOREIGN_KEYS.items():
+        target_table, target_column = target.split(".")
+        if table not in exported or target_table not in exported:
+            continue
+        dangling = _rows(
+            out,
+            f"SELECT count(*) FROM {table} WHERE {column} IS NOT NULL "
+            f"AND {column} NOT IN (SELECT {target_column} FROM {target_table} "
+            f"WHERE {target_column} IS NOT NULL)",
+        )[0][0]
+        assert dangling == 0, f"{table}.{column} -> {target} has {dangling} dangling row(s)"
+        checked += 1
+    assert checked >= 10, f"only {checked} joins were exercised; the fixture is too thin"
+
+
+def test_the_manifest_declares_a_format_version(indexed: Any, tmp_path: Path) -> None:
+    """An outside reader needs to know when the shape changed without diffing
+    schemas, so the version is part of the payload, not of the release notes."""
+
+    out = tmp_path / "out"
+    report = _export(indexed, out, tables=["artifacts"])
+    assert report["format_version"] == analytics.EXPORT_FORMAT_VERSION
+    manifest = json.loads((out / analytics.MANIFEST_NAME).read_text(encoding="utf-8"))
+    assert manifest["format_version"] == analytics.EXPORT_FORMAT_VERSION
+
+
+def test_schema_report_reflects_the_live_tables(indexed: Any) -> None:
+    """`pheasant export tables --schema -c …` must describe what will actually
+    be written, migration-added columns included."""
+
+    live = analytics.export_schema(indexed.state)
+    declared = analytics.export_schema()
+
+    assert set(live) == set(analytics.EXPORTABLE)
+    live_artifacts = {column["name"] for column in live["artifacts"]["columns"]}
+    declared_artifacts = {column["name"] for column in declared["artifacts"]["columns"]}
+    # `acl` arrives through a one-shot migration, so it is in the database and
+    # not in CORE_SCHEMA. Exactly the drift the schema report has to survive.
+    assert "acl" in live_artifacts
+    assert "acl" not in declared_artifacts
+    assert live["artifacts"]["primary_key"] == "id"
+    assert live["memory_records"]["primary_key"] == "record_id"
+    assert live["graph_edges"]["primary_key"] is None
+
+    references = {column["name"]: column["references"] for column in live["chunks"]["columns"]}
+    assert references["artifact_id"] == "artifacts.id"
+    assert analytics.render_schema(live).startswith("sources.parquet")
+
+
+def test_memory_text_is_recoverable_by_joining_chunks(tmp_path: Path) -> None:
+    """The claim the schema doc makes about agent memory: the projection is in
+    `memory_records`, the record's words are in `chunks`, and a correction
+    leaves both versions in the export with the old one dated."""
+
+    from datetime import UTC, datetime
+
+    from pheasant.memory.store import MemoryStore
+
+    config = _config(tmp_path, memory=True)
+    store = MemoryStore(tmp_path / "memory")
+    first, _ = store.append(
+        "The rollout password is BANANAS.",
+        scope="org",
+        subject="rollout",
+        now=datetime(2026, 7, 1, tzinfo=UTC),
+    )
+    store.append(
+        "The rollout password is CHERRIES.",
+        scope="org",
+        subject="rollout",
+        supersedes=first.record_id,
+        now=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    engine = SyncEngine(config)
+    try:
+        engine.sync_all("full")
+        out = tmp_path / "out"
+        analytics.export_parquet(
+            engine.state,
+            out_dir=out,
+            kb_id=config.knowledge_base_id,
+            graph=engine.graph_builder.graph,
+        )
+    finally:
+        engine.close()
+
+    rows = _rows(
+        out,
+        "SELECT m.scope, m.valid_until IS NULL AS current, c.text "
+        "FROM memory_records m JOIN chunks c ON c.artifact_id = m.artifact_id "
+        "ORDER BY m.asserted_at",
+    )
+    assert len(rows) == 2
+    assert [row[1] for row in rows] == [False, True], "the corrected record must be dated, not gone"
+    assert "BANANAS" in rows[0][2] and "CHERRIES" in rows[1][2]
+    # And the correction is in the graph as an edge, not only as a column.
+    assert _rows(out, "SELECT count(*) FROM graph_edges WHERE type = 'supersedes'")[0][0] == 1

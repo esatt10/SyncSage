@@ -92,6 +92,7 @@ nav:
       - HTTP API: reference/http-api.md
       - MCP tools & resources: mcp_tools.md
       - Graph model: graph_model.md
+      - Parquet export schema: reference/export-schema.md
       - Security: security.md
       - Deployment: deployment.md
   - Explanation:

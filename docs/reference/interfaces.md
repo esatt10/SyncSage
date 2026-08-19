@@ -97,9 +97,11 @@ Routing, fan-out, merge, and global cross-region search live on the **router**
 | Export state as Parquet | `pheasant export parquet [--table NAME]` |
 | Query an export | `pheasant export query "<SQL>"` |
 | List exportable tables | `pheasant export tables` |
+| Show the export schema | `pheasant export tables --schema [--json]` |
 
 See [HTTP API](http-api.md) for the full route list and
 [MCP tools & resources](../mcp_tools.md) for the full tool/resource list.
 Parquet exports are CLI-only by design — they read state and write files, so
 there is nothing for a server route or an agent tool to add. See
-[Export a corpus as Parquet](../how-to/parquet-exports.md).
+[Export a corpus as Parquet](../how-to/parquet-exports.md), and
+[Parquet export schema](export-schema.md) for what an outside reader gets.

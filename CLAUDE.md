@@ -129,7 +129,7 @@ pheasant migrate --to postgres             # one-shot, verified, preserves origi
 pheasant backup|restore
 pheasant export parquet [--table NAME]      # /exports/parquet/<kb_id>/*.parquet
 pheasant export query "SELECT …"            # SQL over an export directory
-pheasant export tables                      # what is exportable, and what it holds
+pheasant export tables [--schema]           # what is exportable; --schema for columns
 pheasant mcp --transport stdio
 pheasant client-config claude-code|cursor|vscode
 pheasant config show                       # resolved config after profile+YAML+--set
@@ -381,7 +381,8 @@ Each of these cost real time. They are listed because the shape recurs.
   **HTTP:** `docs/reference/http-api.md`
 - **Scale:** `docs/how-to/capacity-planning.md`,
   `docs/how-to/worker-fleet.md`, `docs/how-to/indexing-performance.md`
-- **Analytics/exports:** `docs/how-to/parquet-exports.md`
+- **Analytics/exports:** `docs/how-to/parquet-exports.md`,
+  `docs/reference/export-schema.md` (the contract an outside reader gets)
 - **Memory:** `docs/memory-system.md`, `docs/how-to/agent-memory.md`
 - **Synapse region spec:** `docs/SYNAPSE_INTEGRATION.md`
 - **Deployment:** `docs/deployment.md`, `deploy/kubernetes/`

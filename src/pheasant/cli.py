@@ -831,6 +831,19 @@ def main(argv: list[str] | None = None) -> int:
     export_tables_p = export_sub.add_parser(
         "tables", help="List what can be exported, and what each table holds."
     )
+    export_tables_p.add_argument(
+        "--schema",
+        action="store_true",
+        help="Print every column, its type and what it joins to.",
+    )
+    export_tables_p.add_argument(
+        "--config",
+        "-c",
+        help=(
+            "With --schema, read the live tables so migration-added columns are "
+            "included. Without it the declared schema is printed."
+        ),
+    )
     export_tables_p.add_argument("--json", action="store_true")
     export_parquet_p = export_sub.add_parser(
         "parquet", help="Export state tables and the knowledge graph as Parquet files."
@@ -1315,18 +1328,40 @@ def main(argv: list[str] | None = None) -> int:
             QueryError,
             export_dir_for,
             export_parquet,
+            export_schema,
             format_rows,
             query,
+            render_schema,
             resolve_tables,
         )
 
         if args.export_command == "tables":
-            if args.json:
-                print(json.dumps(EXPORTABLE, indent=2, sort_keys=True))
+            if not args.schema:
+                if args.json:
+                    print(json.dumps(EXPORTABLE, indent=2, sort_keys=True))
+                    return 0
+                width = max(len(name) for name in EXPORTABLE)
+                for name in sorted(EXPORTABLE):
+                    print(f"{name.ljust(width)}  {EXPORTABLE[name]}")
                 return 0
-            width = max(len(name) for name in EXPORTABLE)
-            for name in sorted(EXPORTABLE):
-                print(f"{name.ljust(width)}  {EXPORTABLE[name]}")
+            # The live tables when a config points at real state, so
+            # migration-added columns show up; the declared schema otherwise.
+            state = None
+            if args.config:
+                from pheasant.config.loader import load_config
+                from pheasant.persistence.paths import StatePaths
+                from pheasant.persistence.state_store import StateStore
+
+                cfg = load_config(Path(args.config))
+                paths = StatePaths.from_config(cfg)
+                if cfg.storage.backend.lower() == "postgres" or paths.sqlite.exists():
+                    state = StateStore.from_config(cfg, paths.sqlite)
+            try:
+                report = export_schema(state)
+            finally:
+                if state is not None:
+                    state.close()
+            print(json.dumps(report, indent=2) if args.json else render_schema(report))
             return 0
 
         from pheasant.config.loader import load_config

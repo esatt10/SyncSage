@@ -91,6 +91,16 @@ EXPORT_SUBDIR = "parquet"
 #: The manifest written beside the Parquet files.
 MANIFEST_NAME = "export.json"
 
+#: Layout version of an export directory, recorded in the manifest.
+#:
+#: An export is consumed by systems that are not pheasant and do not upgrade
+#: with it, so they need a way to notice that the shape changed without
+#: diffing schemas. Bump it when a table is removed or renamed, a column is
+#: removed or retyped, or an identifier grammar changes — not for an added
+#: table or an added column, which a reader written against version 1 keeps
+#: handling correctly.
+EXPORT_FORMAT_VERSION = 1
+
 #: Rows the Parquet writer buffers before flushing a row group.
 #:
 #: DuckDB's default is 122,880, which on ``chunks`` — whose rows carry the full
@@ -285,6 +295,93 @@ def resolve_tables(requested: list[str] | tuple[str, ...] | None) -> list[str]:
     # Deduplicated, in the order EXPORTABLE declares, so two invocations that
     # name the same tables differently produce the same manifest.
     return [name for name in EXPORTABLE if name in set(requested)]
+
+
+#: Where a column points, for the tables whose keys are not self-evident. The
+#: export is a set of files rather than a database, so nothing in the Parquet
+#: carries a foreign key — this is the join map an outside reader would
+#: otherwise have to infer, and inferring it wrongly is silent.
+FOREIGN_KEYS: dict[tuple[str, str], str] = {
+    ("artifacts", "source_id"): "sources.id",
+    ("chunks", "artifact_id"): "artifacts.id",
+    ("chunks", "source_id"): "sources.id",
+    ("symbols", "artifact_id"): "artifacts.id",
+    ("symbols", "source_id"): "sources.id",
+    ("memory_records", "artifact_id"): "artifacts.id",
+    ("memory_records", "source_id"): "sources.id",
+    ("memory_records", "supersedes"): "memory_records.record_id",
+    ("artifact_terms", "artifact_id"): "artifacts.id",
+    ("artifact_terms", "node_id"): "graph_nodes.node_id",
+    ("sync_events", "source_id"): "sources.id",
+    ("graph_nodes", "source_id"): "sources.id",
+    ("graph_nodes", "artifact_id"): "artifacts.id",
+    ("graph_edges", "from_node"): "graph_nodes.node_id",
+    ("graph_edges", "to_node"): "graph_nodes.node_id",
+}
+
+
+def schema_of(table: str, state: Any = None) -> list[tuple[str, str]]:
+    """``[(column, DuckDB type)]`` for one exportable table.
+
+    With a ``state`` store this is the schema the export will actually
+    produce, migration-added columns included; without one it is the schema
+    the shared DDL declares, which is what a caller with no state directory
+    (``pheasant export tables --schema`` with no config) can be told.
+    """
+
+    if table == "graph_nodes":
+        columns = _GRAPH_NODE_COLUMNS
+    elif table == "graph_edges":
+        columns = _GRAPH_EDGE_COLUMNS
+    elif state is not None:
+        columns = export_columns(state, table)
+    else:
+        columns = columns_of(table)
+    return [(name, _DUCKDB_TYPES[kind]) for name, kind in columns]
+
+
+def export_schema(state: Any = None) -> dict[str, dict[str, Any]]:
+    """The full export schema: every table, its key, its columns, its joins.
+
+    Generated rather than written down, so it cannot drift from what the
+    export produces. ``pheasant export tables --schema`` renders it, and
+    ``tests/test_parquet_export.py`` gates the reference documentation against
+    it — a column added to a table and not to the docs fails CI.
+    """
+
+    report: dict[str, dict[str, Any]] = {}
+    for table, description in EXPORTABLE.items():
+        columns = schema_of(table, state)
+        report[table] = {
+            "description": description,
+            "file": f"{table}.parquet",
+            "primary_key": primary_key_of(table) if table in SQL_TABLES else None,
+            "columns": [
+                {
+                    "name": name,
+                    "type": kind,
+                    "references": FOREIGN_KEYS.get((table, name)),
+                }
+                for name, kind in columns
+            ],
+        }
+    return report
+
+
+def render_schema(report: dict[str, dict[str, Any]]) -> str:
+    """The schema as aligned text, for the terminal."""
+
+    lines: list[str] = []
+    for spec in report.values():
+        key = f"  (primary key: {spec['primary_key']})" if spec["primary_key"] else ""
+        lines.append(f"{spec['file']}{key}")
+        lines.append(f"  {spec['description']}")
+        width = max(len(column["name"]) for column in spec["columns"])
+        for column in spec["columns"]:
+            arrow = f"  -> {column['references']}" if column["references"] else ""
+            lines.append(f"    {column['name'].ljust(width)}  {column['type']:<8}{arrow}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def export_dir_for(exports_path: str | Path, kb_id: str) -> Path:
@@ -494,6 +591,7 @@ def export_parquet(
         shutil.rmtree(spill, ignore_errors=True)
 
     manifest = {
+        "format_version": EXPORT_FORMAT_VERSION,
         "kb_id": kb_id,
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "pheasant_version": _version(),

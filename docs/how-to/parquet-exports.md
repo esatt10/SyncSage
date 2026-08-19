@@ -73,6 +73,7 @@ never a half-written file.
 
 ```json
 {
+  "format_version": 1,
   "kb_id": "pheasant-repo",
   "generated_at": "2026-08-19T01:22:12+00:00",
   "pheasant_version": "0.10.0",
@@ -90,12 +91,18 @@ never a half-written file.
 
 `exported` is what this run refreshed; `refreshed: false` with an older
 `modified_at` is how a stale file from a previous export shows up as stale
-instead of passing for current.
+instead of passing for current. `format_version` is the layout contract for
+readers that are not pheasant — see
+[Parquet export schema](../reference/export-schema.md).
 
 ## What gets exported
 
 Run `pheasant export tables` for the live list. Every column of every state
 table is exported, including columns added by migration (`artifacts.acl`).
+
+This is the summary. The column-by-column reference — types, join keys, ID
+grammar, and the semantics an outside reader has to apply itself — is
+[Parquet export schema](../reference/export-schema.md).
 
 | File | One row per | Useful columns |
 |---|---|---|
