@@ -313,6 +313,13 @@ memory:
   session_ttl_days: null
   user_ttl_days: null
   org_ttl_days: null
+  # Days a superseded/TTL-expired record stays indexed (hidden from default
+  # results, reachable via `as_of`/`current_only: false`) before it is
+  # actually archived. 0 = archive immediately, the pre-Phase-2 default.
+  # Opt in for point-in-time recall; it measurably costs ranking (see
+  # docs/memory-system.md) since a corrected record's near-duplicate text
+  # stays indexed alongside its correction.
+  supersede_retention_days: 0
   # How memory takes part in a search that does not say. A per-call `memory`
   # argument always wins over this. auto | off | only | prefer
   default_policy: auto

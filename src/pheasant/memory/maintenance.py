@@ -68,6 +68,7 @@ def _run(engine: Any, config: Any, settings: Any, source: Any, *, now: datetime 
         session_ttl_days=settings.session_ttl_days,
         user_ttl_days=settings.user_ttl_days,
         org_ttl_days=settings.org_ttl_days,
+        supersede_retention_days=getattr(settings, "supersede_retention_days", 0) or 0,
         records=records,
     )
     result: dict[str, Any] = {"source": source.name, "report": report.as_dict()}

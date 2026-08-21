@@ -33,7 +33,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -302,6 +302,29 @@ class MemoryRecord:
             "valid_from": self.valid_from or self.asserted_at,
             "valid_until": self.valid_until,
         }
+
+
+def _supersession_instants(records: list[MemoryRecord]) -> dict[str, str]:
+    """``{superseded_record_id: when the correction was asserted}`` (Phase 2).
+
+    A local twin of ``memory.projection.supersession_index`` — not imported
+    from there, because ``projection.py`` imports :class:`MemoryRecord` from
+    *this* module, and importing back would be a cycle. Same semantics:
+    when two records correct the same target, the **earliest** correction is
+    the one that ended the original's validity, matching
+    :func:`pheasant.memory.projection.effective_valid_until`'s "earliest end
+    wins" rule exactly — this is the timestamp :meth:`MemoryStore.consolidate`
+    measures its retention window from.
+    """
+    out: dict[str, str] = {}
+    for record in records:
+        target = record.supersedes
+        if not target or not record.asserted_at:
+            continue
+        previous = out.get(target)
+        if previous is None or record.asserted_at < previous:
+            out[target] = record.asserted_at
+    return out
 
 
 class MemoryStore:
@@ -586,16 +609,32 @@ class MemoryStore:
         session_ttl_days: int | None = None,
         user_ttl_days: int | None = None,
         org_ttl_days: int | None = None,
+        supersede_retention_days: int = 0,
         records: list[MemoryRecord] | None = None,
     ) -> ConsolidationReport:
-        """Archive superseded and TTL-expired records (Step 33.2).
+        """Archive superseded and TTL-expired records (Step 33.2, Phase 2).
 
         Archiving renames ``<id>.md`` to ``<id>.md.archived`` in place — the
         bytes are preserved forever (append-only), but the file stops matching
-        the memory source's ``**/*.md`` include glob, so the next **full**
-        sync of the source drops it from the index. Deterministic in ``now``
-        and idempotent: a second pass over unchanged content archives nothing.
-        TTLs are opt-in per scope (``None`` = that scope never expires).
+        the memory source's ``**/*.md`` include glob, so the next sync drops
+        it from the index. Deterministic in ``now`` and idempotent: a second
+        pass over unchanged content archives nothing. TTLs are opt-in per
+        scope (``None`` = that scope never expires).
+
+        ``supersede_retention_days`` (Phase 2) is what repairs the documented
+        ``as_of`` guarantee: a record that just became superseded or
+        TTL-expired is *not* archived immediately. It stays a live file,
+        still indexed — hidden from default (``current_only=True``) results
+        by the query-time ``valid_until`` predicate exactly as before, but
+        still reachable via ``as_of`` or ``current_only=False`` — until
+        ``supersede_retention_days`` have passed since it stopped being
+        current. Only then is it actually archived. ``0`` (opt-in) reproduces
+        the pre-Phase-2 behavior of archiving on the very next pass. No new
+        column, no policy change: the same ``valid_until`` predicate that
+        already hides a superseded record from default results is what makes
+        it reachable through the retention window — this only changes *when*
+        the file leaves the index, never what a query sees while it is still
+        there.
 
         ``records``, when given, is used instead of a fresh
         :meth:`list_records` call — a caller that runs a second store
@@ -605,20 +644,37 @@ class MemoryStore:
         instant = (now or datetime.now(tz=UTC)).astimezone(UTC)
         ttls = {"session": session_ttl_days, "user": user_ttl_days, "org": org_ttl_days}
         records = self.list_records() if records is None else records
-        superseded = self.superseded_ids(records)
+        superseded_at = _supersession_instants(records)
         archived_superseded: list[str] = []
         archived_expired: list[str] = []
         for record in records:
-            if record.record_id in superseded:
-                self._archive(record)
+            is_superseded = record.record_id in superseded_at
+            end_at: str | None = None
+            if is_superseded:
+                end_at = superseded_at[record.record_id]
+            else:
+                ttl_days = ttls.get(record.scope)
+                if ttl_days is not None and record.asserted_at:
+                    asserted = datetime.fromisoformat(record.asserted_at.replace("Z", "+00:00"))
+                    if asserted.tzinfo is None:
+                        asserted = asserted.replace(tzinfo=UTC)
+                    deadline = asserted + timedelta(days=ttl_days)
+                    if instant >= deadline:
+                        end_at = deadline.isoformat().replace("+00:00", "Z")
+            if end_at is None:
+                continue  # still current
+            end_instant = datetime.fromisoformat(str(end_at).replace("Z", "+00:00"))
+            if end_instant.tzinfo is None:
+                end_instant = end_instant.replace(tzinfo=UTC)
+            if (instant - end_instant).days < supersede_retention_days:
+                # No longer current, but still inside the retention window —
+                # left indexed on purpose. The query-time predicate already
+                # hides it from default results.
+                continue
+            self._archive(record)
+            if is_superseded:
                 archived_superseded.append(record.record_id)
-                continue
-            ttl_days = ttls.get(record.scope)
-            if ttl_days is None or not record.asserted_at:
-                continue
-            asserted = datetime.fromisoformat(record.asserted_at.replace("Z", "+00:00"))
-            if (instant - asserted).days >= ttl_days:
-                self._archive(record)
+            else:
                 archived_expired.append(record.record_id)
         kept = len(records) - len(archived_superseded) - len(archived_expired)
         return ConsolidationReport(

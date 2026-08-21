@@ -787,6 +787,26 @@ class MemorySettings(ModelMixin):
     session_ttl_days: int | None = None
     user_ttl_days: int | None = None
     org_ttl_days: int | None = None
+    #: Days a superseded or TTL-expired record stays indexed — hidden from
+    #: default results by the existing `valid_until` query-time predicate,
+    #: but still reachable via `as_of` / `current_only=False` — before
+    #: consolidation actually archives its file (Phase 2). `0` (the
+    #: default) reproduces the pre-Phase-2 behavior: archive the instant a
+    #: record is no longer current.
+    #:
+    #: **Opt-in, not on by default, and that is a measured trade-off, not
+    #: caution for its own sake.** Retaining a corrected record's near-
+    #: duplicate text alongside its correction gives the hybrid RRF fusion
+    #: two close competitors for one query instead of one — `stale_leak_rate`
+    #: stays 0.0 (the query-time `valid_until` predicate does correctly
+    #: exclude the old record from every result set), but `update_accuracy`
+    #: was observed to swing 0.75-1.0 run to run on the same seed in
+    #: `tests/test_memory_benchmark.py` at the default `retention=7`, from
+    #: exactly this near-duplicate ranking competition. A region that wants
+    #: the documented `as_of` guarantee — "what did we believe last week" —
+    #: sets this explicitly and accepts that cost; one that does not is
+    #: unaffected.
+    supersede_retention_days: int = 0
 
     # --- retrieval (Steps 33.6-33.9) -------------------------------------
     #: How memory takes part in a search that does not say: ``auto`` (like any

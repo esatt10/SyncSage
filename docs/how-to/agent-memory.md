@@ -125,7 +125,21 @@ memory:
   session_ttl_days: 14          # opt-in: scratch session memories decay
   user_ttl_days: null           # null = the scope never expires (default)
   org_ttl_days: null
+  supersede_retention_days: 0   # opt-in: keep a correction's old record
+                                 # indexed (reachable via as_of) for this
+                                 # many days before archiving it. 0 = archive
+                                 # on the very next pass. See "point-in-time
+                                 # recall" note below.
 ```
+
+**Want `as_of` to reliably reach a value from last week?** Set
+`supersede_retention_days` above `0`. It is opt-in rather than the default
+because it is a real trade-off, not a free fix: a superseded record's file
+stays indexed alongside its correction for that many days, and near-duplicate
+text competing for the same query measurably affects ranking under hybrid
+(RRF) fusion — see `docs/memory-system.md` §4 for the numbers. At `0`
+(default), a corrected fact is dropped from the index on the very next
+consolidation pass, same as before this knob existed.
 
 ## Fleet routing
 

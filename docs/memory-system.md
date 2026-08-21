@@ -123,6 +123,27 @@ region knows a fact was corrected and serves it anyway between consolidation
 beats. `current_only` (on by default) closes it. `as_of` deliberately brings the
 old record back — that is the whole point of invalidating rather than deleting.
 
+**But `as_of` can only find a row that is still indexed, and consolidation
+archives an invalidated record's file the moment it is no longer current** —
+a `.md.archived` file drops out of the source's `**/*.md` include glob, so
+the next sync removes its row entirely. That made the guarantee above true
+only in the window between a correction and the next consolidation beat:
+seconds at agent write rates, since an agent can call `memory_consolidate`
+itself. `memory.supersede_retention_days` (Phase 2, default `0`, opt-in)
+keeps an invalidated record's file — and so its row — around for that many
+days past the instant it stopped being current, before archiving it. No new
+column and no policy change: the *same* `valid_until` predicate that already
+hides a superseded record from default results is what makes it reachable
+through the window via `as_of` / `current_only=False`; only *when* the file
+leaves the index moves, never what a query sees while it is still there. Left
+at its default of `0`, behavior is unchanged from before Phase 2 — a
+deliberate trade-off, not an oversight: keeping a corrected record's
+near-duplicate text indexed alongside its correction gives hybrid RRF fusion
+two close competitors for one query instead of one, and that measurably
+affects ranking in a small corpus (see `tests/test_memory_benchmark.py`'s
+comment on `update_accuracy`). A region that wants "what did we believe last
+week" to stay answerable sets this explicitly and accepts that cost.
+
 ---
 
 ## 5. Query-time policy

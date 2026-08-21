@@ -23,6 +23,18 @@ from pheasant.memory.benchmark import (
 
 CI_SPEC = MemoryBenchSpec(n_facts=12, n_distractors=40, n_updates=4, n_abstain=4)
 
+#: Every test here runs with the default `memory.supersede_retention_days: 0`
+#: (no explicit `memory:` block in `_tools`'s config) — deliberately.
+#: Enabling retention (Phase 2) keeps a corrected record's near-duplicate
+#: text indexed alongside its correction, and that measurably costs
+#: `update_accuracy`: observed to swing 0.75-1.0 run to run on this exact
+#: seed with `supersede_retention_days=7`, from hybrid RRF fusion giving the
+#: still-indexed (but query-time-filtered) old record and its correction two
+#: close competitors for one query instead of one. `stale_leak_rate` stayed
+#: 0.0 throughout — the old record never leaked into a result set, so this
+#: is a ranking-competition cost, not a correctness bug. See
+#: `docs/memory-system.md` §4 and `tests/test_memory_retention.py`.
+
 
 def _tools(tmp_path: Path) -> PheasantTools:
     (tmp_path / "memory").mkdir(exist_ok=True)
