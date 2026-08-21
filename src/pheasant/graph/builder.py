@@ -551,6 +551,28 @@ class GraphBuilder:
         ]
         self.graph.remove_nodes_from(nodes)
 
+    def remove_artifact_nodes(self, artifact_ids: list[str]) -> None:
+        """Remove specific artifacts' nodes (and anything derived from them)
+        without touching the rest of the source (Phase 0).
+
+        An artifact's own node id *is* its artifact id (`add_artifact`
+        upserts on `artifact.id` directly); a few derived node types
+        (heading, entity) instead carry it as an `artifact_id` attribute.
+        Either match removes the node and, via `remove_nodes_from`, every
+        edge incident to it — the same shape `remove_source_content` uses,
+        narrowed from a whole source to a specific id set so a small batch
+        of archived memory records does not force a whole-source rebuild.
+        """
+        ids = set(artifact_ids)
+        if not ids:
+            return
+        nodes = [
+            node_id
+            for node_id, attrs in self.graph.nodes(data=True)
+            if node_id in ids or attrs.get("artifact_id") in ids
+        ]
+        self.graph.remove_nodes_from(nodes)
+
 
 def _batches(items: list[str], size: int):
     """Chunk ids so an IN (...) clause stays inside SQLite's parameter limit."""

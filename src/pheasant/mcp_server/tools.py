@@ -453,6 +453,11 @@ class PheasantTools:
             written_by=principal,
             valid_until=valid_until,
         )
+        from pheasant.telemetry import metrics as _metrics
+
+        _metrics.REGISTRY.inc(
+            "pheasant_memory_writes_total", outcome="created" if created else "duplicate"
+        )
         result: dict = {"record": record.as_dict(), "created": created, "source": source.name}
         # The record is already durably on disk; this sync only makes it
         # *searchable now*. Failing the whole request when it cannot run — most
@@ -462,7 +467,13 @@ class PheasantTools:
         # both pick it up.
         if sync and created:
             try:
-                result["sync"] = self.engine.sync_source(source.name, "incremental").__dict__
+                # `enrich="deferred"`: a write must not pay the whole-graph
+                # walk (similarity + cross-source + memory bridge edges) —
+                # see sync/engine.py:_finalize_index_state. The next
+                # scheduler beat runs it and clears the dirty flag.
+                result["sync"] = self.engine.sync_source(
+                    source.name, "incremental", enrich="deferred"
+                ).__dict__
             except Exception as exc:
                 logger.warning("memory write indexed later: %s", exc)
                 result["sync_deferred"] = str(exc)

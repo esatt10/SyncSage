@@ -202,6 +202,12 @@ class StateStore:
                 (scope, fingerprint, updated_at),
             )
 
+    def clear_fingerprint(self, scope: str) -> None:
+        """Drop a scope's fingerprint row. A no-op if it was never set."""
+
+        with self.conn:
+            self.conn.execute("DELETE FROM sync_fingerprints WHERE scope=?", (scope,))
+
     def replace_idp_groups(self, mapping: dict[str, list[str]], synced_at: str) -> bool:
         """Persist one IdP sync pass (Step 32.4). Returns True when rows changed.
 
@@ -690,6 +696,44 @@ class StateStore:
         # quietly reset a memory's track record. Genuine removal goes through
         # `delete_source`, which does clear them.
         return count
+
+    def delete_artifacts(self, artifact_ids: list[str]) -> int:
+        """Remove specific artifacts (and their chunks/symbols/terms) by id.
+
+        Phase 0: the targeted counterpart to `delete_source_artifacts`. That
+        method's whole-source `DELETE ... WHERE source_id=?` is cheap because
+        every table involved is indexed on `source_id`; this one is a
+        per-artifact `WHERE id/artifact_id IN (...)` instead, which is the
+        exact shape CLAUDE.md warns against for `chunks_fts` — its
+        `artifact_id` column is UNINDEXED, so this degrades to a table scan
+        per call. It exists anyway because a handful of archived memory
+        records does not justify re-syncing (and re-parsing) an entire
+        source; callers own picking a size where a full sync is cheaper
+        instead (see `memory.maintenance.MEMORY_TARGETED_ARCHIVE_MAX`).
+
+        Like `delete_source_artifacts`, `memory_records` rows are left alone
+        — the caller (memory maintenance) rebuilds that table itself from the
+        record files, which is what keeps `uses`/`salience`/`last_used_at`
+        earned rather than reset.
+        """
+        ids = [str(i) for i in artifact_ids if i]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        params = tuple(ids)
+        with self.conn:
+            self.conn.execute(
+                f"DELETE FROM chunks_fts WHERE artifact_id IN ({placeholders})", params
+            )
+            self.conn.execute(f"DELETE FROM chunks WHERE artifact_id IN ({placeholders})", params)
+            self.conn.execute(f"DELETE FROM symbols WHERE artifact_id IN ({placeholders})", params)
+            self.conn.execute(
+                f"DELETE FROM artifact_terms WHERE artifact_id IN ({placeholders})", params
+            )
+            cursor = self.conn.execute(
+                f"DELETE FROM artifacts WHERE id IN ({placeholders})", params
+            )
+            return int(cursor.rowcount or 0)
 
     def delete_source(self, source_id: str) -> None:
         with self.conn:

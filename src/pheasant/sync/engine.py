@@ -1373,6 +1373,15 @@ class SyncEngine:
                 exc_info=True,
             )
 
+    #: Scope key for the `sync_fingerprints` KV table (Phase 0). Presence of a
+    #: row means "an `enrich=deferred` write landed here and the whole-graph
+    #: enrichment block has not run since." Reused rather than adding a table:
+    #: the same scope->value KV already backs config-change detection, and a
+    #: dirty flag is exactly that shape — one value, read-then-clear, no
+    #: history. Persisted (not in-process) so it survives a restart and is
+    #: visible across the indexer/API/worker role split.
+    _ENRICH_DIRTY_SCOPE = "memory-enrich-dirty:{name}"
+
     def _finalize_index_state(
         self,
         *,
@@ -1386,6 +1395,7 @@ class SyncEngine:
         total_items: int,
         report: Callable[[str, int, int | None, str], None],
         embedding_progress: Callable[[int], None],
+        enrich: str = "now",
     ) -> int:
         """Finalize one source while holding the coordinated writer mutex."""
 
@@ -1401,14 +1411,28 @@ class SyncEngine:
                 pruned_vectors = self.vectors.prune_source(source.name, live_chunk_ids)
 
             self._project_memory_records(source)
-            if indexed or mode == "full":
-                report("enriching", total_items, total_items, "linking the graph")
-                self.graph_builder.add_similarity_edges(
-                    source.name,
-                    changed_ids=None if mode == "full" else changed_ids,
-                )
-                self.graph_builder.add_cross_source_edges()
-                self._bridge_memory()
+            dirty_scope = self._ENRICH_DIRTY_SCOPE.format(name=source.name)
+            if enrich == "deferred":
+                # The whole-graph walk (similarity + cross-source + memory
+                # bridge) never runs on a deferred call, regardless of any
+                # prior dirty state — that is the entire point of deferring.
+                # Only mark dirty when this call actually indexed something;
+                # a no-op memory write (an exact-duplicate `created=False`)
+                # has nothing new for enrichment to pick up.
+                if indexed:
+                    self.state.set_fingerprint(dirty_scope, "1", utc_now())
+            else:
+                pending_enrich = bool(self.state.get_fingerprint(dirty_scope))
+                if indexed or mode == "full" or pending_enrich:
+                    report("enriching", total_items, total_items, "linking the graph")
+                    self.graph_builder.add_similarity_edges(
+                        source.name,
+                        changed_ids=None if mode == "full" else changed_ids,
+                    )
+                    self.graph_builder.add_cross_source_edges()
+                    self._bridge_memory()
+                    if pending_enrich:
+                        self.state.clear_fingerprint(dirty_scope)
 
             if self.vectors is not None:
                 # Finish provider work before advertising a saved, completed
@@ -1439,6 +1463,7 @@ class SyncEngine:
         max_depth: int | None = None,
         full_scan: bool = False,
         on_progress: ProgressHook | None = None,
+        enrich: str = "now",
     ) -> SyncResult:
         """Sync one source.
 
@@ -1453,6 +1478,16 @@ class SyncEngine:
         sense: it rides the per-artifact yield point that already exists, and
         an exception raised inside it can never fail the sync (see
         :func:`_report_progress`).
+
+        ``enrich="deferred"`` (used by memory writes) skips the whole-graph
+        enrichment block in :meth:`_finalize_index_state` — similarity edges,
+        cross-source edges, memory bridging — and marks the source dirty
+        instead. The next ``enrich="now"`` pass over the source (the
+        scheduler beat, a watcher-triggered sync, or an explicit `full`
+        sync — every caller but the memory write path uses the "now"
+        default) runs enrichment and clears the flag, even if that pass
+        itself finds nothing new to index. Never used for `full` syncs: a
+        full pass always enriches.
         """
         report = _progress_reporter(on_progress, source_name)
         if mode not in SYNC_MODES:
@@ -1734,6 +1769,7 @@ class SyncEngine:
                 total_items=total_items,
                 report=report,
                 embedding_progress=embedding_progress,
+                enrich=enrich,
             )
             # Recorded only after the pass succeeded, so a sync that dies
             # halfway is retried rather than being remembered as "done with

@@ -1903,6 +1903,9 @@ def create_app(
                     "will not do."
                 ),
             ) from exc
+        metrics.REGISTRY.inc(
+            "pheasant_memory_writes_total", outcome="created" if created else "duplicate"
+        )
         payload: dict = {"record": record.as_dict(), "created": created, "source": source.name}
         # The record is already durably on disk; this sync only makes it
         # *searchable now*. Failing the whole request when it cannot run — most
@@ -1912,7 +1915,11 @@ def create_app(
         # both pick it up.
         if req.sync and created:
             try:
-                payload["sync"] = engine.sync_source(source.name, "incremental").__dict__
+                # `enrich="deferred"`: skip the whole-graph enrichment walk on
+                # the write path — see sync/engine.py:_finalize_index_state.
+                payload["sync"] = engine.sync_source(
+                    source.name, "incremental", enrich="deferred"
+                ).__dict__
             except Exception as exc:
                 logger.warning("memory write indexed later: %s", exc)
                 payload["sync_deferred"] = str(exc)

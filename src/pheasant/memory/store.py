@@ -281,6 +281,15 @@ class MemoryStore:
 
     def __init__(self, root: Path | str):
         self.root = Path(root)
+        # Parse-once cache for one maintenance pass (Phase 0). Keyed on
+        # (mtime_ns, size), not just "seen before": records are append-only
+        # so this is exact rather than heuristic — a cache hit means the
+        # bytes on disk cannot have changed since the entry was made. This
+        # is what lets `run_memory_maintenance` call `list_records()` twice
+        # (once inside `consolidate`, once for the capacity-prune archive
+        # loop) at the cost of one `stat()` per file on the second call
+        # instead of a second full parse of the store.
+        self._record_cache: dict[Path, tuple[int, int, MemoryRecord]] = {}
 
     def append(
         self,
@@ -408,6 +417,21 @@ class MemoryStore:
             schema_version=version,
         )
 
+    def _load_cached(self, path: Path) -> MemoryRecord:
+        """`load(path)`, reusing the last parse if the file is unchanged.
+
+        Exact, not heuristic: a hit requires both `st_mtime_ns` and `st_size`
+        to match the cached entry, and records are never rewritten in place
+        (append-only), so a stale hit cannot happen within one process.
+        """
+        stat = path.stat()
+        cached = self._record_cache.get(path)
+        if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+            return cached[2]
+        record = self.load(path)
+        self._record_cache[path] = (stat.st_mtime_ns, stat.st_size, record)
+        return record
+
     def list_records(
         self, scope: str | None = None, *, current_only: bool = False
     ) -> list[MemoryRecord]:
@@ -427,7 +451,7 @@ class MemoryStore:
                 continue
             for path in sorted(scope_dir.glob("mem-*.md")):
                 try:
-                    everything.append(self.load(path))
+                    everything.append(self._load_cached(path))
                 except (ValueError, OSError):
                     # One unreadable file must not cost the caller everything
                     # else. This method backs listing, consolidation *and* the
@@ -457,6 +481,7 @@ class MemoryStore:
         session_ttl_days: int | None = None,
         user_ttl_days: int | None = None,
         org_ttl_days: int | None = None,
+        records: list[MemoryRecord] | None = None,
     ) -> ConsolidationReport:
         """Archive superseded and TTL-expired records (Step 33.2).
 
@@ -466,10 +491,15 @@ class MemoryStore:
         sync of the source drops it from the index. Deterministic in ``now``
         and idempotent: a second pass over unchanged content archives nothing.
         TTLs are opt-in per scope (``None`` = that scope never expires).
+
+        ``records``, when given, is used instead of a fresh
+        :meth:`list_records` call — a caller that runs a second store
+        operation in the same maintenance pass (capacity pruning) can parse
+        the store once and hand the list to both (Phase 0).
         """
         instant = (now or datetime.now(tz=UTC)).astimezone(UTC)
         ttls = {"session": session_ttl_days, "user": user_ttl_days, "org": org_ttl_days}
-        records = self.list_records()
+        records = self.list_records() if records is None else records
         superseded = self.superseded_ids(records)
         archived_superseded: list[str] = []
         archived_expired: list[str] = []

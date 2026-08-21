@@ -373,6 +373,18 @@ def register_default_metrics(version: str) -> None:
     REGISTRY.gauge("pheasant_graph_nodes", "Nodes in the loaded graph.")
     REGISTRY.gauge("pheasant_graph_edges", "Edges in the loaded graph.")
 
+    # Agent memory (compaction Phase 0). Refreshed by `run_memory_maintenance`
+    # (`pheasant_memory_records`, `pheasant_memory_maintenance_seconds`) and
+    # at write time (`pheasant_memory_writes_total`) — nothing here existed
+    # before, so a compaction change is otherwise unfalsifiable.
+    REGISTRY.gauge(
+        "pheasant_memory_records", "Live (non-archived) memory records, per scope.", ("scope",)
+    )
+    REGISTRY.counter(
+        "pheasant_memory_writes_total", "memory_write calls, by outcome.", ("outcome",)
+    )
+    REGISTRY.histogram("pheasant_memory_maintenance_seconds", "One consolidation pass.")
+
     # Remote preparation workers (Phase 35.5 hardens these; the gauge exists
     # now so a scaling policy has something to read from the first release).
     REGISTRY.gauge(

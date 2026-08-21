@@ -346,7 +346,13 @@ def test_maintenance_reindexes_so_search_forgets_archived_records(tmp_path: Path
         result = run_memory_maintenance(tools.engine)
         assert result is not None
         assert result["report"]["archived"] == 1
-        assert result["sync"]["indexed_artifacts"] >= 1
+        # Phase 0: one archived record is well under
+        # `MEMORY_TARGETED_ARCHIVE_MAX`, so this takes the targeted path
+        # (delete just that record's rows) rather than a full re-sync of the
+        # whole source — asserted directly rather than via a `SyncResult`
+        # field that only the (now conditional) full-sync path produces.
+        assert result["sync"]["mode"] == "targeted"
+        assert result["sync"]["removed"] == [old_id]
 
         flattened = str(
             tools.search_context("memory-test", "rollout password", mode="text")
