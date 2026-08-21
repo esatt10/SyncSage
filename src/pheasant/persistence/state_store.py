@@ -138,6 +138,31 @@ class StateStore:
         # keep acl NULL = "source expressed no ACL", the pre-32 semantics).
         if "acl" not in self.backend.table_columns("artifacts"):
             self.conn.execute("ALTER TABLE artifacts ADD COLUMN acl TEXT")
+        # Phase 1 (agent-speed memory compaction) — one-shot idempotent
+        # column adds. Existing rows keep canon_key NULL (never reinforced
+        # against, since nothing can match a NULL) and observations 0/
+        # last_seen NULL/variants NULL, which are exactly the pre-Phase-1
+        # values for a record that predates reinforcement. `canon_key` is
+        # recomputed for every row on the next projection rebuild regardless
+        # (it is derived, not earned — see schema.py), so leaving it NULL
+        # here is only ever a transient state until that next sync.
+        memory_columns = self.backend.table_columns("memory_records")
+        if memory_columns and "canon_key" not in memory_columns:
+            self.conn.execute("ALTER TABLE memory_records ADD COLUMN canon_key TEXT")
+        if memory_columns and "observations" not in memory_columns:
+            self.conn.execute(
+                "ALTER TABLE memory_records ADD COLUMN observations INTEGER NOT NULL DEFAULT 0"
+            )
+        if memory_columns and "last_seen" not in memory_columns:
+            self.conn.execute("ALTER TABLE memory_records ADD COLUMN last_seen TEXT")
+        if memory_columns and "variants" not in memory_columns:
+            self.conn.execute("ALTER TABLE memory_records ADD COLUMN variants TEXT")
+        # Only safe to create once the column above is guaranteed present —
+        # either it was in this database's original CREATE TABLE, or the
+        # ALTER just above added it. See the comment in schema.py.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_records_canon_key ON memory_records(canon_key)"
+        )
         self.conn.commit()
         self._migrate_fts_titles()
 
@@ -591,12 +616,20 @@ class StateStore:
         existing row when one is present — they are earned by *use* (Step
         33.9) and are the one thing here that is not derivable from the file,
         so a re-sync must not silently reset them to zero.
+
+        ``observations``/``last_seen``/``variants`` (Phase 1) are earned the
+        same way, by a near-duplicate write reinforcing this record instead
+        of creating its own file, and are carried over identically.
+        ``canon_key`` is the opposite: a pure function of the record's own
+        fields (see ``pheasant.memory.normalize``), so it is *not* carried
+        over — ``records`` supplies a freshly computed one on every rebuild.
         """
         with self.conn:
             earned = {
                 str(row["record_id"]): row
                 for row in self.conn.execute(
-                    "SELECT record_id, salience, uses, last_used_at "
+                    "SELECT record_id, salience, uses, last_used_at, "
+                    "observations, last_seen, variants "
                     "FROM memory_records WHERE source_id=?",
                     (source_id,),
                 )
@@ -607,13 +640,15 @@ class StateStore:
                 self.conn.execute(
                     """INSERT INTO memory_records(
                         record_id,artifact_id,source_id,scope,subject,kind,asserted_at,
-                        valid_from,valid_until,supersedes,tags,written_by,
-                        salience,uses,last_used_at,schema_version
+                        valid_from,valid_until,supersedes,tags,written_by,canon_key,
+                        salience,uses,last_used_at,observations,last_seen,variants,
+                        schema_version
                     )
                     VALUES(
                         :record_id,:artifact_id,:source_id,:scope,:subject,:kind,:asserted_at,
-                        :valid_from,:valid_until,:supersedes,:tags,:written_by,
-                        :salience,:uses,:last_used_at,:schema_version
+                        :valid_from,:valid_until,:supersedes,:tags,:written_by,:canon_key,
+                        :salience,:uses,:last_used_at,:observations,:last_seen,:variants,
+                        :schema_version
                     )""",
                     {
                         "subject": None,
@@ -623,11 +658,15 @@ class StateStore:
                         "supersedes": None,
                         "tags": None,
                         "written_by": None,
+                        "canon_key": None,
                         "schema_version": 1,
                         **record,
                         "salience": float(prior["salience"]) if prior else 1.0,
                         "uses": int(prior["uses"]) if prior else 0,
                         "last_used_at": prior["last_used_at"] if prior else None,
+                        "observations": int(prior["observations"]) if prior else 0,
+                        "last_seen": prior["last_seen"] if prior else None,
+                        "variants": prior["variants"] if prior else None,
                     },
                 )
         return len(records)
@@ -655,13 +694,70 @@ class StateStore:
             logger.debug("memory use counters not recorded", exc_info=True)
             return 0
 
+    def find_canonical_record(self, canon_digest: str) -> str | None:
+        """The record_id of a live record already carrying this canonical
+        key (Phase 1's write-path near-duplicate lookup), or None.
+
+        `ORDER BY record_id` makes ties deterministic — a canonical key can
+        in principle match more than one live row only through a race
+        between concurrent writers, and picking the lexicographically first
+        id is arbitrary but always the *same* arbitrary choice, matching the
+        tie-break `memory.salience.rank` already uses elsewhere.
+        """
+        rows = self.rows(
+            "SELECT record_id FROM memory_records WHERE canon_key = ? ORDER BY record_id LIMIT 1",
+            (canon_digest,),
+        )
+        return str(rows[0]["record_id"]) if rows else None
+
+    def reinforce_memory_record(
+        self, record_id: str, submitted_text: str, when: str, *, max_variants: int = 8
+    ) -> None:
+        """Bump `observations`/`last_seen` for a record a new write folded
+        into instead of creating its own file, and remember the submitted
+        surface form as a `variant` if it is new.
+
+        Best-effort and off the write's critical path, the same posture
+        `record_memory_use` takes for `uses`: a counter that fails to update
+        costs ranking signal, never the write the caller already has in
+        hand. Read-then-write rather than a single UPDATE because merging a
+        bounded, deduplicated JSON list needs the current value — an
+        acceptable non-atomic window for a stats sidecar that only ever
+        grows a *count*, not a decision anything else depends on mid-update.
+        """
+        try:
+            with self.conn:
+                row = self.conn.execute(
+                    "SELECT variants FROM memory_records WHERE record_id = ?", (record_id,)
+                ).fetchone()
+                variants: list[str] = []
+                if row is not None and row["variants"]:
+                    try:
+                        variants = json.loads(row["variants"])
+                    except (TypeError, ValueError):
+                        variants = []
+                text = str(submitted_text or "").strip()
+                if text and text not in variants and len(variants) < max_variants:
+                    variants.append(text)
+                self.conn.execute(
+                    "UPDATE memory_records SET observations = observations + 1, "
+                    "last_seen = ?, variants = ? WHERE record_id = ?",
+                    (when, json.dumps(variants) if variants else None, record_id),
+                )
+        except Exception:  # pragma: no cover - never fail a write over a counter
+            logger.debug("memory reinforcement not recorded", exc_info=True)
+
     def memory_salience_rows(self) -> list[dict[str, Any]]:
         """Everything the salience formula reads, for a pruning pass."""
         try:
             rows = self.rows(
                 # `kind` is here so capacity pruning can tell a retrieval *rule*
-                # from a recallable fact; see `memory.maintenance`.
-                "SELECT record_id, scope, kind, asserted_at, uses, last_used_at, salience "
+                # from a recallable fact; see `memory.maintenance`. `last_seen`
+                # and `observations` (Phase 1) are what let the formula
+                # recognize a fact re-observed 10,000 times instead of
+                # decaying it from its original `asserted_at` forever.
+                "SELECT record_id, scope, kind, asserted_at, uses, last_used_at, salience, "
+                "observations, last_seen "
                 "FROM memory_records"
             )
         except Exception:  # pragma: no cover - state store older than 33.5

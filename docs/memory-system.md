@@ -241,20 +241,48 @@ Coverage is reported, not silent: `describe_retrieval` carries
 
 ---
 
-## 8. Salience and bounded growth
+## 8. Salience, reinforcement and bounded growth
 
-The one thing memory learns from *being used*. A documented deterministic
-formula over recorded inputs — no model, no sampling — so a pruning pass is
-reproducible rather than a judgement call:
+At agent write rates a fact is rarely asserted once — it is restated,
+paraphrased and re-derived, and each restatement used to be indistinguishable
+from a new fact. **Reinforcement** (`memory.reinforcement_enabled`, on by
+default) closes that gap on the write path: before creating a file, a write is
+checked against a *normalized* form of its text (`pheasant.memory.normalize` —
+Unicode-folded, whitespace-collapsed, stripped of leading articles and framing
+clauses like "note that", but never token-sorted and never stripped of
+quantifiers like "not" — see that module for why) scoped to the same
+`(scope, subject, kind, ACL partition)` bucket a reader could legally see as
+one thing. A match — whether the write is byte-identical or merely a
+paraphrase — does not create a new record: it bumps that record's
+`observations` counter and `last_seen` timestamp, and remembers the submitted
+surface form as a `variant` (bounded to 8) when it differs from what is
+stored. `memory_write`'s response gains `outcome: "created" | "reinforced"`
+alongside the existing `created` boolean, and `submitted_text` when what was
+written differs from what is now stored.
+
+Two principals can never reinforce each other's `user`/`session`-scope
+records — the ACL partition is `written_by`, mirroring
+`security.acl.normalize_acl`'s own partition exactly — because a shared record
+could only carry one writer's ACL. `org` records, being shared by design, do
+reinforce across writers.
+
+Salience is the one thing memory learns from *being used*. A documented
+deterministic formula over recorded inputs — no model, no sampling — so a
+pruning pass is reproducible rather than a judgement call:
 
 ```
-salience = recency(90-day half-life) × (1 + 0.5·log1p(uses)) × scope_weight
+evidence = 1 + 0.5·log1p(uses) + 0.5·log1p(observations)
+salience = recency(90-day half-life, anchored on the most recent of
+           asserted_at/last_seen/last_used_at) × evidence × scope_weight
 scope_weight: org 1.25, user 1.0, session 0.6
 ```
 
 `uses` is counted **after truncation**, so a record is credited for being
-*served*, not merely considered. Usage tracking is off by default — it is a
-write on the read path.
+*served*, not merely considered, and usage tracking stays off by default — it
+is a write on the read path. `observations` carries no such argument (it
+records what was *written*, not what anyone *looked up*) and is on by default;
+in a region that never enables usage tracking, `observations` is what keeps
+salience from degenerating to age-and-scope-only ranking.
 
 `memory.max_records` archives the least salient beyond the cap, via the same
 in-place rename consolidation uses, with the score written back so a prune is

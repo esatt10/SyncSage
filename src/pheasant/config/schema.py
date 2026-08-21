@@ -809,6 +809,20 @@ class MemorySettings(ModelMixin):
     #: ceiling the retired concept layer never had.
     about_max_targets: int = 3
 
+    # --- compaction (Phase 1) ---------------------------------------------
+    #: L0 write-path admission: a write whose *normalized* text already
+    #: matches a live record in the same (scope, subject, kind, ACL
+    #: partition) bucket reinforces that record (bumps `observations`,
+    #: records the surface form as a `variant`) instead of creating a new
+    #: file — collapsing exact repeats and paraphrases alike, which today
+    #: are indistinguishable "new" writes. **On by default**, unlike
+    #: `usage_tracking` above: this is a write-path counter with none of
+    #: that flag's read-path privacy argument (recording what an agent
+    #: *wrote* is not recording what anyone *looked up*), and shipped off it
+    #: would be exactly as inert as `uses` is while `usage_tracking` stays
+    #: at its own default.
+    reinforcement_enabled: bool = True
+
 
 @dataclass
 class IdPSettings(ModelMixin):

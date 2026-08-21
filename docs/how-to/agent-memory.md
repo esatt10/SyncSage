@@ -52,6 +52,25 @@ decides its read ACL, so a newline in a field value would otherwise let a
 caller forge frontmatter and escalate a private note to `org`. Everything else
 — colons, unicode, punctuation — round-trips unchanged.
 
+**Restating a fact reinforces it, it does not duplicate it.** An agent that
+asserts the same thing in fresh words every time it comes up — the normal
+case at agent write rates — does not grow the store one record per
+paraphrase. `memory.reinforcement_enabled` (on by default) checks a new
+write's normalized text (case/whitespace/framing folded, nothing else — see
+`docs/memory-system.md` §8) against the same `(scope, subject, kind)` bucket
+before creating a file; a match reinforces the existing record instead. The
+response's `outcome` says which happened:
+
+```jsonc
+{"created": false, "outcome": "reinforced", "record": {"record_id": "mem-..."}, "submitted_text": "the staging cluster runs in us-east-2"}
+```
+
+`outcome` is `"created"` (a genuinely new record), `"reinforced"` (folded
+into an existing one — exact repeat or paraphrase alike), or `"duplicate"`
+(reinforcement disabled, exact repeat only — the pre-compaction behavior).
+Two principals can never reinforce each other's `user`/`session`-scope
+memories this way; see §8 of the memory-system doc.
+
 ## 3. Recall is just search
 
 ```bash
@@ -90,9 +109,11 @@ Pass `supersedes: <record_id>` when a memory corrects an earlier one. The
 old record is then no longer *current* — `GET /memory?current_only=true`
 filters it immediately — and the next **consolidation pass** archives it:
 the file is renamed `<id>.md.archived` in place (bytes preserved forever,
-nothing deleted) and a full re-sync of the memory source drops it from the
-index, so search stops surfacing the stale fact while the audit trail
-remains on disk.
+nothing deleted), so search stops surfacing the stale fact while the audit
+trail remains on disk. Below a few hundred archived records the pass drops
+just those records' indexed state directly; above that it falls back to a
+full re-sync of the (small) memory source — either way the result is the
+same, only the cost differs.
 
 Consolidation runs automatically on the scheduler beat, or on demand via
 the `memory_consolidate` MCP tool / `POST /memory/consolidate`. Per-scope

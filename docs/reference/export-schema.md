@@ -203,8 +203,12 @@ WHERE m.valid_until IS NULL;
 | `tags` | VARCHAR | Free-form tags. |
 | `written_by` | VARCHAR | Principal that wrote it. |
 | `salience` | DOUBLE | Ranking weight. |
-| `uses` | BIGINT | Times recalled. |
-| `last_used_at` | VARCHAR | ISO-8601 UTC. |
+| `uses` | BIGINT | Times recalled (only counted with `memory.usage_tracking` on). |
+| `last_used_at` | VARCHAR | ISO-8601 UTC — last time `uses` was bumped. |
+| `canon_key` | VARCHAR | Normalized-content dedup key (scope/subject/kind/ACL/text — see `pheasant.memory.normalize`); NULL for a record from before compaction. Derived, not earned: recomputed on every re-sync. |
+| `observations` | BIGINT | Times a write re-asserted this record — exactly or as a paraphrase — instead of creating a new file. |
+| `last_seen` | VARCHAR | ISO-8601 UTC — last time `observations` was bumped. |
+| `variants` | VARCHAR | JSON array of distinct surface forms (up to 8) that reinforced this record, when any differed from the stored text. |
 | `schema_version` | BIGINT | Record-format version. |
 
 Two semantics an outside reader must apply itself, because pheasant applies

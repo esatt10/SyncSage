@@ -327,6 +327,12 @@ memory:
   max_records: null
   # Cap on `about` graph edges drawn per record by the memory bridge.
   about_max_targets: 3
+  # Fold a write into an existing record (bump observations/last_seen)
+  # instead of creating a new file when its normalized text already matches
+  # one in the same scope/subject/kind/ACL bucket — exact repeat or
+  # paraphrase alike. On by default, unlike usage_tracking above: this
+  # records what was written, not what was looked up.
+  reinforcement_enabled: true
 
 # byte-for-byte deterministic.
 #

@@ -204,9 +204,27 @@ CREATE TABLE IF NOT EXISTS memory_records (
   salience REAL NOT NULL DEFAULT 1.0,
   uses INTEGER NOT NULL DEFAULT 0,
   last_used_at TEXT,
+  -- Phase 1 (agent-speed memory compaction): `canon_key` is a pure function
+  -- of the record's own fields (see pheasant.memory.normalize), so it is
+  -- recomputed on every projection rebuild like every other column above
+  -- this line, never carried over. `observations`/`last_seen`/`variants`
+  -- are earned by reinforcement (a near-duplicate write folding into this
+  -- record instead of creating its own file) and are carried over on
+  -- rebuild exactly like `salience`/`uses`/`last_used_at` below.
+  canon_key TEXT,
+  observations INTEGER NOT NULL DEFAULT 0,
+  last_seen TEXT,
+  variants TEXT,
   schema_version INTEGER NOT NULL DEFAULT 1,
   FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
 );
+-- The `idx_memory_records_canon_key` index (Phase 1's reinforcement lookup)
+-- is NOT declared here: on a fresh database this CREATE TABLE already
+-- carries `canon_key`, so it could be, but on an upgraded one the column
+-- is added later by a guarded ALTER TABLE in StateStore.migrate() — and
+-- `executescript` runs this whole file as one script, before that ALTER
+-- ever runs. Declaring the index here would then fail against a
+-- pre-Phase-1 table that has no such column yet. See migrate().
 -- Retrieval joins chunks -> artifacts -> memory_records on every memory-aware
 -- query, and the validity predicate is `scope` + `valid_until`.
 CREATE INDEX IF NOT EXISTS idx_memory_records_artifact_id

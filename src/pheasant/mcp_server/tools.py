@@ -431,6 +431,7 @@ class PheasantTools:
         itself. All three are optional and default to the pre-33.5 behavior
         (CLAUDE.md §4 rule 8: additive only).
         """
+        from pheasant.memory.reinforcement import StateReinforcementIndex
         from pheasant.memory.store import MemoryStore, memory_source
 
         self._require_knowledge_base(knowledge_base)
@@ -443,7 +444,19 @@ class PheasantTools:
                 "      type: memory\n"
                 "      path: memory"
             )
-        record, created = MemoryStore(source.path).append(
+        # Phase 1: a write whose *normalized* text already matches a live
+        # record in the same (scope, subject, kind, ACL) bucket reinforces
+        # that record instead of creating a new one. `reinforcement_enabled`
+        # defaults on (see MemorySettings) but stays a real knob, and a
+        # cold/absent projection degrades `find()` to "no match" — never
+        # blocks the write.
+        reinforcement = (
+            StateReinforcementIndex(self.state)
+            if self.config.memory.reinforcement_enabled
+            else None
+        )
+        store = MemoryStore(source.path)
+        record, created = store.append(
             text,
             scope=scope,
             subject=subject,
@@ -452,13 +465,31 @@ class PheasantTools:
             kind=kind,
             written_by=principal,
             valid_until=valid_until,
+            reinforcement=reinforcement,
         )
+        outcome = store.last_outcome or ("created" if created else "duplicate")
+
         from pheasant.telemetry import metrics as _metrics
 
-        _metrics.REGISTRY.inc(
-            "pheasant_memory_writes_total", outcome="created" if created else "duplicate"
-        )
-        result: dict = {"record": record.as_dict(), "created": created, "source": source.name}
+        _metrics.REGISTRY.inc("pheasant_memory_writes_total", outcome=outcome)
+        result: dict = {
+            "record": record.as_dict(),
+            "created": created,
+            "source": source.name,
+            # Additive (rule 8): "created" | "reinforced" | "duplicate".
+            # `created` is unchanged and still means exactly what it always
+            # has; `outcome` distinguishes the two ways `created=False` can
+            # now happen.
+            "outcome": outcome,
+        }
+        submitted = (text or "").strip()
+        if not created and submitted and submitted != record.text:
+            # Only possible for outcome="reinforced": an exact-digest match
+            # (outcome="duplicate") is byte-identical to `record.text` by
+            # construction. The caller gets back a record whose stored text
+            # is not what it wrote — worth surfacing rather than leaving
+            # implicit.
+            result["submitted_text"] = submitted
         # The record is already durably on disk; this sync only makes it
         # *searchable now*. Failing the whole request when it cannot run — most
         # often because another writer holds the engine lease, which a live run

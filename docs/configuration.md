@@ -703,7 +703,7 @@ memory source itself. See [Agent memory](how-to/agent-memory.md).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `consolidation_enabled` | bool | `true` | Archive superseded records (an explicit correction) and per-scope TTL-expired records on the scheduler beat or via `memory_consolidate` / `POST /memory/consolidate`. Archiving renames `<id>.md` → `<id>.md.archived` in place — bytes preserved, never deleted — then a full re-sync prunes it from the index. |
+| `consolidation_enabled` | bool | `true` | Archive superseded records (an explicit correction) and per-scope TTL-expired records on the scheduler beat or via `memory_consolidate` / `POST /memory/consolidate`. Archiving renames `<id>.md` → `<id>.md.archived` in place — bytes preserved, never deleted — then the archived records' indexed state is dropped directly (or, above a few hundred in one pass, a full re-sync prunes them). |
 | `session_ttl_days` | integer \| null | `null` | TTL for `session`-scoped records. `null` = never expires by age. |
 | `user_ttl_days` | integer \| null | `null` | TTL for `user`-scoped records. |
 | `org_ttl_days` | integer \| null | `null` | TTL for `org`-scoped records. |
@@ -712,6 +712,7 @@ memory source itself. See [Agent memory](how-to/agent-memory.md).
 | `usage_tracking` | bool | `false` | Count which records retrieval actually returns, so salience reflects use. Off by default — it is a write on the read path, and recording what someone looks up is an operator's decision. |
 | `max_records` | integer \| null | `null` | Archive the least salient records once the store exceeds this many. `null` = unbounded. Pruning uses the same in-place `.md.archived` rename as consolidation; nothing is deleted. |
 | `about_max_targets` | integer | `3` | Cap on `about` edges the graph bridge draws per record. Total `about` edges stay bounded by this times the record count — the ceiling the retired concept layer never had. |
+| `reinforcement_enabled` | bool | `true` | Before creating a file, check a write's normalized text against the same `(scope, subject, kind, ACL partition)` bucket; a match — exact repeat or paraphrase — reinforces the existing record (`observations`, `last_seen`, a bounded `variants` list) instead of creating a new one. On by default: unlike `usage_tracking`, this records what was *written*, not what was *looked up*. See [Agent memory](how-to/agent-memory.md) and `docs/memory-system.md` §8. |
 
 **Corrected records are excluded from retrieval automatically**, at query time,
 without waiting for a consolidation pass — pass `{"current_only": false}` or an

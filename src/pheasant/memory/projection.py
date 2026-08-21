@@ -20,6 +20,7 @@ arithmetic, no model and no network.
 
 from __future__ import annotations
 
+from pheasant.memory.normalize import acl_class_for, normalized_digest
 from pheasant.memory.store import MemoryRecord
 
 
@@ -95,6 +96,19 @@ def project(source_name: str, records: list[MemoryRecord]) -> list[dict[str, obj
             "supersedes": record.supersedes,
             "tags": ", ".join(record.tags) if record.tags else None,
             "written_by": record.written_by,
+            # Phase 1 — a pure function of this record's own fields (scope,
+            # subject, kind, ACL partition, normalized text), so it is
+            # recomputed on every rebuild rather than carried over, unlike
+            # observations/last_seen/variants just below it in the row
+            # (those are earned by write-path reinforcement; see
+            # `StateStore.replace_memory_records`).
+            "canon_key": normalized_digest(
+                scope=record.scope,
+                subject=record.subject,
+                kind=record.kind,
+                acl_class=acl_class_for(record.scope, record.written_by),
+                text=record.text,
+            ),
             "schema_version": record.schema_version,
         }
         for record in records

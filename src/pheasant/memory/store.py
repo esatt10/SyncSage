@@ -35,10 +35,38 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from pheasant.config.schema import PheasantConfig, SourceConfig, SourceType
+from pheasant.memory.normalize import acl_class_for, normalized_digest
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class ReinforcementIndex(Protocol):
+    """Caller-supplied bridge to the canonical-key index (Phase 1/6).
+
+    `MemoryStore` stays filesystem-only — it has no state handle and
+    should not grow one — so a caller that already holds `engine.state`
+    (the MCP/HTTP write paths) passes an adapter satisfying this shape to
+    `append()` instead. See `pheasant.memory.reinforcement
+    .StateReinforcementIndex` for the concrete implementation.
+    """
+
+    def find(self, canon_digest: str) -> str | None:
+        """The record_id of a live record already carrying this canonical
+        key, or None. `canon_digest` already encodes scope, subject, kind
+        and ACL partition, so any match is in the exact bucket a caller
+        may legally fold into."""
+        ...
+
+    def reinforce(self, record_id: str, *, submitted_text: str, now: datetime) -> None:
+        """Record that `record_id` was observed again via `submitted_text`
+        (which may differ from the record's stored text — a paraphrase).
+        Best-effort: implementations must not raise."""
+        ...
+
 
 MEMORY_RECORD_VERSION = 2
 VALID_SCOPES = ("session", "user", "org")
@@ -290,6 +318,10 @@ class MemoryStore:
         # loop) at the cost of one `stat()` per file on the second call
         # instead of a second full parse of the store.
         self._record_cache: dict[Path, tuple[int, int, MemoryRecord]] = {}
+        #: Set by the most recent `append()` call: "created" | "reinforced"
+        #: | "duplicate" | None (never called yet). See `append`'s docstring
+        #: for why this rides an attribute instead of a third return value.
+        self.last_outcome: str | None = None
 
     def append(
         self,
@@ -304,11 +336,31 @@ class MemoryStore:
         written_by: str | None = None,
         valid_from: str | None = None,
         valid_until: str | None = None,
+        reinforcement: ReinforcementIndex | None = None,
     ) -> tuple[MemoryRecord, bool]:
         """Write one memory record; returns ``(record, created)``.
 
         Append-only: an existing record file is never rewritten — an
         identical write returns the stored record with ``created=False``.
+
+        ``reinforcement`` adds L0 admission (Phase 1) on top of the
+        always-on exact-digest dedup below: a write whose *normalized*
+        content (see ``pheasant.memory.normalize`` — no token-sort, no
+        stopword removal, so this only folds genuine restatements) already
+        matches a live record in the same (scope, subject, kind,
+        ACL-partition) bucket does not create a new file either — it
+        returns that record with ``created=False``, whether the match was
+        byte-exact or merely a paraphrase, and bumps its observation count.
+        ``None`` (the default) reproduces exactly the pre-Phase-1 behavior:
+        only the exact-digest dedup, no reinforcement of anything.
+
+        The outcome of the last call — ``"created"``, ``"reinforced"`` (a
+        match was found and ``reinforcement`` recorded it) or
+        ``"duplicate"`` (an exact match was found but ``reinforcement`` was
+        not supplied) — is left on ``self.last_outcome`` afterward. Kept off
+        the return tuple deliberately: every existing caller of ``append``
+        unpacks exactly ``record, created = store.append(...)``, and this is
+        an internal instance, not public API.
         """
         text = (text or "").strip()
         if not text:
@@ -337,6 +389,18 @@ class MemoryStore:
         ).hexdigest()
         record_id = f"mem-{instant.strftime('%Y%m%dT%H%M%SZ')}-{digest}"
         path = self.root / scope / f"{record_id}.md"
+        # `_digest_input` is record *identity* and stays untouched by Phase
+        # 1 — this is a separate key, over the *normalized* text, used only
+        # to decide whether this write reinforces an existing record. Cheap
+        # to compute unconditionally: it is a handful of string ops plus one
+        # blake2b call, whether or not `reinforcement` ends up used below.
+        canon_digest = normalized_digest(
+            scope=scope,
+            subject=subject,
+            kind=kind,
+            acl_class=acl_class_for(scope, written_by),
+            text=text,
+        )
         # Content identity is the *digest*; the timestamp prefix orders and
         # labels records, it does not identify them. Matching on the full path
         # alone made "an identical write returns the stored record" true only
@@ -354,7 +418,26 @@ class MemoryStore:
         # consolidated away correctly brings it back.
         existing = next(iter(sorted((self.root / scope).glob(f"mem-*-{digest}.md"))), None)
         if existing is not None:
-            return self.load(existing), False
+            record = self.load(existing)
+            self.last_outcome = "reinforced" if reinforcement is not None else "duplicate"
+            self._reinforce(reinforcement, record, text, instant)
+            return record, False
+        if reinforcement is not None:
+            # A near-duplicate: different bytes, same normalized claim, same
+            # (scope, subject, kind, ACL) bucket. `find` is scoped by the
+            # digest alone, so any match is already in this exact bucket.
+            near_dup_id = reinforcement.find(canon_digest)
+            if near_dup_id:
+                near_dup_path = self.root / scope / f"{near_dup_id}.md"
+                if near_dup_path.exists():
+                    record = self._load_cached(near_dup_path)
+                    self.last_outcome = "reinforced"
+                    self._reinforce(reinforcement, record, text, instant)
+                    return record, False
+                # The index named a record with no file on disk — a stale or
+                # cold projection (see `StateReinforcementIndex`). Never
+                # block the write over it; fall through and create a new
+                # record, same as `reinforcement=None`.
         record = MemoryRecord(
             record_id=record_id,
             scope=scope,
@@ -370,12 +453,34 @@ class MemoryStore:
             valid_until=valid_until,
         )
         if path.exists():
-            return self.load(path), False
+            record = self.load(path)
+            self.last_outcome = "reinforced" if reinforcement is not None else "duplicate"
+            self._reinforce(reinforcement, record, text, instant)
+            return record, False
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".md.tmp")
         tmp.write_text(_render(record), encoding="utf-8")
         os.replace(tmp, path)
+        self.last_outcome = "created"
         return record, True
+
+    def _reinforce(
+        self,
+        reinforcement: ReinforcementIndex | None,
+        record: MemoryRecord,
+        submitted_text: str,
+        now: datetime,
+    ) -> None:
+        """Best-effort: a failed reinforcement costs ranking signal, never
+        the write itself (the record was already returned to the caller)."""
+        if reinforcement is None:
+            return
+        try:
+            reinforcement.reinforce(record.record_id, submitted_text=submitted_text, now=now)
+        except Exception:
+            logger.warning(
+                "memory reinforcement not recorded for %s", record.record_id, exc_info=True
+            )
 
     def load(self, path: Path) -> MemoryRecord:
         raw = Path(path).read_text(encoding="utf-8")

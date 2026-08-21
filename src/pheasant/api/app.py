@@ -1867,6 +1867,7 @@ def create_app(
 
     @app.post("/memory")
     def memory_write(req: MemoryWriteRequest) -> dict:
+        from pheasant.memory.reinforcement import StateReinforcementIndex
         from pheasant.memory.store import MemoryStore, memory_source
 
         source = memory_source(config, state)
@@ -1878,8 +1879,13 @@ def create_app(
                     "source to pheasant.yaml"
                 ),
             )
+        # Phase 1: see the matching comment in mcp_server/tools.py:memory_write.
+        reinforcement = (
+            StateReinforcementIndex(state) if config.memory.reinforcement_enabled else None
+        )
         try:
-            record, created = MemoryStore(source.path).append(
+            store = MemoryStore(source.path)
+            record, created = store.append(
                 req.text,
                 scope=req.scope,
                 subject=req.subject,
@@ -1888,6 +1894,7 @@ def create_app(
                 kind=req.kind,
                 written_by=req.principal,
                 valid_until=req.valid_until,
+                reinforcement=reinforcement,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1903,10 +1910,17 @@ def create_app(
                     "will not do."
                 ),
             ) from exc
-        metrics.REGISTRY.inc(
-            "pheasant_memory_writes_total", outcome="created" if created else "duplicate"
-        )
-        payload: dict = {"record": record.as_dict(), "created": created, "source": source.name}
+        outcome = store.last_outcome or ("created" if created else "duplicate")
+        metrics.REGISTRY.inc("pheasant_memory_writes_total", outcome=outcome)
+        payload: dict = {
+            "record": record.as_dict(),
+            "created": created,
+            "source": source.name,
+            "outcome": outcome,
+        }
+        submitted = (req.text or "").strip()
+        if not created and submitted and submitted != record.text:
+            payload["submitted_text"] = submitted
         # The record is already durably on disk; this sync only makes it
         # *searchable now*. Failing the whole request when it cannot run — most
         # often because another writer holds the engine lease, which a live run
