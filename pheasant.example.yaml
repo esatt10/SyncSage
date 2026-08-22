@@ -313,6 +313,13 @@ memory:
   session_ttl_days: null
   user_ttl_days: null
   org_ttl_days: null
+  # Days a superseded/TTL-expired record stays indexed (hidden from default
+  # results, reachable via `as_of`/`current_only: false`) before it is
+  # actually archived. 0 = archive immediately, the pre-Phase-2 default.
+  # Opt in for point-in-time recall; it measurably costs ranking (see
+  # docs/memory-system.md) since a corrected record's near-duplicate text
+  # stays indexed alongside its correction.
+  supersede_retention_days: 0
   # How memory takes part in a search that does not say. A per-call `memory`
   # argument always wins over this. auto | off | only | prefer
   default_policy: auto
@@ -323,10 +330,52 @@ memory:
   # Count which records retrieval returns, so salience reflects use. Off by
   # default — a write on the read path, and an operator's decision to make.
   usage_tracking: false
-  # Archive the least salient records past this many. null = unbounded.
+  # Archive the least salient records past this many. null = unbounded. Runs
+  # as a backstop after the per-scope/per-subject caps below.
   max_records: null
+  # Per-scope caps, mirroring the *_ttl_days trio above — each scope its own
+  # isolated pool, so a session flood cannot use its share of max_records to
+  # crowd out an org fact (max_records alone only ever *outranks* it by
+  # scope_weight, never fully protects it). null = that scope unbounded.
+  session_max_records: null
+  user_max_records: null
+  org_max_records: null
+  # Cap on live records sharing one `subject`, across scopes. Records with no
+  # subject are exempt. null = unbounded.
+  max_records_per_subject: null
   # Cap on `about` graph edges drawn per record by the memory bridge.
   about_max_targets: 3
+  # Fold a write into an existing record (bump observations/last_seen)
+  # instead of creating a new file when its normalized text already matches
+  # one in the same scope/subject/kind/ACL bucket — exact repeat or
+  # paraphrase alike. On by default, unlike usage_tracking above: this
+  # records what was written, not what was looked up.
+  reinforcement_enabled: true
+  # Offline near-duplicate clustering + medoid promotion on the
+  # consolidation pass. Off by default: unlike reinforcement, this changes
+  # what a *default* query returns (a subsumed near-duplicate stops
+  # appearing in results, though it stays indexed and reachable via an
+  # explicit tier filter or current_only: false).
+  compaction_enabled: false
+  compaction_similarity_threshold: 0.6
+  compaction_min_cluster_size: 2
+  # L3: LLM-merge for what deterministic clustering cannot resolve
+  # (complementary partial facts, progressive refinement, abstraction).
+  # Opt-in AND never automatic — only the explicit memory_synthesize tool /
+  # POST /memory/synthesize runs it, never the scheduler beat. Mirrors
+  # assistant.* field for field.
+  synthesis:
+    enabled: false
+    provider: auto            # auto | anthropic | openai | gemini | none
+    model: null
+    max_calls_per_pass: 20
+    max_input_chars: 6000
+    min_cluster_size: 3
+    # Above this mean pairwise similarity a cluster is skipped: near-
+    # identical rephrasings are what medoid promotion already resolves
+    # losslessly, so model spend goes only where L1/L2 provably cannot
+    # help (complementary partials, progressive refinement, abstraction).
+    max_jaccard: 0.55
 
 # byte-for-byte deterministic.
 #

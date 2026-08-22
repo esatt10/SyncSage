@@ -98,8 +98,8 @@ actually behind. See [Monitor indexing](../how-to/monitor-indexing.md).
 
 `POST /search`, `/relevant-files` and `/assistant/chat` all accept `memory`:
 one of `"auto"` (default), `"off"`, `"only"`, `"prefer"`, or an object with
-`scopes`, `subject`, `current_only`, `as_of`, `max_results` and
-`include_rules`.
+`scopes`, `subject`, `current_only`, `as_of`, `max_results`,
+`include_rules` and `tiers`.
 
 `include_rules` defaults to `false`: `alias`/`preference`/`exclusion` records
 steer ranking but are not themselves returned as passages. Set it true to see
@@ -108,16 +108,22 @@ them in results.
 Records a later record corrected are excluded automatically — you do not have
 to wait for a consolidation pass. Pass `{"current_only": false}` or an `as_of`
 instant to see them. Hits that came from memory carry a `memory` block naming
-the record, its scope, subject and when it was asserted.
+the record, its scope, subject, when it was asserted, and its tier.
+
+`tiers` (`["hot"]` default) reaches records demoted by compaction
+(`memory.compaction_enabled`) — `["cold"]` or `["hot","cold"]`; `current_only:
+false` and `as_of` widen to both tiers automatically, same as they already
+widen the validity window.
 
 ## Agent memory
 
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/memory/enable` | Provision the `type: memory` source. Idempotent; the only way to turn memory on without editing `pheasant.yaml`. |
-| POST | `/memory` | Append one record. Body: `text`, `scope` (`session`/`user`/`org`), `subject`, `supersedes`, `tags`, `kind`, `principal`, `valid_until`, `sync`. |
-| GET | `/memory` | List records. Query: `scope`, `current_only`. |
+| POST | `/memory` | Append one record. Body: `text`, `scope` (`session`/`user`/`org`), `subject`, `supersedes`, `tags`, `kind`, `principal`, `valid_until`, `sync`. Response adds `outcome` (`"created"` \| `"reinforced"` \| `"duplicate"`) and, when a reinforcement changed what is stored, `submitted_text`. |
+| GET | `/memory` | List records. Query: `scope`, `current_only`. Each record carries `tier` (`hot`/`cold`) and `subsumed_by`. |
 | POST | `/memory/consolidate` | Archive superseded/expired records, prune past `memory.max_records`, then re-index. Returns `{"skipped": …}` when consolidation is off — not an error. |
+| POST | `/memory/synthesize` | LLM-merge a near-duplicate cluster deterministic compaction could not resolve into one canonical record, subsuming the inputs. Off by default (`memory.synthesis.enabled`) and never automatic — only this call runs it. `{"skipped": …}` when disabled, no memory source, or no model reachable; otherwise `{"attempted","synthesized","cached","records"}`. |
 
 See [Agent memory](../how-to/agent-memory.md).
 

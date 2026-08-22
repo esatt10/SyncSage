@@ -1867,6 +1867,7 @@ def create_app(
 
     @app.post("/memory")
     def memory_write(req: MemoryWriteRequest) -> dict:
+        from pheasant.memory.reinforcement import StateReinforcementIndex
         from pheasant.memory.store import MemoryStore, memory_source
 
         source = memory_source(config, state)
@@ -1878,8 +1879,13 @@ def create_app(
                     "source to pheasant.yaml"
                 ),
             )
+        # Phase 1: see the matching comment in mcp_server/tools.py:memory_write.
+        reinforcement = (
+            StateReinforcementIndex(state) if config.memory.reinforcement_enabled else None
+        )
         try:
-            record, created = MemoryStore(source.path).append(
+            store = MemoryStore(source.path)
+            record, created = store.append(
                 req.text,
                 scope=req.scope,
                 subject=req.subject,
@@ -1888,6 +1894,7 @@ def create_app(
                 kind=req.kind,
                 written_by=req.principal,
                 valid_until=req.valid_until,
+                reinforcement=reinforcement,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1903,7 +1910,17 @@ def create_app(
                     "will not do."
                 ),
             ) from exc
-        payload: dict = {"record": record.as_dict(), "created": created, "source": source.name}
+        outcome = store.last_outcome or ("created" if created else "duplicate")
+        metrics.record_memory_write(outcome, store.last_fold)
+        payload: dict = {
+            "record": record.as_dict(),
+            "created": created,
+            "source": source.name,
+            "outcome": outcome,
+        }
+        submitted = (req.text or "").strip()
+        if not created and submitted and submitted != record.text:
+            payload["submitted_text"] = submitted
         # The record is already durably on disk; this sync only makes it
         # *searchable now*. Failing the whole request when it cannot run — most
         # often because another writer holds the engine lease, which a live run
@@ -1912,7 +1929,11 @@ def create_app(
         # both pick it up.
         if req.sync and created:
             try:
-                payload["sync"] = engine.sync_source(source.name, "incremental").__dict__
+                # `enrich="deferred"`: skip the whole-graph enrichment walk on
+                # the write path — see sync/engine.py:_finalize_index_state.
+                payload["sync"] = engine.sync_source(
+                    source.name, "incremental", enrich="deferred"
+                ).__dict__
             except Exception as exc:
                 logger.warning("memory write indexed later: %s", exc)
                 payload["sync_deferred"] = str(exc)
@@ -1950,7 +1971,19 @@ def create_app(
             records = MemoryStore(source.path).list_records(scope, current_only=current_only)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"source": source.name, "records": [r.as_dict() for r in records]}
+        # Phase 3: see the matching comment in mcp_server/tools.py:memory_list.
+        try:
+            compaction = {str(row["record_id"]): row for row in state.memory_compaction_rows()}
+        except Exception:
+            compaction = {}
+        out = []
+        for record in records:
+            payload = record.as_dict()
+            row = compaction.get(record.record_id)
+            payload["tier"] = str(row["tier"]) if row and row.get("tier") else "hot"
+            payload["subsumed_by"] = row.get("subsumed_by") if row else None
+            out.append(payload)
+        return {"source": source.name, "records": out}
 
     @app.post("/memory/enable")
     def memory_enable(req: MemoryEnableRequest) -> dict:
@@ -2048,6 +2081,28 @@ def create_app(
                 )
             }
         audit(result["source"], "memory_consolidate", result["report"])
+        return result
+
+    @app.post("/memory/synthesize")
+    def memory_synthesize() -> dict:
+        """LLM-merge a near-duplicate memory cluster deterministic
+        compaction could not resolve into one canonical record. Off by
+        default (`memory.synthesis.enabled`) and never automatic — see
+        `MemorySynthesisSettings`. 200 with `{"skipped": reason}` when
+        synthesis is disabled, no memory source is configured, or no model
+        is reachable — matching `POST /memory/consolidate`'s posture: this
+        is a well-formed request the server declined by its own
+        configuration, not a client error.
+        """
+        from pheasant.memory.store import MemoryStore, memory_source
+        from pheasant.memory.synthesis import run_synthesis
+
+        source = memory_source(config, state)
+        if source is None:
+            return {"skipped": "no `type: memory` source is configured"}
+        records = MemoryStore(source.path).list_records()
+        result = run_synthesis(engine, records, config.memory.synthesis, source)
+        audit(source.name, "memory_synthesize", result)
         return result
 
     @app.post("/security/idp/sync")

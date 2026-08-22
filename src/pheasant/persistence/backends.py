@@ -58,16 +58,21 @@ class StateBackend(ABC):
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         """Run one statement."""
 
-    def statement(self, sql: str, params: tuple[Any, ...] = ()) -> list[Row]:
-        """Run a statement that may write, returning any rows it produced.
+    def statement(self, sql: str, params: tuple[Any, ...] = ()) -> tuple[list[Row], int]:
+        """Run a statement that may write, returning ``(rows, rowcount)``.
 
         Separate from :meth:`rows` because a backend may release a pooled
         connection after a pure read but must not after a write — see
-        :meth:`PostgresBackend.statement`. Defaults to :meth:`rows`, which is
-        correct for a backend holding one connection per thread.
+        :meth:`PostgresBackend.statement`. ``rowcount`` is how many rows a
+        bare ``UPDATE``/``DELETE`` touched, for callers that need to know
+        (`StateStore.subsume_records`, `delete_artifacts`); ``rows`` covers
+        `RETURNING`. Defaults to :meth:`rows` with ``rowcount=0``, which is
+        correct for a backend holding one connection per thread — nothing
+        calls this default in practice, since only :class:`PostgresBackend`
+        is reached through :class:`_PgConnection`.
         """
 
-        return self.rows(sql, params)
+        return self.rows(sql, params), 0
 
     @abstractmethod
     def executemany(self, sql: str, seq: list[tuple[Any, ...]]) -> None:
@@ -187,12 +192,21 @@ class _PgResult:
     materialized eagerly because the cursor is closed as soon as the statement
     finishes — a lazy cursor handed back to a caller that iterates it later is
     how you get "cursor already closed" at a random call site.
+
+    ``rowcount`` is captured for the same reason: `StateStore` reads
+    ``cursor.rowcount`` after a bare ``UPDATE``/``DELETE`` (no ``RETURNING``,
+    so ``rows`` is empty) to learn how many rows a statement actually
+    touched — `subsume_records`'s demoted-member count, `delete_artifacts`'s
+    return value. Found missing (an `AttributeError`, not a silent wrong
+    answer) by running a real memory consolidation pass against a real
+    Postgres server, per CLAUDE.md rule 10.
     """
 
-    __slots__ = ("_rows",)
+    __slots__ = ("_rows", "rowcount")
 
-    def __init__(self, rows: list[Row]):
+    def __init__(self, rows: list[Row], rowcount: int = 0):
         self._rows = rows
+        self.rowcount = rowcount
 
     def __iter__(self):
         return iter(self._rows)
@@ -225,7 +239,8 @@ class _PgConnection:
 
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> _PgResult:
         # `statement`, not `rows`: this is the write path.
-        return _PgResult(self._backend.statement(sql, params))
+        rows, rowcount = self._backend.statement(sql, params)
+        return _PgResult(rows, rowcount)
 
     def executemany(self, sql: str, seq: list[tuple[Any, ...]]) -> None:
         self._backend.executemany(sql, seq)
@@ -386,15 +401,22 @@ class PostgresBackend(StateBackend):
         self._finish()
         return result
 
-    def statement(self, sql: str, params: tuple[Any, ...] = ()) -> list[Row]:
-        """Run a statement that may write, returning any rows it produced.
+    def statement(self, sql: str, params: tuple[Any, ...] = ()) -> tuple[list[Row], int]:
+        """Run a statement that may write, returning ``(rows, rowcount)``.
 
-        Distinct from :meth:`rows` in exactly one way, and it is load-bearing:
-        this never auto-releases the connection. ``_PgConnection.execute`` —
-        the sqlite3-shaped path every ``with self.conn:`` block in
-        ``StateStore`` uses — is a *write* path, so releasing after it would
-        hand back the connection mid-transaction and discard the uncommitted
-        work. ``UPDATE ... RETURNING`` (the queue's claim) needs the same.
+        Distinct from :meth:`rows` in two ways, both load-bearing:
+
+        - This never auto-releases the connection. ``_PgConnection.execute``
+          — the sqlite3-shaped path every ``with self.conn:`` block in
+          ``StateStore`` uses — is a *write* path, so releasing after it
+          would hand back the connection mid-transaction and discard the
+          uncommitted work. ``UPDATE ... RETURNING`` (the queue's claim)
+          needs the same.
+        - ``cursor.rowcount`` is read *inside* the ``with conn.cursor()``
+          block, before psycopg closes the cursor — reading it after would
+          raise, and a bare ``UPDATE``/``DELETE`` (no ``RETURNING``) is
+          exactly the shape that has no rows to fall back on for "how many
+          did this touch".
         """
 
         conn = self._conn()
@@ -408,11 +430,12 @@ class PostgresBackend(StateBackend):
                     result = [
                         Row(dict(zip(columns, values, strict=True))) for values in cursor.fetchall()
                     ]
+                rowcount = cursor.rowcount
         except Exception:
             self._abort()
             raise
         self._local.dirty = True
-        return result
+        return result, rowcount
 
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         conn = self._conn()

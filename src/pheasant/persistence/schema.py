@@ -204,15 +204,92 @@ CREATE TABLE IF NOT EXISTS memory_records (
   salience REAL NOT NULL DEFAULT 1.0,
   uses INTEGER NOT NULL DEFAULT 0,
   last_used_at TEXT,
-  schema_version INTEGER NOT NULL DEFAULT 1,
-  FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
+  -- Phase 1 (agent-speed memory compaction): `canon_key` is a pure function
+  -- of the record's own fields (see pheasant.memory.normalize), so it is
+  -- recomputed on every projection rebuild like every other column above
+  -- this line, never carried over. `observations`/`last_seen`/`variants`
+  -- are earned by reinforcement (a near-duplicate write folding into this
+  -- record instead of creating its own file) and are carried over on
+  -- rebuild exactly like `salience`/`uses`/`last_used_at` below.
+  canon_key TEXT,
+  observations INTEGER NOT NULL DEFAULT 0,
+  last_seen TEXT,
+  variants TEXT,
+  -- Phase 3: `tier` and `subsumed_by` are earned by a compaction pass (a
+  -- near-duplicate *cluster*, as opposed to Phase 1's exact canonical-key
+  -- match) choosing a medoid and demoting the rest — carried over on
+  -- rebuild exactly like the Phase 1 columns above. Deliberately DISTINCT
+  -- from `supersedes`/`valid_until`: a subsumed record is redundant but
+  -- still TRUE, so `subsumed_by` must never feed `effective_valid_until`
+  -- (memory/projection.py) — conflating the two would silently expire
+  -- facts that are still valid. `tier` is `hot` (default, in every result
+  -- set a policy would normally return) or `cold` (demoted; excluded from
+  -- default results, reachable via an explicit tier filter or
+  -- `current_only=False`/`as_of`, same as a retained superseded record).
+  tier TEXT NOT NULL DEFAULT 'hot',
+  subsumed_by TEXT,
+  schema_version INTEGER NOT NULL DEFAULT 1
+  -- Deliberately NO `FOREIGN KEY (artifact_id) REFERENCES artifacts(id)`
+  -- here (there was one before this comment; removing it fixed a real,
+  -- reproduced-against-a-real-Postgres bug — CLAUDE.md rule 10). SQLite
+  -- never enforced it (no `PRAGMA foreign_keys=ON` exists anywhere in this
+  -- codebase), but a real Postgres connection enforces every declared FK by
+  -- default, and `delete_source_artifacts`/`delete_artifacts` *deliberately*
+  -- delete an `artifacts` row while leaving its `memory_records` row alone
+  -- (see those methods' own docstrings: wiping earned `uses`/`salience`/
+  -- `observations`/`tier` on every consolidation pass would reset a
+  -- memory's track record for no benefit, since `replace_memory_records`
+  -- rebuilds the row moments later regardless). Under Postgres with the FK
+  -- declared, that DELETE raises `foreign key constraint ... still
+  -- referenced from table "memory_records"` and aborts the whole
+  -- transaction — every full sync of any source once a single memory
+  -- record existed, and after Phase 0 (agent-speed memory compaction) also
+  -- `_drop_archived`'s targeted `delete_artifacts` on every consolidation
+  -- pass that archived anything. Same reasoning `memory_compactions`
+  -- already documents for its own `member_id`/`canonical_id` columns —
+  -- applied here to the column that predates this plan.
 );
+-- The `idx_memory_records_canon_key` (Phase 1) and `idx_memory_records_tier`
+-- (Phase 3) indexes are NOT declared here: on a fresh database this CREATE
+-- TABLE already carries both columns, so they could be, but on an upgraded
+-- one the columns are added later by guarded ALTER TABLE in
+-- StateStore.migrate() — and `executescript` runs this whole file as one
+-- script, before those ALTERs ever run. Declaring an index on a column that
+-- does not exist yet would fail against a pre-Phase-1/3 table. See migrate().
 -- Retrieval joins chunks -> artifacts -> memory_records on every memory-aware
 -- query, and the validity predicate is `scope` + `valid_until`.
 CREATE INDEX IF NOT EXISTS idx_memory_records_artifact_id
   ON memory_records(artifact_id);
 CREATE INDEX IF NOT EXISTS idx_memory_records_scope
   ON memory_records(scope, valid_until);
+-- Append-only audit trail for every compaction decision (Phase 3): a
+-- near-duplicate cluster's medoid promotion, one row per subsumed member.
+-- `op` is currently always `subsume`, kept as a column rather than a fixed
+-- value so a later op (e.g. an LLM-synthesized merge, Phase 4) needs no
+-- schema change. `id` is a deterministic hash of
+-- (op, member_id, canonical_id, params_hash), so re-running a pass over
+-- unchanged content with unchanged parameters writes the SAME row id and
+-- `INSERT OR IGNORE` makes the pass idempotent — the property
+-- `MemoryStore.consolidate` already has for archiving.
+-- `member_id`/`canonical_id` are `memory_records.record_id`, not enforced as
+-- a live FK (SQLite never enforces FKs here regardless — see CLAUDE.md's
+-- note on `delete_source_artifacts`, and a member's canonical record could,
+-- in principle, itself later be superseded or subsumed by something else,
+-- at which point the ledger row is history rather than a pointer that must
+-- still resolve).
+CREATE TABLE IF NOT EXISTS memory_compactions (
+  id TEXT PRIMARY KEY,
+  op TEXT NOT NULL,
+  member_id TEXT NOT NULL,
+  canonical_id TEXT NOT NULL,
+  rule_id TEXT NOT NULL,
+  params_hash TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_compactions_canonical
+  ON memory_compactions(canonical_id);
+CREATE INDEX IF NOT EXISTS idx_memory_compactions_member
+  ON memory_compactions(member_id);
 -- What the indexed state was built with, per scope (a source, or the vector
 -- space). A restart compares the live config against these: same fingerprint
 -- means the stored artifacts/chunks/vectors are still valid and there is

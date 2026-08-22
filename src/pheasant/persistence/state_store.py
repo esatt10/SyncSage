@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -28,6 +29,14 @@ logger = logging.getLogger(__name__)
 #: lock long enough to blow a 5-second budget under that load. Waiting a minute
 #: costs nothing when the alternative is losing the whole index.
 BUSY_TIMEOUT_MS = 60_000
+
+#: The columns both write-path fold lookups read (Phase 1/3). One string so
+#: `find_canonical_record` and `foldable_record` cannot disagree on the
+#: empty-string-is-unset tier corner `MemoryPolicy.sql_predicate` documents.
+_FOLD_COLUMNS = (
+    "SELECT record_id, COALESCE(NULLIF(tier, ''), 'hot') AS tier, subsumed_by, valid_until "
+    "FROM memory_records"
+)
 
 
 def _basename(path: str | None) -> str:
@@ -138,6 +147,43 @@ class StateStore:
         # keep acl NULL = "source expressed no ACL", the pre-32 semantics).
         if "acl" not in self.backend.table_columns("artifacts"):
             self.conn.execute("ALTER TABLE artifacts ADD COLUMN acl TEXT")
+        # Phase 1 (agent-speed memory compaction) — one-shot idempotent
+        # column adds. Existing rows keep canon_key NULL (never reinforced
+        # against, since nothing can match a NULL) and observations 0/
+        # last_seen NULL/variants NULL, which are exactly the pre-Phase-1
+        # values for a record that predates reinforcement. `canon_key` is
+        # recomputed for every row on the next projection rebuild regardless
+        # (it is derived, not earned — see schema.py), so leaving it NULL
+        # here is only ever a transient state until that next sync.
+        memory_columns = self.backend.table_columns("memory_records")
+        if memory_columns and "canon_key" not in memory_columns:
+            self.conn.execute("ALTER TABLE memory_records ADD COLUMN canon_key TEXT")
+        if memory_columns and "observations" not in memory_columns:
+            self.conn.execute(
+                "ALTER TABLE memory_records ADD COLUMN observations INTEGER NOT NULL DEFAULT 0"
+            )
+        if memory_columns and "last_seen" not in memory_columns:
+            self.conn.execute("ALTER TABLE memory_records ADD COLUMN last_seen TEXT")
+        if memory_columns and "variants" not in memory_columns:
+            self.conn.execute("ALTER TABLE memory_records ADD COLUMN variants TEXT")
+        # Only safe to create once the column above is guaranteed present —
+        # either it was in this database's original CREATE TABLE, or the
+        # ALTER just above added it. See the comment in schema.py.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_records_canon_key ON memory_records(canon_key)"
+        )
+        # Phase 3 — same shape. Existing rows keep tier='hot' (their default
+        # is exactly the pre-Phase-3 state: a record nothing has clustered
+        # yet is not demoted) and subsumed_by NULL.
+        if memory_columns and "tier" not in memory_columns:
+            self.conn.execute(
+                "ALTER TABLE memory_records ADD COLUMN tier TEXT NOT NULL DEFAULT 'hot'"
+            )
+        if memory_columns and "subsumed_by" not in memory_columns:
+            self.conn.execute("ALTER TABLE memory_records ADD COLUMN subsumed_by TEXT")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_records_tier ON memory_records(tier, scope)"
+        )
         self.conn.commit()
         self._migrate_fts_titles()
 
@@ -201,6 +247,12 @@ class StateStore:
                 "updated_at=excluded.updated_at",
                 (scope, fingerprint, updated_at),
             )
+
+    def clear_fingerprint(self, scope: str) -> None:
+        """Drop a scope's fingerprint row. A no-op if it was never set."""
+
+        with self.conn:
+            self.conn.execute("DELETE FROM sync_fingerprints WHERE scope=?", (scope,))
 
     def replace_idp_groups(self, mapping: dict[str, list[str]], synced_at: str) -> bool:
         """Persist one IdP sync pass (Step 32.4). Returns True when rows changed.
@@ -585,12 +637,26 @@ class StateStore:
         existing row when one is present — they are earned by *use* (Step
         33.9) and are the one thing here that is not derivable from the file,
         so a re-sync must not silently reset them to zero.
+
+        ``observations``/``last_seen``/``variants`` (Phase 1) are earned the
+        same way, by a near-duplicate write reinforcing this record instead
+        of creating its own file, and are carried over identically.
+        ``canon_key`` is the opposite: a pure function of the record's own
+        fields (see ``pheasant.memory.normalize``), so it is *not* carried
+        over — ``records`` supplies a freshly computed one on every rebuild.
+
+        ``tier``/``subsumed_by`` (Phase 3) are earned by a compaction pass
+        choosing a medoid and demoting the rest — carried over exactly like
+        ``salience``. A record a pass has never seen keeps the column
+        defaults (``tier='hot'``, ``subsumed_by=NULL``), which is exactly
+        the pre-Phase-3 state.
         """
         with self.conn:
             earned = {
                 str(row["record_id"]): row
                 for row in self.conn.execute(
-                    "SELECT record_id, salience, uses, last_used_at "
+                    "SELECT record_id, salience, uses, last_used_at, "
+                    "observations, last_seen, variants, tier, subsumed_by "
                     "FROM memory_records WHERE source_id=?",
                     (source_id,),
                 )
@@ -601,13 +667,15 @@ class StateStore:
                 self.conn.execute(
                     """INSERT INTO memory_records(
                         record_id,artifact_id,source_id,scope,subject,kind,asserted_at,
-                        valid_from,valid_until,supersedes,tags,written_by,
-                        salience,uses,last_used_at,schema_version
+                        valid_from,valid_until,supersedes,tags,written_by,canon_key,
+                        salience,uses,last_used_at,observations,last_seen,variants,
+                        tier,subsumed_by,schema_version
                     )
                     VALUES(
                         :record_id,:artifact_id,:source_id,:scope,:subject,:kind,:asserted_at,
-                        :valid_from,:valid_until,:supersedes,:tags,:written_by,
-                        :salience,:uses,:last_used_at,:schema_version
+                        :valid_from,:valid_until,:supersedes,:tags,:written_by,:canon_key,
+                        :salience,:uses,:last_used_at,:observations,:last_seen,:variants,
+                        :tier,:subsumed_by,:schema_version
                     )""",
                     {
                         "subject": None,
@@ -617,11 +685,17 @@ class StateStore:
                         "supersedes": None,
                         "tags": None,
                         "written_by": None,
+                        "canon_key": None,
                         "schema_version": 1,
                         **record,
                         "salience": float(prior["salience"]) if prior else 1.0,
                         "uses": int(prior["uses"]) if prior else 0,
                         "last_used_at": prior["last_used_at"] if prior else None,
+                        "observations": int(prior["observations"]) if prior else 0,
+                        "last_seen": prior["last_seen"] if prior else None,
+                        "variants": prior["variants"] if prior else None,
+                        "tier": str(prior["tier"]) if prior and prior["tier"] else "hot",
+                        "subsumed_by": prior["subsumed_by"] if prior else None,
                     },
                 )
         return len(records)
@@ -649,16 +723,199 @@ class StateStore:
             logger.debug("memory use counters not recorded", exc_info=True)
             return 0
 
+    def find_canonical_record(self, canon_digest: str, *, now: str) -> str | None:
+        """The record_id a write carrying this canonical key may fold into
+        (Phase 1's write-path near-duplicate lookup), or None.
+
+        **Only ever a record a default query could return**, and that is the
+        whole point rather than a refinement. Reinforcement makes a write
+        return `created=False` with `outcome="reinforced"` — the caller is
+        told "we already hold this". If the row it folded into were one a
+        plain `current_only=True` query filters out, that would be false:
+        the assertion would be unreachable through every default read path
+        while the writer believed it was recorded. Two ways a row gets into
+        that state, both excluded here:
+
+        The validity predicate is spelled exactly as
+        `MemoryPolicy.sql_predicate` spells it —
+        `COALESCE(valid_until,'')=''` rather than `valid_until IS NULL` —
+        because an empty string is falsy to the Python half and is not NULL
+        to SQL, the same corner that halves already documents. A fold that
+        judged validity differently from the query that has to return the
+        record would put the two out of step in exactly the way this method
+        exists to prevent.
+
+        * **Superseded or expired** (`valid_until` at or before `now`). A
+          later record corrected this claim. Re-asserting the old claim is
+          a *new* assertion about the present, not a restatement of history
+          — it must create its own record so retrieval can see the conflict
+          (and `supersedes` can resolve it), not vanish into the record it
+          contradicts. `supersede_retention_days` (Phase 2) keeps such rows
+          queryable for days, which is exactly how long this window would
+          otherwise stay open.
+        * **Demoted** (`tier='cold'`, from a Phase 3 compaction pass). Here
+          the fold is still right, but the *target* is wrong: the cluster's
+          canonical record is what a default query returns, so `subsumed_by`
+          is followed to it and the observation credit lands there. The
+          chain is walked (a canonical record can itself later be subsumed)
+          with a hard step cap, so a cycle written by a future rule cannot
+          hang a write.
+
+        `ORDER BY record_id` makes ties deterministic — a canonical key can
+        in principle match more than one live row only through a race
+        between concurrent writers, and picking the lexicographically first
+        id is arbitrary but always the *same* arbitrary choice, matching the
+        tie-break `memory.salience.rank` already uses elsewhere.
+
+        `COALESCE(NULLIF(tier,''),'hot')` rather than `COALESCE(tier,'hot')`
+        — the empty-string-is-unset corner `MemoryPolicy.sql_predicate`
+        already documents, kept identical here so the two agree on what
+        "hot" means.
+        """
+        rows = self.rows(
+            f"{_FOLD_COLUMNS} "
+            "WHERE canon_key = ? AND (COALESCE(valid_until, '') = '' OR valid_until > ?) "
+            "ORDER BY record_id LIMIT 1",
+            (canon_digest, now),
+        )
+        return self._resolve_fold_target(rows, now) if rows else None
+
+    #: Hard cap on `subsumed_by` hops. A cluster's canonical record can itself
+    #: later be subsumed, so one hop is not always enough; bounded rather than
+    #: "until it resolves" so a cycle written by a future rule cannot hang a
+    #: write.
+    _MAX_SUBSUMED_HOPS = 8
+
+    def _resolve_fold_target(self, rows: list[Any], now: str) -> str | None:
+        """The record a write may fold into, given a candidate row.
+
+        Shared by :meth:`find_canonical_record` (matched on `canon_key`) and
+        :meth:`foldable_record` (matched on `record_id`) so the two cannot
+        drift on what "foldable" means. `rows` must already be filtered to
+        current records; a hot row folds into itself, a demoted one into the
+        canonical record `subsumed_by` names.
+        """
+        record_id = str(rows[0]["record_id"])
+        if str(rows[0]["tier"]) == "hot":
+            return record_id
+        seen = {record_id}
+        target = rows[0]["subsumed_by"]
+        for _ in range(self._MAX_SUBSUMED_HOPS):
+            if not target or str(target) in seen:
+                return None
+            seen.add(str(target))
+            hop = self.rows(
+                f"{_FOLD_COLUMNS} WHERE record_id = ? "
+                "AND (COALESCE(valid_until, '') = '' OR valid_until > ?)",
+                (str(target), now),
+            )
+            if not hop:
+                return None
+            if str(hop[0]["tier"]) == "hot":
+                return str(hop[0]["record_id"])
+            target = hop[0]["subsumed_by"]
+        return None
+
+    def foldable_record(self, record_id: str, *, now: str) -> str | None:
+        """Where a write that byte-matches `record_id` on disk should fold.
+
+        The exact-digest twin of :meth:`find_canonical_record`, and it exists
+        because the two lookups answer the same question from different
+        starting points: `MemoryStore.append` finds a byte-identical *file*
+        by globbing its digest, which says nothing about whether that record
+        is still current. Folding into a superseded one reports the write as
+        `reinforced` while leaving the assertion unreachable by every default
+        query — the same failure `find_canonical_record` documents, reached
+        through the filesystem instead of through `canon_key`.
+
+        Returns `record_id` itself when the projection has no row for it at
+        all. That case is a cold or absent `/state`, not a judgement that the
+        record is stale, and the pre-Phase-1 behavior (dedup on the file) is
+        the right fallback: a missed *fold* costs a counter, where a missed
+        *dedup* would write a duplicate file for a byte-identical assertion.
+        """
+        rows = self.rows(
+            f"{_FOLD_COLUMNS} WHERE record_id = ?",
+            (record_id,),
+        )
+        if not rows:
+            return record_id
+        valid_until = rows[0]["valid_until"]
+        if valid_until and str(valid_until) <= now:
+            return None
+        return self._resolve_fold_target(rows, now)
+
+    def reinforce_memory_record(
+        self, record_id: str, submitted_text: str, when: str, *, max_variants: int = 8
+    ) -> None:
+        """Bump `observations`/`last_seen` for a record a new write folded
+        into instead of creating its own file, and remember the submitted
+        surface form as a `variant` if it is new.
+
+        Best-effort and off the write's critical path, the same posture
+        `record_memory_use` takes for `uses`: a counter that fails to update
+        costs ranking signal, never the write the caller already has in
+        hand. Read-then-write rather than a single UPDATE because merging a
+        bounded, deduplicated JSON list needs the current value — an
+        acceptable non-atomic window for a stats sidecar that only ever
+        grows a *count*, not a decision anything else depends on mid-update.
+        """
+        try:
+            with self.conn:
+                row = self.conn.execute(
+                    "SELECT variants FROM memory_records WHERE record_id = ?", (record_id,)
+                ).fetchone()
+                variants: list[str] = []
+                if row is not None and row["variants"]:
+                    try:
+                        variants = json.loads(row["variants"])
+                    except (TypeError, ValueError):
+                        variants = []
+                text = str(submitted_text or "").strip()
+                if text and text not in variants and len(variants) < max_variants:
+                    variants.append(text)
+                self.conn.execute(
+                    "UPDATE memory_records SET observations = observations + 1, "
+                    "last_seen = ?, variants = ? WHERE record_id = ?",
+                    (when, json.dumps(variants) if variants else None, record_id),
+                )
+        except Exception:  # pragma: no cover - never fail a write over a counter
+            logger.debug("memory reinforcement not recorded", exc_info=True)
+
     def memory_salience_rows(self) -> list[dict[str, Any]]:
         """Everything the salience formula reads, for a pruning pass."""
         try:
             rows = self.rows(
                 # `kind` is here so capacity pruning can tell a retrieval *rule*
-                # from a recallable fact; see `memory.maintenance`.
-                "SELECT record_id, scope, kind, asserted_at, uses, last_used_at, salience "
+                # from a recallable fact; see `memory.maintenance`. `last_seen`
+                # and `observations` (Phase 1) are what let the formula
+                # recognize a fact re-observed 10,000 times instead of
+                # decaying it from its original `asserted_at` forever.
+                # `subject` (Phase 5) is what lets a pruning pass group by
+                # entity for `max_records_per_subject`.
+                "SELECT record_id, scope, subject, kind, asserted_at, uses, last_used_at, "
+                "salience, observations, last_seen "
                 "FROM memory_records"
             )
         except Exception:  # pragma: no cover - state store older than 33.5
+            return []
+        return [dict(row) for row in rows]
+
+    def memory_scope_tier_counts(self) -> list[dict[str, Any]]:
+        """Live record counts grouped by (scope, tier) — Phase 5's
+        `pheasant_memory_records{scope,tier}` gauge. `NULLIF` before
+        `COALESCE`, not `COALESCE` alone: the same empty-string-vs-NULL
+        corner `MemoryPolicy.sql_predicate` already documents — an empty
+        string is falsy in Python's `tier or "hot"` but is not NULL to SQL,
+        so a bare `COALESCE(tier, 'hot')` would undercount 'hot' whenever a
+        row's `tier` was written as `''` rather than left NULL.
+        """
+        try:
+            rows = self.rows(
+                "SELECT scope, COALESCE(NULLIF(tier, ''), 'hot') AS tier, COUNT(*) AS n "
+                "FROM memory_records GROUP BY scope, tier"
+            )
+        except Exception:  # pragma: no cover - state store older than Phase 2
             return []
         return [dict(row) for row in rows]
 
@@ -671,6 +928,124 @@ class StateStore:
                 "UPDATE memory_records SET salience = ? WHERE record_id = ?",
                 [(value, key) for key, value in sorted(scores.items())],
             )
+
+    def memory_compaction_rows(self) -> list[dict[str, Any]]:
+        """Everything a clustering pass needs beyond the record text itself
+        (Phase 3) — record text lives only in the `.md` files, so the caller
+        joins these by `record_id` against an already-parsed
+        `MemoryStore.list_records()` (`memory.maintenance` parses the store
+        once per pass, per Phase 0, and hands the same list to every stage).
+        """
+        try:
+            rows = self.rows(
+                "SELECT record_id, scope, subject, kind, written_by, tier, subsumed_by, "
+                "observations "
+                "FROM memory_records"
+            )
+        except Exception:  # pragma: no cover - state store older than Phase 3
+            return []
+        return [dict(row) for row in rows]
+
+    def subsume_records(
+        self,
+        canonical_id: str,
+        member_ids: list[str],
+        *,
+        absorbed_observations: int,
+        now: str,
+        rule_id: str,
+        params_hash: str,
+        op: str = "subsume",
+    ) -> int:
+        """Demote `member_ids` to `tier='cold'` pointing at `canonical_id`,
+        credit the canonical record with the cluster's absorbed
+        `observations`, and append one ledger row per member (Phase 3).
+
+        `op` defaults to `"subsume"` (deterministic medoid promotion,
+        Phase 3) but the mechanics are identical for `"synthesize"`
+        (Phase 4's LLM-merged canonical record) — a member is redundant but
+        still true either way, so the same tier/subsumed_by/ledger write
+        applies; only what produced the canonical record differs, and that
+        is exactly what `op` + `rule_id` distinguish.
+
+        Idempotent: the ledger row id is a deterministic hash of
+        `(op, member_id, canonical_id, params_hash)`, so a second pass over
+        an unchanged cluster with unchanged parameters writes the same ids —
+        `INSERT OR IGNORE` makes them no-ops — while the tier/subsumed_by
+        UPDATEs are themselves idempotent (setting the same value twice).
+        Returns the number of members actually demoted this call.
+        """
+        ids = [str(i) for i in member_ids if i and i != canonical_id]
+        if not ids:
+            return 0
+        with self.conn:
+            placeholders = ",".join("?" for _ in ids)
+            cursor = self.conn.execute(
+                f"UPDATE memory_records SET tier='cold', subsumed_by=? "
+                f"WHERE record_id IN ({placeholders})",
+                (canonical_id, *ids),
+            )
+            demoted = int(cursor.rowcount or 0)
+            if absorbed_observations:
+                self.conn.execute(
+                    "UPDATE memory_records SET observations = observations + ? WHERE record_id = ?",
+                    (absorbed_observations, canonical_id),
+                )
+            for member_id in ids:
+                row_id = hashlib.blake2b(
+                    f"{op}|{member_id}|{canonical_id}|{params_hash}".encode(),
+                    digest_size=16,
+                ).hexdigest()
+                self.conn.execute(
+                    # `ON CONFLICT (id) DO NOTHING`, not `INSERT OR IGNORE`
+                    # — the latter is SQLite-only syntax with no Postgres
+                    # equivalent `dialect.translate()` handles (a hard
+                    # `SyntaxError`, caught by running this against a real
+                    # Postgres server, CLAUDE.md rule 10). `ON CONFLICT` is
+                    # supported identically by both, the same portable
+                    # idiom every other upsert in this file already uses.
+                    "INSERT INTO memory_compactions"
+                    "(id, op, member_id, canonical_id, rule_id, params_hash, at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (id) DO NOTHING",
+                    (row_id, op, member_id, canonical_id, rule_id, params_hash, now),
+                )
+        return demoted
+
+    def memory_compaction_ledger(
+        self,
+        *,
+        canonical_id: str | None = None,
+        member_id: str | None = None,
+        params_hash: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Ledger rows, optionally filtered by canonical id, member id or
+        params_hash — the audit trail answering "why is this record cold"
+        (Phase 3). `params_hash` (Phase 4) is what a synthesis pass checks
+        *before* calling a model: any row already means this exact cluster
+        was already resolved under this exact model + member set, so the
+        pass costs zero calls on a repeat run over unchanged content."""
+        clauses: list[str] = []
+        params: list[str] = []
+        if canonical_id is not None:
+            clauses.append("canonical_id = ?")
+            params.append(canonical_id)
+        if member_id is not None:
+            clauses.append("member_id = ?")
+            params.append(member_id)
+        if params_hash is not None:
+            clauses.append("params_hash = ?")
+            params.append(params_hash)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        try:
+            rows = self.rows(
+                "SELECT id, op, member_id, canonical_id, rule_id, params_hash, at "
+                f"FROM memory_compactions{where} ORDER BY at, id",
+                tuple(params),
+            )
+        except Exception:  # pragma: no cover - state store older than Phase 3
+            return []
+        return [dict(row) for row in rows]
 
     def delete_source_artifacts(self, source_id: str) -> int:
         rows = self.rows("SELECT COUNT(*) AS c FROM artifacts WHERE source_id=?", (source_id,))
@@ -690,6 +1065,44 @@ class StateStore:
         # quietly reset a memory's track record. Genuine removal goes through
         # `delete_source`, which does clear them.
         return count
+
+    def delete_artifacts(self, artifact_ids: list[str]) -> int:
+        """Remove specific artifacts (and their chunks/symbols/terms) by id.
+
+        Phase 0: the targeted counterpart to `delete_source_artifacts`. That
+        method's whole-source `DELETE ... WHERE source_id=?` is cheap because
+        every table involved is indexed on `source_id`; this one is a
+        per-artifact `WHERE id/artifact_id IN (...)` instead, which is the
+        exact shape CLAUDE.md warns against for `chunks_fts` — its
+        `artifact_id` column is UNINDEXED, so this degrades to a table scan
+        per call. It exists anyway because a handful of archived memory
+        records does not justify re-syncing (and re-parsing) an entire
+        source; callers own picking a size where a full sync is cheaper
+        instead (see `memory.maintenance.MEMORY_TARGETED_ARCHIVE_MAX`).
+
+        Like `delete_source_artifacts`, `memory_records` rows are left alone
+        — the caller (memory maintenance) rebuilds that table itself from the
+        record files, which is what keeps `uses`/`salience`/`last_used_at`
+        earned rather than reset.
+        """
+        ids = [str(i) for i in artifact_ids if i]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        params = tuple(ids)
+        with self.conn:
+            self.conn.execute(
+                f"DELETE FROM chunks_fts WHERE artifact_id IN ({placeholders})", params
+            )
+            self.conn.execute(f"DELETE FROM chunks WHERE artifact_id IN ({placeholders})", params)
+            self.conn.execute(f"DELETE FROM symbols WHERE artifact_id IN ({placeholders})", params)
+            self.conn.execute(
+                f"DELETE FROM artifact_terms WHERE artifact_id IN ({placeholders})", params
+            )
+            cursor = self.conn.execute(
+                f"DELETE FROM artifacts WHERE id IN ({placeholders})", params
+            )
+            return int(cursor.rowcount or 0)
 
     def delete_source(self, source_id: str) -> None:
         with self.conn:
@@ -895,8 +1308,11 @@ class StateStore:
 
         # `statement`, not `rows`: on a pooled backend a read may hand the
         # connection back, and the commit below would then land on a
-        # different connection — silently discarding the UPDATE.
-        result = self.backend.statement(sql, params)
+        # different connection — silently discarding the UPDATE. `statement`
+        # returns `(rows, rowcount)` (Phase 5 added the rowcount half for
+        # `subsume_records`/`delete_artifacts`); this caller only ever wants
+        # the `RETURNING` rows.
+        result, _rowcount = self.backend.statement(sql, params)
         self.backend.commit()
         return result
 

@@ -123,6 +123,27 @@ region knows a fact was corrected and serves it anyway between consolidation
 beats. `current_only` (on by default) closes it. `as_of` deliberately brings the
 old record back — that is the whole point of invalidating rather than deleting.
 
+**But `as_of` can only find a row that is still indexed, and consolidation
+archives an invalidated record's file the moment it is no longer current** —
+a `.md.archived` file drops out of the source's `**/*.md` include glob, so
+the next sync removes its row entirely. That made the guarantee above true
+only in the window between a correction and the next consolidation beat:
+seconds at agent write rates, since an agent can call `memory_consolidate`
+itself. `memory.supersede_retention_days` (Phase 2, default `0`, opt-in)
+keeps an invalidated record's file — and so its row — around for that many
+days past the instant it stopped being current, before archiving it. No new
+column and no policy change: the *same* `valid_until` predicate that already
+hides a superseded record from default results is what makes it reachable
+through the window via `as_of` / `current_only=False`; only *when* the file
+leaves the index moves, never what a query sees while it is still there. Left
+at its default of `0`, behavior is unchanged from before Phase 2 — a
+deliberate trade-off, not an oversight: keeping a corrected record's
+near-duplicate text indexed alongside its correction gives hybrid RRF fusion
+two close competitors for one query instead of one, and that measurably
+affects ranking in a small corpus (see `tests/test_memory_benchmark.py`'s
+comment on `update_accuracy`). A region that wants "what did we believe last
+week" to stay answerable sets this explicitly and accepts that cost.
+
 ---
 
 ## 5. Query-time policy
@@ -224,6 +245,12 @@ Memory is not a graph island. Records become `memory_record` nodes, with:
 
 - **`supersedes` edges** between records, so a correction is a traversable
   relationship rather than only a frontmatter string;
+- **`subsumes` edges** (Phase 3) from a near-duplicate cluster's medoid to
+  each record it absorbed — drawn straight from `subsumed_by`, never through
+  the `about` ladder below (that ladder is corpus-only; a subsumption is
+  memory-to-memory). Deliberately distinct from `supersedes`: a subsumed
+  record is redundant but still *true*, so this edge (and the column it is
+  drawn from) never feeds `effective_valid_until`. See §8.
 - **`about` edges** to what the record is *about*, drawn by a precedence
   ladder — **reference → symbol → heading → entity**, first rung wins, capped
   at `memory.about_max_targets`.
@@ -241,31 +268,217 @@ Coverage is reported, not silent: `describe_retrieval` carries
 
 ---
 
-## 8. Salience and bounded growth
+## 8. Salience, reinforcement and bounded growth
 
-The one thing memory learns from *being used*. A documented deterministic
-formula over recorded inputs — no model, no sampling — so a pruning pass is
-reproducible rather than a judgement call:
+At agent write rates a fact is rarely asserted once — it is restated,
+paraphrased and re-derived, and each restatement used to be indistinguishable
+from a new fact. **Reinforcement** (`memory.reinforcement_enabled`, on by
+default) closes that gap on the write path: before creating a file, a write is
+checked against a *normalized* form of its text (`pheasant.memory.normalize` —
+Unicode-folded, whitespace-collapsed, stripped of leading articles and framing
+clauses like "note that", but never token-sorted and never stripped of
+quantifiers like "not" — see that module for why) scoped to the same
+`(scope, subject, kind, ACL partition)` bucket a reader could legally see as
+one thing. A match — whether the write is byte-identical or merely a
+paraphrase — does not create a new record: it bumps that record's
+`observations` counter and `last_seen` timestamp, and remembers the submitted
+surface form as a `variant` (bounded to 8) when it differs from what is
+stored. `memory_write`'s response gains `outcome: "created" | "reinforced"`
+alongside the existing `created` boolean, and `submitted_text` when what was
+written differs from what is now stored.
+
+**A fold never targets a record a default query cannot return.** Reinforcement
+answers a write with `created=False` / `outcome="reinforced"` — "we already
+hold this" — and that is only true if the record it folded into is one
+retrieval will actually surface. Two ways a record fails that test, and the
+write path refuses both:
+
+- **Superseded or expired.** Re-asserting a claim a later record corrected is
+  a *new* assertion about the present, not a restatement of history, so it
+  becomes its own record and retrieval can see the conflict. Folding instead
+  would report success while the claim stayed unreachable —
+  `supersede_retention_days` (§4) keeps corrected records queryable for days,
+  which is exactly how long that window would otherwise stand open.
+- **Demoted to `cold`.** Here the fold is right but the *target* is not: the
+  cluster's canonical record is what a default query returns, so `subsumed_by`
+  is followed to it and the observation credit lands there.
+
+With no projection to consult at all (a cold or absent `/state`) a
+byte-identical re-write still dedups on the file, because a missed *fold*
+costs a counter where a missed *dedup* costs a duplicate record.
+
+Two principals can never reinforce each other's `user`/`session`-scope
+records — the ACL partition is `written_by`, mirroring
+`security.acl.normalize_acl`'s own partition exactly — because a shared record
+could only carry one writer's ACL. `org` records, being shared by design, do
+reinforce across writers.
+
+Salience is the one thing memory learns from *being used*. A documented
+deterministic formula over recorded inputs — no model, no sampling — so a
+pruning pass is reproducible rather than a judgement call:
 
 ```
-salience = recency(90-day half-life) × (1 + 0.5·log1p(uses)) × scope_weight
+evidence = 1 + 0.5·log1p(uses) + 0.5·log1p(observations)
+salience = recency(90-day half-life, anchored on the most recent of
+           asserted_at/last_seen/last_used_at) × evidence × scope_weight
 scope_weight: org 1.25, user 1.0, session 0.6
 ```
 
 `uses` is counted **after truncation**, so a record is credited for being
-*served*, not merely considered. Usage tracking is off by default — it is a
-write on the read path.
+*served*, not merely considered, and usage tracking stays off by default — it
+is a write on the read path. `observations` carries no such argument (it
+records what was *written*, not what anyone *looked up*) and is on by default;
+in a region that never enables usage tracking, `observations` is what keeps
+salience from degenerating to age-and-scope-only ranking.
 
 `memory.max_records` archives the least salient beyond the cap, via the same
 in-place rename consolidation uses, with the score written back so a prune is
 explainable. Unbounded by default.
 
-**Steering records are exempt from the cap in both directions** — they neither
-consume slots nor get archived. Ranking a deliberate operator-written rule
-against ordinary facts, on a formula built for facts, meant crossing
-`max_records` could silently switch off an `exclusion` and change ranking for
-every future query. The number of rules actually in force is bounded separately
+**Per-scope and per-subject budgets** (Phase 5) run *before* that global cap,
+each its own isolated pool: `session_max_records`, `user_max_records` and
+`org_max_records` mirror the existing `session_ttl_days`/`user_ttl_days`/
+`org_ttl_days` trio, and `max_records_per_subject` caps how many live records
+can accumulate about one named entity, across scopes. This closes a real gap
+`max_records` alone leaves open — ranking the whole store as one pool means a
+`session`-scope flood only ever *outranks* an `org` fact by the fixed
+`scope_weight` multiplier above, it never fully protects it, and a large
+enough flood still eventually prunes it. Each cap defaults to unbounded; a
+record can be doomed by more than one rule (its own scope's cap, its
+subject's cap, and the global backstop), and is archived once regardless.
+
+**Steering records are exempt from every cap here in both directions** — they
+neither consume slots nor get archived. Ranking a deliberate operator-written
+rule against ordinary facts, on a formula built for facts, meant crossing a
+cap could silently switch off an `exclusion` and change ranking for every
+future query. The number of rules actually in force is bounded separately
 by `steering.MAX_RULES`.
+
+### Compaction: clustering near-duplicates, not just deduplicating them
+
+Reinforcement (above) only folds *exact equivalents* — the same claim,
+different casing or framing. It cannot fold two records an agent phrased
+genuinely differently but which still assert the same thing; that is a
+*similarity* judgement, not an equivalence, and the write path is
+deliberately never allowed to make one (nothing lossy happens before a
+caller sees the result of their own write). `memory.compaction_enabled`
+(off by default — see below) runs that judgement offline, on the same
+consolidation pass as archival and capacity pruning:
+
+1. **Bucket** live (`tier='hot'`) records by the exact same
+   `(scope, subject, kind, ACL partition)` key reinforcement uses — never
+   across scope, never across a steering kind, never across principal at
+   `user`/`session` scope.
+2. **Cluster** within a bucket by exact Jaccard similarity over normalized
+   content tokens (`memory.compaction_similarity_threshold`, default `0.6`),
+   using a postings index for candidate generation — the same shape as the
+   corpus's own (retired, dormant) `_similarity_edges` pass, reused here
+   because a memory bucket is small enough that an inverted index plus exact
+   Jaccard needs no probabilistic signature.
+3. **Promote a medoid**: within each cluster of at least
+   `memory.compaction_min_cluster_size` (default `2`) members, the record
+   maximizing summed similarity to every other member becomes canonical —
+   ties break on the lowest `record_id`. Nothing is machine-authored: the
+   "summary" is a real record a real writer wrote, so provenance stays
+   exact.
+4. **Demote the rest**: every other member gets `tier='cold'` and
+   `subsumed_by=<canonical>`. **No file is renamed or deleted** — a demoted
+   record stays on disk, stays indexed, and is fully reachable through an
+   explicit `tiers=("cold",)` policy or the same `current_only=False`/
+   `as_of` that already reaches retained superseded history (`allowed_tiers`
+   widens to `("hot","cold")` under the same signals that widen the validity
+   window — §5). The canonical record's `observations` absorbs the cluster
+   (each demoted member's own count, plus one for having existed at all), so
+   importance concentrates on the survivor instead of splitting across
+   near-duplicates.
+5. **Ledger**: every subsumption is appended to `memory_compactions`
+   (`op`, `member_id`, `canonical_id`, `rule_id`, `params_hash`, `at`) — a
+   permanent, append-only answer to "why is this record cold" that survives
+   independently of the `subsumed_by` pointer itself. Idempotent: the row id
+   is a deterministic hash of its own fields, so a second pass over
+   unchanged content with unchanged parameters writes nothing new.
+
+**Off by default, unlike reinforcement.** Reinforcement only ever changes
+what `created` means for an exact restatement; compaction changes what a
+*default* query returns (a subsumed near-duplicate stops appearing), which
+is the same class of decision `supersede_retention_days` is — an explicit
+opt-in, not an assumed-safe default.
+
+### Synthesis: the one non-deterministic tier
+
+Deterministic compaction folds *redundancy*. It cannot **merge**: three
+concrete cases it provably does not cover —
+
+1. **Complementary partials** — "runs in us-east-2" and "owned by ada" are
+   not near-duplicates, both are true, and the compact form is one record
+   stating both. No selector can emit a sentence present in neither input.
+2. **Progressive refinement** — ten records each adding one detail to the
+   same subject compact correctly only into one record stating all ten.
+   Medoid promotion (L2) picks whichever single member overlaps most and
+   leaves the other nine cold, carrying detail the canonical record lacks.
+3. **Abstraction across instances** — "deploy failed Monday", "…Tuesday",
+   "…Wednesday" → "deploys have been failing all week" is generalization,
+   not selection.
+
+`memory.synthesis` (Phase 4) is a model call for exactly this gap, and
+nothing more. **The model is a writer, never an indexer** — it produces one
+ordinary record through the same `MemoryStore.append` path a human or
+agent write uses, and the deterministic pipeline then indexes it
+identically to every other record. No LLM call ever happens on the
+indexing path (CLAUDE.md rule 1), and it is **never invoked automatically**
+— not from the scheduler beat, not from consolidation — only through the
+explicit `memory_synthesize` MCP tool / `POST /memory/synthesize`. `pytest`
+stays network-free by construction: the default `provider: auto` resolves
+to nothing reachable when no API key is set, so a pass degrades to
+`{"skipped": "no model reachable"}` rather than needing a mock.
+
+Configuration mirrors `AssistantSettings` field for field — an operator who
+has already pointed the assistant at a model recognizes every knob:
+
+```yaml
+memory:
+  synthesis:
+    enabled: false          # opt-in, and never automatic regardless
+    provider: auto           # auto | anthropic | openai | gemini | none
+    model: null               # explicit model id; null = provider default
+    max_calls_per_pass: 20
+    max_input_chars: 6000     # combined member text; over this, skip the cluster
+    min_cluster_size: 3
+    max_jaccard: 0.55         # above this, medoid promotion already has it
+```
+
+Candidates are subject-tagged buckets (the same `(scope, subject, kind, ACL
+partition)` isolation reinforcement and clustering already enforce — a
+cluster never crosses scope, kind, or principal) still `tier='hot'` after
+L1/L2 has run, **and below `max_jaccard`**. That last gate is what decides
+what the model is asked to do without a model: a bucket of near-identical
+rephrasings is precisely what medoid promotion resolves losslessly and for
+free, so it is skipped, and spend goes only to the shape L1/L2 provably
+cannot handle. It matters most with `compaction_enabled` off (the default),
+where nothing has been demoted and every near-duplicate bucket would
+otherwise reach the model. Similarity is measured with the same tokenizer
+and normalizer L1 clusters with, so the gate and the tier it defers to
+cannot disagree about what "near-duplicate" means. A successful merge **subsumes its members** through the
+identical mechanism medoid promotion uses — `tier='cold'`,
+`subsumed_by=<new record>`, a `memory_compactions` row — not `supersedes`:
+the inputs are not corrected, they are redundant-but-still-true, exactly
+compaction's own category. The synthesized record inherits its cluster's
+`written_by` (never a synthetic identity — a `user`/`session` cluster
+shares one writer by construction, and using anything else would make the
+merge unreadable by the very principal whose facts it summarizes), carries
+the tag `llm-synthesized`, and its ledger row's `rule_id`/`params_hash`
+records the model id — a generated record is always distinguishable from a
+written one.
+
+**Efficiency, cheapest first:** the model never sees anything L1/L2 already
+resolved; a repeat pass over an already-subsumed cluster costs nothing
+because its members are no longer `tier='hot'` and drop out of candidacy
+entirely (the primary guarantee); a content-addressed `params_hash` (model
+id + sorted member ids) is checked against the ledger *before* any call, so
+even a cluster reset back to hot under unchanged parameters costs zero;
+`max_calls_per_pass` bounds an unbounded first pass; and `try_complete`
+degrades a provider failure to "skip this cluster" rather than failing the
+whole run.
 
 ---
 
@@ -330,8 +543,34 @@ From `memory/benchmark.py` (deterministic, offline, through the real
 | stale leak | 0.000 |
 | abstention | 1.000 |
 | bytes/record | 212.9 B |
-| write latency | 4.51 ms |
+| write latency (batched, `sync=False`) | 4.51 ms |
+| write latency (default path, `sync=True`) | 83.2 ms |
 | search latency | 11.83 ms |
+
+**The two write-latency rows measure different things, on purpose (Phase
+5).** The batched number reflects a script seeding a corpus — every write in
+that loop skips the per-write index update, with one `sync_source` call at
+the end. `memory_write`'s actual default (`sync=True`) is what an agent's
+own write pays: one incremental sync with `enrich="deferred"` per call
+(finding (2) of the compaction plan). The batched number was, for three
+phases, the only one published — nobody had measured the path an agent
+actually takes until this row existed.
+
+**Redundancy** (Phase 5's fifth category — see §8): with `reinforcement_enabled`
+on (default) and `compaction_enabled` on, an agent's paraphrase-heavy write
+pattern —
+
+| Metric | Value |
+|---|---|
+| records/fact | 1.000 |
+| reinforcement ratio | 0.500 |
+| compaction ratio | 0.500 |
+
+— against `records_per_fact: 2.000, compaction_ratio: 0.000` with
+`compaction_enabled` at its default (off): the same write pattern, the
+same reinforcement, but nothing left to fold the surviving near-duplicate
+into its canonical record. Reproduce both with
+`python -m pheasant.memory.benchmark`.
 
 On a real corpus (microsoft/vscode, partial index), through the real MCP stdio
 surface: corpus MRR 0.462 → **0.495** with memory on (memory is not a tax),
@@ -354,3 +593,10 @@ moved team-vocabulary queries **0.029 → 0.467** while control queries moved
   currently by design rather than by decision.
 - **Taxonomy is not published on the Synapse contract** — the outline is
   region-local retrieval structure, not routing signal.
+- **Reinforcement, tier, and observation counters live only in `/state`.**
+  A `/state` restore predating N reinforcements resets those counters —
+  record *content* is never at risk (the `.md` files are the truth, and
+  restoring an older `/state` cannot lose or alter a written record), but
+  compaction's inputs (`observations`, `tier`, `subsumed_by`, the
+  `memory_compactions` ledger) are covered by `pheasant backup`, not by the
+  record files themselves.
