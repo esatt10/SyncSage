@@ -228,8 +228,26 @@ CREATE TABLE IF NOT EXISTS memory_records (
   -- `current_only=False`/`as_of`, same as a retained superseded record).
   tier TEXT NOT NULL DEFAULT 'hot',
   subsumed_by TEXT,
-  schema_version INTEGER NOT NULL DEFAULT 1,
-  FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
+  schema_version INTEGER NOT NULL DEFAULT 1
+  -- Deliberately NO `FOREIGN KEY (artifact_id) REFERENCES artifacts(id)`
+  -- here (there was one before this comment; removing it fixed a real,
+  -- reproduced-against-a-real-Postgres bug — CLAUDE.md rule 10). SQLite
+  -- never enforced it (no `PRAGMA foreign_keys=ON` exists anywhere in this
+  -- codebase), but a real Postgres connection enforces every declared FK by
+  -- default, and `delete_source_artifacts`/`delete_artifacts` *deliberately*
+  -- delete an `artifacts` row while leaving its `memory_records` row alone
+  -- (see those methods' own docstrings: wiping earned `uses`/`salience`/
+  -- `observations`/`tier` on every consolidation pass would reset a
+  -- memory's track record for no benefit, since `replace_memory_records`
+  -- rebuilds the row moments later regardless). Under Postgres with the FK
+  -- declared, that DELETE raises `foreign key constraint ... still
+  -- referenced from table "memory_records"` and aborts the whole
+  -- transaction — every full sync of any source once a single memory
+  -- record existed, and after Phase 0 (agent-speed memory compaction) also
+  -- `_drop_archived`'s targeted `delete_artifacts` on every consolidation
+  -- pass that archived anything. Same reasoning `memory_compactions`
+  -- already documents for its own `member_id`/`canonical_id` columns —
+  -- applied here to the column that predates this plan.
 );
 -- The `idx_memory_records_canon_key` (Phase 1) and `idx_memory_records_tier`
 -- (Phase 3) indexes are NOT declared here: on a fresh database this CREATE

@@ -883,9 +883,17 @@ class StateStore:
                     digest_size=16,
                 ).hexdigest()
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO memory_compactions"
+                    # `ON CONFLICT (id) DO NOTHING`, not `INSERT OR IGNORE`
+                    # — the latter is SQLite-only syntax with no Postgres
+                    # equivalent `dialect.translate()` handles (a hard
+                    # `SyntaxError`, caught by running this against a real
+                    # Postgres server, CLAUDE.md rule 10). `ON CONFLICT` is
+                    # supported identically by both, the same portable
+                    # idiom every other upsert in this file already uses.
+                    "INSERT INTO memory_compactions"
                     "(id, op, member_id, canonical_id, rule_id, params_hash, at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (id) DO NOTHING",
                     (row_id, op, member_id, canonical_id, rule_id, params_hash, now),
                 )
         return demoted
@@ -1186,8 +1194,11 @@ class StateStore:
 
         # `statement`, not `rows`: on a pooled backend a read may hand the
         # connection back, and the commit below would then land on a
-        # different connection — silently discarding the UPDATE.
-        result = self.backend.statement(sql, params)
+        # different connection — silently discarding the UPDATE. `statement`
+        # returns `(rows, rowcount)` (Phase 5 added the rowcount half for
+        # `subsume_records`/`delete_artifacts`); this caller only ever wants
+        # the `RETURNING` rows.
+        result, _rowcount = self.backend.statement(sql, params)
         self.backend.commit()
         return result
 

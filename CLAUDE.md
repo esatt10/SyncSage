@@ -316,6 +316,21 @@ Each of these cost real time. They are listed because the shape recurs.
 - **Under Postgres READ COMMITTED only the *outer* `WHERE` is re-evaluated**
   after a blocking UPDATE's winner commits — not the subquery. The outer clause
   must be a predicate the winner's own write falsifies.
+- **A declared FK a maintenance path deliberately violates is fine under
+  SQLite and fatal under Postgres.** `memory_records` carried
+  `FOREIGN KEY (artifact_id) REFERENCES artifacts(id)`; `delete_artifacts`/
+  `delete_source_artifacts` delete the `artifacts` row while intentionally
+  leaving the `memory_records` row (preserving earned `uses`/`salience`/
+  `observations` — `replace_memory_records` rebuilds the row anyway).
+  SQLite never enforces a declared FK (no `PRAGMA foreign_keys=ON`
+  anywhere); Postgres enforces every one by default and aborted the whole
+  transaction. Two siblings, found the same way: `PostgresBackend.statement()`
+  discarded `cursor.rowcount`, so any caller reading it (`subsume_records`,
+  `delete_artifacts`) raised `AttributeError`; and one `INSERT OR IGNORE`
+  (SQLite-only) needed `INSERT … ON CONFLICT … DO NOTHING`, the portable
+  form already used everywhere else in this file. None of the three
+  surfaced in the offline suite; all three surfaced in one run against a
+  real local Postgres server, first try (`tests/test_backend_parity.py`).
 - **`wasmtime.Trap` and `wasmtime.WasmtimeError` are siblings**, not parent and
   child. Catch `guest_failures()`.
 - **A mutation harness must `touch` the restored file and purge
