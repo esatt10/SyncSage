@@ -15,6 +15,8 @@ from pheasant.mcp_server.tools import PheasantTools
 from pheasant.memory.salience import (
     HALF_LIFE_DAYS,
     over_capacity,
+    over_scope_capacity,
+    over_subject_capacity,
     rank,
     salience,
 )
@@ -23,11 +25,19 @@ from pheasant.memory.store import MemoryStore
 NOW = datetime(2026, 7, 16, 12, 0, 0, tzinfo=UTC)
 
 
-def _record(record_id: str, *, scope: str = "user", days_old: float = 0.0, uses: int = 0) -> dict:
+def _record(
+    record_id: str,
+    *,
+    scope: str = "user",
+    subject: str | None = None,
+    days_old: float = 0.0,
+    uses: int = 0,
+) -> dict:
     asserted = NOW.timestamp() - days_old * 86400
     return {
         "record_id": record_id,
         "scope": scope,
+        "subject": subject,
         "asserted_at": datetime.fromtimestamp(asserted, tz=UTC)
         .replace(microsecond=0)
         .isoformat()
@@ -36,12 +46,28 @@ def _record(record_id: str, *, scope: str = "user", days_old: float = 0.0, uses:
     }
 
 
-def _config(tmp_path: Path, *, usage: bool = False, max_records: int | None = None) -> Path:
+def _config(
+    tmp_path: Path,
+    *,
+    usage: bool = False,
+    max_records: int | None = None,
+    session_max_records: int | None = None,
+    user_max_records: int | None = None,
+    org_max_records: int | None = None,
+    max_records_per_subject: int | None = None,
+) -> Path:
     tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / "docs").mkdir(exist_ok=True)
     (tmp_path / "docs" / "readme.md").write_text("# Notes\n\nSomething.\n", encoding="utf-8")
     (tmp_path / "memory").mkdir(exist_ok=True)
-    cap = f"\n  max_records: {max_records}" if max_records is not None else ""
+    caps = {
+        "max_records": max_records,
+        "session_max_records": session_max_records,
+        "user_max_records": user_max_records,
+        "org_max_records": org_max_records,
+        "max_records_per_subject": max_records_per_subject,
+    }
+    cap = "".join(f"\n  {name}: {value}" for name, value in caps.items() if value is not None)
     config_path = tmp_path / "pheasant.yaml"
     config_path.write_text(
         f"""pheasant:
@@ -141,6 +167,51 @@ def test_pruning_is_idempotent() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-scope / per-subject capacity (Phase 5)
+# ---------------------------------------------------------------------------
+
+
+def test_scope_capacity_isolates_pools() -> None:
+    """A session flood must not be able to crowd out an org fact — that is
+    exactly what a shared `max_records` pool cannot guarantee, since a
+    session record only ever loses by `SCOPE_WEIGHT`, not by exclusion."""
+    org = [_record(f"org-{i}", scope="org", days_old=1) for i in range(2)]
+    session = [_record(f"session-{i}", scope="session", days_old=0) for i in range(50)]
+    doomed = {
+        r["record_id"]
+        for r in over_scope_capacity(org + session, {"org": 2, "session": 3}, now=NOW)
+    }
+    assert not doomed & {r["record_id"] for r in org}
+    assert len(doomed) == 47
+
+
+def test_scope_capacity_with_no_caps_drops_nothing() -> None:
+    records = [_record(f"mem-{i}", scope="org") for i in range(10)]
+    assert over_scope_capacity(records, {}, now=NOW) == []
+    assert over_scope_capacity(records, {"org": None, "user": None}, now=NOW) == []
+
+
+def test_subject_capacity_groups_across_scopes() -> None:
+    records = [
+        _record("a", scope="org", subject="widget", days_old=5),
+        _record("b", scope="user", subject="widget", days_old=1),
+        _record("c", scope="session", subject="widget", days_old=0),
+        _record("d", scope="org", subject="gadget", days_old=5),
+    ]
+    doomed = {r["record_id"] for r in over_subject_capacity(records, 2, now=NOW)}
+    # Least salient of the three "widget" records loses — here that is the
+    # freshest-but-`session`-scoped one, since `SCOPE_WEIGHT` dominates a
+    # 5-day recency gap; "gadget" is alone, so it is never at risk regardless
+    # of the cap.
+    assert doomed == {"c"}
+
+
+def test_subject_capacity_exempts_untagged_records() -> None:
+    records = [_record(f"mem-{i}", subject=None) for i in range(10)]
+    assert over_subject_capacity(records, 1, now=NOW) == []
+
+
+# ---------------------------------------------------------------------------
 # End to end
 # ---------------------------------------------------------------------------
 
@@ -150,6 +221,23 @@ def _tools(tmp_path: Path, texts: list[str], **kwargs) -> PheasantTools:
     store = MemoryStore(tmp_path / "memory")
     for index, text in enumerate(texts):
         store.append(text, scope="org", now=datetime(2026, 7, 16, 12, 0, index, tzinfo=UTC))
+    tools = PheasantTools(load_config(config_path))
+    tools.sync_source("salience-test", "docs", "full")
+    tools.sync_source("salience-test", "agent-memory", "full")
+    return tools
+
+
+def _tools_writes(tmp_path: Path, writes: list[dict], **kwargs) -> PheasantTools:
+    """Like `_tools`, but each write picks its own scope/subject (Phase 5)."""
+    config_path = _config(tmp_path, **kwargs)
+    store = MemoryStore(tmp_path / "memory")
+    for index, write in enumerate(writes):
+        store.append(
+            write["text"],
+            scope=write.get("scope", "org"),
+            subject=write.get("subject"),
+            now=datetime(2026, 7, 16, 12, 0, index, tzinfo=UTC),
+        )
     tools = PheasantTools(load_config(config_path))
     tools.sync_source("salience-test", "docs", "full")
     tools.sync_source("salience-test", "agent-memory", "full")
@@ -255,5 +343,70 @@ def test_no_cap_configured_prunes_nothing(tmp_path: Path) -> None:
         result = run_memory_maintenance(tools.engine, now=NOW)
         assert not result.get("pruned")
         assert len(tools.engine.state.rows("SELECT 1 FROM memory_records")) == 6
+    finally:
+        tools.engine.close()
+
+
+def test_scope_budget_protects_org_from_a_session_flood(tmp_path: Path) -> None:
+    """The end-to-end version of `test_scope_capacity_isolates_pools`: a
+    `session_max_records` cap must survive a real maintenance pass, not just
+    the pure `salience` formula, without touching the org record at all."""
+    from pheasant.memory.maintenance import run_memory_maintenance
+
+    writes = [{"text": "An org-wide policy fact.", "scope": "org"}]
+    writes += [{"text": f"Session scratch note {i}.", "scope": "session"} for i in range(5)]
+    tools = _tools_writes(tmp_path, writes, session_max_records=2)
+    try:
+        result = run_memory_maintenance(tools.engine, now=NOW)
+        assert result is not None
+        assert len(result["pruned"]) == 3
+
+        rows = tools.engine.state.rows("SELECT scope FROM memory_records")
+        scopes = [str(r["scope"]) for r in rows]
+        assert scopes.count("org") == 1
+        assert scopes.count("session") == 2
+    finally:
+        tools.engine.close()
+
+
+def test_subject_budget_caps_one_entity_without_touching_another(tmp_path: Path) -> None:
+    from pheasant.memory.maintenance import run_memory_maintenance
+
+    writes = [
+        {"text": f"Widget detail {i}.", "scope": "org", "subject": "widget"} for i in range(4)
+    ]
+    writes += [{"text": "The only gadget fact.", "scope": "org", "subject": "gadget"}]
+    tools = _tools_writes(tmp_path, writes, max_records_per_subject=2)
+    try:
+        result = run_memory_maintenance(tools.engine, now=NOW)
+        assert result is not None
+        assert len(result["pruned"]) == 2
+
+        rows = tools.engine.state.rows("SELECT subject FROM memory_records")
+        subjects = [str(r["subject"]) for r in rows]
+        assert subjects.count("widget") == 2
+        assert subjects.count("gadget") == 1
+    finally:
+        tools.engine.close()
+
+
+def test_scope_and_global_caps_compose_without_double_archiving(tmp_path: Path) -> None:
+    """The global `max_records` backstop must run only over what the
+    per-scope cap left behind, never re-consider a record already doomed."""
+    from pheasant.memory.maintenance import run_memory_maintenance
+
+    writes = [{"text": f"Session note {i}.", "scope": "session"} for i in range(5)]
+    writes += [{"text": f"User fact {i}.", "scope": "user"} for i in range(3)]
+    tools = _tools_writes(tmp_path, writes, session_max_records=3, max_records=4)
+    try:
+        result = run_memory_maintenance(tools.engine, now=NOW)
+        assert result is not None
+        # 2 archived by the session cap (5 -> 3), then the global backstop
+        # brings the remaining 6 down to `max_records`: 2 more archived, each
+        # counted once even though every session survivor was eligible for
+        # both rules.
+        assert len(result["pruned"]) == 4
+        assert len(set(result["pruned"])) == 4
+        assert len(tools.engine.state.rows("SELECT 1 FROM memory_records")) == 4
     finally:
         tools.engine.close()

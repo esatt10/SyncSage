@@ -870,8 +870,29 @@ class MemorySettings(ModelMixin):
     #: recording what a person looks up is a choice an operator should make.
     usage_tracking: bool = False
     #: Archive the least salient records once the store exceeds this many.
-    #: ``None`` = unbounded, which is the pre-33.9 behavior.
+    #: ``None`` = unbounded, which is the pre-33.9 behavior. Runs as the
+    #: **backstop** over whatever the per-scope/per-subject caps below leave
+    #: behind (Phase 5) — those isolate their own pools first, this cap
+    #: cleans up anything still over budget after that.
     max_records: int | None = None
+
+    # --- per-scope budgets (Phase 5) ----------------------------------------
+    #: Mirrors ``session_ttl_days``/``user_ttl_days``/``org_ttl_days`` above,
+    #: but for count rather than age. ``max_records`` alone ranks the whole
+    #: store as one pool, so with the default ``SCOPE_WEIGHT`` a session
+    #: flood only ever *outranks* org facts by a fixed multiplier — it never
+    #: fully isolates them. These three cap each scope's own pool
+    #: independently, before the global backstop runs. ``None`` = that
+    #: scope is unbounded (the pre-Phase-5 behavior).
+    session_max_records: int | None = None
+    user_max_records: int | None = None
+    org_max_records: int | None = None
+    #: Cap on live records sharing one ``subject`` (across scopes), grouped
+    #: the same way graph bridging already groups by subject. Records with
+    #: no ``subject`` are exempt — there is no single entity to cap them
+    #: against. ``None`` = unbounded.
+    max_records_per_subject: int | None = None
+
     #: Cap on `about` edges drawn per record by the graph bridge (Step 33.7).
     #: Total `about` edges stay bounded by this times the record count — the
     #: ceiling the retired concept layer never had.

@@ -89,6 +89,13 @@ No extra dependency and no configuration — it is always on.
 | `pheasant_search_total{mode,outcome}` | counter | Query volume and errors. |
 | `pheasant_embedding_requests_total{outcome}` | counter | Provider health. |
 | `pheasant_graph_nodes`, `pheasant_graph_edges` | gauge | Graph size — the RAM driver. |
+| `pheasant_memory_records{scope,tier}` | gauge | Live memory records, per scope and tier — a `tier="cold"` count rising is compaction working. |
+| `pheasant_memory_writes_total{outcome}` | counter | `memory_write` calls: `created`, `reinforced`, or `duplicate`. |
+| `pheasant_memory_reinforcement_ratio` | gauge | Of writes that produced a live record, the fraction L0 folded into an existing one — "is reinforcement doing anything". |
+| `pheasant_memory_maintenance_seconds` | histogram | One consolidation pass (archival + capacity pruning). |
+| `pheasant_memory_compactions_total{op}` | counter | New `memory_compactions` ledger rows, by `op` (`subsume`, `synthesize`). |
+| `pheasant_memory_compaction_seconds` | histogram | One L1/L2 clustering pass, when `memory.compaction_enabled`. |
+| `pheasant_memory_synthesis_calls_total{outcome}` | counter | L3 synthesis cluster attempts (`synthesized`, `cached`, `empty`, `collision`) — only moves when `memory.synthesis.enabled` and `memory_synthesize` is called; never on the scheduler beat. |
 | `pheasant_process_resident_bytes` | gauge | This process's RSS. |
 | `pheasant_build_info{version}` | gauge | Always 1; the version is the label. |
 | `pheasant_up` | gauge | 1 while serving. |
@@ -113,6 +120,9 @@ time() - pheasant_sync_last_success_timestamp_seconds > 86400
 
 # Search p95 latency.
 histogram_quantile(0.95, sum by (le, mode) (rate(pheasant_search_duration_seconds_bucket[5m])))
+
+# Is memory compaction keeping up with an agent's write rate?
+sum(rate(pheasant_memory_writes_total[1h])) and sum(rate(pheasant_memory_compactions_total[1h]))
 ```
 
 !!! warning "Metrics are per process"

@@ -127,3 +127,54 @@ def over_capacity(records: list[Any], max_records: int | None, *, now: datetime 
     if not max_records or max_records <= 0 or len(records) <= max_records:
         return []
     return rank(records, now=now)[max_records:]
+
+
+def _field(record: Any, key: str) -> str:
+    get = record.get if hasattr(record, "get") else lambda _key, default=None: default
+    return str(get(key) or "")
+
+
+def over_scope_capacity(
+    records: list[Any], caps: dict[str, int | None], *, now: datetime | None = None
+) -> list[Any]:
+    """The least salient records beyond each scope's own cap (Phase 5).
+
+    `over_capacity` alone ranks the whole store as one queue, so with the
+    default `SCOPE_WEIGHT` a session flood only ever *outranks* org facts by
+    a fixed multiplier — it never fully isolates them, and a big enough flood
+    still eventually crowds an org fact out of a shared `max_records` budget.
+    Grouping by scope first, then capping each group independently, is what
+    actually isolates the pools. Scopes absent from `caps`, or mapped to a
+    falsy cap, are left unbounded — same convention as `over_capacity`.
+    """
+    if not caps or not any(caps.values()):
+        return []
+    by_scope: dict[str, list[Any]] = {}
+    for record in records:
+        by_scope.setdefault(_field(record, "scope"), []).append(record)
+    doomed: list[Any] = []
+    for scope in sorted(by_scope):
+        doomed.extend(over_capacity(by_scope[scope], caps.get(scope), now=now))
+    return doomed
+
+
+def over_subject_capacity(
+    records: list[Any], max_per_subject: int | None, *, now: datetime | None = None
+) -> list[Any]:
+    """The least salient records beyond `max_per_subject` within one subject
+    (Phase 5), across scopes. Records with no `subject` are exempt — grouping
+    every untagged record together would cap "everything untagged" as if it
+    were one entity, which is not what a per-subject cap means.
+    """
+    if not max_per_subject or max_per_subject <= 0:
+        return []
+    by_subject: dict[str, list[Any]] = {}
+    for record in records:
+        subject = _field(record, "subject")
+        if not subject:
+            continue
+        by_subject.setdefault(subject, []).append(record)
+    doomed: list[Any] = []
+    for subject in sorted(by_subject):
+        doomed.extend(over_capacity(by_subject[subject], max_per_subject, now=now))
+    return doomed

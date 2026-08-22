@@ -1912,6 +1912,7 @@ def create_app(
             ) from exc
         outcome = store.last_outcome or ("created" if created else "duplicate")
         metrics.REGISTRY.inc("pheasant_memory_writes_total", outcome=outcome)
+        metrics.record_memory_reinforcement_ratio()
         payload: dict = {
             "record": record.as_dict(),
             "created": created,

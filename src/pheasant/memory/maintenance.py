@@ -88,11 +88,18 @@ def _run(engine: Any, config: Any, settings: Any, source: Any, *, now: datetime 
         live_records = [r for r in records if r.record_id not in archived]
         from pheasant.memory.compaction import run_compaction
 
+        compaction_started = time.perf_counter()
         compaction = run_compaction(engine, live_records, settings, now=now)
+        metrics.REGISTRY.observe(
+            "pheasant_memory_compaction_seconds", time.perf_counter() - compaction_started
+        )
         if compaction.get("subsumed"):
             result["compaction"] = compaction
+            metrics.REGISTRY.inc(
+                "pheasant_memory_compactions_total", len(compaction["subsumed"]), op="subsume"
+            )
 
-    _record_scope_gauge(store)
+    _record_scope_gauge(engine)
     return result
 
 
@@ -142,56 +149,102 @@ def _drop_archived(
     return {"mode": "targeted", "removed": sorted(set(archived_ids))}
 
 
-def _record_scope_gauge(store: MemoryStore) -> None:
-    """Refresh `pheasant_memory_records{scope}` from the live store."""
+def _record_scope_gauge(engine: Any) -> None:
+    """Refresh `pheasant_memory_records{scope,tier}` (Phase 5) from SQL.
 
-    counts: dict[str, int] = {}
-    for record in store.list_records():
-        counts[record.scope] = counts.get(record.scope, 0) + 1
+    Reads `memory_records` rather than re-globbing the store's files: tier is
+    SQL-only metadata (Phase 3's `subsume_records` writes it directly, never
+    touching a `.md` file), so a file walk cannot see it — and by this point
+    in `_run`, both halves are current: archival above already reconciled
+    SQL via `_drop_archived` when anything was archived, and compaction (if
+    enabled) has already written this pass's tier changes.
+    """
+    counts = {
+        (str(row["scope"]), str(row["tier"])): int(row["n"])
+        for row in engine.state.memory_scope_tier_counts()
+    }
     for scope in ("session", "user", "org"):
-        metrics.REGISTRY.set("pheasant_memory_records", float(counts.get(scope, 0)), scope=scope)
+        for tier in ("hot", "cold"):
+            metrics.REGISTRY.set(
+                "pheasant_memory_records",
+                float(counts.get((scope, tier), 0)),
+                scope=scope,
+                tier=tier,
+            )
 
 
 def _prune_to_capacity(engine: Any, store: MemoryStore, settings: Any, *, now=None) -> list[str]:
     """Archive the least salient records once the store exceeds its cap.
 
-    Step 33.9. The only mechanism here that decides what to *forget* on
-    grounds other than a correction or an explicit TTL, so it is deliberately
-    the most conservative: `memory.max_records` defaults to `None` (unbounded,
-    the pre-33.9 behavior), the ranking is a documented deterministic formula,
-    and archiving is the same in-place rename consolidation already uses —
-    bytes preserved, nothing deleted.
+    Step 33.9, extended Phase 5. The only mechanism here that decides what to
+    *forget* on grounds other than a correction or an explicit TTL, so it is
+    deliberately the most conservative: every cap below defaults to `None`
+    (unbounded, the pre-33.9 behavior), the ranking is a documented
+    deterministic formula, and archiving is the same in-place rename
+    consolidation already uses — bytes preserved, nothing deleted.
+
+    Order of enforcement, each one a separately-configured pool: per-scope
+    (`session_max_records`/`user_max_records`/`org_max_records`) and
+    per-subject (`max_records_per_subject`) caps run first, independently of
+    each other, isolating those pools the way `over_scope_capacity` and
+    `over_subject_capacity` describe; whatever neither dooms then goes
+    through `max_records` as a global backstop. A record can be doomed by
+    more than one rule — the union is what gets archived, once.
 
     Salience is also written back so an operator can see the score that
     decided it rather than having to recompute the formula by hand.
     """
     from pheasant.memory.policy import STEERING_KINDS
-    from pheasant.memory.salience import over_capacity, salience
+    from pheasant.memory.salience import (
+        over_capacity,
+        over_scope_capacity,
+        over_subject_capacity,
+        salience,
+    )
 
     max_records = getattr(settings, "max_records", None)
+    scope_caps = {
+        "session": getattr(settings, "session_max_records", None),
+        "user": getattr(settings, "user_max_records", None),
+        "org": getattr(settings, "org_max_records", None),
+    }
+    max_per_subject = getattr(settings, "max_records_per_subject", None)
     rows = engine.state.memory_salience_rows()
     if not rows:
         return []
 
     engine.state.set_memory_salience({str(r["record_id"]): salience(r, now=now) for r in rows})
-    if not max_records:
+    if not max_records and not any(scope_caps.values()) and not max_per_subject:
         return []
 
     # `alias`/`preference`/`exclusion` records are retrieval *machinery*, not
-    # recallable content, and they are exempt from the cap in both directions:
-    # they neither consume slots nor get archived. Ranking them by salience put
-    # a deliberate operator-written rule in competition with ordinary facts on
-    # a formula built for facts — recency decay and use counts — so crossing
-    # `max_records` could silently switch off an `exclusion` with no signal
-    # anywhere, changing ranking for every future query. The number of rules
-    # actually in force is already bounded, by `steering.MAX_RULES`.
+    # recallable content, and they are exempt from every cap here in both
+    # directions: they neither consume slots nor get archived. Ranking them
+    # by salience put a deliberate operator-written rule in competition with
+    # ordinary facts on a formula built for facts — recency decay and use
+    # counts — so crossing a cap could silently switch off an `exclusion`
+    # with no signal anywhere, changing ranking for every future query. The
+    # number of rules actually in force is already bounded, by
+    # `steering.MAX_RULES`.
     prunable = [row for row in rows if str(row.get("kind") or "") not in STEERING_KINDS]
     if not prunable:
         return []
 
-    doomed = {str(row["record_id"]) for row in over_capacity(prunable, max_records, now=now)}
+    doomed: dict[str, Any] = {}
+    for row in over_scope_capacity(prunable, scope_caps, now=now):
+        doomed[str(row["record_id"])] = row
+    for row in over_subject_capacity(prunable, max_per_subject, now=now):
+        doomed[str(row["record_id"])] = row
+    # The global cap runs only over what the pool-specific caps left behind —
+    # a record already doomed by its own scope or subject need not compete
+    # for a second slot in the shared backstop too.
+    remaining = [row for row in prunable if str(row["record_id"]) not in doomed]
+    for row in over_capacity(remaining, max_records, now=now):
+        doomed[str(row["record_id"])] = row
+
     if not doomed:
         return []
+    doomed_ids = set(doomed.keys())
     archived: list[str] = []
     # Re-globs the directory as it stands now (after `consolidate` above may
     # already have archived some records this same pass) — served mostly
@@ -200,7 +253,7 @@ def _prune_to_capacity(engine: Any, store: MemoryStore, settings: Any, *, now=No
     # archived this pass simply will not appear here (its file no longer
     # matches `mem-*.md`), so it is never archived twice.
     for record in store.list_records():
-        if record.record_id in doomed:
+        if record.record_id in doomed_ids:
             store.archive(record)
             archived.append(record.record_id)
     return sorted(archived)

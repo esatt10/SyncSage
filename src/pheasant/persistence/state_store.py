@@ -777,11 +777,31 @@ class StateStore:
                 # and `observations` (Phase 1) are what let the formula
                 # recognize a fact re-observed 10,000 times instead of
                 # decaying it from its original `asserted_at` forever.
-                "SELECT record_id, scope, kind, asserted_at, uses, last_used_at, salience, "
-                "observations, last_seen "
+                # `subject` (Phase 5) is what lets a pruning pass group by
+                # entity for `max_records_per_subject`.
+                "SELECT record_id, scope, subject, kind, asserted_at, uses, last_used_at, "
+                "salience, observations, last_seen "
                 "FROM memory_records"
             )
         except Exception:  # pragma: no cover - state store older than 33.5
+            return []
+        return [dict(row) for row in rows]
+
+    def memory_scope_tier_counts(self) -> list[dict[str, Any]]:
+        """Live record counts grouped by (scope, tier) — Phase 5's
+        `pheasant_memory_records{scope,tier}` gauge. `NULLIF` before
+        `COALESCE`, not `COALESCE` alone: the same empty-string-vs-NULL
+        corner `MemoryPolicy.sql_predicate` already documents — an empty
+        string is falsy in Python's `tier or "hot"` but is not NULL to SQL,
+        so a bare `COALESCE(tier, 'hot')` would undercount 'hot' whenever a
+        row's `tier` was written as `''` rather than left NULL.
+        """
+        try:
+            rows = self.rows(
+                "SELECT scope, COALESCE(NULLIF(tier, ''), 'hot') AS tier, COUNT(*) AS n "
+                "FROM memory_records GROUP BY scope, tier"
+            )
+        except Exception:  # pragma: no cover - state store older than Phase 2
             return []
         return [dict(row) for row in rows]
 

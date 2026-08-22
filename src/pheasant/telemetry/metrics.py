@@ -273,6 +273,26 @@ class MetricsRegistry:
 REGISTRY = MetricsRegistry()
 
 
+def record_memory_reinforcement_ratio() -> None:
+    """Refresh `pheasant_memory_reinforcement_ratio` from the write-outcome
+    counters (Phase 5). Call this right after incrementing
+    `pheasant_memory_writes_total` on the write path — MCP's `memory_write`
+    and `POST /memory` both do, the same duplication `memory.policy` already
+    accepts for MCP/HTTP parity, rather than one surface calling the other.
+
+    `duplicate` (an exact byte-identical re-write) is excluded from both
+    halves of the ratio: that dedup predates Phase 1, costs nothing whether
+    reinforcement exists or not, and folding it in would let the ratio read
+    high even with `reinforcement_enabled` off — defeating the point of the
+    gauge, which is "is Phase 1 doing anything".
+    """
+    created = REGISTRY.value("pheasant_memory_writes_total", outcome="created") or 0.0
+    reinforced = REGISTRY.value("pheasant_memory_writes_total", outcome="reinforced") or 0.0
+    total = created + reinforced
+    ratio = round(reinforced / total, 6) if total else 0.0
+    REGISTRY.set("pheasant_memory_reinforcement_ratio", ratio)
+
+
 def resident_bytes() -> float | None:
     """This process's resident set size, or None where it cannot be read.
 
@@ -378,12 +398,44 @@ def register_default_metrics(version: str) -> None:
     # at write time (`pheasant_memory_writes_total`) — nothing here existed
     # before, so a compaction change is otherwise unfalsifiable.
     REGISTRY.gauge(
-        "pheasant_memory_records", "Live (non-archived) memory records, per scope.", ("scope",)
+        "pheasant_memory_records",
+        # Phase 5: `tier` joined `scope` so a compaction pass's effect (hot
+        # records demoted to cold) is visible here too, not just in the
+        # ledger.
+        "Live (non-archived) memory records, per scope and tier.",
+        ("scope", "tier"),
     )
     REGISTRY.counter(
         "pheasant_memory_writes_total", "memory_write calls, by outcome.", ("outcome",)
     )
     REGISTRY.histogram("pheasant_memory_maintenance_seconds", "One consolidation pass.")
+
+    # Compaction / synthesis (Phase 3-5). `pheasant_memory_compactions_total`
+    # counts ledger rows actually written this process — an idempotent
+    # re-run over an unchanged cluster increments nothing, by the same
+    # `INSERT OR IGNORE` the ledger itself uses for idempotency.
+    REGISTRY.counter(
+        "pheasant_memory_compactions_total",
+        "New memory_compactions ledger rows written, by op.",
+        ("op",),
+    )
+    REGISTRY.histogram("pheasant_memory_compaction_seconds", "One L1/L2 clustering pass.")
+    REGISTRY.counter(
+        "pheasant_memory_synthesis_calls_total",
+        "L3 synthesis cluster attempts, by outcome "
+        "(synthesized|cached|empty|collision) — never incremented when "
+        "memory.synthesis.enabled is false, since no cluster is attempted.",
+        ("outcome",),
+    )
+    # The number that says whether Phase 1 is doing anything: of the writes
+    # that produced a live record (created or reinforced — an exact-digest
+    # `duplicate` is excluded, see `record_memory_reinforcement_ratio`), what
+    # fraction folded into an existing one rather than creating a new file.
+    REGISTRY.gauge(
+        "pheasant_memory_reinforcement_ratio",
+        "Fraction of memory writes that reinforced an existing record "
+        "rather than creating a new one (excludes exact-digest duplicates).",
+    )
 
     # Remote preparation workers (Phase 35.5 hardens these; the gauge exists
     # now so a scaling policy has something to read from the first release).

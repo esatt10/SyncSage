@@ -257,6 +257,16 @@ deliberate rule against ordinary facts, on a formula built for facts, meant
 crossing the cap could silently switch off an `exclusion` and change ranking
 for every future query.
 
+`max_records` alone ranks the whole store as one pool, so a `session`-scope
+flood only ever *outranks* an `org` fact by the fixed `scope_weight`
+multiplier — it never fully protects it. `session_max_records`,
+`user_max_records` and `org_max_records` (mirroring the `*_ttl_days` trio)
+cap each scope's own pool independently, and `max_records_per_subject` caps
+how many live records can pile up about one named entity, across scopes.
+Each defaults to unbounded; where a record's own scope cap, its subject's
+cap, and the global `max_records` backstop all apply, it is archived once,
+not three times.
+
 ## Compaction — folding near-duplicates without losing them {#compaction}
 
 An agent restates the same fact in fresh words every time it comes up.

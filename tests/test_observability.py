@@ -127,6 +127,80 @@ def test_registration_is_idempotent_and_never_clears_recorded_values() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Agent memory (Phase 0-5) — nothing here existed before that work, so a
+# compaction change would otherwise be unfalsifiable at the metrics layer.
+# ---------------------------------------------------------------------------
+
+
+def test_memory_metric_surface_is_declared() -> None:
+    # A private registry, not the process-wide `metrics.REGISTRY` — this
+    # module's other tests accumulate on the shared one by design (see
+    # `test_registration_is_idempotent_...` above), so asserting an exact
+    # value against it here would be order-dependent on whatever else in
+    # this file already ran.
+    registry = metrics.MetricsRegistry()
+    saved = metrics.REGISTRY
+    try:
+        metrics.REGISTRY = registry
+        metrics.register_default_metrics("9.9.9")
+        registry.set("pheasant_memory_records", 3, scope="org", tier="hot")
+        registry.inc("pheasant_memory_writes_total", outcome="reinforced")
+        registry.observe("pheasant_memory_maintenance_seconds", 0.01)
+        registry.inc("pheasant_memory_compactions_total", 2, op="subsume")
+        registry.observe("pheasant_memory_compaction_seconds", 0.02)
+        registry.inc("pheasant_memory_synthesis_calls_total", outcome="synthesized")
+        registry.set("pheasant_memory_reinforcement_ratio", 0.5)
+
+        samples = _parse_exposition(registry.render())
+        assert samples['pheasant_memory_records{scope="org",tier="hot"}'] == 3
+        assert samples['pheasant_memory_writes_total{outcome="reinforced"}'] == 1
+        assert samples["pheasant_memory_maintenance_seconds_count"] == 1
+        assert samples['pheasant_memory_compactions_total{op="subsume"}'] == 2
+        assert samples["pheasant_memory_compaction_seconds_count"] == 1
+        assert samples['pheasant_memory_synthesis_calls_total{outcome="synthesized"}'] == 1
+        assert samples["pheasant_memory_reinforcement_ratio"] == 0.5
+    finally:
+        metrics.REGISTRY = saved
+
+
+def test_reinforcement_ratio_excludes_exact_digest_duplicates() -> None:
+    """`duplicate` predates Phase 1 and costs nothing either way — folding it
+    into the ratio would let it read high even with reinforcement disabled,
+    which defeats its purpose."""
+
+    registry = metrics.MetricsRegistry()
+    saved = metrics.REGISTRY
+    try:
+        metrics.REGISTRY = registry
+        metrics.register_default_metrics("9.9.9")
+        registry.inc("pheasant_memory_writes_total", 5, outcome="duplicate")
+        metrics.record_memory_reinforcement_ratio()
+        assert registry.value("pheasant_memory_reinforcement_ratio") == 0.0
+
+        registry.inc("pheasant_memory_writes_total", 3, outcome="created")
+        registry.inc("pheasant_memory_writes_total", 1, outcome="reinforced")
+        metrics.record_memory_reinforcement_ratio()
+        assert registry.value("pheasant_memory_reinforcement_ratio") == 0.25
+    finally:
+        metrics.REGISTRY = saved
+
+
+def test_reinforcement_ratio_is_zero_before_any_write() -> None:
+    registry = metrics.MetricsRegistry()
+    # A fresh registry (no writes recorded at all): `value()` returns None
+    # for both halves, and the helper must not raise on that.
+    registry.gauge("pheasant_memory_reinforcement_ratio", "test")
+    registry.counter("pheasant_memory_writes_total", "test", ("outcome",))
+    saved = metrics.REGISTRY
+    try:
+        metrics.REGISTRY = registry
+        metrics.record_memory_reinforcement_ratio()
+        assert registry.value("pheasant_memory_reinforcement_ratio") == 0.0
+    finally:
+        metrics.REGISTRY = saved
+
+
+# ---------------------------------------------------------------------------
 # Per-source progress
 # ---------------------------------------------------------------------------
 

@@ -315,11 +315,23 @@ salience from degenerating to age-and-scope-only ranking.
 in-place rename consolidation uses, with the score written back so a prune is
 explainable. Unbounded by default.
 
-**Steering records are exempt from the cap in both directions** — they neither
-consume slots nor get archived. Ranking a deliberate operator-written rule
-against ordinary facts, on a formula built for facts, meant crossing
-`max_records` could silently switch off an `exclusion` and change ranking for
-every future query. The number of rules actually in force is bounded separately
+**Per-scope and per-subject budgets** (Phase 5) run *before* that global cap,
+each its own isolated pool: `session_max_records`, `user_max_records` and
+`org_max_records` mirror the existing `session_ttl_days`/`user_ttl_days`/
+`org_ttl_days` trio, and `max_records_per_subject` caps how many live records
+can accumulate about one named entity, across scopes. This closes a real gap
+`max_records` alone leaves open — ranking the whole store as one pool means a
+`session`-scope flood only ever *outranks* an `org` fact by the fixed
+`scope_weight` multiplier above, it never fully protects it, and a large
+enough flood still eventually prunes it. Each cap defaults to unbounded; a
+record can be doomed by more than one rule (its own scope's cap, its
+subject's cap, and the global backstop), and is archived once regardless.
+
+**Steering records are exempt from every cap here in both directions** — they
+neither consume slots nor get archived. Ranking a deliberate operator-written
+rule against ordinary facts, on a formula built for facts, meant crossing a
+cap could silently switch off an `exclusion` and change ranking for every
+future query. The number of rules actually in force is bounded separately
 by `steering.MAX_RULES`.
 
 ### Compaction: clustering near-duplicates, not just deduplicating them
@@ -502,8 +514,34 @@ From `memory/benchmark.py` (deterministic, offline, through the real
 | stale leak | 0.000 |
 | abstention | 1.000 |
 | bytes/record | 212.9 B |
-| write latency | 4.51 ms |
+| write latency (batched, `sync=False`) | 4.51 ms |
+| write latency (default path, `sync=True`) | 83.2 ms |
 | search latency | 11.83 ms |
+
+**The two write-latency rows measure different things, on purpose (Phase
+5).** The batched number reflects a script seeding a corpus — every write in
+that loop skips the per-write index update, with one `sync_source` call at
+the end. `memory_write`'s actual default (`sync=True`) is what an agent's
+own write pays: one incremental sync with `enrich="deferred"` per call
+(finding (2) of the compaction plan). The batched number was, for three
+phases, the only one published — nobody had measured the path an agent
+actually takes until this row existed.
+
+**Redundancy** (Phase 5's fifth category — see §8): with `reinforcement_enabled`
+on (default) and `compaction_enabled` on, an agent's paraphrase-heavy write
+pattern —
+
+| Metric | Value |
+|---|---|
+| records/fact | 1.000 |
+| reinforcement ratio | 0.500 |
+| compaction ratio | 0.500 |
+
+— against `records_per_fact: 2.000, compaction_ratio: 0.000` with
+`compaction_enabled` at its default (off): the same write pattern, the
+same reinforcement, but nothing left to fold the surviving near-duplicate
+into its canonical record. Reproduce both with
+`python -m pheasant.memory.benchmark`.
 
 On a real corpus (microsoft/vscode, partial index), through the real MCP stdio
 surface: corpus MRR 0.462 → **0.495** with memory on (memory is not a tax),
@@ -526,3 +564,10 @@ moved team-vocabulary queries **0.029 → 0.467** while control queries moved
   currently by design rather than by decision.
 - **Taxonomy is not published on the Synapse contract** — the outline is
   region-local retrieval structure, not routing signal.
+- **Reinforcement, tier, and observation counters live only in `/state`.**
+  A `/state` restore predating N reinforcements resets those counters —
+  record *content* is never at risk (the `.md` files are the truth, and
+  restoring an older `/state` cannot lose or alter a written record), but
+  compaction's inputs (`observations`, `tier`, `subsumed_by`, the
+  `memory_compactions` ledger) are covered by `pheasant backup`, not by the
+  record files themselves.

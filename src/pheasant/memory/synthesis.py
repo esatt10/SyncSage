@@ -53,6 +53,7 @@ from typing import Any
 from pheasant.memory.compaction import _bucket_key
 from pheasant.memory.policy import STEERING_KINDS
 from pheasant.memory.store import MemoryRecord, MemoryStore
+from pheasant.telemetry import metrics
 
 RULE_ID = "llm-synthesis-v1"
 
@@ -204,11 +205,13 @@ def run_synthesis(
             # This exact cluster was already resolved under this exact
             # model — nothing new to attempt, whatever the outcome was.
             cached += 1
+            metrics.REGISTRY.inc("pheasant_memory_synthesis_calls_total", outcome="cached")
             continue
 
         attempted += 1
         completion = llm.try_complete(_SYSTEM_PROMPT, _prompt(members))
         if not completion or not completion.strip():
+            metrics.REGISTRY.inc("pheasant_memory_synthesis_calls_total", outcome="empty")
             continue
 
         scope, subject, kind, _acl_class = key
@@ -229,7 +232,9 @@ def run_synthesis(
             # An exact-digest collision with something already on disk —
             # extraordinarily unlikely for model prose, but if it happens
             # there is nothing new to subsume with; skip cleanly.
+            metrics.REGISTRY.inc("pheasant_memory_synthesis_calls_total", outcome="collision")
             continue
+        metrics.REGISTRY.inc("pheasant_memory_synthesis_calls_total", outcome="synthesized")
         written.append(
             {
                 "record_id": record.record_id,
@@ -253,8 +258,9 @@ def run_synthesis(
     # current before subsume_records credits the new canonical rows below.
     engine.sync_source(source.name, "incremental")
 
+    demoted_total = 0
     for entry in written:
-        engine.state.subsume_records(
+        demoted_total += engine.state.subsume_records(
             entry["record_id"],
             entry["member_ids"],
             absorbed_observations=entry["absorbed"],
@@ -263,6 +269,8 @@ def run_synthesis(
             params_hash=entry["params_hash"],
             op="synthesize",
         )
+    if demoted_total:
+        metrics.REGISTRY.inc("pheasant_memory_compactions_total", demoted_total, op="synthesize")
 
     try:
         engine.graph_builder.add_memory_edges(engine.state, engine.config.memory.about_max_targets)

@@ -472,6 +472,7 @@ class PheasantTools:
         from pheasant.telemetry import metrics as _metrics
 
         _metrics.REGISTRY.inc("pheasant_memory_writes_total", outcome=outcome)
+        _metrics.record_memory_reinforcement_ratio()
         result: dict = {
             "record": record.as_dict(),
             "created": created,
