@@ -24,12 +24,17 @@ saves calls:
    still `tier='hot'` after compaction, size-gated so a genuinely tiny
    group is left for L2 (which is lossless) rather than spent on a model
    call.
-2. Content-addressed caching: a cluster's member-id set + model id + rule
+2. The gate decides *what the model is asked to do* without a model:
+   `max_jaccard` skips any cluster whose members are already near-
+   identical, because that is exactly the shape medoid promotion resolves
+   for free. Spend goes only where deterministic compaction provably
+   cannot help.
+3. Content-addressed caching: a cluster's member-id set + model id + rule
    id hashes into `params_hash`, checked against the `memory_compactions`
    ledger *before* any call — a repeat pass over unchanged clusters costs
    zero.
-3. `max_calls_per_pass` bounds what an unbounded first pass could spend.
-4. `LLM.try_complete` degrades to "skip this cluster" on any failure — a
+4. `max_calls_per_pass` bounds what an unbounded first pass could spend.
+5. `LLM.try_complete` degrades to "skip this cluster" on any failure — a
    pass always completes, never half-fails the rest of its work.
 
 The synthesized record `subsumes` its members through the same mechanism
@@ -50,12 +55,16 @@ import os
 from datetime import UTC, datetime
 from typing import Any
 
-from pheasant.memory.compaction import _bucket_key
+from pheasant.memory.compaction import _bucket_key, mean_pairwise_jaccard
 from pheasant.memory.policy import STEERING_KINDS
 from pheasant.memory.store import MemoryRecord, MemoryStore
 from pheasant.telemetry import metrics
 
 RULE_ID = "llm-synthesis-v1"
+
+#: Mirrors `MemorySynthesisSettings.max_jaccard`, for callers reaching
+#: `_candidate_clusters` directly (tests) rather than through `run_synthesis`.
+DEFAULT_MAX_JACCARD = 0.55
 
 #: Tag stamped on every synthesized record — the human-visible twin of the
 #: ledger's machine-readable provenance.
@@ -117,6 +126,7 @@ def _candidate_clusters(
     tiers: dict[str, str],
     *,
     min_cluster_size: int,
+    max_jaccard: float = DEFAULT_MAX_JACCARD,
 ) -> dict[tuple[str, str, str, str], list[MemoryRecord]]:
     """Buckets worth a synthesis attempt: live, non-steering, subject-
     tagged records sharing (scope, subject, kind, ACL partition) — the
@@ -126,6 +136,16 @@ def _candidate_clusters(
     and `subject` is the one field a record uses to say what that is. An
     untagged bucket has no anchor to merge around, so it is left alone —
     L1/L2 still apply to it exactly as before.
+
+    **`max_jaccard` is what decides what the model is asked to do, without
+    a model.** A bucket whose members are already near-identical is the
+    shape medoid promotion (L2) resolves losslessly and for free; synthesis
+    exists for the opposite one — same subject, genuinely different
+    content. Gating here rather than after the call is the difference
+    between spending on what only a model can do and spending on what L2
+    would have done anyway, and it matters most when `compaction_enabled`
+    is off (the default): nothing has been demoted, so every near-duplicate
+    bucket would otherwise reach the model.
     """
     buckets: dict[tuple[str, str, str, str], list[MemoryRecord]] = {}
     for record in records:
@@ -140,6 +160,7 @@ def _candidate_clusters(
         key: sorted(members, key=lambda r: r.record_id)
         for key, members in buckets.items()
         if len(members) >= min_cluster_size
+        and mean_pairwise_jaccard([r.text for r in members]) <= max_jaccard
     }
 
 
@@ -183,10 +204,13 @@ def run_synthesis(
     observations = {str(row["record_id"]): int(row.get("observations") or 0) for row in rows}
 
     min_size = int(getattr(settings, "min_cluster_size", 3) or 3)
+    max_similarity = float(getattr(settings, "max_jaccard", DEFAULT_MAX_JACCARD))
     max_chars = int(getattr(settings, "max_input_chars", 6000) or 6000)
     max_calls = int(getattr(settings, "max_calls_per_pass", 20) or 20)
 
-    buckets = _candidate_clusters(records, tiers, min_cluster_size=min_size)
+    buckets = _candidate_clusters(
+        records, tiers, min_cluster_size=min_size, max_jaccard=max_similarity
+    )
     store = MemoryStore(source.path)
 
     attempted = 0
@@ -227,6 +251,12 @@ def run_synthesis(
             kind=kind,
             tags=(SYNTHESIZED_TAG,),
             written_by=writer,
+            # The caller's instant, not the wall clock. A record id embeds
+            # its own second, so leaving this unthreaded made a pass with a
+            # pinned `now` still stamp real time — the synthesized record
+            # and the ledger row recording it would then disagree about
+            # when the merge happened.
+            now=instant,
         )
         if not created:
             # An exact-digest collision with something already on disk —

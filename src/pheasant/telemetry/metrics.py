@@ -273,23 +273,34 @@ class MetricsRegistry:
 REGISTRY = MetricsRegistry()
 
 
-def record_memory_reinforcement_ratio() -> None:
-    """Refresh `pheasant_memory_reinforcement_ratio` from the write-outcome
-    counters (Phase 5). Call this right after incrementing
-    `pheasant_memory_writes_total` on the write path — MCP's `memory_write`
-    and `POST /memory` both do, the same duplication `memory.policy` already
-    accepts for MCP/HTTP parity, rather than one surface calling the other.
+def record_memory_write(outcome: str, fold: str | None) -> None:
+    """Record one memory write's outcome and refresh the derived ratio.
 
-    `duplicate` (an exact byte-identical re-write) is excluded from both
-    halves of the ratio: that dedup predates Phase 1, costs nothing whether
-    reinforcement exists or not, and folding it in would let the ratio read
-    high even with `reinforcement_enabled` off — defeating the point of the
-    gauge, which is "is Phase 1 doing anything".
+    Call this instead of incrementing `pheasant_memory_writes_total` by hand
+    — MCP's `memory_write` and `POST /memory` both do, the same duplication
+    `memory.policy` already accepts for MCP/HTTP parity, rather than one
+    surface calling the other. `fold` is `MemoryStore.last_fold`.
+
+    The ratio is **not** derivable from `outcome` alone, which is why this
+    takes `fold` as well. With `reinforcement_enabled` on (the default) a
+    byte-identical re-write also reports `outcome="reinforced"` — correctly,
+    since it really does bump the record's counters — so a ratio computed
+    from `reinforced / (created + reinforced)` would count the pre-Phase-1
+    exact dedup as if reinforcement had earned it, and read high on a store
+    that only ever sees verbatim repeats. `fold` is what separates the two:
+
+        ratio = normalized folds / (records created + normalized folds)
+
+    An exact fold sits in neither half — it never would have become a record
+    in the first place, so it is not redundancy reinforcement removed.
     """
+    REGISTRY.inc("pheasant_memory_writes_total", outcome=outcome)
+    if fold:
+        REGISTRY.inc("pheasant_memory_l0_folds_total", kind=fold)
     created = REGISTRY.value("pheasant_memory_writes_total", outcome="created") or 0.0
-    reinforced = REGISTRY.value("pheasant_memory_writes_total", outcome="reinforced") or 0.0
-    total = created + reinforced
-    ratio = round(reinforced / total, 6) if total else 0.0
+    normalized = REGISTRY.value("pheasant_memory_l0_folds_total", kind="normalized") or 0.0
+    total = created + normalized
+    ratio = round(normalized / total, 6) if total else 0.0
     REGISTRY.set("pheasant_memory_reinforcement_ratio", ratio)
 
 
@@ -427,14 +438,25 @@ def register_default_metrics(version: str) -> None:
         "memory.synthesis.enabled is false, since no cluster is attempted.",
         ("outcome",),
     )
-    # The number that says whether Phase 1 is doing anything: of the writes
-    # that produced a live record (created or reinforced — an exact-digest
-    # `duplicate` is excluded, see `record_memory_reinforcement_ratio`), what
-    # fraction folded into an existing one rather than creating a new file.
+    # How L0 admission folded, when it folded at all. Finer-grained than
+    # `pheasant_memory_writes_total{outcome}` on purpose: `outcome` is public
+    # API and stays three-valued, but a `reinforced` write can mean either
+    # "a byte-identical record already existed" (the dedup that predates
+    # Phase 1, free either way) or "a *paraphrase* matched" (what Phase 1
+    # newly does). Only the second says reinforcement is earning its keep.
+    REGISTRY.counter(
+        "pheasant_memory_l0_folds_total",
+        "Writes folded into an existing record by L0 admission, by kind: "
+        "'exact' (byte-identical, pre-Phase-1 dedup) or 'normalized' "
+        "(a paraphrase matched on its normalized key).",
+        ("kind",),
+    )
+    # The number that says whether reinforcement is doing anything.
     REGISTRY.gauge(
         "pheasant_memory_reinforcement_ratio",
-        "Fraction of memory writes that reinforced an existing record "
-        "rather than creating a new one (excludes exact-digest duplicates).",
+        "Of the writes that either created a record or were folded as a "
+        "paraphrase, the fraction folded. Byte-identical repeats are in "
+        "neither half — they never would have become a record.",
     )
 
     # Remote preparation workers (Phase 35.5 hardens these; the gauge exists

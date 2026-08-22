@@ -346,3 +346,189 @@ def test_http_memory_write_reinforces_like_mcp(tmp_path: Path) -> None:
         assert body["submitted_text"] == "deploy freezes start friday 5pm"
     finally:
         app.state.engine.close()
+
+
+# ---------------------------------------------------------------------------
+# Liveness: a fold must never swallow an assertion
+# ---------------------------------------------------------------------------
+#
+# Reinforcement answers a write with `created=False` / `outcome="reinforced"`
+# — "we already hold this". That is a lie if the row it folded into is one a
+# default `current_only=True` query filters out: the caller believes the
+# assertion was recorded while it is unreachable through every default read
+# path. Two ways a row reaches that state, and the write path must refuse
+# both. `supersede_retention_days` (Phase 2) is what makes the superseded
+# case a days-long window rather than a single scheduler beat.
+
+
+def _retention_config(tmp_path: Path, **memory: object) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "memory").mkdir(exist_ok=True)
+    block = "".join(f"\n  {key}: {value}" for key, value in memory.items())
+    config_path = tmp_path / "pheasant.yaml"
+    config_path.write_text(
+        f"""pheasant:
+  name: reinforcement-test
+  state_path: {tmp_path / ".pheasant" / "state"}
+  exports_path: {tmp_path / ".pheasant" / "exports"}
+  workspace_root: {tmp_path}
+sync:
+  watcher:
+    enabled: false
+  scheduler:
+    enabled: false
+memory:{block}
+sources:
+  - name: agent-memory
+    type: memory
+    path: memory
+""",
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def test_a_paraphrase_never_folds_into_a_corrected_record(tmp_path: Path) -> None:
+    """Re-asserting a claim a later record corrected is a *new* assertion
+    about the present, not a restatement of history: it must become its own
+    record so retrieval can see it, not vanish into the record it
+    contradicts."""
+
+    tools = PheasantTools(load_config(_retention_config(tmp_path, supersede_retention_days=30)))
+    try:
+        old = tools.memory_write(
+            "reinforcement-test", "The paydb service runs in us-east-2.", scope="org"
+        )["record"]
+        tools.memory_write(
+            "reinforcement-test",
+            "The paydb service now runs in eu-west-1.",
+            scope="org",
+            supersedes=old["record_id"],
+        )
+
+        result = tools.memory_write(
+            "reinforcement-test", "Note that the PAYDB service runs in us-east-2!", scope="org"
+        )
+        assert result["outcome"] == "created", result
+        assert result["record"]["record_id"] != old["record_id"]
+
+        # And it is genuinely reachable, which is the whole point.
+        hits = tools.search_context("reinforcement-test", "paydb service region", mode="text")
+        returned = {hit["memory"]["record_id"] for hit in hits["results"] if hit.get("memory")}
+        assert result["record"]["record_id"] in returned
+    finally:
+        tools.engine.close()
+
+
+def test_an_exact_repeat_never_folds_into_a_corrected_record(tmp_path: Path) -> None:
+    """The same rule reached through the filesystem instead of `canon_key`:
+    `append` globs a byte-identical file by digest, which says nothing about
+    whether that record is still current."""
+
+    from datetime import UTC, datetime
+
+    from pheasant.memory.reinforcement import StateReinforcementIndex
+    from pheasant.memory.store import MemoryStore
+
+    tools = PheasantTools(load_config(_retention_config(tmp_path, supersede_retention_days=30)))
+    store = MemoryStore(tmp_path / "memory")
+    index = StateReinforcementIndex(tools.engine.state)
+    # Explicit, day-apart instants: a record id carries its own second, so
+    # three writes inside one wall-clock second would collide on the id and
+    # test the same-second corner instead of this one.
+    start = datetime(2026, 3, 1, 9, 0, 0, tzinfo=UTC)
+    try:
+        old, _ = store.append("The paydb service runs in us-east-2.", scope="org", now=start)
+        store.append(
+            "The paydb service now runs in eu-west-1.",
+            scope="org",
+            supersedes=old.record_id,
+            now=start.replace(day=2),
+        )
+        tools.sync_source("reinforcement-test", "agent-memory", "full")
+
+        again, created = store.append(
+            "The paydb service runs in us-east-2.",
+            scope="org",
+            now=start.replace(day=5),
+            reinforcement=index,
+        )
+        assert created, store.last_outcome
+        assert again.record_id != old.record_id
+    finally:
+        tools.engine.close()
+
+
+def test_a_write_matching_a_demoted_record_folds_into_its_canonical(tmp_path: Path) -> None:
+    """A subsumed record is redundant but still true, so the fold itself is
+    right — the *target* is not. Credit belongs on the cluster's canonical
+    record, which is the one a default query returns."""
+
+    from pheasant.memory.maintenance import run_memory_maintenance
+
+    tools = PheasantTools(load_config(_retention_config(tmp_path, compaction_enabled="true")))
+    try:
+        first = tools.memory_write(
+            "reinforcement-test",
+            "The paydb service runs in us-east-2 and is owned by ada.",
+            scope="org",
+            subject="paydb",
+        )["record"]
+        second = tools.memory_write(
+            "reinforcement-test",
+            "The paydb service runs in us-east-2 and is owned by ada, per inventory.",
+            scope="org",
+            subject="paydb",
+        )["record"]
+
+        report = run_memory_maintenance(tools.engine)
+        subsumed = set(report.get("compaction", {}).get("subsumed") or ())
+        assert subsumed, report
+        demoted = next(r for r in (first, second) if r["record_id"] in subsumed)
+        canonical = next(r for r in (first, second) if r["record_id"] not in subsumed)
+
+        # Re-assert the *demoted* record's own wording, framed so only the
+        # normalized key can match it.
+        result = tools.memory_write(
+            "reinforcement-test",
+            "Note that " + demoted["text"].upper(),
+            scope="org",
+            subject="paydb",
+        )
+        assert result["outcome"] == "reinforced", result
+        assert result["record"]["record_id"] == canonical["record_id"]
+
+        row = tools.engine.state.rows(
+            "SELECT observations FROM memory_records WHERE record_id = ?",
+            (canonical["record_id"],),
+        )
+        assert int(row[0]["observations"]) > 0
+    finally:
+        tools.engine.close()
+
+
+def test_a_cold_projection_still_dedups_a_byte_identical_rewrite(tmp_path: Path) -> None:
+    """The failure direction that matters: when the index knows nothing about
+    a record (a cold or absent `/state`), a byte-identical re-write must still
+    dedup on the file. A missed *fold* costs a counter; a missed *dedup*
+    writes a duplicate record."""
+
+    from pheasant.memory.reinforcement import StateReinforcementIndex
+    from pheasant.memory.store import MemoryStore
+
+    tools = PheasantTools(load_config(_retention_config(tmp_path)))
+    store = MemoryStore(tmp_path / "memory")
+    index = StateReinforcementIndex(tools.engine.state)
+    try:
+        first, created = store.append("A fact nobody indexed.", scope="org", reinforcement=index)
+        assert created
+        # No sync: `memory_records` has no row for `first` at all.
+        assert not tools.engine.state.rows("SELECT record_id FROM memory_records")
+
+        again, created_again = store.append(
+            "A fact nobody indexed.", scope="org", reinforcement=index
+        )
+        assert not created_again
+        assert again.record_id == first.record_id
+    finally:
+        tools.engine.close()

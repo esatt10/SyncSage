@@ -287,6 +287,26 @@ stored. `memory_write`'s response gains `outcome: "created" | "reinforced"`
 alongside the existing `created` boolean, and `submitted_text` when what was
 written differs from what is now stored.
 
+**A fold never targets a record a default query cannot return.** Reinforcement
+answers a write with `created=False` / `outcome="reinforced"` — "we already
+hold this" — and that is only true if the record it folded into is one
+retrieval will actually surface. Two ways a record fails that test, and the
+write path refuses both:
+
+- **Superseded or expired.** Re-asserting a claim a later record corrected is
+  a *new* assertion about the present, not a restatement of history, so it
+  becomes its own record and retrieval can see the conflict. Folding instead
+  would report success while the claim stayed unreachable —
+  `supersede_retention_days` (§4) keeps corrected records queryable for days,
+  which is exactly how long that window would otherwise stand open.
+- **Demoted to `cold`.** Here the fold is right but the *target* is not: the
+  cluster's canonical record is what a default query returns, so `subsumed_by`
+  is followed to it and the observation credit lands there.
+
+With no projection to consult at all (a cold or absent `/state`) a
+byte-identical re-write still dedups on the file, because a missed *fold*
+costs a counter where a missed *dedup* costs a duplicate record.
+
 Two principals can never reinforce each other's `user`/`session`-scope
 records — the ACL partition is `written_by`, mirroring
 `security.acl.normalize_acl`'s own partition exactly — because a shared record
@@ -424,12 +444,21 @@ memory:
     max_calls_per_pass: 20
     max_input_chars: 6000     # combined member text; over this, skip the cluster
     min_cluster_size: 3
+    max_jaccard: 0.55         # above this, medoid promotion already has it
 ```
 
 Candidates are subject-tagged buckets (the same `(scope, subject, kind, ACL
 partition)` isolation reinforcement and clustering already enforce — a
 cluster never crosses scope, kind, or principal) still `tier='hot'` after
-L1/L2 has run. A successful merge **subsumes its members** through the
+L1/L2 has run, **and below `max_jaccard`**. That last gate is what decides
+what the model is asked to do without a model: a bucket of near-identical
+rephrasings is precisely what medoid promotion resolves losslessly and for
+free, so it is skipped, and spend goes only to the shape L1/L2 provably
+cannot handle. It matters most with `compaction_enabled` off (the default),
+where nothing has been demoted and every near-duplicate bucket would
+otherwise reach the model. Similarity is measured with the same tokenizer
+and normalizer L1 clusters with, so the gate and the tier it defers to
+cannot disagree about what "near-duplicate" means. A successful merge **subsumes its members** through the
 identical mechanism medoid promotion uses — `tier='cold'`,
 `subsumed_by=<new record>`, a `memory_compactions` row — not `supersedes`:
 the inputs are not corrected, they are redundant-but-still-true, exactly

@@ -91,7 +91,8 @@ No extra dependency and no configuration — it is always on.
 | `pheasant_graph_nodes`, `pheasant_graph_edges` | gauge | Graph size — the RAM driver. |
 | `pheasant_memory_records{scope,tier}` | gauge | Live memory records, per scope and tier — a `tier="cold"` count rising is compaction working. |
 | `pheasant_memory_writes_total{outcome}` | counter | `memory_write` calls: `created`, `reinforced`, or `duplicate`. |
-| `pheasant_memory_reinforcement_ratio` | gauge | Of writes that produced a live record, the fraction L0 folded into an existing one — "is reinforcement doing anything". |
+| `pheasant_memory_l0_folds_total{kind}` | counter | Writes folded by L0, by `kind`: `exact` (byte-identical, the dedup that predates reinforcement) or `normalized` (a paraphrase matched). |
+| `pheasant_memory_reinforcement_ratio` | gauge | Of the writes that either created a record or were folded as a **paraphrase**, the fraction folded — "is reinforcement earning its keep". Byte-identical repeats are in neither half: they never would have become a record. |
 | `pheasant_memory_maintenance_seconds` | histogram | One consolidation pass (archival + capacity pruning). |
 | `pheasant_memory_compactions_total{op}` | counter | New `memory_compactions` ledger rows, by `op` (`subsume`, `synthesize`). |
 | `pheasant_memory_compaction_seconds` | histogram | One L1/L2 clustering pass, when `memory.compaction_enabled`. |

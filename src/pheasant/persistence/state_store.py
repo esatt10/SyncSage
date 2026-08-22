@@ -30,6 +30,14 @@ logger = logging.getLogger(__name__)
 #: costs nothing when the alternative is losing the whole index.
 BUSY_TIMEOUT_MS = 60_000
 
+#: The columns both write-path fold lookups read (Phase 1/3). One string so
+#: `find_canonical_record` and `foldable_record` cannot disagree on the
+#: empty-string-is-unset tier corner `MemoryPolicy.sql_predicate` documents.
+_FOLD_COLUMNS = (
+    "SELECT record_id, COALESCE(NULLIF(tier, ''), 'hot') AS tier, subsumed_by, valid_until "
+    "FROM memory_records"
+)
+
 
 def _basename(path: str | None) -> str:
     """Final path segment, for the FTS ``title`` column.
@@ -715,21 +723,127 @@ class StateStore:
             logger.debug("memory use counters not recorded", exc_info=True)
             return 0
 
-    def find_canonical_record(self, canon_digest: str) -> str | None:
-        """The record_id of a live record already carrying this canonical
-        key (Phase 1's write-path near-duplicate lookup), or None.
+    def find_canonical_record(self, canon_digest: str, *, now: str) -> str | None:
+        """The record_id a write carrying this canonical key may fold into
+        (Phase 1's write-path near-duplicate lookup), or None.
+
+        **Only ever a record a default query could return**, and that is the
+        whole point rather than a refinement. Reinforcement makes a write
+        return `created=False` with `outcome="reinforced"` — the caller is
+        told "we already hold this". If the row it folded into were one a
+        plain `current_only=True` query filters out, that would be false:
+        the assertion would be unreachable through every default read path
+        while the writer believed it was recorded. Two ways a row gets into
+        that state, both excluded here:
+
+        The validity predicate is spelled exactly as
+        `MemoryPolicy.sql_predicate` spells it —
+        `COALESCE(valid_until,'')=''` rather than `valid_until IS NULL` —
+        because an empty string is falsy to the Python half and is not NULL
+        to SQL, the same corner that halves already documents. A fold that
+        judged validity differently from the query that has to return the
+        record would put the two out of step in exactly the way this method
+        exists to prevent.
+
+        * **Superseded or expired** (`valid_until` at or before `now`). A
+          later record corrected this claim. Re-asserting the old claim is
+          a *new* assertion about the present, not a restatement of history
+          — it must create its own record so retrieval can see the conflict
+          (and `supersedes` can resolve it), not vanish into the record it
+          contradicts. `supersede_retention_days` (Phase 2) keeps such rows
+          queryable for days, which is exactly how long this window would
+          otherwise stay open.
+        * **Demoted** (`tier='cold'`, from a Phase 3 compaction pass). Here
+          the fold is still right, but the *target* is wrong: the cluster's
+          canonical record is what a default query returns, so `subsumed_by`
+          is followed to it and the observation credit lands there. The
+          chain is walked (a canonical record can itself later be subsumed)
+          with a hard step cap, so a cycle written by a future rule cannot
+          hang a write.
 
         `ORDER BY record_id` makes ties deterministic — a canonical key can
         in principle match more than one live row only through a race
         between concurrent writers, and picking the lexicographically first
         id is arbitrary but always the *same* arbitrary choice, matching the
         tie-break `memory.salience.rank` already uses elsewhere.
+
+        `COALESCE(NULLIF(tier,''),'hot')` rather than `COALESCE(tier,'hot')`
+        — the empty-string-is-unset corner `MemoryPolicy.sql_predicate`
+        already documents, kept identical here so the two agree on what
+        "hot" means.
         """
         rows = self.rows(
-            "SELECT record_id FROM memory_records WHERE canon_key = ? ORDER BY record_id LIMIT 1",
-            (canon_digest,),
+            f"{_FOLD_COLUMNS} "
+            "WHERE canon_key = ? AND (COALESCE(valid_until, '') = '' OR valid_until > ?) "
+            "ORDER BY record_id LIMIT 1",
+            (canon_digest, now),
         )
-        return str(rows[0]["record_id"]) if rows else None
+        return self._resolve_fold_target(rows, now) if rows else None
+
+    #: Hard cap on `subsumed_by` hops. A cluster's canonical record can itself
+    #: later be subsumed, so one hop is not always enough; bounded rather than
+    #: "until it resolves" so a cycle written by a future rule cannot hang a
+    #: write.
+    _MAX_SUBSUMED_HOPS = 8
+
+    def _resolve_fold_target(self, rows: list[Any], now: str) -> str | None:
+        """The record a write may fold into, given a candidate row.
+
+        Shared by :meth:`find_canonical_record` (matched on `canon_key`) and
+        :meth:`foldable_record` (matched on `record_id`) so the two cannot
+        drift on what "foldable" means. `rows` must already be filtered to
+        current records; a hot row folds into itself, a demoted one into the
+        canonical record `subsumed_by` names.
+        """
+        record_id = str(rows[0]["record_id"])
+        if str(rows[0]["tier"]) == "hot":
+            return record_id
+        seen = {record_id}
+        target = rows[0]["subsumed_by"]
+        for _ in range(self._MAX_SUBSUMED_HOPS):
+            if not target or str(target) in seen:
+                return None
+            seen.add(str(target))
+            hop = self.rows(
+                f"{_FOLD_COLUMNS} WHERE record_id = ? "
+                "AND (COALESCE(valid_until, '') = '' OR valid_until > ?)",
+                (str(target), now),
+            )
+            if not hop:
+                return None
+            if str(hop[0]["tier"]) == "hot":
+                return str(hop[0]["record_id"])
+            target = hop[0]["subsumed_by"]
+        return None
+
+    def foldable_record(self, record_id: str, *, now: str) -> str | None:
+        """Where a write that byte-matches `record_id` on disk should fold.
+
+        The exact-digest twin of :meth:`find_canonical_record`, and it exists
+        because the two lookups answer the same question from different
+        starting points: `MemoryStore.append` finds a byte-identical *file*
+        by globbing its digest, which says nothing about whether that record
+        is still current. Folding into a superseded one reports the write as
+        `reinforced` while leaving the assertion unreachable by every default
+        query — the same failure `find_canonical_record` documents, reached
+        through the filesystem instead of through `canon_key`.
+
+        Returns `record_id` itself when the projection has no row for it at
+        all. That case is a cold or absent `/state`, not a judgement that the
+        record is stale, and the pre-Phase-1 behavior (dedup on the file) is
+        the right fallback: a missed *fold* costs a counter, where a missed
+        *dedup* would write a duplicate file for a byte-identical assertion.
+        """
+        rows = self.rows(
+            f"{_FOLD_COLUMNS} WHERE record_id = ?",
+            (record_id,),
+        )
+        if not rows:
+            return record_id
+        valid_until = rows[0]["valid_until"]
+        if valid_until and str(valid_until) <= now:
+            return None
+        return self._resolve_fold_target(rows, now)
 
     def reinforce_memory_record(
         self, record_id: str, submitted_text: str, when: str, *, max_variants: int = 8

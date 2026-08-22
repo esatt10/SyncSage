@@ -54,11 +54,34 @@ class ReinforcementIndex(Protocol):
     .StateReinforcementIndex` for the concrete implementation.
     """
 
-    def find(self, canon_digest: str) -> str | None:
-        """The record_id of a live record already carrying this canonical
-        key, or None. `canon_digest` already encodes scope, subject, kind
-        and ACL partition, so any match is in the exact bucket a caller
-        may legally fold into."""
+    def find(self, canon_digest: str, *, now: str) -> str | None:
+        """The record_id of a record a write may fold into, or None.
+
+        `canon_digest` already encodes scope, subject, kind and ACL
+        partition, so any match is in the exact bucket a caller may
+        legally fold into. `now` is the write's own instant, used to judge
+        validity.
+
+        The contract is narrower than "a row with this key exists", and
+        the difference is load-bearing: an implementation must never
+        return a record a *default* query could not return. Folding into
+        a superseded or demoted record would report the write as
+        `reinforced` while leaving the assertion unreachable — see
+        `StateReinforcementIndex.find`.
+        """
+        ...
+
+    def foldable(self, record_id: str, *, now: str) -> str | None:
+        """Where a write that byte-matches `record_id` on disk should fold.
+
+        `append` finds a byte-identical file by globbing its digest, which
+        says nothing about whether that record is still *current* — so this
+        is asked before folding into it. Returns the id to fold into (the
+        record itself, or the canonical record of the cluster that subsumed
+        it), or None when nothing current should absorb the write and it
+        must become its own record. Must not raise; see
+        `StateReinforcementIndex.foldable` for the failure direction.
+        """
         ...
 
     def reinforce(self, record_id: str, *, submitted_text: str, now: datetime) -> None:
@@ -345,6 +368,15 @@ class MemoryStore:
         #: | "duplicate" | None (never called yet). See `append`'s docstring
         #: for why this rides an attribute instead of a third return value.
         self.last_outcome: str | None = None
+        #: How the most recent `append()` folded, when it folded at all:
+        #: "exact" (a byte-identical record already existed — the dedup that
+        #: predates Phase 1) or "normalized" (L0 matched a *paraphrase*, the
+        #: thing Phase 1 newly does); None when the write created a record.
+        #: Deliberately finer-grained than `last_outcome`, which is public
+        #: API and stays three-valued: telling those two apart is what makes
+        #: `pheasant_memory_reinforcement_ratio` mean "is reinforcement
+        #: earning its keep" rather than "did anything match".
+        self.last_fold: str | None = None
 
     def append(
         self,
@@ -441,20 +473,28 @@ class MemoryStore:
         # consolidated away correctly brings it back.
         existing = next(iter(sorted((self.root / scope).glob(f"mem-*-{digest}.md"))), None)
         if existing is not None:
-            record = self.load(existing)
-            self.last_outcome = "reinforced" if reinforcement is not None else "duplicate"
-            self._reinforce(reinforcement, record, text, instant)
-            return record, False
+            folded = self._fold_target(reinforcement, self.load(existing), asserted_at)
+            if folded is not None:
+                self.last_outcome = "reinforced" if reinforcement is not None else "duplicate"
+                self.last_fold = "exact"
+                self._reinforce(reinforcement, folded, text, instant)
+                return folded, False
+            # The byte-identical record on disk is no longer current (a later
+            # record corrected it). Re-asserting a corrected claim is a *new*
+            # assertion about the present, not a restatement of history, so it
+            # falls through and becomes its own record — otherwise the write
+            # would report `reinforced` while the claim stayed unreachable.
         if reinforcement is not None:
             # A near-duplicate: different bytes, same normalized claim, same
             # (scope, subject, kind, ACL) bucket. `find` is scoped by the
             # digest alone, so any match is already in this exact bucket.
-            near_dup_id = reinforcement.find(canon_digest)
+            near_dup_id = reinforcement.find(canon_digest, now=asserted_at)
             if near_dup_id:
                 near_dup_path = self.root / scope / f"{near_dup_id}.md"
                 if near_dup_path.exists():
                     record = self._load_cached(near_dup_path)
                     self.last_outcome = "reinforced"
+                    self.last_fold = "normalized"
                     self._reinforce(reinforcement, record, text, instant)
                     return record, False
                 # The index named a record with no file on disk — a stale or
@@ -476,16 +516,69 @@ class MemoryStore:
             valid_until=valid_until,
         )
         if path.exists():
+            folded = self._fold_target(reinforcement, self.load(path), asserted_at)
+            if folded is not None:
+                self.last_outcome = "reinforced" if reinforcement is not None else "duplicate"
+                self.last_fold = "exact"
+                self._reinforce(reinforcement, folded, text, instant)
+                return folded, False
+            # Same reasoning as the glob branch above, for the case where the
+            # prior record landed in this very second: there is nowhere else
+            # to write, so return it rather than clobbering an existing file.
             record = self.load(path)
-            self.last_outcome = "reinforced" if reinforcement is not None else "duplicate"
-            self._reinforce(reinforcement, record, text, instant)
+            self.last_outcome = "duplicate"
+            self.last_fold = "exact"
             return record, False
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".md.tmp")
         tmp.write_text(_render(record), encoding="utf-8")
         os.replace(tmp, path)
         self.last_outcome = "created"
+        self.last_fold = None
         return record, True
+
+    def _fold_target(
+        self,
+        reinforcement: ReinforcementIndex | None,
+        matched: MemoryRecord,
+        now: str,
+    ) -> MemoryRecord | None:
+        """The record an exact byte-match should actually fold into, or None.
+
+        Usually `matched` itself. Two cases where it is not, both decided by
+        the index rather than here (`MemoryStore` is filesystem-only and
+        cannot see validity without re-globbing the whole store on the write
+        path, which is precisely the cost Phase 0 removed):
+
+        * `matched` was corrected by a later record -> None, so the caller
+          writes a new record instead of reporting a swallowed assertion.
+        * `matched` was demoted by a compaction pass -> the cluster's
+          canonical record, so the observation credit lands on the record a
+          default query actually returns.
+
+        With no index (`reinforcement=None`, i.e. `reinforcement_enabled`
+        off) this is exactly the pre-Phase-1 behavior: always fold.
+        """
+        if reinforcement is None:
+            return matched
+        try:
+            target_id = reinforcement.foldable(matched.record_id, now=now)
+        except Exception:
+            logger.warning("fold target unresolved for %s", matched.record_id, exc_info=True)
+            return matched
+        if not target_id:
+            return None
+        if target_id == matched.record_id:
+            return matched
+        target_path = self.root / matched.scope / f"{target_id}.md"
+        if not target_path.exists():
+            # The index named a canonical record with no file on disk (a
+            # stale projection). Fold into what we can actually see.
+            return matched
+        try:
+            return self._load_cached(target_path)
+        except (ValueError, OSError):
+            return matched
 
     def _reinforce(
         self,

@@ -145,6 +145,7 @@ def test_memory_metric_surface_is_declared() -> None:
         metrics.register_default_metrics("9.9.9")
         registry.set("pheasant_memory_records", 3, scope="org", tier="hot")
         registry.inc("pheasant_memory_writes_total", outcome="reinforced")
+        registry.inc("pheasant_memory_l0_folds_total", kind="normalized")
         registry.observe("pheasant_memory_maintenance_seconds", 0.01)
         registry.inc("pheasant_memory_compactions_total", 2, op="subsume")
         registry.observe("pheasant_memory_compaction_seconds", 0.02)
@@ -154,6 +155,7 @@ def test_memory_metric_surface_is_declared() -> None:
         samples = _parse_exposition(registry.render())
         assert samples['pheasant_memory_records{scope="org",tier="hot"}'] == 3
         assert samples['pheasant_memory_writes_total{outcome="reinforced"}'] == 1
+        assert samples['pheasant_memory_l0_folds_total{kind="normalized"}'] == 1
         assert samples["pheasant_memory_maintenance_seconds_count"] == 1
         assert samples['pheasant_memory_compactions_total{op="subsume"}'] == 2
         assert samples["pheasant_memory_compaction_seconds_count"] == 1
@@ -163,23 +165,32 @@ def test_memory_metric_surface_is_declared() -> None:
         metrics.REGISTRY = saved
 
 
-def test_reinforcement_ratio_excludes_exact_digest_duplicates() -> None:
-    """`duplicate` predates Phase 1 and costs nothing either way — folding it
-    into the ratio would let it read high even with reinforcement disabled,
-    which defeats its purpose."""
+def test_reinforcement_ratio_counts_paraphrases_not_verbatim_repeats() -> None:
+    """The distinction the gauge exists for. With `reinforcement_enabled` on
+    — the default — a byte-identical re-write also reports
+    `outcome="reinforced"`, so a ratio derived from `outcome` alone would
+    credit reinforcement for the exact dedup that predates it and read high
+    on a store that only ever sees verbatim repeats."""
 
     registry = metrics.MetricsRegistry()
     saved = metrics.REGISTRY
     try:
         metrics.REGISTRY = registry
         metrics.register_default_metrics("9.9.9")
-        registry.inc("pheasant_memory_writes_total", 5, outcome="duplicate")
-        metrics.record_memory_reinforcement_ratio()
+
+        # Four verbatim repeats of one record: reinforcement is doing nothing
+        # the pre-Phase-1 dedup would not have done for free.
+        metrics.record_memory_write("created", None)
+        for _ in range(4):
+            metrics.record_memory_write("reinforced", "exact")
         assert registry.value("pheasant_memory_reinforcement_ratio") == 0.0
 
-        registry.inc("pheasant_memory_writes_total", 3, outcome="created")
-        registry.inc("pheasant_memory_writes_total", 1, outcome="reinforced")
-        metrics.record_memory_reinforcement_ratio()
+        # One paraphrase folded: now it is earning its keep.
+        metrics.record_memory_write("reinforced", "normalized")
+        assert registry.value("pheasant_memory_reinforcement_ratio") == 0.5
+
+        metrics.record_memory_write("created", None)
+        metrics.record_memory_write("created", None)
         assert registry.value("pheasant_memory_reinforcement_ratio") == 0.25
     finally:
         metrics.REGISTRY = saved
@@ -187,17 +198,77 @@ def test_reinforcement_ratio_excludes_exact_digest_duplicates() -> None:
 
 def test_reinforcement_ratio_is_zero_before_any_write() -> None:
     registry = metrics.MetricsRegistry()
-    # A fresh registry (no writes recorded at all): `value()` returns None
-    # for both halves, and the helper must not raise on that.
-    registry.gauge("pheasant_memory_reinforcement_ratio", "test")
-    registry.counter("pheasant_memory_writes_total", "test", ("outcome",))
     saved = metrics.REGISTRY
     try:
         metrics.REGISTRY = registry
-        metrics.record_memory_reinforcement_ratio()
+        metrics.register_default_metrics("9.9.9")
+        metrics.record_memory_write("duplicate", "exact")
         assert registry.value("pheasant_memory_reinforcement_ratio") == 0.0
     finally:
         metrics.REGISTRY = saved
+
+
+def test_the_ratio_reflects_what_the_real_write_path_produces(tmp_path: Path) -> None:
+    """The end-to-end version, and the one that would have caught the gauge
+    being wrong: drive real `memory_write` calls rather than hand-incremented
+    counters, so the test cannot pass against a state the default config
+    never produces."""
+
+    from pheasant.config.loader import load_config
+    from pheasant.mcp_server.tools import PheasantTools
+
+    (tmp_path / "memory").mkdir()
+    config_path = tmp_path / "pheasant.yaml"
+    config_path.write_text(
+        f"""pheasant:
+  name: ratio
+  state_path: {tmp_path / "state"}
+  exports_path: {tmp_path / "exports"}
+  workspace_root: {tmp_path}
+sync:
+  watcher:
+    enabled: false
+  scheduler:
+    enabled: false
+sources:
+  - name: agent-memory
+    type: memory
+    path: memory
+""",
+        encoding="utf-8",
+    )
+
+    registry = metrics.MetricsRegistry()
+    saved = metrics.REGISTRY
+    tools = PheasantTools(load_config(config_path))
+    try:
+        metrics.REGISTRY = registry
+        metrics.register_default_metrics("9.9.9")
+
+        tools.memory_write("ratio", "The paydb service runs in us-east-2.", scope="org")
+        # Verbatim repeat: reports `reinforced` (its counters really do move)
+        # but must not move the ratio.
+        assert (
+            tools.memory_write("ratio", "The paydb service runs in us-east-2.", scope="org")[
+                "outcome"
+            ]
+            == "reinforced"
+        )
+        assert registry.value("pheasant_memory_reinforcement_ratio") == 0.0
+
+        # A paraphrase of the same claim: this is the redundancy L0 removes.
+        assert (
+            tools.memory_write(
+                "ratio", "Note that the PAYDB service runs in us-east-2!", scope="org"
+            )["outcome"]
+            == "reinforced"
+        )
+        assert registry.value("pheasant_memory_reinforcement_ratio") == 0.5
+        assert registry.value("pheasant_memory_l0_folds_total", kind="exact") == 1
+        assert registry.value("pheasant_memory_l0_folds_total", kind="normalized") == 1
+    finally:
+        metrics.REGISTRY = saved
+        tools.engine.close()
 
 
 # ---------------------------------------------------------------------------

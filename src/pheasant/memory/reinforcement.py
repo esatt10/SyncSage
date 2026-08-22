@@ -29,11 +29,21 @@ class StateReinforcementIndex:
     def __init__(self, state: Any):
         self.state = state
 
-    def find(self, canon_digest: str) -> str | None:
+    def find(self, canon_digest: str, *, now: str) -> str | None:
         try:
-            return self.state.find_canonical_record(canon_digest)
+            return self.state.find_canonical_record(canon_digest, now=now)
         except Exception:
             return None
+
+    def foldable(self, record_id: str, *, now: str) -> str | None:
+        try:
+            return self.state.foldable_record(record_id, now=now)
+        except Exception:
+            # Same failure direction as `find`, but the safe answer is the
+            # opposite one: a backend error here must not turn a
+            # byte-identical re-write into a duplicate file, so fall back to
+            # the record the caller already matched on disk.
+            return record_id
 
     def reinforce(self, record_id: str, *, submitted_text: str, now: datetime) -> None:
         when = now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")

@@ -26,6 +26,7 @@ def _write_config(
     synthesis_enabled: bool = True,
     min_cluster_size: int = 2,
     max_calls_per_pass: int = 20,
+    max_jaccard: float = 0.55,
 ) -> Path:
     tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / "memory").mkdir(exist_ok=True)
@@ -47,6 +48,7 @@ memory:
     provider: anthropic
     min_cluster_size: {min_cluster_size}
     max_calls_per_pass: {max_calls_per_pass}
+    max_jaccard: {max_jaccard}
 sources:
   - name: agent-memory
     type: memory
@@ -423,12 +425,24 @@ def test_max_calls_per_pass_bounds_the_pass(
     config = load_config(_write_config(tmp_path, max_calls_per_pass=1))
     tools = PheasantTools(config)
     try:
+        # Complementary, not near-duplicate: two records about one subject
+        # that say genuinely different things. That is the shape synthesis
+        # exists for, and the shape `max_jaccard` admits — a pair of
+        # rephrasings of one claim is what medoid promotion already handles
+        # losslessly, so the gate would (correctly) skip it and this test
+        # would be measuring the gate rather than `max_calls_per_pass`.
         for subject in ("topic-a", "topic-b", "topic-c"):
             tools.memory_write(
-                "synthesis-test", f"First fact about {subject}.", scope="org", subject=subject
+                "synthesis-test",
+                f"The {subject} deploy runs nightly.",
+                scope="org",
+                subject=subject,
             )
             tools.memory_write(
-                "synthesis-test", f"Second fact about {subject}.", scope="org", subject=subject
+                "synthesis-test",
+                f"Platform owns {subject} escalations.",
+                scope="org",
+                subject=subject,
             )
         result = tools.memory_synthesize("synthesis-test")
         assert result["attempted"] == 1
@@ -494,3 +508,145 @@ def test_http_memory_synthesize_disabled_returns_200_with_skipped(tmp_path: Path
         assert resp.json() == {"skipped": "memory.synthesis.enabled is false"}
     finally:
         app.state.engine.close()
+
+
+# ---------------------------------------------------------------------------
+# The similarity gate (max_jaccard)
+# ---------------------------------------------------------------------------
+#
+# The lever that decides what the model is asked to do *without* a model.
+# Synthesis exists for what deterministic compaction provably cannot do —
+# merge complementary partials, fold progressive refinement, abstract across
+# instances. A cluster of near-identical rephrasings is not that: medoid
+# promotion (L2) resolves it losslessly and for free. Spending a call there
+# buys nothing, and without this gate every such bucket reaches the model
+# whenever `compaction_enabled` is off — which is the default.
+
+
+def test_near_duplicate_clusters_are_left_to_medoid_promotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    calls = _install_fake_model(monkeypatch, "Merged note.")
+
+    tools = PheasantTools(load_config(_write_config(tmp_path)))
+    try:
+        # Two rephrasings of one claim: high Jaccard, exactly L2's job.
+        tools.memory_write(
+            "synthesis-test",
+            "The staging cluster runs in us-east-2 and is owned by platform.",
+            scope="org",
+            subject="staging",
+        )
+        tools.memory_write(
+            "synthesis-test",
+            "The staging cluster runs in us-east-2 and is owned by platform team.",
+            scope="org",
+            subject="staging",
+        )
+        result = tools.memory_synthesize("synthesis-test")
+        assert result["attempted"] == 0, result
+        assert calls["n"] == 0
+    finally:
+        tools.engine.close()
+
+
+def test_complementary_facts_about_one_subject_still_reach_the_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other side of the same gate — it must not swallow the case the
+    whole tier exists for."""
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    calls = _install_fake_model(
+        monkeypatch, "The staging cluster runs in us-east-2 and is owned by ada."
+    )
+
+    tools = PheasantTools(load_config(_write_config(tmp_path)))
+    try:
+        tools.memory_write(
+            "synthesis-test",
+            "The staging cluster runs in us-east-2.",
+            scope="org",
+            subject="staging",
+        )
+        tools.memory_write(
+            "synthesis-test",
+            "Ada owns anything that pages overnight.",
+            scope="org",
+            subject="staging",
+        )
+        result = tools.memory_synthesize("synthesis-test")
+        assert result["attempted"] == 1, result
+        assert result["synthesized"] == 1
+        assert calls["n"] == 1
+    finally:
+        tools.engine.close()
+
+
+def test_the_gate_measures_similarity_the_way_clustering_does() -> None:
+    """`mean_pairwise_jaccard` lives in `memory.compaction` so the gate and
+    the tier it defers to cannot disagree about what "near-duplicate" means
+    — a gate reading "L2 has this" must be right about that."""
+
+    from pheasant.memory.compaction import mean_pairwise_jaccard
+
+    assert mean_pairwise_jaccard(["only one"]) == 0.0
+    identical = mean_pairwise_jaccard(["the gateway restarts nightly"] * 3)
+    assert identical == 1.0
+    unrelated = mean_pairwise_jaccard(
+        ["the gateway restarts nightly", "invoices are generated monthly"]
+    )
+    assert unrelated < 0.2
+    # Deterministic: a mean of ratios is order-dependent in the last bit, so
+    # a gate that flipped between runs would make a pass non-reproducible.
+    texts = ["alpha beta gamma", "beta gamma delta", "gamma delta epsilon"]
+    assert mean_pairwise_jaccard(texts) == mean_pairwise_jaccard(list(reversed(texts)))
+
+
+def test_a_synthesized_record_is_stamped_with_the_callers_instant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A record id embeds its own second, so a pass with a pinned `now` must
+    stamp that instant rather than the wall clock — otherwise the record and
+    the ledger row recording it disagree about when the merge happened."""
+
+    from datetime import UTC, datetime
+
+    from pheasant.memory.store import memory_source
+    from pheasant.memory.synthesis import run_synthesis
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    _install_fake_model(monkeypatch, "The staging cluster runs in us-east-2 and is owned by ada.")
+
+    config = load_config(_write_config(tmp_path))
+    tools = PheasantTools(config)
+    pinned = datetime(2026, 3, 4, 5, 6, 7, tzinfo=UTC)
+    try:
+        tools.memory_write(
+            "synthesis-test",
+            "The staging cluster runs in us-east-2.",
+            scope="org",
+            subject="staging",
+        )
+        tools.memory_write(
+            "synthesis-test",
+            "Ada owns anything that pages overnight.",
+            scope="org",
+            subject="staging",
+        )
+        source = memory_source(tools.config, tools.state)
+        from pheasant.memory.store import MemoryStore
+
+        records = MemoryStore(source.path).list_records()
+        result = run_synthesis(tools.engine, records, config.memory.synthesis, source, now=pinned)
+        assert result["synthesized"] == 1, result
+
+        record_id = result["records"][0]
+        assert record_id.startswith("mem-20260304T050607Z-"), record_id
+        ledger = tools.engine.state.memory_compaction_ledger()
+        assert {row["at"] for row in ledger if row["op"] == "synthesize"} == {
+            "2026-03-04T05:06:07Z"
+        }
+    finally:
+        tools.engine.close()

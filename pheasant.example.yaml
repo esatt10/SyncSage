@@ -371,6 +371,11 @@ memory:
     max_calls_per_pass: 20
     max_input_chars: 6000
     min_cluster_size: 3
+    # Above this mean pairwise similarity a cluster is skipped: near-
+    # identical rephrasings are what medoid promotion already resolves
+    # losslessly, so model spend goes only where L1/L2 provably cannot
+    # help (complementary partials, progressive refinement, abstraction).
+    max_jaccard: 0.55
 
 # byte-for-byte deterministic.
 #

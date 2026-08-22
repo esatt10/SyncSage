@@ -100,7 +100,11 @@ Its response carries `outcome` (`"created"` \| `"reinforced"` \| `"duplicate"`)
 alongside the existing `created` boolean — a write whose normalized text
 already matches a live record in the same scope/subject/kind/ACL bucket folds
 into it instead of creating a new file (`memory.reinforcement_enabled`, on by
-default). See `docs/memory-system.md` §8 for reinforcement and compaction.
+default). A fold only ever targets a record a *default* query can return: a
+claim a later record corrected becomes its own new record rather than folding
+into the record it contradicts, and a write matching a compaction-demoted
+record folds into that cluster's canonical one. See `docs/memory-system.md` §8
+for reinforcement and compaction.
 
 `describe_retrieval` reports the memory source's name, its scopes and counts,
 how many records are wired into the graph, and any steering in force, so an

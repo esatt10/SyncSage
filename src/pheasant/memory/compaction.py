@@ -89,6 +89,31 @@ def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     return round(shared / union_size, 6) if union_size else 0.0
 
 
+def mean_pairwise_jaccard(texts: list[str]) -> float:
+    """Average exact Jaccard over every pair in `texts`, or 0.0 below two.
+
+    How alike a group already is, as one number. Lives here rather than in
+    `memory.synthesis` so the L3 gate measures similarity with exactly the
+    tokenizer and normalizer L1 clusters with — a gate reading "these are
+    near-duplicates, medoid promotion has them" has to agree with the tier
+    that actually does the promoting, or it would wave through the clusters
+    L2 already solves and skip the ones it cannot.
+
+    Rounded to 6 decimals like every other score in this module: a mean of
+    ratios is order-dependent in the last bit, and a gate that flipped
+    between runs on the same content would make a pass non-reproducible.
+    """
+    if len(texts) < 2:
+        return 0.0
+    token_sets = [_tokens(text) for text in texts]
+    scores = [
+        _jaccard(token_sets[i], token_sets[j])
+        for i in range(len(token_sets))
+        for j in range(i + 1, len(token_sets))
+    ]
+    return round(sum(scores) / len(scores), 6) if scores else 0.0
+
+
 def _connected_components(pairs: set[tuple[str, str]], node_ids: list[str]) -> list[list[str]]:
     """Union-find over `pairs`. Deterministic regardless of `pairs`' own
     iteration order: rooting always attaches the lexicographically larger

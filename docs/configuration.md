@@ -727,6 +727,7 @@ memory source itself. See [Agent memory](how-to/agent-memory.md).
 | `synthesis.max_calls_per_pass` | integer | `20` | Hard cap on model calls in one pass. A repeat pass over already-subsumed clusters costs zero regardless — this bounds a large first pass. |
 | `synthesis.max_input_chars` | integer | `6000` | A cluster whose combined member text exceeds this is skipped rather than truncated into a partial merge. |
 | `synthesis.min_cluster_size` | integer | `3` | Below this, medoid promotion (L2) already resolves the cluster losslessly. |
+| `synthesis.max_jaccard` | float | `0.55` | Above this mean pairwise similarity (over normalized tokens, measured exactly as L1 clustering measures it) a cluster is skipped: near-identical rephrasings are what medoid promotion resolves for free, so spend goes only where deterministic compaction provably cannot help. Matters most with `compaction_enabled` off (the default), where nothing has been demoted. |
 
 **Corrected records are excluded from retrieval automatically**, at query time,
 without waiting for a consolidation pass — pass `{"current_only": false}` or an

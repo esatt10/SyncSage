@@ -819,6 +819,18 @@ class MemorySynthesisSettings(ModelMixin):
     #: promotion (L2, Phase 3) already resolves anything smaller cleanly
     #: and losslessly; synthesis is reserved for what that tier cannot.
     min_cluster_size: int = 3
+    #: The other half of that gate, and the one that decides *what the model
+    #: is asked to do* without a model. A cluster whose members are already
+    #: near-identical (high Jaccard over normalized tokens) is what medoid
+    #: promotion solves losslessly and for free; synthesis exists for the
+    #: opposite shape — records about one subject that say genuinely
+    #: *different* things (complementary partials, progressive refinement,
+    #: abstraction across instances). Above this similarity a cluster is
+    #: skipped, so spend goes only where deterministic compaction provably
+    #: cannot help. Matters most when `compaction_enabled` is off (the
+    #: default): nothing has been demoted, so without this gate every
+    #: near-duplicate bucket would reach the model.
+    max_jaccard: float = 0.55
 
 
 @dataclass
