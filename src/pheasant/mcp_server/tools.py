@@ -542,10 +542,27 @@ class PheasantTools:
         if source is None:
             return {"enabled": False, "records": []}
         records = MemoryStore(source.path).list_records(scope, current_only=current_only)
+        # Phase 3: tier/subsumed_by are SQL-only (earned by a compaction
+        # pass, not a file field), so a record's file-based `as_dict()` is
+        # annotated with them here rather than the store growing a state
+        # handle. Best-effort — a cold/absent projection just means every
+        # record reports the pre-Phase-3 default (hot, unsubsumed), same as
+        # a region that has never run compaction.
+        try:
+            compaction = {str(row["record_id"]): row for row in self.state.memory_compaction_rows()}
+        except Exception:
+            compaction = {}
+        out = []
+        for record in records:
+            payload = record.as_dict()
+            row = compaction.get(record.record_id)
+            payload["tier"] = str(row["tier"]) if row and row.get("tier") else "hot"
+            payload["subsumed_by"] = row.get("subsumed_by") if row else None
+            out.append(payload)
         return {
             "enabled": True,
             "source": source.name,
-            "records": [record.as_dict() for record in records],
+            "records": out,
         }
 
     def memory_consolidate(self, knowledge_base: str) -> dict:

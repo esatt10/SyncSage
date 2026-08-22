@@ -47,6 +47,11 @@ TABLE_ORDER = (
     "idp_groups",
     "idp_sync_meta",
     "memory_records",
+    # Phase 3: after memory_records — its rows reference record_id (member
+    # and canonical), the same FK-dependency-order rule every other table
+    # here follows, even though SQLite itself never enforces the FK (see
+    # CLAUDE.md's delete_source_artifacts note).
+    "memory_compactions",
     "sync_fingerprints",
 )
 

@@ -843,6 +843,23 @@ class MemorySettings(ModelMixin):
     #: at its own default.
     reinforcement_enabled: bool = True
 
+    # --- clustering (Phase 3) ----------------------------------------------
+    #: L1/L2 near-duplicate clustering and medoid promotion, on the same
+    #: consolidation pass as archival and capacity pruning. Off by default —
+    #: unlike reinforcement, this changes what a *default* query sees
+    #: (subsumed records drop to the cold tier and stop appearing in results
+    #: a plain `current_only=True` query returns), so it is an explicit
+    #: opt-in rather than an assumed-safe default, the same posture
+    #: `supersede_retention_days` takes.
+    compaction_enabled: bool = False
+    #: Exact-Jaccard threshold (over normalized content tokens — see
+    #: `pheasant.memory.normalize`) above which two records in the same
+    #: (scope, subject, kind, ACL) bucket link into one cluster.
+    compaction_similarity_threshold: float = 0.6
+    #: A cluster below this size is left alone. `2` is the floor — anything
+    #: less is not a cluster.
+    compaction_min_cluster_size: int = 2
+
 
 @dataclass
 class IdPSettings(ModelMixin):

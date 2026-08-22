@@ -714,6 +714,9 @@ memory source itself. See [Agent memory](how-to/agent-memory.md).
 | `max_records` | integer \| null | `null` | Archive the least salient records once the store exceeds this many. `null` = unbounded. Pruning uses the same in-place `.md.archived` rename as consolidation; nothing is deleted. |
 | `about_max_targets` | integer | `3` | Cap on `about` edges the graph bridge draws per record. Total `about` edges stay bounded by this times the record count — the ceiling the retired concept layer never had. |
 | `reinforcement_enabled` | bool | `true` | Before creating a file, check a write's normalized text against the same `(scope, subject, kind, ACL partition)` bucket; a match — exact repeat or paraphrase — reinforces the existing record (`observations`, `last_seen`, a bounded `variants` list) instead of creating a new one. On by default: unlike `usage_tracking`, this records what was *written*, not what was *looked up*. See [Agent memory](how-to/agent-memory.md) and `docs/memory-system.md` §8. |
+| `compaction_enabled` | bool | `false` | Offline near-duplicate clustering and medoid promotion, on the consolidation pass. Demoted records go to `tier='cold'` (never deleted or renamed — reachable via an explicit tier filter or `current_only=False`/`as_of`) and their `observations` are absorbed by the surviving canonical record. Off by default: unlike reinforcement, this changes what a *default* query returns. See `docs/memory-system.md` §8. |
+| `compaction_similarity_threshold` | float | `0.6` | Exact-Jaccard threshold over normalized content tokens above which two records in the same bucket link into one cluster. |
+| `compaction_min_cluster_size` | integer | `2` | A cluster below this size is left alone. |
 
 **Corrected records are excluded from retrieval automatically**, at query time,
 without waiting for a consolidation pass — pass `{"current_only": false}` or an

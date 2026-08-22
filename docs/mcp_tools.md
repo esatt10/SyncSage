@@ -86,14 +86,21 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 `"auto"` (default), `"off"`, `"only"`, `"prefer"`, or an object with
 `scopes` / `subject` / `current_only` / `as_of` / `max_results` /
 `include_rules` (default `false` — steering records steer ranking but are not
-returned as passages). Records a
+returned as passages) / `tiers` (`["hot"]` default; `["cold"]` or
+`["hot","cold"]` reaches records demoted by compaction, `current_only: false`
+and `as_of` widen to both automatically). Records a
 later record corrected are excluded automatically — pass an `as_of` instant to
 ask what was believed then. Hits that came from memory carry a `memory` block
-naming the record, its scope and when it was asserted.
+naming the record, its scope, when it was asserted, and its tier.
 
 `memory_write` takes `kind` (`fact` by default; `alias` / `preference` /
 `exclusion` are retrieval rules), `principal` (who asserted it — part of the
 record id, and what scopes it under `security.acl_enforced`) and `valid_until`.
+Its response carries `outcome` (`"created"` \| `"reinforced"` \| `"duplicate"`)
+alongside the existing `created` boolean — a write whose normalized text
+already matches a live record in the same scope/subject/kind/ACL bucket folds
+into it instead of creating a new file (`memory.reinforcement_enabled`, on by
+default). See `docs/memory-system.md` §8 for reinforcement and compaction.
 
 `describe_retrieval` reports the memory source's name, its scopes and counts,
 how many records are wired into the graph, and any steering in force, so an

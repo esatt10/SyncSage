@@ -340,6 +340,14 @@ memory:
   # paraphrase alike. On by default, unlike usage_tracking above: this
   # records what was written, not what was looked up.
   reinforcement_enabled: true
+  # Offline near-duplicate clustering + medoid promotion on the
+  # consolidation pass. Off by default: unlike reinforcement, this changes
+  # what a *default* query returns (a subsumed near-duplicate stops
+  # appearing in results, though it stays indexed and reachable via an
+  # explicit tier filter or current_only: false).
+  compaction_enabled: false
+  compaction_similarity_threshold: 0.6
+  compaction_min_cluster_size: 2
 
 # byte-for-byte deterministic.
 #

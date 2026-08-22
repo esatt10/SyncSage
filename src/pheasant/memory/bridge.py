@@ -43,6 +43,13 @@ from typing import Any
 #: Edge type emitted for every rung. Documented in `docs/graph_model.md`.
 ABOUT_EDGE = "about"
 
+#: Phase 3: a near-duplicate cluster's medoid promotion, distinct from
+#: `supersedes` — a subsumed record is redundant but still TRUE, so this
+#: edge (and the `subsumed_by` field it is drawn from) must never feed
+#: `memory.projection.effective_valid_until`. Documented in
+#: `docs/graph_model.md`.
+SUBSUMES_EDGE = "subsumes"
+
 #: Signals, strongest first. A record takes the first rung that yields targets.
 SIGNALS = ("reference", "symbol", "heading", "entity")
 
@@ -278,4 +285,30 @@ def supersedes_edges(records: list[dict[str, Any]]) -> list[tuple[str, str]]:
         older = by_record.get(str(target or ""))
         if target and newer and older:
             out.append((newer, older))
+    return out
+
+
+def subsumes_edges(records: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """`(canonical_artifact_id, member_artifact_id)` for every subsumption
+    (Phase 3). Same shape as :func:`supersedes_edges`, keyed off
+    `subsumed_by` instead of `supersedes` — kept as a **separate**
+    function rather than a shared helper, because the two fields must never
+    be conflated: `supersedes` means *corrected* and feeds
+    `memory.projection.effective_valid_until`; `subsumed_by` means
+    *redundant but still true* and must not. A record naming a canonical id
+    that is not in the store (e.g. one that was itself later archived) is
+    skipped rather than pointing at nothing — the ledger
+    (`memory_compactions`) is the durable record of that decision, not
+    this edge.
+    """
+    by_record = {
+        str(record.get("record_id")): str(record.get("artifact_id") or "") for record in records
+    }
+    out: list[tuple[str, str]] = []
+    for record in sorted(records, key=lambda r: str(r.get("record_id") or "")):
+        target = record.get("subsumed_by")
+        member = str(record.get("artifact_id") or "")
+        canonical = by_record.get(str(target or ""))
+        if target and member and canonical:
+            out.append((canonical, member))
     return out

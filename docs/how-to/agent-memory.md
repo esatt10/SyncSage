@@ -171,10 +171,17 @@ or an object for the rest:
     "scopes": ["user"],
     "subject": "deploy",
     "as_of": "2026-01-01T00:00:00Z",
-    "current_only": false
+    "current_only": false,
+    "tiers": ["cold"]
   }
 }
 ```
+
+`tiers` (Phase 3, `["hot"]` \| `["cold"]` \| `["hot","cold"]`) reaches
+records demoted by [compaction](#compaction) — omit it and a plain query
+sees `hot` only, exactly like before compaction existed; `current_only:
+false` or `as_of` widen to `["hot","cold"]` automatically, the same signal
+that already widens the validity window.
 
 **A corrected record is never returned by default.** Supersession is enforced
 at query time, so you do not have to wait for a consolidation pass to stop
@@ -249,6 +256,43 @@ directions — they neither consume slots nor get archived — because ranking a
 deliberate rule against ordinary facts, on a formula built for facts, meant
 crossing the cap could silently switch off an `exclusion` and change ranking
 for every future query.
+
+## Compaction — folding near-duplicates without losing them {#compaction}
+
+An agent restates the same fact in fresh words every time it comes up.
+Reinforcement (above the write examples) already folds *exact* restatements
+at write time; `memory.compaction_enabled` (off by default) additionally
+clusters genuinely-different-wording near-duplicates **offline**, on the
+consolidation pass:
+
+```yaml
+memory:
+  compaction_enabled: false            # opt-in
+  compaction_similarity_threshold: 0.6 # exact-Jaccard, over normalized tokens
+  compaction_min_cluster_size: 2
+```
+
+Within one `(scope, subject, kind, ACL partition)` bucket — never crossing
+any of those, same as reinforcement's isolation — near-duplicate records
+above the threshold cluster together, and the member with the highest
+summed similarity to the rest of the cluster is promoted as the canonical
+record, **as-is**: nothing is synthesized or machine-authored. Every other
+member is demoted to `tier: cold` and gets `subsumed_by: <canonical id>` —
+**never renamed or deleted**. A demoted record stays on disk, stays
+indexed, and stays reachable:
+
+```bash
+curl -s localhost:8765/search -X POST -H 'content-type: application/json' -d '{
+  "query": "staging cluster region",
+  "memory": {"tiers": ["cold"]}
+}'
+```
+
+Every subsumption is recorded in the `memory_compactions` ledger
+(`op`, `member_id`, `canonical_id`, `rule_id`, `params_hash`, `at` — see
+`docs/reference/export-schema.md`), so "why is this record cold" always has
+an answer. Off by default because, unlike reinforcement, it changes what a
+plain query returns — the same posture `supersede_retention_days` takes.
 
 ## In the UI
 

@@ -210,11 +210,17 @@ class GraphBuilder:
     def add_memory_edges(self, state: Any, max_targets: int | None = None) -> dict[str, Any]:
         """Wire memory records into the graph (Step 33.7). Returns a report.
 
-        Two kinds of edge, both previously missing:
+        Three kinds of edge:
 
         * ``supersedes`` — a documented edge type nothing emitted, so a
           correction existed only as a frontmatter string and the graph could
           not answer "what replaced this".
+        * ``subsumes`` (Phase 3) — a near-duplicate cluster's medoid to the
+          records it absorbed. Deliberately drawn straight from
+          ``subsumed_by``, never through the ``about`` ladder below: that
+          ladder is corpus-only by design (a memory must not be matched
+          against symbols/headings/entities extracted from *another
+          memory*), and a subsumption is memory-to-memory by definition.
         * ``about`` — the record to what it is *about*, by the strongest signal
           that fires (see :mod:`pheasant.memory.bridge`).
 
@@ -226,11 +232,20 @@ class GraphBuilder:
         from pheasant.memory.bridge import (
             ABOUT_EDGE,
             DEFAULT_MAX_TARGETS,
+            SUBSUMES_EDGE,
             resolve_bridges,
+            subsumes_edges,
             supersedes_edges,
         )
 
-        report = {"records": 0, "about": 0, "supersedes": 0, "unbridged": [], "by_signal": {}}
+        report = {
+            "records": 0,
+            "about": 0,
+            "supersedes": 0,
+            "subsumes": 0,
+            "unbridged": [],
+            "by_signal": {},
+        }
         records = self._memory_rows(state)
         if not records:
             return report
@@ -239,6 +254,10 @@ class GraphBuilder:
         for newer, older in supersedes_edges(records):
             self.upsert_edge(newer, older, "supersedes", {"enrichment_pass": "memory_bridge"})
             report["supersedes"] += 1
+
+        for canonical, member in subsumes_edges(records):
+            self.upsert_edge(canonical, member, SUBSUMES_EDGE, {"enrichment_pass": "memory_bridge"})
+            report["subsumes"] += 1
 
         inputs = self._bridge_inputs(state, records)
         edges, unbridged = resolve_bridges(
@@ -269,10 +288,20 @@ class GraphBuilder:
     def _memory_rows(state: Any) -> list[dict[str, Any]]:
         try:
             rows = state.rows(
-                "SELECT record_id, artifact_id, source_id, supersedes FROM memory_records"
+                "SELECT record_id, artifact_id, source_id, supersedes, subsumed_by "
+                "FROM memory_records"
             )
-        except Exception:  # pragma: no cover - state store older than 33.5
-            return []
+        except Exception:
+            # Either a state store older than 33.5 (no memory_records at
+            # all) or one that predates Phase 3's subsumed_by column —
+            # retry without it rather than losing supersedes/about bridging
+            # entirely over one missing column.
+            try:
+                rows = state.rows(
+                    "SELECT record_id, artifact_id, source_id, supersedes FROM memory_records"
+                )
+            except Exception:  # pragma: no cover - state store older than 33.5
+                return []
         return [dict(row) for row in rows]
 
     def _bridge_inputs(self, state: Any, records: list[dict[str, Any]]) -> Any:

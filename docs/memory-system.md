@@ -245,6 +245,12 @@ Memory is not a graph island. Records become `memory_record` nodes, with:
 
 - **`supersedes` edges** between records, so a correction is a traversable
   relationship rather than only a frontmatter string;
+- **`subsumes` edges** (Phase 3) from a near-duplicate cluster's medoid to
+  each record it absorbed — drawn straight from `subsumed_by`, never through
+  the `about` ladder below (that ladder is corpus-only; a subsumption is
+  memory-to-memory). Deliberately distinct from `supersedes`: a subsumed
+  record is redundant but still *true*, so this edge (and the column it is
+  drawn from) never feeds `effective_valid_until`. See §8.
 - **`about` edges** to what the record is *about*, drawn by a precedence
   ladder — **reference → symbol → heading → entity**, first rung wins, capped
   at `memory.about_max_targets`.
@@ -315,6 +321,56 @@ against ordinary facts, on a formula built for facts, meant crossing
 `max_records` could silently switch off an `exclusion` and change ranking for
 every future query. The number of rules actually in force is bounded separately
 by `steering.MAX_RULES`.
+
+### Compaction: clustering near-duplicates, not just deduplicating them
+
+Reinforcement (above) only folds *exact equivalents* — the same claim,
+different casing or framing. It cannot fold two records an agent phrased
+genuinely differently but which still assert the same thing; that is a
+*similarity* judgement, not an equivalence, and the write path is
+deliberately never allowed to make one (nothing lossy happens before a
+caller sees the result of their own write). `memory.compaction_enabled`
+(off by default — see below) runs that judgement offline, on the same
+consolidation pass as archival and capacity pruning:
+
+1. **Bucket** live (`tier='hot'`) records by the exact same
+   `(scope, subject, kind, ACL partition)` key reinforcement uses — never
+   across scope, never across a steering kind, never across principal at
+   `user`/`session` scope.
+2. **Cluster** within a bucket by exact Jaccard similarity over normalized
+   content tokens (`memory.compaction_similarity_threshold`, default `0.6`),
+   using a postings index for candidate generation — the same shape as the
+   corpus's own (retired, dormant) `_similarity_edges` pass, reused here
+   because a memory bucket is small enough that an inverted index plus exact
+   Jaccard needs no probabilistic signature.
+3. **Promote a medoid**: within each cluster of at least
+   `memory.compaction_min_cluster_size` (default `2`) members, the record
+   maximizing summed similarity to every other member becomes canonical —
+   ties break on the lowest `record_id`. Nothing is machine-authored: the
+   "summary" is a real record a real writer wrote, so provenance stays
+   exact.
+4. **Demote the rest**: every other member gets `tier='cold'` and
+   `subsumed_by=<canonical>`. **No file is renamed or deleted** — a demoted
+   record stays on disk, stays indexed, and is fully reachable through an
+   explicit `tiers=("cold",)` policy or the same `current_only=False`/
+   `as_of` that already reaches retained superseded history (`allowed_tiers`
+   widens to `("hot","cold")` under the same signals that widen the validity
+   window — §5). The canonical record's `observations` absorbs the cluster
+   (each demoted member's own count, plus one for having existed at all), so
+   importance concentrates on the survivor instead of splitting across
+   near-duplicates.
+5. **Ledger**: every subsumption is appended to `memory_compactions`
+   (`op`, `member_id`, `canonical_id`, `rule_id`, `params_hash`, `at`) — a
+   permanent, append-only answer to "why is this record cold" that survives
+   independently of the `subsumed_by` pointer itself. Idempotent: the row id
+   is a deterministic hash of its own fields, so a second pass over
+   unchanged content with unchanged parameters writes nothing new.
+
+**Off by default, unlike reinforcement.** Reinforcement only ever changes
+what `created` means for an exact restatement; compaction changes what a
+*default* query returns (a subsumed near-duplicate stops appearing), which
+is the same class of decision `supersede_retention_days` is — an explicit
+opt-in, not an assumed-safe default.
 
 ---
 

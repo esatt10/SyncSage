@@ -78,6 +78,20 @@ def _run(engine: Any, config: Any, settings: Any, source: Any, *, now: datetime 
     archived_ids = [*report.archived_superseded, *report.archived_expired, *pruned]
     if archived_ids:
         result["sync"] = _drop_archived(engine, store, source, by_id, archived_ids)
+
+    if getattr(settings, "compaction_enabled", False):
+        # Phase 3: cluster and demote near-duplicates. Records archived by
+        # this same pass are excluded — they have no live file left, and
+        # SQL (which the compaction pass also reads, for observations/tier)
+        # will not reflect their removal until the next projection rebuild.
+        archived = set(archived_ids)
+        live_records = [r for r in records if r.record_id not in archived]
+        from pheasant.memory.compaction import run_compaction
+
+        compaction = run_compaction(engine, live_records, settings, now=now)
+        if compaction.get("subsumed"):
+            result["compaction"] = compaction
+
     _record_scope_gauge(store)
     return result
 

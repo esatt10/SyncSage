@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -162,6 +163,18 @@ class StateStore:
         # ALTER just above added it. See the comment in schema.py.
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_memory_records_canon_key ON memory_records(canon_key)"
+        )
+        # Phase 3 — same shape. Existing rows keep tier='hot' (their default
+        # is exactly the pre-Phase-3 state: a record nothing has clustered
+        # yet is not demoted) and subsumed_by NULL.
+        if memory_columns and "tier" not in memory_columns:
+            self.conn.execute(
+                "ALTER TABLE memory_records ADD COLUMN tier TEXT NOT NULL DEFAULT 'hot'"
+            )
+        if memory_columns and "subsumed_by" not in memory_columns:
+            self.conn.execute("ALTER TABLE memory_records ADD COLUMN subsumed_by TEXT")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_records_tier ON memory_records(tier, scope)"
         )
         self.conn.commit()
         self._migrate_fts_titles()
@@ -623,13 +636,19 @@ class StateStore:
         ``canon_key`` is the opposite: a pure function of the record's own
         fields (see ``pheasant.memory.normalize``), so it is *not* carried
         over — ``records`` supplies a freshly computed one on every rebuild.
+
+        ``tier``/``subsumed_by`` (Phase 3) are earned by a compaction pass
+        choosing a medoid and demoting the rest — carried over exactly like
+        ``salience``. A record a pass has never seen keeps the column
+        defaults (``tier='hot'``, ``subsumed_by=NULL``), which is exactly
+        the pre-Phase-3 state.
         """
         with self.conn:
             earned = {
                 str(row["record_id"]): row
                 for row in self.conn.execute(
                     "SELECT record_id, salience, uses, last_used_at, "
-                    "observations, last_seen, variants "
+                    "observations, last_seen, variants, tier, subsumed_by "
                     "FROM memory_records WHERE source_id=?",
                     (source_id,),
                 )
@@ -642,13 +661,13 @@ class StateStore:
                         record_id,artifact_id,source_id,scope,subject,kind,asserted_at,
                         valid_from,valid_until,supersedes,tags,written_by,canon_key,
                         salience,uses,last_used_at,observations,last_seen,variants,
-                        schema_version
+                        tier,subsumed_by,schema_version
                     )
                     VALUES(
                         :record_id,:artifact_id,:source_id,:scope,:subject,:kind,:asserted_at,
                         :valid_from,:valid_until,:supersedes,:tags,:written_by,:canon_key,
                         :salience,:uses,:last_used_at,:observations,:last_seen,:variants,
-                        :schema_version
+                        :tier,:subsumed_by,:schema_version
                     )""",
                     {
                         "subject": None,
@@ -667,6 +686,8 @@ class StateStore:
                         "observations": int(prior["observations"]) if prior else 0,
                         "last_seen": prior["last_seen"] if prior else None,
                         "variants": prior["variants"] if prior else None,
+                        "tier": str(prior["tier"]) if prior and prior["tier"] else "hot",
+                        "subsumed_by": prior["subsumed_by"] if prior else None,
                     },
                 )
         return len(records)
@@ -773,6 +794,97 @@ class StateStore:
                 "UPDATE memory_records SET salience = ? WHERE record_id = ?",
                 [(value, key) for key, value in sorted(scores.items())],
             )
+
+    def memory_compaction_rows(self) -> list[dict[str, Any]]:
+        """Everything a clustering pass needs beyond the record text itself
+        (Phase 3) — record text lives only in the `.md` files, so the caller
+        joins these by `record_id` against an already-parsed
+        `MemoryStore.list_records()` (`memory.maintenance` parses the store
+        once per pass, per Phase 0, and hands the same list to every stage).
+        """
+        try:
+            rows = self.rows(
+                "SELECT record_id, scope, subject, kind, written_by, tier, subsumed_by, "
+                "observations "
+                "FROM memory_records"
+            )
+        except Exception:  # pragma: no cover - state store older than Phase 3
+            return []
+        return [dict(row) for row in rows]
+
+    def subsume_records(
+        self,
+        canonical_id: str,
+        member_ids: list[str],
+        *,
+        absorbed_observations: int,
+        now: str,
+        rule_id: str,
+        params_hash: str,
+    ) -> int:
+        """Demote `member_ids` to `tier='cold'` pointing at `canonical_id`,
+        credit the canonical record with the cluster's absorbed
+        `observations`, and append one ledger row per member (Phase 3).
+
+        Idempotent: the ledger row id is a deterministic hash of
+        `(op, member_id, canonical_id, params_hash)`, so a second pass over
+        an unchanged cluster with unchanged parameters writes the same ids —
+        `INSERT OR IGNORE` makes them no-ops — while the tier/subsumed_by
+        UPDATEs are themselves idempotent (setting the same value twice).
+        Returns the number of members actually demoted this call.
+        """
+        ids = [str(i) for i in member_ids if i and i != canonical_id]
+        if not ids:
+            return 0
+        with self.conn:
+            placeholders = ",".join("?" for _ in ids)
+            cursor = self.conn.execute(
+                f"UPDATE memory_records SET tier='cold', subsumed_by=? "
+                f"WHERE record_id IN ({placeholders})",
+                (canonical_id, *ids),
+            )
+            demoted = int(cursor.rowcount or 0)
+            if absorbed_observations:
+                self.conn.execute(
+                    "UPDATE memory_records SET observations = observations + ? WHERE record_id = ?",
+                    (absorbed_observations, canonical_id),
+                )
+            for member_id in ids:
+                row_id = hashlib.blake2b(
+                    f"subsume|{member_id}|{canonical_id}|{params_hash}".encode(),
+                    digest_size=16,
+                ).hexdigest()
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO memory_compactions"
+                    "(id, op, member_id, canonical_id, rule_id, params_hash, at) "
+                    "VALUES (?, 'subsume', ?, ?, ?, ?, ?)",
+                    (row_id, member_id, canonical_id, rule_id, params_hash, now),
+                )
+        return demoted
+
+    def memory_compaction_ledger(
+        self, *, canonical_id: str | None = None, member_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Ledger rows, optionally filtered by canonical or member id —
+        the audit trail answering "why is this record cold" (Phase 3)."""
+        clauses: list[str] = []
+        params: list[str] = []
+        if canonical_id is not None:
+            clauses.append("canonical_id = ?")
+            params.append(canonical_id)
+        if member_id is not None:
+            clauses.append("member_id = ?")
+            params.append(member_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        try:
+            rows = self.rows(
+                "SELECT id, op, member_id, canonical_id, rule_id, params_hash, at "
+                f"FROM memory_compactions{where} ORDER BY at, id",
+                tuple(params),
+            )
+        except Exception:  # pragma: no cover - state store older than Phase 3
+            return []
+        return [dict(row) for row in rows]
 
     def delete_source_artifacts(self, source_id: str) -> int:
         rows = self.rows("SELECT COUNT(*) AS c FROM artifacts WHERE source_id=?", (source_id,))

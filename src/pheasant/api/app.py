@@ -1971,7 +1971,19 @@ def create_app(
             records = MemoryStore(source.path).list_records(scope, current_only=current_only)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"source": source.name, "records": [r.as_dict() for r in records]}
+        # Phase 3: see the matching comment in mcp_server/tools.py:memory_list.
+        try:
+            compaction = {str(row["record_id"]): row for row in state.memory_compaction_rows()}
+        except Exception:
+            compaction = {}
+        out = []
+        for record in records:
+            payload = record.as_dict()
+            row = compaction.get(record.record_id)
+            payload["tier"] = str(row["tier"]) if row and row.get("tier") else "hot"
+            payload["subsumed_by"] = row.get("subsumed_by") if row else None
+            out.append(payload)
+        return {"source": source.name, "records": out}
 
     @app.post("/memory/enable")
     def memory_enable(req: MemoryEnableRequest) -> dict:
