@@ -821,10 +821,18 @@ class StateStore:
         now: str,
         rule_id: str,
         params_hash: str,
+        op: str = "subsume",
     ) -> int:
         """Demote `member_ids` to `tier='cold'` pointing at `canonical_id`,
         credit the canonical record with the cluster's absorbed
         `observations`, and append one ledger row per member (Phase 3).
+
+        `op` defaults to `"subsume"` (deterministic medoid promotion,
+        Phase 3) but the mechanics are identical for `"synthesize"`
+        (Phase 4's LLM-merged canonical record) — a member is redundant but
+        still true either way, so the same tier/subsumed_by/ledger write
+        applies; only what produced the canonical record differs, and that
+        is exactly what `op` + `rule_id` distinguish.
 
         Idempotent: the ledger row id is a deterministic hash of
         `(op, member_id, canonical_id, params_hash)`, so a second pass over
@@ -851,22 +859,30 @@ class StateStore:
                 )
             for member_id in ids:
                 row_id = hashlib.blake2b(
-                    f"subsume|{member_id}|{canonical_id}|{params_hash}".encode(),
+                    f"{op}|{member_id}|{canonical_id}|{params_hash}".encode(),
                     digest_size=16,
                 ).hexdigest()
                 self.conn.execute(
                     "INSERT OR IGNORE INTO memory_compactions"
                     "(id, op, member_id, canonical_id, rule_id, params_hash, at) "
-                    "VALUES (?, 'subsume', ?, ?, ?, ?, ?)",
-                    (row_id, member_id, canonical_id, rule_id, params_hash, now),
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (row_id, op, member_id, canonical_id, rule_id, params_hash, now),
                 )
         return demoted
 
     def memory_compaction_ledger(
-        self, *, canonical_id: str | None = None, member_id: str | None = None
+        self,
+        *,
+        canonical_id: str | None = None,
+        member_id: str | None = None,
+        params_hash: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Ledger rows, optionally filtered by canonical or member id —
-        the audit trail answering "why is this record cold" (Phase 3)."""
+        """Ledger rows, optionally filtered by canonical id, member id or
+        params_hash — the audit trail answering "why is this record cold"
+        (Phase 3). `params_hash` (Phase 4) is what a synthesis pass checks
+        *before* calling a model: any row already means this exact cluster
+        was already resolved under this exact model + member set, so the
+        pass costs zero calls on a repeat run over unchanged content."""
         clauses: list[str] = []
         params: list[str] = []
         if canonical_id is not None:
@@ -875,6 +891,9 @@ class StateStore:
         if member_id is not None:
             clauses.append("member_id = ?")
             params.append(member_id)
+        if params_hash is not None:
+            clauses.append("params_hash = ?")
+            params.append(params_hash)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         try:
             rows = self.rows(

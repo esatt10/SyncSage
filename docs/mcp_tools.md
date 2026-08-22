@@ -106,6 +106,14 @@ default). See `docs/memory-system.md` §8 for reinforcement and compaction.
 how many records are wired into the graph, and any steering in force, so an
 agent never has to guess the source name to exclude it.
 
+`memory_synthesize` LLM-merges a near-duplicate cluster deterministic
+compaction could not resolve (complementary partial facts, progressive
+refinement, abstraction) into one canonical record, subsuming the inputs the
+same way medoid promotion does. Off by default (`memory.synthesis.enabled`)
+and **never automatic** — only this explicit call runs it, so the scheduler
+beat never makes a network request. Returns `{"skipped": reason}` when
+disabled, no memory source is configured, or no model is reachable.
+
 ## Resources
 
 ```text

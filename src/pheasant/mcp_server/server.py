@@ -234,6 +234,14 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         return tools.memory_consolidate(knowledge_base)
 
     @mcp.tool()
+    def memory_synthesize(knowledge_base: str) -> dict:
+        """LLM-merge a near-duplicate memory cluster deterministic compaction
+        could not resolve into one canonical record. Off by default
+        (`memory.synthesis.enabled`) and never automatic."""
+
+        return tools.memory_synthesize(knowledge_base)
+
+    @mcp.tool()
     def sync_all(
         knowledge_base: str,
         mode: str = "incremental",

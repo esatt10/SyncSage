@@ -294,6 +294,37 @@ Every subsumption is recorded in the `memory_compactions` ledger
 an answer. Off by default because, unlike reinforcement, it changes what a
 plain query returns — the same posture `supersede_retention_days` takes.
 
+### When clustering isn't enough: synthesis
+
+Clustering folds redundancy — many phrasings of one claim. It cannot
+**merge** two records that are each true and each say something the other
+doesn't ("runs in us-east-2" + "owned by ada"), or abstract across several
+("deploy failed Mon/Tue/Wed" → "failing all week"). For that,
+`memory.synthesis` calls a model — opt-in, and unlike everything else on
+this page, **never automatic**: only an explicit call runs it.
+
+```yaml
+memory:
+  synthesis:
+    enabled: false      # opt-in
+    provider: auto        # auto | anthropic | openai | gemini | none
+    model: null
+    max_calls_per_pass: 20
+```
+
+```bash
+curl -s localhost:8765/memory/synthesize -X POST
+```
+
+The model only ever sees clusters clustering already tried and couldn't
+fully resolve; a successful merge subsumes its inputs exactly like medoid
+promotion (`tier: cold`, `subsumed_by`), tagged `llm-synthesized` and
+recorded in the ledger with the model id — never `supersedes`, since the
+inputs weren't wrong, just redundant. It is a writer, not an indexer: the
+merged text becomes an ordinary record through the normal write path, so
+no LLM call ever happens on the indexing path itself, and a repeat call
+over an unchanged, already-subsumed cluster costs nothing.
+
 ## In the UI
 
 The **Memory** tab lists what has been recorded, grouped by subject, with the

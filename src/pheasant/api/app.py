@@ -2083,6 +2083,28 @@ def create_app(
         audit(result["source"], "memory_consolidate", result["report"])
         return result
 
+    @app.post("/memory/synthesize")
+    def memory_synthesize() -> dict:
+        """LLM-merge a near-duplicate memory cluster deterministic
+        compaction could not resolve into one canonical record. Off by
+        default (`memory.synthesis.enabled`) and never automatic — see
+        `MemorySynthesisSettings`. 200 with `{"skipped": reason}` when
+        synthesis is disabled, no memory source is configured, or no model
+        is reachable — matching `POST /memory/consolidate`'s posture: this
+        is a well-formed request the server declined by its own
+        configuration, not a client error.
+        """
+        from pheasant.memory.store import MemoryStore, memory_source
+        from pheasant.memory.synthesis import run_synthesis
+
+        source = memory_source(config, state)
+        if source is None:
+            return {"skipped": "no `type: memory` source is configured"}
+        records = MemoryStore(source.path).list_records()
+        result = run_synthesis(engine, records, config.memory.synthesis, source)
+        audit(source.name, "memory_synthesize", result)
+        return result
+
     @app.post("/security/idp/sync")
     def idp_sync() -> dict:
         from pheasant.security.idp import run_idp_sync

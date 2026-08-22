@@ -372,6 +372,73 @@ what `created` means for an exact restatement; compaction changes what a
 is the same class of decision `supersede_retention_days` is — an explicit
 opt-in, not an assumed-safe default.
 
+### Synthesis: the one non-deterministic tier
+
+Deterministic compaction folds *redundancy*. It cannot **merge**: three
+concrete cases it provably does not cover —
+
+1. **Complementary partials** — "runs in us-east-2" and "owned by ada" are
+   not near-duplicates, both are true, and the compact form is one record
+   stating both. No selector can emit a sentence present in neither input.
+2. **Progressive refinement** — ten records each adding one detail to the
+   same subject compact correctly only into one record stating all ten.
+   Medoid promotion (L2) picks whichever single member overlaps most and
+   leaves the other nine cold, carrying detail the canonical record lacks.
+3. **Abstraction across instances** — "deploy failed Monday", "…Tuesday",
+   "…Wednesday" → "deploys have been failing all week" is generalization,
+   not selection.
+
+`memory.synthesis` (Phase 4) is a model call for exactly this gap, and
+nothing more. **The model is a writer, never an indexer** — it produces one
+ordinary record through the same `MemoryStore.append` path a human or
+agent write uses, and the deterministic pipeline then indexes it
+identically to every other record. No LLM call ever happens on the
+indexing path (CLAUDE.md rule 1), and it is **never invoked automatically**
+— not from the scheduler beat, not from consolidation — only through the
+explicit `memory_synthesize` MCP tool / `POST /memory/synthesize`. `pytest`
+stays network-free by construction: the default `provider: auto` resolves
+to nothing reachable when no API key is set, so a pass degrades to
+`{"skipped": "no model reachable"}` rather than needing a mock.
+
+Configuration mirrors `AssistantSettings` field for field — an operator who
+has already pointed the assistant at a model recognizes every knob:
+
+```yaml
+memory:
+  synthesis:
+    enabled: false          # opt-in, and never automatic regardless
+    provider: auto           # auto | anthropic | openai | gemini | none
+    model: null               # explicit model id; null = provider default
+    max_calls_per_pass: 20
+    max_input_chars: 6000     # combined member text; over this, skip the cluster
+    min_cluster_size: 3
+```
+
+Candidates are subject-tagged buckets (the same `(scope, subject, kind, ACL
+partition)` isolation reinforcement and clustering already enforce — a
+cluster never crosses scope, kind, or principal) still `tier='hot'` after
+L1/L2 has run. A successful merge **subsumes its members** through the
+identical mechanism medoid promotion uses — `tier='cold'`,
+`subsumed_by=<new record>`, a `memory_compactions` row — not `supersedes`:
+the inputs are not corrected, they are redundant-but-still-true, exactly
+compaction's own category. The synthesized record inherits its cluster's
+`written_by` (never a synthetic identity — a `user`/`session` cluster
+shares one writer by construction, and using anything else would make the
+merge unreadable by the very principal whose facts it summarizes), carries
+the tag `llm-synthesized`, and its ledger row's `rule_id`/`params_hash`
+records the model id — a generated record is always distinguishable from a
+written one.
+
+**Efficiency, cheapest first:** the model never sees anything L1/L2 already
+resolved; a repeat pass over an already-subsumed cluster costs nothing
+because its members are no longer `tier='hot'` and drop out of candidacy
+entirely (the primary guarantee); a content-addressed `params_hash` (model
+id + sorted member ids) is checked against the ledger *before* any call, so
+even a cluster reset back to hot under unchanged parameters costs zero;
+`max_calls_per_pass` bounds an unbounded first pass; and `try_complete`
+degrades a provider failure to "skip this cluster" rather than failing the
+whole run.
+
 ---
 
 ## 9. Isolation

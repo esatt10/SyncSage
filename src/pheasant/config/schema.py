@@ -774,6 +774,54 @@ class AssistantSettings(ModelMixin):
 
 
 @dataclass
+class MemorySynthesisSettings(ModelMixin):
+    """L3 compaction (Phase 4): abstractive merge of a near-duplicate
+    cluster deterministic methods cannot resolve — complementary partial
+    facts, progressive refinement, or genuine abstraction across records.
+    See `docs/memory-system.md` §8 for what deterministic clustering (L1/L2)
+    already handles and why this tier exists for what it cannot.
+
+    Mirrors `AssistantSettings` field-for-field on purpose: an operator who
+    has already configured the assistant's model recognizes every knob
+    here, and the fields feed the exact same `assistant.llm`/
+    `assistant.catalog` machinery — no second provider stack.
+
+    **Off by default and never on an automatic beat.** Unlike consolidation
+    or compaction (Phase 3), which are pure metadata operations, this makes
+    a network call — CLAUDE.md rule 1 forbids an LLM on the indexing path,
+    and the scheduler's maintenance beat is exactly that path. Synthesis
+    runs only through the explicit `memory_synthesize` MCP tool /
+    `POST /memory/synthesize`, never automatically, so `pytest` stays
+    network-free by construction (the default `provider` resolves to
+    nothing reachable) rather than by mocking.
+    """
+
+    enabled: bool = False
+    provider: str = "auto"  # auto | anthropic | openai | gemini | none
+    model: str | None = None
+    base_url: str | None = None
+    api_key_env: str | None = None
+    max_output_tokens: int = 1024
+    request_timeout_seconds: float = 60.0
+    #: Hard cap on model calls in one pass. The content-addressed cache
+    #: (a cluster's member-id set + model id + rule id, checked against the
+    #: `memory_compactions` ledger before any call) already makes a repeat
+    #: pass over unchanged clusters cost zero regardless — this bounds the
+    #: *first* pass over a large store, or one after many new clusters
+    #: appeared at once.
+    max_calls_per_pass: int = 20
+    #: Conservative char-based proxy for input size — no tokenizer
+    #: dependency, matching the no-extra-dependency posture the rest of
+    #: this module keeps. A cluster whose combined member text exceeds this
+    #: is skipped rather than truncated silently into a partial merge.
+    max_input_chars: int = 6000
+    #: A cluster below this size is not a synthesis candidate — medoid
+    #: promotion (L2, Phase 3) already resolves anything smaller cleanly
+    #: and losslessly; synthesis is reserved for what that tier cannot.
+    min_cluster_size: int = 3
+
+
+@dataclass
 class MemorySettings(ModelMixin):
     """Agent-memory consolidation policy (Step 33.2).
 
@@ -859,6 +907,12 @@ class MemorySettings(ModelMixin):
     #: A cluster below this size is left alone. `2` is the floor — anything
     #: less is not a cluster.
     compaction_min_cluster_size: int = 2
+
+    # --- synthesis (Phase 4) -----------------------------------------------
+    #: L3: abstractive merge for what L1/L2 cannot resolve deterministically.
+    #: See `MemorySynthesisSettings` — off by default, never on an automatic
+    #: beat.
+    synthesis: MemorySynthesisSettings = field(default_factory=MemorySynthesisSettings)
 
 
 @dataclass
@@ -1087,6 +1141,9 @@ class PheasantConfig(ModelMixin):
             if dc is AssistantSettings:
                 if "retrieval" in raw and isinstance(raw["retrieval"], dict):
                     raw["retrieval"] = build(RetrievalSettings, raw["retrieval"])
+            if dc is MemorySettings:
+                if "synthesis" in raw and isinstance(raw["synthesis"], dict):
+                    raw["synthesis"] = build(MemorySynthesisSettings, raw["synthesis"])
             if dc is IngestionSettings:
                 if "captioner" in raw and isinstance(raw["captioner"], dict):
                     raw["captioner"] = build(CaptionerSettings, raw["captioner"])

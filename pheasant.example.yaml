@@ -348,6 +348,18 @@ memory:
   compaction_enabled: false
   compaction_similarity_threshold: 0.6
   compaction_min_cluster_size: 2
+  # L3: LLM-merge for what deterministic clustering cannot resolve
+  # (complementary partial facts, progressive refinement, abstraction).
+  # Opt-in AND never automatic — only the explicit memory_synthesize tool /
+  # POST /memory/synthesize runs it, never the scheduler beat. Mirrors
+  # assistant.* field for field.
+  synthesis:
+    enabled: false
+    provider: auto            # auto | anthropic | openai | gemini | none
+    model: null
+    max_calls_per_pass: 20
+    max_input_chars: 6000
+    min_cluster_size: 3
 
 # byte-for-byte deterministic.
 #

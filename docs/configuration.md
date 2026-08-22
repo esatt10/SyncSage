@@ -717,6 +717,12 @@ memory source itself. See [Agent memory](how-to/agent-memory.md).
 | `compaction_enabled` | bool | `false` | Offline near-duplicate clustering and medoid promotion, on the consolidation pass. Demoted records go to `tier='cold'` (never deleted or renamed — reachable via an explicit tier filter or `current_only=False`/`as_of`) and their `observations` are absorbed by the surviving canonical record. Off by default: unlike reinforcement, this changes what a *default* query returns. See `docs/memory-system.md` §8. |
 | `compaction_similarity_threshold` | float | `0.6` | Exact-Jaccard threshold over normalized content tokens above which two records in the same bucket link into one cluster. |
 | `compaction_min_cluster_size` | integer | `2` | A cluster below this size is left alone. |
+| `synthesis.enabled` | bool | `false` | LLM-merge (Phase 4) for what deterministic clustering cannot resolve — complementary partial facts, progressive refinement, abstraction across records. Opt-in *and* never automatic: only the explicit `memory_synthesize` tool / `POST /memory/synthesize` runs it, never the scheduler beat. Mirrors `assistant.*` field for field. |
+| `synthesis.provider` | `auto` \| `anthropic` \| `openai` \| `gemini` \| `none` | `auto` | Same semantics as `assistant.provider`. |
+| `synthesis.model` | string \| null | `null` | Explicit model id; `null` uses the provider's default. |
+| `synthesis.max_calls_per_pass` | integer | `20` | Hard cap on model calls in one pass. A repeat pass over already-subsumed clusters costs zero regardless — this bounds a large first pass. |
+| `synthesis.max_input_chars` | integer | `6000` | A cluster whose combined member text exceeds this is skipped rather than truncated into a partial merge. |
+| `synthesis.min_cluster_size` | integer | `3` | Below this, medoid promotion (L2) already resolves the cluster losslessly. |
 
 **Corrected records are excluded from retrieval automatically**, at query time,
 without waiting for a consolidation pass — pass `{"current_only": false}` or an

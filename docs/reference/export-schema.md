@@ -247,7 +247,7 @@ JOIN chunks c_text ON c_text.artifact_id = cr.artifact_id;
 | Column | Type | Notes |
 |---|---|---|
 | `id` | VARCHAR | Deterministic hash of `(op, member_id, canonical_id, params_hash)` — a re-run over unchanged content with unchanged parameters produces the same id, which is what makes the pass idempotent. |
-| `op` | VARCHAR | Currently always `subsume`. |
+| `op` | VARCHAR | `subsume` (deterministic medoid promotion) or `synthesize` (Phase 4's LLM merge — `rule_id='llm-synthesis-v1'` and `params_hash` encodes the model id). |
 | `member_id` | VARCHAR | → `memory_records.record_id` — the demoted record. |
 | `canonical_id` | VARCHAR | → `memory_records.record_id` — the promoted medoid. |
 | `rule_id` | VARCHAR | The algorithm version, e.g. `jaccard-medoid-v1`. |

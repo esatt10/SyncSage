@@ -587,6 +587,27 @@ class PheasantTools:
         )
         return result
 
+    def memory_synthesize(self, knowledge_base: str) -> dict:
+        """Run one LLM-merge pass now (Phase 4). Off by default and never
+        automatic — see `MemorySynthesisSettings`. Merges a near-duplicate
+        cluster deterministic compaction could not resolve into one new
+        canonical record, subsuming the originals exactly as medoid
+        promotion does. Returns `{"skipped": reason}` when synthesis is
+        disabled, no `type: memory` source is configured, or no model is
+        reachable.
+        """
+        from pheasant.memory.store import MemoryStore, memory_source
+        from pheasant.memory.synthesis import run_synthesis
+
+        self._require_knowledge_base(knowledge_base)
+        source = memory_source(self.config, self.state)
+        if source is None:
+            return {"skipped": "no `type: memory` source is configured"}
+        records = MemoryStore(source.path).list_records()
+        result = run_synthesis(self.engine, records, self.config.memory.synthesis, source)
+        self._audit(source.name, "memory_synthesize", "mcp", "mcp", None, utc_now(), result)
+        return result
+
     def search_context(
         self,
         knowledge_base: str,
