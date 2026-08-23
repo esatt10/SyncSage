@@ -29,6 +29,12 @@ wasted redundant compilation across knowledge bases on the same machine
 for zero benefit. Cache writes are best-effort: a failure to read or write
 the cache file never breaks a caller, it just falls back to an in-memory
 compile for that call.
+
+The OS temp directory is shared by every local user, and
+``wasmtime.Module.deserialize_file`` trusts whatever bytes it's pointed at
+as already-compiled native code — so the cache directory and file are
+verified private to this process's own uid before either is trusted; see
+:mod:`pheasant.sandbox.accel.cache_security` for what that closes and why.
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+from pheasant.sandbox.accel.cache_security import load_or_compile
 from pheasant.sandbox.wasm_runtime import WasmRuntimeUnavailable
 
 logger = logging.getLogger(__name__)
@@ -64,34 +71,8 @@ def _cache_path(wasm_bytes: bytes) -> Path:
     return _cache_dir() / f"accel-{digest}.cwasm"
 
 
-def _compile_and_cache(engine: wasmtime.Engine, wasm_bytes: bytes) -> wasmtime.Module:
-    module = wasmtime.Module(engine, wasm_bytes)
-    try:
-        cache_path = _cache_path(wasm_bytes)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = cache_path.with_suffix(".tmp")
-        tmp_path.write_bytes(module.serialize())
-        tmp_path.replace(cache_path)
-    except OSError as exc:
-        # Fail-soft: an unwritable temp dir must never break a sync/query,
-        # it just means every process in this run pays the JIT cost.
-        logger.warning(
-            "could not write WASM AOT cache (falling back to per-process compile): %s", exc
-        )
-    return module
-
-
 def _load_module(engine: wasmtime.Engine, wasm_bytes: bytes) -> wasmtime.Module:
-    cache_path = _cache_path(wasm_bytes)
-    if cache_path.exists():
-        try:
-            return wasmtime.Module.deserialize_file(engine, str(cache_path))
-        except wasmtime.WasmtimeError as exc:
-            # A wasmtime/engine-config/architecture mismatch fails closed
-            # here (never silently loads a wrong-architecture artifact) —
-            # recompile and overwrite the stale cache entry.
-            logger.info("WASM AOT cache entry unusable, recompiling: %s", exc)
-    return _compile_and_cache(engine, wasm_bytes)
+    return load_or_compile(engine, wasm_bytes, _cache_path(wasm_bytes))
 
 
 def _engine_and_module() -> tuple[wasmtime.Engine, wasmtime.Module]:

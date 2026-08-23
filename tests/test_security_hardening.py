@@ -1,11 +1,11 @@
-"""Regression gate for the security scan of 2026-07-31.
+"""Regression gate for the security scan of 2026-07-31, extended 2026-08-23.
 
 Every test here pins a vulnerability that was reachable on `main` and is
 now closed. They are written adversarially — each one fails if the guard is
 removed — and paired with a "still works" assertion so a future tightening
 does not quietly amputate the feature it protects.
 
-The findings, in the order they appear below:
+The 2026-07-31 findings, in the order they appear below:
 
 1. ``config_path`` on the promote surfaces was written verbatim, turning
    source management into an arbitrary file write (HTTP + MCP).
@@ -19,6 +19,10 @@ The findings, in the order they appear below:
    transport helpers).
 6. Backup extraction trusted symlink members.
 7. ``max_results`` was unbounded.
+
+The 2026-08-23 findings (see ``docs/security-audit-2026-08-23.md``) are
+appended below in the order remediated, each in its own numbered section
+starting at 8.
 """
 
 from __future__ import annotations
@@ -471,3 +475,83 @@ def test_max_results_is_clamped(workspace: Path) -> None:
 
     assert response.status_code == 200
     assert len(response.json()["results"]) <= MAX_RESULTS_CEILING
+
+
+# ---------------------------------------------------------------------------
+# 8. WASM AOT cache deserialized from a shared, attacker-writable temp dir
+#    (docs/security-audit-2026-08-23.md finding C5)
+# ---------------------------------------------------------------------------
+
+
+def test_wasm_cache_dir_owned_by_another_uid_is_never_trusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cache directory this process did not create is refused, not trusted.
+
+    Simulates "another uid pre-created the shared cache dir" the only way a
+    single-uid test process can: by making the ownership check itself see a
+    foreign uid. A real deserialize_file call is not exercised here (that
+    needs wasmtime and is covered by test_wasm_accel_loader.py's fixtures);
+    this isolates the trust decision the security fix is actually about.
+    """
+    from pheasant.sandbox.accel import cache_security
+
+    cache_dir = tmp_path / "wasm-cache"
+    cache_dir.mkdir(mode=0o700)
+    real_uid = cache_security.os.getuid()
+    monkeypatch.setattr(cache_security.os, "getuid", lambda: real_uid + 1)
+
+    assert cache_security.secure_dir(cache_dir) is None
+
+
+def test_wasm_cache_dir_that_is_group_or_other_accessible_is_refused(tmp_path: Path) -> None:
+    from pheasant.sandbox.accel.cache_security import secure_dir
+
+    cache_dir = tmp_path / "wasm-cache"
+    cache_dir.mkdir(mode=0o755)  # group/other readable+executable
+
+    assert secure_dir(cache_dir) is None
+
+
+def test_wasm_cache_dir_that_is_a_symlink_is_refused(tmp_path: Path) -> None:
+    from pheasant.sandbox.accel.cache_security import secure_dir
+
+    real = tmp_path / "real-cache"
+    real.mkdir(mode=0o700)
+    link = tmp_path / "wasm-cache-link"
+    link.symlink_to(real)
+
+    assert secure_dir(link) is None
+
+
+def test_wasm_cache_file_owned_by_another_uid_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pheasant.sandbox.accel import cache_security
+
+    cache_file = tmp_path / "accel-deadbeef.cwasm"
+    cache_file.write_bytes(b"not really a compiled module")
+    real_uid = cache_security.os.getuid()
+    monkeypatch.setattr(cache_security.os, "getuid", lambda: real_uid + 1)
+
+    assert cache_security.secure_cache_file(cache_file) is None
+
+
+def test_wasm_cache_dir_and_file_created_by_this_process_are_still_trusted(
+    tmp_path: Path,
+) -> None:
+    """The "still works" half: a private cache this process itself created
+    and wrote is accepted, so the hardening does not amputate the cache."""
+    from pheasant.sandbox.accel.cache_security import secure_cache_file, secure_dir
+
+    cache_dir = tmp_path / "wasm-cache"
+    assert secure_dir(cache_dir) == cache_dir
+    assert cache_dir.stat().st_mode & 0o777 == 0o700
+
+    cache_file = cache_dir / "accel-deadbeef.cwasm"
+    cache_file.write_bytes(b"a legitimate serialized module")
+    assert secure_cache_file(cache_file) == cache_file
+
+    # A file that does not exist yet is not distrusted — there is nothing to
+    # distrust, and refusing it would break the first-ever cache write.
+    assert secure_cache_file(cache_dir / "not-written-yet.cwasm") is not None
