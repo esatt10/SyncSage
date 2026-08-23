@@ -493,12 +493,12 @@ class WorkerPool:
                 f"results for {len(tasks)} tasks"
             )
         prepared: list[ParsedArtifact | None] = []
-        for entry in results:
+        for task, entry in zip(tasks, results, strict=True):
             if not isinstance(entry, dict):
                 raise _Retryable("worker returned a malformed result entry")
             if entry.get("error"):
                 raise TaskRejected(str(entry["error"]))
-            prepared.append(parsed_from_wire(entry.get("parsed")))
+            prepared.append(parsed_from_wire(entry.get("parsed"), task))
         return prepared
 
 

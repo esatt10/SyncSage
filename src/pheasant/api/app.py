@@ -2481,7 +2481,17 @@ def create_app(
         artifact_rows = state.rows("SELECT path FROM artifacts WHERE id=? LIMIT 1", (node_id,))
         if artifact_rows:
             path = Path(artifact_rows[0]["path"])
-            if path.exists() and path.is_file():
+            # Defense in depth for security audit finding H5: an
+            # artifacts.path value can no longer be forged by a remote
+            # worker (remote_worker.parsed_from_wire derives it locally
+            # now), but this still guards against any other path a bad
+            # `artifacts` row could reach this route by, the same way
+            # `_resolve_source_path` guards every other file read.
+            try:
+                path = resolve_under(str(path), _allowed_roots(config))
+            except PathPolicyError:
+                path = None
+            if path is not None and path.exists() and path.is_file():
                 content = read_text(path)
                 if content:
                     return {"node_id": node_id, "content": content}

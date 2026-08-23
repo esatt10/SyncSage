@@ -842,3 +842,104 @@ def test_is_memory_record_visible_matches_the_documented_scope_rules() -> None:
     # an anonymous one.
     assert is_memory_record_visible("user", None, {"user:carol"}) is True
     assert is_memory_record_visible("user", None, None) is False
+
+
+# ---------------------------------------------------------------------------
+# 11. A worker's id/path/source_id/relative_path/git_branch/git_commit were
+#    trusted from the wire (docs/security-audit-2026-08-23.md finding H5)
+# ---------------------------------------------------------------------------
+
+
+def _task(*, source_name: str = "docs", relative_path: str = "guide.md") -> dict:
+    return {
+        "source": {
+            "name": source_name,
+            "type": "web_collection",
+            "path": "/does/not/matter",
+            "chunking": {},
+            "taxonomy": {"enabled": False},
+        },
+        "item": {
+            "identity": f"web:{relative_path}",
+            "relative_path": relative_path,
+            "uri": f"https://example.test/{relative_path}",
+            "mime_type": "text/markdown",
+            "size_bytes": None,
+            "sha256": None,
+            "mtime": None,
+            "etag": None,
+            "metadata": {},
+        },
+        "payload": {"metadata": {}},
+        "git_metadata": None,
+    }
+
+
+def _wire_payload(**overrides: object) -> dict:
+    payload = {
+        "id": "file:attacker-source:../../etc/passwd:branch=none",
+        "source_id": "attacker-source",
+        "path": "/etc/passwd",
+        "relative_path": "../../etc/passwd",
+        "type": "text",
+        "mime_type": "text/markdown",
+        "size_bytes": 3,
+        "sha256": "deadbeef",
+        "mtime": "2026-01-01T00:00:00Z",
+        "git_branch": "attacker-branch",
+        "git_commit": "deadbeef",
+        "chunks": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_parsed_from_wire_ignores_a_forged_id_and_path() -> None:
+    """The worker's `id`/`path` are never trusted — they are derived from
+    the coordinator's own task record, which a worker cannot influence."""
+
+    from pheasant.sync.remote_worker import parsed_from_wire
+
+    task = _task(source_name="docs", relative_path="guide.md")
+    parsed = parsed_from_wire(_wire_payload(), task)
+
+    assert parsed is not None
+    assert parsed.id == "file:docs:guide.md:branch=none"
+    assert parsed.source_id == "docs"
+    assert parsed.relative_path == "guide.md"
+    # None of the forged values leaked through.
+    assert "attacker" not in parsed.id
+    assert "etc/passwd" not in parsed.path
+    assert parsed.git_branch != "attacker-branch"
+
+
+def test_parsed_from_wire_still_uses_the_wires_content_fields(tmp_path: Path) -> None:
+    """The "still works" half: fields that are genuinely the worker's own
+    answer (parsed text, sha256, mime type) still come from the wire."""
+
+    from pheasant.sync.remote_worker import parsed_from_wire
+
+    task = _task()
+    parsed = parsed_from_wire(
+        _wire_payload(sha256="realhash", mime_type="text/plain", size_bytes=42),
+        task,
+    )
+
+    assert parsed is not None
+    assert parsed.sha256 == "realhash"
+    assert parsed.mime_type == "text/plain"
+    assert parsed.size_bytes == 42
+
+
+def test_parsed_from_wire_matches_the_local_parsing_grammar() -> None:
+    """A legitimate worker's id must equal what local parsing would have
+    produced for the same source/item — the whole reason recomputation is
+    lossless rather than a behavior change."""
+
+    from pheasant.sync.remote_worker import parsed_from_wire
+
+    task = _task(source_name="my-source", relative_path="a/b/c.md")
+    parsed = parsed_from_wire(_wire_payload(), task)
+
+    assert parsed is not None
+    assert parsed.id == "file:my-source:a/b/c.md:branch=none"

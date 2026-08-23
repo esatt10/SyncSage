@@ -57,21 +57,57 @@ def parsed_to_wire(parsed: ParsedArtifact | None) -> dict[str, Any] | None:
     }
 
 
-def parsed_from_wire(payload: dict[str, Any] | None) -> ParsedArtifact | None:
+def parsed_from_wire(payload: dict[str, Any] | None, task: dict[str, Any]) -> ParsedArtifact | None:
+    """Build a ``ParsedArtifact`` from a worker's response — but never trust
+    the worker for ``id``/``source_id``/``path``/``relative_path``/
+    ``git_branch``/``git_commit``.
+
+    Security audit finding H5: those six fields used to come straight from
+    ``payload``, and only ``source_id``/``relative_path``/``sha256`` were
+    ever checked against the coordinator's own expectation (in
+    ``engine.py``, after this function returns). ``id`` and ``path`` were
+    committed to the ``artifacts`` table verbatim — ``id`` collides with
+    (and silently overwrites) another artifact's row and graph node if a
+    worker names one that already exists; ``path`` is later opened
+    straight off disk by the unauthenticated ``GET /nodes/content``. A
+    compromised worker, or anyone who recovers the shared bearer token off
+    the cleartext transport (see ``sync/grpc_worker.py``'s TLS note), could
+    use either as a primitive.
+
+    The fix is not to validate the wire values but to never read them:
+    ``task`` is the coordinator's own record of what it asked this worker
+    to prepare (``task_payload``'s output, still in hand at both call
+    sites — ``prepare_remote`` and the gRPC/HTTP batch transports), and
+    every one of these six fields is a pure, deterministic function of
+    ``task["source"]``/``task["item"]``/``task["git_metadata"]`` — the
+    exact grammar ``ingestion/pipeline.py::parse_connector_payload`` uses
+    locally. A legitimate worker's answer was always going to compute the
+    identical values from those identical inputs, so recomputing here is
+    lossless for a correct worker and closes the primitive for a
+    dishonest one.
+    """
     if payload is None:
         return None
+    source = task["source"]
+    item = task["item"]
+    git_metadata = task.get("git_metadata")
+    branch = git_metadata[0] if git_metadata else None
+    commit = git_metadata[1] if git_metadata else None
+    relative_path = str(item["relative_path"])
+    source_name = str(source["name"])
+    path = (task.get("payload") or {}).get("metadata", {}).get("path") or item.get("uri")
     return ParsedArtifact(
-        id=str(payload["id"]),
-        source_id=str(payload["source_id"]),
-        path=str(payload["path"]),
-        relative_path=str(payload["relative_path"]),
+        id=f"file:{source_name}:{relative_path}:branch={branch or 'none'}",
+        source_id=source_name,
+        path=str(path),
+        relative_path=relative_path,
         type=str(payload["type"]),
         mime_type=payload.get("mime_type"),
         size_bytes=int(payload["size_bytes"]),
         sha256=str(payload["sha256"]),
         mtime=str(payload["mtime"]),
-        git_branch=payload.get("git_branch"),
-        git_commit=payload.get("git_commit"),
+        git_branch=branch,
+        git_commit=commit,
         chunks=[TextChunk(**row) for row in payload.get("chunks") or []],
         headings=[],
     )
@@ -253,4 +289,4 @@ def prepare_remote(
             body = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
         raise RemoteWorkerError(f"Remote preparation failed at {url}: {exc}") from exc
-    return parsed_from_wire(body.get("parsed"))
+    return parsed_from_wire(body.get("parsed"), task)
