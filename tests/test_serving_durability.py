@@ -190,6 +190,103 @@ def test_probes_still_answer_on_a_saturated_replica(tmp_path: Path) -> None:
     assert client.get("/sources").status_code == 429
 
 
+def test_health_ready_metrics_are_declared_async(tmp_path: Path) -> None:
+    """A2's actual, unconditional fix: these three routes must not dispatch
+    through anyio's thread pool at all.
+
+    Checked structurally rather than by timing. Timing is the right tool for
+    proving `/health` specifically answers instantly under saturation (see
+    the test below) but is the *wrong* tool for `/ready` and `/metrics`:
+    both still make one blocking call each (``state.rows``, ``queue.depth``),
+    so under literal 100% pool saturation they queue for a token exactly as
+    long in the old, buggy code as in the new, fixed code — the fix there is
+    that only that one call touches the pool, not the whole route, which a
+    stopwatch cannot see but ``inspect.iscoroutinefunction`` can.
+    """
+
+    import inspect
+
+    from fastapi.routing import APIRoute
+
+    config = _config(tmp_path, state_name="async-routes")
+    app = create_app(config)
+
+    endpoints = {
+        route.path: route.endpoint
+        for route in app.routes
+        if isinstance(route, APIRoute) and route.path in {"/health", "/ready", "/metrics"}
+    }
+    assert endpoints.keys() == {"/health", "/ready", "/metrics"}
+    for path, endpoint in endpoints.items():
+        assert inspect.iscoroutinefunction(endpoint), f"{path} is not an async def route"
+
+
+@pytest.mark.asyncio
+async def test_health_answers_instantly_under_full_thread_pool_saturation(
+    tmp_path: Path,
+) -> None:
+    """`/health` needs zero worker-thread tokens, provably.
+
+    `test_probes_still_answer_on_a_saturated_replica` occupies a limiter
+    *count* via ``limiter.acquire()`` directly — it never touches a real
+    worker thread, so it would pass identically even if `/health` were sync
+    ``def`` and queued behind other in-flight sync handlers on anyio's
+    shared thread pool. This test saturates that actual pool — every single
+    token, held indefinitely — and proves `/health` still answers, because
+    unlike `/ready` and `/metrics` it makes no blocking call at all and so
+    never asks the pool for anything.
+
+    Uses ``httpx.AsyncClient`` + ``ASGITransport`` rather than
+    ``TestClient``: ``TestClient`` runs the app on its own blocking portal —
+    a separate event loop on a separate thread — so
+    ``anyio.to_thread.current_default_thread_limiter()`` called from this
+    test body would not be the same limiter instance the app's route
+    handlers see. ``ASGITransport`` calls the app in-process on the calling
+    coroutine's own event loop, so the test and the app share one pool.
+    """
+
+    import asyncio
+
+    import anyio.to_thread
+    from httpx import ASGITransport, AsyncClient
+
+    config = _config(tmp_path, state_name="health-under-saturation")
+    app = create_app(config)
+
+    pool = anyio.to_thread.current_default_thread_limiter()
+    original_total = pool.total_tokens
+    pool_size = 4  # small and deterministic, not anyio's real default of 40
+    pool.total_tokens = pool_size
+
+    starts = [threading.Event() for _ in range(pool_size)]
+    release = threading.Event()
+
+    def _hog(start_evt: threading.Event) -> None:
+        start_evt.set()
+        release.wait(timeout=10)
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            hog_tasks = [asyncio.create_task(anyio.to_thread.run_sync(_hog, evt)) for evt in starts]
+            deadline = time.monotonic() + 5
+            while not all(evt.is_set() for evt in starts):
+                assert time.monotonic() < deadline, "hog threads never acquired all pool tokens"
+                await asyncio.sleep(0.01)
+            # Every token is now held, indefinitely (until release.set()) —
+            # the pool is fully saturated with nothing free for anyone else.
+
+            start = time.monotonic()
+            response = await client.get("/health")
+            elapsed = time.monotonic() - start
+            assert response.status_code == 200
+            assert elapsed < 1.0, f"/health took {elapsed:.2f}s under a fully saturated pool"
+        release.set()
+        await asyncio.gather(*hog_tasks)
+    finally:
+        release.set()
+        pool.total_tokens = original_total
+
+
 def test_an_unlimited_replica_never_sheds(tmp_path: Path) -> None:
     """Rule 7 in serving form: the default path is untouched."""
 
@@ -450,6 +547,36 @@ def test_the_drain_handler_is_installed_from_the_lifespan(tmp_path: Path, monkey
     state, seconds = calls[0]
     assert state is app.state.drain
     assert seconds == 2.0
+
+
+def test_max_concurrent_requests_raises_the_thread_pool_budget(tmp_path: Path) -> None:
+    """A4: `max_concurrent_requests` and anyio's thread pool are separate
+    budgets by default (40 tokens, unrelated to the limiter's own count).
+    Wiring them together at lifespan startup is what keeps a request the
+    limiter admits from silently queuing for a thread instead — otherwise
+    setting `max_concurrent_requests` above the pool size reintroduces
+    exactly the blocking behavior shedding exists to replace.
+
+    Reads the pool via ``client.portal`` (available once inside
+    ``with TestClient(app) as client:``) rather than
+    ``anyio.to_thread.current_default_thread_limiter()`` called directly
+    from this test body: that call needs a running event loop in the
+    *current* thread, and this is a plain sync test with none — the pool
+    that matters here lives on TestClient's own portal thread, which is
+    also where the lifespan that raises it actually ran.
+    """
+
+    import anyio.to_thread
+
+    config = _config(tmp_path, state_name="pool-budget", max_concurrent=80)
+    app = create_app(config)
+
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        total = client.portal.call(
+            lambda: anyio.to_thread.current_default_thread_limiter().total_tokens
+        )
+    assert total >= 80, "the pool was not raised to match max_concurrent_requests"
 
 
 def test_installing_off_the_main_thread_does_not_break_startup(tmp_path: Path) -> None:

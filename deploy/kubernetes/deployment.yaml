@@ -41,17 +41,22 @@ spec:
             - name: exports
               mountPath: /exports
           # Probe budgets are sized for a BUSY process, not just a dead one.
-          # pheasant answers from one Python process: a heavy agentic question
-          # or a large graph walk holds the GIL for stretches, and /health —
-          # which returns a constant dict — still has to wait its turn behind
-          # that work. With the old budget (5s timeout, 3 failures, 30s period)
-          # a genuinely healthy pod under load could be killed after ~90s of
-          # slow replies, taking an in-flight sync with it. That is the probe
+          # /health, /ready and /metrics are `async def` routes that answer
+          # without ever needing a token from anyio's shared worker-thread
+          # pool — the budget every sync HTTP route and every MCP tool call
+          # actually runs on (see docs/configuration.md's "Serving
+          # durability" section). This comment used to blame the GIL for a
+          # busy /health; that was measured wrong (a CPU-bound handler cost
+          # /health 0.33s under load, a saturated thread pool cost it 5.23s)
+          # and is corrected now that the real cause is fixed. With the old
+          # budget (5s timeout, 3 failures, 30s period) a genuinely healthy
+          # pod under load could still be killed after ~90s of slow replies,
+          # taking an in-flight sync with it — that was the probe
           # interfering with the workload it is supposed to be protecting.
           #
-          # Liveness therefore only asks "is this process gone", and answers it
-          # slowly: ~5 minutes of no response before a restart. A wedged
-          # process is still caught; a working one is left alone.
+          # Liveness therefore still only asks "is this process gone", and
+          # answers it slowly: ~5 minutes of no response before a restart.
+          # A wedged process is still caught; a working one is left alone.
           livenessProbe:
             httpGet:
               path: /health

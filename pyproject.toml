@@ -37,6 +37,11 @@ dependencies = [
   "pymupdf>=1.24",
   "numpy>=1.26",
   "zstandard>=0.22",
+  # Already pulled in transitively via fastapi/starlette; declared directly
+  # because api/app.py now calls anyio.to_thread itself, to move blocking
+  # work off the event loop instead of leaving it on a sync `def` route by
+  # accident. Bounded to match starlette's own anyio<5,>=3.6.2.
+  "anyio>=3.6.2,<5",
 ]
 
 [project.optional-dependencies]
