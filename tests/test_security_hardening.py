@@ -747,3 +747,98 @@ def test_plugin_connector_types_are_not_credential_checked() -> None:
         "confluence",
         "imap",
     }
+
+
+# ---------------------------------------------------------------------------
+# 10. Memory-record listing ignored scope isolation
+#    (docs/security-audit-2026-08-23.md finding C4)
+# ---------------------------------------------------------------------------
+
+
+def _enable_memory(client: TestClient) -> None:
+    response = client.post("/memory/enable", json={})
+    assert response.status_code == 200, response.text
+
+
+def test_memory_list_without_a_principal_still_returns_everything(workspace: Path) -> None:
+    """The pre-fix behavior is preserved for standalone/single-user use,
+    which never supplies a principal — rule 7, byte-identical default."""
+
+    _config, client = _build(workspace)
+    _enable_memory(client)
+    client.post(
+        "/memory", json={"text": "alice's note", "scope": "user", "principal": "user:alice"}
+    )
+    client.post("/memory", json={"text": "bob's note", "scope": "user", "principal": "user:bob"})
+
+    response = client.get("/memory")
+
+    assert response.status_code == 200
+    texts = {record["text"] for record in response.json()["records"]}
+    assert texts == {"alice's note", "bob's note"}
+
+
+def test_memory_list_with_a_principal_hides_another_principals_records(workspace: Path) -> None:
+    _config, client = _build(workspace)
+    _enable_memory(client)
+    client.post(
+        "/memory", json={"text": "alice's note", "scope": "user", "principal": "user:alice"}
+    )
+    client.post("/memory", json={"text": "bob's note", "scope": "user", "principal": "user:bob"})
+    client.post(
+        "/memory", json={"text": "shared policy", "scope": "org", "principal": "user:alice"}
+    )
+
+    response = client.get("/memory", params={"principal": "user:alice"})
+
+    assert response.status_code == 200
+    texts = {record["text"] for record in response.json()["records"]}
+    assert texts == {"alice's note", "shared policy"}
+    assert "bob's note" not in texts
+
+
+def test_mcp_memory_list_with_a_principal_hides_another_principals_records(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pheasant.mcp_server.tools import PheasantTools
+
+    monkeypatch.setenv("PHEASANT_CONFIG", str(workspace / "pheasant.yaml"))
+    config, client = _build(workspace)
+    _enable_memory(client)
+    client.post(
+        "/memory", json={"text": "alice's note", "scope": "user", "principal": "user:alice"}
+    )
+    client.post("/memory", json={"text": "bob's note", "scope": "user", "principal": "user:bob"})
+
+    tools = PheasantTools(config)
+    result = tools.memory_list(config.knowledge_base_id, principal="user:alice")
+
+    texts = {record["text"] for record in result["records"]}
+    assert texts == {"alice's note"}
+
+    # The "still works" half: no principal is the resource's own behavior
+    # (pheasant://…/memory never passes one) and must stay unfiltered.
+    unfiltered = tools.memory_list(config.knowledge_base_id)
+    assert {record["text"] for record in unfiltered["records"]} == {
+        "alice's note",
+        "bob's note",
+    }
+
+
+def test_is_memory_record_visible_matches_the_documented_scope_rules() -> None:
+    from pheasant.security.acl import is_memory_record_visible
+
+    # org scope: visible to anyone, including no principal at all.
+    assert is_memory_record_visible("org", "user:alice", {"user:alice"}) is True
+    assert is_memory_record_visible("org", "user:alice", {"user:bob"}) is True
+    assert is_memory_record_visible("org", "user:alice", None) is True
+
+    # user/session scope: only the writer.
+    assert is_memory_record_visible("user", "user:alice", {"user:alice"}) is True
+    assert is_memory_record_visible("user", "user:alice", {"user:bob"}) is False
+    assert is_memory_record_visible("session", "user:alice", None) is False
+
+    # No recorded writer, not org scope: any authenticated principal, never
+    # an anonymous one.
+    assert is_memory_record_visible("user", None, {"user:carol"}) is True
+    assert is_memory_record_visible("user", None, None) is False

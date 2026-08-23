@@ -2015,7 +2015,9 @@ def create_app(
         return payload
 
     @app.get("/memory")
-    def memory_list(scope: str | None = None, current_only: bool = False) -> dict:
+    def memory_list(
+        scope: str | None = None, current_only: bool = False, principal: str | None = None
+    ) -> dict:
         from pheasant.memory.store import MemoryStore, memory_source
 
         source = memory_source(config, state)
@@ -2036,8 +2038,26 @@ def create_app(
             compaction = {str(row["record_id"]): row for row in state.memory_compaction_rows()}
         except Exception:
             compaction = {}
+        # Security audit finding C4: without a principal, this stays the
+        # pre-fix "list everything" behavior (standalone/single-user use
+        # never supplies one); with one, every user/session-scope record is
+        # filtered to its own writer — org-scope and un-attributable legacy
+        # records follow is_memory_record_visible's own rule, not "everyone
+        # sees everything" (see that function's docstring).
+        identities: set[str] | None = None
+        if principal:
+            from pheasant.security.acl import expand_principal, is_memory_record_visible
+            from pheasant.security.idp import fresh_idp_groups
+
+            identities = expand_principal(principal, None, config.security.groups)
+            if identities is not None:
+                identities |= fresh_idp_groups(state, principal, config.security.idp)
         out = []
         for record in records:
+            if principal and not is_memory_record_visible(
+                record.scope, record.written_by, identities
+            ):
+                continue
             payload = record.as_dict()
             row = compaction.get(record.record_id)
             payload["tier"] = str(row["tier"]) if row and row.get("tier") else "hot"
