@@ -2,6 +2,11 @@
 
 pheasant indexes local content for agents, so it must be conservative about paths, secrets, and execution.
 
+A [security audit dated 2026-08-23](security-audit-2026-08-23.md) records open
+findings against several claims on this page, including the ACL-coverage
+statement below — treat that audit as the current state of remediation, not
+this page alone.
+
 ## Required controls
 
 - Only index paths under configured allowlisted roots.

@@ -19,6 +19,7 @@ from pheasant.config.schema import (
     ChunkingSettings,
     PheasantConfig,
     PheasantSettings,
+    SecuritySettings,
     SourceConfig,
     SourceConnectorSettings,
     SourceSyncSettings,
@@ -561,4 +562,10 @@ def _config(tmp_path: Path, source: SourceConfig) -> PheasantConfig:
             exports_path=tmp_path / "exports",
         ),
         sources=[source],
+        # These tests fetch from a real HTTP server on loopback (the
+        # `web_server` fixture) — exactly the "self-hosted/local test
+        # endpoint" case security.allow_private_egress exists for (security
+        # audit finding C2). Off by default is what's under test elsewhere
+        # (tests/test_security_hardening.py).
+        security=SecuritySettings(allow_private_egress=True),
     )

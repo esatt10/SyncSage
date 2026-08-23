@@ -909,8 +909,16 @@ def test_an_answer_for_the_wrong_file_is_refused(tmp_path: Path, monkeypatch: An
 
     A batch makes this sharper than it was: results are matched to tasks by
     position, so a worker that reorders or drops one would otherwise commit
-    file A's chunks under file B's stable ID. The identity check turns that
-    into a loud failure instead of a silently wrong index.
+    file A's chunks under file B's stable ID.
+
+    Security audit finding H5 moved the primary defense: `id`/`source_id`/
+    `relative_path` are no longer read from the wire at all (they are
+    derived from the coordinator's own task record), so reordering can no
+    longer desync *those* — what it still desyncs is *content*, which is
+    exactly what the content-hash check below catches. The end result is
+    the same as before the H5 fix: a loud failure instead of a silently
+    wrong index, just from the check that is now the one actually doing
+    the catching.
     """
 
     class Reversing(FakeTransport):
@@ -919,7 +927,7 @@ def test_an_answer_for_the_wrong_file_is_refused(tmp_path: Path, monkeypatch: An
             body["results"] = list(reversed(body["results"]))
             return body, reuse
 
-    with pytest.raises(ValueError, match="different source/item"):
+    with pytest.raises(ValueError, match="wrong content hash"):
         _sync_with_transport(
             tmp_path,
             monkeypatch,

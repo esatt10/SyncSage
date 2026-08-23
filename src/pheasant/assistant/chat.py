@@ -758,7 +758,11 @@ def answer_question(
     max_results = max_results or int(getattr(settings, "max_context_chunks", 8) or 8)
 
     selected = resolve_provider(config, credential, env)
-    llm = llm_from_selection(selected, settings)
+    llm = llm_from_selection(
+        selected,
+        settings,
+        allow_private_egress=bool(getattr(config.security, "allow_private_egress", False)),
+    )
     retriever = PheasantRetriever(
         search=search,
         knowledge_base=knowledge_base,

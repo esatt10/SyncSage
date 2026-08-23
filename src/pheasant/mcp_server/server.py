@@ -228,6 +228,26 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         )
 
     @mcp.tool()
+    def list_memory_records(
+        knowledge_base: str,
+        scope: str | None = None,
+        current_only: bool = True,
+        principal: str | None = None,
+    ) -> dict:
+        """This region's memory records, newest last.
+
+        The `pheasant://…/memory` resource offers the same listing with no
+        `principal` (a resource URI carries no caller identity), which is
+        why this tool exists alongside it: pass `principal` whenever you
+        know the caller's identity, exactly as `memory_write` asks, and only
+        the records that principal may see come back — `user`/`session`-scope
+        records are visible only to their own writer, `org`-scope always is.
+        Omit it and every record is returned, same as the resource.
+        """
+
+        return tools.memory_list(knowledge_base, scope, current_only, principal)
+
+    @mcp.tool()
     def memory_consolidate(knowledge_base: str) -> dict:
         """Archive superseded/expired memory records and re-index the memory source."""
 

@@ -68,6 +68,7 @@ from urllib.request import Request, urlopen
 import numpy as np
 
 from pheasant.search.sqlite_store import _row_result
+from pheasant.security import egress
 
 if TYPE_CHECKING:
     from pheasant.config.schema import EmbeddingsSettings, PheasantConfig
@@ -238,6 +239,8 @@ class OpenAISpecEmbedder:
         timeout: int = 30,
         max_retries: int = 4,
         retry_backoff_seconds: float = 1.0,
+        *,
+        allow_private_egress: bool = False,
     ):
         self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
         self.model = model
@@ -248,6 +251,12 @@ class OpenAISpecEmbedder:
         # Bounded retry on transient transport failures — see _post_with_retry.
         self.max_retries = max(0, int(max_retries))
         self.retry_backoff_seconds = max(0.1, float(retry_backoff_seconds))
+        # security.allow_private_egress (default False) — checked at call
+        # time, in _embed_batch, not here: construction happens at server
+        # startup and on every config hot-reload, and an embedder that is
+        # configured but never actually used to embed should not crash
+        # either of those.
+        self.allow_private_egress = allow_private_egress
         self.calls = 0
         self.texts_embedded = 0
         self._counter_lock = threading.Lock()
@@ -276,7 +285,19 @@ class OpenAISpecEmbedder:
         Only *transient* conditions are retried. A 401 is a wrong key and a 400
         is a malformed request; retrying either burns time and money to fail
         the same way, so both surface immediately.
+
+        The egress check (security audit finding C2) runs once, here, before
+        the retry loop rather than per-attempt via a redirect-validating
+        opener — consistent with how ``assistant/providers.py`` and
+        ``security/idp.py`` treat their own single, operator-configured
+        endpoint: a self-hosted embedding gateway does not itself redirect
+        in normal operation, and this keeps ``urlopen`` a plain, directly
+        monkeypatchable stdlib call (see ``tests/test_vector_search.py``'s
+        retry/backoff tests, which replace it wholesale with a fake).
         """
+        # Not caught/retried: EgressBlocked is not in _TRANSIENT_ERRORS, and a
+        # blocked destination is never going to become allowed on retry.
+        egress.check_fetchable(request.full_url, allow_private=self.allow_private_egress)
         delay = self.retry_backoff_seconds
         last: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -953,7 +974,7 @@ class VectorSearcher:
         return results
 
 
-def build_embedder(settings: EmbeddingsSettings) -> Embedder:
+def build_embedder(settings: EmbeddingsSettings, *, allow_private_egress: bool = False) -> Embedder:
     provider = (settings.provider or "").lower()
     if provider == "stub":
         return StubEmbedder(dim=settings.dimensions, model=settings.model)
@@ -966,6 +987,7 @@ def build_embedder(settings: EmbeddingsSettings) -> Embedder:
             batch_size=settings.batch_size,
             max_retries=getattr(settings, "max_retries", 4),
             retry_backoff_seconds=getattr(settings, "retry_backoff_seconds", 1.0),
+            allow_private_egress=allow_private_egress,
         )
     raise ValueError(
         f"Unsupported search.embeddings.provider {settings.provider!r}; "
@@ -1031,7 +1053,7 @@ def vector_indexer_from_config(config: PheasantConfig) -> VectorIndexer | None:
         return None
     try:
         return VectorIndexer(
-            build_embedder(settings),
+            build_embedder(settings, allow_private_egress=config.security.allow_private_egress),
             build_vector_store(config),
             max_parallel_embeddings=getattr(config.sync.concurrency, "max_parallel_embeddings", 1),
         )

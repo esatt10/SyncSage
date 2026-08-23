@@ -127,3 +127,37 @@ def is_allowed(
     if identities is None:
         return False
     return bool(identities.intersection(acl.get("allow") or []))
+
+
+def is_memory_record_visible(
+    scope: str,
+    written_by: str | None,
+    identities: set[str] | None,
+) -> bool:
+    """May a caller with ``identities`` see one memory record with ``scope``/``written_by``?
+
+    Applies the same isolation :func:`normalize_acl`'s ``"memory"`` branch
+    documents for artifact-level filtering, to *listing* — security audit
+    finding C4: ``GET /memory`` and the MCP memory resource returned every
+    principal's ``user``/``session``-scope records unfiltered, regardless of
+    ``security.acl_enforced``, contradicting the guarantee this module's
+    docstring already states.
+
+    Unlike artifact ACL enforcement, this check does **not** consult
+    ``security.acl_enforced`` — memory scope isolation is a narrower,
+    always-on guarantee once a principal is actually supplied. It also does
+    not consult ``security.default_visibility``: it is always
+    "private-default" (``default_public=False`` below), so a record this
+    function cannot attribute to anyone (no recorded writer, not
+    ``org``-scope — a legacy or malformed record) is visible to any
+    *authenticated* principal and to no one else, never to the whole
+    region regardless of visibility settings.
+
+    Callers that want the pre-fix "list everything" behavior (standalone /
+    single-user use, where no principal is ever supplied) do not call this
+    function at all rather than calling it with ``identities=None`` — see
+    the call sites in ``api/app.py`` and ``mcp_server/tools.py``.
+    """
+    acl_doc = normalize_acl("memory", {"scope": scope, "written_by": written_by})
+    acl_json = json.dumps(acl_doc, sort_keys=True) if acl_doc else None
+    return is_allowed(acl_json, identities, default_public=False)

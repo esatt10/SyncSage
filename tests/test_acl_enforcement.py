@@ -62,6 +62,16 @@ def _config(tmp_path: Path, *, enforced: bool) -> Any:
   workspace_root: {tmp_path}
 security:
   acl_enforced: {str(enforced).lower()}
+  # Security audit finding C3: acl_enforced requires principal_source != "body"
+  # (see PheasantConfig.model_validate). Only the HTTP /search route in this
+  # file (test_http_search_forwards_principal) actually cares which mode —
+  # it sends the principal via header, matching this. The MCP-facing tests
+  # here (synced_tools, get_relevant_files, ...) are unaffected by this
+  # setting either way: an MCP call's principal is trusted the same on every
+  # mode (see pheasant.security.principal's module docstring) — it just has
+  # to be *some* non-"body" value for a config with acl_enforced: true to
+  # load at all.
+  principal_source: {"header" if enforced else "body"}
   groups:
     carol:
       - eng
@@ -136,6 +146,11 @@ def test_enforcement_off_is_pre32_behavior(tmp_path: Path) -> None:
 
 
 def test_http_search_forwards_principal(tmp_path: Path) -> None:
+    """With principal_source: header (this file's default under
+    acl_enforced=True — security audit finding C3), a body-supplied
+    principal is ignored and the X-Pheasant-Principal header is what
+    /search actually honors."""
+
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
     from pheasant.api.app import create_app
 
@@ -146,10 +161,17 @@ def test_http_search_forwards_principal(tmp_path: Path) -> None:
     client = fastapi_testclient.TestClient(app)
     try:
         app.state.engine.sync_source("docs", "incremental")
-        body = {"query": "project", "mode": "text", "principal": "user:alice"}
-        hits = client.post("/search", json=body).json()["results"]
+        body = {"query": "project", "mode": "text"}
+        hits = client.post(
+            "/search", json=body, headers={"X-Pheasant-Principal": "user:alice"}
+        ).json()["results"]
         paths = {h.get("relative_path") for h in hits}
         assert "alice-notes.txt" in paths and "bob-notes.txt" not in paths
+        # A body-supplied principal is no longer trusted under this mode.
+        ignored = client.post(
+            "/search", json={"query": "project", "mode": "text", "principal": "user:alice"}
+        ).json()["results"]
+        assert {h.get("relative_path") for h in ignored} <= {"handbook.txt"}
         anon = client.post("/search", json={"query": "project", "mode": "text"}).json()["results"]
         assert {h.get("relative_path") for h in anon} <= {"handbook.txt"}
     finally:
@@ -210,6 +232,11 @@ sync:
     enabled: false
 security:
   acl_enforced: {"true" if enforced else "false"}
+  # Security audit finding C3: acl_enforced requires principal_source != "body"
+  # to load at all. The tests using this config call PheasantTools (MCP)
+  # directly, which trusts its principal argument the same on every mode —
+  # this just satisfies the schema validator.
+  principal_source: {"header" if enforced else "body"}
 sources:
   - name: docs
     type: document_folder

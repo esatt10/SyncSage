@@ -86,6 +86,7 @@ from pheasant.ingestion.extractor import (
     extract_builtin,
     iter_pdf_content_streams,
 )
+from pheasant.sandbox.accel.cache_security import load_or_compile
 from pheasant.sandbox.wasm_runtime import (
     SandboxError,
     WasmRuntimeUnavailable,
@@ -145,24 +146,7 @@ def _engine_and_module() -> tuple[object, object]:
             config.consume_fuel = True
             engine = wasmtime.Engine(config)
             wasm_bytes = _ACCEL_WASM_PATH.read_bytes()
-            cache = _cache_path(wasm_bytes)
-            module = None
-            if cache.exists():
-                try:
-                    module = wasmtime.Module.deserialize_file(engine, str(cache))
-                except wasmtime.WasmtimeError as exc:
-                    # Fails closed on an engine/architecture mismatch rather
-                    # than loading a stale artifact.
-                    logger.info("extraction WASM cache unusable, recompiling: %s", exc)
-            if module is None:
-                module = wasmtime.Module(engine, wasm_bytes)
-                try:
-                    cache.parent.mkdir(parents=True, exist_ok=True)
-                    tmp = cache.with_suffix(".tmp")
-                    tmp.write_bytes(module.serialize())
-                    tmp.replace(cache)
-                except OSError as exc:
-                    logger.warning("could not write extraction WASM cache: %s", exc)
+            module = load_or_compile(engine, wasm_bytes, _cache_path(wasm_bytes))
             _engine, _module = engine, module
         assert _engine is not None and _module is not None
         return _engine, _module

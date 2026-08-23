@@ -363,6 +363,7 @@ class SyncEngine:
         self.router_webhook = RouterWebhook(
             config.synapse.router_url,
             timeout=config.synapse.webhook_timeout_seconds,
+            allow_private_egress=config.security.allow_private_egress,
         )
         # Mid-sync graph checkpointing (see _maybe_checkpoint_graph).
         self._graph_dirty = False
@@ -964,10 +965,20 @@ class SyncEngine:
     ) -> _PreparedItem:
         """Validate a worker's answer and turn it into a prepared item.
 
-        The two identity checks are not defensive padding: a worker is another
-        process reached over the network, and an answer for the wrong file
-        would be committed under this item's stable ID. Content-addressing the
-        request is what makes them checkable at all.
+        A worker is another process reached over the network, and an answer
+        for the wrong file would be committed under this item's stable ID.
+        ``parsed.source_id``/``.relative_path``/``.id``/``.path``/
+        ``.git_branch``/``.git_commit`` are no longer taken on trust at all
+        (security audit finding H5) — ``remote_worker.parsed_from_wire``
+        derives every one of them from the coordinator's own task record
+        rather than the worker's response, so the identity check below is
+        now structurally unreachable for a genuine mismatch; it stays as a
+        belt-and-suspenders assertion documenting the invariant, not the
+        primary defense. The content-hash check *is* still the primary
+        defense against a worker answering (honestly or not) for the wrong
+        file, or a reordered batch response: ``sha256`` is the one field
+        still read from the wire, cross-checked here against the hash the
+        coordinator computed itself from the bytes it fetched.
         """
 
         previous = artifacts.get(item.relative_path)
@@ -1515,7 +1526,9 @@ class SyncEngine:
         # between per-artifact writes so a kill -9 can land mid-sync.
         slow_sync_s = float(os.environ.get("PHEASANT_TEST_SLOW_SYNC_MS", "0") or 0) / 1000.0
         with self._source_write_lock(source.name):
-            connector = connector_for_source(source, self.state)
+            connector = connector_for_source(
+                source, self.state, allow_private_egress=self.config.security.allow_private_egress
+            )
             if mode == "validate_only":
                 health = connector.validate()
                 status = "validated" if health.ok else health.status

@@ -29,7 +29,9 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from pheasant.security import egress
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +92,12 @@ class RouterWebhook:
     No-op (returns ``False``) when ``router_url`` is unset.
     """
 
-    def __init__(self, router_url: str | None, *, timeout: float = 5.0):
+    def __init__(
+        self, router_url: str | None, *, timeout: float = 5.0, allow_private_egress: bool = False
+    ):
         self.router_url = (router_url or "").rstrip("/") or None
         self.timeout = timeout
+        self.allow_private_egress = allow_private_egress
 
     @property
     def enabled(self) -> bool:
@@ -102,7 +107,10 @@ class RouterWebhook:
         """POST the event to ``<router>/v1/synapse/events``.
 
         Returns ``True`` on a 2xx response, ``False`` when disabled or on any
-        failure (logged, never raised).
+        failure (logged, never raised) — including the destination failing
+        the egress check (security audit finding C2), which surfaces here as
+        an ordinary :class:`~pheasant.security.egress.EgressBlocked`, caught
+        below same as any other reason the webhook could not be delivered.
         """
 
         if not self.enabled:
@@ -116,9 +124,11 @@ class RouterWebhook:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with egress.open_url(
+                request, timeout=self.timeout, allow_private=self.allow_private_egress
+            ) as response:
                 status = int(getattr(response, "status", 0) or response.getcode() or 0)
-        except (URLError, OSError, ValueError) as exc:
+        except (URLError, OSError, ValueError, egress.EgressBlocked) as exc:
             logger.warning("Synapse router webhook to %s failed: %s", url, exc)
             return False
         if 200 <= status < 300:

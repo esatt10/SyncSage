@@ -7,10 +7,10 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import yaml
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
@@ -38,6 +38,9 @@ from pheasant.registry.knowledge_base_registry import KnowledgeBaseRegistry
 from pheasant.registry.source_registry import SourceRegistry
 from pheasant.search.hybrid import HybridSearch
 from pheasant.search.sqlite_store import SearchStore
+from pheasant.security.credentials import (
+    CHECKABLE_CONNECTOR_TYPES as _CHECKABLE_CONNECTOR_TYPES,
+)
 from pheasant.security.path_policy import (
     PathPolicyError,
     resolve_config_write_target,
@@ -402,6 +405,29 @@ LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
 }
 
 
+def _find_credential_env_values(node: Any) -> list[str]:
+    """Every string value of a key literally named ``api_key_env``, at any
+    depth in ``node`` (dicts and lists of dicts) — security audit C1.
+
+    A recursive structural scan rather than a per-section allowlist of
+    dotted paths: ``PATCH /config/section/{section}`` accepts an arbitrary
+    nested ``values`` mapping for *any* section, so a new schema field named
+    ``api_key_env`` anywhere is covered automatically rather than needing a
+    second edit here when one is added.
+    """
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "api_key_env" and isinstance(value, str):
+                found.append(value)
+            else:
+                found.extend(_find_credential_env_values(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_find_credential_env_values(item))
+    return found
+
+
 def _allowed_roots(config: PheasantConfig) -> list[Path]:
     """Roots a UI may browse / register sources under.
 
@@ -504,7 +530,38 @@ def _check_source_type(type_name: str) -> bool:
     )
 
 
-def _source_from_payload(payload: dict) -> SourceConfig:
+def _source_from_payload(payload: dict, config: PheasantConfig | None = None) -> SourceConfig:
+    """Validate one source registration payload.
+
+    ``config`` is optional only so the function stays callable without a
+    live server config in isolation (there are none such callers today; the
+    default exists to keep the signature forgiving); every route below
+    passes its own ``config`` closure variable. When present, and
+    ``payload["type"]`` is one of the first-party connectors this module has
+    a known default credential env var for
+    (:data:`~pheasant.security.credentials.CHECKABLE_CONNECTOR_TYPES` —
+    deliberately not plugin types, see that constant's docstring), any
+    ``connector.api_key_env`` in ``payload`` is checked against
+    :func:`~pheasant.security.credentials.known_credential_envs` — security
+    audit finding C1: an unauthenticated ``POST``/``PUT /sources`` could
+    otherwise name an arbitrary environment variable as a connector's
+    credential and, paired with ``connector.api_endpoint``, ship its value
+    wherever that endpoint points.
+    """
+    if config is not None and payload.get("type") in _CHECKABLE_CONNECTOR_TYPES:
+        connector = payload.get("connector")
+        env_name = connector.get("api_key_env") if isinstance(connector, dict) else None
+        if env_name:
+            from pheasant.security.credentials import (
+                CredentialEnvNotAllowed,
+                known_credential_envs,
+                resolve_credential_env,
+            )
+
+            try:
+                resolve_credential_env(env_name, allowed=known_credential_envs(config))
+            except CredentialEnvNotAllowed as exc:
+                raise ValueError(str(exc)) from exc
     return PheasantConfig.model_validate({"sources": [payload]}).sources[0]
 
 
@@ -1323,7 +1380,7 @@ def create_app(
             except PathPolicyError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
-            source = _source_from_payload(_source_payload(req, resolved))
+            source = _source_from_payload(_source_payload(req, resolved), config=config)
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=400, detail=f"Invalid source: {exc}") from exc
         SourceRegistry(config, state).register_source(source)
@@ -1363,7 +1420,7 @@ def create_app(
                 raise HTTPException(status_code=404, detail=f"Unknown source: {source_id}")
             import json
 
-            source = _source_from_payload(json.loads(row["config_json"]))
+            source = _source_from_payload(json.loads(row["config_json"]), config=config)
         # An edit that doesn't touch the type must not re-validate it: a
         # plugin that got uninstalled shouldn't lock its source out of the
         # form. Only a type the caller actually sends is checked.
@@ -1380,7 +1437,9 @@ def create_app(
             except PathPolicyError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
-            updated = _source_from_payload(_source_payload(req, resolved, existing=source))
+            updated = _source_from_payload(
+                _source_payload(req, resolved, existing=source), config=config
+            )
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=400, detail=f"Invalid source: {exc}") from exc
         engine.graph_builder.remove_source_content(source_id)
@@ -1798,7 +1857,8 @@ def create_app(
                     # default include list is code-shaped and would silently
                     # drop a dropped PDF or .docx.
                     "include": ["**/*"],
-                }
+                },
+                config=config,
             )
             registry.register_source(source)
             config.sources = [s for s in config.sources if s.name != name]
@@ -1866,9 +1926,10 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/memory")
-    def memory_write(req: MemoryWriteRequest) -> dict:
+    def memory_write(req: MemoryWriteRequest, http_request: Request) -> dict:
         from pheasant.memory.reinforcement import StateReinforcementIndex
         from pheasant.memory.store import MemoryStore, memory_source
+        from pheasant.security.principal import resolve_http_principal
 
         source = memory_source(config, state)
         if source is None:
@@ -1879,6 +1940,17 @@ def create_app(
                     "source to pheasant.yaml"
                 ),
             )
+        # Security audit finding H3: written_by must be the *resolved*
+        # principal, not the raw body field — under "body" mode (the only
+        # mode that ever reaches this line unauthenticated by construction)
+        # this is unchanged from before; under "header"/"signed" it is what
+        # stops a caller writing a record attributed to someone else.
+        principal, _groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=req.principal,
+            body_groups=None,
+            config=config,
+        )
         # Phase 1: see the matching comment in mcp_server/tools.py:memory_write.
         reinforcement = (
             StateReinforcementIndex(state) if config.memory.reinforcement_enabled else None
@@ -1892,7 +1964,7 @@ def create_app(
                 supersedes=req.supersedes,
                 tags=req.tags,
                 kind=req.kind,
-                written_by=req.principal,
+                written_by=principal,
                 valid_until=req.valid_until,
                 reinforcement=reinforcement,
             )
@@ -1955,8 +2027,14 @@ def create_app(
         return payload
 
     @app.get("/memory")
-    def memory_list(scope: str | None = None, current_only: bool = False) -> dict:
+    def memory_list(
+        http_request: Request,
+        scope: str | None = None,
+        current_only: bool = False,
+        principal: str | None = None,
+    ) -> dict:
         from pheasant.memory.store import MemoryStore, memory_source
+        from pheasant.security.principal import resolve_http_principal
 
         source = memory_source(config, state)
         if source is None:
@@ -1976,8 +2054,37 @@ def create_app(
             compaction = {str(row["record_id"]): row for row in state.memory_compaction_rows()}
         except Exception:
             compaction = {}
+        principal, _groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=principal,
+            body_groups=None,
+            config=config,
+        )
+        # Security audit finding C4: with no principal *and* principal_source
+        # still "body" (the standalone/single-user default), this stays the
+        # pre-fix "list everything" behavior. Once principal_source is
+        # "header"/"signed" (security audit finding C3), a caller who
+        # presents no valid identity is anonymous, not exempt from
+        # filtering — an unauthenticated request must not see more once the
+        # operator has opted into authenticated principals than it would
+        # once the operator hadn't, which "always filter in that mode" is
+        # what guarantees.
+        from pheasant.security.acl import expand_principal, is_memory_record_visible
+
+        should_filter = bool(principal) or config.security.principal_source != "body"
+        identities: set[str] | None = None
+        if principal:
+            from pheasant.security.idp import fresh_idp_groups
+
+            identities = expand_principal(principal, None, config.security.groups)
+            if identities is not None:
+                identities |= fresh_idp_groups(state, principal, config.security.idp)
         out = []
         for record in records:
+            if should_filter and not is_memory_record_visible(
+                record.scope, record.written_by, identities
+            ):
+                continue
             payload = record.as_dict()
             row = compaction.get(record.record_id)
             payload["tier"] = str(row["tier"]) if row and row.get("tier") else "hot"
@@ -2049,7 +2156,8 @@ def create_app(
 
         try:
             source = _source_from_payload(
-                {"name": req.name, "type": "memory", "path": str(path), "enabled": True}
+                {"name": req.name, "type": "memory", "path": str(path), "enabled": True},
+                config=config,
             )
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=400, detail=f"Invalid source: {exc}") from exc
@@ -2101,7 +2209,13 @@ def create_app(
         if source is None:
             return {"skipped": "no `type: memory` source is configured"}
         records = MemoryStore(source.path).list_records()
-        result = run_synthesis(engine, records, config.memory.synthesis, source)
+        result = run_synthesis(
+            engine,
+            records,
+            config.memory.synthesis,
+            source,
+            allow_private_egress=config.security.allow_private_egress,
+        )
         audit(source.name, "memory_synthesize", result)
         return result
 
@@ -2223,12 +2337,13 @@ def create_app(
         }
 
     @app.post("/search")
-    def search_context(req: SearchRequest) -> dict:
+    def search_context(req: SearchRequest, http_request: Request) -> dict:
         from pheasant.search.criteria import (
             apply_retrieval_criteria,
             criteria_active,
             criteria_dict,
         )
+        from pheasant.security.principal import resolve_http_principal
 
         # Over-fetch when a post-filter will drop rows, so `max_results` keeps
         # meaning "give me this many" — the same bookkeeping the MCP tool does.
@@ -2239,6 +2354,12 @@ def create_app(
             req.source_types,
             req.exclude_source_types,
         )
+        principal, principal_groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=req.principal,
+            body_groups=req.principal_groups,
+            config=config,
+        )
         started = time.perf_counter()
         try:
             payload = search.search_context(
@@ -2248,8 +2369,8 @@ def create_app(
                 req.max_results * 4 if filtering else req.max_results,
                 req.source_name,
                 graph=engine.graph_builder.graph,
-                principal=req.principal,
-                principal_groups=req.principal_groups,
+                principal=principal,
+                principal_groups=principal_groups,
                 security=config.security,
                 section=req.section,
                 memory=req.memory,
@@ -2286,21 +2407,29 @@ def create_app(
         return payload
 
     @app.post("/relevant-files")
-    def relevant_files(req: SearchRequest) -> dict:
+    def relevant_files(req: SearchRequest, http_request: Request) -> dict:
+        from pheasant.security.principal import resolve_http_principal
+
         # Same retrieval as /search, so it must run under the same ACL
         # enforcement: dropping `security`/`principal` here silently returned
         # unfiltered results for every caller whenever acl_enforced was on.
         # No `graph=` on purpose — this route projects to *files*, and graph
         # nodes (concepts, symbols) carry no relative_path, so admitting them
         # would crowd file hits out of the merge and return an empty list.
+        principal, principal_groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=req.principal,
+            body_groups=req.principal_groups,
+            config=config,
+        )
         payload = search.search_context(
             req.knowledge_base or config.knowledge_base_id,
             req.query,
             "hybrid",
             req.max_results,
             req.source_name,
-            principal=req.principal,
-            principal_groups=req.principal_groups,
+            principal=principal,
+            principal_groups=principal_groups,
             security=config.security,
             section=req.section,
             # Same reasoning as the ACL note above: this is the same retrieval,
@@ -2350,10 +2479,19 @@ def create_app(
 
     @app.get("/files/summary")
     def file_summary(
+        http_request: Request,
         path: str,
         source_name: str | None = None,
         principal: str | None = None,
     ) -> dict:
+        from pheasant.security.principal import resolve_http_principal
+
+        principal, _groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=principal,
+            body_groups=None,
+            config=config,
+        )
         # GROUP_CONCAT order is arbitrary unless the input rows are ordered,
         # so concatenate over ordered scalar subqueries to keep summaries and
         # content in chunk order.
@@ -2376,7 +2514,15 @@ def create_app(
         return dict(rows[0])
 
     @app.get("/nodes/content")
-    def node_content(node_id: str, principal: str | None = None) -> dict:
+    def node_content(http_request: Request, node_id: str, principal: str | None = None) -> dict:
+        from pheasant.security.principal import resolve_http_principal
+
+        principal, _groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=principal,
+            body_groups=None,
+            config=config,
+        )
         graph = engine.graph_builder.graph
         attrs = graph.nodes.get(node_id)
         if attrs is None:
@@ -2394,7 +2540,17 @@ def create_app(
         artifact_rows = state.rows("SELECT path FROM artifacts WHERE id=? LIMIT 1", (node_id,))
         if artifact_rows:
             path = Path(artifact_rows[0]["path"])
-            if path.exists() and path.is_file():
+            # Defense in depth for security audit finding H5: an
+            # artifacts.path value can no longer be forged by a remote
+            # worker (remote_worker.parsed_from_wire derives it locally
+            # now), but this still guards against any other path a bad
+            # `artifacts` row could reach this route by, the same way
+            # `_resolve_source_path` guards every other file read.
+            try:
+                path = resolve_under(str(path), _allowed_roots(config))
+            except PathPolicyError:
+                path = None
+            if path is not None and path.exists() and path.is_file():
                 content = read_text(path)
                 if content:
                     return {"node_id": node_id, "content": content}
@@ -2869,6 +3025,21 @@ def create_app(
             VECTOR_STORE_PROVIDERS,
             vector_store_available,
         )
+        from pheasant.security.credentials import (
+            CredentialEnvNotAllowed,
+            known_credential_envs,
+            resolve_credential_env,
+        )
+
+        # Security audit finding C1: `api_key_env` names which environment
+        # variable's value gets sent as a bearer credential to `base_url` —
+        # an unauthenticated caller choosing both was an arbitrary-env-var
+        # exfiltration primitive. Checked before anything else in this route
+        # so a rejected request changes nothing.
+        try:
+            resolve_credential_env(req.api_key_env, allowed=known_credential_envs(config))
+        except CredentialEnvNotAllowed as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         settings = config.search.embeddings
         # Refuse a backend this deployment cannot run *before* touching the
@@ -3092,6 +3263,25 @@ def create_app(
         if not isinstance(req.values, dict):
             raise HTTPException(status_code=400, detail="values must be a mapping")
 
+        # Security audit finding C1: this route can reach `api_key_env` at
+        # any depth (`search.embeddings.api_key_env`, `assistant.api_key_env`,
+        # ...) with no per-field typing to hang a check on the way
+        # `EmbeddingsRequest` has, and it can *persist* to the config file
+        # even for a non-live section, so the check runs on the raw request
+        # body regardless of `section`.
+        from pheasant.security.credentials import (
+            CredentialEnvNotAllowed,
+            known_credential_envs,
+            resolve_credential_env,
+        )
+
+        allowed_envs = known_credential_envs(config)
+        try:
+            for env_name in _find_credential_env_values(req.values):
+                resolve_credential_env(env_name, allowed=allowed_envs)
+        except CredentialEnvNotAllowed as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         from pheasant.config.loader import deep_merge
 
         current = config.model_dump(mode="json")
@@ -3311,13 +3501,20 @@ def create_app(
         return {"revoked": app.state.session_keys.revoke(session_id)}
 
     @app.post("/assistant/chat")
-    def assistant_chat(req: ChatRequest) -> dict:
+    def assistant_chat(req: ChatRequest, http_request: Request) -> dict:
         from pheasant.assistant.chat import answer_question
+        from pheasant.security.principal import resolve_http_principal
 
         if not config.assistant.enabled:
             raise HTTPException(status_code=403, detail="The assistant is disabled")
         if not req.question.strip():
             raise HTTPException(status_code=400, detail="question must not be empty")
+        principal, principal_groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=req.principal,
+            body_groups=req.principal_groups,
+            config=config,
+        )
         return answer_question(
             req.question,
             search=search,
@@ -3332,15 +3529,15 @@ def create_app(
             source_name=req.source_name,
             source_types=req.source_types,
             exclude_source_types=req.exclude_source_types,
-            principal=req.principal,
-            principal_groups=req.principal_groups,
+            principal=principal,
+            principal_groups=principal_groups,
             workflow=req.workflow,
             options=req.options,
             memory=req.memory,
         )
 
     @app.post("/assistant/chat/stream")
-    def assistant_chat_stream(req: ChatRequest):
+    def assistant_chat_stream(req: ChatRequest, http_request: Request):
         """The same answer as ``/assistant/chat``, with progress as it happens.
 
         Server-sent events: one ``step`` per workflow stage the moment it
@@ -3359,11 +3556,18 @@ def create_app(
         from starlette.responses import StreamingResponse
 
         from pheasant.assistant.chat import answer_question
+        from pheasant.security.principal import resolve_http_principal
 
         if not config.assistant.enabled:
             raise HTTPException(status_code=403, detail="The assistant is disabled")
         if not req.question.strip():
             raise HTTPException(status_code=400, detail="question must not be empty")
+        principal, principal_groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=req.principal,
+            body_groups=req.principal_groups,
+            config=config,
+        )
 
         events: queue_module.Queue = queue_module.Queue()
         credential = app.state.session_keys.get(req.session_id)
@@ -3385,8 +3589,8 @@ def create_app(
                     source_name=req.source_name,
                     source_types=req.source_types,
                     exclude_source_types=req.exclude_source_types,
-                    principal=req.principal,
-                    principal_groups=req.principal_groups,
+                    principal=principal,
+                    principal_groups=principal_groups,
                     workflow=req.workflow,
                     options=req.options,
                     on_step=lambda step: events.put(
@@ -3570,7 +3774,7 @@ def create_app(
                 except PathPolicyError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
             try:
-                source = _source_from_payload(payload)
+                source = _source_from_payload(payload, config=config)
             except (ValueError, TypeError) as exc:
                 raise HTTPException(status_code=400, detail=f"Invalid source: {exc}") from exc
             registry.register_source(source)

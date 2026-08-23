@@ -181,6 +181,7 @@ def run_synthesis(
     source: Any,
     *,
     now: datetime | None = None,
+    allow_private_egress: bool = False,
 ) -> dict[str, Any]:
     """One synthesis pass. Never called automatically — see module
     docstring. Returns `{"skipped": reason}` when nothing ran, or
@@ -192,7 +193,7 @@ def run_synthesis(
     from pheasant.assistant.llm import llm_from_selection
 
     selection = _resolve_provider(settings, os.environ)
-    llm = llm_from_selection(selection, settings)
+    llm = llm_from_selection(selection, settings, allow_private_egress=allow_private_egress)
     if llm is None:
         return {"skipped": "no model reachable"}
 

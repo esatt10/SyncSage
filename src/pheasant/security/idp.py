@@ -29,6 +29,8 @@ import urllib.request
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from pheasant.security import egress
+
 logger = logging.getLogger(__name__)
 
 SCIM_PAGE_SIZE = 100
@@ -92,6 +94,16 @@ def run_idp_sync(
         raise ValueError(f"unknown IdP provider {settings.provider!r} (supported: scim)")
     if not settings.base_url:
         raise ValueError("security.idp.base_url is required for SCIM sync")
+    # Validated once, here — not inside _http_get_json, which
+    # tests/test_idp_sync.py replaces wholesale with a 2-argument fake — so
+    # one check covers every paginated request fetch_scim_groups makes
+    # against the same host (security audit finding C2).
+    try:
+        egress.check_fetchable(
+            settings.base_url, allow_private=config.security.allow_private_egress
+        )
+    except egress.EgressBlocked as exc:
+        raise ValueError(str(exc)) from exc
     token = os.environ.get(settings.api_key_env)
     fetcher = fetch or fetch_scim_groups
     mapping = fetcher(settings.base_url, token)

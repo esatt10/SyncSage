@@ -525,15 +525,28 @@ class PheasantTools:
         return result
 
     def memory_list(
-        self, knowledge_base: str, scope: str | None = None, current_only: bool = True
+        self,
+        knowledge_base: str,
+        scope: str | None = None,
+        current_only: bool = True,
+        principal: str | None = None,
     ) -> dict:
         """This region's memory records, newest last.
 
-        Backs the `pheasant://…/memory` resource. `current_only` defaults to
-        **True** here, unlike `GET /memory`, because a resource is context an
-        agent reads directly: handing it corrected records without the
-        supersedes chain to interpret them would be worse than handing it
-        nothing.
+        Backs the `pheasant://…/memory` resource (which never passes
+        `principal` — a resource URI carries no caller identity in this
+        protocol, so that path stays the pre-C4 "list everything" behavior)
+        and the `list_memory_records` tool, which does. `current_only`
+        defaults to **True** here, unlike `GET /memory`, because a resource
+        is context an agent reads directly: handing it corrected records
+        without the supersedes chain to interpret them would be worse than
+        handing it nothing.
+
+        `principal`, when given, filters to records that principal may see
+        — security audit finding C4: unfiltered, this returned every other
+        principal's `user`/`session`-scope records regardless of
+        `security.acl_enforced`. See
+        `pheasant.security.acl.is_memory_record_visible`.
         """
         from pheasant.memory.store import MemoryStore, memory_source
 
@@ -552,8 +565,20 @@ class PheasantTools:
             compaction = {str(row["record_id"]): row for row in self.state.memory_compaction_rows()}
         except Exception:
             compaction = {}
+        identities: set[str] | None = None
+        if principal:
+            from pheasant.security.acl import expand_principal, is_memory_record_visible
+            from pheasant.security.idp import fresh_idp_groups
+
+            identities = expand_principal(principal, None, self.config.security.groups)
+            if identities is not None:
+                identities |= fresh_idp_groups(self.state, principal, self.config.security.idp)
         out = []
         for record in records:
+            if principal and not is_memory_record_visible(
+                record.scope, record.written_by, identities
+            ):
+                continue
             payload = record.as_dict()
             row = compaction.get(record.record_id)
             payload["tier"] = str(row["tier"]) if row and row.get("tier") else "hot"
@@ -604,7 +629,13 @@ class PheasantTools:
         if source is None:
             return {"skipped": "no `type: memory` source is configured"}
         records = MemoryStore(source.path).list_records()
-        result = run_synthesis(self.engine, records, self.config.memory.synthesis, source)
+        result = run_synthesis(
+            self.engine,
+            records,
+            self.config.memory.synthesis,
+            source,
+            allow_private_egress=self.config.security.allow_private_egress,
+        )
         self._audit(source.name, "memory_synthesize", "mcp", "mcp", None, utc_now(), result)
         return result
 

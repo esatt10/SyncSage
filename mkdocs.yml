@@ -94,6 +94,7 @@ nav:
       - Graph model: graph_model.md
       - Parquet export schema: reference/export-schema.md
       - Security: security.md
+      - Security audit (2026-08-23): security-audit-2026-08-23.md
       - Deployment: deployment.md
   - Explanation:
       - Architecture: architecture.md
