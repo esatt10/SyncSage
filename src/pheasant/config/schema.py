@@ -1005,6 +1005,30 @@ class SecuritySettings(ModelMixin):
     # here only to let a caller *change* an integration's credential env
     # var to something new over HTTP/MCP without editing YAML first.
     allowed_credential_envs: list[str] = field(default_factory=list)
+    # Security audit finding C3 (2026-08-23): who the HTTP API trusts as
+    # "the principal" on /search, _acl_guard's callers (/files/summary,
+    # /nodes/content), /assistant/chat and the /memory routes — see
+    # `pheasant.security.principal`. "body" (default) reads it from the
+    # request itself (a JSON field or query string), which is self-asserted
+    # and unauthenticated by construction: any caller can claim to be
+    # anyone. `PheasantConfig.model_validate` refuses `acl_enforced: true`
+    # combined with `principal_source: "body"` — that combination cannot
+    # enforce anything and would only look like it does. "header" trusts
+    # `principal_header` (default `X-Pheasant-Principal`), set by an
+    # authenticating ingress in front of this region — the ingress
+    # authenticates the caller and injects the header; this region trusts
+    # whatever the ingress asserts and never reads a body-supplied principal
+    # at all. "signed" verifies a signed assertion from the Synapse router
+    # (see `pheasant.synapse.signing`), keyed by
+    # `principal_signing_public_key_ref` — for router fan-out, where the
+    # router itself is the thing that should authenticate the original
+    # caller and this region only needs to trust the router's signature.
+    # Deliberately HTTP-only: an MCP tool call's `principal` argument keeps
+    # meaning exactly what it always has, on every setting here — see
+    # `pheasant.security.principal`'s module docstring for why.
+    principal_source: str = "body"
+    principal_header: str = "X-Pheasant-Principal"
+    principal_signing_public_key_ref: str | None = None
 
 
 @dataclass
@@ -1268,6 +1292,25 @@ class PheasantConfig(ModelMixin):
         cfg.storage.sqlite_path = cfg.storage.sqlite_path or state / "pheasant.db"
         cfg.storage.graph_path = cfg.storage.graph_path or state / "graphs"
         cfg.storage.manifest_path = cfg.storage.manifest_path or state / "manifests"
+        if cfg.security.principal_source not in {"body", "header", "signed"}:
+            raise ValueError(
+                f"security.principal_source must be 'body', 'header' or 'signed', "
+                f"got {cfg.security.principal_source!r}"
+            )
+        if cfg.security.acl_enforced and cfg.security.principal_source == "body":
+            # Security audit finding C3: a body-supplied principal is
+            # self-asserted by any caller — acl_enforced under "body" cannot
+            # enforce anything, it would only look like it does. Refusing
+            # this combination at load time is what makes that true in
+            # every deployment rather than a fact this module's docstrings
+            # state and no code checks.
+            raise ValueError(
+                "security.acl_enforced requires security.principal_source to be "
+                "'header' or 'signed' — a body-supplied principal (the default, "
+                "'body') is unauthenticated by construction, so acl_enforced "
+                "would not actually enforce anything. Set security.principal_source "
+                "explicitly, or leave acl_enforced off."
+            )
         return cfg
 
     def effective_source(

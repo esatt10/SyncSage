@@ -70,6 +70,11 @@ def _config(tmp_path: Path, *, idp_enabled: bool = True, staleness_minutes: int 
   workspace_root: {tmp_path}
 security:
   acl_enforced: true
+  # Security audit finding C3: acl_enforced requires principal_source !=
+  # "body" to load at all. This file exercises IdP group sync (a config/
+  # state-level feature), not the HTTP principal channel, so the value here
+  # only needs to satisfy the schema validator.
+  principal_source: header
   groups:
     carol:
       - eng

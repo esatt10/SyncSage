@@ -291,14 +291,24 @@ def test_cors_wildcard_remains_available_as_an_explicit_opt_in(workspace: Path) 
 
 
 def test_relevant_files_enforces_acls_like_search(workspace: Path) -> None:
-    """/relevant-files is /search with a different projection — same filter."""
+    """/relevant-files is /search with a different projection — same filter.
 
-    _config, client = _build(workspace, acl_enforced=True, default_visibility="private")
+    principal_source: header (required alongside acl_enforced since the
+    2026-08-23 C3 fix — see PheasantConfig.model_validate) — the principal
+    goes in X-Pheasant-Principal, not the body, and a body-supplied one is
+    ignored.
+    """
+
+    _config, client = _build(
+        workspace, acl_enforced=True, default_visibility="private", principal_source="header"
+    )
     _register_notes(client, workspace)
 
     anonymous = client.post("/relevant-files", json={"query": "widget service"}).json()["files"]
     identified = client.post(
-        "/relevant-files", json={"query": "widget service", "principal": "user:alice"}
+        "/relevant-files",
+        json={"query": "widget service"},
+        headers={"X-Pheasant-Principal": "user:alice"},
     ).json()["files"]
 
     assert anonymous == []
@@ -332,24 +342,27 @@ def test_relevant_files_still_returns_files_under_a_small_limit(workspace: Path)
 
 
 def test_content_endpoints_enforce_acls(workspace: Path) -> None:
-    """Filtering search while serving the same bytes elsewhere is not enforcement."""
+    """Filtering search while serving the same bytes elsewhere is not enforcement.
 
-    _config, client = _build(workspace, acl_enforced=True, default_visibility="private")
+    principal_source: header, matching the other ACL test in this file —
+    see its docstring.
+    """
+
+    _config, client = _build(
+        workspace, acl_enforced=True, default_visibility="private", principal_source="header"
+    )
     _register_notes(client, workspace)
-    files = client.post(
-        "/relevant-files", json={"query": "widget service", "principal": "user:alice"}
-    ).json()["files"]
+    alice = {"X-Pheasant-Principal": "user:alice"}
+    files = client.post("/relevant-files", json={"query": "widget service"}, headers=alice).json()[
+        "files"
+    ]
     node_id = files[0]["node_id"]
 
     assert client.get("/files/summary", params={"path": "a.md"}).status_code == 403
     assert client.get("/nodes/content", params={"node_id": node_id}).status_code == 403
 
-    allowed_summary = client.get(
-        "/files/summary", params={"path": "a.md", "principal": "user:alice"}
-    )
-    allowed_content = client.get(
-        "/nodes/content", params={"node_id": node_id, "principal": "user:alice"}
-    )
+    allowed_summary = client.get("/files/summary", params={"path": "a.md"}, headers=alice)
+    allowed_content = client.get("/nodes/content", params={"node_id": node_id}, headers=alice)
     assert allowed_summary.status_code == 200
     assert allowed_content.status_code == 200
 
@@ -943,3 +956,237 @@ def test_parsed_from_wire_matches_the_local_parsing_grammar() -> None:
 
     assert parsed is not None
     assert parsed.id == "file:my-source:a/b/c.md:branch=none"
+
+
+# ---------------------------------------------------------------------------
+# 12. ACL enforcement trusted a self-asserted principal
+#    (docs/security-audit-2026-08-23.md finding C3)
+# ---------------------------------------------------------------------------
+
+
+def test_acl_enforced_requires_a_non_body_principal_source(workspace: Path) -> None:
+    """`acl_enforced: true` cannot be configured with the unauthenticated
+    default principal channel — the exact combination that made the
+    feature advisory in every shipped configuration."""
+
+    with pytest.raises(ValueError, match="principal_source"):
+        PheasantConfig.model_validate(
+            {
+                "pheasant": {
+                    "name": "sec",
+                    "workspace_root": str(workspace / "ws"),
+                    "state_path": str(workspace / "state"),
+                    "exports_path": str(workspace / "exports"),
+                },
+                "security": {"acl_enforced": True},
+            }
+        )
+
+
+def test_acl_enforced_still_loads_with_header_principal_source(workspace: Path) -> None:
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(workspace / "ws"),
+                "state_path": str(workspace / "state"),
+                "exports_path": str(workspace / "exports"),
+            },
+            "security": {"acl_enforced": True, "principal_source": "header"},
+        }
+    )
+    assert config.security.acl_enforced is True
+    assert config.security.principal_source == "header"
+
+
+def test_unknown_principal_source_is_rejected(workspace: Path) -> None:
+    with pytest.raises(ValueError, match="principal_source"):
+        PheasantConfig.model_validate(
+            {
+                "pheasant": {
+                    "name": "sec",
+                    "workspace_root": str(workspace / "ws"),
+                    "state_path": str(workspace / "state"),
+                    "exports_path": str(workspace / "exports"),
+                },
+                "security": {"principal_source": "cookie"},
+            }
+        )
+
+
+class _FakeSecurity:
+    def __init__(self, **kwargs: object) -> None:
+        self.principal_source = "body"
+        self.principal_header = "X-Pheasant-Principal"
+        self.principal_signing_public_key_ref = None
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class _FakeConfig:
+    def __init__(self, **kwargs: object) -> None:
+        self.security = _FakeSecurity(**kwargs)
+
+
+def test_resolve_http_principal_body_mode_passes_through_unauthenticated() -> None:
+    from pheasant.security.principal import resolve_http_principal
+
+    principal, groups = resolve_http_principal(
+        headers={},
+        body_principal="user:alice",
+        body_groups=["group:eng"],
+        config=_FakeConfig(),
+    )
+    assert principal == "user:alice"
+    assert groups == ["group:eng"]
+
+
+def test_resolve_http_principal_header_mode_ignores_the_body() -> None:
+    from pheasant.security.principal import resolve_http_principal
+
+    config = _FakeConfig(principal_source="header")
+    principal, groups = resolve_http_principal(
+        headers={"X-Pheasant-Principal": "user:carol"},
+        body_principal="user:attacker",
+        body_groups=["group:admin"],
+        config=config,
+    )
+    assert principal == "user:carol"
+    assert groups is None  # groups are never taken from a header
+
+
+def test_resolve_http_principal_header_mode_with_no_header_is_anonymous() -> None:
+    from pheasant.security.principal import resolve_http_principal
+
+    config = _FakeConfig(principal_source="header")
+    principal, groups = resolve_http_principal(
+        headers={}, body_principal="user:attacker", body_groups=None, config=config
+    )
+    assert principal is None
+    assert groups is None
+
+
+def test_resolve_http_principal_unknown_mode_is_anonymous_not_body() -> None:
+    """A hand-built config (bypassing model_validate) with a bogus mode must
+    not silently fall back to trusting the body."""
+
+    from pheasant.security.principal import resolve_http_principal
+
+    config = _FakeConfig(principal_source="carrier-pigeon")
+    principal, groups = resolve_http_principal(
+        headers={}, body_principal="user:alice", body_groups=None, config=config
+    )
+    assert principal is None
+    assert groups is None
+
+
+def _signed_assertion(claims: dict, seed: bytes) -> tuple[str, str]:
+    import base64
+    import json
+
+    from pheasant.synapse.signing import _require_crypto
+
+    _require_crypto()
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    assertion_bytes = json.dumps(claims, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    private_key = Ed25519PrivateKey.from_private_bytes(seed)
+    signature = private_key.sign(assertion_bytes)
+    return (
+        base64.b64encode(assertion_bytes).decode("ascii"),
+        base64.b64encode(signature).decode("ascii"),
+    )
+
+
+def test_verify_signed_principal_round_trips(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("cryptography")
+    from pheasant.synapse.signing import public_key_b64, verify_signed_principal
+
+    seed = bytes(range(32))
+    monkeypatch.setenv("TEST_ROUTER_PUBKEY", public_key_b64(seed))
+    assertion, signature = _signed_assertion({"principal": "user:alice", "groups": ["eng"]}, seed)
+
+    claims = verify_signed_principal(assertion, signature, "TEST_ROUTER_PUBKEY")
+
+    assert claims["principal"] == "user:alice"
+    assert claims["groups"] == ["eng"]
+
+
+def test_verify_signed_principal_rejects_a_tampered_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cryptography")
+    from pheasant.synapse.signing import (
+        PrincipalSignatureError,
+        public_key_b64,
+        verify_signed_principal,
+    )
+
+    seed = bytes(range(32))
+    other_seed = bytes(range(1, 33))
+    monkeypatch.setenv("TEST_ROUTER_PUBKEY", public_key_b64(seed))
+    # Signed with a *different* key than the one this deployment trusts.
+    assertion, signature = _signed_assertion({"principal": "user:mallory"}, other_seed)
+
+    with pytest.raises(PrincipalSignatureError):
+        verify_signed_principal(assertion, signature, "TEST_ROUTER_PUBKEY")
+
+
+def test_verify_signed_principal_rejects_an_expired_assertion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cryptography")
+    from pheasant.synapse.signing import (
+        PrincipalSignatureError,
+        public_key_b64,
+        verify_signed_principal,
+    )
+
+    seed = bytes(range(32))
+    monkeypatch.setenv("TEST_ROUTER_PUBKEY", public_key_b64(seed))
+    assertion, signature = _signed_assertion(
+        {"principal": "user:alice", "exp": "2020-01-01T00:00:00Z"}, seed
+    )
+
+    with pytest.raises(PrincipalSignatureError, match="expired"):
+        verify_signed_principal(assertion, signature, "TEST_ROUTER_PUBKEY")
+
+
+def test_resolve_http_principal_signed_mode_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The full chain: a valid router-signed header resolves to its
+    principal; a caller-supplied body principal alongside it is ignored."""
+
+    pytest.importorskip("cryptography")
+    from pheasant.security.principal import resolve_http_principal
+    from pheasant.synapse.signing import public_key_b64
+
+    seed = bytes(range(32))
+    monkeypatch.setenv("TEST_ROUTER_PUBKEY", public_key_b64(seed))
+    assertion, signature = _signed_assertion({"principal": "user:dana"}, seed)
+    config = _FakeConfig(
+        principal_source="signed", principal_signing_public_key_ref="TEST_ROUTER_PUBKEY"
+    )
+
+    principal, groups = resolve_http_principal(
+        headers={
+            "X-Pheasant-Principal-Assertion": assertion,
+            "X-Pheasant-Principal-Signature": signature,
+        },
+        body_principal="user:attacker",
+        body_groups=None,
+        config=config,
+    )
+
+    assert principal == "user:dana"
+
+
+def test_resolve_http_principal_signed_mode_with_no_assertion_is_anonymous() -> None:
+    from pheasant.security.principal import resolve_http_principal
+
+    config = _FakeConfig(
+        principal_source="signed", principal_signing_public_key_ref="TEST_ROUTER_PUBKEY"
+    )
+    principal, groups = resolve_http_principal(
+        headers={}, body_principal="user:attacker", body_groups=None, config=config
+    )
+    assert principal is None

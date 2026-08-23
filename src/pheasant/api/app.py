@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import yaml
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
@@ -1926,9 +1926,10 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/memory")
-    def memory_write(req: MemoryWriteRequest) -> dict:
+    def memory_write(req: MemoryWriteRequest, http_request: Request) -> dict:
         from pheasant.memory.reinforcement import StateReinforcementIndex
         from pheasant.memory.store import MemoryStore, memory_source
+        from pheasant.security.principal import resolve_http_principal
 
         source = memory_source(config, state)
         if source is None:
@@ -1939,6 +1940,17 @@ def create_app(
                     "source to pheasant.yaml"
                 ),
             )
+        # Security audit finding H3: written_by must be the *resolved*
+        # principal, not the raw body field — under "body" mode (the only
+        # mode that ever reaches this line unauthenticated by construction)
+        # this is unchanged from before; under "header"/"signed" it is what
+        # stops a caller writing a record attributed to someone else.
+        principal, _groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=req.principal,
+            body_groups=None,
+            config=config,
+        )
         # Phase 1: see the matching comment in mcp_server/tools.py:memory_write.
         reinforcement = (
             StateReinforcementIndex(state) if config.memory.reinforcement_enabled else None
@@ -1952,7 +1964,7 @@ def create_app(
                 supersedes=req.supersedes,
                 tags=req.tags,
                 kind=req.kind,
-                written_by=req.principal,
+                written_by=principal,
                 valid_until=req.valid_until,
                 reinforcement=reinforcement,
             )
@@ -2016,9 +2028,13 @@ def create_app(
 
     @app.get("/memory")
     def memory_list(
-        scope: str | None = None, current_only: bool = False, principal: str | None = None
+        http_request: Request,
+        scope: str | None = None,
+        current_only: bool = False,
+        principal: str | None = None,
     ) -> dict:
         from pheasant.memory.store import MemoryStore, memory_source
+        from pheasant.security.principal import resolve_http_principal
 
         source = memory_source(config, state)
         if source is None:
@@ -2038,15 +2054,26 @@ def create_app(
             compaction = {str(row["record_id"]): row for row in state.memory_compaction_rows()}
         except Exception:
             compaction = {}
-        # Security audit finding C4: without a principal, this stays the
-        # pre-fix "list everything" behavior (standalone/single-user use
-        # never supplies one); with one, every user/session-scope record is
-        # filtered to its own writer — org-scope and un-attributable legacy
-        # records follow is_memory_record_visible's own rule, not "everyone
-        # sees everything" (see that function's docstring).
+        principal, _groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=principal,
+            body_groups=None,
+            config=config,
+        )
+        # Security audit finding C4: with no principal *and* principal_source
+        # still "body" (the standalone/single-user default), this stays the
+        # pre-fix "list everything" behavior. Once principal_source is
+        # "header"/"signed" (security audit finding C3), a caller who
+        # presents no valid identity is anonymous, not exempt from
+        # filtering — an unauthenticated request must not see more once the
+        # operator has opted into authenticated principals than it would
+        # once the operator hadn't, which "always filter in that mode" is
+        # what guarantees.
+        from pheasant.security.acl import expand_principal, is_memory_record_visible
+
+        should_filter = bool(principal) or config.security.principal_source != "body"
         identities: set[str] | None = None
         if principal:
-            from pheasant.security.acl import expand_principal, is_memory_record_visible
             from pheasant.security.idp import fresh_idp_groups
 
             identities = expand_principal(principal, None, config.security.groups)
@@ -2054,7 +2081,7 @@ def create_app(
                 identities |= fresh_idp_groups(state, principal, config.security.idp)
         out = []
         for record in records:
-            if principal and not is_memory_record_visible(
+            if should_filter and not is_memory_record_visible(
                 record.scope, record.written_by, identities
             ):
                 continue
@@ -2310,12 +2337,13 @@ def create_app(
         }
 
     @app.post("/search")
-    def search_context(req: SearchRequest) -> dict:
+    def search_context(req: SearchRequest, http_request: Request) -> dict:
         from pheasant.search.criteria import (
             apply_retrieval_criteria,
             criteria_active,
             criteria_dict,
         )
+        from pheasant.security.principal import resolve_http_principal
 
         # Over-fetch when a post-filter will drop rows, so `max_results` keeps
         # meaning "give me this many" — the same bookkeeping the MCP tool does.
@@ -2326,6 +2354,12 @@ def create_app(
             req.source_types,
             req.exclude_source_types,
         )
+        principal, principal_groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=req.principal,
+            body_groups=req.principal_groups,
+            config=config,
+        )
         started = time.perf_counter()
         try:
             payload = search.search_context(
@@ -2335,8 +2369,8 @@ def create_app(
                 req.max_results * 4 if filtering else req.max_results,
                 req.source_name,
                 graph=engine.graph_builder.graph,
-                principal=req.principal,
-                principal_groups=req.principal_groups,
+                principal=principal,
+                principal_groups=principal_groups,
                 security=config.security,
                 section=req.section,
                 memory=req.memory,
@@ -2373,21 +2407,29 @@ def create_app(
         return payload
 
     @app.post("/relevant-files")
-    def relevant_files(req: SearchRequest) -> dict:
+    def relevant_files(req: SearchRequest, http_request: Request) -> dict:
+        from pheasant.security.principal import resolve_http_principal
+
         # Same retrieval as /search, so it must run under the same ACL
         # enforcement: dropping `security`/`principal` here silently returned
         # unfiltered results for every caller whenever acl_enforced was on.
         # No `graph=` on purpose — this route projects to *files*, and graph
         # nodes (concepts, symbols) carry no relative_path, so admitting them
         # would crowd file hits out of the merge and return an empty list.
+        principal, principal_groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=req.principal,
+            body_groups=req.principal_groups,
+            config=config,
+        )
         payload = search.search_context(
             req.knowledge_base or config.knowledge_base_id,
             req.query,
             "hybrid",
             req.max_results,
             req.source_name,
-            principal=req.principal,
-            principal_groups=req.principal_groups,
+            principal=principal,
+            principal_groups=principal_groups,
             security=config.security,
             section=req.section,
             # Same reasoning as the ACL note above: this is the same retrieval,
@@ -2437,10 +2479,19 @@ def create_app(
 
     @app.get("/files/summary")
     def file_summary(
+        http_request: Request,
         path: str,
         source_name: str | None = None,
         principal: str | None = None,
     ) -> dict:
+        from pheasant.security.principal import resolve_http_principal
+
+        principal, _groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=principal,
+            body_groups=None,
+            config=config,
+        )
         # GROUP_CONCAT order is arbitrary unless the input rows are ordered,
         # so concatenate over ordered scalar subqueries to keep summaries and
         # content in chunk order.
@@ -2463,7 +2514,15 @@ def create_app(
         return dict(rows[0])
 
     @app.get("/nodes/content")
-    def node_content(node_id: str, principal: str | None = None) -> dict:
+    def node_content(http_request: Request, node_id: str, principal: str | None = None) -> dict:
+        from pheasant.security.principal import resolve_http_principal
+
+        principal, _groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=principal,
+            body_groups=None,
+            config=config,
+        )
         graph = engine.graph_builder.graph
         attrs = graph.nodes.get(node_id)
         if attrs is None:
@@ -3442,13 +3501,20 @@ def create_app(
         return {"revoked": app.state.session_keys.revoke(session_id)}
 
     @app.post("/assistant/chat")
-    def assistant_chat(req: ChatRequest) -> dict:
+    def assistant_chat(req: ChatRequest, http_request: Request) -> dict:
         from pheasant.assistant.chat import answer_question
+        from pheasant.security.principal import resolve_http_principal
 
         if not config.assistant.enabled:
             raise HTTPException(status_code=403, detail="The assistant is disabled")
         if not req.question.strip():
             raise HTTPException(status_code=400, detail="question must not be empty")
+        principal, principal_groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=req.principal,
+            body_groups=req.principal_groups,
+            config=config,
+        )
         return answer_question(
             req.question,
             search=search,
@@ -3463,15 +3529,15 @@ def create_app(
             source_name=req.source_name,
             source_types=req.source_types,
             exclude_source_types=req.exclude_source_types,
-            principal=req.principal,
-            principal_groups=req.principal_groups,
+            principal=principal,
+            principal_groups=principal_groups,
             workflow=req.workflow,
             options=req.options,
             memory=req.memory,
         )
 
     @app.post("/assistant/chat/stream")
-    def assistant_chat_stream(req: ChatRequest):
+    def assistant_chat_stream(req: ChatRequest, http_request: Request):
         """The same answer as ``/assistant/chat``, with progress as it happens.
 
         Server-sent events: one ``step`` per workflow stage the moment it
@@ -3490,11 +3556,18 @@ def create_app(
         from starlette.responses import StreamingResponse
 
         from pheasant.assistant.chat import answer_question
+        from pheasant.security.principal import resolve_http_principal
 
         if not config.assistant.enabled:
             raise HTTPException(status_code=403, detail="The assistant is disabled")
         if not req.question.strip():
             raise HTTPException(status_code=400, detail="question must not be empty")
+        principal, principal_groups = resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=req.principal,
+            body_groups=req.principal_groups,
+            config=config,
+        )
 
         events: queue_module.Queue = queue_module.Queue()
         credential = app.state.session_keys.get(req.session_id)
@@ -3516,8 +3589,8 @@ def create_app(
                     source_name=req.source_name,
                     source_types=req.source_types,
                     exclude_source_types=req.exclude_source_types,
-                    principal=req.principal,
-                    principal_groups=req.principal_groups,
+                    principal=principal,
+                    principal_groups=principal_groups,
                     workflow=req.workflow,
                     options=req.options,
                     on_step=lambda step: events.put(
