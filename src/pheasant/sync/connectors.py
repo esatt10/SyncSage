@@ -12,12 +12,13 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import unquote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from pheasant.config.schema import SourceConfig
 from pheasant.ingestion.pipeline import _match_any, utc_now, within_max_depth
 from pheasant.ingestion.walk import walk_source
 from pheasant.persistence.state_store import StateStore
+from pheasant.security import egress
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,16 @@ class SourceConnector(ABC):
     def __init__(self, source: SourceConfig, state: StateStore):
         self.source = source
         self.state = state
+        # security.allow_private_egress (default False), set by
+        # connector_for_source() after construction rather than threaded
+        # through every subclass's __init__ — including third-party plugin
+        # connectors, whose documented constructor shape
+        # (pheasant.testing.ConnectorConformance) is exactly (source, state)
+        # and must not need to change to pick this up. Only
+        # WebCollectionConnector and APIConnector consult it (they are the
+        # ones that fetch over HTTP); every other connector carries the
+        # attribute unused.
+        self.allow_private_egress = False
         self.sync_mode: str | None = None
         self._previous_cursor: dict[str, Any] | None = None
         self._previous_watermark: dict[str, Any] | None = None
@@ -282,7 +293,7 @@ class WebCollectionConnector(SourceConnector):
         self._require_experimental_enabled()
         items: list[ConnectorItem] = []
         for index, url in enumerate(self.source.urls):
-            if not is_fetchable_url(url):
+            if not is_fetchable_url(url, allow_private=self.allow_private_egress):
                 # Drop it here rather than at read time, so one unfetchable
                 # URL (a `file://` that would have read the host filesystem)
                 # is a skipped item and not a failed sync for every other URL
@@ -317,6 +328,7 @@ class WebCollectionConnector(SourceConnector):
             timeout=self.source.connector.request_timeout_seconds,
             etag=cached.get("etag"),
             last_modified=cached.get("last_modified"),
+            allow_private=self.allow_private_egress,
         )
         if response.get("not_modified"):
             # Carry validators forward so the next sync stays conditional.
@@ -391,6 +403,7 @@ class APIConnector(SourceConnector):
             endpoint,
             headers=self.source.connector.headers,
             timeout=self.source.connector.request_timeout_seconds,
+            allow_private=self.allow_private_egress,
         )
         payload = json.loads(response["content"].decode("utf-8"))
         raw_items = payload.get(self.source.connector.api_items_field, payload)
@@ -479,6 +492,7 @@ class APIConnector(SourceConnector):
             item.uri,
             headers=self.source.connector.headers,
             timeout=self.source.connector.request_timeout_seconds,
+            allow_private=self.allow_private_egress,
         )
         content = response["content"]
         digest = hashlib.sha256(content).hexdigest()
@@ -604,7 +618,21 @@ class S3Connector(SourceConnector):
         )
 
 
-def connector_for_source(source: SourceConfig, state: StateStore) -> SourceConnector:
+def connector_for_source(
+    source: SourceConfig,
+    state: StateStore,
+    *,
+    allow_private_egress: bool = False,
+) -> SourceConnector:
+    """Build the connector for ``source``.
+
+    ``allow_private_egress`` is ``security.allow_private_egress`` from the
+    caller's config (default False): set on every returned connector rather
+    than threaded through each subclass's constructor, so a third-party
+    connector plugin's documented ``__init__(self, source, state)`` shape
+    (``pheasant.testing.ConnectorConformance``) never needs to change to
+    carry it. Only the HTTP-fetching connectors consult it.
+    """
     if source.connector.runtime == "sandboxed":
         # Synapse Step 34.1+: opt-in per source, checked before the
         # source.type dispatch below so it takes precedence. Default
@@ -622,9 +650,13 @@ def connector_for_source(source: SourceConfig, state: StateStore) -> SourceConne
     }:
         return FilesystemConnector(source, state)
     if source.type.value == "web_collection":
-        return WebCollectionConnector(source, state)
+        connector = WebCollectionConnector(source, state)
+        connector.allow_private_egress = allow_private_egress
+        return connector
     if source.type.value == "api":
-        return APIConnector(source, state)
+        connector = APIConnector(source, state)
+        connector.allow_private_egress = allow_private_egress
+        return connector
     if source.type.value == "s3":
         return S3Connector(source, state)
     from pheasant.sync.connector_registry import get_connector_class, list_connector_types
@@ -662,25 +694,42 @@ def _path_uri(path: Path) -> str:
 #: serves it straight back out of ``/search``. Fetching remote documents is
 #: the feature; reading the host filesystem through the same door is not —
 #: local content has its own connector, with its own path policy.
-FETCHABLE_SCHEMES = frozenset({"http", "https"})
+#:
+#: Kept as an alias of ``security.egress.FETCHABLE_SCHEMES`` (not a second
+#: definition) so ``pheasant.sandbox.wasm_runtime`` — which imports
+#: ``require_fetchable_url``/``is_fetchable_url`` from here for the
+#: sandboxed-connector guest fetch path — and every other existing caller
+#: keep working unchanged while the scheme+host check both now share.
+FETCHABLE_SCHEMES = egress.FETCHABLE_SCHEMES
 
 
-def is_fetchable_url(url: str) -> bool:
-    """Whether the connectors may fetch ``url`` at all."""
-    return urlparse(url).scheme.lower() in FETCHABLE_SCHEMES
+def is_fetchable_url(url: str, *, allow_private: bool = False) -> bool:
+    """Whether the connectors may fetch ``url`` at all: scheme *and* host.
+
+    Denies a private/loopback/link-local/reserved resolved address by
+    default — connector fetches (a "web collection"/"api" source, or a
+    sandboxed guest's ``host_fetch``) are reachable by registering a source
+    over the unauthenticated HTTP/MCP surface and triggering a sync. Callers
+    with access to ``security.allow_private_egress`` (``WebCollectionConnector``
+    / ``APIConnector``, via ``self.allow_private_egress``) pass it through
+    explicitly; every other caller — including
+    ``pheasant.sandbox.wasm_runtime``'s sandboxed-guest fetch path, which
+    intentionally never sees this flag — keeps the strict default, since a
+    sandboxed guest reaching an operator's internal network is exactly the
+    class of access the sandbox exists to deny even when the host is on the
+    guest's own ``allowed_hosts`` list.
+    """
+    return egress.is_fetchable(url, allow_private=allow_private)
 
 
-def require_fetchable_url(url: str) -> str:
-    """Reject any URL whose scheme the connectors must not fetch."""
-    scheme = urlparse(url).scheme.lower()
-    if not is_fetchable_url(url):
+def require_fetchable_url(url: str, *, allow_private: bool = False) -> str:
+    """Reject any URL that :func:`is_fetchable_url` would reject."""
+    try:
+        return egress.check_fetchable(url, allow_private=allow_private)
+    except egress.EgressBlocked as exc:
         raise ConnectorUnavailable(
-            f"refusing to fetch {url!r}: only "
-            f"{'/'.join(sorted(FETCHABLE_SCHEMES))} URLs may be fetched "
-            f"(got scheme {scheme or 'none'!r}). Index local content with a "
-            f"filesystem source instead."
-        )
-    return url
+            f"{exc} Index local content with a filesystem source instead."
+        ) from exc
 
 
 def _urlopen(
@@ -689,8 +738,10 @@ def _urlopen(
     timeout: int,
     etag: str | None = None,
     last_modified: str | None = None,
+    *,
+    allow_private: bool = False,
 ) -> dict[str, Any]:
-    require_fetchable_url(url)
+    require_fetchable_url(url, allow_private=allow_private)
     request_headers = {"User-Agent": "pheasant/0.1"}
     request_headers.update(headers)
     if etag:
@@ -699,7 +750,7 @@ def _urlopen(
         request_headers["If-Modified-Since"] = last_modified
     request = Request(url, headers=request_headers)
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with egress.open_url(request, timeout=timeout, allow_private=allow_private) as response:
             content = response.read()
             info = response.info()
             mime_type = info.get_content_type() if hasattr(info, "get_content_type") else None

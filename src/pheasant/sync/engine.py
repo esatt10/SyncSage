@@ -363,6 +363,7 @@ class SyncEngine:
         self.router_webhook = RouterWebhook(
             config.synapse.router_url,
             timeout=config.synapse.webhook_timeout_seconds,
+            allow_private_egress=config.security.allow_private_egress,
         )
         # Mid-sync graph checkpointing (see _maybe_checkpoint_graph).
         self._graph_dirty = False
@@ -1515,7 +1516,9 @@ class SyncEngine:
         # between per-artifact writes so a kill -9 can land mid-sync.
         slow_sync_s = float(os.environ.get("PHEASANT_TEST_SLOW_SYNC_MS", "0") or 0) / 1000.0
         with self._source_write_lock(source.name):
-            connector = connector_for_source(source, self.state)
+            connector = connector_for_source(
+                source, self.state, allow_private_egress=self.config.security.allow_private_egress
+            )
             if mode == "validate_only":
                 health = connector.validate()
                 status = "validated" if health.ok else health.status

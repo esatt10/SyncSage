@@ -49,6 +49,10 @@ def _publish_engine(tmp_path: Path, *, embeddings: bool = True, **synapse: Any) 
     engine.router_webhook = RouterWebhook(
         engine.config.synapse.router_url,
         timeout=engine.config.synapse.webhook_timeout_seconds,
+        # router_server (conftest) is a real HTTP server on loopback —
+        # exactly the self-hosted-endpoint case security.allow_private_egress
+        # exists for (security audit finding C2).
+        allow_private_egress=True,
     )
     return engine
 

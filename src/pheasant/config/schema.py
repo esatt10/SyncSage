@@ -987,6 +987,24 @@ class SecuritySettings(ModelMixin):
     read_only_sources: bool = True
     deny_path_traversal: bool = True
     default_exclude_secrets: bool = True
+    # Security audit finding C2 (2026-08-23): off by default, an
+    # unauthenticated `POST /sources` + `POST /sync` can otherwise point a
+    # web_collection/api connector — or, once enabled, the IdP sync, the
+    # Synapse router webhook, or the assistant/embeddings provider — at a
+    # cloud metadata endpoint, a loopback admin surface, or an internal
+    # RFC1918/link-local address. See `pheasant.security.egress` for exactly
+    # which surfaces honor this and which (the sandboxed-connector guest
+    # fetch path) never do regardless of it.
+    allow_private_egress: bool = False
+    # Security audit finding C1 (2026-08-23): the credential-env-var
+    # allowlist `pheasant.security.credentials.known_credential_envs`
+    # checks any HTTP/MCP-supplied `api_key_env` against. Empty by
+    # default — every integration's own documented default env var name
+    # (per provider/connector) and whatever this config already has
+    # configured are always allowed regardless of this list; add a name
+    # here only to let a caller *change* an integration's credential env
+    # var to something new over HTTP/MCP without editing YAML first.
+    allowed_credential_envs: list[str] = field(default_factory=list)
 
 
 @dataclass

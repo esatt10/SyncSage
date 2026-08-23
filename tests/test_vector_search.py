@@ -275,6 +275,12 @@ def test_openai_spec_embedder_wire_format(monkeypatch: pytest.MonkeyPatch) -> No
         api_key_env="PHEASANT_TEST_EMBED_KEY",
         dimensions=2,
         batch_size=8,
+        # This test is offline wire-format conformance (the fake `urlopen`
+        # above never touches a socket); `localhost:9` is a stand-in
+        # endpoint, not a real destination, so the egress check
+        # (security audit finding C2) that would otherwise refuse it is
+        # opted out of rather than mocked separately.
+        allow_private_egress=True,
     )
     vectors = embedder.embed(["alpha", "beta"])
 

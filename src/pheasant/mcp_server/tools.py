@@ -604,7 +604,13 @@ class PheasantTools:
         if source is None:
             return {"skipped": "no `type: memory` source is configured"}
         records = MemoryStore(source.path).list_records()
-        result = run_synthesis(self.engine, records, self.config.memory.synthesis, source)
+        result = run_synthesis(
+            self.engine,
+            records,
+            self.config.memory.synthesis,
+            source,
+            allow_private_egress=self.config.security.allow_private_egress,
+        )
         self._audit(source.name, "memory_synthesize", "mcp", "mcp", None, utc_now(), result)
         return result
 

@@ -28,6 +28,7 @@ class LLM:
     source: str = "environment"
     max_output_tokens: int = 4096
     timeout: float = 90.0
+    allow_private_egress: bool = False
 
     @property
     def model_id(self) -> str:
@@ -45,6 +46,7 @@ class LLM:
             base_url=self.base_url,
             max_output_tokens=max_output_tokens or self.max_output_tokens,
             timeout=self.timeout,
+            allow_private_egress=self.allow_private_egress,
         )
 
     def try_complete(self, system: str, prompt: str, **kwargs: Any) -> str | None:
@@ -61,7 +63,9 @@ class LLM:
             return None
 
 
-def llm_from_selection(selection: dict | None, settings: Any) -> LLM | None:
+def llm_from_selection(
+    selection: dict | None, settings: Any, *, allow_private_egress: bool = False
+) -> LLM | None:
     """Build an :class:`LLM` from :func:`chat.resolve_provider` output."""
     if not selection:
         return None
@@ -73,4 +77,5 @@ def llm_from_selection(selection: dict | None, settings: Any) -> LLM | None:
         source=selection.get("source", "environment"),
         max_output_tokens=int(getattr(settings, "max_output_tokens", 4096) or 4096),
         timeout=float(getattr(settings, "request_timeout_seconds", 90.0) or 90.0),
+        allow_private_egress=allow_private_egress,
     )

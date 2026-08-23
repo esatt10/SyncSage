@@ -38,6 +38,7 @@ from pheasant.assistant.catalog import (
 from pheasant.assistant.catalog import (
     resolve_auto_provider as catalog_resolve_auto_provider,
 )
+from pheasant.security import egress
 
 DEFAULT_TIMEOUT = 90.0
 
@@ -118,7 +119,17 @@ def _http_json(
     headers: dict[str, str],
     timeout: float,
 ) -> dict:
-    """POST JSON, return parsed JSON. The single monkeypatch seam."""
+    """POST JSON, return parsed JSON. The single monkeypatch seam.
+
+    Signature deliberately unchanged (still exactly these four positional
+    parameters, no ``allow_private`` here) — this is the exact function
+    ``tests/test_assistant_chat.py`` and ``tests/test_memory_synthesis.py``
+    replace wholesale with a 4-argument fake, and widening it would break
+    every one of those fakes for no test-visible benefit, since the egress
+    check that matters for this call path is the one :func:`complete` runs
+    against ``base`` before ever reaching here (see its docstring for why
+    that single check is what closes the audit finding for this surface).
+    """
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -129,8 +140,11 @@ def _http_json(
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:  # pragma: no cover - network path
-        detail = exc.read().decode("utf-8", "replace")[:600]
-        raise ProviderError(f"{exc.code} from provider: {detail}") from exc
+        # Bounded to the status line's worth of context, not the response
+        # body: a 600-char echo of whatever the upstream returned is a
+        # reflection channel back to a caller who does not otherwise get to
+        # see that response (security audit finding C2).
+        raise ProviderError(f"{exc.code} from provider: {exc.reason}") from exc
     except urllib.error.URLError as exc:  # pragma: no cover - network path
         raise ProviderError(f"could not reach provider: {exc.reason}") from exc
 
@@ -145,8 +159,20 @@ def complete(
     base_url: str | None = None,
     max_output_tokens: int = 4096,
     timeout: float = DEFAULT_TIMEOUT,
+    allow_private_egress: bool = False,
 ) -> str:
-    """Single-turn completion. Returns the assistant's text."""
+    """Single-turn completion. Returns the assistant's text.
+
+    ``allow_private_egress`` gates one check, run here rather than inside
+    ``_http_json`` (see that function's docstring): ``base`` must be an
+    http(s) URL that does not resolve to a private/loopback/link-local
+    address unless the caller opts in. This is the operator-configured
+    endpoint (``assistant.base_url`` / a session-supplied ``base_url``, both
+    locked to operator-only config over HTTP by the C1 remediation), so one
+    check against it covers this surface — a self-hosted gateway does not
+    itself redirect in normal operation, unlike a "web collection" source
+    fetching arbitrary remote content.
+    """
     spec = PROVIDERS.get(provider)
     if spec is None:
         raise ProviderError(
@@ -156,6 +182,10 @@ def complete(
         raise ProviderError(f"no API key available for {spec.label}")
     model = model or spec.default_model
     base = (base_url or spec.default_base_url).rstrip("/")
+    try:
+        egress.check_fetchable(base, allow_private=allow_private_egress)
+    except egress.EgressBlocked as exc:
+        raise ProviderError(str(exc)) from exc
 
     if provider == "anthropic":
         return _anthropic(base, api_key, model, system, prompt, max_output_tokens, timeout)

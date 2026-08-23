@@ -555,3 +555,195 @@ def test_wasm_cache_dir_and_file_created_by_this_process_are_still_trusted(
     # A file that does not exist yet is not distrusted — there is nothing to
     # distrust, and refusing it would break the first-ever cache write.
     assert secure_cache_file(cache_dir / "not-written-yet.cwasm") is not None
+
+
+# ---------------------------------------------------------------------------
+# 9. Arbitrary environment-variable exfiltration via api_key_env, and
+#    unrestricted SSRF (docs/security-audit-2026-08-23.md findings C1, C2)
+# ---------------------------------------------------------------------------
+
+
+def test_embeddings_update_refuses_an_unapproved_credential_env(workspace: Path) -> None:
+    """`api_key_env` may not name an arbitrary environment variable."""
+
+    _config, client = _build(workspace)
+
+    response = client.put("/search/embeddings", json={"api_key_env": "AWS_SECRET_ACCESS_KEY"})
+
+    assert response.status_code == 400
+    assert "AWS_SECRET_ACCESS_KEY" in response.json()["detail"]
+    assert "not an approved credential" in response.json()["detail"]
+
+
+def test_embeddings_update_still_accepts_the_providers_own_default_env(workspace: Path) -> None:
+    config, client = _build(workspace)
+
+    response = client.put("/search/embeddings", json={"api_key_env": "OPENAI_API_KEY"})
+
+    assert response.status_code == 200
+    assert config.search.embeddings.api_key_env == "OPENAI_API_KEY"
+
+
+def test_config_section_patch_refuses_a_nested_unapproved_credential_env(
+    workspace: Path,
+) -> None:
+    """The generic PATCH surface is checked too, at any nesting depth."""
+
+    _config, client = _build(workspace)
+
+    response = client.patch(
+        "/config/section/assistant",
+        json={"values": {"api_key_env": "PHEASANT_INDEX_WORKER_TOKEN"}},
+    )
+
+    assert response.status_code == 400
+    assert "PHEASANT_INDEX_WORKER_TOKEN" in response.json()["detail"]
+
+
+def test_config_section_patch_still_accepts_a_known_provider_env(workspace: Path) -> None:
+    config, client = _build(workspace)
+
+    response = client.patch(
+        "/config/section/assistant",
+        json={"values": {"api_key_env": "ANTHROPIC_API_KEY"}},
+    )
+
+    assert response.status_code == 200
+    assert config.assistant.api_key_env == "ANTHROPIC_API_KEY"
+
+
+def test_register_source_refuses_an_unapproved_credential_env_for_a_first_party_connector(
+    workspace: Path,
+) -> None:
+    _config, client = _build(workspace)
+
+    response = client.post(
+        "/sources",
+        json={
+            "name": "notion-docs",
+            "type": "notion",
+            "path": "",
+            "connector": {"api_key_env": "PHEASANT_INDEX_WORKER_TOKEN"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "PHEASANT_INDEX_WORKER_TOKEN" in response.json()["detail"]
+
+
+def test_register_source_still_accepts_the_connectors_own_default_env(workspace: Path) -> None:
+    _config, client = _build(workspace)
+
+    response = client.post(
+        "/sources",
+        json={
+            "name": "notion-docs",
+            "type": "notion",
+            "path": "",
+            "connector": {"api_key_env": "NOTION_TOKEN"},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+
+
+def test_check_fetchable_blocks_literal_metadata_and_private_addresses() -> None:
+    from pheasant.security.egress import EgressBlocked, check_fetchable
+
+    for url in (
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "http://127.0.0.1:8080/",
+        "http://10.0.0.5/internal",
+        "http://192.168.1.1/",
+        "http://localhost/",
+        "http://[::1]/",
+        "ftp://169.254.169.254/",
+    ):
+        with pytest.raises(EgressBlocked):
+            check_fetchable(url)
+
+
+def test_check_fetchable_allows_private_addresses_when_opted_in() -> None:
+    from pheasant.security.egress import check_fetchable
+
+    assert check_fetchable("http://169.254.169.254/", allow_private=True) == (
+        "http://169.254.169.254/"
+    )
+    assert check_fetchable("http://127.0.0.1:11434/api/generate", allow_private=True)
+
+
+def test_check_fetchable_does_not_require_dns_to_be_reachable() -> None:
+    """A hostname that fails to resolve is not treated as a security denial —
+    see check_fetchable's docstring for why coupling the check to live DNS
+    would be a worse trade than it looks."""
+
+    from pheasant.security.egress import check_fetchable
+
+    # This name is guaranteed never to resolve (RFC 2606).
+    assert check_fetchable("https://name.invalid/path") == "https://name.invalid/path"
+
+
+def test_open_url_rejects_a_redirect_to_a_blocked_destination() -> None:
+    """The bypass this closes: an initially-clean URL redirects to a
+    scheme/host the initial check would have refused, and plain `urlopen`
+    follows it with no further check."""
+
+    from urllib.request import Request
+
+    from pheasant.security.egress import EgressBlocked, _ValidatingRedirectHandler
+
+    handler = _ValidatingRedirectHandler(allow_private=False)
+    request = Request("http://example.test/start")
+
+    with pytest.raises(EgressBlocked):
+        handler.redirect_request(request, None, 302, "Found", {}, "http://127.0.0.1:9999/secret")
+
+
+def test_resolve_credential_env_rejects_names_outside_the_allowlist() -> None:
+    from pheasant.security.credentials import CredentialEnvNotAllowed, resolve_credential_env
+
+    with pytest.raises(CredentialEnvNotAllowed):
+        resolve_credential_env("AWS_SECRET_ACCESS_KEY", allowed={"OPENAI_API_KEY"})
+
+
+def test_resolve_credential_env_allows_none_and_allowlisted_names() -> None:
+    from pheasant.security.credentials import resolve_credential_env
+
+    assert resolve_credential_env(None, allowed=set()) is None
+    assert resolve_credential_env("", allowed=set()) == ""
+    assert resolve_credential_env("OPENAI_API_KEY", allowed={"OPENAI_API_KEY"}) == "OPENAI_API_KEY"
+
+
+def test_known_credential_envs_covers_every_first_party_default(workspace: Path) -> None:
+    from pheasant.security.credentials import known_credential_envs
+
+    config, _client = _build(workspace)
+    envs = known_credential_envs(config)
+
+    assert {
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "NOTION_TOKEN",
+        "GDRIVE_TOKEN",
+        "SLACK_TOKEN",
+        "CONFLUENCE_TOKEN",
+        "IMAP_CREDENTIALS",
+        "IDP_TOKEN",
+    } <= envs
+
+
+def test_plugin_connector_types_are_not_credential_checked() -> None:
+    """A plugin's own env-var convention cannot be known in advance — see
+    CHECKABLE_CONNECTOR_TYPES's docstring. Only the fixed first-party set is
+    checked; this pins the boundary so it cannot silently widen or narrow."""
+
+    from pheasant.security.credentials import CHECKABLE_CONNECTOR_TYPES
+
+    assert CHECKABLE_CONNECTOR_TYPES == {
+        "notion",
+        "gdrive",
+        "slack",
+        "confluence",
+        "imap",
+    }
