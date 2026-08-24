@@ -389,23 +389,31 @@ def extract_docx_text_builtin(content: bytes) -> str:
     stores the body text as ``<w:t>`` runs inside ``<w:p>`` paragraphs, so
     reading it with ``zipfile`` + ``xml.etree`` recovers the document text
     directly. Tables are included (their cells are ordinary paragraphs).
+
+    The archive read and the parse both go through
+    :mod:`pheasant.ingestion.office`'s bounded reader and DOCTYPE-refusing
+    parser (security audit finding M1) — this used to hand-roll a plain
+    ``archive.read(...)``/``ET.fromstring(...)`` pair, unbounded in both
+    size and entity expansion, the one DOCX-specific gap in guards every
+    other format here already carried.
     """
     import io
     import xml.etree.ElementTree as ET
     import zipfile
 
+    from pheasant.ingestion.office import _read_member, _safe_fromstring
+
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
-            names = set(archive.namelist())
-            if "word/document.xml" not in names:
-                return ""
-            xml_bytes = archive.read("word/document.xml")
+            xml_bytes = _read_member(archive, "word/document.xml")
     except (zipfile.BadZipFile, KeyError, OSError) as exc:
         logger.debug("DOCX archive unreadable: %s", exc)
         return ""
+    if xml_bytes is None:
+        return ""
 
     try:
-        root = ET.fromstring(xml_bytes)
+        root = _safe_fromstring(xml_bytes)
     except ET.ParseError as exc:
         logger.debug("DOCX document.xml unparseable: %s", exc)
         return ""

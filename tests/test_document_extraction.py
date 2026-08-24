@@ -18,7 +18,9 @@ exercises both carving paths; ``report.docx`` is a fixed-timestamp ZIP;
 
 from __future__ import annotations
 
+import io
 import random
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -150,6 +152,53 @@ def test_builtin_matches_native_on_docx() -> None:
     assert extract_docx_text_builtin(REPORT.read_bytes()) == NativeExtractor().extract(
         REPORT.read_bytes(), "report.docx"
     )
+
+
+def _docx_with_document_xml(xml_bytes: bytes) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", xml_bytes)
+    return buffer.getvalue()
+
+
+def test_docx_oversized_document_xml_is_refused_not_read_unbounded() -> None:
+    """Security audit finding M1: office.MAX_MEMBER_BYTES bounds every other
+    archive member this codebase reads (PPTX/XLSX/EPUB, via
+    office._read_member); word/document.xml used to be read with a bare,
+    unbounded `archive.read(...)`. Highly compressible content keeps the
+    fixture itself small while its declared uncompressed size exceeds the
+    bound."""
+    from pheasant.ingestion.office import MAX_MEMBER_BYTES
+
+    oversized = b"<w:document>" + b" " * (MAX_MEMBER_BYTES + 1) + b"</w:document>"
+
+    text = extract_docx_text_builtin(_docx_with_document_xml(oversized))
+
+    assert text == ""
+
+
+def test_docx_billion_laughs_document_xml_is_refused() -> None:
+    """Security audit finding M1: a DOCTYPE-declared internal entity bomb
+    in a few KB of document.xml used to expand to gigabytes.
+    ElementTree/pyexpat does not fetch external entities or DTDs (no XXE
+    here), but it does expand internal ones — and the 32 MB member cap
+    alone bounds the *input*, never the expansion."""
+
+    bomb = (
+        b'<?xml version="1.0"?>\n'
+        b"<!DOCTYPE lolz [\n"
+        b' <!ENTITY lol "lol">\n'
+        b' <!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">\n'
+        b' <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">\n'
+        b' <!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">\n'
+        b"]>\n"
+        b'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        b"<w:body><w:p><w:r><w:t>&lol4;</w:t></w:r></w:p></w:body></w:document>\n"
+    )
+
+    text = extract_docx_text_builtin(_docx_with_document_xml(bomb))
+
+    assert text == ""
 
 
 def test_html_extraction_drops_script_and_style() -> None:

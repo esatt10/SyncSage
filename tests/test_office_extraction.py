@@ -335,6 +335,39 @@ def test_oversized_archive_member_is_skipped() -> None:
         office.MAX_MEMBER_BYTES = original
 
 
+def test_billion_laughs_archive_member_is_refused() -> None:
+    """Security audit finding M1: shared by every format that goes through
+    office._parse_member (PPTX/XLSX/EPUB), not just DOCX — a DOCTYPE-
+    declared internal entity bomb in a few KB of XML is refused outright,
+    the same way an oversized member already is, rather than expanded."""
+
+    bomb = (
+        b'<?xml version="1.0"?>\n'
+        b"<!DOCTYPE lolz [\n"
+        b' <!ENTITY lol "lol">\n'
+        b' <!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">\n'
+        b' <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">\n'
+        b"]>\n"
+        b"<p>&lol3;</p>\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("ppt/slides/slide1.xml", bomb)
+
+    assert extract_pptx_text(buf.getvalue()) == ""
+
+
+def test_safe_fromstring_still_parses_ordinary_xml() -> None:
+    """The guard refuses a DOCTYPE, not XML in general — every legitimate
+    OOXML/EPUB part this codebase reads carries no DOCTYPE at all."""
+    from pheasant.ingestion.office import _safe_fromstring
+
+    root = _safe_fromstring(b"<root><a>hello</a></root>")
+
+    assert root.tag == "root"
+    assert root[0].text == "hello"
+
+
 # ---------------------------------------------------------------------------
 # Wiring: accepted <-> extractable must not drift
 # ---------------------------------------------------------------------------

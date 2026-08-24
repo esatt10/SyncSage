@@ -73,12 +73,50 @@ def _read_member(archive: zipfile.ZipFile, name: str) -> bytes | None:
         return None
 
 
+class _EntityBombError(ET.ParseError):
+    """A DOCTYPE declaration was refused (security audit finding M1).
+
+    Subclasses ``ET.ParseError`` so every existing ``except ET.ParseError``
+    around a parse call here keeps working unchanged — a refused bomb is
+    just one more way a member turns out to be "not parseable".
+    """
+
+
+class _NoDoctypeTarget(ET.TreeBuilder):
+    """A ``TreeBuilder`` that refuses any DOCTYPE outright.
+
+    ``xml.etree.ElementTree`` (via pyexpat) does not resolve external
+    entities or fetch DTDs, so XXE file disclosure is not a risk here — but
+    it *does* expand internal general entities, so a
+    ``<!DOCTYPE x [<!ENTITY a "..."><!ENTITY b "&a;&a;...">]>`` "billion
+    laughs" bomb in a few KB of ``document.xml`` still reaches gigabytes.
+    No format this module reads — OOXML's ``document.xml``/``slideN.xml``/
+    ``sharedStrings.xml``, an EPUB's container/OPF/content documents —
+    legitimately declares a DOCTYPE, so refusing one outright, before any
+    entity inside it is ever seen, closes the whole class without needing
+    to parse or bound individual entity declarations. Keeps this module
+    pure standard library — no ``defusedxml`` dependency needed.
+    """
+
+    def doctype(self, name: str, pubid: str | None, system: str | None) -> None:
+        raise _EntityBombError(f"refusing a DOCTYPE declaration ({name!r})")
+
+
+def _safe_fromstring(raw: bytes) -> ET.Element:
+    """``ET.fromstring``, refusing any DOCTYPE (security audit finding M1).
+
+    Raises ``ET.ParseError`` (via ``_EntityBombError``) the same way a
+    malformed document would, so callers need no new exception handling.
+    """
+    return ET.fromstring(raw, parser=ET.XMLParser(target=_NoDoctypeTarget()))
+
+
 def _parse_member(archive: zipfile.ZipFile, name: str) -> ET.Element | None:
     raw = _read_member(archive, name)
     if raw is None:
         return None
     try:
-        return ET.fromstring(raw)
+        return _safe_fromstring(raw)
     except ET.ParseError as exc:
         logger.debug("archive member %s is not parseable XML: %s", name, exc)
         return None
