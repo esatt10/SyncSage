@@ -21,7 +21,7 @@ name: pheasant-fleet
 
 x-fleet-env: &fleet-env
   PHEASANT_CONFIG: /config/pheasant.yaml
-  PHEASANT_DATABASE_URL: postgresql://pheasant:${POSTGRES_PASSWORD:-pheasant}@postgres:5432/pheasant
+  PHEASANT_DATABASE_URL: postgresql://pheasant:${POSTGRES_PASSWORD:?set a postgres password}@postgres:5432/pheasant
   PHEASANT_INDEX_WORKER_TOKEN: ${PHEASANT_INDEX_WORKER_TOKEN:?set a shared worker token}
 
 services:
@@ -30,7 +30,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: pheasant
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pheasant}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set a postgres password}
       POSTGRES_DB: pheasant
     volumes:
       - pheasant-pg:/var/lib/postgresql/data

@@ -45,6 +45,7 @@ from pheasant.security.credentials import (
 )
 from pheasant.security.path_policy import (
     PathPolicyError,
+    configured_roots,
     resolve_config_write_target,
     resolve_under,
 )
@@ -430,59 +431,37 @@ def _find_credential_env_values(node: Any) -> list[str]:
     return found
 
 
-def _allowed_roots(config: PheasantConfig) -> list[Path]:
-    """Roots a UI may browse / register sources under.
-
-    Mirrors the allowlist used by the MCP register tool plus the exports path.
-    """
-    roots = [
-        config.pheasant.workspace_root,
-        config.pheasant.exports_path,
-        *config.security.allow_workspace_roots,
-    ]
-    if config.security.allow_user_selected_source_paths:
-        roots.append(Path("/"))
-    seen: list[Path] = []
-    for root in roots:
-        resolved = root.expanduser().resolve()
-        if resolved not in seen and resolved.exists():
-            seen.append(resolved)
-    return seen
-
-
 def _configured_roots(config: PheasantConfig) -> list[Path]:
-    """Browse roots for the UI, *including* configured-but-unmounted ones.
+    """Roots a UI may browse / register sources under, *including*
+    configured-but-unmounted ones — so the browser can render a root the
+    operator added to ``security.allow_workspace_roots`` but forgot to
+    mount, flagged ``mounted: false``, instead of silently hiding it.
 
-    Unlike ``_allowed_roots`` (which drops non-existent roots because they can
-    never contain a selectable path), this preserves every configured root so
-    the browser can render a root the operator added to
-    ``security.allow_workspace_roots`` but forgot to mount — flagged
-    ``mounted: false`` — instead of silently hiding it.
+    Security audit finding M4: this used to be two functions — this one,
+    and a since-removed ``_allowed_roots`` that filtered out roots not
+    currently on disk. Every *enforcement* call site
+    (``_resolve_source_path``, both content-route ``resolve_under`` calls)
+    used the filtered one, so an operator who locked indexing down to an
+    explicit ``allow_workspace_roots`` and then mistyped or forgot to mount
+    one entry could end up with every configured root filtered away —
+    ``resolve_under([])`` used to treat that as "no restriction" rather
+    than "nothing is allowed". There is now exactly one list, unfiltered,
+    shared with the MCP register tool via
+    :func:`pheasant.security.path_policy.configured_roots`, and
+    ``resolve_under`` itself refuses an empty list rather than opening up.
     """
-    roots = [
-        config.pheasant.workspace_root,
-        config.pheasant.exports_path,
-        *config.security.allow_workspace_roots,
-    ]
-    if config.security.allow_user_selected_source_paths:
-        roots.append(Path("/"))
-    seen: list[Path] = []
-    for root in roots:
-        resolved = root.expanduser().resolve()
-        if resolved not in seen:
-            seen.append(resolved)
-    return seen
+    return configured_roots(config)
 
 
 def _config_write_roots(config: PheasantConfig) -> list[Path]:
     """Roots a *config file* may be written into.
 
-    Deliberately not ``_allowed_roots``: that one honors
-    ``security.allow_user_selected_source_paths``, which widens the list to
-    ``/`` so a user can index any folder they like. Choosing what content to
-    index is not the same permission as choosing where the server writes
-    YAML, and conflating them turns source promotion into an arbitrary file
-    write. Only the explicitly configured roots count here.
+    Deliberately not :func:`configured_roots`/``_configured_roots``: those
+    honor ``security.allow_user_selected_source_paths``, which widens the
+    list to ``/`` so a user can index any folder they like. Choosing what
+    content to index is not the same permission as choosing where the
+    server writes YAML, and conflating them turns source promotion into an
+    arbitrary file write. Only the explicitly configured roots count here.
     """
     roots = [
         config.pheasant.workspace_root,
@@ -503,7 +482,7 @@ def _resolve_source_path(path: str, config: PheasantConfig) -> Path:
         if not resolved.exists():
             raise PathPolicyError(f"Path does not exist: {resolved}")
         return resolved
-    return resolve_under(path, _allowed_roots(config))
+    return resolve_under(path, _configured_roots(config))
 
 
 def _check_source_type(type_name: str) -> bool:
@@ -2249,7 +2228,7 @@ def create_app(
             )
             if not config.security.allow_user_selected_source_paths:
                 try:
-                    path = resolve_under(str(path), _allowed_roots(config))
+                    path = resolve_under(str(path), _configured_roots(config))
                 except PathPolicyError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -2694,7 +2673,7 @@ def create_app(
             # `artifacts` row could reach this route by, the same way
             # `_resolve_source_path` guards every other file read.
             try:
-                path = resolve_under(str(path), _allowed_roots(config))
+                path = resolve_under(str(path), _configured_roots(config))
             except PathPolicyError:
                 path = None
             if path is not None and path.exists() and path.is_file():
@@ -3120,7 +3099,7 @@ def create_app(
 
     @app.get("/fs/list")
     def fs_list(path: str | None = None) -> dict:
-        roots = _allowed_roots(config)
+        roots = _configured_roots(config)
         if not path:
             browse_roots = _configured_roots(config)
             return {

@@ -86,6 +86,13 @@ class SourceConnector(ABC):
         # ones that fetch over HTTP); every other connector carries the
         # attribute unused.
         self.allow_private_egress = False
+        # Security audit finding M5: the configured allow-list a followed
+        # symlink's *target* must also stay under, beyond the source root
+        # itself (which `walk_source` always enforces once `follow_symlinks`
+        # is on, regardless of this attribute). Same post-construction
+        # pattern as `allow_private_egress` above, for the same reason —
+        # only FilesystemConnector consults it.
+        self.allowed_roots: list[Path] | None = None
         self.sync_mode: str | None = None
         self._previous_cursor: dict[str, Any] | None = None
         self._previous_watermark: dict[str, Any] | None = None
@@ -219,6 +226,7 @@ class FilesystemConnector(SourceConnector):
             max_depth=self.source.max_depth,
             budget=budget,
             follow_symlinks=bool(getattr(self.source.limits, "follow_symlinks", False)),
+            allowed_roots=self.allowed_roots,
         )
         if report.limit_hit:
             raise SyncBudgetExceeded(budget_message(self.source.name, report, budget), report)
@@ -623,6 +631,7 @@ def connector_for_source(
     state: StateStore,
     *,
     allow_private_egress: bool = False,
+    allowed_roots: list[Path] | None = None,
 ) -> SourceConnector:
     """Build the connector for ``source``.
 
@@ -632,6 +641,12 @@ def connector_for_source(
     connector plugin's documented ``__init__(self, source, state)`` shape
     (``pheasant.testing.ConnectorConformance``) never needs to change to
     carry it. Only the HTTP-fetching connectors consult it.
+
+    ``allowed_roots`` (security audit finding M5) is the caller's
+    ``security.path_policy.configured_roots(config)`` — set the same way,
+    for the same reason, on ``FilesystemConnector`` instances only: it is
+    the extra symlink-target containment ``walk_source`` applies beyond the
+    source's own root when ``sync.limits.follow_symlinks`` is on.
     """
     if source.connector.runtime == "sandboxed":
         # Synapse Step 34.1+: opt-in per source, checked before the
@@ -648,7 +663,9 @@ def connector_for_source(
         "single_file",
         "memory",
     }:
-        return FilesystemConnector(source, state)
+        connector = FilesystemConnector(source, state)
+        connector.allowed_roots = allowed_roots
+        return connector
     if source.type.value == "web_collection":
         connector = WebCollectionConnector(source, state)
         connector.allow_private_egress = allow_private_egress

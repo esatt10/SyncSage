@@ -151,6 +151,105 @@ def test_symlinks_are_not_followed_by_default(tmp_path: Path) -> None:
     assert [p.name for p in report.files] == ["a.md"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only; see comment above.")
+def test_symlinked_directory_escaping_the_root_is_refused_with_follow_symlinks_on(
+    tmp_path: Path,
+) -> None:
+    """Security audit finding M5: the existing loop-detection realpath was
+    never compared against where the walk is *rooted* — only deduplicated
+    against other symlinks already followed — so a symlink anywhere inside
+    an already-validated source root could point outside it and its
+    contents were walked and indexed anyway."""
+
+    root = tmp_path / "root"
+    (root / "real").mkdir(parents=True)
+    (root / "real" / "a.md").write_text("# a", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("# should not be reached", encoding="utf-8")
+    os.symlink(outside, root / "link")
+
+    report = walk_source(
+        root, include=["**/*.md"], exclude=[], budget=WalkBudget.unlimited(), follow_symlinks=True
+    )
+
+    assert [p.name for p in report.files] == ["a.md"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only; see comment above.")
+def test_symlinked_file_escaping_the_root_is_refused_with_follow_symlinks_on(
+    tmp_path: Path,
+) -> None:
+    """Same escape, the file-symlink half: the entry's nominal path looks
+    like it is under the root, but opening it later follows the link, so a
+    target outside every allowed root must be refused at walk time, not
+    merely have its nominal (safe-looking) path recorded."""
+
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.md").write_text("# a", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.md"
+    secret.write_text("# should not be reached", encoding="utf-8")
+    os.symlink(secret, root / "leak.md")
+
+    report = walk_source(
+        root, include=["**/*.md"], exclude=[], budget=WalkBudget.unlimited(), follow_symlinks=True
+    )
+
+    assert [p.name for p in report.files] == ["a.md"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only; see comment above.")
+def test_symlinks_inside_the_root_still_work_with_follow_symlinks_on(tmp_path: Path) -> None:
+    """The feature itself is intact: a symlink pointing within the root is
+    still followed — same topology as
+    `test_symlinks_are_not_followed_by_default`, with the flag turned on."""
+
+    root = tmp_path / "root"
+    inside = root / "inside"
+    inside.mkdir(parents=True)
+    (inside / "b.md").write_text("# b", encoding="utf-8")
+    os.symlink(inside, root / "link")
+
+    report = walk_source(
+        root, include=["**/*.md"], exclude=[], budget=WalkBudget.unlimited(), follow_symlinks=True
+    )
+
+    assert "b.md" in {p.name for p in report.files}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only; see comment above.")
+def test_symlink_outside_root_but_inside_an_allowed_root_is_followed(tmp_path: Path) -> None:
+    """`allowed_roots` widens containment beyond the source root itself —
+    the operator's broader `security.allow_workspace_roots` allow-list, per
+    `walk_source`'s own docstring."""
+
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.md").write_text("# a", encoding="utf-8")
+    other_allowed = tmp_path / "other-allowed"
+    other_allowed.mkdir()
+    (other_allowed / "b.md").write_text("# b", encoding="utf-8")
+    os.symlink(other_allowed, root / "link")
+
+    without_allowlist = walk_source(
+        root, include=["**/*.md"], exclude=[], budget=WalkBudget.unlimited(), follow_symlinks=True
+    )
+    assert "b.md" not in {p.name for p in without_allowlist.files}
+
+    with_allowlist = walk_source(
+        root,
+        include=["**/*.md"],
+        exclude=[],
+        budget=WalkBudget.unlimited(),
+        follow_symlinks=True,
+        allowed_roots=[other_allowed],
+    )
+    assert "b.md" in {p.name for p in with_allowlist.files}
+
+
 def test_depth_is_applied_during_traversal(tmp_path: Path) -> None:
     root = tmp_path / "deep"
     (root / "a" / "b" / "c").mkdir(parents=True)
@@ -289,6 +388,42 @@ def test_depth_override_is_per_run_only(tmp_path: Path, home: Path) -> None:
     assert shallow.indexed_artifacts == 0  # README.md sits at depth 2
     assert deep.indexed_artifacts >= 1
     assert config.sources[0].max_depth is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only; see comment above.")
+def test_sync_refuses_a_symlink_that_escapes_every_allowed_root(tmp_path: Path) -> None:
+    """Security audit finding M5, wired end to end: SyncEngine ->
+    connector_for_source -> FilesystemConnector.allowed_roots ->
+    walk_source. `follow_symlinks: true` is opt-in and legitimate; a
+    symlink escaping every allowed root must still never reach the index,
+    through the real sync path rather than a direct `walk_source` call."""
+
+    workspace = tmp_path / "ws"
+    corpus = workspace / "corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "a.md").write_text("# a\nreal content\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("# leaked\nTOP-SECRET-VALUE\n", encoding="utf-8")
+    os.symlink(outside, corpus / "link")
+
+    config = _config(tmp_path, workspace, sync={"limits": {"follow_symlinks": True}})
+    config.sources = [
+        SourceConfig(
+            name="corpus", type=SourceType.document_folder, path=corpus, include=["**/*.md"]
+        )
+    ]
+    engine = SyncEngine(config)
+    try:
+        result = engine.sync_source("corpus", "full")
+        paths = {
+            row["relative_path"] for row in engine.state.rows("SELECT relative_path FROM artifacts")
+        }
+    finally:
+        engine.close()
+
+    assert result.indexed_artifacts == 1
+    assert paths == {"a.md"}
 
 
 # ---------------------------------------------------------------------------

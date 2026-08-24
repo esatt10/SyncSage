@@ -89,13 +89,21 @@ def within_max_depth(relative: str, max_depth: int | None) -> bool:
     return depth <= max(0, max_depth)
 
 
-def discover_files(source: SourceConfig) -> list[Path]:
+def discover_files(source: SourceConfig, *, allowed_roots: list[Path] | None = None) -> list[Path]:
     """Files a source would index, via the shared pruning walk.
 
     Delegates to :func:`pheasant.ingestion.walk.walk_source` so there is one
     traversal implementation rather than two that drift — this used to
     ``rglob("*")`` the whole tree and filter afterwards, which meant exclude
     patterns never pruned the walk.
+
+    ``allowed_roots`` (security audit finding M5) is the operator's
+    configured allow-list — pass ``security.path_policy.configured_roots(config)``
+    when ``source.limits.follow_symlinks`` is on and this function's caller
+    has a ``PheasantConfig`` to derive it from; a bare ``SourceConfig`` never
+    carries enough to compute it itself. ``None`` (the default) still gets
+    the containment ``walk_source`` always applies against the source's own
+    root, just not the wider allow-list.
     """
     from pheasant.ingestion.walk import WalkBudget, walk_source
 
@@ -106,6 +114,7 @@ def discover_files(source: SourceConfig) -> list[Path]:
         max_depth=source.max_depth,
         budget=WalkBudget.from_settings(source.limits),
         follow_symlinks=bool(getattr(source.limits, "follow_symlinks", False)),
+        allowed_roots=allowed_roots,
     )
     return report.files
 

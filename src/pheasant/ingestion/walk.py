@@ -153,6 +153,18 @@ def should_prune_directory(relative: str, exclude: list[str]) -> bool:
     return False
 
 
+def _real_path_under(candidate_real: str, root_real: str) -> bool:
+    """Is ``candidate_real`` equal to, or a descendant of, ``root_real``?
+
+    Both arguments must already be ``os.path.realpath`` output — this is a
+    plain string containment check, not a filesystem call, so it is only as
+    correct as its inputs are already resolved.
+    """
+    if candidate_real == root_real:
+        return True
+    return candidate_real.startswith(root_real.rstrip(os.sep) + os.sep)
+
+
 def walk_source(
     root: Path,
     *,
@@ -162,12 +174,22 @@ def walk_source(
     budget: WalkBudget | None = None,
     follow_symlinks: bool = False,
     collect_stats: bool = True,
+    allowed_roots: list[Path] | None = None,
 ) -> WalkReport:
     """Walk ``root``, pruning as it goes, and report what it found.
 
     Never raises on a budget breach — it records ``limit_hit`` and stops.
     Callers that must refuse (the sync path) check the field and raise;
     callers that want the numbers regardless (``scan``) simply read them.
+
+    ``allowed_roots`` (security audit finding M5) additionally constrains
+    where a followed symlink may point, beyond ``root`` itself — pass the
+    operator's configured allow-list (``security.allow_workspace_roots`` and
+    friends) when ``follow_symlinks`` is on and
+    ``security.allow_user_selected_source_paths`` is off, so a symlink
+    inside an allow-listed corpus cannot read content the allow-list itself
+    would refuse as a source root. It has no effect when ``follow_symlinks``
+    is off (the default), since no symlink is ever followed in that case.
     """
     budget = budget or WalkBudget.unlimited()
     report = WalkReport()
@@ -177,7 +199,9 @@ def walk_source(
 
     if root.is_file():
         # A single_file source: the "tree" is one entry, and the include /
-        # exclude patterns are matched against the bare filename.
+        # exclude patterns are matched against the bare filename. `root`
+        # itself was already resolved (and symlinks followed) by whatever
+        # registered this source, so there is no second hop to re-check here.
         relative = root.name
         if not _match_any(relative, exclude) and (not include or _match_any(relative, include)):
             size = root.stat().st_size
@@ -189,6 +213,19 @@ def walk_source(
                 report.files_by_depth[0] = 1
         report.entries_scanned = 1
         return report
+
+    # Security audit finding M5: computed once, used at every symlink this
+    # walk follows — `follow_symlinks`'s existing loop-detection realpath
+    # was never compared against where the walk is *rooted*, so a symlink
+    # anywhere inside an already-validated source root could point outside
+    # it (and outside the configured allow-list) and its contents were
+    # walked and indexed anyway, defeating the containment check that was
+    # applied to the source root itself at registration time.
+    symlink_containment_roots: list[str] = []
+    if follow_symlinks:
+        symlink_containment_roots.append(os.path.realpath(root))
+        for extra in allowed_roots or []:
+            symlink_containment_roots.append(os.path.realpath(extra))
 
     # Explicit stack rather than recursion: a deep tree must not be able to
     # exhaust the interpreter's stack, and an explicit frontier is what lets
@@ -229,11 +266,19 @@ def walk_source(
                 if max_depth is not None and len(Path(relative).parts) > max_depth:
                     continue
                 if follow_symlinks:
-                    # Guard against symlink loops when the operator opts in.
                     try:
                         real = os.path.realpath(entry.path)
                     except OSError:
                         continue
+                    # Security audit finding M5: containment before loop
+                    # detection — a symlink pointing outside every allowed
+                    # root is refused outright, not merely deduplicated
+                    # against other escapes already seen.
+                    if not any(
+                        _real_path_under(real, allowed) for allowed in symlink_containment_roots
+                    ):
+                        continue
+                    # Guard against symlink loops when the operator opts in.
                     if real in seen_real_dirs:
                         continue
                     seen_real_dirs.add(real)
@@ -245,6 +290,21 @@ def walk_source(
                     continue
             except OSError:
                 continue
+
+            if follow_symlinks:
+                # Security audit finding M5: a symlinked *file* is the other
+                # half of the same escape — `entry.path` looks like it is
+                # under `root`, but opening it later follows the link, so a
+                # target outside every allowed root must be refused here,
+                # not merely have its nominal path recorded as if safe.
+                try:
+                    real = os.path.realpath(entry.path)
+                except OSError:
+                    continue
+                if not any(
+                    _real_path_under(real, allowed) for allowed in symlink_containment_roots
+                ):
+                    continue
 
             if not within_max_depth(relative, max_depth):
                 continue

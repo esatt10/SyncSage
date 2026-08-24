@@ -47,6 +47,7 @@ from pheasant.search.vector_store import (
     VectorSearcher,
     vector_indexer_from_config,
 )
+from pheasant.security.path_policy import configured_roots
 from pheasant.synapse.events import EventStream, RouterWebhook
 from pheasant.synapse.publisher import ContractPublisher
 from pheasant.sync.connectors import (
@@ -1527,7 +1528,10 @@ class SyncEngine:
         slow_sync_s = float(os.environ.get("PHEASANT_TEST_SLOW_SYNC_MS", "0") or 0) / 1000.0
         with self._source_write_lock(source.name):
             connector = connector_for_source(
-                source, self.state, allow_private_egress=self.config.security.allow_private_egress
+                source,
+                self.state,
+                allow_private_egress=self.config.security.allow_private_egress,
+                allowed_roots=self._symlink_allowed_roots(),
             )
             if mode == "validate_only":
                 health = connector.validate()
@@ -2129,6 +2133,7 @@ class SyncEngine:
                 max_total_bytes=None,
             ),
             follow_symlinks=bool(getattr(source.limits, "follow_symlinks", False)),
+            allowed_roots=self._symlink_allowed_roots(),
         )
         would_exceed = []
         if configured.max_files is not None and report.file_count > configured.max_files:
@@ -2195,6 +2200,19 @@ class SyncEngine:
             self.config.sources.append(resolved)
             return resolved
         raise KeyError(f"Unknown source: {name}")
+
+    def _symlink_allowed_roots(self) -> list[Path] | None:
+        """The extra allow-list a followed symlink's target must stay under
+        (security audit finding M5), or ``None`` when
+        ``security.allow_user_selected_source_paths`` is on — an operator
+        who already said "any path may be a source root" gets no extra
+        symlink restriction beyond the source root itself, which
+        ``walk_source`` enforces unconditionally whenever
+        ``follow_symlinks`` is set. Shared by both call sites in this class
+        that build a connector or walk a source directly."""
+        if self.config.security.allow_user_selected_source_paths:
+            return None
+        return configured_roots(self.config)
 
     def _can_skip_before_read(
         self,

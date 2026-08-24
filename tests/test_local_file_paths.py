@@ -107,6 +107,58 @@ def test_configured_roots_keeps_unmounted_allowlisted_root(tmp_path: Path) -> No
     assert not Path("/data-not-mounted").exists()
 
 
+def test_resolve_under_refuses_an_empty_root_list() -> None:
+    """Security audit finding M4: `resolve_under([])` used to return the
+    candidate path unchanged — "no roots" silently meant "no restriction".
+    An operator who locks indexing down to an explicit allow-list and then
+    mistypes or forgets to mount every one of its entries must end up with
+    *nothing* reachable, not *everything*."""
+
+    with pytest.raises(PathPolicyError, match="no roots are configured"):
+        resolve_under("/etc/passwd", [])
+
+
+def test_configured_roots_never_produces_an_empty_list_the_caller_did_not_ask_for(
+    tmp_path: Path,
+) -> None:
+    """The fail-open bug this closes: `_allowed_roots` (now removed) dropped
+    a configured-but-unmounted root before handing the list to
+    `resolve_under`, so an operator who correctly locked indexing down with
+    `allow_user_selected_source_paths: false` and a single, not-yet-mounted
+    `allow_workspace_roots` entry got an *empty* effective allow-list — and
+    `resolve_under` used to treat that as unrestricted. `_configured_roots`
+    (the one surviving list, security audit finding M4) never drops an
+    entry for non-existence, so this same config now still has a
+    non-empty, correctly-restrictive root list."""
+
+    config = PheasantConfig.model_validate(
+        {
+            **_base_config(tmp_path, []),
+            "pheasant": {
+                "name": "path-tests",
+                "state_path": str(tmp_path / "state"),
+                # A workspace_root that does not exist — the scenario that
+                # used to empty the whole list.
+                "workspace_root": str(tmp_path / "not-mounted-workspace"),
+                "exports_path": str(tmp_path / "exports"),
+            },
+            "security": {
+                "allow_user_selected_source_paths": False,
+                "allow_workspace_roots": ["/also-not-mounted"],
+            },
+        }
+    )
+
+    roots = _configured_roots(config)
+
+    assert roots  # never empty for this config — both entries are kept
+    assert (tmp_path / "not-mounted-workspace").resolve() in roots
+    assert Path("/also-not-mounted") in roots
+    # And the policy check itself still correctly denies an unrelated path.
+    with pytest.raises(PathPolicyError):
+        resolve_under("/etc/passwd", roots)
+
+
 # Same as above: the allowlist is in-container POSIX roots, which a native
 # Windows run resolves against the current drive.
 @pytest.mark.skipif(os.name == "nt", reason="POSIX-only; see comment above.")

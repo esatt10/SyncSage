@@ -27,7 +27,11 @@ from pheasant.search.criteria import (
 )
 from pheasant.search.hybrid import HybridSearch
 from pheasant.search.sqlite_store import SearchStore
-from pheasant.security.path_policy import resolve_config_write_target, resolve_under
+from pheasant.security.path_policy import (
+    configured_roots,
+    resolve_config_write_target,
+    resolve_under,
+)
 from pheasant.sync.engine import SyncEngine
 
 logger = logging.getLogger(__name__)
@@ -108,14 +112,14 @@ class PheasantTools:
             if not resolved_path.exists():
                 raise ValueError(f"Path does not exist: {resolved_path}")
         else:
-            resolved_path = resolve_under(
-                path,
-                [
-                    self.config.pheasant.workspace_root,
-                    self.config.pheasant.exports_path,
-                    *self.config.security.allow_workspace_roots,
-                ],
-            )
+            # Security audit finding M4: shared with the HTTP register/promote
+            # routes (`api/app.py`'s `_configured_roots`) via
+            # `security.path_policy.configured_roots`, so this allow-list
+            # cannot drift out of agreement with theirs — and, unlike the
+            # roots this call site built inline before, does not drop a
+            # root that is not currently mounted (`resolve_under` now
+            # refuses an empty list rather than treating it as "unrestricted").
+            resolved_path = resolve_under(path, configured_roots(self.config))
         source = SourceConfig(
             name=name,
             type=SourceType(source_type),

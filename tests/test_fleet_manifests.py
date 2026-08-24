@@ -517,6 +517,20 @@ def test_the_compose_worker_gets_no_database_url() -> None:
     assert "PHEASANT_INDEX_WORKER_TOKEN" in env
 
 
+def test_the_compose_postgres_password_has_no_default_fallback() -> None:
+    """Security audit finding M6: this file used to default
+    POSTGRES_PASSWORD to the literal string 'pheasant' when unset —
+    `docker compose -f docker-compose.scale.yml up` with no `.env` silently
+    stood up a real Postgres instance with that password.
+    PHEASANT_INDEX_WORKER_TOKEN on the very next line already failed closed
+    with Compose's `:?` syntax; POSTGRES_PASSWORD now does too, everywhere
+    it appears (the connection URL and the postgres service's own env)."""
+
+    raw = COMPOSE_FLEET.read_text(encoding="utf-8")
+    assert "POSTGRES_PASSWORD:-" not in raw
+    assert raw.count("${POSTGRES_PASSWORD:?") == 2
+
+
 def test_the_compose_configs_are_valid_for_their_roles() -> None:
     fleet = PheasantConfig.model_validate(
         yaml.safe_load((COMPOSE_CONFIG / "fleet.yaml").read_text(encoding="utf-8"))
