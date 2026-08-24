@@ -830,7 +830,7 @@ def create_app(
         startup_sources = [
             source.name for source in config.sources if source.enabled and source.sync.on_startup
         ]
-        if startup_sources:
+        if startup_sources and role_policy.indexes_locally:
             loop = asyncio.get_running_loop()
 
             def _run_startup() -> None:

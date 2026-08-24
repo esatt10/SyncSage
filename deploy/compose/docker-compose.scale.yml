@@ -1,33 +1,39 @@
 # The role-split fleet, in Compose.
 #
-#   docker compose -f docker-compose.scale.yml up -d --scale worker=4
+#   docker compose --env-file .env -f deploy/compose/docker-compose.scale.yml up -d \
+#     --scale indexer=4 --scale worker=8
 #
 # `docker-compose.yml` (one container, role `all`) remains the default and
-# needs no infrastructure. This file is the other trade: Postgres, a shared
-# state volume, and three tiers that scale independently. It is worth it past
+# needs no infrastructure. This file is the other trade: Postgres, NATS
+# JetStream, a shared state volume, and three tiers that scale independently.
+# It is worth it past
 # the point where one container stops being enough — see
 # docs/how-to/capacity-planning.md — and not before.
 #
 # The three tiers and why they are separate:
 #
 #   api      serves search/UI/MCP, never indexes; publishes index work
-#   indexer  ONE replica: watches, schedules, drains the queue
+#   indexer  watches, schedules and drains the durable NATS queue
 #   worker   parse/chunk only — the tier you scale, with --scale worker=N
 #
-# Only `worker` is safe to scale here: `api` would need a load balancer in
-# front of it (Compose has none), and a second `indexer` would spend its life
-# losing lease races.
+# Scale indexers and workers together. PostgreSQL supplies per-source leases
+# and JetStream distributes source tasks. API replicas still need an external
+# load balancer, which Compose intentionally does not provide.
 name: pheasant-fleet
 
 x-fleet-env: &fleet-env
   PHEASANT_CONFIG: /config/pheasant.yaml
   PHEASANT_DATABASE_URL: postgresql://pheasant:${POSTGRES_PASSWORD:-pheasant}@postgres:5432/pheasant
   PHEASANT_INDEX_WORKER_TOKEN: ${PHEASANT_INDEX_WORKER_TOKEN:?set a shared worker token}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+  GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+  GH_TOKEN: ${GH_TOKEN:-}
 
 services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    command: ["postgres", "-c", "max_connections=400"]
     environment:
       POSTGRES_USER: pheasant
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pheasant}
@@ -40,14 +46,43 @@ services:
       timeout: 5s
       retries: 10
 
+  nats:
+    image: nats:2.10-alpine
+    restart: unless-stopped
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - pheasant-nats:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  db-init:
+    image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.10.3}
+    restart: "no"
+    entrypoint: ["python", "-c"]
+    command:
+      - "from pathlib import Path; from pheasant.cli import _engine; engine = _engine(Path('/config/pheasant.yaml')); engine.close()"
+    environment: *fleet-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./fleet.yaml:/config/pheasant.yaml:ro
+      - pheasant-state:/state
+      - pheasant-exports:/exports
+
   api:
     image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.10.3}
     build:
-      context: .
+      context: ../..
     restart: unless-stopped
     command: ["serve", "--role", "api"]
     depends_on:
-      postgres:
+      db-init:
+        condition: service_completed_successfully
+      nats:
         condition: service_healthy
     ports:
       # Loopback only. The API is unauthenticated and can be pointed at any
@@ -55,11 +90,12 @@ services:
       - "${PHEASANT_BIND:-127.0.0.1}:${PHEASANT_PORT:-8765}:8765"
     environment: *fleet-env
     volumes:
-      - ./deploy/compose/fleet.yaml:/config/pheasant.yaml:ro
+      - ./fleet.yaml:/config/pheasant.yaml:ro
       # Read-only: the indexer is the only writer of /state. The api replica
       # polls the graph file and reloads it when the indexer rewrites it.
       - pheasant-state:/state:ro
-      - ${PHEASANT_WORKSPACE_PATH:-.}:/workspace:ro
+      - ${PHEASANT_FLEET_WORKSPACE_PATH:-pheasant-workspace}:/workspace:ro
+      - pheasant-memory:/memory
       # The Parquet extract, and the one volume meant to be read by
       # something that is not pheasant. Swap the named volume for a host
       # path to hand it straight to an outside service:
@@ -75,20 +111,21 @@ services:
   indexer:
     image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.10.3}
     build:
-      context: .
+      context: ../..
     restart: unless-stopped
     command: ["serve", "--role", "indexer"]
-    # Not scalable, and Compose will happily let you try: `--scale indexer=2`
-    # gives two processes taking turns on one lease, not twice the throughput.
-    scale: 1
     depends_on:
-      postgres:
+      db-init:
+        condition: service_completed_successfully
+      nats:
         condition: service_healthy
     environment: *fleet-env
     volumes:
-      - ./deploy/compose/fleet.yaml:/config/pheasant.yaml:ro
+      - ./fleet.yaml:/config/pheasant.yaml:ro
       - pheasant-state:/state
-      - ${PHEASANT_WORKSPACE_PATH:-.}:/workspace:ro
+      # URL-managed repositories need to clone, fetch and fast-forward here.
+      - ${PHEASANT_FLEET_WORKSPACE_PATH:-pheasant-workspace}:/workspace
+      - pheasant-memory:/memory
       - pheasant-exports:/exports
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health || exit 1"]
@@ -100,9 +137,9 @@ services:
   worker:
     image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.10.3}
     build:
-      context: .
+      context: ../..
     restart: unless-stopped
-    command: ["serve", "--role", "worker"]
+    command: ["worker", "--transport", "grpc", "--port", "8766", "--max-workers", "16"]
     # No ports: reached only by the indexer, over the Compose network, by
     # service name. Compose round-robins DNS across the scaled replicas, and
     # the coordinator's circuit breakers take a dead one out of rotation.
@@ -111,9 +148,9 @@ services:
       # The only secret a worker gets — deliberately not the database URL.
       PHEASANT_INDEX_WORKER_TOKEN: ${PHEASANT_INDEX_WORKER_TOKEN:?set a shared worker token}
     volumes:
-      - ./deploy/compose/worker.yaml:/config/pheasant.yaml:ro
+      - ./worker.yaml:/config/pheasant.yaml:ro
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health || exit 1"]
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8766), 5).close()"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -121,5 +158,8 @@ services:
 
 volumes:
   pheasant-state:
+  pheasant-workspace:
+  pheasant-memory:
   pheasant-exports:
   pheasant-pg:
+  pheasant-nats:

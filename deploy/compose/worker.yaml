@@ -1,38 +1,85 @@
-# Config for the worker tier. Separate from fleet.yaml for one reason that
-# matters: a worker must not carry the database DSN, the connector
-# credentials, or the source list. It receives a file's bytes and a
-# whitelisted parse config and returns chunks — that is the whole trust
-# boundary, and a config it does not need would widen it for free.
 pheasant:
-  name: compose-fleet-worker
+  name: pheasant-scalable-worker
+  description: Stateless gRPC preparation worker for the scalable Pheasant fleet
   environment: compose
   log_level: INFO
-  # A worker never reads or writes authoritative state. These exist because
-  # the process expects the paths, not because anything durable lives here.
   state_path: /state
   workspace_root: /workspace
   exports_path: /exports
 server:
   host: 0.0.0.0
   port: 8765
+  role: worker
   mcp:
     enabled: false
   api:
-    enabled: true
+    enabled: false
     openapi: false
-    max_concurrent_requests: 32
-    drain_seconds: 5
   ui:
     enabled: false
 sync:
   watcher:
     enabled: false
+  git:
+    enabled: false
   scheduler:
     enabled: false
   concurrency:
-    # Without this the preparation routes 404 — and every batch would fall
-    # back to local parsing on the indexer, which still works and would make
-    # the whole worker tier a silent no-op.
+    max_parallel_sources: 1
+    max_parallel_files: 32
+    max_parallel_embeddings: 1
+    file_executor: thread
     remote_worker_enabled: true
     remote_worker_token_env: PHEASANT_INDEX_WORKER_TOKEN
+    remote_worker_timeout_seconds: 300
+    remote_worker_batch_size: 16
+    worker_transport: grpc
+  queue:
+    enabled: false
+  limits:
+    max_files: 50000
+    max_file_size_mb: 25
+search:
+  embeddings:
+    enabled: false
+  default_mode: hybrid
+  max_results_default: 10
+graph:
+  memory_entity_bridging: false
+  wasm_cross_source_resolution: true
+assistant:
+  enabled: false
+  model: null
+  retrieval:
+    max_rounds: 2
+    per_query_results: 6
+    max_context_passages: 10
+    expand_graph: true
+    expand_depth: 1
+    grade_evidence: true
+    retrieval_modes:
+      - text
+      - vector
 sources: []
+storage:
+  graph_snapshots: true
+  max_state_size_gb: 10
+ingestion:
+  extractor:
+    provider: auto
+  captioner:
+    provider: stub
+  transcriber:
+    provider: stub
+memory:
+  consolidation_enabled: true
+  default_policy: auto
+  steering_enabled: false
+  usage_tracking: false
+  max_records: null
+security:
+  default_exclude_secrets: true
+  allow_user_selected_source_paths: true
+  acl_enforced: false
+synapse:
+  publish: false

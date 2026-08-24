@@ -18,7 +18,7 @@ making sure the UI you are looking at is the current one.
 | I already run `pheasant` from the CLI and just want the UI | [Option 1 — pheasant serves it](#option-1-let-pheasant-serve-the-ui-no-docker) | `http://localhost:8765` |
 | I want the whole thing in containers, one command | [Option 2 — `pheasant host`](#option-2-pheasant-host-one-line-containers) | `http://localhost:8080` |
 | I want a brand-new container configured entirely in the UI | [Fresh UI-native reset](#fresh-ui-native-reset) | `http://localhost:8765` |
-| I have this repo cloned and want the standard stack | [Option 3 — `docker compose`](#option-3-docker-compose-from-this-repo) | `http://localhost:8080` |
+| I have this repo cloned and want the standard stack | [Option 3 — `docker compose`](#option-3-docker-compose-from-this-repo) | `http://localhost:8765` |
 | I am editing the UI source | [Option 4 — Vite dev server](#option-4-vite-dev-server-for-ui-development) | `http://localhost:5173` |
 
 Every path serves the same bundle from `ui/`. None of them change how indexing
@@ -134,7 +134,7 @@ it, or re-run it yourself with `docker compose -f docker-compose.pheasant.yml up
 From a clone of this repository, run exactly one Docker command:
 
 ```bash
-docker compose -f docker-compose.fresh.yml up -d --build --force-recreate
+docker compose -f deploy/compose/docker-compose.fresh.yml up -d --build --force-recreate
 ```
 
 Open **<http://localhost:8765>**. The container starts with a freshly generated
@@ -142,7 +142,7 @@ container-native config and no sources, ready to configure from the browser.
 Files uploaded in the UI are stored inside the persistent state volume.
 
 !!! danger "This resets pheasant's Docker data"
-    Every run clears the named config, state, vault, and export volumes before
+    Every run clears the named config, state, and export volumes before
     startup. It does not delete host files, Docker images, or unrelated Docker
     volumes. Use ordinary `docker compose up -d --build` when you want to keep
     an existing knowledge base.
@@ -158,63 +158,26 @@ creates `/config/pheasant.yaml` from its live defaults. If `OPENAI_API_KEY`,
 
 ## Option 3: `docker compose` from this repo
 
-The repo's `docker-compose.yml` is the reference stack: pheasant plus the
-`pheasant-ui` sidecar (nginx serving the bundle and proxying `/api/*` to the
-pheasant container).
+The repository keeps its Compose manifests under `deploy/compose/`; the root
+stays reserved for source and contributor entry points. Copy the environment
+template once, then launch the standard repository stack:
 
 ```bash
-git clone https://github.com/esatt10/pheasant-kb && cd pheasant
-docker compose up -d --build
+git clone https://github.com/esatt10/pheasant-kb && cd pheasant-kb
+cp deploy/compose/.env.example .env
+docker compose --env-file .env -f deploy/compose/docker-compose.yml up -d --build
 ```
 
-Open **<http://localhost:8080>** for the UI and **<http://localhost:8765>** for
-the API.
-
-**Always pass `--build`.** The UI service carries both a `build:` context and an
-`image:` tag. Compose builds only when no image with that tag exists locally, so
-without `--build` you keep getting the bundle you built the first time — the
-single most common reason "the UI didn't update".
+Open **<http://localhost:8765>**. The bundled UI and API share that port.
 
 ### Point it at your own content
 
-The default mounts index the repository itself. To index your own files, either
-edit the compose variables directly:
+Add paths or repository URLs from the Sources page, or choose one of the
+small, advanced and scalable presets in `deploy/compose/README.md`. That guide owns the
+profile-specific variables and commands so they do not drift across pages.
 
-```bash
-PHEASANT_WORKSPACE_PATH=~/projects/my-app docker compose up -d --build
-```
-
-or generate an env file from your own config:
-
-```bash
-pheasant init --profile quickstart --output pheasant.yaml
-# edit pheasant.yaml: sources + deployment.compose.workspace_path
-pheasant compose-env pheasant.yaml --output .pheasant/compose.env
-docker compose --env-file .pheasant/compose.env up -d --build
-```
-
-!!! warning "`compose-env` defaults the workspace to `./workspace`"
-    Unless your config sets `deployment.compose.workspace_path`, the generated
-    env file mounts `./workspace` — a directory that usually does not exist, so
-    Docker creates it empty, nothing is indexed, and the UI comes up with one
-    lonely knowledge-base node. Set `workspace_path` (or override
-    `PHEASANT_WORKSPACE_PATH`) to the directory you actually want indexed.
-
-### The compose variables
-
-| Variable | Default | What it does |
-|---|---|---|
-| `PHEASANT_UI_PORT` | `8080` | Host port for the UI. |
-| `PHEASANT_BIND` | `127.0.0.1` | Interface both ports publish on. |
-| `PHEASANT_UI_IMAGE` | `ghcr.io/esatt10/pheasant-ui:<version>` | UI image tag to run/build as. |
-| `PHEASANT_IMAGE` | `ghcr.io/esatt10/pheasant:<version>` | pheasant image tag. |
-| `PHEASANT_CONFIG_PATH` | `./pheasant.example.yaml` | Config mounted at `/config/pheasant.yaml`. |
-| `PHEASANT_WORKSPACE_PATH` | `.` | Mounted read-only at `/workspace`. |
-| `PHEASANT_DATA_PATH` | `./data` | Extra read-only mount at `/data`. |
-
-Both ports publish to **loopback only** by default. The API is unauthenticated,
-so only set `PHEASANT_BIND=0.0.0.0` behind an authenticating ingress — Docker's
-iptables rules bypass most host firewalls. See [Security](../security.md).
+The API publishes to loopback by default. It is unauthenticated, so only widen
+the bind address behind an authenticating ingress. See [Security](../security.md).
 
 ---
 

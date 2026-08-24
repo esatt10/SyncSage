@@ -30,3 +30,6 @@ Ordinary code changes (bug fixes, features, tests) follow the rules in
 `CLAUDE.md` §4 and the canonical commands in §3. A change that touches
 `src/pheasant/config/schema.py` owes `docs/configuration.md` an update —
 `tests/test_config_surface_freshness.py` enforces the mechanical part.
+
+For local deployment, configuration, scaling, MCP attachment, or deployment
+troubleshooting, use `.agents/skills/pheasant-deploy/SKILL.md`.

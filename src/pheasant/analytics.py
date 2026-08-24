@@ -319,7 +319,7 @@ def _unreadable(backend: str, sqlite_path: Any, exc: Exception) -> str:
     bug and is not: **SQLite cannot read a WAL database on a read-only
     filesystem at all.** It needs to create the ``-wal`` and ``-shm`` sidecars
     even to read, so a `/state:ro` mount — exactly what
-    ``docker-compose.scale.yml`` gives the api replicas — fails with "unable to
+    ``deploy/compose/docker-compose.scale.yml`` gives the api replicas — fails with "unable to
     open database file" while the tables sit right there.
 
     ``?immutable=1`` does open such a file, and is deliberately not used: it

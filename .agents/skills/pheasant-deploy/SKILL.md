@@ -1,0 +1,125 @@
+---
+name: pheasant-deploy
+description: Configure, deploy, validate, troubleshoot, or scale Pheasant locally from a blank canvas or the repository's small, advanced, and fleet presets. Use when an IDE agent is asked to set up Pheasant, select or modify a deployment profile, configure Docker Compose, enable MCP/vector/agentic/memory/PostgreSQL/NATS/gRPC/WASM features, connect an agent, verify repository URL synchronization, or diagnose startup and indexing health.
+---
+
+# Deploy Pheasant
+
+Treat configuration as generated data and deployment state as user data.
+
+## Establish context
+
+1. Read `AGENTS.md`, then `CLAUDE.md`.
+2. Read `docs/how-to/setup.md` for configuration work.
+3. Read `deploy/compose/README.md` for Docker profiles.
+4. Read only the task-specific guide afterward:
+   - sources or repository URLs: `docs/how-to/sources.md`
+   - MCP attachment: `docs/how-to/attach-to-coding-agent.md`
+   - indexing progress: `docs/how-to/monitor-indexing.md`
+   - scaling: `docs/how-to/worker-fleet.md` and `docs/how-to/capacity-planning.md`
+   - failures: `docs/troubleshooting.md`
+
+Inspect the current worktree and running containers before changing either.
+Preserve unrelated local changes and existing volumes.
+
+## Choose one route
+
+### Blank canvas
+
+Prefer the one-container Compose manifest when the user wants Docker:
+
+```bash
+cp deploy/compose/.env.example .env
+docker compose --env-file .env -f deploy/compose/docker-compose.yml config --quiet
+docker compose --env-file .env -f deploy/compose/docker-compose.yml up -d --build
+```
+
+Prefer the CLI outside Docker when the user wants a purely local install:
+
+```bash
+pheasant setup
+pheasant doctor -c pheasant.yaml
+pheasant start -c pheasant.yaml
+```
+
+Never hand-write `pheasant.yaml`. Use `pheasant setup`, `--answers`, or a
+documented API/config surface so the live schema validates every key.
+
+### Preset
+
+Select the smallest adequate preset:
+
+- `deploy/compose/local-small.yaml`: SQLite, offline text search, MCP and
+  durable memory; run directly with `pheasant start -c`.
+- `deploy/compose/docker-compose.advanced.yml`: one Docker node using
+  `local-advanced.yaml`, SQLite, LanceDB, WASM, OpenAI embeddings and agentic
+  retrieval.
+- `deploy/compose/docker-compose.scale.yml`: PostgreSQL, NATS JetStream,
+  LanceDB and gRPC preparation workers using `fleet.yaml` and `worker.yaml`.
+
+For advanced or fleet deployments, require `OPENAI_API_KEY` in `.env`. For the
+fleet, also require a long random `PHEASANT_INDEX_WORKER_TOKEN` and a real
+`POSTGRES_PASSWORD`. Never print or place secret values in YAML, logs, commits
+or responses.
+
+Start the advanced preset:
+
+```bash
+docker compose --env-file .env \
+  -f deploy/compose/docker-compose.advanced.yml config --quiet
+docker compose --env-file .env \
+  -f deploy/compose/docker-compose.advanced.yml up -d --build
+```
+
+Start the fleet and scale the CPU preparation path:
+
+```bash
+docker compose --env-file .env \
+  -f deploy/compose/docker-compose.scale.yml config --quiet
+docker compose --env-file .env \
+  -f deploy/compose/docker-compose.scale.yml up -d --build \
+  --scale indexer=4 --scale worker=8
+```
+
+Scale indexers for multiple concurrently queued sources and gRPC workers for
+parsing/chunking. Do not claim that workers accelerate OpenAI embeddings; the
+provider's RPM/TPM quota bounds that phase.
+
+## Configure a custom preset
+
+1. Copy the nearest JSON answer file under `deploy/compose/answers/`.
+2. Change dotted schema answers and source definitions; keep only environment
+   variable names for secrets.
+3. Generate YAML with `pheasant setup --answers ... --accept-defaults --force`.
+4. Run `pheasant doctor -c <generated-yaml> --no-require-paths` before Compose.
+5. Keep the answer JSON and generated YAML together in the change.
+
+For managed repository URLs, retain `repo.clone_url`, `clone_path` and
+`clone_ref`. Give the coordinator/indexer a writable `/workspace`; workers do
+not need that mount. Confirm remote, checkout and indexed commit evidence from
+the source status after synchronization.
+
+For durable memory, configure exactly one writable `type: memory` source and a
+persistent `/memory` mount shared by the API and indexer. Memory is written
+explicitly through MCP `memory_write` or `POST /memory`; ordinary chat is not
+silently recorded.
+
+## Validate and hand off
+
+After starting a profile:
+
+```bash
+docker compose --env-file .env -f <manifest> ps
+curl -fsS http://127.0.0.1:8765/health
+curl -fsS http://127.0.0.1:8765/ready
+curl -fsS http://127.0.0.1:8765/jobs
+```
+
+Inspect service logs when readiness, queue depth or indexing progress stalls.
+Report the selected profile, config path, Compose path, UI URL
+`http://127.0.0.1:8765`, MCP URL `http://127.0.0.1:8765/mcp`, required unset
+environment variable names, health state and any remaining validation failure.
+
+Never run `deploy/compose/docker-compose.fresh.yml`, remove a named volume, or replace an
+existing state directory unless the user explicitly requests a reset and the
+exact targets have been inspected first.

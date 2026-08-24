@@ -65,10 +65,11 @@ IMAGE_REFERENCE_RE = re.compile(r"ghcr\.io/esatt10/(pheasant(?:-ui)?):([0-9A-Za-
 #: is allowed to spell a tag as `<version>`. A wrong tag in one of these starts
 #: the wrong image; there is no reader to notice.
 MACHINE_CONSUMED = (
-    ".env.example",
-    "docker-compose.yml",
-    "docker-compose.fresh.yml",
-    "docker-compose.scale.yml",
+    "deploy/compose/.env.example",
+    "deploy/compose/docker-compose.yml",
+    "deploy/compose/docker-compose.advanced.yml",
+    "deploy/compose/docker-compose.fresh.yml",
+    "deploy/compose/docker-compose.scale.yml",
     "docker-compose.override.yml",
     "pheasant.example.yaml",
     "deploy/",
@@ -93,7 +94,7 @@ def _machine_consumed_files() -> list[Path]:
 def test_every_runnable_file_names_the_current_image_version() -> None:
     """A pinned tag in a file someone runs must be the version they installed.
 
-    `docker-compose.fresh.yml` sat on 0.9.0 for three releases because nothing
+    The fresh Compose manifest sat on 0.9.0 for three releases because nothing
     rewrote it and nothing checked it: `--check` only inspected the handful of
     files `replacements()` happened to list, so a new compose file or manifest
     joined the repo already outside the net. This closes that by scanning the

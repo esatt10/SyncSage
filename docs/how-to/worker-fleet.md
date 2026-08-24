@@ -201,12 +201,18 @@ only past the point where one container stops being enough
 
 ```bash
 export PHEASANT_INDEX_WORKER_TOKEN=$(openssl rand -hex 32)
-docker compose -f docker-compose.scale.yml up -d --scale worker=4
+export OPENAI_API_KEY=...
+docker compose --env-file .env -f deploy/compose/docker-compose.scale.yml up -d \
+  --scale indexer=4 --scale worker=8
 ```
 
-Postgres, one api, one indexer, four workers. Only `worker` is safe to scale
-here: `api` would need a load balancer Compose does not have, and a second
-`indexer` would spend its life losing lease races.
+Postgres, NATS JetStream, one API, four indexers and eight gRPC workers. The
+durable consumer distributes source tasks and PostgreSQL leases writes per
+source, so indexers can work on different sources at the same time. A single
+source still has one write lease: scaling indexers helps a multi-source corpus,
+while gRPC workers fan out parsing and chunking within the source being
+processed. Scale API replicas only after putting a load balancer in front of
+them; Compose deliberately publishes one API endpoint.
 
 ### Kubernetes
 

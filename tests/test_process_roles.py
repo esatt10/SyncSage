@@ -232,6 +232,26 @@ def test_the_api_role_publishes_a_sync_instead_of_running_it(tmp_path: Path) -> 
     assert int(rows[0]["c"]) == 0
 
 
+def test_the_api_role_never_runs_startup_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Configured on-startup sources belong to the indexer tier, not the API."""
+
+    called = threading.Event()
+
+    def startup(_self: Any) -> list[Any]:
+        called.set()
+        return []
+
+    monkeypatch.setattr("pheasant.sync.worker.WorkerBackedEngine.startup", startup)
+    config = _config(tmp_path, state_name="api-startup", role="api", queue=True)
+
+    with TestClient(create_app(config, role="api")):
+        time.sleep(0.05)
+
+    assert not called.is_set()
+
+
 def test_the_api_role_deduplicates_a_double_click(tmp_path: Path) -> None:
     config = _config(tmp_path, state_name="api-dedup", role="api", queue=True)
     client = TestClient(create_app(config, role="api"))

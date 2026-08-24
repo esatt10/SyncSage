@@ -134,9 +134,12 @@ pheasant mcp --transport stdio
 pheasant client-config claude-code|cursor|vscode
 pheasant config show                       # resolved config after profile+YAML+--set
 
-docker compose up                          # container + optional UI profile
-docker compose -f docker-compose.scale.yml up --scale worker=3
+docker compose --env-file .env -f deploy/compose/docker-compose.yml up
+docker compose --env-file .env -f deploy/compose/docker-compose.scale.yml up --scale indexer=2 --scale worker=3
 ```
+
+For deployment/configuration work, load
+`.agents/skills/pheasant-deploy/SKILL.md` before changing files or containers.
 
 ---
 
@@ -190,7 +193,7 @@ docker compose -f docker-compose.scale.yml up --scale worker=3
     claims), which is a bulk-columnar engine's worst case; DuckDB's FTS index
     is rebuilt wholesale rather than maintained, which would break pillar 2;
     and its exclusive *file* lock blocks other processes from opening the
-    database at all, where SQLite's WAL is what lets `docker-compose.scale.yml`
+    database at all, where SQLite's WAL is what lets `deploy/compose/docker-compose.scale.yml`
     mount `/state:ro` on the API replicas while the indexer writes. The export
     takes no lease and issues nothing but `SELECT`, which is what makes it safe
     to run during a sync.
@@ -344,7 +347,7 @@ Each of these cost real time. They are listed because the shape recurs.
   publish workflow then skipped silently because it only fires on green CI.
 - **A version reference nothing rewrites is a version reference that rots.**
   `sync_version.py` rewrote the files it happened to list, so every compose
-  file and manifest added later started outside the net — `docker-compose.fresh.yml`
+  file and manifest added later started outside the net — `deploy/compose/docker-compose.fresh.yml`
   sat three releases behind on a tag users actually pulled. The list of files
   to stage in the release commit is now derived from the script, not pasted
   into the workflow, and `tests/test_version_alignment.py` scans the files
