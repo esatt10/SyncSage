@@ -23,6 +23,7 @@ sync loop is Step 32.4).
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from typing import Any
 
 PUBLIC = {"allow": [], "public": True}
@@ -127,6 +128,61 @@ def is_allowed(
     if identities is None:
         return False
     return bool(identities.intersection(acl.get("allow") or []))
+
+
+def visible_node_ids(
+    node_ids: Iterable[str],
+    *,
+    graph: Any,
+    state: Any,
+    security: Any,
+    principal: str | None,
+    principal_groups: list[str] | None = None,
+) -> set[str]:
+    """The subset of ``node_ids`` a principal may see in ``graph`` (security
+    audit finding H1: the graph-explorer routes — ``/graph``,
+    ``/graph/export/*``, ``/graph/neighbors``, ``/graph/slice`` — had no ACL
+    guard at all, unlike ``search_context`` and ``_acl_guard``).
+
+    Applies the identical rule those two already apply: a node resolves to
+    the ``artifacts`` row that governs it — directly, if it *is* an artifact
+    node; via ``chunks.artifact_id``, if it is a chunk node (the same lookup
+    ``_acl_guard`` does for a single chunk in ``GET /nodes/content``) — and
+    every other node type (symbol/entity/heading/memory_record/
+    external_reference/source/knowledge_base/...) has no artifact row to
+    check, so it is conservatively denied, exactly as an unresolvable node
+    already is in both of those call sites (``hybrid.py``'s ``visible()``,
+    ``_acl_guard``'s ``artifact_id not in acls`` branch).
+
+    No-op (returns every id, unchanged) when ``security.acl_enforced`` is
+    off, matching every other ACL call site's default-off behavior — the
+    graph-explorer routes are otherwise byte-identical to pre-H1.
+    """
+    ids = list(dict.fromkeys(node_ids))  # de-dup, preserve order
+    if not getattr(security, "acl_enforced", False):
+        return set(ids)
+
+    identities = expand_principal(principal, principal_groups, getattr(security, "groups", None))
+    if identities is not None and principal:
+        from pheasant.security.idp import fresh_idp_groups
+
+        identities |= fresh_idp_groups(state, principal, getattr(security, "idp", None))
+    default_public = getattr(security, "default_visibility", "public") != "private"
+
+    chunk_ids = [nid for nid in ids if (graph.nodes.get(nid) or {}).get("type") == "chunk"]
+    chunk_to_artifact = state.chunk_artifact_ids(chunk_ids) if chunk_ids else {}
+
+    lookup_ids = list({chunk_to_artifact.get(nid, nid) for nid in ids})
+    acls = state.artifact_acls(lookup_ids)
+
+    allowed: set[str] = set()
+    for nid in ids:
+        artifact_id = chunk_to_artifact.get(nid, nid)
+        if artifact_id not in acls:
+            continue
+        if is_allowed(acls[artifact_id], identities, default_public=default_public):
+            allowed.add(nid)
+    return allowed
 
 
 def is_memory_record_visible(

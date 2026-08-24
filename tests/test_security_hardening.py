@@ -1190,3 +1190,303 @@ def test_resolve_http_principal_signed_mode_with_no_assertion_is_anonymous() -> 
         headers={}, body_principal="user:attacker", body_groups=None, config=config
     )
     assert principal is None
+
+
+# ---------------------------------------------------------------------------
+# 13. ACL coverage claim was false for the graph and structural routes
+# ---------------------------------------------------------------------------
+
+
+def _alice_node_id(client: TestClient, alice: dict[str, str]) -> str:
+    """An artifact-type graph node id `alice` may see, via a route already
+    proven to enforce ACLs correctly (section 4) — reused here as a fixture,
+    not re-tested."""
+    files = client.post("/relevant-files", json={"query": "widget service"}, headers=alice).json()[
+        "files"
+    ]
+    assert files, "fixture query must return at least one file"
+    return str(files[0]["node_id"])
+
+
+def test_graph_export_routes_enforce_acls(workspace: Path) -> None:
+    """The two 'unbounded whole-graph dump' routes named in the audit."""
+
+    _config, client = _build(
+        workspace, acl_enforced=True, default_visibility="private", principal_source="header"
+    )
+    _register_notes(client, workspace)
+    alice = {"X-Pheasant-Principal": "user:alice"}
+
+    anon_node_link = client.get("/graph/export/node-link-json").json()
+    assert anon_node_link["nodes"] == []
+
+    alice_node_link = client.get("/graph/export/node-link-json", headers=alice).json()
+    assert any(n.get("relative_path") == "a.md" for n in alice_node_link["nodes"])
+
+    anon_cyto = client.get("/graph/export/cytoscape-json").json()
+    assert anon_cyto["elements"]["nodes"] == []
+
+    alice_cyto = client.get("/graph/export/cytoscape-json", headers=alice).json()
+    assert alice_cyto["elements"]["nodes"]
+
+    anon_graph = client.get("/graph").json()
+    assert anon_graph["nodes"] == []
+
+
+def test_graph_export_routes_unchanged_when_enforcement_is_off(workspace: Path) -> None:
+    _config, client = _build(workspace)
+    _register_notes(client, workspace)
+
+    payload = client.get("/graph/export/node-link-json").json()
+
+    assert any(n.get("relative_path") == "a.md" for n in payload["nodes"])
+
+
+def test_graph_neighbors_and_slice_enforce_acls(workspace: Path) -> None:
+    _config, client = _build(
+        workspace, acl_enforced=True, default_visibility="private", principal_source="header"
+    )
+    _register_notes(client, workspace)
+    alice = {"X-Pheasant-Principal": "user:alice"}
+    node_id = _alice_node_id(client, alice)
+
+    assert client.get("/graph/neighbors", params={"node_id": node_id}).status_code == 403
+    allowed_neighbors = client.get("/graph/neighbors", params={"node_id": node_id}, headers=alice)
+    assert allowed_neighbors.status_code == 200
+
+    assert client.get("/graph/slice", params={"node_id": node_id}).status_code == 403
+    allowed_slice = client.get("/graph/slice", params={"node_id": node_id}, headers=alice)
+    assert allowed_slice.status_code == 200
+    assert any(str(n.get("id")) == node_id for n in allowed_slice.json()["nodes"])
+
+
+def test_graph_neighbors_and_slice_unchanged_when_enforcement_is_off(workspace: Path) -> None:
+    _config, client = _build(workspace)
+    _register_notes(client, workspace)
+    files = client.post("/relevant-files", json={"query": "widget service"}).json()["files"]
+    node_id = files[0]["node_id"]
+
+    assert client.get("/graph/neighbors", params={"node_id": node_id}).status_code == 200
+    assert client.get("/graph/slice", params={"node_id": node_id}).status_code == 200
+
+
+def test_nodes_explain_enforces_acls(workspace: Path) -> None:
+    _config, client = _build(
+        workspace, acl_enforced=True, default_visibility="private", principal_source="header"
+    )
+    _register_notes(client, workspace)
+    alice = {"X-Pheasant-Principal": "user:alice"}
+    node_id = _alice_node_id(client, alice)
+
+    assert client.get("/nodes/explain", params={"node_id": node_id}).status_code == 403
+    allowed = client.get("/nodes/explain", params={"node_id": node_id}, headers=alice)
+    assert allowed.status_code == 200
+    assert allowed.json()["node_id"] == node_id
+
+
+def test_repo_map_enforces_acls(workspace: Path) -> None:
+    _config, client = _build(
+        workspace, acl_enforced=True, default_visibility="private", principal_source="header"
+    )
+    _register_notes(client, workspace)
+    alice = {"X-Pheasant-Principal": "user:alice"}
+
+    anon = client.get("/sources/n1/repo-map").json()
+    assert anon["files"] == []
+
+    allowed = client.get("/sources/n1/repo-map", headers=alice).json()
+    assert any(f["relative_path"] == "a.md" for f in allowed["files"])
+
+
+def test_repo_map_unchanged_when_enforcement_is_off(workspace: Path) -> None:
+    _config, client = _build(workspace)
+    _register_notes(client, workspace)
+
+    payload = client.get("/sources/n1/repo-map").json()
+
+    assert any(f["relative_path"] == "a.md" for f in payload["files"])
+
+
+def test_taxonomy_enforces_acls(workspace: Path) -> None:
+    _config, client = _build(
+        workspace, acl_enforced=True, default_visibility="private", principal_source="header"
+    )
+    response = client.post(
+        "/sources",
+        json={
+            "name": "n1",
+            "type": "document_folder",
+            "path": str(workspace / "ws" / "notes"),
+            "taxonomy": {"enabled": True},
+            "sync_now": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+    alice = {"X-Pheasant-Principal": "user:alice"}
+
+    anon = client.get("/taxonomy").json()
+    assert anon["documents"] == []
+
+    allowed = client.get("/taxonomy", headers=alice).json()
+    assert any(doc["relative_path"] == "a.md" for doc in allowed["documents"])
+
+
+def test_graph_diagnostics_and_path_are_gated_off_under_enforcement(workspace: Path) -> None:
+    """These two cannot be filtered per-principal without either recomputing
+    whole-graph statistics per request (diagnostics) or redacting the middle
+    of a connectivity chain (path) — the audit's own named fallback: gate
+    the route off under acl_enforced rather than leave it unfiltered."""
+
+    _config, client = _build(
+        workspace, acl_enforced=True, default_visibility="private", principal_source="header"
+    )
+    _register_notes(client, workspace)
+    alice = {"X-Pheasant-Principal": "user:alice"}
+    node_id = _alice_node_id(client, alice)
+
+    assert client.get("/graph/diagnostics").status_code == 403
+    assert client.get("/graph/diagnostics", headers=alice).status_code == 403
+
+    path_params = {"source": node_id, "target": node_id}
+    assert client.get("/graph/path", params=path_params).status_code == 403
+    assert client.get("/graph/path", params=path_params, headers=alice).status_code == 403
+
+
+def test_graph_diagnostics_and_path_unchanged_when_enforcement_is_off(workspace: Path) -> None:
+    _config, client = _build(workspace)
+    _register_notes(client, workspace)
+    files = client.post("/relevant-files", json={"query": "widget service"}).json()["files"]
+    node_id = files[0]["node_id"]
+
+    assert client.get("/graph/diagnostics").status_code == 200
+    assert (
+        client.get("/graph/path", params={"source": node_id, "target": node_id}).status_code == 200
+    )
+
+
+def test_content_endpoints_accept_a_principal_groups_query_param(workspace: Path) -> None:
+    """The audit named this explicitly: /search accepted `principal_groups`
+    and these two did not. `principal_groups` only ever changes behavior
+    under `principal_source: body` (the only mode that reads a caller-
+    supplied groups list at all — `header`/`signed` derive groups from
+    config/IdP or a signed claim, never the request — see
+    `resolve_http_principal`), and `acl_enforced: true` can never combine
+    with `body` mode (finding C3), so there is no enforcement behavior to
+    pin here — this confirms the parameter is now accepted, matching /search's
+    shape."""
+
+    _config, client = _build(workspace)
+    _register_notes(client, workspace)
+
+    response = client.get(
+        "/files/summary", params={"path": "a.md", "principal_groups": ["group:eng"]}
+    )
+
+    assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 14. Memory writes accepted a forged author and could steer every agent's
+#     ranking with no permission check
+# ---------------------------------------------------------------------------
+
+
+def _build_memory(
+    workspace: Path,
+    *,
+    allow_org_scope_writes: bool = True,
+    principal_source: str = "body",
+) -> tuple[PheasantConfig, TestClient]:
+    memory_path = workspace / "ws" / "memory"
+    memory_path.mkdir(parents=True, exist_ok=True)
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(workspace / "ws"),
+                "state_path": str(workspace / "state"),
+                "exports_path": str(workspace / "exports"),
+            },
+            "security": {"principal_source": principal_source},
+            "memory": {"allow_org_scope_writes": allow_org_scope_writes},
+            "sources": [{"name": "agent-memory", "type": "memory", "path": str(memory_path)}],
+        }
+    )
+    client = TestClient(create_app(config, config_path=str(workspace / "pheasant.yaml")))
+    return config, client
+
+
+def test_memory_write_records_the_resolved_principal_not_the_body(workspace: Path) -> None:
+    """`written_by` must come from the authenticated principal (C3), never
+    the caller's own claim — the forged-author half of finding H3."""
+
+    _config, client = _build_memory(workspace, principal_source="header")
+
+    response = client.post(
+        "/memory",
+        json={"text": "a private note", "scope": "user", "principal": "user:forged"},
+        headers={"X-Pheasant-Principal": "user:real"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["record"]["written_by"] == "user:real"
+
+
+def test_memory_write_org_scope_gated_off_when_disabled(workspace: Path) -> None:
+    """Org-scope and steering-kind records are what every agent in the region
+    treats as shared fact, or uses to steer ranking on every query — the
+    'anyone can steer every agent' half of finding H3."""
+
+    _config, client = _build_memory(workspace, allow_org_scope_writes=False)
+
+    denied_org = client.post("/memory", json={"text": "org fact", "scope": "org"})
+    assert denied_org.status_code == 403
+
+    denied_steering = client.post(
+        "/memory",
+        json={"text": "prefer concise answers", "scope": "user", "kind": "preference"},
+    )
+    assert denied_steering.status_code == 403
+
+    allowed = client.post("/memory", json={"text": "a private fact-kind note", "scope": "user"})
+    assert allowed.status_code == 200
+
+
+def test_memory_write_org_scope_still_works_by_default(workspace: Path) -> None:
+    """True by default (rule 7): a single-user region needs nothing else."""
+
+    _config, client = _build_memory(workspace)
+
+    response = client.post("/memory", json={"text": "org fact", "scope": "org"})
+
+    assert response.status_code == 200
+
+
+def test_mcp_memory_write_org_scope_gated_off_when_disabled(workspace: Path) -> None:
+    """The MCP facade carries the same gate as HTTP — agents are callers too."""
+
+    from pheasant.mcp_server.tools import PheasantTools
+
+    memory_path = workspace / "ws" / "memory"
+    memory_path.mkdir(parents=True, exist_ok=True)
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(workspace / "ws"),
+                "state_path": str(workspace / "state"),
+                "exports_path": str(workspace / "exports"),
+            },
+            "memory": {"allow_org_scope_writes": False},
+            "sources": [{"name": "agent-memory", "type": "memory", "path": str(memory_path)}],
+        }
+    )
+    tools = PheasantTools(config)
+    try:
+        with pytest.raises(ValueError, match="allow_org_scope_writes"):
+            tools.memory_write(config.knowledge_base_id, "org fact", scope="org")
+        # Still works at user scope.
+        result = tools.memory_write(config.knowledge_base_id, "a private note", scope="user")
+        assert result["created"] is True
+    finally:
+        tools.engine.close()

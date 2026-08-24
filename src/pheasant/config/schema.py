@@ -847,6 +847,19 @@ class MemorySettings(ModelMixin):
     session_ttl_days: int | None = None
     user_ttl_days: int | None = None
     org_ttl_days: int | None = None
+    # Security audit finding H3 (2026-08-23): org-scope memory is what every
+    # agent in the region treats as shared ground truth, and (with
+    # steering_enabled) alias/preference/exclusion records at org scope
+    # change ranking for every query — a durable, persisted-to-disk
+    # prompt-injection primitive if written by a caller nothing has
+    # authenticated. `written_by` is now always the resolved principal
+    # (C3), never a raw request field, but "which principal" is a different
+    # question from "may this API write org-scope at all". True by default
+    # — org-scope writes over HTTP/MCP are exactly how a single-user region
+    # is meant to be used, and this is a knob for a multi-tenant/exposed
+    # deployment that wants to reserve org-scope authorship for the CLI or
+    # a hand-authored file, not a changed default.
+    allow_org_scope_writes: bool = True
     #: Days a superseded or TTL-expired record stays indexed — hidden from
     #: default results by the existing `valid_until` query-time predicate,
     #: but still reachable via `as_of` / `current_only=False` — before

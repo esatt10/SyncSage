@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from pheasant.graph.simple import SimpleMultiDiGraph
 
 
@@ -10,6 +12,7 @@ def node_link(
     node_types: set[str] | None = None,
     exclude_node_types: set[str] | None = None,
     source_id: str | None = None,
+    node_id_filter: Callable[[str], bool] | None = None,
 ) -> dict:
     """Node-link JSON, optionally bounded and filtered.
 
@@ -18,15 +21,28 @@ def node_link(
     than a budget's worth of nodes that then mostly get dropped.
     ``total_nodes``/``total_links`` always report the unfiltered graph, so
     the caller can tell "filtered out" from "truncated away".
-    """
-    filtering = bool(node_types or exclude_node_types or source_id)
 
-    def keep(node: dict) -> bool:
+    ``node_id_filter``, when given, is an ACL check (security audit finding
+    H1) — a callable answering "may the current caller see this node id".
+    It runs as part of the same pre-limit filter as ``node_types``, so an
+    ACL-restricted view still fills its requested budget with nodes the
+    caller may actually see, rather than being handed a page that is mostly
+    denied nodes silently dropped afterward. The caller is expected to have
+    already resolved this from a batched ACL lookup (e.g.
+    ``security.acl.visible_node_ids``) — calling a per-row check function
+    here, one node at a time, would turn an export into the kind of hidden
+    per-row cost `CLAUDE.md` §6 warns about.
+    """
+    filtering = bool(node_types or exclude_node_types or source_id or node_id_filter)
+
+    def keep(node_id: str, node: dict) -> bool:
         if node_types and node.get("type") not in node_types:
             return False
         if exclude_node_types and node.get("type") in exclude_node_types:
             return False
         if source_id and node.get("source_id") not in (source_id, None):
+            return False
+        if node_id_filter is not None and not node_id_filter(node_id):
             return False
         return True
 
@@ -57,7 +73,7 @@ def node_link(
         # front cost seconds on a large graph, and the copy bought nothing
         # because the lock already excludes the writer.
         for node_id, attrs in graph.iter_nodes():
-            if not keep(attrs):
+            if not keep(node_id, attrs):
                 continue
             eligible += 1
             if len(nodes) >= max_nodes:
@@ -90,8 +106,27 @@ def node_link(
     }
 
 
-def cytoscape(graph: SimpleMultiDiGraph) -> dict:
-    payload = graph.to_node_link()
+def cytoscape(
+    graph: SimpleMultiDiGraph,
+    node_limit: int | None = None,
+    link_limit: int | None = None,
+    node_types: set[str] | None = None,
+    exclude_node_types: set[str] | None = None,
+    source_id: str | None = None,
+    node_id_filter: Callable[[str], bool] | None = None,
+) -> dict:
+    """Cytoscape JSON. Delegates to :func:`node_link` for the same optional
+    bounding/filtering (including the ``node_id_filter`` ACL check, security
+    audit finding H1) rather than re-walking the graph a second way."""
+    payload = node_link(
+        graph,
+        node_limit=node_limit,
+        link_limit=link_limit,
+        node_types=node_types,
+        exclude_node_types=exclude_node_types,
+        source_id=source_id,
+        node_id_filter=node_id_filter,
+    )
     elements = {"nodes": [{"data": data} for data in payload["nodes"]], "edges": []}
     for edge in payload["links"]:
         elements["edges"].append({"data": edge})

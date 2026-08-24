@@ -431,10 +431,22 @@ class PheasantTools:
         itself. All three are optional and default to the pre-33.5 behavior
         (CLAUDE.md §4 rule 8: additive only).
         """
+        from pheasant.memory.policy import STEERING_KINDS
         from pheasant.memory.reinforcement import StateReinforcementIndex
         from pheasant.memory.store import MemoryStore, memory_source
 
         self._require_knowledge_base(knowledge_base)
+        # Security audit finding H3: see the matching comment on HTTP
+        # POST /memory. True by default (rule 7 — unchanged for the
+        # single-user case).
+        if not self.config.memory.allow_org_scope_writes and (
+            scope == "org" or kind in STEERING_KINDS
+        ):
+            raise ValueError(
+                "memory.allow_org_scope_writes is false: org-scope and steering-kind "
+                "records may not be written over MCP. Write session/user scope instead, "
+                "or enable memory.allow_org_scope_writes."
+            )
         source = memory_source(self.config, self.state)
         if source is None:
             raise ValueError(

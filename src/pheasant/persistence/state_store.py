@@ -30,6 +30,16 @@ logger = logging.getLogger(__name__)
 #: costs nothing when the alternative is losing the whole index.
 BUSY_TIMEOUT_MS = 60_000
 
+#: Batch size for a `WHERE id IN (...)` built from a caller-supplied list.
+#: SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` is 999 on older builds;
+#: 400 leaves headroom without needing a second round-trip for the common
+#: case. `artifact_acls`/`chunk_artifact_ids` were previously single
+#: unbounded queries — fine while every caller's candidate list was already
+#: bounded (hybrid search over-fetches at most `max_results * 4`), but the
+#: security-audit H1 graph-explorer ACL filter calls them with every node id
+#: in the graph, which blows the SQLite limit on any real-sized corpus.
+_SQL_IN_BATCH = 400
+
 #: The columns both write-path fold lookups read (Phase 1/3). One string so
 #: `find_canonical_record` and `foldable_record` cannot disagree on the
 #: empty-string-is-unset tier corner `MemoryPolicy.sql_predicate` documents.
@@ -303,14 +313,34 @@ class StateStore:
 
     def artifact_acls(self, artifact_ids: list[str]) -> dict[str, str | None]:
         """The stored ACL JSON (or None) for each artifact id (Step 32.2)."""
-        if not artifact_ids:
-            return {}
-        placeholders = ",".join("?" for _ in artifact_ids)
-        rows = self.conn.execute(
-            f"SELECT id, acl FROM artifacts WHERE id IN ({placeholders})",
-            tuple(artifact_ids),
-        )
-        return {row[0]: row[1] for row in rows}
+        result: dict[str, str | None] = {}
+        for start in range(0, len(artifact_ids), _SQL_IN_BATCH):
+            batch = artifact_ids[start : start + _SQL_IN_BATCH]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.conn.execute(
+                f"SELECT id, acl FROM artifacts WHERE id IN ({placeholders})",
+                tuple(batch),
+            )
+            result.update({row[0]: row[1] for row in rows})
+        return result
+
+    def chunk_artifact_ids(self, chunk_ids: list[str]) -> dict[str, str]:
+        """The owning artifact id for each chunk id (security audit H1).
+
+        The same resolution `_acl_guard` (`api/app.py`) already does for one
+        chunk node at a time, batched for the graph-explorer ACL filter,
+        which checks many chunk-type graph nodes per request.
+        """
+        result: dict[str, str] = {}
+        for start in range(0, len(chunk_ids), _SQL_IN_BATCH):
+            batch = chunk_ids[start : start + _SQL_IN_BATCH]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.conn.execute(
+                f"SELECT id, artifact_id FROM chunks WHERE id IN ({placeholders})",
+                tuple(batch),
+            )
+            result.update({row[0]: row[1] for row in rows})
+        return result
 
     def upsert_knowledge_base(
         self,

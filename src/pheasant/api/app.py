@@ -5,6 +5,7 @@ import os
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
@@ -1027,7 +1028,19 @@ def create_app(
         head = path.strip("/").split("/", 1)[0]
         return f"/{head}" if head else "/"
 
-    def audit(source_id: str | None, action: str, details: dict | None = None) -> None:
+    def audit(
+        source_id: str | None,
+        action: str,
+        details: dict | None = None,
+        *,
+        actor: str | None = None,
+    ) -> None:
+        """``actor`` defaults to ``"ui"`` — the pre-H3 behavior for every
+        caller that has no more specific identity to record. Security audit
+        finding H3: ``memory_write`` passes the *resolved* principal (C3)
+        here instead, so a mutation of what this region will later assert
+        as fact is traceable to who actually asserted it, not just to "some
+        HTTP caller"."""
         created_at = utc_now()
         ordinal = len(state.list_source_audit_events(source_id, limit=10000))
         import hashlib
@@ -1044,7 +1057,7 @@ def create_app(
             f"audit:{digest}:{ordinal}",
             source_id,
             action,
-            "ui",
+            actor or "ui",
             "http",
             None,
             created_at,
@@ -1529,13 +1542,39 @@ def create_app(
         }
 
     @app.get("/sources/{source_id}/repo-map")
-    def repo_map(source_id: str) -> dict:
+    def repo_map(
+        http_request: Request,
+        source_id: str,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
+    ) -> dict:
+        principal, principal_groups = _resolve_graph_principal(
+            http_request, principal, principal_groups
+        )
         rows = state.rows(
-            "SELECT relative_path,type,size_bytes FROM artifacts "
+            "SELECT id,relative_path,type,size_bytes FROM artifacts "
             "WHERE source_id=? ORDER BY relative_path",
             (source_id,),
         )
-        return {"source_name": source_id, "files": [dict(row) for row in rows]}
+        # Security audit finding H1: this route returns every indexed file's
+        # path and size with no ACL guard at all. Filtered the same way
+        # `_acl_guard` filters a single artifact read, just batched.
+        if config.security.acl_enforced:
+            allowed = _visible_graph_nodes(
+                [str(row["id"]) for row in rows], principal, principal_groups
+            )
+            rows = [row for row in rows if str(row["id"]) in allowed]
+        return {
+            "source_name": source_id,
+            "files": [
+                {
+                    "relative_path": row["relative_path"],
+                    "type": row["type"],
+                    "size_bytes": row["size_bytes"],
+                }
+                for row in rows
+            ],
+        }
 
     @app.get("/sources/{source_id}/history")
     def source_history(source_id: str, limit: int = 100, offset: int = 0) -> dict:
@@ -1951,6 +1990,25 @@ def create_app(
             body_groups=None,
             config=config,
         )
+        # Security audit finding H3: org-scope facts (and, with
+        # memory.steering_enabled, alias/preference/exclusion records) are
+        # what every agent in the region treats as shared ground truth or
+        # uses to steer ranking on every query. True by default (rule 7 —
+        # unchanged for the single-user case); an operator locks this to
+        # keep org-scope authorship on the CLI/hand-authored files only.
+        from pheasant.memory.policy import STEERING_KINDS
+
+        if not config.memory.allow_org_scope_writes and (
+            req.scope == "org" or req.kind in STEERING_KINDS
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "memory.allow_org_scope_writes is false: org-scope and steering-kind "
+                    "records may not be written over the API. Write session/user scope "
+                    "instead, or enable memory.allow_org_scope_writes."
+                ),
+            )
         # Phase 1: see the matching comment in mcp_server/tools.py:memory_write.
         reinforcement = (
             StateReinforcementIndex(state) if config.memory.reinforcement_enabled else None
@@ -2023,6 +2081,7 @@ def create_app(
                 "kind": record.kind,
                 "created": created,
             },
+            actor=principal,
         )
         return payload
 
@@ -2477,20 +2536,49 @@ def create_app(
         if not is_allowed(acls[artifact_id], identities, default_public=default_public):
             raise HTTPException(status_code=403, detail="Not permitted")
 
+    def _visible_graph_nodes(
+        node_ids: list[str],
+        principal: str | None,
+        principal_groups: list[str] | None,
+    ) -> set[str]:
+        """The subset of ``node_ids`` ``principal`` may see (security audit
+        finding H1 — the graph-explorer routes had no ACL guard at all).
+        No-op (returns every id) when ``security.acl_enforced`` is off."""
+        from pheasant.security.acl import visible_node_ids
+
+        return visible_node_ids(
+            node_ids,
+            graph=engine.graph_builder.graph,
+            state=state,
+            security=config.security,
+            principal=principal,
+            principal_groups=principal_groups,
+        )
+
+    def _resolve_graph_principal(
+        http_request: Request,
+        principal: str | None,
+        principal_groups: list[str] | None = None,
+    ) -> tuple[str | None, list[str] | None]:
+        from pheasant.security.principal import resolve_http_principal
+
+        return resolve_http_principal(
+            headers=http_request.headers,
+            body_principal=principal,
+            body_groups=principal_groups,
+            config=config,
+        )
+
     @app.get("/files/summary")
     def file_summary(
         http_request: Request,
         path: str,
         source_name: str | None = None,
         principal: str | None = None,
+        principal_groups: list[str] | None = None,
     ) -> dict:
-        from pheasant.security.principal import resolve_http_principal
-
-        principal, _groups = resolve_http_principal(
-            headers=http_request.headers,
-            body_principal=principal,
-            body_groups=None,
-            config=config,
+        principal, principal_groups = _resolve_graph_principal(
+            http_request, principal, principal_groups
         )
         # GROUP_CONCAT order is arbitrary unless the input rows are ordered,
         # so concatenate over ordered scalar subqueries to keep summaries and
@@ -2510,18 +2598,18 @@ def create_app(
         )
         if not rows:
             return {"path": path, "summary": None}
-        _acl_guard(str(rows[0]["id"]), principal)
+        _acl_guard(str(rows[0]["id"]), principal, principal_groups)
         return dict(rows[0])
 
     @app.get("/nodes/content")
-    def node_content(http_request: Request, node_id: str, principal: str | None = None) -> dict:
-        from pheasant.security.principal import resolve_http_principal
-
-        principal, _groups = resolve_http_principal(
-            headers=http_request.headers,
-            body_principal=principal,
-            body_groups=None,
-            config=config,
+    def node_content(
+        http_request: Request,
+        node_id: str,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
+    ) -> dict:
+        principal, principal_groups = _resolve_graph_principal(
+            http_request, principal, principal_groups
         )
         graph = engine.graph_builder.graph
         attrs = graph.nodes.get(node_id)
@@ -2534,9 +2622,9 @@ def create_app(
                 (node_id,),
             )
             if rows:
-                _acl_guard(str(rows[0]["artifact_id"]), principal)
+                _acl_guard(str(rows[0]["artifact_id"]), principal, principal_groups)
             return {"node_id": node_id, "content": rows[0]["text"] if rows else None}
-        _acl_guard(node_id, principal)
+        _acl_guard(node_id, principal, principal_groups)
         artifact_rows = state.rows("SELECT path FROM artifacts WHERE id=? LIMIT 1", (node_id,))
         if artifact_rows:
             path = Path(artifact_rows[0]["path"])
@@ -2566,9 +2654,12 @@ def create_app(
 
     @app.get("/taxonomy")
     def taxonomy(
+        http_request: Request,
         source: str | None = None,
         path: str | None = None,
         max_nodes: int = 2000,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
     ) -> dict:
         """The structural outline of taxonomy-enabled documents.
 
@@ -2590,9 +2681,11 @@ def create_app(
             taxonomy_tree,
         )
 
+        principal, principal_groups = _resolve_graph_principal(
+            http_request, principal, principal_groups
+        )
         graph_obj = engine.graph_builder.graph
-        by_document: dict[str, list[SectionHeading]] = {}
-        seen = 0
+        candidates = []
         for _node_id, data in graph_obj.node_map().items():
             if data.get("type") != "heading":
                 continue
@@ -2601,9 +2694,29 @@ def create_app(
             relative = str(data.get("relative_path") or "")
             if path and relative != path:
                 continue
+            candidates.append(data)
+
+        # Security audit finding H1: heading nodes carry no ACL guard at
+        # all. Resolved via the heading's own `artifact_id` (set at graph-
+        # build time, `graph/builder.py:_emit_headings`), the same way
+        # `_acl_guard` resolves a chunk node via `chunks.artifact_id`.
+        # Filtered before `max_nodes` truncation for the same reason
+        # `node_link` filters before its limit: an ACL-restricted view
+        # should still fill its requested budget with visible documents.
+        if config.security.acl_enforced:
+            artifact_ids = {str(d["artifact_id"]) for d in candidates if d.get("artifact_id")}
+            allowed = _visible_graph_nodes(list(artifact_ids), principal, principal_groups)
+            candidates = [
+                d for d in candidates if d.get("artifact_id") and str(d["artifact_id"]) in allowed
+            ]
+
+        by_document: dict[str, list[SectionHeading]] = {}
+        seen = 0
+        for data in candidates:
             seen += 1
             if seen > max(1, max_nodes):
                 break
+            relative = str(data.get("relative_path") or "")
             parts = tuple(int(p) for p in (data.get("ordinal_parts") or []))
             ordinal = (
                 Ordinal(
@@ -2652,13 +2765,36 @@ def create_app(
             "truncated": seen > max(1, max_nodes),
         }
 
+    def _full_graph_node_filter(
+        http_request: Request,
+        principal: str | None,
+        principal_groups: list[str] | None,
+    ) -> Callable[[str], bool] | None:
+        """An ACL ``node_id_filter`` for :func:`node_link`/:func:`cytoscape`,
+        pre-computed over every node currently in the graph — ``None`` when
+        enforcement is off, so the whole-graph export routes stay
+        byte-identical to pre-H1 in the default (unenforced) config."""
+        if not config.security.acl_enforced:
+            return None
+        principal, principal_groups = _resolve_graph_principal(
+            http_request, principal, principal_groups
+        )
+        graph_obj = engine.graph_builder.graph
+        with graph_obj.reading():
+            all_ids = [node_id for node_id, _attrs in graph_obj.iter_nodes()]
+        allowed = _visible_graph_nodes(all_ids, principal, principal_groups)
+        return allowed.__contains__
+
     @app.get("/graph")
     def graph(
+        http_request: Request,
         limit: int | None = None,
         link_limit: int | None = None,
         types: str | None = None,
         exclude_types: str | None = None,
         source: str | None = None,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
     ) -> dict:
         def _set(value: str | None) -> set[str] | None:
             items = {t.strip() for t in (value or "").split(",") if t.strip()}
@@ -2671,40 +2807,76 @@ def create_app(
             node_types=_set(types),
             exclude_node_types=_set(exclude_types),
             source_id=source,
+            node_id_filter=_full_graph_node_filter(http_request, principal, principal_groups),
         )
 
     @app.get("/graph/export/node-link-json")
-    def graph_node_link() -> dict:
-        return node_link(engine.graph_builder.graph)
+    def graph_node_link(
+        http_request: Request,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
+    ) -> dict:
+        return node_link(
+            engine.graph_builder.graph,
+            node_id_filter=_full_graph_node_filter(http_request, principal, principal_groups),
+        )
 
     @app.get("/graph/export/cytoscape-json")
-    def graph_cyto() -> dict:
-        return cytoscape(engine.graph_builder.graph)
+    def graph_cyto(
+        http_request: Request,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
+    ) -> dict:
+        return cytoscape(
+            engine.graph_builder.graph,
+            node_id_filter=_full_graph_node_filter(http_request, principal, principal_groups),
+        )
 
     @app.get("/graph/neighbors")
     def graph_neighbors_route(
+        http_request: Request,
         node_id: str,
         depth: int = 1,
         edge_types: str | None = None,
         exclude_edge_types: str | None = None,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
     ) -> dict:
         types = [t for t in edge_types.split(",") if t] if edge_types else None
-        return graph_neighbors(
+        result = graph_neighbors(
             engine.graph_builder.graph,
             node_id,
             depth,
             types,
             exclude_edge_types=_edge_type_set(exclude_edge_types),
         )
+        # Security audit finding H1: no ACL guard at all on this route. The
+        # traversal is already bounded (`depth`/`max_nodes`), so filtering
+        # the finished result — rather than threading a check through the
+        # BFS itself — costs one batched lookup per request, not one per
+        # node visited.
+        if config.security.acl_enforced:
+            principal, principal_groups = _resolve_graph_principal(
+                http_request, principal, principal_groups
+            )
+            candidate_ids = [node_id, *(n["node_id"] for n in result["neighbors"])]
+            allowed = _visible_graph_nodes(candidate_ids, principal, principal_groups)
+            if node_id not in allowed:
+                raise HTTPException(status_code=403, detail="Not permitted")
+            result["neighbors"] = [n for n in result["neighbors"] if n["node_id"] in allowed]
+        return result
 
     @app.get("/graph/slice")
     def graph_slice_route(
+        http_request: Request,
         node_id: str,
         depth: int = 1,
         limit: int = 100,
         edge_types: str | None = None,
         exclude_edge_types: str | None = None,
         exclude_types: str | None = None,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
     ) -> dict:
         """A bounded sub-graph around a node.
 
@@ -2715,7 +2887,7 @@ def create_app(
         """
 
         types = [t for t in edge_types.split(",") if t] if edge_types else None
-        return graph_slice(
+        result = graph_slice(
             engine.graph_builder.graph,
             node_id,
             depth,
@@ -2724,16 +2896,54 @@ def create_app(
             exclude_edge_types=_edge_type_set(exclude_edge_types),
             exclude_node_types=_edge_type_set(exclude_types),
         )
+        # Security audit finding H1, same post-hoc filter as `/graph/neighbors`
+        # (`graph_slice` is built from `graph_neighbors` internally).
+        if config.security.acl_enforced:
+            principal, principal_groups = _resolve_graph_principal(
+                http_request, principal, principal_groups
+            )
+            candidate_ids = [str(n.get("id")) for n in result["nodes"] if n.get("id")]
+            allowed = _visible_graph_nodes(candidate_ids, principal, principal_groups)
+            if node_id not in allowed:
+                raise HTTPException(status_code=403, detail="Not permitted")
+            result["nodes"] = [n for n in result["nodes"] if str(n.get("id")) in allowed]
+            result["links"] = [
+                link
+                for link in result["links"]
+                if link["source"] in allowed and link["target"] in allowed
+            ]
+            result["depths"] = {k: v for k, v in result["depths"].items() if k in allowed}
+        return result
 
     @app.get("/graph/diagnostics")
-    def graph_diagnostics(top: int = 20) -> dict:
+    def graph_diagnostics(http_request: Request, top: int = 20) -> dict:
         """Structural health of the graph, for the full-screen workspace.
 
         Answers the questions a picture cannot: which nodes are hubs, how much
         of the graph is disconnected, which edge types actually carry weight,
         and how the sources compare. One pinned read of the graph — this walks
         it, so it must not be on a hot path the UI polls.
+
+        Security audit finding H1: unlike ``/graph/neighbors``/``/graph/slice``,
+        this route's hub/orphan/degree statistics are aggregated across the
+        *whole* graph in one pass, so filtering them to what one principal may
+        see would mean recomputing degree and connectivity over a visibility-
+        restricted subgraph — a materially different (and materially more
+        expensive) computation, not a post-hoc drop. Per the audit's own
+        fallback ("where a route genuinely cannot be filtered, gate it off
+        under acl_enforced rather than leaving the docs wrong"), this route is
+        gated off entirely when enforcement is on, rather than silently
+        leaking hub labels and orphan node ids to every principal.
         """
+        if config.security.acl_enforced:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "GET /graph/diagnostics aggregates across the whole graph and "
+                    "cannot be filtered per-principal; it is disabled while "
+                    "security.acl_enforced is true"
+                ),
+            )
         graph_obj = engine.graph_builder.graph
         # `iter_edges`/`node_map` hand back the live mappings instead of
         # copying 850k edges per call; both require holding `reading()` for
@@ -2785,7 +2995,23 @@ def create_app(
         uniquely able to answer and the canvas alone cannot — two nodes six
         hops apart are never on screen together. Bidirectional BFS so a miss
         on a large graph costs two shallow frontiers rather than one deep one.
+
+        Security audit finding H1: checking only the two endpoints would
+        leave the *hop chain between them* unfiltered, and a path is not a
+        path with holes redacted out of its middle — there is no way to
+        partially answer "how are these related" without revealing every
+        node on the route. Per the audit's own fallback, gated off entirely
+        under ``security.acl_enforced`` rather than leaking it.
         """
+        if config.security.acl_enforced:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "GET /graph/path cannot redact the intermediate hops of a "
+                    "connectivity path without revealing them; it is disabled "
+                    "while security.acl_enforced is true"
+                ),
+            )
         graph_obj = engine.graph_builder.graph
         if source not in graph_obj:
             raise HTTPException(status_code=404, detail=f"Unknown node: {source}")
@@ -2804,11 +3030,25 @@ def create_app(
         }
 
     @app.get("/nodes/explain")
-    def explain_node(node_id: str) -> dict:
+    def explain_node(
+        http_request: Request,
+        node_id: str,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
+    ) -> dict:
         g = engine.graph_builder.graph
         attrs = g.nodes.get(node_id)
         if attrs is None:
             return {"node_id": node_id, "explanation": "Node is not present in the current graph."}
+        # Security audit finding H1: no ACL guard at all. A single-node
+        # lookup, so filtered the same way `/nodes/content` filters one.
+        if config.security.acl_enforced:
+            principal, principal_groups = _resolve_graph_principal(
+                http_request, principal, principal_groups
+            )
+            allowed = _visible_graph_nodes([node_id], principal, principal_groups)
+            if node_id not in allowed:
+                raise HTTPException(status_code=403, detail="Not permitted")
         node = dict(attrs)
         return {
             "node_id": node_id,
