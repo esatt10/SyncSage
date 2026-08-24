@@ -48,12 +48,21 @@ def test_fresh_ui_compose_resets_only_its_mounted_pheasant_volumes() -> None:
     assert "docker-compose.override.yml" not in script
 
 
-def _entrypoint_wasm_answers() -> dict:
-    """The answers JSON the container feeds `pheasant setup`, parsed."""
+def _entrypoint_answers(shell_var: str) -> dict:
+    """One of the answers JSON blobs the container feeds `pheasant setup`,
+    parsed. `shell_var` is the shell variable name in docker-entrypoint.sh."""
     script = ENTRYPOINT_PATH.read_text(encoding="utf-8")
-    match = re.search(r"^WASM_ANSWERS='(.*)'$", script, re.M)
-    assert match, "docker-entrypoint.sh no longer defines WASM_ANSWERS"
+    match = re.search(rf"^{re.escape(shell_var)}='(.*)'$", script, re.M)
+    assert match, f"docker-entrypoint.sh no longer defines {shell_var}"
     return json.loads(match.group(1))
+
+
+def _entrypoint_wasm_answers() -> dict:
+    """The answers JSON a container with wasmtime installed feeds `pheasant
+    setup` — WASM acceleration on, alongside the security audit finding H4
+    fix (server.host: 0.0.0.0, unconditional — see the other answers blob
+    below) that every container needs regardless of wasmtime."""
+    return _entrypoint_answers("SETUP_ANSWERS_WITH_WASM")
 
 
 def test_a_fresh_container_generates_a_config_with_wasm_acceleration_on() -> None:
@@ -61,10 +70,13 @@ def test_a_fresh_container_generates_a_config_with_wasm_acceleration_on() -> Non
     its own config should use what it was built with.
 
     Driven through the **real wizard** rather than asserting on the script's
-    text: the two flags are schema keys, and a rename would leave a
+    text: the flags are schema keys, and a rename would leave a
     string-matching test green while the container silently generated a config
     with acceleration off — which is exactly the failure mode, since both
-    accelerators fall back to pure Python without ever erroring.
+    accelerators fall back to pure Python without ever erroring. Same reasoning
+    covers `server.host` (security audit finding H4): a wrong or missing
+    answer would not error either, it would just silently bind loopback-only
+    inside a container whose only reachability is that bind.
     """
     from pheasant.setup_wizard import Wizard
 
@@ -74,11 +86,36 @@ def test_a_fresh_container_generates_a_config_with_wasm_acceleration_on() -> Non
 
     assert rendered["search"]["wasm_relationship_search"] is True
     assert rendered["graph"]["wasm_cross_source_resolution"] is True
+    assert rendered["server"]["host"] == "0.0.0.0"
 
 
-def test_the_default_config_without_those_answers_still_has_wasm_off() -> None:
-    """The flags are opt-in in the schema and stay that way — the container
-    turning them on is a container decision, not a changed default."""
+def test_a_fresh_container_without_wasmtime_still_gets_the_host_answer() -> None:
+    """security audit finding H4: `server.host: 0.0.0.0` must reach every
+    container's generated config, not only ones with wasmtime installed —
+    it is a reachability fix, not an acceleration one, and must not be
+    accidentally gated behind the same `import wasmtime` check."""
+    from pheasant.setup_wizard import Wizard
+
+    answers = _entrypoint_answers("SETUP_ANSWERS_BASE")
+    assert answers == {"server.host": "0.0.0.0"}
+
+    wizard = Wizard(accept_defaults=True, preset=answers)
+    wizard.run()
+    rendered = wizard.config_dict()
+
+    assert rendered["server"]["host"] == "0.0.0.0"
+    assert rendered.get("search", {}).get("wasm_relationship_search", False) is False
+    assert rendered.get("graph", {}).get("wasm_cross_source_resolution", False) is False
+
+
+def test_the_default_config_without_those_answers_binds_loopback_only() -> None:
+    """The WASM flags are opt-in in the schema and stay that way — the
+    container turning them on is a container decision, not a changed
+    default. `server.host` is the opposite direction (security audit
+    finding H4): the *schema* default is now the safe one (127.0.0.1), and
+    it is the container's `SETUP_ANSWERS_BASE`/`_WITH_WASM` answer that
+    widens it to 0.0.0.0 — so with no answers at all, the wizard must still
+    produce the safe bind, matching a bare `pip install`."""
     from pheasant.setup_wizard import Wizard
 
     wizard = Wizard(accept_defaults=True)
@@ -87,6 +124,7 @@ def test_the_default_config_without_those_answers_still_has_wasm_off() -> None:
 
     assert rendered.get("search", {}).get("wasm_relationship_search", False) is False
     assert rendered.get("graph", {}).get("wasm_cross_source_resolution", False) is False
+    assert rendered["server"]["host"] == "127.0.0.1"
 
 
 def test_the_entrypoint_gates_wasm_on_the_extra_being_installed() -> None:
@@ -108,10 +146,12 @@ def test_the_sandboxed_pdf_extractor_is_not_swept_in_with_the_accelerators() -> 
     answers = _entrypoint_wasm_answers()
 
     assert set(answers) == {
+        "server.host",
         "search.wasm_relationship_search",
         "graph.wasm_cross_source_resolution",
     }
-    assert all(value is True for value in answers.values())
+    assert answers["search.wasm_relationship_search"] is True
+    assert answers["graph.wasm_cross_source_resolution"] is True
 
 
 def test_fresh_ui_one_liner_is_documented() -> None:

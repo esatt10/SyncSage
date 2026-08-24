@@ -614,8 +614,14 @@ def _apply_transport_security(settings: Any, config: PheasantConfig) -> None:
     documented escape hatch it already is. FastMCP's localhost defaults are
     kept alongside, so this only ever *widens* to hosts the operator already
     admitted, and a config that never mentions CORS behaves as FastMCP intends.
+
+    The origin walk itself is shared with the ``TrustedHostMiddleware`` set up
+    in ``api/app.py`` (security audit finding H2) via
+    ``pheasant.security.hosts.cors_origin_hosts`` — this is the netloc half of
+    that one walk; the middleware uses the bare-hostname half, since
+    Starlette's ``TrustedHostMiddleware`` compares hostnames, not netlocs.
     """
-    from urllib.parse import urlsplit
+    from pheasant.security.hosts import cors_origin_hosts
 
     security = getattr(settings, "transport_security", None)
     if security is None:
@@ -627,14 +633,13 @@ def _apply_transport_security(settings: Any, config: PheasantConfig) -> None:
         # inconsistent with every other route on the same port.
         security.enable_dns_rebinding_protection = False
         return
+    _hostnames, netlocs = cors_origin_hosts(api)
     hosts = list(security.allowed_hosts)
+    for netloc in netlocs:
+        if netloc not in hosts:
+            hosts.append(netloc)
     origins = list(security.allowed_origins)
     for origin in api.cors_origins or []:
-        parsed = urlsplit(origin)
-        if not parsed.netloc:
-            continue
-        if parsed.netloc not in hosts:
-            hosts.append(parsed.netloc)
         if origin not in origins:
             origins.append(origin)
     security.allowed_hosts = hosts

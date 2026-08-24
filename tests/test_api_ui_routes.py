@@ -620,5 +620,16 @@ sources: []
     assert handshake_status("pheasant.internal:8765") == 200, (
         "a host the operator allowed via cors_origins was refused by the MCP transport guard"
     )
-    # Narrowed to the operator's list, not switched off.
-    assert handshake_status("evil.example:8765") == 421, "an unlisted host should be refused"
+    # Narrowed to the operator's list, not switched off. Security audit
+    # finding H2 added a `TrustedHostMiddleware` on the outer FastAPI app,
+    # seeded from the same `cors_origins` this test configures (see
+    # `pheasant.security.hosts.cors_origin_hosts`, shared by both guards) —
+    # it now rejects an unlisted host with 400 before the request ever
+    # reaches `/mcp/`, so FastMCP's own guard (421) is no longer the layer
+    # this particular request path exercises. It is still real, still
+    # correct, and still reachable directly — see `_apply_transport_security`
+    # and `tests/test_security_hardening.py`'s
+    # `test_mcp_transport_security_still_derives_from_cors_origins` — this
+    # test's own contract ("an unlisted host should be refused") is what
+    # actually matters here, and it still holds.
+    assert handshake_status("evil.example:8765") == 400, "an unlisted host should be refused"

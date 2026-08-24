@@ -41,38 +41,50 @@ WORKSPACE="${PHEASANT_WORKSPACE:-/workspace}"
 # the precompiled guest, so a container that generates its own config should
 # use what it was built with rather than leave it switched off.
 #
+# `server.host` defaults to 127.0.0.1 in the schema as of security audit
+# finding H4 (2026-08-23) — the right default for a bare `pip install`,
+# where the bind address is the only thing standing between an
+# unauthenticated API and the network. Inside a container that default is
+# wrong: the port is only reachable at all because *this process* publishes
+# it, and 127.0.0.1 here would mean 0.0.0.0 outside would still see nothing
+# — `docker run -p` publishes what the container binds, and compose already
+# does the actual "publish to 127.0.0.1 on the host" step
+# (`docker-compose.yml`). So this container always answers 0.0.0.0 for
+# `server.host`, same reasoning `quickstart.py` documents for the opposite
+# (host) case, unconditionally rather than gated like the WASM answers below
+# — every container needs it, not just one with wasmtime installed.
+#
 # Written through `--answers` rather than by post-editing the YAML, so the
 # entrypoint keeps having exactly one code path for "what does a default config
-# look like" — `pheasant setup` still renders it, this only supplies two answers.
+# look like" — `pheasant setup` still renders it, this only supplies answers.
 #
-# Gated on wasmtime actually importing. Both accelerators fall back to pure
-# Python on any failure, so enabling them without the extra would still be
-# *correct* — it would just log a warning per call and mean nothing. Deliberately
-# NOT enabled here: `ingestion.extractor.provider: sandboxed`. That is a
-# fidelity trade, not an acceleration one — `native` handles encrypted PDFs,
-# LZW/CCITT and Type0/CID CMaps that the sandboxed tokenizer does not.
-WASM_ANSWERS='{"search.wasm_relationship_search": true, "graph.wasm_cross_source_resolution": true}'
+# The WASM answers are gated on wasmtime actually importing. Both
+# accelerators fall back to pure Python on any failure, so enabling them
+# without the extra would still be *correct* — it would just log a warning
+# per call and mean nothing. Deliberately NOT enabled here:
+# `ingestion.extractor.provider: sandboxed`. That is a fidelity trade, not
+# an acceleration one — `native` handles encrypted PDFs, LZW/CCITT and
+# Type0/CID CMaps that the sandboxed tokenizer does not.
+SETUP_ANSWERS_BASE='{"server.host": "0.0.0.0"}'
+SETUP_ANSWERS_WITH_WASM='{"server.host": "0.0.0.0", "search.wasm_relationship_search": true, "graph.wasm_cross_source_resolution": true}'
 
 ensure_config() {
     [ -f "$CONFIG_PATH" ] && return 0
     mkdir -p "$(dirname "$CONFIG_PATH")" 2>/dev/null || return 1
     echo "pheasant: no config at $CONFIG_PATH — generating one." >&2
 
-    answers_file=""
+    answers="$SETUP_ANSWERS_BASE"
     if python -c "import wasmtime" >/dev/null 2>&1; then
-        answers_file="${TMPDIR:-/tmp}/pheasant-wasm-answers.json"
-        if printf '%s' "$WASM_ANSWERS" > "$answers_file" 2>/dev/null; then
-            echo "pheasant: wasmtime present — enabling WASM acceleration." >&2
-        else
-            answers_file=""
-        fi
+        echo "pheasant: wasmtime present — enabling WASM acceleration." >&2
+        answers="$SETUP_ANSWERS_WITH_WASM"
     else
         echo "pheasant: wasmtime not installed — WASM acceleration stays off." >&2
     fi
 
-    # `--accept-defaults` asks nothing and reads every default off the live
-    # schema, so this stays correct as the schema changes.
-    if [ -n "$answers_file" ]; then
+    # `--accept-defaults` asks nothing and reads every other default off the
+    # live schema, so this stays correct as the schema changes.
+    answers_file="${TMPDIR:-/tmp}/pheasant-setup-answers.json"
+    if printf '%s' "$answers" > "$answers_file" 2>/dev/null; then
         if python -m pheasant setup --accept-defaults --output "$CONFIG_PATH" \
                 --answers "$answers_file" >/dev/null; then
             rm -f "$answers_file"
@@ -81,6 +93,12 @@ ensure_config() {
         rm -f "$answers_file"
         return 1
     fi
+    # Could not stage the answers file (e.g. an unwritable temp dir) — fall
+    # back to plain schema defaults rather than fail the whole container.
+    # This is the one path where a container could still come up bound to
+    # 127.0.0.1 and unreachable; the "no config generated" case above logs
+    # loudly, and this is at least as visible (the server plainly won't
+    # answer on the published port).
     python -m pheasant setup --accept-defaults --output "$CONFIG_PATH" >/dev/null
 }
 

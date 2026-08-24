@@ -263,7 +263,18 @@ class UiSettings(ModelMixin):
 
 @dataclass
 class ServerSettings(ModelMixin):
-    host: str = "0.0.0.0"
+    #: Security audit finding H4 (2026-08-23): this is an unauthenticated
+    #: API — `docs/security.md` names the bind address as the primary
+    #: compensating control — so the default has to be the safe one.
+    #: `pheasant setup --accept-defaults` reads its defaults straight off
+    #: this dataclass, so a bare-metal/`pip install` install used to bind
+    #: every interface with no authentication out of the box; the
+    #: container image already overrode this to "0.0.0.0" explicitly (see
+    #: `docker-entrypoint.sh`'s `ensure_config`), which is correct *inside*
+    #: a container whose port publishing is the actual boundary — this
+    #: default is for everything else. `quickstart.py` sets "127.0.0.1"
+    #: explicitly for the same reason and is unaffected by this change.
+    host: str = "127.0.0.1"
     port: int = 8765
     #: Which jobs this process takes on: ``all`` (the default and today's
     #: behavior), ``api`` (serve only — publishes index work instead of

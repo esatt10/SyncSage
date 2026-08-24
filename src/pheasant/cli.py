@@ -118,12 +118,53 @@ def _report_ui(app_obj, cfg) -> None:
         )
 
 
+#: Bind addresses that only accept connections originating on this machine.
+#: Anything else means "every host that can reach the port" — the exact
+#: reachability `_warn_if_bound_beyond_loopback` (security audit finding H4)
+#: warns about.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _warn_if_bound_beyond_loopback(cfg) -> None:
+    """Loud, not fatal, when this unauthenticated API binds beyond loopback
+    with no declared ingress authentication in front (security audit
+    finding H4).
+
+    `docs/security.md` names the bind address as this API's primary
+    compensating control — there is no authentication of its own. A
+    non-loopback bind means every host that can reach the port can also
+    rewrite the config, read the whole index, and register a source
+    anywhere the process can read from. Not fatal: some deployments have
+    network isolation this process cannot see (a Kubernetes NetworkPolicy,
+    a firewall, a container network with no route from outside) and this
+    codebase does not get to veto that — `server.api.cors_allow_all_origins`
+    is the existing, documented signal an operator already uses to say "an
+    authenticating ingress fronts this" (see its schema docstring), reused
+    here rather than inventing a second one.
+    """
+    host = cfg.server.host
+    if host in _LOOPBACK_HOSTS:
+        return
+    if cfg.server.api.cors_allow_all_origins:
+        return
+    print(
+        f"WARNING: server.host is {host!r} (not loopback) and no authenticating "
+        "ingress is declared (server.api.cors_allow_all_origins is off) — this "
+        f"unauthenticated API is reachable from every host that can reach port "
+        f"{cfg.server.port}. Bind to 127.0.0.1 behind your own proxy, or set "
+        "server.api.cors_allow_all_origins if a proxy/ingress already in front "
+        "of this process authenticates callers.",
+        file=sys.stderr,
+    )
+
+
 def _serve_app(cfg, config_path: str, *, report_ui: bool = True, role: str | None = None) -> None:
     import uvicorn
 
     from pheasant.api.app import create_app
     from pheasant.deployment.roles import resolve_role
 
+    _warn_if_bound_beyond_loopback(cfg)
     policy = resolve_role(cfg, role)
     app_obj = create_app(cfg, config_path=config_path, role=policy.name)
     if report_ui and policy.serves_ui:

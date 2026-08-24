@@ -15,6 +15,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from pheasant.assistant.credentials import SessionKeyStore
 from pheasant.config.loader import (
@@ -980,6 +981,64 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Security audit finding H2: CORS is an *origin* check enforced by the
+    # browser reading a cross-origin response; it does nothing to stop a
+    # browser reaching this server in the first place. `docs/security.md`
+    # names the bind address (loopback by default — H4) as the primary
+    # compensating control for an unauthenticated API, and DNS rebinding
+    # defeats exactly that: a page the operator visits can rebind its own
+    # hostname to 127.0.0.1, at which point the browser treats this API as
+    # same-origin and CORS never applies. `TrustedHostMiddleware` rejects
+    # any request whose `Host` header does not name a host this deployment
+    # actually expects, closing that gap.
+    #
+    # Same escape hatch as `cors_allow_all_origins` for the same reason the
+    # FastMCP guard (`mcp_server/server.py:_apply_transport_security`)
+    # already treats it that way: an operator who declares this API open
+    # behind their own authenticating ingress would find host validation
+    # here merely inconsistent with every other route on the same port.
+    if not cors_settings.cors_allow_all_origins:
+        from pheasant.security.hosts import ALWAYS_TRUSTED_HOSTS, cors_origin_hosts
+
+        hostnames, _netlocs = cors_origin_hosts(cors_settings)
+        allowed_hosts = list(ALWAYS_TRUSTED_HOSTS)
+        for host in hostnames:
+            if host not in allowed_hosts:
+                allowed_hosts.append(host)
+        try:
+            import socket
+
+            container_host = socket.gethostname()
+        except OSError:
+            container_host = None
+        if container_host and container_host not in allowed_hosts:
+            allowed_hosts.append(container_host)
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+
+    # Security audit finding H2, second half: `multipart/form-data` (what
+    # `POST /sources/upload` accepts) is a CORS-*simple* content type — a
+    # cross-origin `<form>` POST needs no preflight, so CORS's origin check
+    # never runs before the request reaches this server; CORS only stops the
+    # attacking page from *reading* the response, and by then the mutation
+    # already happened. Every browser sends `Origin` on a cross-origin
+    # request (and increasingly on same-origin ones too); a request that
+    # names a foreign origin on a state-changing verb is refused here,
+    # closing the one gap CORS structurally cannot. A request with no
+    # Origin header at all — same-origin navigation, or any non-browser
+    # client (curl, a script, an agent) — is unaffected.
+    mutating_methods = {"POST", "PUT", "PATCH", "DELETE"}
+
+    @app.middleware("http")
+    async def csrf_origin_guard(request, call_next):  # type: ignore[no-untyped-def]
+        if request.method in mutating_methods and not cors_settings.cors_allow_all_origins:
+            origin = request.headers.get("origin")
+            if origin and origin not in cors_settings.cors_origins:
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": f"Origin {origin!r} is not permitted for this request"},
+                )
+        return await call_next(request)
 
     # Phase 35.6: shed rather than queue, and drain before dying. Both are
     # replica behaviors — the limiter is off by default because with one

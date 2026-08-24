@@ -1490,3 +1490,249 @@ def test_mcp_memory_write_org_scope_gated_off_when_disabled(workspace: Path) -> 
         assert result["created"] is True
     finally:
         tools.engine.close()
+
+
+# ---------------------------------------------------------------------------
+# 15. No Host validation — DNS rebinding defeats the loopback-bind control;
+#     multipart/form-data CSRF on a mutating route
+# ---------------------------------------------------------------------------
+
+
+def test_trusted_host_middleware_rejects_an_unknown_host(workspace: Path) -> None:
+    """DNS rebinding: a page the operator's browser visits rebinds its own
+    hostname to 127.0.0.1. The browser then sends whatever Host header that
+    rebound name carries, not 'localhost' — this is exactly the header a
+    rebinding attack controls and CORS cannot see."""
+
+    _config, client = _build(workspace)
+
+    response = client.get("/overview", headers={"Host": "attacker-controlled.example"})
+
+    assert response.status_code == 400
+
+
+def test_trusted_host_middleware_allows_the_configured_hosts(workspace: Path) -> None:
+    """The default config's own CORS origins (localhost/127.0.0.1) — and the
+    TestClient's own fixed default Host — must keep working unchanged."""
+
+    _config, client = _build(workspace)
+
+    assert client.get("/overview").status_code == 200
+    assert client.get("/overview", headers={"Host": "localhost"}).status_code == 200
+    assert client.get("/overview", headers={"Host": "127.0.0.1"}).status_code == 200
+
+
+def test_trusted_host_middleware_disabled_under_the_cors_wildcard_escape_hatch(
+    workspace: Path,
+) -> None:
+    """Same escape hatch as cors_allow_all_origins, and for the same reason
+    the FastMCP DNS-rebinding guard already treats it that way: an operator
+    who declares this API open behind their own ingress would find host
+    validation here merely inconsistent with every other route."""
+
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(workspace / "ws"),
+                "state_path": str(workspace / "state"),
+                "exports_path": str(workspace / "exports"),
+            },
+            "server": {"api": {"cors_allow_all_origins": True}},
+            "sources": [],
+        }
+    )
+    client = TestClient(create_app(config, config_path=str(workspace / "pheasant.yaml")))
+
+    response = client.get("/overview", headers={"Host": "attacker-controlled.example"})
+
+    assert response.status_code == 200
+
+
+def test_csrf_origin_guard_rejects_a_foreign_origin_on_a_mutating_route(workspace: Path) -> None:
+    """multipart/form-data (POST /sources/upload's content type) is a
+    CORS-simple request: no preflight, so CORS's own origin check never
+    runs before this server receives it. This is the check that closes
+    that gap, verb-gated rather than content-type-gated so it covers every
+    mutating route, not just the one upload endpoint."""
+
+    _config, client = _build(workspace)
+
+    response = client.post(
+        "/search",
+        json={"query": "widget"},
+        headers={"Origin": "https://evil.example"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_csrf_origin_guard_allows_the_configured_origin(workspace: Path) -> None:
+    _config, client = _build(workspace)
+
+    response = client.post(
+        "/search",
+        json={"query": "widget"},
+        headers={"Origin": "http://localhost:5173"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_csrf_origin_guard_allows_requests_with_no_origin_header(workspace: Path) -> None:
+    """Same-origin navigation and every non-browser client (curl, a script,
+    an agent) send no Origin header at all — the overwhelming majority of
+    this API's real traffic — and must be unaffected."""
+
+    _config, client = _build(workspace)
+
+    response = client.post("/search", json={"query": "widget"})
+
+    assert response.status_code == 200
+
+
+def test_csrf_origin_guard_disabled_under_the_cors_wildcard_escape_hatch(workspace: Path) -> None:
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(workspace / "ws"),
+                "state_path": str(workspace / "state"),
+                "exports_path": str(workspace / "exports"),
+            },
+            "server": {"api": {"cors_allow_all_origins": True}},
+            "sources": [],
+        }
+    )
+    client = TestClient(create_app(config, config_path=str(workspace / "pheasant.yaml")))
+
+    response = client.post(
+        "/search",
+        json={"query": "widget"},
+        headers={"Origin": "https://evil.example"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_mcp_transport_security_still_derives_from_cors_origins(workspace: Path) -> None:
+    """The refactor that shares cors_origin_hosts() between the FastMCP
+    DNS-rebinding guard and the new TrustedHostMiddleware must not change
+    the guard's own already-tested behavior."""
+
+    from pheasant.mcp_server.server import _apply_transport_security
+
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(workspace / "ws"),
+                "state_path": str(workspace / "state"),
+                "exports_path": str(workspace / "exports"),
+            },
+            "server": {"api": {"cors_origins": ["http://example-ui:9999"]}},
+            "sources": [],
+        }
+    )
+
+    class _FakeSecurity:
+        allowed_hosts: list[str] = []
+        allowed_origins: list[str] = []
+        enable_dns_rebinding_protection = True
+
+    class _FakeSettings:
+        transport_security = _FakeSecurity()
+
+    settings = _FakeSettings()
+    _apply_transport_security(settings, config)
+
+    assert "example-ui:9999" in settings.transport_security.allowed_hosts
+    assert "http://example-ui:9999" in settings.transport_security.allowed_origins
+
+
+# ---------------------------------------------------------------------------
+# 16. `pheasant setup --accept-defaults` bound 0.0.0.0 unauthenticated
+# ---------------------------------------------------------------------------
+
+
+def test_server_host_default_is_loopback() -> None:
+    """The schema default itself, independent of the wizard or any
+    container answer — a bare `pip install`'s config generator reads
+    defaults straight off this dataclass."""
+
+    from pheasant.config.schema import ServerSettings
+
+    assert ServerSettings().host == "127.0.0.1"
+
+
+def test_warn_if_bound_beyond_loopback_warns_on_a_wide_open_bind(
+    workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from pheasant.cli import _warn_if_bound_beyond_loopback
+
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(workspace / "ws"),
+                "state_path": str(workspace / "state"),
+                "exports_path": str(workspace / "exports"),
+            },
+            "server": {"host": "0.0.0.0"},
+            "sources": [],
+        }
+    )
+
+    _warn_if_bound_beyond_loopback(config)
+
+    assert "server.host is '0.0.0.0'" in capsys.readouterr().err
+
+
+def test_warn_if_bound_beyond_loopback_silent_on_loopback(
+    workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from pheasant.cli import _warn_if_bound_beyond_loopback
+
+    # No explicit server.host: the schema default (127.0.0.1) applies.
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(workspace / "ws"),
+                "state_path": str(workspace / "state"),
+                "exports_path": str(workspace / "exports"),
+            },
+            "sources": [],
+        }
+    )
+
+    _warn_if_bound_beyond_loopback(config)
+
+    assert capsys.readouterr().err == ""
+
+
+def test_warn_if_bound_beyond_loopback_silent_under_the_cors_wildcard_escape_hatch(
+    workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`cors_allow_all_origins` is the existing, documented signal an
+    operator uses to say an authenticating ingress fronts this API —
+    reused here rather than inventing a second knob."""
+
+    from pheasant.cli import _warn_if_bound_beyond_loopback
+
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(workspace / "ws"),
+                "state_path": str(workspace / "state"),
+                "exports_path": str(workspace / "exports"),
+            },
+            "server": {"host": "0.0.0.0", "api": {"cors_allow_all_origins": True}},
+            "sources": [],
+        }
+    )
+
+    _warn_if_bound_beyond_loopback(config)
+
+    assert capsys.readouterr().err == ""
