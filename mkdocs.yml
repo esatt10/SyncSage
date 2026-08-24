@@ -101,3 +101,4 @@ nav:
       - Troubleshooting: troubleshooting.md
   - Contributor:
       - pheasant as a Synapse region (spec): SYNAPSE_INTEGRATION.md
+      - Vector backend decision (LanceDB vs turbovec): vector-backend-choice.md
