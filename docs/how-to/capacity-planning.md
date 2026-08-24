@@ -265,6 +265,26 @@ parsing is expensive (PDFs, large documents), not uniformly.
 
 Only **shards** and **memory** come straight from measurement.
 
+## Request concurrency and the thread pool
+
+The table above sizes **api replicas** for traffic, but not the budget those
+replicas actually enforce it with. `server.api.max_concurrent_requests`
+(`docs/configuration.md`'s "Serving durability" section) bounds how many
+requests the shedding middleware admits at once before answering 429. Every
+sync HTTP route in this process — which is most of them — and every MCP tool
+call made against the `/mcp` mount in the same process run on a *separate*
+budget: anyio's shared worker-thread pool, 40 tokens by default. On startup,
+if `max_concurrent_requests` is set, this process raises that pool's token
+count to at least match it, so admitting a request the limiter is happy with
+never means it silently queues for a thread instead. Size
+`max_concurrent_requests` for HTTP *and* MCP traffic combined, not HTTP
+alone, since both draw from the one pool. `GET /metrics`'s
+`pheasant_threadpool_tokens_total` / `_tokens_available` show the pool's
+current headroom next to `pheasant_requests_inflight`.
+
+This is a fixed invariant, not a measured coefficient like the numbers
+above it — it does not live in `src/pheasant/capacity.py`.
+
 ## Measure your own
 
 ```bash

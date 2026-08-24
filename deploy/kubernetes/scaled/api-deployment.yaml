@@ -58,10 +58,13 @@ spec:
               readOnly: true
             - name: exports
               mountPath: /exports
-          # Liveness asks only "is this process gone", and slowly: pheasant
-          # answers from one Python process, so a heavy question holds the GIL
-          # and even /health waits its turn. A tight budget does not detect a
-          # problem, it invents one.
+          # Liveness asks only "is this process gone", and slowly. /health is
+          # an `async def` route that answers without needing a token from
+          # anyio's shared worker-thread pool — the budget every sync HTTP
+          # route and every MCP tool call actually runs on (see
+          # docs/configuration.md's "Serving durability" section) — so a busy
+          # pool no longer delays it. The budget stays generous anyway: a
+          # tight one does not detect a problem, it invents one.
           livenessProbe:
             httpGet:
               path: /health

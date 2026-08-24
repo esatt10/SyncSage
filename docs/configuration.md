@@ -149,15 +149,34 @@ multi-hour first index would take the whole Service down for that time.
 Both default off, and that is a decision rather than caution.
 
 **Shedding only makes sense when there is somewhere else to go.** With one
-process, a burst piles up behind the GIL and every request gets slower — but
-waiting is still the best available answer, and a 429 to the only user is
-worse. With N replicas behind a load balancer a fast 429 is strictly better
-than a request that sits for thirty seconds and times out anyway. So set this
-on replicas, not on a laptop.
+process, a burst piles up behind anyio's shared worker-thread pool (see
+below) and every request gets slower — but waiting is still the best
+available answer, and a 429 to the only user is worse. With N replicas
+behind a load balancer a fast 429 is strictly better than a request that sits
+for thirty seconds and times out anyway. So set this on replicas, not on a
+laptop.
 
 `/health`, `/ready` and `/metrics` are **never** shed. A pod that answers 429
 to its own liveness probe gets restarted by the thing meant to be protecting
-it, turning a busy replica into a crash-looping one.
+it, turning a busy replica into a crash-looping one. All three are `async
+def` routes for the same reason: they answer without needing a worker-thread
+token from the pool below, so a saturated pool no longer delays them either.
+
+**`max_concurrent_requests` and the thread pool are two separate budgets.**
+Every sync `def` HTTP route — most of them — and every MCP tool call made
+against the `/mcp` mount in this same process (`mcp_server/server.py`'s
+`@mcp.tool()` handlers are correctly synchronous; ingestion-path determinism
+forbids an async LLM call on the pipeline they share) run on anyio's shared
+worker-thread pool, 40 tokens by default and otherwise unrelated to
+`max_concurrent_requests`. On startup, if `max_concurrent_requests` is set,
+this process raises that pool's token count to at least match it (never
+lowers it) — so a request the limiter admits never silently queues for a
+thread instead, which would reintroduce the blocking behavior shedding
+exists to replace. Size `max_concurrent_requests` for HTTP *and* MCP traffic
+together, not HTTP alone, since both draw from the one pool.
+`GET /metrics`'s `pheasant_threadpool_tokens_total` /
+`_tokens_available` show the pool's current headroom next to
+`pheasant_requests_inflight`.
 
 **Draining exists because Kubernetes does two things at once.** SIGTERM and
 endpoint removal happen concurrently, and endpoint propagation is not instant

@@ -390,6 +390,20 @@ def register_default_metrics(version: str) -> None:
     )
     REGISTRY.gauge("pheasant_requests_inflight", "Requests currently being served.")
     REGISTRY.gauge("pheasant_draining", "1 while this process is draining after SIGTERM.")
+    # The separate budget every sync HTTP route and every /mcp tool call
+    # actually runs on (anyio's shared worker-thread pool), sized against
+    # `server.api.max_concurrent_requests` at startup — see
+    # docs/configuration.md's "Serving durability" section. Distinct from
+    # pheasant_requests_inflight, which counts admitted requests, not the
+    # threads they occupy while running.
+    REGISTRY.gauge(
+        "pheasant_threadpool_tokens_total",
+        "Size of anyio's shared worker-thread pool.",
+    )
+    REGISTRY.gauge(
+        "pheasant_threadpool_tokens_available",
+        "Unborrowed tokens in anyio's shared worker-thread pool right now.",
+    )
     REGISTRY.histogram("pheasant_search_duration_seconds", "Search latency.", ("mode",))
     REGISTRY.counter(
         "pheasant_search_total", "Searches answered, by mode and outcome.", ("mode", "outcome")
