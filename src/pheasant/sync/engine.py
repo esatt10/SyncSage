@@ -236,6 +236,14 @@ class _PreparedItem:
 _PROCESS_SAFE_TEXT_EXTENSIONS = TEXT_EXTENSIONS - {".html"}
 
 
+def _process_safe_text_path(path: str) -> bool:
+    candidate = Path(path)
+    return (
+        candidate.suffix.lower() in _PROCESS_SAFE_TEXT_EXTENSIONS
+        or candidate.name.lower() == "dockerfile"
+    )
+
+
 def _process_cpu_capacity() -> int:
     """CPU count visible to this process (affinity/cgroup aware where available)."""
 
@@ -1097,10 +1105,7 @@ class SyncEngine:
             connector.connector_type == "filesystem"
             and mode != "repair"
             and not bool(getattr(source.taxonomy, "enabled", False))
-            and all(
-                Path(item.relative_path).suffix.lower() in _PROCESS_SAFE_TEXT_EXTENSIONS
-                for item in items
-            )
+            and all(_process_safe_text_path(item.relative_path) for item in items)
         )
         process_safe = requested_executor == "process" and plain_text_source
         remote_urls = list(self.config.sync.concurrency.remote_worker_urls or [])
@@ -1480,6 +1485,22 @@ class SyncEngine:
         # between per-artifact writes so a kill -9 can land mid-sync.
         slow_sync_s = float(os.environ.get("PHEASANT_TEST_SLOW_SYNC_MS", "0") or 0) / 1000.0
         with self._source_write_lock(source.name):
+            remote_state: dict[str, Any] | None = None
+            if source.type.value == "repository":
+                # URL quick-add repositories are managed checkouts. Updating
+                # them happens under the same per-source lock as indexing, so
+                # the commit cannot change between fetch and the artifact
+                # pass. Local-path repositories have no clone metadata and
+                # remain byte-for-byte on the old path.
+                from pheasant.targets import TargetError, refresh_managed_repository
+
+                report("fetching", 0, None, f"checking the remote for {source.name}")
+                try:
+                    remote_state = refresh_managed_repository(source)
+                except TargetError as exc:
+                    self.state.mark_source_status(source.name, "remote_error")
+                    logger.error("Remote update failed for %s: %s", source.name, exc)
+                    raise
             connector = connector_for_source(source, self.state)
             if mode == "validate_only":
                 health = connector.validate()
@@ -1498,10 +1519,11 @@ class SyncEngine:
                         "checked_items": health.checked_items,
                         "errors": health.errors,
                         "checkpoint": health.checkpoint,
+                        **({"repository": remote_state} if remote_state else {}),
                     },
                 )
             started_at = utc_now()
-            details_extra: dict = {}
+            details_extra: dict = {"repository": remote_state} if remote_state is not None else {}
             manifest = self.manifests.load(source.name)
             artifacts = manifest.setdefault("artifacts", {})
             # Synapse 21.3: thread the previous checkpoint into the connector
@@ -1574,6 +1596,14 @@ class SyncEngine:
             indexed_bytes = 0
             changed_ids: set[str] = set()
             git_metadata = git_state(source.path) if source.type.value == "repository" else None
+            if remote_state is not None:
+                indexed_commit = git_metadata[1] if git_metadata else None
+                remote_state["indexed_commit"] = indexed_commit
+                remote_state["fresh"] = bool(
+                    indexed_commit
+                    and indexed_commit == remote_state.get("local_commit")
+                    and indexed_commit == remote_state.get("remote_commit")
+                )
             # The denominator only exists now — listing is what produced it.
             total_items = len(items)
             report("preparing", 0, total_items, f"queued {total_items} item(s)")
@@ -1749,15 +1779,19 @@ class SyncEngine:
             now = utc_now()
             cursor, high_watermark = connector.checkpoint_from_items(items)
             high_watermark.update({"indexed_artifacts": indexed, "skipped_artifacts": skipped})
+            if remote_state is not None:
+                high_watermark["repository"] = remote_state
             connector.set_checkpoint(cursor, high_watermark, "healthy")
             self.state.mark_source_indexed(source.name, now)
             if self.vectors is not None:
                 # Synapse 21.4: additive keys, present only when embeddings
                 # are enabled so default sync_events stay byte-identical.
-                details_extra = {
-                    "embedded_chunks": embedded_chunks,
-                    "pruned_vectors": pruned_vectors,
-                }
+                details_extra.update(
+                    {
+                        "embedded_chunks": embedded_chunks,
+                        "pruned_vectors": pruned_vectors,
+                    }
+                )
             # Synapse 21.3: record skipped-vs-fetched transfer counts per sync.
             self.state.append_sync_event(
                 uuid.uuid4().hex,

@@ -124,6 +124,17 @@ export function SourcesPage() {
                 ) : (
                   (source.last_status ?? "—")
                 )}
+                {source.repository?.managed ? (
+                  <div
+                    className={source.repository.fresh ? "" : "error"}
+                    title={repositoryFreshnessTitle(source)}
+                  >
+                    remote {source.repository.fresh ? "current" : "not verified"}
+                    {source.repository.indexed_commit
+                      ? ` · ${source.repository.indexed_commit.slice(0, 8)}`
+                      : ""}
+                  </div>
+                ) : null}
               </td>
               <td className="actions-cell">
                 <SyncControl
@@ -225,6 +236,20 @@ export function SourcesPage() {
       )}
     </div>
   );
+}
+
+function repositoryFreshnessTitle(source: SourceRecord): string {
+  const repository = source.repository;
+  if (!repository) return "";
+  return [
+    repository.remote_url,
+    repository.tracking_ref ? `tracking: ${repository.tracking_ref}` : null,
+    repository.remote_commit ? `remote: ${repository.remote_commit}` : null,
+    repository.local_commit ? `checkout: ${repository.local_commit}` : null,
+    repository.indexed_commit ? `indexed: ${repository.indexed_commit}` : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function SyncControl({

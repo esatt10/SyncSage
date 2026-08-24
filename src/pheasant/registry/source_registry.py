@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 from pheasant.config.loader import config_hash
@@ -70,5 +71,25 @@ class SourceRegistry:
         ):
             source = dict(row)
             source["checkpoint"] = checkpoints.get(source["id"])
+            # URL-backed repositories carry commit evidence in their latest
+            # checkpoint. Promote it to a stable source-status field so the UI
+            # and MCP clients can answer the operational question directly:
+            # remote == checkout == indexed commit?
+            try:
+                configured = json.loads(source.get("config_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                configured = {}
+            repo = configured.get("repo") if isinstance(configured, dict) else None
+            if isinstance(repo, dict) and repo.get("clone_url"):
+                checkpoint = source.get("checkpoint") or {}
+                high_watermark = checkpoint.get("high_watermark") or {}
+                evidence = dict(high_watermark.get("repository") or {})
+                evidence.setdefault("managed", True)
+                evidence.setdefault("remote_url", repo.get("clone_url"))
+                evidence.setdefault("requested_ref", repo.get("clone_ref"))
+                evidence["fresh"] = bool(
+                    evidence.get("fresh") and source.get("last_status") == "healthy"
+                )
+                source["repository"] = evidence
             sources.append(source)
         return sources

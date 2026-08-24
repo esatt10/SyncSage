@@ -85,6 +85,18 @@ export interface SourceRecord {
   job?: JobRecord | null;
   /** This source's own slice of that job — its counter, not the whole run's. */
   progress?: SourceProgress | null;
+  /** Commit evidence for a repository materialized from a remote URL. */
+  repository?: {
+    managed?: boolean;
+    remote_url?: string;
+    requested_ref?: string | null;
+    tracking_ref?: string;
+    branch?: string;
+    local_commit?: string;
+    remote_commit?: string;
+    indexed_commit?: string;
+    fresh?: boolean;
+  };
   [key: string]: unknown;
 }
 

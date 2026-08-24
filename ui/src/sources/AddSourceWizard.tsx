@@ -159,6 +159,10 @@ export function AddSourceWizard({ source, onClose }: AddSourceWizardProps) {
         graph_nodes: taxonomyGraphNodes,
       },
       repo: {
+        // URL quick-add persists its managed checkout recipe here. Editing
+        // ordinary repository knobs must not silently turn that source back
+        // into an unmanaged, stale local folder.
+        ...repo,
         branch_policy: repoBranchPolicy,
         include_uncommitted: repoIncludeUncommitted,
         commit_trigger: repoCommitTrigger,

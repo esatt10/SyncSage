@@ -86,8 +86,8 @@ RUN chmod +x /app/docker-entrypoint.sh /app/docker-fresh-entrypoint.sh
 # generates one there on first boot. A read-only bind mount still wins — the
 # entrypoint only writes when the file is absent.
 RUN useradd --create-home --uid 10001 pheasant \
-    && mkdir -p /state /exports /workspace /config \
-    && chown -R pheasant:pheasant /state /exports /app /config
+    && mkdir -p /state /exports /workspace /config /memory \
+    && chown -R pheasant:pheasant /state /exports /app /config /memory
 USER pheasant
 
 EXPOSE 8765

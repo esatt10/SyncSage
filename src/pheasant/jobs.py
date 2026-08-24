@@ -385,6 +385,14 @@ class JobRegistry:
             if name is None:
                 names = list(job.sources)
                 name = names[0] if len(names) == 1 else "*"
+            elif name != "*":
+                # A source-less bootstrap update on a multi-source job is
+                # represented by a synthetic ``*`` record.  Once the worker
+                # reports a real source, that placeholder must disappear;
+                # otherwise the UI keeps showing "waiting_for_indexer" next
+                # to sources that are visibly indexing, and the placeholder
+                # also prevents a complete job total from being calculated.
+                job.sources.pop("*", None)
             record = job.source_record(name)
             record.observe(
                 phase=phase,

@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from pheasant.config.schema import SourceType
+from pheasant.config.schema import SourceConfig, SourceType
 
 GIT_HOSTS = ("github.com", "gitlab.com", "bitbucket.org", "codeberg.org", "git.sr.ht")
 
@@ -55,6 +55,7 @@ TYPE_PREFIXES = {
 
 MARKDOWN_INCLUDES = ["**/*.md", "**/*.markdown"]
 WEB_INCLUDES = ["**/*.html", "**/*.htm", "**/*.md", "**/*.txt"]
+GIT_COMMAND_TIMEOUT_SECONDS = 600
 
 
 class TargetError(ValueError):
@@ -93,6 +94,12 @@ class ResolvedTarget:
             payload["urls"] = list(self.urls)
         if self.connector:
             payload["connector"] = dict(self.connector)
+        if self.clone_url:
+            payload["repo"] = {
+                "clone_url": self.clone_url,
+                "clone_path": self.clone_path or self.path,
+                "clone_ref": self.clone_ref,
+            }
         return payload
 
 
@@ -151,12 +158,18 @@ def validate_clone_url(url: str) -> str:
         raise TargetError(
             f"refusing to clone {url!r}: a URL starting with '-' would be read by git as an option"
         )
-    scheme = urlparse(candidate).scheme.lower()
+    parsed = urlparse(candidate)
+    scheme = parsed.scheme.lower()
     if scheme:
         if scheme not in CLONE_SCHEMES:
             raise TargetError(
                 f"refusing to clone {url!r}: unsupported transport {scheme!r} "
                 f"(allowed: {', '.join(sorted(CLONE_SCHEMES))})"
+            )
+        if scheme in {"http", "https"} and (parsed.username or parsed.password):
+            raise TargetError(
+                "refusing a clone URL containing credentials; put a GitHub token in "
+                "GITHUB_TOKEN/GH_TOKEN (or configure SSH) so secrets are never persisted"
             )
         return candidate
     if SCP_LIKE.match(candidate):
@@ -499,12 +512,174 @@ def _git_env(clone_url: str | None = None) -> dict[str, str]:
     return env
 
 
+def managed_target(source: SourceConfig) -> ResolvedTarget | None:
+    """Rehydrate the clone recipe persisted under ``sources[].repo``."""
+
+    repo = getattr(source, "repo", None)
+    clone_url = str(getattr(repo, "clone_url", "") or "").strip()
+    if not clone_url:
+        return None
+    path = str(source.path)
+    return ResolvedTarget(
+        name=str(source.name),
+        type=SourceType.repository.value,
+        path=path,
+        description=str(getattr(source, "description", "") or ""),
+        clone_url=clone_url,
+        clone_path=str(getattr(repo, "clone_path", "") or path),
+        clone_ref=str(getattr(repo, "clone_ref", "") or "") or None,
+    )
+
+
+def _run_git(destination: Path, args: list[str], clone_url: str) -> subprocess.CompletedProcess:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(destination), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+            env=_git_env(clone_url),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TargetError(
+            f"git {' '.join(args[:2])} timed out after {GIT_COMMAND_TIMEOUT_SECONDS}s "
+            f"for {destination}"
+        ) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "git command failed").strip()
+        raise TargetError(f"git {' '.join(args[:2])} failed for {destination}: {detail}")
+    return result
+
+
+def _git_output(destination: Path, args: list[str], clone_url: str = "") -> str:
+    return _run_git(destination, args, clone_url).stdout.strip()
+
+
+def _try_git_output(destination: Path, args: list[str]) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(destination), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+        env=_git_env(),
+    )
+    value = result.stdout.strip()
+    return value if result.returncode == 0 and value else None
+
+
+def _tracking_ref(destination: Path, requested_ref: str | None) -> str:
+    upstream = _try_git_output(destination, ["rev-parse", "--symbolic-full-name", "@{upstream}"])
+    if upstream:
+        return upstream
+    candidates: list[str] = []
+    if requested_ref:
+        candidates.extend([f"refs/remotes/origin/{requested_ref}", f"refs/tags/{requested_ref}"])
+    origin_head = _try_git_output(destination, ["symbolic-ref", "refs/remotes/origin/HEAD"])
+    if origin_head:
+        candidates.append(origin_head)
+    for candidate in candidates:
+        if _try_git_output(destination, ["rev-parse", "--verify", candidate]):
+            return candidate
+    raise TargetError(
+        f"managed repository at {destination} has no upstream tracking ref; "
+        "configure the branch upstream or add it again with a GitHub tree URL"
+    )
+
+
+def _canonical_remote(url: str) -> str:
+    return url.strip().rstrip("/").removesuffix(".git")
+
+
+def _fast_forward_target(target: ResolvedTarget, destination: Path, clone_url: str) -> None:
+    origin = _git_output(destination, ["remote", "get-url", "origin"], clone_url)
+    if _canonical_remote(origin) != _canonical_remote(clone_url):
+        raise TargetError(
+            f"managed repository {target.name!r} points at {origin!r}, not its configured "
+            f"remote {clone_url!r}; remove/re-add the source instead of indexing the wrong clone"
+        )
+    dirty = _git_output(destination, ["status", "--porcelain"], clone_url)
+    if dirty:
+        raise TargetError(
+            f"managed repository {target.name!r} has local working-tree changes; "
+            "commit/stash them or use a separate local repository source"
+        )
+    _run_git(destination, ["fetch", "--prune", "origin"], clone_url)
+    remote_ref = _tracking_ref(destination, target.clone_ref)
+    local_commit = _git_output(destination, ["rev-parse", "HEAD"], clone_url)
+    remote_commit = _git_output(destination, ["rev-parse", remote_ref], clone_url)
+    if local_commit != remote_commit:
+        ancestor = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(destination),
+                "merge-base",
+                "--is-ancestor",
+                local_commit,
+                remote_commit,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+            env=_git_env(clone_url),
+        )
+        if ancestor.returncode != 0:
+            raise TargetError(
+                f"managed repository {target.name!r} is ahead of or diverged from {remote_ref}; "
+                "Pheasant will not discard local commits"
+            )
+        _run_git(destination, ["merge", "--ff-only", "--quiet", remote_commit], clone_url)
+    updated = _git_output(destination, ["rev-parse", "HEAD"], clone_url)
+    if updated != remote_commit:
+        raise TargetError(
+            f"managed repository {target.name!r} did not reach {remote_ref} ({remote_commit})"
+        )
+
+
+def managed_repository_state(target: ResolvedTarget) -> dict[str, object]:
+    """Return local/remote commit evidence after a managed update."""
+
+    destination = Path(target.clone_path or target.path)
+    local_commit = _git_output(destination, ["rev-parse", "HEAD"], target.clone_url or "")
+    remote_ref = _tracking_ref(destination, target.clone_ref)
+    remote_commit = _git_output(destination, ["rev-parse", remote_ref], target.clone_url or "")
+    branch = _git_output(destination, ["rev-parse", "--abbrev-ref", "HEAD"], target.clone_url or "")
+    return {
+        "managed": True,
+        "remote_url": target.clone_url,
+        "requested_ref": target.clone_ref,
+        "tracking_ref": remote_ref,
+        "branch": branch,
+        "local_commit": local_commit,
+        "remote_commit": remote_commit,
+        "fresh": local_commit == remote_commit,
+    }
+
+
+def refresh_managed_repository(source: SourceConfig) -> dict[str, object] | None:
+    """Materialize/update a URL-backed source and return freshness evidence."""
+
+    target = managed_target(source)
+    if target is None:
+        return None
+    fetch_target(target)
+    state = managed_repository_state(target)
+    if not state["fresh"]:  # defensive: _fast_forward_target already enforces this
+        raise TargetError(
+            f"managed repository {target.name!r} is not at its fetched remote revision"
+        )
+    return state
+
+
 def fetch_target(target: ResolvedTarget) -> str | None:
     """Materialize a remote target locally. Returns a status line, or None.
 
-    Idempotent: an existing clone is fetched and fast-forwarded rather than
-    re-cloned, so re-running ``up`` neither duplicates work nor discards
-    local commits.
+    Idempotent: an existing clean clone is fetched and fast-forwarded rather
+    than re-cloned. Dirty, ahead, and divergent checkouts fail visibly rather
+    than being indexed as though they represented the remote.
     """
     if not target.clone_url:
         return None
@@ -516,12 +691,7 @@ def fetch_target(target: ResolvedTarget) -> str | None:
         raise TargetError("git is required to clone a remote repository but was not found on PATH")
     destination = Path(target.clone_path or target.path)
     if (destination / ".git").is_dir():
-        subprocess.run(
-            ["git", "-C", str(destination), "fetch", "--all", "--quiet"],
-            check=False,
-            capture_output=True,
-            env=_git_env(clone_url),
-        )
+        _fast_forward_target(target, destination, clone_url)
         source_path = Path(target.path)
         if not source_path.exists():
             raise TargetError(
@@ -529,21 +699,27 @@ def fetch_target(target: ResolvedTarget) -> str | None:
             )
         return f"{target.name}: reusing existing clone at {source_path}"
     destination.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        # `--` ends option parsing, so nothing after it can be read as a flag.
-        [
-            "git",
-            "clone",
-            "--quiet",
-            *(["--branch", target.clone_ref, "--single-branch"] if target.clone_ref else []),
-            "--",
-            clone_url,
-            str(destination),
-        ],
-        capture_output=True,
-        text=True,
-        env=_git_env(clone_url),
-    )
+    try:
+        result = subprocess.run(
+            # `--` ends option parsing, so nothing after it can be read as a flag.
+            [
+                "git",
+                "clone",
+                "--quiet",
+                *(["--branch", target.clone_ref, "--single-branch"] if target.clone_ref else []),
+                "--",
+                clone_url,
+                str(destination),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+            env=_git_env(clone_url),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TargetError(
+            f"git clone timed out after {GIT_COMMAND_TIMEOUT_SECONDS}s for {target.name!r}"
+        ) from exc
     if result.returncode != 0:
         raise TargetError(
             f"could not clone {target.clone_url}: {result.stderr.strip() or 'git clone failed'}"

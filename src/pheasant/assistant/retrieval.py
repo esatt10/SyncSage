@@ -532,7 +532,17 @@ class PheasantRetriever:
         sequential = [pair for pair in pairs if pair[1] == "vector"]
         batches: list[list[Passage]] = []
         if len(concurrent) > 1:
-            with ThreadPoolExecutor(max_workers=min(len(concurrent), 8)) as pool:
+            # SQLite benefits strongly from broad read fan-out.  Postgres text
+            # ranking is CPU work inside the database; sending four planner
+            # queries at once made each one take minutes on a two-core local
+            # container and left the stream parked on its last "plan" event.
+            # Two keeps network/vector overlap without turning query latency
+            # into CPU contention.
+            postgres = bool(
+                getattr(self.state, "dialect", None) and self.state.dialect.is_postgres
+            )
+            max_workers = 2 if postgres else 8
+            with ThreadPoolExecutor(max_workers=min(len(concurrent), max_workers)) as pool:
                 batches.extend(pool.map(run, concurrent))
         else:
             batches.extend(run(pair) for pair in concurrent)

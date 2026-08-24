@@ -62,6 +62,36 @@ def test_an_unknown_total_reports_no_fraction() -> None:
     assert registry.get(job.id)["progress"]["fraction"] is None
 
 
+def test_named_progress_replaces_the_multi_source_bootstrap_placeholder() -> None:
+    """A live source must not remain paired with a synthetic waiting row."""
+    registry = JobRegistry()
+    job = registry.create("sync", "Indexing all", ["docs", "code"])
+
+    registry.progress(
+        job.id,
+        phase="waiting_for_indexer",
+        detail="Queued for the index writer",
+    )
+    assert {row["source"] for row in registry.get(job.id)["sources"]} == {
+        "*",
+        "code",
+        "docs",
+    }
+
+    registry.progress(
+        job.id,
+        phase="preparing",
+        current=1,
+        total=10,
+        detail="README.md",
+        source="docs",
+    )
+
+    live = registry.get(job.id)
+    assert {row["source"] for row in live["sources"]} == {"code", "docs"}
+    assert live["progress"]["phase"] == "preparing"
+
+
 def test_a_new_unknown_total_phase_drops_the_previous_denominator() -> None:
     registry = JobRegistry()
     job = registry.create("sync", "Indexing", ["docs"])

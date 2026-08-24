@@ -857,6 +857,12 @@ class RepoSettings(ModelMixin):
     include_uncommitted: bool = True
     commit_trigger: bool = True
     dependency_graph: dict[str, Any] = field(default_factory=dict)
+    # Populated by URL quick-add. Local repository sources leave these unset.
+    # Keeping the materialization recipe with the source is what lets every
+    # later sync advance the managed checkout before it indexes it.
+    clone_url: str | None = None
+    clone_path: str | None = None
+    clone_ref: str | None = None
 
 
 @dataclass

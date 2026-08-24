@@ -54,6 +54,15 @@ _TS_RANK_WEIGHTS = "0.125, 0.25, 0.375, 1.0"
 # the document that matched two of the three query terms.
 _TS_RANK_NORMALIZATION = 32
 
+# Postgres has to evaluate ``ts_rank_cd`` against the stored position list for
+# every candidate row.  An OR query made from a planner's whole sentence can
+# admit most of a code corpus ("main", framework names, and so on), then pay
+# that cost once per query term.  Use the rarest terms to choose candidates
+# while retaining a wider, bounded set for final IDF-weighted ranking.  Queries
+# of four terms or fewer are unchanged.
+_POSTGRES_MAX_MATCH_TERMS = 4
+_POSTGRES_MAX_RANK_TERMS = 12
+
 # Structural priors, applied as a DIVISOR on the (negative) BM25 cost, so they
 # scale a match rather than displacing it: a strong deep hit still beats a weak
 # shallow one, but ties break toward the more central file. An additive penalty
@@ -206,7 +215,9 @@ def _idf(total_docs: int, document_frequency: int) -> float:
     return math.log(1.0 + (n - df + 0.5) / (df + 0.5))
 
 
-def _postgres_rank_expression(state: Any, tokens: list[str]) -> tuple[str, list[object]]:
+def _postgres_rank_expression(
+    state: Any, tokens: list[str]
+) -> tuple[str, list[object], list[str]]:
     """A BM25-shaped ranking expression for Postgres.
 
     ``ts_rank_cd`` has **no inverse document frequency**: it accumulates cover
@@ -226,23 +237,37 @@ def _postgres_rank_expression(state: Any, tokens: list[str]) -> tuple[str, list[
     where every IDF would be identical anyway.
     """
 
-    total, frequencies = _postgres_document_frequencies(state, tokens)
+    unique = list(dict.fromkeys(tokens))
+    total, frequencies = _postgres_document_frequencies(state, unique)
     if not tokens or not total:
         return (
             f"ts_rank_cd('{{{_TS_RANK_WEIGHTS}}}', chunks_fts.search_vector, "
             f"query_ts, {_TS_RANK_NORMALIZATION})",
             [],
+            unique,
         )
+    # A zero-frequency token cannot admit or score a row.  Among terms that
+    # exist, lower document frequency means higher retrieval signal and a much
+    # smaller GIN candidate set.  Lexical position is the deterministic tie
+    # break because ``_query_tokens`` is sorted.
+    ranked_tokens = sorted(
+        (token for token in unique if frequencies.get(token, 0) > 0),
+        key=lambda token: (frequencies.get(token, 0), token),
+    )
+    if not ranked_tokens:
+        ranked_tokens = unique
+    match_tokens = ranked_tokens[:_POSTGRES_MAX_MATCH_TERMS]
+    score_tokens = ranked_tokens[:_POSTGRES_MAX_RANK_TERMS]
     terms: list[str] = []
     params: list[object] = []
-    for token in dict.fromkeys(tokens):
+    for token in score_tokens:
         weight = _idf(total, frequencies.get(token, 0))
         terms.append(
             f"{weight:.6f} * ts_rank_cd('{{{_TS_RANK_WEIGHTS}}}', chunks_fts.search_vector, "
             f"to_tsquery('simple', ?), {_TS_RANK_NORMALIZATION})"
         )
         params.append(token)
-    return "(" + " + ".join(terms) + ")", params
+    return "(" + " + ".join(terms) + ")", params, match_tokens
 
 
 class SearchStore:
@@ -295,8 +320,8 @@ class SearchStore:
         prior_sql, prior_params = _structural_prior(steering, tokens, postgres=postgres)
         rank_sql, rank_params = "", []
         if postgres:
-            match_expr = " | ".join(dict.fromkeys(tokens)) if tokens else query
-            rank_sql, rank_params = _postgres_rank_expression(self.state, tokens)
+            rank_sql, rank_params, match_tokens = _postgres_rank_expression(self.state, tokens)
+            match_expr = " | ".join(match_tokens) if match_tokens else query
         # Params are positional, so they must be assembled in the order the
         # placeholders appear in the final SQL. On Postgres the ranking
         # expression (`-{rank_sql}`) precedes the divisor (`/ {prior_sql}`),

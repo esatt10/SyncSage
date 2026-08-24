@@ -280,7 +280,15 @@ class WorkerBackedEngine:
             full_scan=full_scan,
             on_progress=on_progress,
         )
-        return self._adopt(report)
+        results = self._adopt(report)
+        # A child-process failure has no per-source result payload. Returning
+        # an empty list made callers conclude that there were zero failures
+        # and mark the UI job succeeded even though the worker exited nonzero.
+        # Preserve the failure as one synthetic result so every caller's
+        # existing ``status in {failed, timeout}`` check sees it.
+        if not results and report.get("status") != "ok":
+            return [self._empty(None, report)]
+        return results
 
     def startup(self) -> list[Any]:
         engine = self._engine

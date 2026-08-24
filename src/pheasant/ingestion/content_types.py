@@ -14,7 +14,12 @@ TEXT_EXTENSIONS = {
     ".xml",
     ".css",
     ".js",
+    ".jsx",
     ".ts",
+    ".tsx",
+    ".mdx",
+    ".rst",
+    ".sh",
 }
 # Formats whose text has to be *extracted* rather than decoded — see
 # pheasant.ingestion.extractor (PDF/DOCX/HTML),

@@ -373,6 +373,7 @@ def test_content_endpoints_unchanged_when_enforcement_is_off(workspace: Path) ->
         "-c core.pager=sh.git",
         "file:///etc/passwd.git",
         "ftp://example.com/x.git",
+        "https://x-access-token:secret@github.com/me/private.git",
         "",
     ],
 )

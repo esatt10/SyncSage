@@ -592,6 +592,13 @@ class LanceDBVectorStore:
     def __init__(self, directory: str | Path):
         self.directory = Path(directory)
         self._db = None
+        # Membership is queried once per artifact by ``VectorIndexer``.  A
+        # Lance table scan there makes a full index O(files * vectors), which
+        # becomes the dominant cost long before embedding does.  One
+        # coordinator owns vector writes, so keep its chunk-id membership in
+        # memory and update it with every successful mutation.
+        self._id_cache: set[str] | None = None
+        self._id_cache_lock = threading.RLock()
 
     def _database(self):
         if self._db is None:
@@ -645,9 +652,21 @@ class LanceDBVectorStore:
         table = self._table()
         if table is None:
             self._database().create_table(self.TABLE, data=rows)
+            with self._id_cache_lock:
+                self._id_cache = set(chunk_ids)
             return
-        self.delete(chunk_ids=chunk_ids)
+        # Content-addressed ids are overwhelmingly new during a sync.  Lance
+        # creates a new table version for delete(), so only pay that price for
+        # ids that actually replace existing rows.
+        replaced = self.existing_ids(chunk_ids)
+        if replaced:
+            self.delete(chunk_ids=sorted(replaced))
         table.add(rows)
+        with self._id_cache_lock:
+            if self._id_cache is None:
+                self._id_cache = set(chunk_ids)
+            else:
+                self._id_cache.update(chunk_ids)
 
     def delete(
         self,
@@ -664,7 +683,15 @@ class LanceDBVectorStore:
             table.delete(f"chunk_id IN ({quoted})")
         if artifact_id is not None:
             table.delete(f"artifact_id = {self._quote(artifact_id)}")
-        return before - table.count_rows()
+        removed = before - table.count_rows()
+        with self._id_cache_lock:
+            if artifact_id is not None:
+                # The artifact predicate can remove ids the caller did not
+                # enumerate; reload membership lazily on the next lookup.
+                self._id_cache = None
+            elif self._id_cache is not None:
+                self._id_cache.difference_update(ids)
+        return removed
 
     def search(self, query_vec: list[float], k: int) -> list[tuple[str, float, dict[str, Any]]]:
         table = self._table()
@@ -690,8 +717,10 @@ class LanceDBVectorStore:
         return 0 if table is None else table.count_rows()
 
     def existing_ids(self, chunk_ids: list[str]) -> set[str]:
-        stored = {row["chunk_id"] for row in self._rows(["chunk_id"])}
-        return {chunk_id for chunk_id in chunk_ids if chunk_id in stored}
+        with self._id_cache_lock:
+            if self._id_cache is None:
+                self._id_cache = {row["chunk_id"] for row in self._rows(["chunk_id"])}
+            return set(chunk_ids).intersection(self._id_cache)
 
     def source_chunk_ids(self, source_id: str) -> set[str]:
         return {
@@ -713,6 +742,8 @@ class LanceDBVectorStore:
             return 0
         removed = table.count_rows()
         self._database().drop_table(self.TABLE)
+        with self._id_cache_lock:
+            self._id_cache = set()
         return removed
 
     def flush(self) -> None:

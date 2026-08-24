@@ -26,6 +26,14 @@ class RemoteWorkerError(RuntimeError):
 REMOTE_TEXT_EXTENSIONS = TEXT_EXTENSIONS - {".html"}
 
 
+def _remote_text_path(path: str) -> bool:
+    candidate = Path(path)
+    return (
+        candidate.suffix.lower() in REMOTE_TEXT_EXTENSIONS
+        or candidate.name.lower() == "dockerfile"
+    )
+
+
 def configured_token(env_name: str) -> str:
     token = os.environ.get(env_name or "", "")
     if not token:
@@ -114,7 +122,7 @@ def prepare_task(task: dict[str, Any]) -> dict[str, Any] | None:
     item = ConnectorItem(**task["item"])
     if source.taxonomy.enabled:
         raise RemoteWorkerError("Remote preparation does not support taxonomy-enabled sources")
-    if Path(item.relative_path).suffix.lower() not in REMOTE_TEXT_EXTENSIONS:
+    if not _remote_text_path(item.relative_path):
         raise RemoteWorkerError(
             f"Remote preparation only accepts ordinary text: {item.relative_path}"
         )

@@ -407,6 +407,23 @@ def test_remote_worker_endpoint_is_disabled_and_bearer_authenticated(
     }
 
 
+def test_remote_workers_accept_the_configured_repository_text_formats() -> None:
+    from pheasant.sync.engine import _process_safe_text_path
+    from pheasant.sync.remote_worker import _remote_text_path
+
+    configured_text = [
+        "component.jsx",
+        "component.tsx",
+        "guide.mdx",
+        "reference.rst",
+        "bootstrap.sh",
+        "Dockerfile",
+    ]
+    assert all(_process_safe_text_path(path) for path in configured_text)
+    assert all(_remote_text_path(path) for path in configured_text)
+    assert not _remote_text_path("document.pdf")
+
+
 def test_failed_parallel_embedding_flush_restores_all_pending_work(tmp_path: Path) -> None:
     class FlakyEmbedder:
         model = "flaky"

@@ -92,3 +92,27 @@ def test_report_parsing_ignores_noise_on_stdout() -> None:
 
     assert _parse_report("no json here", "x")["status"] == "unknown"
     assert _parse_report("", None)["results"] == []
+
+
+def test_sync_all_preserves_a_child_failure_as_a_result(monkeypatch) -> None:
+    from pheasant.sync import worker as worker_module
+
+    class Engine:
+        paths = type("Paths", (), {"sqlite": Path("/state/pheasant.db")})()
+
+    backed = WorkerBackedEngine(Engine(), "/config/pheasant.yaml")
+    monkeypatch.setattr(backed, "_can_delegate", lambda: True)
+    monkeypatch.setattr(
+        worker_module,
+        "run_sync",
+        lambda *_args, **_kwargs: {
+            "status": "failed",
+            "error": "HTTP Error 429: Too Many Requests",
+            "results": [],
+        },
+    )
+
+    results = backed.sync_all("full")
+    assert len(results) == 1
+    assert results[0].status == "failed"
+    assert "429" in results[0].details["error"]

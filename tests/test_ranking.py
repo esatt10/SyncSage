@@ -23,7 +23,11 @@ import pytest
 
 from pheasant.persistence.state_store import StateStore, _basename
 from pheasant.search.hybrid import RRF_K, _merge_rrf
-from pheasant.search.sqlite_store import SearchStore, _query_tokens
+from pheasant.search.sqlite_store import (
+    SearchStore,
+    _postgres_rank_expression,
+    _query_tokens,
+)
 
 
 def _index(tmp_path, files: dict[str, str]) -> SearchStore:
@@ -88,6 +92,31 @@ def test_an_all_stopword_query_still_searches_for_something() -> None:
 def test_identifiers_survive_intact() -> None:
     tokens = _query_tokens("SyncEngine._run_sync")
     assert "syncengine" in tokens and "sync" in tokens and "run" in tokens
+
+
+def test_postgres_uses_the_rarest_terms_to_bound_the_candidate_set(monkeypatch) -> None:
+    """Planner prose must not make Postgres rank most of the corpus per term."""
+    frequencies = {
+        "architecture": 139,
+        "components": 287,
+        "openwiki": 834,
+        "main": 1624,
+        "langgraph": 2517,
+        "deepagents": 6206,
+        "langchain": 6769,
+    }
+    monkeypatch.setattr(
+        "pheasant.search.sqlite_store._postgres_document_frequencies",
+        lambda _state, _tokens: (19_865, frequencies),
+    )
+
+    expression, params, match_tokens = _postgres_rank_expression(
+        object(), list(frequencies)
+    )
+
+    assert match_tokens == ["architecture", "components", "openwiki", "main"]
+    assert params[:4] == match_tokens
+    assert expression.count("ts_rank_cd") == len(frequencies)
 
 
 # -------------------------------------------------------------- name matching

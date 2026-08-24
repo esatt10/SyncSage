@@ -862,6 +862,25 @@ Each source item supports:
 | `include_uncommitted` | bool | `true` | Include working tree changes. |
 | `commit_trigger` | bool | `true` | Trigger sync on commit change events. |
 | `dependency_graph` | object | `{}` | Optional language-specific dependency graph config. |
+| `clone_url` | string/null | `null` | Remote cloned by URL quick-add. When set, every sync fetches and safely fast-forwards before indexing. Use `GITHUB_TOKEN`/`GH_TOKEN` for private GitHub repositories; never put credentials in this URL. |
+| `clone_path` | string/null | `null` | Root of the managed checkout. This differs from `sources[].path` when a GitHub tree URL selects a repository subdirectory. |
+| `clone_ref` | string/null | `null` | Branch or tag requested by a GitHub tree URL. Otherwise the clone's tracked default branch is used. |
+
+URL-added repositories are managed checkouts. Before `incremental`, `full`,
+`repair`, or `validate_only`, Pheasant fetches `origin`, resolves the tracked
+revision, and permits only a fast-forward. It then records the remote, local,
+and indexed commit IDs in the source checkpoint. `GET /sources` and the
+Sources page report `remote current` only when all three commits match.
+
+Pheasant will fail with `remote_error` instead of indexing stale content when
+the fetch cannot authenticate, the checkout has working-tree changes or local
+commits, the history diverged, or `origin` does not match `clone_url`. Local
+repository sources (`clone_url: null`) are never fetched or modified.
+
+Sources created with URL quick-add live immediately in operational state. Use
+the Sources page's **promote** action to add the generated source block to
+`pheasant.yaml` when scheduler/startup synchronization must survive a complete
+server restart.
 
 ### `sources[].chunking`
 
