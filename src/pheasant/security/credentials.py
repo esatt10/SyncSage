@@ -45,12 +45,19 @@ class CredentialEnvNotAllowed(ValueError):
 
 
 #: Connector `type` values this module knows a `DEFAULT_TOKEN_ENV` for —
-#: the only ones :func:`known_credential_envs`/callers can meaningfully
-#: check a `connector.api_key_env` against. Every other type — built-in
-#: ones with no credential concept (`document_folder`, `web_collection`,
-#: `api`, `s3`, `memory`, ...) and, deliberately, every third-party plugin
-#: type — is left unchecked: a plugin is an operator-installed extension
-#: whose own credential-env convention this module cannot know in advance
+#: the only ones a caller can meaningfully check a bare `connector.api_key_env`
+#: against *without* an explicit allowlist entry (unrecognized names still
+#: need `security.allowed_credential_envs`, or to already be configured).
+#: `web_collection`/`api` are deliberately not here even though they do
+#: have a credential concept since H6 (`connector.header_env`): unlike the
+#: five SaaS connectors below, they have no fixed default env var name to
+#: fall back to — every `header_env` value is checked unconditionally,
+#: by type, wherever it is validated (`api/app.py`'s `_source_from_payload`),
+#: rather than through this type-gated set. Every other type — built-in
+#: ones with no credential concept at all (`document_folder`, `s3`,
+#: `memory`, ...) and, deliberately, every third-party plugin type — is
+#: left unchecked: a plugin is an operator-installed extension whose own
+#: credential-env convention this module cannot know in advance
 #: (`pheasant.testing.ConnectorConformance` is the SDK's stability
 #: contract, and it says nothing about a fixed env var name), so refusing
 #: an unrecognized name there would break the plugin SDK's basic
@@ -129,5 +136,12 @@ def known_credential_envs(config: Any) -> set[str]:
         env_name = getattr(connector, "api_key_env", None) if connector is not None else None
         if env_name:
             allowed.add(env_name)
+        # Security audit finding H6: connector.header_env (a header name ->
+        # env var name map, for web_collection/api's own credential
+        # header) is the same class of reference as api_key_env, so an
+        # already-configured value is grandfathered the same way.
+        header_env = getattr(connector, "header_env", None) if connector is not None else None
+        if header_env:
+            allowed.update(v for v in header_env.values() if v)
 
     return allowed

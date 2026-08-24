@@ -409,20 +409,25 @@ LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
 
 
 def _find_credential_env_values(node: Any) -> list[str]:
-    """Every string value of a key literally named ``api_key_env``, at any
-    depth in ``node`` (dicts and lists of dicts) — security audit C1.
+    """Every credential-env-var name reachable at any depth in ``node``
+    (dicts and lists of dicts) — security audit C1, extended for H6.
 
-    A recursive structural scan rather than a per-section allowlist of
-    dotted paths: ``PATCH /config/section/{section}`` accepts an arbitrary
-    nested ``values`` mapping for *any* section, so a new schema field named
-    ``api_key_env`` anywhere is covered automatically rather than needing a
-    second edit here when one is added.
+    Two shapes: the string value of a key literally named ``api_key_env``,
+    and every value of a dict under a key named ``header_env`` (a header
+    name -> env var name map — security audit finding H6). A recursive
+    structural scan rather than a per-section allowlist of dotted paths:
+    ``PATCH /config/section/{section}`` accepts an arbitrary nested
+    ``values`` mapping for *any* section, so a new schema field named either
+    way is covered automatically rather than needing a second edit here
+    when one is added.
     """
     found: list[str] = []
     if isinstance(node, dict):
         for key, value in node.items():
             if key == "api_key_env" and isinstance(value, str):
                 found.append(value)
+            elif key == "header_env" and isinstance(value, dict):
+                found.extend(v for v in value.values() if isinstance(v, str) and v)
             else:
                 found.extend(_find_credential_env_values(value))
     elif isinstance(node, list):
@@ -517,32 +522,50 @@ def _source_from_payload(payload: dict, config: PheasantConfig | None = None) ->
     ``config`` is optional only so the function stays callable without a
     live server config in isolation (there are none such callers today; the
     default exists to keep the signature forgiving); every route below
-    passes its own ``config`` closure variable. When present, and
-    ``payload["type"]`` is one of the first-party connectors this module has
-    a known default credential env var for
-    (:data:`~pheasant.security.credentials.CHECKABLE_CONNECTOR_TYPES` —
-    deliberately not plugin types, see that constant's docstring), any
-    ``connector.api_key_env`` in ``payload`` is checked against
-    :func:`~pheasant.security.credentials.known_credential_envs` — security
-    audit finding C1: an unauthenticated ``POST``/``PUT /sources`` could
-    otherwise name an arbitrary environment variable as a connector's
-    credential and, paired with ``connector.api_endpoint``, ship its value
-    wherever that endpoint points.
-    """
-    if config is not None and payload.get("type") in _CHECKABLE_CONNECTOR_TYPES:
-        connector = payload.get("connector")
-        env_name = connector.get("api_key_env") if isinstance(connector, dict) else None
-        if env_name:
-            from pheasant.security.credentials import (
-                CredentialEnvNotAllowed,
-                known_credential_envs,
-                resolve_credential_env,
-            )
+    passes its own ``config`` closure variable. When present:
 
-            try:
-                resolve_credential_env(env_name, allowed=known_credential_envs(config))
-            except CredentialEnvNotAllowed as exc:
-                raise ValueError(str(exc)) from exc
+    - and ``payload["type"]`` is one of the first-party connectors this
+      module has a known default credential env var for
+      (:data:`~pheasant.security.credentials.CHECKABLE_CONNECTOR_TYPES` —
+      deliberately not plugin types, see that constant's docstring), any
+      ``connector.api_key_env`` in ``payload`` is checked against
+      :func:`~pheasant.security.credentials.known_credential_envs` — security
+      audit finding C1: an unauthenticated ``POST``/``PUT /sources`` could
+      otherwise name an arbitrary environment variable as a connector's
+      credential and, paired with ``connector.api_endpoint``, ship its value
+      wherever that endpoint points.
+    - regardless of type, every value in ``connector.header_env`` is checked
+      the same way — security audit finding H6: unlike ``api_key_env``,
+      ``header_env`` has no per-connector-type default to fall back to, so
+      every name in it needs an explicit allowlist entry (or to already be
+      configured) on every source type, not only the checkable ones.
+    """
+    if config is not None:
+        from pheasant.security.credentials import (
+            CredentialEnvNotAllowed,
+            known_credential_envs,
+            resolve_credential_env,
+        )
+
+        connector = payload.get("connector")
+        connector = connector if isinstance(connector, dict) else {}
+        allowed = known_credential_envs(config)
+        if payload.get("type") in _CHECKABLE_CONNECTOR_TYPES:
+            env_name = connector.get("api_key_env")
+            if env_name:
+                try:
+                    resolve_credential_env(env_name, allowed=allowed)
+                except CredentialEnvNotAllowed as exc:
+                    raise ValueError(str(exc)) from exc
+        header_env = connector.get("header_env")
+        if isinstance(header_env, dict):
+            for env_name in header_env.values():
+                if not env_name:
+                    continue
+                try:
+                    resolve_credential_env(env_name, allowed=allowed)
+                except CredentialEnvNotAllowed as exc:
+                    raise ValueError(str(exc)) from exc
     return PheasantConfig.model_validate({"sources": [payload]}).sources[0]
 
 
@@ -1279,8 +1302,35 @@ def create_app(
                 app.state.metrics_queue = queue
             return queue
 
+    def _authorize_metrics(authorization: str | None) -> None:
+        """Constant-time bearer-token check for ``GET /metrics`` (security
+        audit finding M7) — no-op when ``security.metrics_token_env`` is
+        unset, which is the default and leaves this route exactly as
+        reachable as every other one on a standalone/no-infrastructure
+        region. Deliberately not ``_authorize_worker``: that gate 404s
+        whenever ``sync.concurrency.remote_worker_enabled`` is off (the
+        default), which would silently break metrics scraping in the
+        common case rather than leaving it opt-in."""
+
+        token_env = config.security.metrics_token_env
+        if not token_env:
+            return
+        import hmac
+
+        from pheasant.sync.remote_worker import RemoteWorkerError, configured_token
+
+        try:
+            expected = configured_token(token_env)
+        except RemoteWorkerError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        scheme, _, supplied = (authorization or "").partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(supplied, expected):
+            raise HTTPException(status_code=401, detail="invalid metrics token")
+
     @app.get("/metrics")
-    def metrics_endpoint() -> PlainTextResponse:
+    def metrics_endpoint(
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> PlainTextResponse:
         """Prometheus exposition text (Phase 35.1).
 
         Named ``metrics_endpoint``, not ``metrics``: every route in this module
@@ -1294,6 +1344,7 @@ def create_app(
         write path drifts the moment any path forgets to update it.
         """
 
+        _authorize_metrics(authorization)
         graph = engine.graph_builder.graph
         sample: dict[str, object] = {
             "pheasant_graph_nodes": graph.number_of_nodes(),
@@ -3144,9 +3195,18 @@ def create_app(
         path = Path(app.state.config_path)
         if path.exists():
             raw_yaml = path.read_text(encoding="utf-8")
+        from pheasant.security.redaction import redact_config
+
+        # Security audit finding H6: `effective` is a read-only
+        # introspection view, so redacting connector.headers here is safe.
+        # `raw_yaml` is deliberately left untouched — it is what the UI's
+        # YAML editor round-trips straight back through `PUT /config`'s
+        # `yaml_text`, and redacting it would risk a save silently
+        # persisting the placeholder as the real header value. See
+        # `pheasant.security.redaction`'s module docstring.
         return {
             "path": str(path),
-            "effective": config.model_dump(mode="json"),
+            "effective": redact_config(config.model_dump(mode="json")),
             "raw_yaml": raw_yaml,
             "profiles": profile_names(),
         }
@@ -3661,8 +3721,12 @@ def create_app(
 
     @app.get("/config/effective")
     def config_effective(profile: str = "quickstart") -> dict:
+        from pheasant.security.redaction import redact_config
+
         try:
-            return effective_config_dict(app.state.config_path, profile, {})
+            # Security audit finding H6 — same redaction as GET /config's
+            # `effective`, and the same reasoning for why: read-only.
+            return redact_config(effective_config_dict(app.state.config_path, profile, {}))
         except ConfigError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

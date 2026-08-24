@@ -483,6 +483,56 @@ def _manifest_paths(directory: Path) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# NetworkPolicy
+# --------------------------------------------------------------------------
+
+
+def test_networkpolicy_ingress_is_not_open_to_every_namespace() -> None:
+    """Security audit finding M3: the shipped policy used to admit
+    `namespaceSelector: {}` (every namespace in the cluster) on 8765 — an
+    unauthenticated API reachable from any pod anywhere. The active
+    ingress rule must name specific namespaces; the old permissive rule
+    may still exist in the file, but only commented out."""
+
+    raw = (KUBERNETES / "networkpolicy.yaml").read_text(encoding="utf-8")
+    policy = yaml.safe_load(raw)
+    ingress_rules = policy["spec"]["ingress"]
+
+    for rule in ingress_rules:
+        for source in rule.get("from", []):
+            selector = source.get("namespaceSelector")
+            assert selector != {}, "an active ingress rule still admits every namespace"
+            if selector is not None:
+                assert selector.get("matchLabels"), (
+                    "namespaceSelector must name specific namespaces via matchLabels"
+                )
+
+    # The pre-M3 rule is preserved as a documented, deliberate opt-in —
+    # commented out, not deleted, so an operator who wants it back can see
+    # exactly what to uncomment.
+    assert "#     - namespaceSelector: {}" in raw
+
+
+def test_networkpolicy_egress_excludes_cloud_metadata_regardless_of_port() -> None:
+    """Security audit finding M3: the 0.0.0.0/0:443 egress rule blocking
+    IMDS was a coincidence of cloud metadata endpoints conventionally
+    serving on port 80, not 443 — the port this rule actually opens. An
+    explicit CIDR exclusion means it no longer depends on that."""
+
+    policy = yaml.safe_load((KUBERNETES / "networkpolicy.yaml").read_text(encoding="utf-8"))
+    egress_rules = policy["spec"]["egress"]
+
+    excluded: list[str] = []
+    for rule in egress_rules:
+        for target in rule.get("to", []):
+            ip_block = target.get("ipBlock")
+            if ip_block and ip_block.get("cidr") == "0.0.0.0/0":
+                excluded.extend(ip_block.get("except") or [])
+
+    assert "169.254.169.254/32" in excluded
+
+
+# --------------------------------------------------------------------------
 # Compose
 # --------------------------------------------------------------------------
 

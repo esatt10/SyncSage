@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
@@ -273,6 +274,27 @@ class FilesystemConnector(SourceConnector):
         return super().validate()
 
 
+def _resolved_headers(connector: Any) -> dict[str, str]:
+    """The headers ``web_collection``/``api`` actually send: ``headers``
+    (literal, non-secret) merged with ``header_env`` resolved from the
+    process environment (security audit finding H6).
+
+    A ``header_env`` entry whose env var is unset resolves to no header at
+    all — the same "resolve softly, let the request fail naturally" posture
+    every first-party SaaS connector already takes for `api_key_env`
+    (``os.environ.get``, not ``os.environ[...]``; see e.g.
+    ``connectors/notion.py``), rather than inventing a new failure mode
+    here. ``header_env`` wins on a name collision with ``headers``: the
+    env-var form is the one this codebase's credential convention trusts.
+    """
+    resolved = dict(connector.headers or {})
+    for name, env_name in (connector.header_env or {}).items():
+        value = os.environ.get(env_name or "")
+        if value:
+            resolved[name] = value
+    return resolved
+
+
 class WebCollectionConnector(SourceConnector):
     connector_type = "web_collection"
     experimental = True
@@ -332,7 +354,7 @@ class WebCollectionConnector(SourceConnector):
         cached = self._cached_validators(item.uri)
         response = _urlopen(
             item.uri,
-            headers=self.source.connector.headers,
+            headers=_resolved_headers(self.source.connector),
             timeout=self.source.connector.request_timeout_seconds,
             etag=cached.get("etag"),
             last_modified=cached.get("last_modified"),
@@ -409,7 +431,7 @@ class APIConnector(SourceConnector):
             )
         response = _urlopen(
             endpoint,
-            headers=self.source.connector.headers,
+            headers=_resolved_headers(self.source.connector),
             timeout=self.source.connector.request_timeout_seconds,
             allow_private=self.allow_private_egress,
         )
@@ -498,7 +520,7 @@ class APIConnector(SourceConnector):
             )
         response = _urlopen(
             item.uri,
-            headers=self.source.connector.headers,
+            headers=_resolved_headers(self.source.connector),
             timeout=self.source.connector.request_timeout_seconds,
             allow_private=self.allow_private_egress,
         )

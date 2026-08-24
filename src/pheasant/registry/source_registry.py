@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pheasant.config.loader import config_hash
 from pheasant.config.schema import PheasantConfig, SourceConfig
 from pheasant.persistence.state_store import StateStore
+from pheasant.security.redaction import redact_config_json
 
 
 def now() -> str:
@@ -70,5 +71,12 @@ class SourceRegistry:
         ):
             source = dict(row)
             source["checkpoint"] = checkpoints.get(source["id"])
+            # Security audit finding H6: this is the one shared query behind
+            # GET /sources, GET /overview and MCP list_sources — every
+            # display/listing surface, never a functional round-trip (a
+            # sync or an edit reads the row straight from
+            # StateStore.get_source instead), so redacting here is safe and
+            # closes all three at once rather than needing a fix at each.
+            source["config_json"] = redact_config_json(source.get("config_json"))
             sources.append(source)
         return sources

@@ -178,6 +178,22 @@ GRAPH_TABLES: dict[str, str] = {
 
 EXPORTABLE: dict[str, str] = {**SQL_TABLES, **GRAPH_TABLES}
 
+#: Columns dropped from an otherwise-exported table (security audit finding
+#: H6, 2026-08-23): ``sources.config_json`` is the full serialized source
+#: config, including ``connector.headers`` — which, unlike every other
+#: credential field in this codebase, can (still) hold a literal secret
+#: value rather than only an env-var *name*. The docstring reasoning above
+#: for the tables left out entirely applies at column granularity here too:
+#: "an export is a file people pass around; identity and audit data is not
+#: that" — neither is a plaintext header value. ``GET /sources`` and MCP
+#: ``list_sources`` redact the same column instead of dropping it
+#: (``pheasant.security.redaction``, via ``SourceRegistry.list_sources``);
+#: an export has no equivalent per-row redaction step before the columns
+#: are known, so dropping the column outright is the equivalent guarantee.
+EXCLUDED_COLUMNS: dict[str, frozenset[str]] = {
+    "sources": frozenset({"config_json"}),
+}
+
 #: Exported unless ``--table`` says otherwise. ``artifact_terms`` is left out:
 #: it reached 1.27M rows on a 2,132-file corpus and is retired as a retrieval
 #: path, so paying for it by default would be paying for history.
@@ -513,12 +529,14 @@ def export_columns(state: Any, table: str) -> list[tuple[str, str]]:
     declared = columns_of(table)
     if not declared:  # pragma: no cover - EXPORTABLE only names core tables
         raise ValueError(f"{table} is not part of the shared schema")
+    excluded = EXCLUDED_COLUMNS.get(table, frozenset())
+    declared = [(name, kind) for name, kind in declared if name not in excluded]
     live = state.backend.table_columns(table)
     if not live:
         return declared
     known = {name for name, _ in declared}
     kept = [(name, kind) for name, kind in declared if name in live]
-    kept.extend((name, "TEXT") for name in sorted(live - known))
+    kept.extend((name, "TEXT") for name in sorted(live - known) if name not in excluded)
     return kept
 
 

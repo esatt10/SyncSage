@@ -1053,6 +1053,18 @@ class SecuritySettings(ModelMixin):
     principal_source: str = "body"
     principal_header: str = "X-Pheasant-Principal"
     principal_signing_public_key_ref: str | None = None
+    # Security audit finding M7 (2026-08-23): GET /metrics exposes
+    # Prometheus data (queue depth, sync rates, request counts by route) to
+    # anything that reaches this port, unauthenticated. `None` (the
+    # default) leaves it exactly as reachable as every other route on a
+    # standalone/no-infrastructure region — the same gate the worker
+    # routes use (`_authorize_worker`) would 404 it whenever
+    # `sync.concurrency.remote_worker_enabled` is off, which is the
+    # default, so it is deliberately a *separate* opt-in rather than
+    # reused verbatim. Set to an env var name to require
+    # `Authorization: Bearer <that var's value>` (constant-time compared,
+    # same as the worker routes) on every scrape.
+    metrics_token_env: str | None = None
 
 
 @dataclass
@@ -1083,10 +1095,28 @@ class SourceSyncSettings(ModelMixin):
 class SourceConnectorSettings(ModelMixin):
     allow_experimental: bool = False
     request_timeout_seconds: int = 10
+    # Sent verbatim on every web_collection/api fetch. Non-secret metadata
+    # only (Accept, a content negotiation header, a tracking header an
+    # endpoint expects) — security audit finding H6 (2026-08-23): this was
+    # the one place in this codebase's credential convention that broke
+    # "a secret is an env-var *name*, never a value" (every other
+    # credential field, api_key_env included, is an env-var name), and it
+    # reaches GET /config's raw_yaml, GET /sources, and sources.parquet
+    # verbatim, none of which redact it. Put a token in header_env instead.
     headers: dict[str, str] = field(default_factory=dict)
     # Name of the environment variable holding the connector's API token
     # (Step 31.2+ SaaS connectors). The secret itself never lands in config.
     api_key_env: str | None = None
+    # Security audit finding H6: header name -> env var name, for
+    # web_collection/api connectors, which have no fixed credential field
+    # of their own the way the five first-party SaaS connectors do.
+    # Resolved at fetch time (sync/connectors.py's _resolved_headers),
+    # merged with `headers` (header_env wins on a name collision — the
+    # env-var form is the one this convention trusts). Every value here is
+    # checked against security.credentials.known_credential_envs the same
+    # way api_key_env already is (security/credentials.py, C1) whenever a
+    # source is registered or updated over HTTP/MCP.
+    header_env: dict[str, str] = field(default_factory=dict)
     api_endpoint: str | None = None
     api_items_field: str = "items"
     api_content_field: str = "content"

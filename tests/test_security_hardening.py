@@ -28,6 +28,7 @@ starting at 8.
 from __future__ import annotations
 
 import io
+import json
 import tarfile
 from pathlib import Path
 
@@ -1736,3 +1737,228 @@ def test_warn_if_bound_beyond_loopback_silent_under_the_cors_wildcard_escape_hat
     _warn_if_bound_beyond_loopback(config)
 
     assert capsys.readouterr().err == ""
+
+
+# ---------------------------------------------------------------------------
+# 17. Unauthenticated /metrics
+# ---------------------------------------------------------------------------
+
+
+def test_metrics_unauthenticated_by_default(workspace: Path) -> None:
+    """Unchanged from pre-M7 behavior: no token configured, no gate — a
+    standalone/no-infrastructure region must not need one (CLAUDE.md rule 7)."""
+
+    _config, client = _build(workspace)
+
+    assert client.get("/metrics").status_code == 200
+
+
+def test_metrics_requires_the_configured_token(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_METRICS_TOKEN", "sekrit")
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(workspace / "ws"),
+                "state_path": str(workspace / "state"),
+                "exports_path": str(workspace / "exports"),
+            },
+            "security": {"metrics_token_env": "TEST_METRICS_TOKEN"},
+            "sources": [],
+        }
+    )
+    client = TestClient(create_app(config, config_path=str(workspace / "pheasant.yaml")))
+
+    assert client.get("/metrics").status_code == 401
+    assert client.get("/metrics", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert client.get("/metrics", headers={"Authorization": "Bearer sekrit"}).status_code == 200
+
+
+def test_metrics_token_env_unset_fails_closed(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured-but-unset env var must refuse the request, not silently
+    accept anything (or crash) — same posture `_authorize_worker` already
+    takes for the worker routes' token."""
+
+    monkeypatch.delenv("TEST_METRICS_TOKEN_UNSET", raising=False)
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(workspace / "ws"),
+                "state_path": str(workspace / "state"),
+                "exports_path": str(workspace / "exports"),
+            },
+            "security": {"metrics_token_env": "TEST_METRICS_TOKEN_UNSET"},
+            "sources": [],
+        }
+    )
+    client = TestClient(create_app(config, config_path=str(workspace / "pheasant.yaml")))
+
+    response = client.get("/metrics", headers={"Authorization": "Bearer anything"})
+
+    assert response.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# 18. connector.headers is a plaintext-secret sink reaching /config,
+#     /sources and the Parquet export
+# ---------------------------------------------------------------------------
+
+
+def test_register_source_refuses_an_unapproved_header_env(workspace: Path) -> None:
+    """header_env has no per-connector-type default the way api_key_env
+    does (web_collection/api are not in CHECKABLE_CONNECTOR_TYPES at all —
+    they have no fixed credential field of their own), so every value in
+    it needs an explicit allowlist entry on every source type."""
+
+    _config, client = _build(workspace)
+
+    response = client.post(
+        "/sources",
+        json={
+            "name": "web-docs",
+            "type": "web_collection",
+            "path": str(workspace / "ws"),
+            "urls": ["https://example.com/a"],
+            "connector": {
+                "allow_experimental": True,
+                "header_env": {"Authorization": "AWS_SECRET_ACCESS_KEY"},
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert "AWS_SECRET_ACCESS_KEY" in response.json()["detail"]
+
+
+def test_register_source_accepts_an_allowlisted_header_env(workspace: Path) -> None:
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(workspace / "ws"),
+                "state_path": str(workspace / "state"),
+                "exports_path": str(workspace / "exports"),
+            },
+            "security": {"allowed_credential_envs": ["WEB_DOCS_TOKEN"]},
+            "sources": [],
+        }
+    )
+    client = TestClient(create_app(config, config_path=str(workspace / "pheasant.yaml")))
+
+    response = client.post(
+        "/sources",
+        json={
+            "name": "web-docs",
+            "type": "web_collection",
+            "path": str(workspace / "ws"),
+            "urls": ["https://example.com/a"],
+            "connector": {
+                "allow_experimental": True,
+                "header_env": {"Authorization": "WEB_DOCS_TOKEN"},
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+
+
+def test_sources_endpoint_redacts_connector_headers(workspace: Path) -> None:
+    """GET /sources' config_json (and, via the same query, GET /overview)
+    must never echo back a literal header value."""
+
+    _config, client = _build(workspace)
+
+    response = client.post(
+        "/sources",
+        json={
+            "name": "web-docs",
+            "type": "web_collection",
+            "path": str(workspace / "ws"),
+            "urls": ["https://example.com/a"],
+            "connector": {
+                "allow_experimental": True,
+                "headers": {"Authorization": "Bearer literal-secret-value"},
+            },
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    listed = client.get("/sources").json()
+    entry = next(s for s in listed if s["name"] == "web-docs")
+    connector = json.loads(entry["config_json"])["connector"]
+
+    assert connector["headers"]["Authorization"] == "***redacted***"
+    assert "literal-secret-value" not in json.dumps(listed)
+
+
+def test_config_effective_redacts_connector_headers_but_not_raw_yaml(workspace: Path) -> None:
+    """`effective` (read-only introspection) is redacted; `raw_yaml` — what
+    the UI's editor round-trips straight back through `PUT /config` — is
+    deliberately left untouched. See `pheasant.security.redaction`."""
+
+    (workspace / "pheasant.yaml").write_text(
+        f"""pheasant:
+  name: sec
+  workspace_root: {workspace / "ws"}
+  state_path: {workspace / "state"}
+  exports_path: {workspace / "exports"}
+sources:
+  - name: web-docs
+    type: web_collection
+    path: {workspace / "ws"}
+    urls: ["https://example.com/a"]
+    connector:
+      allow_experimental: true
+      headers:
+        Authorization: "Bearer literal-secret-value"
+""",
+        encoding="utf-8",
+    )
+    from pheasant.config.loader import load_config
+
+    config = load_config(workspace / "pheasant.yaml")
+    client = TestClient(create_app(config, config_path=str(workspace / "pheasant.yaml")))
+
+    response = client.get("/config")
+    body = response.json()
+
+    effective_headers = body["effective"]["sources"][0]["connector"]["headers"]
+    assert effective_headers["Authorization"] == "***redacted***"
+    assert "literal-secret-value" in body["raw_yaml"]
+
+
+def test_sources_parquet_export_drops_config_json(tmp_path: Path) -> None:
+    """Security audit finding H6: an export has no per-row redaction step
+    (unlike GET /sources/GET /overview), so the column is dropped outright
+    rather than exported with a literal secret in it."""
+
+    from pheasant.analytics import EXCLUDED_COLUMNS, export_columns
+
+    assert "config_json" in EXCLUDED_COLUMNS.get("sources", frozenset())
+
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(tmp_path / "ws"),
+                "state_path": str(tmp_path / "state"),
+                "exports_path": str(tmp_path / "exports"),
+            },
+            "sources": [],
+        }
+    )
+    from pheasant.sync.engine import SyncEngine
+
+    engine = SyncEngine(config)
+    try:
+        columns = {name for name, _kind in export_columns(engine.state, "sources")}
+    finally:
+        engine.close()
+
+    assert "config_json" not in columns
+    assert "id" in columns  # the export itself still works

@@ -158,6 +158,42 @@ def _web_config(tmp_path: Path, urls: list[str]) -> PheasantConfig:
     )
 
 
+def test_resolved_headers_merges_literal_and_env_backed_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Security audit finding H6: connector.header_env resolves at fetch
+    time from the environment, merged with the literal (non-secret)
+    connector.headers — header_env wins on a name collision, since the
+    env-var form is the one this codebase's credential convention trusts."""
+
+    from pheasant.sync.connectors import _resolved_headers
+
+    monkeypatch.setenv("TEST_CONNECTOR_TOKEN", "sekrit-value")
+    connector = SourceConnectorSettings(
+        headers={"Accept": "application/json", "Authorization": "should-be-overridden"},
+        header_env={"Authorization": "TEST_CONNECTOR_TOKEN"},
+    )
+
+    resolved = _resolved_headers(connector)
+
+    assert resolved == {"Accept": "application/json", "Authorization": "sekrit-value"}
+
+
+def test_resolved_headers_omits_an_unset_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing env var yields no header at all — the same 'resolve softly,
+    let the request fail naturally' posture the SaaS connectors already
+    take for api_key_env, not a hard failure at resolution time."""
+
+    monkeypatch.delenv("TEST_CONNECTOR_TOKEN_UNSET", raising=False)
+    from pheasant.sync.connectors import _resolved_headers
+
+    connector = SourceConnectorSettings(header_env={"Authorization": "TEST_CONNECTOR_TOKEN_UNSET"})
+
+    resolved = _resolved_headers(connector)
+
+    assert "Authorization" not in resolved
+
+
 def test_misclassified_github_tree_url_has_actionable_error(tmp_path: Path) -> None:
     config = _web_config(tmp_path, ["https://github.com/apache/spark/tree/master/python"])
     engine = SyncEngine(config)

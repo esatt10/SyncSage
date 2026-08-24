@@ -11,17 +11,52 @@ spec:
     - Ingress
     - Egress
   ingress:
+    # Security audit finding M3 (2026-08-23): this used to admit
+    # `namespaceSelector: {}` — every namespace in the cluster — on 8765.
+    # This API has no authentication of its own (see docs/security.md), so
+    # that meant any pod anywhere in the cluster could rewrite the config,
+    # read the whole corpus, or register a source over a sensitive mount.
+    # Narrowed to the ingress/proxy namespace plus same-namespace traffic
+    # (a worker/UI sidecar reaching the API pod in a scaled deployment).
+    # Adjust the `ingress-nginx` label below to your actual ingress
+    # controller's namespace — every namespace gets a `kubernetes.io/
+    # metadata.name` label matching its own name automatically as of
+    # Kubernetes 1.21, so this works unmodified only if your ingress
+    # namespace really is named `ingress-nginx`.
     - from:
-        - namespaceSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: pheasant
       ports:
         - protocol: TCP
           port: 8765
+    # The pre-M3 rule this replaced. Uncomment only with a deliberate
+    # decision that every pod in the cluster is a trusted caller — a
+    # materially stronger claim than "this cluster has network policies at
+    # all", and one most clusters running more than this one workload
+    # cannot actually make.
+    # - from:
+    #     - namespaceSelector: {}
+    #   ports:
+    #     - protocol: TCP
+    #       port: 8765
   egress:
     - to:
         - namespaceSelector: {}
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
+            # Security audit finding M3: explicit and unconditional, so
+            # this does not depend on the coincidence that cloud metadata
+            # endpoints conventionally serve on port 80, not port 443 —
+            # the one this rule actually opens. A provider that also
+            # serves IMDS over 443, or a future one that does, is covered
+            # either way.
+            except:
+              - 169.254.169.254/32
       ports:
         - protocol: TCP
           port: 443

@@ -112,7 +112,6 @@ One row per configured source. Primary key `id`.
 | `type` | VARCHAR | `repository`, `markdown_folder`, `obsidian_vault`, `document_folder`, `web_collection`, `single_file`, `s3`, `api`, `memory`, or a connector-plugin type. |
 | `path` | VARCHAR | Where the source was read from. |
 | `enabled` | BIGINT | 0/1, not a boolean — SQLite has no boolean type. |
-| `config_json` | VARCHAR | The source's full resolved config, as JSON text. |
 | `last_indexed_at` | VARCHAR | ISO-8601 UTC. |
 | `last_status` | VARCHAR | Outcome of the last sync. |
 
@@ -357,6 +356,7 @@ for diagnostics. Join on the columns.
 | **Embedding vectors** | They live in the LanceDB store under `<state>/vectors/`. An export supports lexical and structural analysis, not semantic search. Copy the vector directory separately if you need it. |
 | **The full-text index** | `chunks_fts` is a derived cache and dialect-specific. Rebuild your own from `chunks.text`. |
 | **Identity and audit** | `idp_groups`, `idp_sync_meta`, `source_audit_events` are deliberately excluded. |
+| **`sources.config_json`** | The source's full resolved config, which can carry a literal secret in `connector.headers` — put a token in `connector.header_env` instead, which never lands in config or state. `GET /sources` and MCP `list_sources` redact this column rather than drop it; an export has no per-row redaction step, so the column is dropped outright. |
 | **Operational state** | `source_checkpoints`, `source_leases`, `index_tasks`, `sync_fingerprints`, `manifests` — transient and meaningless outside the region that wrote them. |
 | **Access-control enforcement** | See the warning at the top. |
 
