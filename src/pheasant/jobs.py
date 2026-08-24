@@ -26,20 +26,24 @@ always reported, so a UI can say "last update 4s ago" during healthy work.
 generous: a single large PDF, or an embedding provider serving a retry with
 backoff, is slow but fine, and a progress bar that cries wolf gets ignored.
 
-Still deliberately **in-memory and process-local**, as when this module
-replaced the ``syncing_sources``/``sync_outcomes`` dicts. Phase 35.1c revisits
-that — with more than one replica an in-process registry is structurally wrong
-— but it is a storage change, not a model change, and the model had to be worth
-persisting first.
+The registry remains in memory for single-process use, and can also publish
+atomic JSON snapshots to a shared state directory. API replicas and indexer
+processes therefore observe the same job state without adding another service
+or making the progress path depend on the queue transport.
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import threading
 import time
 import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
 
@@ -70,6 +74,8 @@ RATE_SAMPLES = 30
 #: Generous on purpose — see the module docstring. A big PDF or a rate-limited
 #: embedding batch is slow, not stuck.
 STALL_AFTER_SECONDS = 300.0
+
+logger = logging.getLogger(__name__)
 
 
 def _fraction(current: int, total: int | None) -> float | None:
@@ -309,6 +315,118 @@ class Job:
         return payload
 
 
+class JobSnapshotStore:
+    """Atomic cross-process snapshots for role-split deployments.
+
+    Indexers own the writable state mount and publish one JSON file per job;
+    API replicas mount the same directory read-only and only list/read it.
+    Atomic replacement means a reader sees either the previous complete
+    update or the next complete update, never a partially written payload.
+    """
+
+    def __init__(self, path: str | Path, max_records: int = DEFAULT_MAX_RECORDS) -> None:
+        self.path = Path(path)
+        self.max_records = max(1, int(max_records))
+
+    def write(self, payload: dict[str, Any]) -> None:
+        self.path.mkdir(parents=True, exist_ok=True)
+        job_id = str(payload.get("id") or "")
+        if not job_id:
+            return
+        temporary = self.path / (
+            f".{job_id}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+        )
+        target = self.path / f"{job_id}.json"
+        try:
+            temporary.write_text(
+                json.dumps(payload, separators=(",", ":"), sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(temporary, target)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._evict()
+
+    def get(self, job_id: str) -> dict[str, Any] | None:
+        return self._read(self.path / f"{job_id}.json")
+
+    def list(self) -> list[dict[str, Any]]:
+        if not self.path.is_dir():
+            return []
+        records: list[dict[str, Any]] = []
+        for path in self.path.glob("*.json"):
+            record = self._read(path)
+            if record is not None:
+                records.append(record)
+        return records
+
+    def clear_finished(self, job_id: str | None = None) -> set[str]:
+        removed: set[str] = set()
+        candidates = [self.path / f"{job_id}.json"] if job_id else list(self.path.glob("*.json"))
+        for path in candidates:
+            record = self._read(path)
+            if record is None or bool(record.get("active")):
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                # A read-only API replica can still display shared jobs; only
+                # the writable indexer can physically clear their snapshots.
+                continue
+            removed.add(str(record.get("id") or path.stem))
+        return removed
+
+    @staticmethod
+    def _read(path: Path) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(payload, dict) or not payload.get("id"):
+            return None
+        return _refresh_snapshot(payload)
+
+    def _evict(self) -> None:
+        records = self.list()
+        if len(records) <= self.max_records:
+            return
+        finished = sorted(
+            (record for record in records if not record.get("active")),
+            key=lambda record: str(record.get("finished_at") or record.get("started_at") or ""),
+        )
+        for record in finished[: max(0, len(records) - self.max_records)]:
+            try:
+                (self.path / f"{record['id']}.json").unlink()
+            except OSError:
+                return
+
+
+def _refresh_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    """Advance wall-clock fields after a snapshot crosses process boundaries."""
+
+    now = datetime.now(UTC)
+    stalled = False
+    for source in payload.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        timestamp = source.get("last_progress_at")
+        seconds = float(source.get("seconds_since_progress") or 0.0)
+        if timestamp:
+            try:
+                then = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+                seconds = max(0.0, (now - then).total_seconds())
+            except ValueError:
+                pass
+        source["seconds_since_progress"] = seconds
+        source["stalled"] = bool(source.get("active")) and seconds > STALL_AFTER_SECONDS
+        stalled = stalled or bool(source["stalled"])
+    payload["stalled"] = stalled
+    return payload
+
+
 class JobRegistry:
     """Thread-safe registry of background jobs, with a subscription stream.
 
@@ -317,12 +435,18 @@ class JobRegistry:
     a live object would let a response serialize a half-updated record.
     """
 
-    def __init__(self, max_records: int = DEFAULT_MAX_RECORDS) -> None:
+    def __init__(
+        self,
+        max_records: int = DEFAULT_MAX_RECORDS,
+        *,
+        shared_path: str | Path | None = None,
+    ) -> None:
         self._lock = threading.Lock()
         self._jobs: dict[str, Job] = {}
         self._order: list[str] = []
         self._max_records = max_records
         self._subscribers: list[Queue] = []
+        self._shared = JobSnapshotStore(shared_path, max_records) if shared_path else None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -461,7 +585,10 @@ class JobRegistry:
     def get(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
             job = self._jobs.get(job_id)
-            return job.as_dict() if job else None
+            local = job.as_dict() if job else None
+        if local is not None:
+            return local
+        return self._shared.get(job_id) if self._shared is not None else None
 
     def list(self, *, active_only: bool = False, limit: int = 50) -> list[dict[str, Any]]:
         """Newest first. Running jobs always sort ahead of finished ones.
@@ -475,15 +602,28 @@ class JobRegistry:
         identical defect in `_publish`; the two shared a cause, not a line.
         """
         with self._lock:
-            jobs = [self._jobs[job_id] for job_id in self._order if job_id in self._jobs]
-            if active_only:
-                jobs = [job for job in jobs if job.status not in TERMINAL]
-            jobs.sort(key=lambda job: (job.status in TERMINAL, job.started_at), reverse=False)
-            active = [job for job in jobs if job.status not in TERMINAL]
-            done = [job for job in jobs if job.status in TERMINAL]
-            active.reverse()
-            done.reverse()
-            return [job.as_dict() for job in (active + done)[:limit]]
+            local = {
+                job_id: self._jobs[job_id].as_dict()
+                for job_id in self._order
+                if job_id in self._jobs
+            }
+        shared = self._shared.list() if self._shared is not None else []
+        merged = {str(record["id"]): record for record in shared}
+        merged.update(local)
+        records = list(merged.values())
+        if active_only:
+            records = [record for record in records if bool(record.get("active"))]
+        active = sorted(
+            (record for record in records if bool(record.get("active"))),
+            key=lambda record: str(record.get("started_at") or ""),
+            reverse=True,
+        )
+        done = sorted(
+            (record for record in records if not bool(record.get("active"))),
+            key=lambda record: str(record.get("finished_at") or record.get("started_at") or ""),
+            reverse=True,
+        )
+        return (active + done)[:limit]
 
     def active_for(self, target: str) -> Job | None:
         with self._lock:
@@ -507,6 +647,28 @@ class JobRegistry:
                     return job
         return None
 
+    def active_snapshot_for(self, target: str) -> dict[str, Any] | None:
+        """Newest active local or shared job touching ``target``."""
+
+        return next(
+            (
+                record
+                for record in self.list(active_only=True, limit=self._max_records)
+                if target in (record.get("targets") or [])
+            ),
+            None,
+        )
+
+    def last_outcome_snapshot_for(self, target: str) -> dict[str, Any] | None:
+        return next(
+            (
+                record
+                for record in self.list(limit=self._max_records)
+                if not record.get("active") and target in (record.get("targets") or [])
+            ),
+            None,
+        )
+
     def source_progress(self, target: str) -> dict[str, Any] | None:
         """The live per-source record for ``target``, if one is running."""
 
@@ -519,7 +681,17 @@ class JobRegistry:
                 record = job.sources.get(target)
                 if record is not None:
                     return record.as_dict(now)
-        return None
+        active = self.active_snapshot_for(target)
+        if active is None:
+            return None
+        return next(
+            (
+                record
+                for record in (active.get("sources") or [])
+                if record.get("source") == target and record.get("active")
+            ),
+            None,
+        )
 
     def metrics_sample(self) -> dict[str, Any]:
         """Gauge values for the metrics endpoint, sampled at scrape time.
@@ -529,33 +701,29 @@ class JobRegistry:
         stays free of any dependency on the telemetry package.
         """
 
-        now = time.monotonic()
         ratio: dict[str, float] = {}
         rate: dict[str, float] = {}
         eta: dict[str, float] = {}
         stalled: dict[str, float] = {}
         queued = 0
         inflight = 0
-        with self._lock:
-            for job_id in self._order:
-                job = self._jobs.get(job_id)
-                if job is None or job.status in TERMINAL:
+        for job in self.list(active_only=True, limit=self._max_records):
+            inflight += 1
+            for record in job.get("sources") or []:
+                if not record.get("active"):
                     continue
-                inflight += 1
-                for name, record in job.sources.items():
-                    if not record.active:
-                        continue
-                    queued += 1
-                    fraction = _fraction(record.current, record.total)
-                    if fraction is not None:
-                        ratio[name] = fraction
-                    observed = record.files_per_second(now)
-                    if observed is not None:
-                        rate[name] = observed
-                    remaining = record.eta_seconds(now)
-                    if remaining is not None:
-                        eta[name] = remaining
-                    stalled[name] = 1.0 if record.stalled(now) else 0.0
+                queued += 1
+                name = str(record.get("source") or "")
+                fraction = record.get("fraction")
+                if fraction is not None:
+                    ratio[name] = float(fraction)
+                observed = record.get("files_per_second")
+                if observed is not None:
+                    rate[name] = float(observed)
+                remaining = record.get("eta_seconds")
+                if remaining is not None:
+                    eta[name] = float(remaining)
+                stalled[name] = 1.0 if record.get("stalled") else 0.0
         return {
             "pheasant_index_queue_depth": queued,
             "pheasant_index_inflight": inflight,
@@ -567,17 +735,19 @@ class JobRegistry:
 
     def clear(self, job_id: str | None = None) -> int:
         """Remove finished notifications; active work is never cancelled."""
+        removed_ids: set[str] = set()
         with self._lock:
             selected = [job_id] if job_id is not None else list(self._order)
-            removed = 0
             for candidate in selected:
                 job = self._jobs.get(candidate)
                 if job is not None and job.status in TERMINAL:
                     self._jobs.pop(candidate, None)
-                    removed += 1
-            if removed:
+                    removed_ids.add(candidate)
+            if removed_ids:
                 self._order = [candidate for candidate in self._order if candidate in self._jobs]
-            return removed
+        if self._shared is not None:
+            removed_ids.update(self._shared.clear_finished(job_id))
+        return len(removed_ids)
 
     # -- streaming --------------------------------------------------------
 
@@ -621,6 +791,12 @@ class JobRegistry:
         with self._lock:
             payload = job.as_dict()
             subscribers = list(self._subscribers)
+        if self._shared is not None:
+            try:
+                self._shared.write(payload)
+            except OSError:
+                # Progress is observability, never a reason to fail indexing.
+                logger.debug("could not persist shared job snapshot", exc_info=True)
         for queue in subscribers:
             try:
                 queue.put_nowait(payload)

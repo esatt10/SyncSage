@@ -73,6 +73,20 @@ services:
       - pheasant-state:/state
       - pheasant-exports:/exports
 
+  workspace-init:
+    image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.10.3}
+    restart: "no"
+    user: "0:0"
+    entrypoint: ["sh", "-c"]
+    # Named-volume roots are created as root by Docker. Pheasant itself runs
+    # as uid/gid 10001, so create the managed-clone parent and grant both
+    # entries before a URL-backed source asks an indexer to clone. Creating a
+    # child also prevents Docker's empty-volume copy-up from restoring the
+    # image's root-owned /workspace metadata after this initializer exits.
+    command: ["mkdir -p /workspace/sources && chown 10001:10001 /workspace /workspace/sources && chmod 0755 /workspace /workspace/sources"]
+    volumes:
+      - ${PHEASANT_FLEET_WORKSPACE_PATH:-pheasant-workspace}:/workspace
+
   api:
     image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.10.3}
     build:
@@ -81,6 +95,8 @@ services:
     command: ["serve", "--role", "api"]
     depends_on:
       db-init:
+        condition: service_completed_successfully
+      workspace-init:
         condition: service_completed_successfully
       nats:
         condition: service_healthy
@@ -117,6 +133,8 @@ services:
     depends_on:
       db-init:
         condition: service_completed_successfully
+      workspace-init:
+        condition: service_completed_successfully
       nats:
         condition: service_healthy
     environment: *fleet-env
@@ -141,8 +159,9 @@ services:
     restart: unless-stopped
     command: ["worker", "--transport", "grpc", "--port", "8766", "--max-workers", "16"]
     # No ports: reached only by the indexer, over the Compose network, by
-    # service name. Compose round-robins DNS across the scaled replicas, and
-    # the coordinator's circuit breakers take a dead one out of rotation.
+    # service name. The coordinator's shared gRPC channel uses client-side
+    # round-robin across every IP returned for the scaled service; without
+    # that policy gRPC's pick_first default pins a whole sync to one replica.
     environment:
       PHEASANT_CONFIG: /config/pheasant.yaml
       # The only secret a worker gets — deliberately not the database URL.

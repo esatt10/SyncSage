@@ -54,6 +54,13 @@ DEAD = "dead"
 #: *silence*, not work.
 DEFAULT_VISIBILITY_SECONDS = 300.0
 
+#: JetStream's default ``ack_wait`` is 30 seconds. The visibility setting is
+#: also used by the local queue and is commonly much larger, so deriving the
+#: first heartbeat from it alone can let NATS redeliver a healthy task before
+#: the first ping. Ten seconds is below that broker default and negligible
+#: overhead compared with a repository sync.
+MAX_HEARTBEAT_INTERVAL_SECONDS = 10.0
+
 #: Attempts before a task is dead-lettered. Three is the point at which a
 #: failure has stopped looking transient; a dead task is kept, never deleted,
 #: so `pheasant queue requeue-dead` can replay it after a fix.
@@ -681,7 +688,7 @@ def _keepalive(queue: TaskQueue, task: IndexTask, visibility_seconds: float):
     here would fail a sync that is going fine.
     """
 
-    interval = max(1.0, visibility_seconds / 3.0)
+    interval = _heartbeat_interval(visibility_seconds)
     done = threading.Event()
 
     def beat() -> None:
@@ -698,3 +705,7 @@ def _keepalive(queue: TaskQueue, task: IndexTask, visibility_seconds: float):
     finally:
         done.set()
         thread.join(timeout=5.0)
+
+
+def _heartbeat_interval(visibility_seconds: float) -> float:
+    return min(MAX_HEARTBEAT_INTERVAL_SECONDS, max(1.0, visibility_seconds / 3.0))

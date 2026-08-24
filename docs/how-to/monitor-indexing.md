@@ -32,6 +32,11 @@ Every source-listing route (`GET /sources`, `GET /overview`) carries a
 }
 ```
 
+In a role-split fleet, indexers write these job snapshots atomically under
+`/state/jobs` and API replicas read them from the shared state mount. This is
+why the Jobs tray and Sources rows continue to show live progress even though
+the process serving the UI never performs indexing itself.
+
 `GET /jobs` carries the same records under each job's `sources`, plus a
 job-level `progress` rollup.
 

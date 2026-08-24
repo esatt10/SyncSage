@@ -252,6 +252,47 @@ def test_the_api_role_never_runs_startup_sync(
     assert not called.is_set()
 
 
+def test_the_api_role_defers_repository_clone_to_the_indexer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The API has read-only mounts; the queued indexer materializes URLs."""
+
+    def must_not_fetch(_target: Any) -> None:
+        raise AssertionError("the API role attempted to clone a repository")
+
+    monkeypatch.setattr("pheasant.targets.fetch_target", must_not_fetch)
+    config = _config(
+        tmp_path,
+        state_name="api-remote-source",
+        sources=0,
+        role="api",
+        queue=True,
+    )
+    client = TestClient(create_app(config, role="api"))
+
+    response = client.post(
+        "/sources/quick-add",
+        json={
+            "target": "https://github.com/example/managed-repo",
+            "sync_now": True,
+            "wait": False,
+        },
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    source = body["sources"][0]
+    expected = Path(config.pheasant.workspace_root) / "sources" / "managed-repo"
+    assert source["path"] == str(expected.resolve())
+    assert source["repo"] == {
+        "clone_url": "https://github.com/example/managed-repo",
+        "clone_path": str(expected.resolve()),
+        "clone_ref": None,
+    }
+    assert body["status"] == "registered"
+    assert body["queued_tasks"]
+
+
 def test_the_api_role_deduplicates_a_double_click(tmp_path: Path) -> None:
     config = _config(tmp_path, state_name="api-dedup", role="api", queue=True)
     client = TestClient(create_app(config, role="api"))

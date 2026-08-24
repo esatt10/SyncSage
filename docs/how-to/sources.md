@@ -18,6 +18,10 @@ Three routes reach the same place, so pick whichever fits:
   page, which shows a live "syncing" state per source until it finishes.
   `pheasant up`/CLI calls still block by default (`wait: true`), matching
   the shell's own expectation of a command that returns when it's done.
+  In a role-split fleet, the API only records a repository URL and publishes
+  the sync task; the writable indexer clones or fast-forwards it under
+  `/workspace` before indexing. The API does not need write access to
+  `/state` or `/workspace`.
 - **The form.** **Sources → Advanced…** in the UI exposes every field on this
   page, with the type list read from `GET /sources/types` so installed
   connector plugins appear automatically.

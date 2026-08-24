@@ -198,7 +198,7 @@ def _chunks_and_headings(
 ) -> tuple[list[TextChunk], list[SectionHeading]]:
     """Detect headings and cut chunks, minus any agent-memory frontmatter.
 
-    Both parse entry points route through here so the strip cannot be applied
+    Both parse entry points route through here so normalization cannot be applied
     on one and forgotten on the other. That is not hypothetical: the first
     version of Step 33.5 patched only ``parse_file``, while the sync engine
     goes through ``parse_connector_payload`` — so record frontmatter went on
@@ -208,7 +208,15 @@ def _chunks_and_headings(
     ``chunk_text`` derives them from offsets into the text it is handed and
     strips each slice; without the correction every memory chunk would claim
     to start at line 1.
+
+    PostgreSQL deliberately rejects NUL in text values. A repository can still
+    contain one in a file whose extension looks textual (binary fixtures are a
+    common example), so remove it before chunking rather than failing the whole
+    source during persistence. SQLite accepts NUL, but applying this at the
+    ingestion boundary keeps both backends' indexed corpus identical.
     """
+
+    text = text.replace("\x00", "")
     text, line_offset = _strip_memory_frontmatter(source, text)
     headings = headings_for_source(source, text)
     chunks = chunks_for_source(source, text, headings)

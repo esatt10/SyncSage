@@ -895,7 +895,10 @@ def create_app(
     app.state.sync_lock = threading.Lock()
     app.state.metrics_queue = None
     app.state.metrics_queue_lock = threading.Lock()
-    app.state.jobs = JobRegistry()
+    # Indexer roles publish atomic progress snapshots here. API replicas mount
+    # /state read-only and merge those snapshots into the same HTTP/UI surface
+    # as their process-local jobs.
+    app.state.jobs = JobRegistry(shared_path=paths.state / "jobs")
     jobs = app.state.jobs
     # Content-addressed results for `/internal/indexing/prepare-batch`, so a
     # coordinator's retry after a timeout is a lookup rather than a second
@@ -1260,11 +1263,11 @@ def create_app(
             name = record.get("name")
             if not name:
                 continue
-            active = jobs.active_for(name)
-            last = jobs.last_outcome_for(name)
+            active = jobs.active_snapshot_for(name)
+            last = jobs.last_outcome_snapshot_for(name)
             record["syncing"] = active is not None
-            record["sync_error"] = last.error if last else None
-            record["job"] = active.as_dict() if active else None
+            record["sync_error"] = last.get("error") if last else None
+            record["job"] = active
             record["progress"] = jobs.source_progress(name)
         return records
 
@@ -2087,52 +2090,39 @@ def create_app(
         something that changes hundreds of times over a few minutes and then
         not at all for an hour.
 
-        Deliberately an **async** generator polling a plain queue, not a sync
-        generator blocking on ``queue.get(timeout=...)``. Starlette runs a sync
-        generator in a threadpool and cannot interrupt it, so a client that
-        disconnects leaves that thread blocking on a queue nobody will ever
-        write to again — one leaked thread per dropped connection, forever. An
-        async generator is cancelled at the first ``await`` after the
-        disconnect, which is at most ``POLL_SECONDS`` away.
+        Deliberately an **async** generator polling snapshots, not a sync
+        generator blocking on ``queue.get(timeout=...)``. In fleet mode the
+        writer is another process, so an in-process subscriber can never see
+        its updates; the shared atomic snapshots are the source of truth for
+        both local and remote jobs. Cancellation occurs at the next sleep.
         """
         import asyncio
         import json as json_module
-        import queue as queue_module
 
         from starlette.responses import StreamingResponse
 
-        poll_seconds = 0.25
+        poll_seconds = 1.0
         ping_every = 4.0
 
         async def publish():
-            queue = jobs.subscribe()
-            try:
-                # Prime the stream with current state, so a client that
-                # connects mid-job renders immediately instead of waiting for
-                # the next update to tell it anything at all.
-                for job in jobs.list(active_only=True):
+            seen: dict[str, str] = {}
+            since_ping = ping_every
+            while True:
+                changed = False
+                for job in jobs.list(limit=50):
+                    signature = json_module.dumps(job, sort_keys=True)
+                    if seen.get(job["id"]) == signature:
+                        continue
+                    seen[job["id"]] = signature
+                    changed = True
                     yield f"data: {json_module.dumps({'type': 'job', 'job': job})}\n\n"
-                since_ping = 0.0
-                while True:
-                    drained = False
-                    while True:
-                        try:
-                            item = queue.get_nowait()
-                        except queue_module.Empty:
-                            break
-                        drained = True
-                        yield f"data: {json_module.dumps({'type': 'job', 'job': item})}\n\n"
-                    if drained:
-                        since_ping = 0.0
-                    elif since_ping >= ping_every:
-                        # Keeps proxies from closing an idle connection, and is
-                        # the write that surfaces a dropped client as an error.
-                        since_ping = 0.0
-                        yield ": ping\n\n"
-                    await asyncio.sleep(poll_seconds)
-                    since_ping += poll_seconds
-            finally:
-                jobs.unsubscribe(queue)
+                if changed:
+                    since_ping = 0.0
+                elif since_ping >= ping_every:
+                    since_ping = 0.0
+                    yield ": ping\n\n"
+                await asyncio.sleep(poll_seconds)
+                since_ping += poll_seconds
 
         return StreamingResponse(
             publish(),
@@ -3490,16 +3480,31 @@ def create_app(
         from pheasant.targets import TargetError, fetch_target, resolve_targets
 
         state_dir = Path(config.pheasant.state_path)
+        # In a role-split fleet the API owns registration, not source
+        # materialization. Its /state and /workspace mounts are deliberately
+        # read-only; the queued indexer owns the writable workspace and will
+        # clone/fetch a managed repository under the source write lease.
+        # Single-process deployments keep the eager clone that makes
+        # `quick-add(wait=true)` immediately syncable.
+        materialize_here = role_policy.indexes_locally
+        if materialize_here:
+            clone_root = state_dir / "sources"
+            external_workspace = state_dir / "external"
+        else:
+            workspace_root = Path(config.pheasant.workspace_root)
+            clone_root = workspace_root / "sources"
+            external_workspace = workspace_root / "external"
         try:
             targets = resolve_targets(
                 [req.target],
-                clone_root=state_dir / "sources",
-                workspace=state_dir / "external",
+                clone_root=clone_root,
+                workspace=external_workspace,
                 split=req.split,
                 name=req.name,
             )
-            for target in targets:
-                fetch_target(target)
+            if materialize_here:
+                for target in targets:
+                    fetch_target(target)
         except TargetError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -3511,7 +3516,16 @@ def create_app(
                 payload["taxonomy"] = {"enabled": True}
             if target.local:
                 try:
-                    payload["path"] = str(_resolve_source_path(payload["path"], config))
+                    if target.clone_url and not materialize_here:
+                        # The managed checkout intentionally does not exist
+                        # yet. Enforce the allowlist without the local-path
+                        # existence check; the indexer creates it while
+                        # processing the queued sync.
+                        payload["path"] = str(
+                            resolve_under(payload["path"], _allowed_roots(config))
+                        )
+                    else:
+                        payload["path"] = str(_resolve_source_path(payload["path"], config))
                 except PathPolicyError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
             try:

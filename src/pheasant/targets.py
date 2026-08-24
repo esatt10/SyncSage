@@ -706,6 +706,12 @@ def fetch_target(target: ResolvedTarget) -> str | None:
                 "git",
                 "clone",
                 "--quiet",
+                # Knowledge indexing needs the checked-out tree, not the
+                # repository's entire history. A depth-one clone preserves
+                # tracked commit evidence while avoiding huge history packs.
+                "--depth",
+                "1",
+                "--no-tags",
                 *(["--branch", target.clone_ref, "--single-branch"] if target.clone_ref else []),
                 "--",
                 clone_url,

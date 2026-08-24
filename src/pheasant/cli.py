@@ -193,6 +193,7 @@ class _QueueDrainer:
     def _run(self) -> None:
         import logging
 
+        from pheasant.jobs import JobRegistry
         from pheasant.sync.queue import drain, owner_id, queue_from_config
 
         log = logging.getLogger("pheasant.cli")
@@ -205,6 +206,7 @@ class _QueueDrainer:
         from pheasant.sync.worker import WorkerBackedEngine
 
         worker = WorkerBackedEngine(engine, self.config_path)
+        jobs = JobRegistry(shared_path=Path(self.cfg.pheasant.state_path) / "jobs")
         owner = owner_id()
         visibility = float(self.cfg.sync.queue.visibility_seconds or 300)
         log.info("draining index queue as %s", owner)
@@ -214,14 +216,62 @@ class _QueueDrainer:
                 # returns when the backlog clears, and the outer loop is what
                 # notices the stop event. Blocking inside `drain` for minutes
                 # would make SIGTERM take minutes.
+                def handle(task):
+                    job = jobs.create(
+                        "sync",
+                        f"Indexing {task.source_id}",
+                        [task.source_id],
+                        job_id=task.id,
+                    )
+                    jobs.progress(
+                        job.id,
+                        phase="claimed",
+                        detail=f"Claimed by {owner}",
+                        source=task.source_id,
+                    )
+
+                    def forward(event: dict) -> None:
+                        meta = event.get("meta") or {}
+                        jobs.progress(
+                            job.id,
+                            phase=event.get("phase"),
+                            current=event.get("current"),
+                            total=event.get("total"),
+                            detail=event.get("detail"),
+                            source=meta.get("source") or task.source_id,
+                            stats=meta,
+                        )
+
+                    try:
+                        result = worker.sync_source(
+                            task.source_id,
+                            task.mode,
+                            max_depth=task.max_depth,
+                            full_scan=task.full_scan,
+                            on_progress=forward,
+                        )
+                    except Exception as exc:
+                        jobs.finish(job.id, "failed", error=str(exc))
+                        raise
+                    failed = result.status in {"failed", "timeout", "limit_exceeded"}
+                    jobs.finish(
+                        job.id,
+                        "failed" if failed else "succeeded",
+                        error=(result.details.get("error") or result.status) if failed else None,
+                        result={
+                            "source_id": result.source_id,
+                            "indexed_artifacts": result.indexed_artifacts,
+                            "skipped_artifacts": result.skipped_artifacts,
+                            "status": result.status,
+                        },
+                    )
+                    if failed:
+                        raise RuntimeError(result.details.get("error") or result.status)
+                    return result
+
                 drain(
                     queue,
-                    lambda task: worker.sync_source(
-                        task.source_id,
-                        task.mode,
-                        max_depth=task.max_depth,
-                        full_scan=task.full_scan,
-                    ),
+                    handle,
                     owner=owner,
                     idle_timeout=2.0,
                     visibility_seconds=visibility,
@@ -1495,12 +1545,19 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
     if args.command == "worker":
+        import logging
+
         from pheasant.config.loader import load_config
         from pheasant.sync.grpc_worker import GrpcUnavailable
         from pheasant.sync.grpc_worker import serve as serve_grpc_worker
         from pheasant.version import __version__
 
         cfg = load_config(Path(args.config))
+        level = getattr(logging, str(cfg.pheasant.log_level).upper(), logging.INFO)
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
         if not cfg.sync.concurrency.remote_worker_enabled:
             print(
                 "Refusing to start: sync.concurrency.remote_worker_enabled is false.\n"

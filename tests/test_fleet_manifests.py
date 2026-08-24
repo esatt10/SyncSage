@@ -509,6 +509,7 @@ def test_the_compose_fleet_has_the_high_throughput_topology() -> None:
         "postgres",
         "nats",
         "db-init",
+        "workspace-init",
         "api",
         "indexer",
         "worker",
@@ -531,6 +532,9 @@ def test_the_compose_fleet_has_the_high_throughput_topology() -> None:
         assert services[name]["depends_on"]["db-init"] == {
             "condition": "service_completed_successfully"
         }
+        assert services[name]["depends_on"]["workspace-init"] == {
+            "condition": "service_completed_successfully"
+        }
 
 
 def test_the_compose_fleet_starts_from_an_isolated_workspace_volume() -> None:
@@ -545,6 +549,15 @@ def test_the_compose_fleet_starts_from_an_isolated_workspace_volume() -> None:
         "${PHEASANT_FLEET_WORKSPACE_PATH:-pheasant-workspace}:/workspace"
         in compose["services"]["indexer"]["volumes"]
     )
+    initializer = compose["services"]["workspace-init"]
+    assert initializer["user"] == "0:0"
+    init_command = initializer["command"]
+    assert len(init_command) == 1
+    assert "mkdir -p /workspace/sources" in init_command[0]
+    assert "chown 10001:10001 /workspace /workspace/sources" in init_command[0]
+    assert initializer["volumes"] == [
+        "${PHEASANT_FLEET_WORKSPACE_PATH:-pheasant-workspace}:/workspace"
+    ]
 
 
 def test_the_compose_worker_gets_no_database_url() -> None:
@@ -602,6 +615,9 @@ def test_the_three_compose_profiles_cover_small_advanced_and_fleet() -> None:
         assert config.graph.memory_entity_bridging is True
         assert config.assistant.model == "gpt-5.6-luna"
         assert config.assistant.workflow == "agentic"
+        assert config.search.default_mode == "hybrid"
+        assert config.assistant.retrieval.retrieval_modes == ["hybrid", "graph"]
+        assert config.assistant.retrieval.expand_graph is True
         assert config.server.mcp.enabled is True
         assert any(source.type.value == "memory" for source in config.sources)
 
@@ -616,9 +632,7 @@ def test_the_default_compose_file_is_still_one_container() -> None:
     """Rule 7: `docker compose up` must keep needing no infrastructure."""
 
     compose = yaml.safe_load(
-        (REPO_ROOT / "deploy" / "compose" / "docker-compose.yml").read_text(
-            encoding="utf-8"
-        )
+        (REPO_ROOT / "deploy" / "compose" / "docker-compose.yml").read_text(encoding="utf-8")
     )
     services = compose["services"]
     assert set(services) == {"pheasant"}
@@ -629,9 +643,7 @@ def test_the_default_compose_file_is_still_one_container() -> None:
         "pheasant-config:/config",
         "${PHEASANT_WORKSPACE_PATH:-pheasant-workspace}:/workspace",
     ]
-    assert services["pheasant"]["environment"]["PHEASANT_WORKSPACE"] == (
-        "/ui-managed-sources"
-    )
+    assert services["pheasant"]["environment"]["PHEASANT_WORKSPACE"] == ("/ui-managed-sources")
 
 
 def test_the_advanced_compose_profile_is_one_node_and_uses_its_generated_config() -> None:

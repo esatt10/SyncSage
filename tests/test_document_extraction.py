@@ -40,7 +40,7 @@ from pheasant.ingestion.extractor import (
     scan_pdf_content_stream,
     source_includes_documents,
 )
-from pheasant.ingestion.pipeline import read_text, read_text_bytes
+from pheasant.ingestion.pipeline import parse_file, read_text, read_text_bytes
 from pheasant.ingestion.transcriber import source_includes_audio
 from pheasant.search.hybrid import HybridSearch
 from pheasant.search.sqlite_store import SearchStore
@@ -51,6 +51,34 @@ HANDBOOK = DOCS / "handbook.pdf"
 REPORT = DOCS / "report.docx"
 SCANNED = DOCS / "scanned.pdf"
 SCANNED_SIDECAR = DOCS / "scanned.pdf.extract.txt"
+
+
+def test_text_nul_is_removed_before_chunk_persistence(tmp_path: Path) -> None:
+    document = tmp_path / "binary-fixture.txt"
+    document.write_bytes(b"before\x00after")
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "nul-safe",
+                "state_path": str(tmp_path / "state"),
+                "workspace_root": str(tmp_path),
+                "exports_path": str(tmp_path / "exports"),
+            },
+            "sources": [
+                {
+                    "name": "fixtures",
+                    "type": "document_folder",
+                    "path": str(tmp_path),
+                    "include": ["**/*.txt"],
+                }
+            ],
+        }
+    )
+
+    parsed = parse_file(config.sources[0], document, git_metadata=(None, None, False))
+
+    assert parsed is not None
+    assert "".join(chunk.text for chunk in parsed.chunks) == "beforeafter"
 
 
 def _make_document_engine(tmp_path: Path, *, provider: str = "auto") -> SyncEngine:

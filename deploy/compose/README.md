@@ -7,8 +7,8 @@ stored in YAML.
 | Profile | State and coordination | Search/assistant | Intended size |
 |---|---|---|---|
 | `local-small.yaml` | Local SQLite, no broker or workers | BM25/text search and extractive answers; MCP and durable memory remain enabled | Laptop, offline, small corpus |
-| `local-advanced.yaml` | Single-node SQLite | Hybrid search, LanceDB, both WASM accelerators, `text-embedding-3-small`, and the `gpt-5.6-luna` agentic workflow | One capable workstation/container |
-| `fleet.yaml` | PostgreSQL, NATS JetStream, shared durable volumes, and stateless gRPC preparation workers | Same advanced retrieval stack with aggressive concurrency limits | Multi-container, horizontally scaled ingestion |
+| `local-advanced.yaml` | Single-node SQLite | Hybrid + graph retrieval by default, LanceDB, both WASM accelerators, `text-embedding-3-small`, and the `gpt-5.6-luna` agentic workflow | One capable workstation/container |
+| `fleet.yaml` | PostgreSQL, NATS JetStream, shared durable volumes, and stateless gRPC preparation workers | Same hybrid + graph retrieval stack with aggressive concurrency limits | Multi-container, horizontally scaled ingestion |
 
 `worker.yaml` is the deliberately minimal trust-boundary config for the
 fleet's stateless gRPC workers. It has no source list, database DSN, OpenAI key,

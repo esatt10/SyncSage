@@ -221,6 +221,7 @@ def test_fetch_target_passes_the_clone_url_through_to_git_env(
     # The token must never appear as an argv element (visible in a `ps`/Task
     # Manager listing) -- only via the env-var-based git config mechanism.
     assert not any("ghp_secret123" in str(part) for part in captured["cmd"])
+    assert captured["cmd"][1:6] == ["clone", "--quiet", "--depth", "1", "--no-tags"]
 
 
 def test_local_shapes_are_classified(tmp_path: Path, roots) -> None:

@@ -139,8 +139,8 @@ assistant:
     per_query_results: 10
     max_context_passages: 16
     retrieval_modes:
-      - text
-      - vector
+      - hybrid
+      - graph
     expand_graph: true
     expand_depth: 2
     expand_per_node: 6

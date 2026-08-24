@@ -140,6 +140,35 @@ def test_finished_jobs_are_evicted_but_running_ones_are_not() -> None:
     assert len(registry.list(limit=100)) <= 4
 
 
+def test_a_second_process_reads_shared_job_progress(tmp_path: Path) -> None:
+    shared = tmp_path / "jobs"
+    writer = JobRegistry(shared_path=shared)
+    reader = JobRegistry(shared_path=shared)
+
+    job = writer.create("sync", "Indexing docs", ["docs"], job_id="idx-docs")
+    writer.progress(
+        job.id,
+        phase="indexing",
+        current=7,
+        total=20,
+        detail="guide.md",
+        source="docs",
+    )
+
+    live = reader.get(job.id)
+    assert live is not None
+    assert live["active"] is True
+    assert live["progress"]["current"] == 7
+    assert reader.source_progress("docs")["detail"] == "guide.md"
+    assert reader.active_snapshot_for("docs")["id"] == job.id
+
+    writer.finish(job.id, "succeeded")
+    done = reader.get(job.id)
+    assert done is not None and done["status"] == "succeeded"
+    assert reader.active_snapshot_for("docs") is None
+    assert reader.last_outcome_snapshot_for("docs")["id"] == job.id
+
+
 def test_subscribers_receive_updates_and_a_slow_one_cannot_block_the_job() -> None:
     registry = JobRegistry()
     queue = registry.subscribe()
@@ -314,6 +343,29 @@ def test_jobs_routes_expose_the_registry(loaded_config, config_path: Path) -> No
     assert single.json()["label"] == "Indexing docs"
 
     assert client.get("/jobs/nope").status_code == 404
+
+
+def test_serving_process_exposes_an_indexers_shared_job(loaded_config, config_path: Path) -> None:
+    client = TestClient(create_app(config=loaded_config, config_path=config_path))
+    source = loaded_config.sources[0].name
+    writer = JobRegistry(shared_path=Path(loaded_config.pheasant.state_path) / "jobs")
+    job = writer.create("sync", f"Indexing {source}", [source], job_id="idx-shared")
+    writer.progress(
+        job.id,
+        phase="embedding",
+        current=12,
+        total=40,
+        detail="embedding batch 12/40",
+        source=source,
+    )
+
+    listing = client.get("/jobs").json()
+    assert listing["active_count"] == 1
+    assert listing["jobs"][0]["progress"]["phase"] == "embedding"
+
+    row = next(item for item in client.get("/sources").json() if item["name"] == source)
+    assert row["syncing"] is True
+    assert row["progress"]["current"] == 12
 
 
 def test_finished_job_notifications_can_be_cleared(loaded_config, config_path: Path) -> None:

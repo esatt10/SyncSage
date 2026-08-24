@@ -49,7 +49,7 @@ search:
     dimensions: 1536
     batch_size: 128
     max_retries: 10
-    retry_backoff_seconds: 0.5
+    retry_backoff_seconds: 2.0
   vector_store:
     provider: lancedb
     path: /state/vectors
@@ -90,7 +90,7 @@ sync:
   concurrency:
     max_parallel_sources: 16
     max_parallel_files: 128
-    max_parallel_embeddings: 16
+    max_parallel_embeddings: 4
     file_executor: remote
     remote_worker_urls:
       - grpc://worker:8766
@@ -103,7 +103,7 @@ sync:
   queue:
     enabled: true
     backend: nats
-    visibility_seconds: 900
+    visibility_seconds: 30
     max_attempts: 5
     nats_servers:
       - nats://nats:4222
@@ -152,8 +152,8 @@ assistant:
     per_query_results: 16
     max_context_passages: 24
     retrieval_modes:
-      - text
-      - vector
+      - hybrid
+      - graph
     expand_graph: true
     expand_depth: 2
     expand_per_node: 8

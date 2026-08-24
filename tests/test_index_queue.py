@@ -28,10 +28,16 @@ from pheasant.sync.queue import (
     PENDING,
     IndexTask,
     LocalQueue,
+    _heartbeat_interval,
     drain,
     owner_id,
     queue_from_config,
 )
+
+
+def test_queue_heartbeat_precedes_jetstream_default_ack_wait() -> None:
+    assert _heartbeat_interval(900.0) == 10.0
+    assert _heartbeat_interval(3.0) == 1.0
 
 
 def _write_docs(workspace: Path, prefix: str, count: int = 2) -> None:

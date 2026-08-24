@@ -211,8 +211,11 @@ durable consumer distributes source tasks and PostgreSQL leases writes per
 source, so indexers can work on different sources at the same time. A single
 source still has one write lease: scaling indexers helps a multi-source corpus,
 while gRPC workers fan out parsing and chunking within the source being
-processed. Scale API replicas only after putting a load balancer in front of
-them; Compose deliberately publishes one API endpoint.
+processed. The gRPC coordinator keeps one multiplexed channel to Docker's
+scaled service name and selects `round_robin`, so concurrent preparation
+batches reach distinct worker replicas instead of gRPC's `pick_first` default
+pinning the source to one container. Scale API replicas only after putting a
+load balancer in front of them; Compose deliberately publishes one API endpoint.
 
 ### Kubernetes
 
