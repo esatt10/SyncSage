@@ -81,8 +81,10 @@ No extra dependency and no configuration — it is always on.
 
 | Metric | Type | Use |
 |---|---|---|
-| `pheasant_index_queue_depth` | gauge | **The autoscaling signal.** Sources queued or running. |
+| `pheasant_index_queue_depth` | gauge | Sources still queued in the durable source queue. |
+| `pheasant_index_preparation_backlog` | gauge | Files still awaiting preparation in active jobs; the worker autoscaling signal after a source is claimed. |
 | `pheasant_index_inflight` | gauge | Index jobs currently running. |
+| `pheasant_indexer_leader` | gauge | 1 on the elected orchestrator, 0 on hot-standby indexers. |
 | `pheasant_index_progress_ratio{source}` | gauge | 0–1 completion of the current pass. |
 | `pheasant_index_files_per_second{source}` | gauge | Observed throughput. |
 | `pheasant_index_eta_seconds{source}` | gauge | Estimated seconds remaining. |
@@ -95,6 +97,7 @@ No extra dependency and no configuration — it is always on.
 | `pheasant_embedding_requests_total{outcome}` | counter | Provider health. |
 | `pheasant_graph_nodes`, `pheasant_graph_edges` | gauge | Graph size — the RAM driver. |
 | `pheasant_process_resident_bytes` | gauge | This process's RSS. |
+| `pheasant_requests_capacity_remaining` | gauge | Free API admission slots when request limiting is enabled. |
 | `pheasant_build_info{version}` | gauge | Always 1; the version is the label. |
 | `pheasant_up` | gauge | 1 while serving. |
 

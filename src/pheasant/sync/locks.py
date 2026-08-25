@@ -374,13 +374,18 @@ class SourceLease:
     def release(self) -> None:
         """Drop the lease so the next writer need not wait it out."""
 
-        if not self._held:
+        was_held = self._held
+        if not was_held and self._thread is None:
             return
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(1.0, self.heartbeat_interval_s * 2))
             self._thread = None
         self._held = False
+        if not was_held:
+            # A conditional heartbeat discovered that ownership was lost.
+            # Never delete the row now: it belongs to the successor.
+            return
         try:
             # Only ever delete our own row: a lease we already lost to a
             # takeover belongs to someone else now, and removing it would
@@ -403,15 +408,38 @@ class SourceLease:
         self._thread.start()
 
     def _heartbeat_loop(self) -> None:
+        failures = 0
         while not self._stop.wait(self.heartbeat_interval_s):
             try:
-                self.state.conn.execute(
-                    "UPDATE source_leases SET heartbeat_at=? WHERE source_id=? AND owner=?",
+                result = self.state.conn.execute(
+                    "UPDATE source_leases SET heartbeat_at=? "
+                    "WHERE source_id=? AND owner=? RETURNING owner",
                     (self._now(), self.source_id, self.owner),
                 )
+                rows = list(result)
                 self.state.conn.commit()
+                failures = 0
+                if not rows:
+                    self._held = False
+                    logger.error(
+                        "Lease ownership was lost for %s; stopping its heartbeat",
+                        self.source_id,
+                    )
+                    return
             except Exception as exc:  # pragma: no cover - disk/network blip
+                failures += 1
                 logger.warning("Lease heartbeat failed for %s: %s", self.source_id, exc)
+                if failures >= 3:
+                    # Continuing to orchestrate after three missed heartbeats
+                    # risks overlapping a successor that correctly took the
+                    # stale lease. The supervisor observes this and stops all
+                    # leader-only services before trying to reacquire.
+                    self._held = False
+                    logger.error(
+                        "Lease heartbeat failed three times for %s; relinquishing leadership",
+                        self.source_id,
+                    )
+                    return
 
     def __enter__(self) -> SourceLease:
         self.acquire()

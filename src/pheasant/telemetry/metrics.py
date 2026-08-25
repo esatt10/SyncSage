@@ -291,6 +291,43 @@ def resident_bytes() -> float | None:
     except OSError:
         pass
     try:
+        import ctypes
+        import sys
+
+        if sys.platform == "win32":
+            from ctypes import wintypes
+
+            class ProcessMemoryCounters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            counters = ProcessMemoryCounters()
+            counters.cb = ctypes.sizeof(counters)
+            kernel32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi.GetProcessMemoryInfo.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(ProcessMemoryCounters),
+                wintypes.DWORD,
+            ]
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+            process = kernel32.GetCurrentProcess()
+            if psapi.GetProcessMemoryInfo(process, ctypes.byref(counters), counters.cb):
+                return float(counters.WorkingSetSize)
+    except Exception:  # pragma: no cover - platform API unavailable
+        pass
+    try:
         import resource
         import sys
 
@@ -313,8 +350,16 @@ def register_default_metrics(version: str) -> None:
     REGISTRY.gauge("pheasant_index_queue_depth", "Sources queued or running in an index job.")
     REGISTRY.gauge("pheasant_index_inflight", "Index jobs currently running.")
     REGISTRY.gauge(
+        "pheasant_indexer_leader",
+        "1 on the elected indexer orchestrator; standby indexers report 0.",
+    )
+    REGISTRY.gauge(
         "pheasant_index_dead_letters",
         "Index tasks that exhausted their attempts and need attention.",
+    )
+    REGISTRY.gauge(
+        "pheasant_index_preparation_backlog",
+        "Files still awaiting preparation in active index jobs.",
     )
     REGISTRY.gauge(
         "pheasant_index_progress_ratio",
@@ -358,6 +403,10 @@ def register_default_metrics(version: str) -> None:
         ("path",),
     )
     REGISTRY.gauge("pheasant_requests_inflight", "Requests currently being served.")
+    REGISTRY.gauge(
+        "pheasant_requests_capacity_remaining",
+        "Immediately available request slots when concurrency limiting is enabled.",
+    )
     REGISTRY.gauge("pheasant_draining", "1 while this process is draining after SIGTERM.")
     REGISTRY.histogram("pheasant_search_duration_seconds", "Search latency.", ("mode",))
     REGISTRY.counter(

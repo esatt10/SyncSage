@@ -96,6 +96,7 @@ def _sync_services(engine, cfg, config_path=None):
     return (
         WatcherService(engine, cfg, sync_lock=sync_lock),
         SchedulerService(engine, cfg, sync_lock=sync_lock),
+        sync_lock,
     )
 
 
@@ -128,15 +129,34 @@ def _serve_app(cfg, config_path: str, *, report_ui: bool = True, role: str | Non
     app_obj = create_app(cfg, config_path=config_path, role=policy.name)
     if report_ui and policy.serves_ui:
         _report_ui(app_obj, cfg)
-    watcher, scheduler = _sync_services(app_obj.state.engine, cfg, config_path=config_path)
-    drainer = _queue_drainer(cfg, config_path, policy)
+    watcher, scheduler, sync_lock = _sync_services(
+        app_obj.state.engine, cfg, config_path=config_path
+    )
+    # Standalone startup syncs and every background producer share this gate.
+    # Postgres indexers additionally hand it to the leader supervisor below.
+    app_obj.state.sync_lock = sync_lock
+    drainer = _queue_drainer(cfg, config_path, policy, sync_lock=sync_lock)
     refresher = _graph_refresher(cfg, app_obj.state.engine, policy)
-    if policy.runs_watcher:
-        watcher.start()
-    if policy.runs_scheduler:
-        scheduler.start()
-    if drainer is not None:
-        drainer.start()
+    orchestration = _orchestration_supervisor(
+        app_obj,
+        cfg,
+        policy,
+        watcher=watcher,
+        scheduler=scheduler,
+        drainer=drainer,
+        config_path=config_path,
+        sync_lock=sync_lock,
+    )
+    if orchestration is not None:
+        app_obj.state.orchestration = orchestration
+        orchestration.start()
+    else:
+        if policy.runs_watcher:
+            watcher.start()
+        if policy.runs_scheduler:
+            scheduler.start()
+        if drainer is not None:
+            drainer.start()
     if refresher is not None:
         refresher.start()
     if not policy.is_default:
@@ -146,11 +166,233 @@ def _serve_app(cfg, config_path: str, *, report_ui: bool = True, role: str | Non
     finally:
         if refresher is not None:
             refresher.stop()
-        if drainer is not None:
-            drainer.stop()
-        scheduler.stop()
-        watcher.stop()
+        if orchestration is not None:
+            orchestration.stop()
+        else:
+            if drainer is not None:
+                drainer.stop()
+            scheduler.stop()
+            watcher.stop()
         app_obj.state.engine.close()
+
+
+class _OrchestrationSupervisor:
+    """Elect one active indexer per knowledge-base shard, with failover.
+
+    Preparation workers are the scalable tier. The graph, manifests, vectors
+    and graph-node FTS are one coordinated commit stream, so starting the
+    watcher, scheduler and queue drainer on every indexer creates duplicate
+    scans and stale whole-graph overwrites. A durable database lease leaves
+    extra indexers as hot standbys and promotes one automatically when the
+    leader dies or loses its database session.
+    """
+
+    def __init__(
+        self,
+        state,
+        knowledge_base: str,
+        *,
+        watcher,
+        scheduler,
+        drainer,
+        on_promote=None,
+        promotion_lock=None,
+        poll_interval: float = 1.0,
+    ) -> None:
+        from pheasant.sync.queue import owner_id
+
+        self.state = state
+        self.lease_name = f"__pheasant_orchestrator__:{knowledge_base}"
+        self.owner = owner_id()
+        self.watcher = watcher
+        self.scheduler = scheduler
+        self.drainer = drainer
+        self.on_promote = on_promote
+        self.promotion_lock = promotion_lock
+        self.poll_interval = max(0.1, float(poll_interval))
+        self._leader = False
+        self._stop = None
+        self._thread = None
+        self._lease = None
+        self._promotion_thread = None
+
+    @property
+    def leader(self) -> bool:
+        return self._leader
+
+    def start(self) -> None:
+        import threading
+
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="pheasant-orchestrator-election", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=35)
+            self._thread = None
+        if self._promotion_thread is not None:
+            self._promotion_thread.join(timeout=10)
+
+    def _set_metric(self, value: float) -> None:
+        try:
+            from pheasant.telemetry import metrics
+
+            metrics.REGISTRY.set("pheasant_indexer_leader", value)
+        except Exception:  # pragma: no cover - telemetry cannot own leadership
+            pass
+
+    def _promote(self) -> None:
+        import logging
+        import threading
+
+        self._leader = True
+        self._set_metric(1.0)
+        if self.on_promote is not None and (
+            self._promotion_thread is None or not self._promotion_thread.is_alive()
+        ):
+            # Reserve the global sync gate before any producer starts. The
+            # promotion worker releases it after startup reconciliation, while
+            # watcher/scheduler/drainer can start immediately and wait behind
+            # it without claiming queue work.
+            if self.promotion_lock is not None:
+                self.promotion_lock.acquire()
+
+            def reconcile() -> None:
+                try:
+                    self.on_promote()
+                except Exception:
+                    logging.getLogger("pheasant.cli").exception(
+                        "leader startup reconciliation failed"
+                    )
+                finally:
+                    if self.promotion_lock is not None:
+                        self.promotion_lock.release()
+
+            self._promotion_thread = threading.Thread(
+                target=reconcile,
+                name="pheasant-leader-startup",
+                daemon=True,
+            )
+            self._promotion_thread.start()
+        if self.watcher is not None:
+            self.watcher.start()
+        if self.scheduler is not None:
+            self.scheduler.start()
+        if self.drainer is not None:
+            self.drainer.start()
+        logging.getLogger("pheasant.cli").info(
+            "indexer elected orchestrator for %s", self.lease_name
+        )
+
+    def _demote(self) -> None:
+        import logging
+
+        if not self._leader:
+            return
+        # Stop claims first, then producers. This prevents a demoted leader
+        # from beginning another queued source while its successor promotes.
+        if self.drainer is not None:
+            self.drainer.stop()
+        if self.scheduler is not None:
+            self.scheduler.stop()
+        if self.watcher is not None:
+            self.watcher.stop()
+        self._leader = False
+        self._set_metric(0.0)
+        logging.getLogger("pheasant.cli").warning(
+            "indexer relinquished orchestrator leadership for %s", self.lease_name
+        )
+
+    def _run(self) -> None:
+        import logging
+
+        from pheasant.sync.locks import SourceLease
+
+        log = logging.getLogger("pheasant.cli")
+        self._set_metric(0.0)
+        try:
+            while not self._stop.is_set():
+                if self._lease is None:
+                    self._lease = SourceLease(
+                        self.state,
+                        self.lease_name,
+                        owner=self.owner,
+                        heartbeat_interval_s=5.0,
+                        stale_after_s=20.0,
+                    )
+                if not self._lease.held:
+                    self._demote()
+                    try:
+                        won = self._lease.try_acquire()
+                    except Exception:
+                        log.warning("orchestrator election failed; retrying", exc_info=True)
+                        won = False
+                    if won:
+                        self._promote()
+                self._stop.wait(self.poll_interval)
+        finally:
+            self._demote()
+            if self._lease is not None:
+                self._lease.release()
+
+
+def _orchestration_supervisor(
+    app_obj,
+    cfg,
+    policy,
+    *,
+    watcher,
+    scheduler,
+    drainer,
+    config_path=None,
+    sync_lock=None,
+):
+    """Elect Postgres indexers; standalone/SQLite keeps its direct services."""
+
+    from pheasant.deployment.roles import Role
+
+    if policy.role is not Role.INDEXER or not app_obj.state.state.dialect.is_postgres:
+        return None
+
+    def reconcile_on_promotion() -> None:
+        import logging
+
+        from pheasant.sync.worker import WorkerBackedEngine
+
+        sources = [
+            source.name
+            for source in app_obj.state.engine.enabled_sources()
+            if source.sync.on_startup
+        ]
+        if not sources:
+            return
+        log = logging.getLogger("pheasant.cli")
+        log.info("Leader startup sync for sources: %s", ", ".join(sources))
+        results = WorkerBackedEngine(app_obj.state.engine, config_path).startup()
+        app_obj.state.startup_sync_results = results
+        log.info(
+            "Leader startup sync complete: sources=%s indexed=%s skipped=%s",
+            len(results),
+            sum(result.indexed_artifacts for result in results),
+            sum(result.skipped_artifacts for result in results),
+        )
+
+    return _OrchestrationSupervisor(
+        app_obj.state.state,
+        cfg.knowledge_base_id,
+        watcher=watcher if policy.runs_watcher else None,
+        scheduler=scheduler if policy.runs_scheduler else None,
+        drainer=drainer,
+        on_promote=reconcile_on_promotion,
+        promotion_lock=sync_lock,
+    )
 
 
 class _QueueDrainer:
@@ -167,9 +409,10 @@ class _QueueDrainer:
     every embedded caller too.
     """
 
-    def __init__(self, cfg, config_path: str) -> None:
+    def __init__(self, cfg, config_path: str, *, sync_lock=None) -> None:
         self.cfg = cfg
         self.config_path = config_path
+        self.sync_lock = sync_lock
         self._stop = None
         self._thread = None
 
@@ -269,13 +512,24 @@ class _QueueDrainer:
                         raise RuntimeError(result.details.get("error") or result.status)
                     return result
 
-                drain(
-                    queue,
-                    handle,
-                    owner=owner,
-                    idle_timeout=2.0,
-                    visibility_seconds=visibility,
-                )
+                def drain_once() -> None:
+                    drain(
+                        queue,
+                        handle,
+                        owner=owner,
+                        idle_timeout=2.0,
+                        visibility_seconds=visibility,
+                    )
+
+                if self.sync_lock is None:
+                    drain_once()
+                else:
+                    # Acquire before claiming, not inside ``handle``. Otherwise
+                    # this drainer can reserve one of a sync-all child's tasks,
+                    # block on the lock, and split one shared graph commit over
+                    # two child processes after the visibility timeout.
+                    with self.sync_lock:
+                        drain_once()
         except Exception:  # noqa: BLE001 - a drainer that dies silently is worse
             log.exception("index queue drainer stopped")
         finally:
@@ -283,12 +537,12 @@ class _QueueDrainer:
             engine.close()
 
 
-def _queue_drainer(cfg, config_path: str, policy):
+def _queue_drainer(cfg, config_path: str, policy, *, sync_lock=None):
     """The drain loop, or ``None`` when this role does not claim tasks."""
 
     if not policy.drains_queue:
         return None
-    return _QueueDrainer(cfg, config_path)
+    return _QueueDrainer(cfg, config_path, sync_lock=sync_lock)
 
 
 class _GraphRefresher:
@@ -377,7 +631,6 @@ def _engine(config_path: Path):
     paths = StatePaths.from_config(cfg)
     paths.ensure()
     state = StateStore.from_config(cfg, paths.sqlite)
-    state.migrate()
     return SyncEngine(cfg, paths, state)
 
 

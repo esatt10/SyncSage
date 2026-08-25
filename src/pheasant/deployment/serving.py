@@ -72,6 +72,13 @@ class ConcurrencyLimiter:
         with self._lock:
             return self._inflight
 
+    @property
+    def capacity_remaining(self) -> int:
+        """Immediately available request slots; 0 when limiting is disabled."""
+
+        with self._lock:
+            return max(0, self.limit - self._inflight) if self.enabled else 0
+
     def is_exempt(self, path: str) -> bool:
         return path in self.exempt
 

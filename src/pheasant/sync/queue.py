@@ -95,6 +95,10 @@ class IndexTask:
     payload: dict[str, Any] = field(default_factory=dict)
     attempts: int = 0
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    #: One publish invocation, distinct from the logical task id. JetStream's
+    #: duplicate window suppresses this value; a fresh IndexTask with the same
+    #: logical id is therefore a legitimate new run after the prior one ends.
+    publish_id: str = field(default_factory=lambda: uuid.uuid4().hex, repr=False, compare=False)
     #: Backend-specific handle (a JetStream message, say). Never persisted.
     handle: Any = None
 
@@ -413,6 +417,12 @@ class NatsQueue(TaskQueue):
         self._client: Any = None
         self._js: Any = None
         self._subscription: Any = None
+        # ``sync_all`` may run several drain loops in a ThreadPoolExecutor.
+        # asyncio event loops and nats-py subscriptions are not safe to drive
+        # concurrently from those threads, so every loop/state transition is
+        # marshalled through one re-entrant gate. Handlers still run outside
+        # the gate, preserving source-level parallelism.
+        self._loop_lock = threading.RLock()
 
     # JetStream's client is asyncio-only while the indexing engine is
     # threaded, so every call is marshalled onto one private event loop. A
@@ -420,41 +430,44 @@ class NatsQueue(TaskQueue):
     def _run(self, coroutine: Any) -> Any:
         import asyncio
 
-        if self._loop is None:
-            self._loop = asyncio.new_event_loop()
-        return self._loop.run_until_complete(coroutine)
+        with self._loop_lock:
+            if self._loop is None:
+                self._loop = asyncio.new_event_loop()
+            return self._loop.run_until_complete(coroutine)
 
     def _connect(self) -> Any:
-        if self._js is not None:
+        with self._loop_lock:
+            if self._js is not None:
+                return self._js
+
+            async def setup() -> Any:
+                import nats
+
+                self._client = await nats.connect(
+                    servers=self.servers, connect_timeout=self.connect_timeout
+                )
+                js = self._client.jetstream()
+                try:
+                    await js.add_stream(name=self.stream, subjects=[self.subject])
+                except Exception:
+                    # Already provisioned by another indexer, which is the normal
+                    # case in a fleet and not worth distinguishing.
+                    logger.debug("JetStream stream %s already exists", self.stream)
+                return js
+
+            self._js = self._run(setup())
             return self._js
-
-        async def setup() -> Any:
-            import nats
-
-            self._client = await nats.connect(
-                servers=self.servers, connect_timeout=self.connect_timeout
-            )
-            js = self._client.jetstream()
-            try:
-                await js.add_stream(name=self.stream, subjects=[self.subject])
-            except Exception:
-                # Already provisioned by another indexer, which is the normal
-                # case in a fleet and not worth distinguishing.
-                logger.debug("JetStream stream %s already exists", self.stream)
-            return js
-
-        self._js = self._run(setup())
-        return self._js
 
     def publish(self, task: IndexTask) -> IndexTask:
         js = self._connect()
         body = json.dumps(task.as_dict(), sort_keys=True).encode("utf-8")
 
         async def send() -> None:
-            # Content-addressed message id: JetStream de-duplicates on it, so
-            # a coordinator that retries a publish after a timeout does not
-            # enqueue the same source twice.
-            await js.publish(self.subject, body, headers={"Nats-Msg-Id": task.id})
+            # A retry of this task object is de-duplicated, while a new task
+            # object with the same logical id is a new requested run. Using
+            # ``task.id`` here made JetStream silently suppress every rapid
+            # re-run for its default two-minute duplicate window.
+            await js.publish(self.subject, body, headers={"Nats-Msg-Id": task.publish_id})
 
         self._run(send())
         return task
@@ -468,14 +481,15 @@ class NatsQueue(TaskQueue):
         would never scale *up*, which is the one thing it exists to do.
         """
 
-        if self._subscription is not None:
-            return
-        js = self._connect()
+        with self._loop_lock:
+            if self._subscription is not None:
+                return
+            js = self._connect()
 
-        async def subscribe() -> Any:
-            return await js.pull_subscribe(self.subject, durable=self.durable)
+            async def subscribe() -> Any:
+                return await js.pull_subscribe(self.subject, durable=self.durable)
 
-        self._subscription = self._run(subscribe())
+            self._subscription = self._run(subscribe())
 
     def claim(
         self, owner: str, *, visibility_seconds: float = DEFAULT_VISIBILITY_SECONDS

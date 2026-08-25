@@ -359,7 +359,7 @@ def test_the_indexer_pdb_permits_a_node_drain(scaled: list[dict[str, Any]]) -> N
     assert pdbs["pheasant-api"]["spec"]["minAvailable"] == 1
 
 
-def test_the_worker_autoscaler_reads_the_queue_depth_metric(scaled: list[dict[str, Any]]) -> None:
+def test_the_worker_autoscaler_reads_source_and_file_backlog(scaled: list[dict[str, Any]]) -> None:
     """CPU is a lagging signal here; the backlog is the leading one.
 
     Also asserts the metric name against the registry, so renaming the series
@@ -370,10 +370,12 @@ def test_the_worker_autoscaler_reads_the_queue_depth_metric(scaled: list[dict[st
 
     metrics.register_default_metrics("test")
     assert "pheasant_index_queue_depth" in metrics.REGISTRY.render()
+    assert "pheasant_index_preparation_backlog" in metrics.REGISTRY.render()
 
     keda = next(doc for doc in _by_kind(scaled, "ScaledObject"))
     assert keda["spec"]["scaleTargetRef"]["name"] == "pheasant-worker"
     assert "pheasant_index_queue_depth" in keda["spec"]["triggers"][0]["metadata"]["query"]
+    assert "pheasant_index_preparation_backlog" in keda["spec"]["triggers"][0]["metadata"]["query"]
     assert keda["spec"]["minReplicaCount"] == 0, "an idle fleet should not pay for workers"
 
     hpa = next(
@@ -382,7 +384,11 @@ def test_the_worker_autoscaler_reads_the_queue_depth_metric(scaled: list[dict[st
         if doc["spec"]["scaleTargetRef"]["name"] == "pheasant-worker"
     )
     external = [entry for entry in hpa["spec"]["metrics"] if entry["type"] == "External"]
-    assert external[0]["external"]["metric"]["name"] == "pheasant_index_queue_depth"
+    external_names = {entry["external"]["metric"]["name"] for entry in external}
+    assert external_names == {
+        "pheasant_index_queue_depth",
+        "pheasant_index_preparation_backlog",
+    }
 
 
 def test_the_indexer_points_at_the_worker_service(scaled: list[dict[str, Any]]) -> None:

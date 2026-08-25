@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,10 @@ def _basename(path: str | None) -> str:
 #: Re-exported for callers that referenced ``state_store.SCHEMA``; the
 #: definitions now live in :mod:`pheasant.persistence.schema`, per dialect.
 SCHEMA = schema_for(SQLITE)
+
+# Bump whenever the core DDL or an additive migration changes. Postgres fleet
+# members use the marker to avoid replaying the complete schema at startup.
+SCHEMA_VERSION = "1"
 
 
 class StateStore:
@@ -133,6 +138,9 @@ class StateStore:
         return self.backend.conn
 
     def migrate(self) -> None:
+        if self.backend.dialect.is_postgres:
+            self._migrate_postgres()
+            return
         self.backend.executescript(schema_for(self.backend.dialect))
         # Step 32.1 — one-shot idempotent column add (additive; existing rows
         # keep acl NULL = "source expressed no ACL", the pre-32 semantics).
@@ -140,6 +148,44 @@ class StateStore:
             self.conn.execute("ALTER TABLE artifacts ADD COLUMN acl TEXT")
         self.conn.commit()
         self._migrate_fts_titles()
+
+    def _migrate_postgres(self) -> None:
+        """Run DDL once across a concurrently starting fleet.
+
+        db-init, API, indexer and short-lived sync children often start
+        together. Replaying the full schema from all of them deadlocks
+        PostgreSQL catalog locks against ordinary chunk writes. The backend's
+        advisory lock elects one migrator; the marker makes later calls cheap.
+        """
+
+        with self.backend.schema_lock():
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS pheasant_schema_meta ("
+                "key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)"
+            )
+            self.conn.commit()
+            version = self.rows("SELECT value FROM pheasant_schema_meta WHERE key=?", ("core",))
+            required = {
+                "artifacts": "acl",
+                "index_tasks": "id",
+                "source_leases": "source_id",
+                "sync_fingerprints": "scope",
+            }
+            schema_present = all(
+                column in self.backend.table_columns(table) for table, column in required.items()
+            )
+            if version and str(version[0]["value"]) == SCHEMA_VERSION and schema_present:
+                return
+            self.backend.executescript(schema_for(self.backend.dialect))
+            if "acl" not in self.backend.table_columns("artifacts"):
+                self.conn.execute("ALTER TABLE artifacts ADD COLUMN acl TEXT")
+            self.conn.execute(
+                "INSERT INTO pheasant_schema_meta(key, value, updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                "updated_at=excluded.updated_at",
+                ("core", SCHEMA_VERSION, datetime.now(UTC).isoformat()),
+            )
+            self.conn.commit()
 
     def _migrate_fts_titles(self) -> None:
         """Re-point ``chunks_fts.title`` at the file's basename.

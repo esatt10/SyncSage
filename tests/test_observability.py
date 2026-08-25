@@ -278,12 +278,14 @@ def test_metrics_sample_reports_queue_depth_and_drops_finished_work() -> None:
     sample = jobs.metrics_sample()
     assert sample["pheasant_index_inflight"] == 1
     assert sample["pheasant_index_queue_depth"] == 2
+    assert sample["pheasant_index_preparation_backlog"] == 9
     assert sample["pheasant_index_progress_ratio"]["docs"] == 0.1
 
     jobs.finish(job.id, "succeeded")
     done = jobs.metrics_sample()
     assert done["pheasant_index_inflight"] == 0
     assert done["pheasant_index_queue_depth"] == 0
+    assert done["pheasant_index_preparation_backlog"] == 0
 
 
 def test_publishing_a_snapshot_is_safe_while_the_job_is_being_written() -> None:

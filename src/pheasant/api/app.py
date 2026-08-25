@@ -828,18 +828,27 @@ def create_app(
                 logger.debug("drain handler not installed: not running in the main thread")
 
         startup_sources = [
-            source.name for source in config.sources if source.enabled and source.sync.on_startup
+            source.name for source in engine.enabled_sources() if source.sync.on_startup
         ]
-        if startup_sources and role_policy.indexes_locally:
+        # A Postgres indexer runs this from its elected leader's promotion
+        # callback. Doing it here would let every hot standby index before it
+        # has won the orchestration lease.
+        leader_managed_startup = getattr(app.state, "orchestration", None) is not None
+        if startup_sources and role_policy.indexes_locally and not leader_managed_startup:
             loop = asyncio.get_running_loop()
 
             def _run_startup() -> None:
+                from contextlib import nullcontext
+
                 from pheasant.sync.worker import WorkerBackedEngine
 
                 logger.info("Running startup sync for sources: %s", ", ".join(startup_sources))
                 # Indexing happens in a child process so it cannot starve the
                 # requests this server exists to answer.
-                results = WorkerBackedEngine(engine, app.state.config_path).startup()
+                sync_lock = getattr(app.state, "sync_lock", None)
+                lock_context = sync_lock if sync_lock is not None else nullcontext()
+                with lock_context:
+                    results = WorkerBackedEngine(engine, app.state.config_path).startup()
                 app.state.startup_sync_results = results
                 indexed = sum(result.indexed_artifacts for result in results)
                 skipped = sum(result.skipped_artifacts for result in results)
@@ -998,7 +1007,7 @@ def create_app(
         )
 
     @app.get("/health")
-    def health() -> dict:
+    async def health() -> dict:
         """Liveness: is this process running at all.
 
         Carries the role so a pod can be identified from a probe response —
@@ -1006,10 +1015,14 @@ def create_app(
         question you answer by reading manifests.
         """
 
-        return {"status": "ok", "service": "pheasant", "role": role_policy.name}
+        payload = {"status": "ok", "service": "pheasant", "role": role_policy.name}
+        orchestration = getattr(app.state, "orchestration", None)
+        if orchestration is not None:
+            payload["leader"] = bool(orchestration.leader)
+        return payload
 
     @app.get("/ready")
-    def ready() -> dict:
+    async def ready() -> dict:
         """Readiness: can this process do its role's job.
 
         Distinct from `/health` on purpose, because Kubernetes uses them for
@@ -1039,8 +1052,24 @@ def create_app(
             payload["status"] = "draining"
             payload["draining_for_seconds"] = round(drain_state.draining_for, 1)
             return JSONResponse(status_code=503, content=payload)  # type: ignore[return-value]
+        orchestration = getattr(app.state, "orchestration", None)
+        if orchestration is not None:
+            payload["leader"] = bool(orchestration.leader)
+            if not orchestration.leader:
+                payload["status"] = "standby"
+                return JSONResponse(status_code=503, content=payload)  # type: ignore[return-value]
         try:
-            state.rows("SELECT 1 AS ok", ())
+            # Starlette sends synchronous routes through one bounded AnyIO
+            # threadpool. During the stress run that pool saturated while the
+            # event loop still accepted TCP, so even exempt probes waited for
+            # a worker. Use the event loop's executor with a hard deadline;
+            # liveness above never leaves the event loop at all.
+            import asyncio
+
+            await asyncio.wait_for(
+                asyncio.to_thread(state.rows, "SELECT 1 AS ok", ()),
+                timeout=2.0,
+            )
         except Exception as exc:  # noqa: BLE001 - any failure means not ready
             logger.warning("readiness probe failed: %s", exc)
             payload["status"] = "not_ready"
@@ -1194,6 +1223,7 @@ def create_app(
             "pheasant_graph_nodes": graph.number_of_nodes(),
             "pheasant_graph_edges": graph.number_of_edges(),
             "pheasant_requests_inflight": limiter.inflight,
+            "pheasant_requests_capacity_remaining": limiter.capacity_remaining,
             "pheasant_draining": 1.0 if drain_state.draining else 0.0,
         }
         sample.update(jobs.metrics_sample())
@@ -1619,7 +1649,7 @@ def create_app(
         here, not inside the thread, so it is atomic against a second caller
         racing in before the first thread has even started.
         """
-        names = [source_name] if source_name else [s.name for s in config.sources if s.enabled]
+        names = [source_name] if source_name else [s.name for s in engine.enabled_sources()]
         if not role_policy.indexes_locally:
             return None, _publish_background_sync(names, mode)
         with app.state.sync_lock:
@@ -1644,12 +1674,14 @@ def create_app(
 
         This is what the ``api`` role *is*. Three api replicas that each
         indexed on request would put three processes on one source; publishing
-        means whichever indexer is free picks it up, exactly once, and the
-        caller still gets an id to poll.
+        means an available indexer claims each task, and the caller still gets
+        an id to poll. Source leases make at-least-once broker delivery safe.
 
-        Task ids are content-addressed on (knowledge base, source, mode) —
-        the same rule ``sync_all`` uses — so two replicas answering the same
-        user's double-click enqueue one task, not two.
+        Logical task ids are content-addressed on (knowledge base, source,
+        mode), the same rule ``sync_all`` uses. The local queue suppresses an
+        outstanding duplicate; JetStream suppresses network retries of one
+        publish invocation, while source leases remain the final guard if two
+        API replicas intentionally submit distinct invocations.
         """
 
         import hashlib
@@ -1693,7 +1725,7 @@ def create_app(
                 "status": _background_status(job_id, queued),
                 "job_id": job_id,
                 "queued_tasks": queued,
-                "sources": [s.name for s in config.sources if s.enabled],
+                "sources": [s.name for s in engine.enabled_sources()],
             }
         try:
             return _index(req.source_name, req.mode, req.depth, req.full_scan)

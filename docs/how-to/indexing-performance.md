@@ -11,6 +11,19 @@ pheasant separates work that can scale from state that must stay ordered:
 This preserves stable IDs, incremental skips and deterministic graph bytes at
 every worker count.
 
+In a fleet, scale the **preparation workers**, not the indexer. Each shard has
+one elected indexer/commit authority; additional indexer replicas are hot
+standbys. If commit/enrichment/graph-save time dominates after preparation is
+fast, split sources into another shard instead of adding writers to the same
+graph.
+
+Keep the dispatch window bounded. A remote batch holds every file's bytes on
+the indexer and worker, so the practical in-flight payload is roughly
+`max_parallel_files * remote_worker_batch_size`. The fleet profile uses 16 x
+16 (256 files), four worker containers with two request threads each, and 8
+embedding requests in flight. That leaves CPU and memory for Postgres, NATS,
+the API and the graph owner on an 8-core development host.
+
 ## Choose a local executor
 
 ```yaml

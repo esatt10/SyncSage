@@ -126,6 +126,76 @@ def test_only_the_indexer_drains_and_only_serving_roles_index() -> None:
     assert sorted(role.value for role in Role if POLICIES[role].runs_watcher) == ["all", "indexer"]
 
 
+def test_indexer_orchestration_has_one_leader_and_fails_over(tmp_path: Path) -> None:
+    """Extra indexers are hot standbys, never duplicate schedulers."""
+
+    from pheasant.cli import _OrchestrationSupervisor
+    from pheasant.persistence.state_store import StateStore
+
+    class Service:
+        def __init__(self) -> None:
+            self.running = False
+            self.starts = 0
+
+        def start(self) -> None:
+            self.running = True
+            self.starts += 1
+
+        def stop(self) -> None:
+            self.running = False
+
+    path = tmp_path / "leadership.db"
+    stores = [StateStore(path), StateStore(path)]
+    for store in stores:
+        store.migrate()
+    service_sets = [[Service(), Service(), Service()] for _ in stores]
+    promotions = [0, 0]
+
+    def promoted(index: int) -> None:
+        promotions[index] += 1
+
+    supervisors = [
+        _OrchestrationSupervisor(
+            store,
+            "kb",
+            watcher=services[0],
+            scheduler=services[1],
+            drainer=services[2],
+            on_promote=lambda index=index: promoted(index),
+            promotion_lock=threading.Lock(),
+            poll_interval=0.05,
+        )
+        for index, (store, services) in enumerate(zip(stores, service_sets, strict=True))
+    ]
+
+    def wait_until(predicate, timeout: float = 5.0) -> None:  # type: ignore[no-untyped-def]
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.02)
+        raise AssertionError("condition did not become true")
+
+    try:
+        for supervisor in supervisors:
+            supervisor.start()
+        wait_until(lambda: sum(item.leader for item in supervisors) == 1)
+        wait_until(lambda: sum(promotions) == 1)
+        leader = next(item for item in supervisors if item.leader)
+        standby = next(item for item in supervisors if not item.leader)
+        assert sum(service.running for services in service_sets for service in services) == 3
+
+        leader.stop()
+        wait_until(lambda: standby.leader)
+        wait_until(lambda: sum(promotions) == 2)
+        assert all(service.running for service in service_sets[supervisors.index(standby)])
+    finally:
+        for supervisor in supervisors:
+            supervisor.stop()
+        for store in stores:
+            store.close()
+
+
 # --------------------------------------------------------------------------
 # The startup refusal
 # --------------------------------------------------------------------------
@@ -252,6 +322,26 @@ def test_the_api_role_never_runs_startup_sync(
     assert not called.is_set()
 
 
+def test_an_orchestrated_indexer_defers_startup_to_leader_promotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called = threading.Event()
+
+    def startup(_self: Any) -> list[Any]:
+        called.set()
+        return []
+
+    monkeypatch.setattr("pheasant.sync.worker.WorkerBackedEngine.startup", startup)
+    config = _config(tmp_path, state_name="standby-startup", role="indexer", queue=True)
+    app = create_app(config, role="indexer")
+    app.state.orchestration = object()
+
+    with TestClient(app):
+        time.sleep(0.05)
+
+    assert not called.is_set()
+
+
 def test_the_api_role_defers_repository_clone_to_the_indexer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -305,6 +395,42 @@ def test_the_api_role_deduplicates_a_double_click(tmp_path: Path) -> None:
     # clicks deduplicated.
     assert first["queued_tasks"], "nothing was published"
     assert first["queued_tasks"] == second["queued_tasks"]
+    assert LocalQueue(client.app.state.engine.state).depth()[PENDING] == 1
+
+
+def test_sync_all_includes_a_source_registered_only_in_state(tmp_path: Path) -> None:
+    """Scheduler/API all-sync must not forget UI sources after restart."""
+
+    from pheasant.registry.source_registry import SourceRegistry
+
+    config = _config(
+        tmp_path,
+        state_name="api-runtime-all",
+        sources=0,
+        role="api",
+        queue=True,
+    )
+    client = TestClient(create_app(config, role="api"))
+    folder = Path(config.pheasant.workspace_root) / "runtime"
+    folder.mkdir(parents=True)
+    source = PheasantConfig.model_validate(
+        {
+            "sources": [
+                {
+                    "name": "runtime-docs",
+                    "type": "markdown_folder",
+                    "path": str(folder),
+                    "include": ["**/*.md"],
+                }
+            ]
+        }
+    ).sources[0]
+    SourceRegistry(config, client.app.state.engine.state).register_source(source)
+
+    response = client.post("/sync", json={"mode": "incremental", "wait": False})
+
+    assert response.status_code == 200
+    assert response.json()["sources"] == ["runtime-docs"]
     assert LocalQueue(client.app.state.engine.state).depth()[PENDING] == 1
 
 
@@ -407,6 +533,38 @@ def test_the_indexer_drains_what_an_api_replica_published(tmp_path: Path) -> Non
         "SELECT source_id, COUNT(*) AS c FROM artifacts GROUP BY source_id ORDER BY source_id"
     )
     assert [(row["source_id"], int(row["c"])) for row in rows] == [("src0", 1), ("src1", 1)]
+
+
+def test_the_drainer_does_not_claim_while_a_sync_coordinator_owns_the_lock(
+    tmp_path: Path,
+) -> None:
+    from pheasant.cli import _QueueDrainer
+    from pheasant.config.loader import load_config
+
+    config = _config(tmp_path, state_name="locked-handoff", sources=1, queue=True)
+    config_path = _write_config_file(config, tmp_path / "pheasant.yaml", role="indexer")
+    api = TestClient(create_app(config, role="api"))
+    api.post("/sync/src0", json={"mode": "full", "wait": False})
+
+    sync_lock = threading.Lock()
+    sync_lock.acquire()
+    drainer = _QueueDrainer(load_config(config_path), str(config_path), sync_lock=sync_lock)
+    drainer.start()
+    try:
+        time.sleep(1.0)
+        assert LocalQueue(api.app.state.engine.state).depth()[PENDING] == 1
+    finally:
+        sync_lock.release()
+
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if LocalQueue(api.app.state.engine.state).depth()[DONE] == 1:
+                break
+            time.sleep(0.25)
+    finally:
+        drainer.stop()
+    assert LocalQueue(api.app.state.engine.state).depth()[DONE] == 1
 
 
 def test_a_drainer_stops_promptly(tmp_path: Path) -> None:
@@ -564,12 +722,15 @@ def test_background_services_start_only_for_their_roles(tmp_path: Path, monkeypa
             lambda engine, cfg, config_path=None: (
                 Recorder("watcher", bucket),
                 Recorder("scheduler", bucket),
+                threading.Lock(),
             ),
         )
         monkeypatch.setattr(
             cli,
             "_queue_drainer",
-            lambda cfg, path, policy: Recorder("drainer", bucket) if policy.drains_queue else None,
+            lambda cfg, path, policy, **_kwargs: (
+                Recorder("drainer", bucket) if policy.drains_queue else None
+            ),
         )
         monkeypatch.setattr(
             cli,

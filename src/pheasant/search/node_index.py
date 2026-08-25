@@ -79,7 +79,17 @@ class NodeIndex:
         if self._ready:
             return True
         try:
-            self.state.conn.executescript(POSTGRES_SCHEMA if self._postgres else SCHEMA)
+            if self._postgres:
+                # Most processes only need to discover the cache another
+                # process created. The re-check under the schema lock closes
+                # the first-start race without replaying catalog DDL from
+                # every API/indexer/sync child.
+                if "node_id" not in self.state.backend.table_columns("graph_nodes_fts"):
+                    with self.state.backend.schema_lock():
+                        if "node_id" not in self.state.backend.table_columns("graph_nodes_fts"):
+                            self.state.conn.executescript(POSTGRES_SCHEMA)
+            else:
+                self.state.conn.executescript(SCHEMA)
             self.state.conn.commit()
             self._ready = True
         except Exception as exc:  # pragma: no cover - SQLite without FTS5
@@ -113,6 +123,8 @@ class NodeIndex:
 
         if not self.ensure():
             return 0
+        if self._postgres:
+            return self._replace_all_postgres(nodes)
         written = 0
         with self.state.conn:
             self.state.conn.execute("DELETE FROM graph_nodes_fts")
@@ -125,12 +137,52 @@ class NodeIndex:
         self._populated = written > 0
         return written
 
+    def _replace_all_postgres(self, nodes: Iterable[tuple[str, str, str]]) -> int:
+        """Reconcile through a temporary stage instead of delete/reinsert.
+
+        The old wholesale DELETE made every live graph-index row dead on each
+        rebuild. On the stress database that left 61k dead rows beside 60k
+        live ones and made this derived cache larger than the chunk index.
+        Staging deletes only vanished nodes and updates only changed text.
+        """
+
+        written = 0
+        with self.state.conn:
+            self.state.conn.execute(
+                "CREATE TEMP TABLE pheasant_graph_nodes_stage ("
+                "node_id TEXT PRIMARY KEY, source_id TEXT, body TEXT) ON COMMIT DROP"
+            )
+            for batch in _batched(nodes, 2000):
+                self.state.conn.executemany(
+                    "INSERT INTO pheasant_graph_nodes_stage(node_id, source_id, body) "
+                    "VALUES(?,?,?)",
+                    batch,
+                )
+                written += len(batch)
+            self.state.conn.execute(
+                "DELETE FROM graph_nodes_fts target WHERE NOT EXISTS ("
+                "SELECT 1 FROM pheasant_graph_nodes_stage stage "
+                "WHERE stage.node_id=target.node_id)"
+            )
+            self.state.conn.execute(
+                "INSERT INTO graph_nodes_fts(node_id, source_id, body) "
+                "SELECT node_id, source_id, body FROM pheasant_graph_nodes_stage "
+                "ON CONFLICT(node_id) DO UPDATE SET "
+                "source_id=excluded.source_id, body=excluded.body "
+                "WHERE graph_nodes_fts.source_id IS DISTINCT FROM excluded.source_id "
+                "OR graph_nodes_fts.body IS DISTINCT FROM excluded.body"
+            )
+        self._populated = written > 0
+        return written
+
     def apply(self, upserts: Iterable[tuple[str, str, str]], removals: Iterable[str]) -> int:
         """Incremental update: delete then re-insert the touched rows."""
 
         if not self.ensure():
             return 0
         upserts = list(upserts)
+        if self._postgres:
+            return self._apply_postgres(upserts, removals)
         touched = [node_id for node_id, _source, _body in upserts]
         touched.extend(removals)
         if not touched:
@@ -145,6 +197,37 @@ class NodeIndex:
             for batch in _batched(iter(upserts), 2000):
                 self.state.conn.executemany(
                     "INSERT INTO graph_nodes_fts (node_id, source_id, body) VALUES (?,?,?)",
+                    batch,
+                )
+        if upserts:
+            self._populated = True
+        return len(upserts)
+
+    def _apply_postgres(
+        self,
+        upserts: list[tuple[str, str, str]],
+        removals: Iterable[str],
+    ) -> int:
+        """UPSERT changed nodes without a duplicate-key race or delete churn."""
+
+        upsert_ids = {node_id for node_id, _source, _body in upserts}
+        removed = [node_id for node_id in removals if node_id not in upsert_ids]
+        if not upserts and not removed:
+            return 0
+        with self.state.conn:
+            for batch in _batched(iter(removed), 500):
+                placeholders = ",".join("?" for _ in batch)
+                self.state.conn.execute(
+                    f"DELETE FROM graph_nodes_fts WHERE node_id IN ({placeholders})",
+                    tuple(batch),
+                )
+            for batch in _batched(iter(upserts), 2000):
+                self.state.conn.executemany(
+                    "INSERT INTO graph_nodes_fts(node_id, source_id, body) VALUES(?,?,?) "
+                    "ON CONFLICT(node_id) DO UPDATE SET "
+                    "source_id=excluded.source_id, body=excluded.body "
+                    "WHERE graph_nodes_fts.source_id IS DISTINCT FROM excluded.source_id "
+                    "OR graph_nodes_fts.body IS DISTINCT FROM excluded.body",
                     batch,
                 )
         if upserts:

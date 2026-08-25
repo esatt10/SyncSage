@@ -51,6 +51,27 @@ VALID_MODES = ("hybrid", "text", "graph", "vector")
 _STRUCTURE_CACHE: dict[tuple, Any] = {}
 
 
+def _top_directories_sql(state: Any) -> str:
+    """Directory roll-up in the configured database's SQL dialect."""
+
+    dialect = getattr(state, "dialect", None)
+    if bool(dialect is not None and dialect.is_postgres):
+        return (
+            "SELECT CASE WHEN strpos(relative_path, '/') > 0 "
+            "THEN substr(relative_path, 1, strpos(relative_path, '/') - 1) "
+            "ELSE '(root)' END AS dir, COUNT(*) AS n "
+            "FROM artifacts WHERE relative_path IS NOT NULL "
+            "GROUP BY dir ORDER BY n DESC LIMIT 12"
+        )
+    return (
+        "SELECT CASE WHEN instr(relative_path, '/') > 0 "
+        "THEN substr(relative_path, 1, instr(relative_path, '/') - 1) "
+        "ELSE '(root)' END AS dir, COUNT(*) AS n "
+        "FROM artifacts WHERE relative_path IS NOT NULL "
+        "GROUP BY dir ORDER BY n DESC LIMIT 12"
+    )
+
+
 @dataclass
 class Passage:
     """One retrieved piece of evidence, normalized across search modes."""
@@ -538,9 +559,7 @@ class PheasantRetriever:
             # container and left the stream parked on its last "plan" event.
             # Two keeps network/vector overlap without turning query latency
             # into CPU contention.
-            postgres = bool(
-                getattr(self.state, "dialect", None) and self.state.dialect.is_postgres
-            )
+            postgres = bool(getattr(self.state, "dialect", None) and self.state.dialect.is_postgres)
             max_workers = 2 if postgres else 8
             with ThreadPoolExecutor(max_workers=min(len(concurrent), max_workers)) as pool:
                 batches.extend(pool.map(run, concurrent))
@@ -980,13 +999,7 @@ class PheasantRetriever:
                 "SELECT language, COUNT(*) FROM symbols WHERE language IS NOT NULL "
                 "GROUP BY language ORDER BY 2 DESC LIMIT 6"
             ),
-            top_directories=aggregate(
-                "SELECT CASE WHEN instr(relative_path, '/') > 0 "
-                "THEN substr(relative_path, 1, instr(relative_path, '/') - 1) "
-                "ELSE '(root)' END AS dir, COUNT(*) AS n "
-                "FROM artifacts WHERE relative_path IS NOT NULL "
-                "GROUP BY dir ORDER BY n DESC LIMIT 12"
-            ),
+            top_directories=aggregate(_top_directories_sql(self.state)),
             node_types=dict(node_counts or {}),
             # The terms this corpus actually uses, by document frequency,
             # read off the FTS index's own vocabulary table. Previously this

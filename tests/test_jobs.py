@@ -325,6 +325,23 @@ def test_run_streaming_forwards_progress_before_the_process_exits(tmp_path: Path
     assert PROGRESS_MARKER not in stdout
 
 
+def test_run_streaming_terminates_a_silent_child(tmp_path: Path, monkeypatch) -> None:
+    """A live process with an open stdout pipe must not evade the watchdog."""
+
+    import sys
+
+    from pheasant.sync import worker
+
+    script = tmp_path / "silent-child.py"
+    script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    monkeypatch.setattr(worker, "DEFAULT_INACTIVITY_TIMEOUT_S", 0.2)
+
+    started = time.monotonic()
+    with pytest.raises(worker.SyncWorkerStalled):
+        worker._run_streaming([sys.executable, str(script)], 30, lambda _event: None)
+    assert time.monotonic() - started < 5
+
+
 # ------------------------------------------------------------------ the API
 
 

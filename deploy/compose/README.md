@@ -58,7 +58,7 @@ Scalable fleet:
 ```bash
 # Set OPENAI_API_KEY and a random PHEASANT_INDEX_WORKER_TOKEN in .env.
 docker compose --env-file .env -f deploy/compose/docker-compose.scale.yml up -d --build \
-  --scale indexer=4 --scale worker=8
+  --scale indexer=1 --scale worker=4
 ```
 
 Fresh UI-managed reset, when existing Pheasant volumes should be cleared:
@@ -77,13 +77,14 @@ The UI is at <http://127.0.0.1:8765> and streamable HTTP MCP is at
 
 ## Throughput and durability notes
 
-- The fleet profile batches 128 chunks per embedding request and permits 16
-  embedding requests in flight. Those are intentionally aggressive ceilings;
+- The fleet profile batches 128 chunks per embedding request and permits 8
+  embedding requests in flight. That is an aggressive but bounded ceiling;
   the OpenAI account's RPM/TPM tier is the actual limit. If logs show repeated
   429 responses, reduce `max_parallel_embeddings` before reducing batch size.
 - gRPC workers accelerate file decoding, parsing, extraction and chunking.
-  They do not accelerate the external embedding API. Scale indexers when there
-  are multiple sources and scale workers for CPU-heavy preparation.
+  They do not accelerate the external embedding API. Scale workers for
+  preparation and create another shard for another commit authority. Extra
+  indexers for one shard are elected hot standbys, not throughput replicas.
 - URL-managed repositories use the persistent `pheasant-workspace` volume by
   default. The indexer mounts it read/write so its persisted clone recipe can
   fetch and fast-forward before each sync; the API mounts it read-only. Set

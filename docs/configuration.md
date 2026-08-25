@@ -114,6 +114,13 @@ pheasant serve --role indexer      # watch, schedule, drain
 pheasant worker --transport grpc   # preparation only
 ```
 
+On PostgreSQL, `indexer` replicas elect one orchestrator per knowledge-base
+shard. Only the leader starts watcher, scheduler and queue drain; standbys
+report `leader: false` and `/ready` returns 503 until promotion. Inside the
+leader, all three work producers share one child-sync lock. Scale preparation
+workers for throughput and shard the knowledge base for more commit capacity;
+extra indexers provide failover, not parallel graph writers.
+
 `all` deliberately does **not** drain the queue: a single container turns the
 queue on for [crash resumption](#the-index-work-queue-syncqueue), not to
 become a fleet member, and `sync_all` already drains what it publishes.

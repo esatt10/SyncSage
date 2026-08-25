@@ -20,19 +20,19 @@ server:
   api:
     enabled: true
     openapi: true
-    max_concurrent_requests: 512
+    max_concurrent_requests: 32
     drain_seconds: 20
-    graph_refresh_seconds: 5
+    graph_refresh_seconds: 30
   ui:
     enabled: true
     graph_visualization: true
 storage:
   backend: postgres
   dsn_env: PHEASANT_DATABASE_URL
-  pool_size: 64
+  pool_size: 16
   graph_snapshots: true
-  graph_snapshot_interval_seconds: 300
-  graph_checkpoint_seconds: 30
+  graph_snapshot_interval_seconds: 900
+  graph_checkpoint_seconds: 120
   checkpoint_mtbf_seconds: 86400
   graph_checkpoint_max_seconds: 300
   compression: zstd
@@ -81,29 +81,29 @@ sync:
     reindex_on_commit: true
   scheduler:
     enabled: true
-    interval_seconds: 300
+    interval_seconds: 900
   limits:
     max_files: null
     max_file_size_mb: 100
     max_total_mb: null
     follow_symlinks: false
   concurrency:
-    max_parallel_sources: 16
-    max_parallel_files: 128
-    max_parallel_embeddings: 4
+    max_parallel_sources: 4
+    max_parallel_files: 16
+    max_parallel_embeddings: 8
     file_executor: remote
     remote_worker_urls:
       - grpc://worker:8766
     remote_worker_enabled: false
     remote_worker_token_env: PHEASANT_INDEX_WORKER_TOKEN
-    remote_worker_timeout_seconds: 300
+    remote_worker_timeout_seconds: 120
     remote_worker_batch_size: 16
     worker_transport: grpc
-    lock_timeout_seconds: 600
+    lock_timeout_seconds: 300
   queue:
     enabled: true
     backend: nats
-    visibility_seconds: 30
+    visibility_seconds: 300
     max_attempts: 5
     nats_servers:
       - nats://nats:4222

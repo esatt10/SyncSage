@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from pheasant.config.loader import load_config
 from pheasant.sync.engine import SyncEngine
@@ -116,3 +117,33 @@ def test_sync_all_preserves_a_child_failure_as_a_result(monkeypatch) -> None:
     assert len(results) == 1
     assert results[0].status == "failed"
     assert "429" in results[0].details["error"]
+
+
+def test_startup_parallelizes_all_persisted_enabled_sources(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class Engine:
+        paths = SimpleNamespace(ensure=lambda: None)
+        state = SimpleNamespace(migrate=lambda: None)
+
+        @staticmethod
+        def reconcile_embeddings() -> None:
+            return None
+
+        @staticmethod
+        def enabled_sources():
+            return [
+                SimpleNamespace(name="yaml-source", sync=SimpleNamespace(on_startup=True)),
+                SimpleNamespace(name="persisted-source", sync=SimpleNamespace(on_startup=True)),
+            ]
+
+    backed = WorkerBackedEngine(Engine(), "/config/pheasant.yaml")
+    monkeypatch.setattr(backed, "_can_delegate", lambda: True)
+    monkeypatch.setattr(
+        backed,
+        "sync_all",
+        lambda mode: calls.append(mode) or ["yaml-source", "persisted-source"],
+    )
+
+    assert backed.startup() == ["yaml-source", "persisted-source"]
+    assert calls == ["incremental"]

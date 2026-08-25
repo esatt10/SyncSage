@@ -544,7 +544,7 @@ class SyncEngine:
         self.reconcile_embeddings()
         self.ensure_node_index()
         results = []
-        for source in self.config.sources:
+        for source in self.enabled_sources():
             if source.enabled and source.sync.on_startup:
                 mode: SyncMode = "incremental"
                 # Unconditional: a graph missing artifacts SQLite already has
@@ -644,7 +644,7 @@ class SyncEngine:
         full_scan: bool = False,
         on_progress: ProgressHook | None = None,
     ) -> list[SyncResult]:
-        sources = [source for source in self.config.sources if source.enabled]
+        sources = self.enabled_sources()
         if not sources:
             return []
         workers = min(
@@ -746,9 +746,10 @@ class SyncEngine:
 
         The difference from the in-memory path is what survives a kill: a
         process stopped nine sources into ten leaves the tenth *queued*, so
-        the next run finishes it instead of starting over. Publishing is
-        idempotent — the task id is derived from the knowledge base, source
-        and mode, so re-running does not duplicate a backlog.
+        the next run finishes it instead of starting over. Logical task ids
+        are stable for observability. The local queue re-arms a completed
+        logical task, while NATS assigns each invocation a distinct broker
+        publish id so its duplicate window cannot suppress a real rapid re-run.
 
         Ordering is by enqueue time, so with one worker the results come back
         in configured source order exactly as before. With several the
@@ -2180,6 +2181,34 @@ class SyncEngine:
             self.config.sources.append(resolved)
             return resolved
         raise KeyError(f"Unknown source: {name}")
+
+    def enabled_sources(self) -> list[SourceConfig]:
+        """Every enabled source, including UI/API registrations in state.
+
+        Runtime registrations are durable precisely so another process can
+        index them. Enumerating only the YAML list made `sync_all`, scheduler
+        beats and post-restart startup silently forget those sources even
+        though source-specific sync still worked through :meth:`_source`.
+        Configured order is preserved, followed by registry-only names in the
+        registry's stable alphabetical order.
+        """
+
+        sources = [source for source in self.config.sources if source.enabled]
+        seen = {source.name for source in sources}
+        registry = SourceRegistry(self.config, self.state)
+        for row in registry.list_sources(enabled=True, limit=100_000):
+            name = str(row.get("id") or row.get("name") or "")
+            if not name or name in seen:
+                continue
+            try:
+                source = self._source(name)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                logger.warning("Ignoring invalid registered source %s", name, exc_info=True)
+                continue
+            if source.enabled:
+                sources.append(source)
+                seen.add(source.name)
+        return sources
 
     def _can_skip_before_read(
         self,

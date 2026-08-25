@@ -705,6 +705,7 @@ class JobRegistry:
         rate: dict[str, float] = {}
         eta: dict[str, float] = {}
         stalled: dict[str, float] = {}
+        preparation_backlog = 0
         queued = 0
         inflight = 0
         for job in self.list(active_only=True, limit=self._max_records):
@@ -724,6 +725,11 @@ class JobRegistry:
                 if remaining is not None:
                     eta[name] = float(remaining)
                 stalled[name] = 1.0 if record.get("stalled") else 0.0
+                if record.get("phase") == "preparing":
+                    current = int(record.get("current") or 0)
+                    total = record.get("total")
+                    if total is not None:
+                        preparation_backlog += max(0, int(total) - current)
         return {
             "pheasant_index_queue_depth": queued,
             "pheasant_index_inflight": inflight,
@@ -731,6 +737,7 @@ class JobRegistry:
             "pheasant_index_files_per_second": rate,
             "pheasant_index_eta_seconds": eta,
             "pheasant_index_stalled": stalled,
+            "pheasant_index_preparation_backlog": preparation_backlog,
         }
 
     def clear(self, job_id: str | None = None) -> int:

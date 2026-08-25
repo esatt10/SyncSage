@@ -197,13 +197,15 @@ big" means. A single source over budget on its own is reported rather than
 split — no arrangement of whole sources fixes that, and the honest answers are
 more memory for that region or a narrower `include`/`exclude`.
 
-### Writing to one knowledge base from several indexers
+### One commit authority per knowledge-base shard
 
-Separate from sharding, and only on Postgres: the write lease is **per source**
-there rather than per state directory, so two indexers can commit two different
-sources concurrently. On SQLite the whole-state lease remains, because SQLite
-genuinely permits one writer per file — that is an accurate model, not a
-limitation to route around.
+Postgres allows API replicas and durable coordination, but the persisted graph
+is one whole-file snapshot and its node FTS is one global projection. Several
+indexers committing different sources from stale graph snapshots can overwrite
+one another even when relational rows are source-scoped. Pheasant therefore
+elects one indexer to own watcher, scheduler, queue drain and graph commits per
+shard. Extra indexers are hot standbys. Parallelism stays in multi-source
+preparation inside that authority and in the stateless worker tier.
 
 ## Which storage backend
 
@@ -212,14 +214,14 @@ Independent of the graph, and a different question:
 | | SQLite (default) | Postgres |
 |---|---|---|
 | Setup | none | a database to run |
-| Writers | **one process per knowledge base** | **one per source** — several indexers at once |
+| Writers | **one process per knowledge base** | **one elected indexer per shard**, with standby failover |
 | Read replicas | one container | many |
 | Ranking | BM25 | see [configuration](../configuration.md#where-state-lives-storagebackend) |
 
-Use SQLite unless you need several processes writing one knowledge base, or
-several replicas serving it. It is not slower for a single container, and it is
-one fewer thing to operate. Postgres is what lifts the one-writer limit; it does
-**not** change the graph numbers above, because the graph is held in memory
+Use SQLite unless you need several replicas serving one knowledge base,
+database-backed leader election, or a durable broker-backed fleet. It is not
+slower for a single container, and it is one fewer thing to operate. Postgres
+does **not** change the graph numbers above, because the graph is held in memory
 either way.
 
 ## Ask pheasant instead of reading the table

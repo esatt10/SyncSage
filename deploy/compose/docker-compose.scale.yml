@@ -1,7 +1,7 @@
 # The role-split fleet, in Compose.
 #
 #   docker compose --env-file .env -f deploy/compose/docker-compose.scale.yml up -d \
-#     --scale indexer=4 --scale worker=8
+#     --scale indexer=1 --scale worker=4
 #
 # `docker-compose.yml` (one container, role `all`) remains the default and
 # needs no infrastructure. This file is the other trade: Postgres, NATS
@@ -16,9 +16,9 @@
 #   indexer  watches, schedules and drains the durable NATS queue
 #   worker   parse/chunk only — the tier you scale, with --scale worker=N
 #
-# Scale indexers and workers together. PostgreSQL supplies per-source leases
-# and JetStream distributes source tasks. API replicas still need an external
-# load balancer, which Compose intentionally does not provide.
+# Scale workers, not indexers. Extra indexers are automatic hot standbys, not
+# throughput: the graph, vectors and graph FTS are one coordinated commit
+# stream. More commit capacity comes from another shard/stack.
 name: pheasant-fleet
 
 x-fleet-env: &fleet-env
@@ -33,7 +33,9 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
-    command: ["postgres", "-c", "max_connections=400"]
+    command: ["postgres", "-c", "max_connections=100"]
+    mem_limit: 1g
+    cpus: 1.0
     environment:
       POSTGRES_USER: pheasant
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pheasant}
@@ -50,6 +52,8 @@ services:
     image: nats:2.10-alpine
     restart: unless-stopped
     command: ["-js", "-sd", "/data", "-m", "8222"]
+    mem_limit: 256m
+    cpus: 0.5
     volumes:
       - pheasant-nats:/data
     healthcheck:
@@ -92,6 +96,10 @@ services:
     build:
       context: ../..
     restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    mem_limit: 1536m
+    cpus: 1.0
     command: ["serve", "--role", "api"]
     depends_on:
       db-init:
@@ -129,6 +137,10 @@ services:
     build:
       context: ../..
     restart: unless-stopped
+    init: true
+    stop_grace_period: 2m
+    mem_limit: 3g
+    cpus: 2.0
     command: ["serve", "--role", "indexer"]
     depends_on:
       db-init:
@@ -157,7 +169,11 @@ services:
     build:
       context: ../..
     restart: unless-stopped
-    command: ["worker", "--transport", "grpc", "--port", "8766", "--max-workers", "16"]
+    init: true
+    stop_grace_period: 30s
+    mem_limit: 256m
+    cpus: 1.0
+    command: ["worker", "--transport", "grpc", "--port", "8766", "--max-workers", "2"]
     # No ports: reached only by the indexer, over the Compose network, by
     # service name. The coordinator's shared gRPC channel uses client-side
     # round-robin across every IP returned for the scaled service; without

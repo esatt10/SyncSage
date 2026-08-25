@@ -203,15 +203,17 @@ only past the point where one container stops being enough
 export PHEASANT_INDEX_WORKER_TOKEN=$(openssl rand -hex 32)
 export OPENAI_API_KEY=...
 docker compose --env-file .env -f deploy/compose/docker-compose.scale.yml up -d \
-  --scale indexer=4 --scale worker=8
+  --scale indexer=1 --scale worker=4
 ```
 
-Postgres, NATS JetStream, one API, four indexers and eight gRPC workers. The
-durable consumer distributes source tasks and PostgreSQL leases writes per
-source, so indexers can work on different sources at the same time. A single
-source still has one write lease: scaling indexers helps a multi-source corpus,
-while gRPC workers fan out parsing and chunking within the source being
-processed. The gRPC coordinator keeps one multiplexed channel to Docker's
+Postgres, NATS JetStream, one API, one elected indexer and four gRPC workers.
+The indexer owns watcher, scheduler, queue drain and the global commit stream;
+those producers share one lock, while a `sync --all` child can still prepare
+several sources concurrently. Starting extra indexers creates hot standbys:
+one database lease elects the leader and promotes a standby after failure.
+It does not add write throughput because the graph file, manifests, vectors
+and graph FTS must reach one end state. The gRPC coordinator keeps one
+multiplexed channel to Docker's
 scaled service name and selects `round_robin`, so concurrent preparation
 batches reach distinct worker replicas instead of gRPC's `pick_first` default
 pinning the source to one container. Scale API replicas only after putting a
@@ -231,7 +233,7 @@ kubectl apply -f deploy/kubernetes/scaled/
 |---|---|---|
 | `pheasant-api` | Deployment | CPU (HPA) |
 | `pheasant-indexer` | StatefulSet, 1 replica | not autoscaled |
-| `pheasant-worker` | Deployment | `pheasant_index_queue_depth` (KEDA or HPA) |
+| `pheasant-worker` | Deployment | queued sources + `pheasant_index_preparation_backlog` |
 
 `deploy/kubernetes/scaled/README.md` lists what you must provide first. Two
 requirements are easy to miss and neither is optional:
@@ -251,13 +253,13 @@ makes the staleness easy to miss.
 
 ### Scale on the backlog, not on CPU
 
-CPU is a lagging signal for the worker tier: workers only get busy once the
-indexer is already sending them work, so a CPU-driven autoscaler adds capacity
-after the queue has built up. `pheasant_index_queue_depth` rises the moment
-sources are enqueued.
+CPU is a lagging signal for the worker tier. Source queue depth rises before a
+source is claimed, then falls to zero while one large source may still have
+thousands of files to prepare. Scale from both signals.
 
 ```promql
-sum(pheasant_index_queue_depth) or vector(0)
+(max(pheasant_index_queue_depth) or vector(0))
+  + ceil((max(pheasant_index_preparation_backlog) or vector(0)) / 500)
 ```
 
 `deploy/kubernetes/scaled/worker-hpa.yaml` ships both a KEDA `ScaledObject`

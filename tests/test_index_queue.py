@@ -853,14 +853,24 @@ def test_nats_round_trips_a_task(nats_queue: Any) -> None:
 
 
 @nats_broker
-def test_nats_publish_is_deduplicated_by_task_id(nats_queue: Any) -> None:
-    """A retried publish must not enqueue the same source twice."""
+def test_nats_publish_retry_is_deduplicated(nats_queue: Any) -> None:
+    """Retrying one publish must not enqueue the same invocation twice."""
 
+    task = _task("docs", id="same-id")
     for _ in range(3):
-        nats_queue.publish(_task("docs", id="same-id"))
+        nats_queue.publish(task)
 
     drained = drain(nats_queue, lambda task: task.source_id)
     assert drained == ["docs"]
+
+
+@nats_broker
+def test_nats_accepts_a_new_run_with_the_same_logical_task_id(nats_queue: Any) -> None:
+    for _ in range(2):
+        nats_queue.publish(_task("docs", id="repeatable-id"))
+
+    drained = drain(nats_queue, lambda task: task.source_id)
+    assert drained == ["docs", "docs"]
 
 
 @nats_broker

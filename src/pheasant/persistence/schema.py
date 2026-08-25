@@ -32,6 +32,11 @@ from pheasant.persistence.sql import Dialect
 
 #: Tables and indexes, shared by every backend.
 CORE_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS pheasant_schema_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS knowledge_bases (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,

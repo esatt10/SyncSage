@@ -135,7 +135,7 @@ pheasant client-config claude-code|cursor|vscode
 pheasant config show                       # resolved config after profile+YAML+--set
 
 docker compose --env-file .env -f deploy/compose/docker-compose.yml up
-docker compose --env-file .env -f deploy/compose/docker-compose.scale.yml up --scale indexer=2 --scale worker=3
+docker compose --env-file .env -f deploy/compose/docker-compose.scale.yml up --scale indexer=1 --scale worker=4
 ```
 
 For deployment/configuration work, load
