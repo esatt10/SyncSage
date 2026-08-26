@@ -55,6 +55,7 @@ def run_sync(
     full_scan: bool = False,
     depth: int | None = None,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
+    task_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Index in a child process and return its report.
 
@@ -78,6 +79,7 @@ def run_sync(
         "--mode",
         mode,
         "--json",
+        "--worker-child",
     ]
     if source_name:
         command += ["--source", source_name]
@@ -89,6 +91,13 @@ def run_sync(
         command += ["--depth", str(depth)]
     if on_progress is not None:
         command += ["--progress"]
+    if task_payload:
+        import base64
+
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(task_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
+        command += ["--task-payload", encoded]
     # Server-owned workers queue behind another legitimate writer. The public
     # CLI remains fail-fast, which is important for scripts and diagnostics.
     command += ["--wait-for-lease", str(DEFAULT_LEASE_WAIT_S)]
@@ -360,6 +369,29 @@ class WorkerBackedEngine:
         )
         results = self._adopt(report)
         return results[0] if results else self._empty(source_name, report)
+
+    def apply_index_task(self, task: Any, *, on_progress: Any = None) -> Any:
+        """Run an ordinary sync or queued graph control operation in a child."""
+
+        if not self._can_delegate():
+            return self._engine.apply_index_task(
+                task,
+                on_progress=_as_engine_hook(on_progress),
+            )
+        report = run_sync(
+            self._config_path,
+            str(task.source_id),
+            str(task.mode),
+            full_scan=task.full_scan,
+            depth=task.max_depth,
+            on_progress=on_progress,
+            task_payload={
+                **dict(task.payload or {}),
+                "_delivery_attempt": int(getattr(task, "attempts", 0) or 0),
+            },
+        )
+        results = self._adopt(report)
+        return results[0] if results else self._empty(str(task.source_id), report)
 
     def sync_all(
         self,

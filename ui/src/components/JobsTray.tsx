@@ -123,7 +123,17 @@ function JobRow({ job, onClear }: { job: JobRecord; onClear: () => void }) {
         ) : null}
       </div>
 
-      <ProgressBar fraction={job.progress.fraction} stalled={job.stalled} />
+      <ProgressBar
+        fraction={
+          job.active
+            ? job.progress.fraction
+            : job.status === "succeeded"
+              ? 1
+              : (job.progress.fraction ?? 0)
+        }
+        active={job.active}
+        stalled={job.stalled}
+      />
 
       <div className="job__detail muted small">
         {job.error ? (

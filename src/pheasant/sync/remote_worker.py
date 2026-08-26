@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
 
-from pheasant.config.schema import PheasantConfig, SourceConfig
+from pheasant.config.schema import ExtractorSettings, PheasantConfig, SourceConfig
 from pheasant.ingestion.chunking import TextChunk
-from pheasant.ingestion.content_types import TEXT_EXTENSIONS
+from pheasant.ingestion.content_types import DOCUMENT_EXTENSIONS, TEXT_EXTENSIONS
+from pheasant.ingestion.extractor import build_extractor
 from pheasant.ingestion.pipeline import ParsedArtifact, parse_connector_payload
 from pheasant.sync.connectors import ConnectorItem, ConnectorPayload
 
@@ -24,6 +25,7 @@ class RemoteWorkerError(RuntimeError):
 
 
 REMOTE_TEXT_EXTENSIONS = TEXT_EXTENSIONS - {".html"}
+REMOTE_DOCUMENT_EXTENSIONS = frozenset(DOCUMENT_EXTENSIONS)
 
 
 def _remote_text_path(path: str) -> bool:
@@ -31,6 +33,24 @@ def _remote_text_path(path: str) -> bool:
     return (
         candidate.suffix.lower() in REMOTE_TEXT_EXTENSIONS
         or candidate.name.lower() == "dockerfile"
+    )
+
+
+def _remote_preparation_path(path: str, *, html_text: bool = False) -> bool:
+    """Return whether a stateless worker can prepare ``path`` safely.
+
+    Documents are pure bytes-to-text work and belong on the preparation
+    fleet just as much as source code does.  Images and audio deliberately do
+    not: those handlers may carry model credentials, which the coordinator
+    never forwards across this trust boundary.
+    """
+
+    candidate = Path(path)
+    suffix = candidate.suffix.lower()
+    return (
+        _remote_text_path(path)
+        or suffix in REMOTE_DOCUMENT_EXTENSIONS
+        or (html_text and suffix in {".html", ".htm", ".xhtml"})
     )
 
 
@@ -90,6 +110,7 @@ def task_payload(
     item: ConnectorItem,
     payload: ConnectorPayload,
     git_metadata: tuple[str | None, str | None, bool] | None,
+    extractor_settings: ExtractorSettings | None = None,
 ) -> dict[str, Any]:
     return {
         # Only parsing inputs cross the trust boundary. In particular, do not
@@ -112,6 +133,14 @@ def task_payload(
             "metadata": payload.metadata,
         },
         "git_metadata": list(git_metadata) if git_metadata is not None else None,
+        # Extractors are deterministic, offline parser settings.  This is
+        # intentionally narrower than forwarding the whole ingestion config:
+        # captioner/transcriber settings can name credential-bearing services.
+        "extractor": (
+            extractor_settings.model_dump(mode="json")
+            if extractor_settings is not None
+            else None
+        ),
     }
 
 
@@ -122,9 +151,17 @@ def prepare_task(task: dict[str, Any]) -> dict[str, Any] | None:
     item = ConnectorItem(**task["item"])
     if source.taxonomy.enabled:
         raise RemoteWorkerError("Remote preparation does not support taxonomy-enabled sources")
-    if not _remote_text_path(item.relative_path):
+    extractor_raw = task.get("extractor")
+    extractor_settings = (
+        PheasantConfig.model_validate({"ingestion": {"extractor": extractor_raw}})
+        .ingestion.extractor
+        if isinstance(extractor_raw, dict)
+        else None
+    )
+    html_text = bool(extractor_settings and extractor_settings.html_text)
+    if not _remote_preparation_path(item.relative_path, html_text=html_text):
         raise RemoteWorkerError(
-            f"Remote preparation only accepts ordinary text: {item.relative_path}"
+            f"Remote preparation does not support this content type: {item.relative_path}"
         )
     raw = task["payload"]
     payload = ConnectorPayload(
@@ -138,7 +175,20 @@ def prepare_task(task: dict[str, Any]) -> dict[str, Any] | None:
     )
     git_raw = task.get("git_metadata")
     git_metadata = tuple(git_raw) if git_raw is not None else None
-    parsed = parse_connector_payload(source, item, payload, git_metadata)  # type: ignore[arg-type]
+    extractor = None
+    if Path(item.relative_path).suffix.lower() in REMOTE_DOCUMENT_EXTENSIONS or html_text:
+        if extractor_settings is None:
+            raise RemoteWorkerError(
+                f"Remote document preparation requires extractor settings: {item.relative_path}"
+            )
+        extractor = build_extractor(extractor_settings)
+    parsed = parse_connector_payload(  # type: ignore[arg-type]
+        source,
+        item,
+        payload,
+        git_metadata,
+        extractor=extractor,
+    )
     return parsed_to_wire(parsed)
 
 

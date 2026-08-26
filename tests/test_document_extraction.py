@@ -145,6 +145,50 @@ def test_pdf_and_docx_yield_text_once_an_extractor_is_supplied() -> None:
     assert "OKAPI" in docx_text
 
 
+def test_stateless_worker_prepares_pdf_with_forwarded_offline_extractor_settings(
+    tmp_path: Path,
+) -> None:
+    """The fleet path must actually handle documents, not fall back locally."""
+
+    from pheasant.sync.connectors import ConnectorItem, ConnectorPayload
+    from pheasant.sync.remote_worker import prepare_task, task_payload
+
+    config = PheasantConfig.model_validate(
+        {
+            "ingestion": {"extractor": {"provider": "builtin"}},
+            "sources": [
+                {
+                    "name": "documents",
+                    "type": "document_folder",
+                    "path": str(tmp_path),
+                    "include": ["**/*.pdf"],
+                }
+            ],
+        }
+    )
+    content = HANDBOOK.read_bytes()
+    item = ConnectorItem(
+        identity="handbook",
+        relative_path="handbook.pdf",
+        uri=(tmp_path / "handbook.pdf").as_uri(),
+        size_bytes=len(content),
+    )
+    payload = ConnectorPayload(item=item, content=content, size_bytes=len(content))
+    wire = prepare_task(
+        task_payload(
+            config.sources[0],
+            item,
+            payload,
+            None,
+            config.ingestion.extractor,
+        )
+    )
+
+    assert wire is not None
+    assert wire["relative_path"] == "handbook.pdf"
+    assert any("ZEBRAFISH" in chunk["text"] for chunk in wire["chunks"])
+
+
 # ---------------------------------------------------------------------------
 # Builtin (pure stdlib) extraction
 # ---------------------------------------------------------------------------

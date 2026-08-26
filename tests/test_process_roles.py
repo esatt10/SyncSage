@@ -10,6 +10,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -248,6 +249,25 @@ def test_health_and_ready_identify_the_pod(tmp_path: Path) -> None:
     assert body["knowledge_base"] == config.knowledge_base_id
 
 
+def test_indexer_coordinator_does_not_duplicate_the_persisted_graph(tmp_path: Path) -> None:
+    from pheasant.sync.engine import SyncEngine
+
+    config = _config(tmp_path, state_name="coordinator-graph", role="indexer")
+    writer = SyncEngine(config)
+    try:
+        writer.sync_source("src0", "full")
+        persisted_nodes = writer.graph_builder.graph.number_of_nodes()
+    finally:
+        writer.close()
+
+    assert persisted_nodes > 1
+    app = create_app(config, role="indexer")
+    assert app.state.engine._loads_persisted_graph is False
+    assert app.state.engine.graph_builder.graph.number_of_nodes() == 1
+    assert app.state.engine.vectors is None
+    assert app.state.engine.extractor is None
+
+
 def test_ready_reports_503_when_the_state_store_is_unreachable(tmp_path: Path) -> None:
     """Readiness takes a pod out of the Service; liveness restarts it.
 
@@ -342,6 +362,22 @@ def test_an_orchestrated_indexer_defers_startup_to_leader_promotion(
     assert not called.is_set()
 
 
+def test_durable_backlog_takes_priority_over_startup_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pheasant.cli import _durable_backlog_depth
+    from pheasant.sync.queue import IndexTask, queue_from_config
+
+    config = _config(tmp_path, state_name="backlog-first", role="indexer", queue=True)
+    app = create_app(config, role="indexer")
+    queue = queue_from_config(config, app.state.state)
+    assert queue is not None
+    queue.publish(IndexTask(id="operator-task", source_id="src0"))
+    assert _durable_backlog_depth(config, app.state.state) == 1
+    assert queue.depth()[PENDING] == 1
+    queue.close()
+
+
 def test_the_api_role_defers_repository_clone_to_the_indexer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -396,6 +432,25 @@ def test_the_api_role_deduplicates_a_double_click(tmp_path: Path) -> None:
     assert first["queued_tasks"], "nothing was published"
     assert first["queued_tasks"] == second["queued_tasks"]
     assert LocalQueue(client.app.state.engine.state).depth()[PENDING] == 1
+
+
+def test_api_source_removal_is_an_ordered_writer_task(tmp_path: Path) -> None:
+    config = _config(tmp_path, state_name="api-remove", role="api", queue=True)
+    client = TestClient(create_app(config, role="api"))
+
+    response = client.delete("/sources/src0")
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["status"] == "removal_queued"
+    assert body["queued_tasks"]
+    row = client.app.state.state.get_source("src0")
+    assert row is not None
+    assert int(row["enabled"]) == 0
+    queue = LocalQueue(client.app.state.state)
+    task = queue.claim("test-control-writer")
+    assert task is not None
+    assert task.payload["operation"] == "delete_source"
 
 
 def test_sync_all_includes_a_source_registered_only_in_state(tmp_path: Path) -> None:
@@ -592,6 +647,37 @@ def test_no_drainer_is_built_for_a_role_that_does_not_drain(tmp_path: Path) -> N
     for role in ("all", "api", "worker"):
         assert _queue_drainer(config, "pheasant.yaml", resolve_role(config, role)) is None
     assert _queue_drainer(config, "pheasant.yaml", resolve_role(config, "indexer")) is not None
+
+
+def test_queue_drainer_parent_never_loads_the_worker_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pheasant.cli import _QueueDrainer
+
+    captured: dict[str, Any] = {}
+
+    class Coordinator:
+        state = object()
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    def fake_engine(_path: Path, **kwargs: Any) -> Coordinator:
+        captured.update(kwargs)
+        return Coordinator()
+
+    monkeypatch.setattr("pheasant.cli._engine", fake_engine)
+    monkeypatch.setattr("pheasant.sync.queue.queue_from_config", lambda *_args: None)
+    drainer = _QueueDrainer(SimpleNamespace(), "pheasant.yaml")
+    drainer._stop = threading.Event()
+
+    drainer._run()
+
+    assert captured == {
+        "load_persisted_graph": False,
+        "initialize_indexing_components": False,
+    }
 
 
 # --------------------------------------------------------------------------

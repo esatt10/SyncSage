@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -7,7 +8,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import yaml
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -792,7 +793,17 @@ def create_app(
     state = StateStore.from_config(config, paths.sqlite)
     state.migrate()
     SourceRegistry(config, state).initialize()
-    engine = SyncEngine(config, paths, state)
+    # The fleet indexer is a coordinator: each sync runs in an isolated child
+    # that owns the graph commit. Loading the same multi-gigabyte graph in the
+    # parent doubles peak RSS for no serving benefit. API/all roles still load
+    # it because they answer graph queries.
+    engine = SyncEngine(
+        config,
+        paths,
+        state,
+        load_persisted_graph=role_policy.name != "indexer",
+        initialize_indexing_components=role_policy.name != "indexer",
+    )
     search = HybridSearch(
         SearchStore(state),
         vector=engine.vector_searcher(),
@@ -807,7 +818,7 @@ def create_app(
     # manager: FastMCP's streamable-http app is useless without its own
     # lifespan running ("Task group is not initialized"), and a plain
     # app.mount() does not run a sub-app's lifespan.
-    mcp_asgi_app = _mcp_asgi_app(config)
+    mcp_asgi_app = _mcp_asgi_app(config) if role_policy.serves_ui else None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -872,7 +883,8 @@ def create_app(
             if warm():
                 logger.info("Agent workflow ready (langgraph imported and graph compiled)")
 
-        threading.Thread(target=_warm_workflows, name="pheasant-warm", daemon=True).start()
+        if role_policy.serves_ui:
+            threading.Thread(target=_warm_workflows, name="pheasant-warm", daemon=True).start()
         try:
             if mcp_asgi_app is None:
                 yield
@@ -1416,17 +1428,29 @@ def create_app(
             updated = _source_from_payload(_source_payload(req, resolved, existing=source))
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=400, detail=f"Invalid source: {exc}") from exc
-        engine.graph_builder.remove_source_content(source_id)
-        engine.manifests.delete(source_id)
-        state.delete_source_artifacts(source_id)
-        SourceRegistry(config, state).register_source(updated)
         config.sources = [s for s in config.sources if s.name != source_id]
         config.sources.append(updated)
-        engine.graph_store.save(config.knowledge_base_id, engine.graph_builder.graph)
+        queued: list[str] = []
+        if not role_policy.is_default and config.sync.queue.enabled:
+            # The API/indexer coordinator graph mount is read-only or not
+            # loaded. Carry the replacement config with the durable operation
+            # so a fresh child does not fall back to stale static YAML.
+            SourceRegistry(config, state).register_source(updated)
+            queued = _publish_background_sync(
+                [source_id],
+                "incremental",
+                task_payload={
+                    "operation": "replace_source",
+                    "source": updated.model_dump(mode="json"),
+                },
+            )
+        else:
+            engine.replace_source(updated.model_dump(mode="json"))
         audit(source_id, "update_source", {"source": updated.model_dump(mode="json")})
         return {
-            "status": "updated",
+            "status": "update_queued" if queued else "updated",
             "source": updated.model_dump(mode="json"),
+            "queued_tasks": queued,
             "config_update_required": True,
         }
 
@@ -1445,13 +1469,26 @@ def create_app(
     def remove_source(source_id: str) -> dict:
         if not state.get_source(source_id):
             raise HTTPException(status_code=404, detail=f"Unknown source: {source_id}")
-        engine.graph_builder.remove_source_content(source_id)
-        engine.graph_store.save(config.knowledge_base_id, engine.graph_builder.graph)
-        engine.manifests.delete(source_id)
-        state.delete_source(source_id)
+        queued: list[str] = []
+        if not role_policy.is_default and config.sync.queue.enabled:
+            # Disable immediately so no scheduler can enqueue more work while
+            # the ordered writer task removes the published generation.
+            state.set_source_enabled(source_id, False, "removal_queued")
+            queued = _publish_background_sync(
+                [source_id],
+                "incremental",
+                task_payload={"operation": "delete_source"},
+            )
+        else:
+            engine.remove_source(source_id)
         config.sources = [s for s in config.sources if s.name != source_id]
         audit(source_id, "remove_source")
-        return {"status": "removed", "source_name": source_id}
+        return {
+            "status": "removal_queued" if queued else "removed",
+            "source_name": source_id,
+            "queued_tasks": queued,
+            "config_update_required": True,
+        }
 
     @app.post("/sources/{source_id}/promote")
     def promote_source(source_id: str, req: PromoteSourceRequest | None = None) -> dict:
@@ -1669,7 +1706,12 @@ def create_app(
         ).start()
         return job.id, []
 
-    def _publish_background_sync(names: list[str], mode: str) -> list[str]:
+    def _publish_background_sync(
+        names: list[str],
+        mode: str,
+        *,
+        task_payload: dict[str, Any] | None = None,
+    ) -> list[str]:
         """Hand the work to an indexer instead of running it here.
 
         This is what the ``api`` role *is*. Three api replicas that each
@@ -1697,22 +1739,29 @@ def create_app(
         published: list[str] = []
         try:
             for name in names:
+                payload = {
+                    "max_depth": None,
+                    "full_scan": False,
+                    **dict(task_payload or {}),
+                }
                 digest = hashlib.sha256(
-                    f"{config.knowledge_base_id}\0{name}\0{mode}".encode()
+                    (
+                        f"{config.knowledge_base_id}\0{name}\0{mode}\0"
+                        + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                    ).encode()
                 ).hexdigest()[:24]
                 task = IndexTask(
                     id=f"idx-{digest}",
                     source_id=name,
                     mode=str(mode),
-                    payload={"max_depth": None, "full_scan": False},
+                    payload=payload,
                     max_attempts=max(1, int(config.sync.queue.max_attempts or 1)),
                 )
-                try:
-                    queue.publish(task)
-                    published.append(task.id)
-                except Exception as exc:  # noqa: BLE001 - already queued is not an error
-                    logger.debug("Index task for %s already queued (%s)", name, exc)
-                    published.append(task.id)
+                # A broker failure is not a duplicate and must reach the API
+                # caller. Pretending this publish succeeded creates a job that
+                # remains "running" forever with no message behind it.
+                queue.publish(task)
+                published.append(task.id)
         finally:
             queue.close()
         return published

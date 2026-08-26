@@ -259,8 +259,14 @@ thousands of files to prepare. Scale from both signals.
 
 ```promql
 (max(pheasant_index_queue_depth) or vector(0))
+  + (max(pheasant_index_inflight) or vector(0))
   + ceil((max(pheasant_index_preparation_backlog) or vector(0)) / 500)
 ```
+
+The in-flight term is required for scale-to-zero. Pending depth drops as soon
+as an indexer claims a source; without the claimed-work signal the scaler can
+remove every worker before preparation starts and strand an otherwise healthy
+task until redelivery.
 
 `deploy/kubernetes/scaled/worker-hpa.yaml` ships both a KEDA `ScaledObject`
 (preferred — reads Prometheus directly and can scale to **zero**, which

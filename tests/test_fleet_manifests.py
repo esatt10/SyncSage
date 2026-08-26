@@ -370,11 +370,13 @@ def test_the_worker_autoscaler_reads_source_and_file_backlog(scaled: list[dict[s
 
     metrics.register_default_metrics("test")
     assert "pheasant_index_queue_depth" in metrics.REGISTRY.render()
+    assert "pheasant_index_inflight" in metrics.REGISTRY.render()
     assert "pheasant_index_preparation_backlog" in metrics.REGISTRY.render()
 
     keda = next(doc for doc in _by_kind(scaled, "ScaledObject"))
     assert keda["spec"]["scaleTargetRef"]["name"] == "pheasant-worker"
     assert "pheasant_index_queue_depth" in keda["spec"]["triggers"][0]["metadata"]["query"]
+    assert "pheasant_index_inflight" in keda["spec"]["triggers"][0]["metadata"]["query"]
     assert "pheasant_index_preparation_backlog" in keda["spec"]["triggers"][0]["metadata"]["query"]
     assert keda["spec"]["minReplicaCount"] == 0, "an idle fleet should not pay for workers"
 
@@ -387,6 +389,7 @@ def test_the_worker_autoscaler_reads_source_and_file_backlog(scaled: list[dict[s
     external_names = {entry["external"]["metric"]["name"] for entry in external}
     assert external_names == {
         "pheasant_index_queue_depth",
+        "pheasant_index_inflight",
         "pheasant_index_preparation_backlog",
     }
 
@@ -622,10 +625,21 @@ def test_the_three_compose_profiles_cover_small_advanced_and_fleet() -> None:
         assert config.assistant.model == "gpt-5.6-luna"
         assert config.assistant.workflow == "agentic"
         assert config.search.default_mode == "hybrid"
-        assert config.assistant.retrieval.retrieval_modes == ["hybrid", "graph"]
         assert config.assistant.retrieval.expand_graph is True
         assert config.server.mcp.enabled is True
-        assert any(source.type.value == "memory" for source in config.sources)
+
+    assert advanced.assistant.retrieval.retrieval_modes == ["hybrid", "graph"]
+    assert fleet.assistant.retrieval.retrieval_modes == [
+        "text",
+        "vector",
+        "graph",
+        "hybrid",
+    ]
+
+    assert any(source.type.value == "memory" for source in advanced.sources)
+    assert not any(source.type.value == "memory" for source in fleet.sources)
+    assert fleet.ingestion.extractor.provider == "auto"
+    assert fleet.search.embeddings.rate_limit_max_wait_seconds == 900.0
 
     assert advanced.storage.backend == "sqlite"
     assert advanced.sync.queue.enabled is False

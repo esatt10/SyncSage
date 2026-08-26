@@ -368,6 +368,11 @@ class EmbeddingsSettings(ModelMixin):
     #: malformed request is never retried.
     max_retries: int = 4
     retry_backoff_seconds: float = 1.0
+    #: A 429 during bulk indexing is provider flow control, not a failed
+    #: source.  Keep retrying within this cumulative wait budget before the
+    #: error is allowed to escape and let the durable source queue retry it.
+    #: Zero restores the ordinary ``max_retries`` behavior.
+    rate_limit_max_wait_seconds: float = 300.0
 
 
 @dataclass

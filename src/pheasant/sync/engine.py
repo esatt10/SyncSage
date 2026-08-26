@@ -21,7 +21,7 @@ from pheasant.capacity import project as project_capacity
 from pheasant.config.schema import FILESYSTEM_SOURCE_TYPES, PheasantConfig, SourceConfig
 from pheasant.graph.builder import GraphBuilder
 from pheasant.ingestion.captioner import captioner_from_config, source_includes_images
-from pheasant.ingestion.content_types import TEXT_EXTENSIONS
+from pheasant.ingestion.content_types import DOCUMENT_EXTENSIONS, TEXT_EXTENSIONS
 from pheasant.ingestion.extractor import extractor_from_config, source_includes_documents
 from pheasant.ingestion.pipeline import (
     ParsedArtifact,
@@ -70,6 +70,7 @@ logger = logging.getLogger(__name__)
 
 SyncMode = Literal["incremental", "full", "validate_only", "repair"]
 SYNC_MODES = {"incremental", "full", "validate_only", "repair"}
+FULL_RESUME_SCOPE = "source:{name}:full_sync_phase"
 
 #: ``(phase, current, total, detail)``, optionally followed by a ``meta``
 #: mapping (Phase 35.1) carrying ``source`` plus whatever counters the
@@ -321,6 +322,10 @@ class SyncEngine:
         paths: StatePaths | None = None,
         state: StateStore | None = None,
         lease: EngineLease | None = None,
+        *,
+        load_persisted_graph: bool = True,
+        defer_persisted_graph_load: bool = False,
+        initialize_indexing_components: bool = True,
     ):
         self.config = config
         self.paths = paths or StatePaths.from_config(config)
@@ -340,29 +345,37 @@ class SyncEngine:
         self.manifests = ManifestStore(self.paths.manifests, self.state)
         self.graph_store = GraphStore(self.paths.graphs)
         self.graph_builder = GraphBuilder(config)
-        existing = self.graph_store.load(config.knowledge_base_id)
-        if len(existing):
-            self.graph_builder.graph = existing
+        self._loads_persisted_graph = bool(load_persisted_graph)
+        self._graph_loaded = not self._loads_persisted_graph
+        if self._loads_persisted_graph and not defer_persisted_graph_load:
+            existing = self.graph_store.load(config.knowledge_base_id)
+            if len(existing):
+                self.graph_builder.graph = existing
+            self._graph_loaded = True
         # Optional embed-on-sync (Synapse 21.4): None when
         # search.embeddings.enabled is false, leaving sync byte-identical
         # to pre-21.4 behavior (no vector dir, no embedder calls).
-        self.vectors = vector_indexer_from_config(config)
+        self.vectors = (
+            vector_indexer_from_config(config) if initialize_indexing_components else None
+        )
         # Multi-modal image ingestion (Synapse 25.4 session A): None unless a
         # source's include globs admit image extensions, so a text-only region
         # is byte-identical to pre-25.4 behavior (no captioner built, no
         # captioning network call possible). Default provider is the offline
         # deterministic stub.
-        self.captioner = captioner_from_config(config)
+        self.captioner = captioner_from_config(config) if initialize_indexing_components else None
         # Multi-modal audio ingestion (Synapse 25.4 session B): None unless a
         # source's include globs admit audio extensions — same opt-in,
         # zero-network-when-absent contract as the image captioner above.
-        self.transcriber = transcriber_from_config(config)
+        self.transcriber = (
+            transcriber_from_config(config) if initialize_indexing_components else None
+        )
         # Document text extraction (PDF/DOCX, optionally HTML): None unless a
         # source's include globs admit a document extension (or html_text is
         # on), so a text-only region behaves exactly as it did when .pdf/.docx
         # were accepted and then silently produced no text. Fully offline and
         # deterministic — no model, no network on any provider.
-        self.extractor = extractor_from_config(config)
+        self.extractor = extractor_from_config(config) if initialize_indexing_components else None
         # Synapse 21.5: contract publisher + NDJSON event stream. The event
         # log is always written (local, useful standalone); contract
         # publication + the router webhook are gated by synapse.publish /
@@ -412,11 +425,18 @@ class SyncEngine:
 
         if not self._graph_dirty:
             return False
-        if source_name and manifest is not None:
-            self.manifests.save(source_name, manifest)
         self.flush_node_index()
         started = time.monotonic()
         self.graph_store.save(self.config.knowledge_base_id, self.graph_builder.graph)
+        # Publish the content-addressed graph generation before advancing the
+        # source manifest.  A crash in between causes harmless reprocessing;
+        # the inverse order could make an incremental scan skip content whose
+        # graph generation was never published.
+        if source_name and manifest is not None:
+            self.manifests.save(source_name, manifest)
+            resume_scope = FULL_RESUME_SCOPE.format(name=source_name)
+            if self.state.get_fingerprint(resume_scope) in {"starting", "cleared"}:
+                self.state.set_fingerprint(resume_scope, "checkpointed", utc_now())
         self._last_save_seconds = time.monotonic() - started
         self._graph_dirty = False
         self._last_checkpoint = time.monotonic()
@@ -432,16 +452,45 @@ class SyncEngine:
         one assignment.
         """
 
+        if not self._loads_persisted_graph:
+            return 0
         loaded = self.graph_store.load(self.config.knowledge_base_id)
         if not len(loaded):
             return 0
         self.graph_builder.graph = loaded
+        self._graph_loaded = True
         # The index on disk was written by the worker for this same graph, so
         # nothing is owed; drop the delta the load itself generated.
         loaded.take_index_delta()
         self.node_index._populated = False
         logger.info("Reloaded graph from state: %d nodes", loaded.number_of_nodes())
         return loaded.number_of_nodes()
+
+    def _ensure_persisted_graph_loaded(self) -> None:
+        """Materialize the published graph only when a task will mutate it.
+
+        Incremental crawls can decide that every content-addressed item is
+        unchanged from the manifest without consulting the graph.  Deferring
+        this load turns that common path from a whole-corpus deserialize into
+        a directory/metadata delta scan.
+        """
+
+        if self._graph_loaded or not self._loads_persisted_graph:
+            return
+        with self._sync_mutex:
+            if self._graph_loaded:
+                return
+            loaded = self.graph_store.load(self.config.knowledge_base_id)
+            if len(loaded):
+                self.graph_builder.graph = loaded
+                loaded.take_index_delta()
+            self._graph_loaded = True
+
+    def _graph_counts(self) -> tuple[int, int]:
+        if self._graph_loaded or not self._loads_persisted_graph:
+            graph = self.graph_builder.graph
+            return graph.number_of_nodes(), graph.number_of_edges()
+        return self.graph_store.counts(self.config.knowledge_base_id)
 
     #: Above this many changed nodes, rebuild the FTS index wholesale instead
     #: of deleting each stale row individually. `node_id` on graph_nodes_fts
@@ -489,11 +538,13 @@ class SyncEngine:
         Cheap when it already exists: one COUNT.
         """
 
+        if self.node_index.count() > 0:
+            if self._graph_loaded:
+                self.flush_node_index()
+            return 0
+        self._ensure_persisted_graph_loaded()
         graph = self.graph_builder.graph
         if graph.number_of_nodes() <= 1:
-            return 0
-        if self.node_index.count() > 0:
-            self.flush_node_index()
             return 0
         return self.rebuild_node_index()
 
@@ -1034,7 +1085,13 @@ class SyncEngine:
 
         if pending:
             tasks = [
-                task_payload(source, item, payload, git_metadata)
+                task_payload(
+                    source,
+                    item,
+                    payload,
+                    git_metadata,
+                    self.config.ingestion.extractor,
+                )
                 for _position, item, payload in pending
             ]
             timeout = float(self.config.sync.concurrency.remote_worker_timeout_seconds or 120)
@@ -1110,7 +1167,24 @@ class SyncEngine:
         )
         process_safe = requested_executor == "process" and plain_text_source
         remote_urls = list(self.config.sync.concurrency.remote_worker_urls or [])
-        remote_safe = requested_executor == "remote" and plain_text_source and bool(remote_urls)
+        if requested_executor == "remote":
+            from pheasant.sync.remote_worker import _remote_preparation_path
+
+            remote_content_safe = (
+                connector.connector_type == "filesystem"
+                and mode != "repair"
+                and not bool(getattr(source.taxonomy, "enabled", False))
+                and all(
+                    _remote_preparation_path(
+                        item.relative_path,
+                        html_text=bool(self.config.ingestion.extractor.html_text),
+                    )
+                    for item in items
+                )
+            )
+        else:
+            remote_content_safe = False
+        remote_safe = requested_executor == "remote" and remote_content_safe and bool(remote_urls)
         remote_token = ""
         if remote_safe:
             from pheasant.sync.remote_worker import configured_token
@@ -1128,8 +1202,8 @@ class SyncEngine:
             )
         elif requested_executor == "remote" and not remote_safe:
             logger.warning(
-                "Source %s cannot use remote workers (requires URLs and plain text without "
-                "taxonomy/repair); using thread workers",
+                "Source %s cannot use remote workers (requires URLs and supported text/document "
+                "content without taxonomy/repair); using thread workers",
                 source.name,
             )
         if remote_safe:
@@ -1221,9 +1295,34 @@ class SyncEngine:
         # allocations, which on a 250k-file source is millions of tuples for a
         # list that never changes. Identical output, same discovery order.
         numbered = list(enumerate(items, start=1))
-        batches = [
-            numbered[start : start + batch_size] for start in range(0, len(numbered), batch_size)
-        ]
+        # A count-only batch is unsafe for documents: sixteen 25 MiB PDFs
+        # become >500 MiB once the coordinator and worker each hold bytes plus
+        # base64/JSON copies.  Keep ordinary source-code batching fast, while
+        # splitting large payloads before they cross the process boundary.
+        batch_byte_budget = 16 * 1024 * 1024
+        batches: list[list[tuple[int, ConnectorItem]]] = []
+        current_batch: list[tuple[int, ConnectorItem]] = []
+        current_bytes = 0
+        for numbered_item in numbered:
+            item = numbered_item[1]
+            estimated_bytes = max(1, int(item.size_bytes or 0))
+            is_document = Path(item.relative_path).suffix.lower() in DOCUMENT_EXTENSIONS
+            would_overflow = current_batch and current_bytes + estimated_bytes > batch_byte_budget
+            document_boundary = current_batch and is_document
+            if len(current_batch) >= batch_size or would_overflow or document_boundary:
+                batches.append(current_batch)
+                current_batch = []
+                current_bytes = 0
+            current_batch.append(numbered_item)
+            current_bytes += estimated_bytes
+            # A document is its own task envelope.  This bounds duplicate byte
+            # copies and lets another replica start work immediately.
+            if is_document:
+                batches.append(current_batch)
+                current_batch = []
+                current_bytes = 0
+        if current_batch:
+            batches.append(current_batch)
         pool = WorkerPool(
             remote_urls,
             remote_token,
@@ -1232,8 +1331,9 @@ class SyncEngine:
         )
         try:
             pool.publish_health()
+            remote_workers = max(1, min(workers, len(batches), len(remote_urls) * 2))
             with ThreadPoolExecutor(
-                max_workers=max(1, min(workers, len(batches))),
+                max_workers=remote_workers,
                 thread_name_prefix=f"pheasant-remote-{source.name}",
             ) as executor:
                 pending: deque[Future[list[_PreparedItem]]] = deque()
@@ -1251,7 +1351,7 @@ class SyncEngine:
                         batch,
                     )
 
-                for _ in range(min(len(batches), max(1, workers) * 2)):
+                for _ in range(min(len(batches), remote_workers * 2)):
                     try:
                         pending.append(submit(next(iterator)))
                     except StopIteration:
@@ -1427,15 +1527,132 @@ class SyncEngine:
                     embedded_chunks,
                     f"embedded {embedded_chunks} changed chunk(s)",
                 )
-            report("saving", total_items, total_items, "writing the graph and index")
+            graph_changed = bool(indexed or mode == "full")
+            report(
+                "saving",
+                total_items,
+                total_items,
+                "writing the graph and index" if graph_changed else "recording source checkpoint",
+            )
             manifest["last_indexed_at"] = utc_now()
             manifest["connector"] = {"type": connector.connector_type}
+            if graph_changed:
+                self.flush_node_index()
+                self.graph_store.save(self.config.knowledge_base_id, self.graph_builder.graph)
+                self._graph_dirty = False
+                self._last_checkpoint = time.monotonic()
+            else:
+                logger.debug("Skipping unchanged graph save for source %s", source.name)
+            # See checkpoint_graph: manifests may lag a published generation,
+            # but must never claim a graph generation that did not commit.
             self.manifests.save(source.name, manifest)
-            self.flush_node_index()
-            self.graph_store.save(self.config.knowledge_base_id, self.graph_builder.graph)
-            self._graph_dirty = False
-            self._last_checkpoint = time.monotonic()
             return pruned_vectors
+
+    def apply_index_task(self, task: Any, *, on_progress: ProgressHook | None = None) -> SyncResult:
+        """Apply one durable data-plane or control-plane queue task.
+
+        Fleet API replicas mount graph state read-only and intentionally never
+        become writers.  Source replacement/removal therefore travels over
+        the same ordered, retryable queue as indexing and is committed by the
+        isolated single-writer child.
+        """
+
+        operation = str((getattr(task, "payload", None) or {}).get("operation") or "")
+        if operation == "delete_source":
+            return self.remove_source(str(task.source_id), on_progress=on_progress)
+        if operation == "replace_source":
+            payload = (getattr(task, "payload", None) or {}).get("source")
+            if not isinstance(payload, dict):
+                raise ValueError("replace_source task is missing its source configuration")
+            return self.replace_source(payload, on_progress=on_progress)
+        requested_mode = str(task.mode)
+        resume_full = bool(
+            requested_mode == "full"
+            and int(getattr(task, "attempts", 0) or 0) > 1
+            and self.state.get_fingerprint(FULL_RESUME_SCOPE.format(name=task.source_id))
+            == "checkpointed"
+        )
+        if resume_full:
+            logger.info(
+                "Resuming interrupted full sync for %s as a content-addressed delta pass",
+                task.source_id,
+            )
+        result = self.sync_source(
+            str(task.source_id),
+            "incremental" if resume_full else requested_mode,
+            max_depth=task.max_depth,
+            full_scan=task.full_scan,
+            on_progress=on_progress,
+            _resume_interrupted_full=resume_full,
+        )
+        if resume_full:
+            self.state.execute(
+                "DELETE FROM sync_fingerprints WHERE scope=?",
+                (FULL_RESUME_SCOPE.format(name=task.source_id),),
+            )
+            return replace(
+                result,
+                details={
+                    **result.details,
+                    "requested_mode": "full",
+                    "resumed_interrupted_full": True,
+                },
+            )
+        return result
+
+    def remove_source(
+        self, source_name: str, *, on_progress: ProgressHook | None = None
+    ) -> SyncResult:
+        """Remove one source through the graph's single-writer publication path."""
+
+        report = _progress_reporter(on_progress, source_name)
+        report("claimed", 0, 1, f"removing {source_name}")
+        with self._source_write_lock(source_name):
+            with self._sync_mutex:
+                self._ensure_persisted_graph_loaded()
+                self.graph_builder.remove_source_content(source_name)
+                self.flush_node_index()
+                # Publish graph removal before deleting the registry entry. If
+                # killed here, redelivery is idempotent and completes cleanup.
+                self.graph_store.save(
+                    self.config.knowledge_base_id,
+                    self.graph_builder.graph,
+                )
+                self.manifests.delete(source_name)
+                self.state.delete_source(source_name)
+                self.config.sources = [s for s in self.config.sources if s.name != source_name]
+        nodes, edges = self._graph_counts()
+        report("saving", 1, 1, f"removed {source_name}")
+        return SyncResult(source_name, 0, 0, nodes, edges, "removed")
+
+    def replace_source(
+        self,
+        source_payload: dict[str, Any],
+        *,
+        on_progress: ProgressHook | None = None,
+    ) -> SyncResult:
+        """Atomically clear old indexed content and install a runtime source config."""
+
+        updated = PheasantConfig.model_validate({"sources": [source_payload]}).sources[0]
+        report = _progress_reporter(on_progress, updated.name)
+        report("claimed", 0, 1, f"updating {updated.name}")
+        with self._source_write_lock(updated.name):
+            with self._sync_mutex:
+                self._ensure_persisted_graph_loaded()
+                self.graph_builder.remove_source_content(updated.name)
+                self.flush_node_index()
+                self.graph_store.save(
+                    self.config.knowledge_base_id,
+                    self.graph_builder.graph,
+                )
+                self.manifests.delete(updated.name)
+                self.state.delete_source_artifacts(updated.name)
+                SourceRegistry(self.config, self.state).register_source(updated)
+                self.config.sources = [s for s in self.config.sources if s.name != updated.name]
+                self.config.sources.append(updated)
+        nodes, edges = self._graph_counts()
+        report("saving", 1, 1, f"updated {updated.name}")
+        return SyncResult(updated.name, 0, 0, nodes, edges, "updated")
 
     def sync_source(
         self,
@@ -1445,6 +1662,7 @@ class SyncEngine:
         max_depth: int | None = None,
         full_scan: bool = False,
         on_progress: ProgressHook | None = None,
+        _resume_interrupted_full: bool = False,
     ) -> SyncResult:
         """Sync one source.
 
@@ -1474,7 +1692,7 @@ class SyncEngine:
         fingerprint = source_fingerprint(source)
         previous_fingerprint = self.state.get_fingerprint(SOURCE_SCOPE.format(name=source.name))
         config_changed = previous_fingerprint is not None and previous_fingerprint != fingerprint
-        if config_changed and mode in {"incremental", "repair"}:
+        if config_changed and mode in {"incremental", "repair"} and not _resume_interrupted_full:
             logger.info(
                 "Source %s config changed since it was indexed (globs/chunking) — "
                 "escalating %s sync to full",
@@ -1507,12 +1725,13 @@ class SyncEngine:
                 health = connector.validate()
                 status = "validated" if health.ok else health.status
                 self.state.mark_source_status(source.name, status)
+                graph_nodes, graph_edges = self._graph_counts()
                 return SyncResult(
                     source.name,
                     0,
                     0,
-                    self.graph_builder.graph.number_of_nodes(),
-                    self.graph_builder.graph.number_of_edges(),
+                    graph_nodes,
+                    graph_edges,
                     status,
                     {
                         "connector_type": connector.connector_type,
@@ -1537,12 +1756,13 @@ class SyncEngine:
             # zero. (validate() only runs in validate_only mode.)
             if source.type in FILESYSTEM_SOURCE_TYPES and not source.path.exists():
                 self.state.mark_source_status(source.name, "path_missing")
+                graph_nodes, graph_edges = self._graph_counts()
                 return SyncResult(
                     source.name,
                     0,
                     0,
-                    self.graph_builder.graph.number_of_nodes(),
-                    self.graph_builder.graph.number_of_edges(),
+                    graph_nodes,
+                    graph_edges,
                     "path_missing",
                     {
                         "connector_type": connector.connector_type,
@@ -1562,12 +1782,13 @@ class SyncEngine:
                 # non-deterministic, and the operator needs to make a choice
                 # (narrow it, or ask for it explicitly with full_scan).
                 self.state.mark_source_status(source.name, "limit_exceeded")
+                graph_nodes, graph_edges = self._graph_counts()
                 return SyncResult(
                     source.name,
                     0,
                     0,
-                    self.graph_builder.graph.number_of_nodes(),
-                    self.graph_builder.graph.number_of_edges(),
+                    graph_nodes,
+                    graph_edges,
                     "limit_exceeded",
                     {
                         "connector_type": connector.connector_type,
@@ -1585,8 +1806,12 @@ class SyncEngine:
             cleared = mode == "full"
             if cleared:
                 with self._sync_mutex:
+                    resume_scope = FULL_RESUME_SCOPE.format(name=source.name)
+                    self.state.set_fingerprint(resume_scope, "starting", utc_now())
+                    self._ensure_persisted_graph_loaded()
                     self.state.delete_source_artifacts(source.name)
                     self.graph_builder.remove_source_content(source.name)
+                    self.state.set_fingerprint(resume_scope, "cleared", utc_now())
                 manifest = {"source_id": source.name, "artifacts": {}}
                 artifacts = manifest["artifacts"]
             indexed = 0
@@ -1695,6 +1920,7 @@ class SyncEngine:
                     for chunk in parsed.chunks
                 ]
                 with self._sync_mutex:
+                    self._ensure_persisted_graph_loaded()
                     self.state.replace_artifact_chunks(artifact_row, chunk_rows, fresh=cleared)
                     if self.vectors is not None:
                         # Chunk ids are content-addressed (text_hash in the id),
@@ -1772,11 +1998,23 @@ class SyncEngine:
             self.state.set_fingerprint(
                 SOURCE_SCOPE.format(name=source.name), fingerprint, utc_now()
             )
+            if mode == "full":
+                self.state.execute(
+                    "DELETE FROM sync_fingerprints WHERE scope=?",
+                    (FULL_RESUME_SCOPE.format(name=source.name),),
+                )
             # Synapse 21.6A: compressed timestamped graph snapshots + retention.
             # Additive history beside graph.latest.json, throttled by the
             # configured interval and bounded by max_state_size_gb. Fail-soft so
             # a snapshot/retention hiccup never fails the sync.
-            self._snapshot_after_sync()
+            if indexed or mode == "full":
+                report(
+                    "snapshotting",
+                    total_items,
+                    total_items,
+                    "preserving the published graph generation",
+                )
+                self._snapshot_after_sync()
             now = utc_now()
             cursor, high_watermark = connector.checkpoint_from_items(items)
             high_watermark.update({"indexed_artifacts": indexed, "skipped_artifacts": skipped})
@@ -1818,12 +2056,13 @@ class SyncEngine:
             capacity = self._graph_capacity_notice()
             if capacity:
                 details_extra = {**details_extra, "capacity": capacity}
+            graph_nodes, graph_edges = self._graph_counts()
             return SyncResult(
                 source.name,
                 indexed,
                 skipped,
-                self.graph_builder.graph.number_of_nodes(),
-                self.graph_builder.graph.number_of_edges(),
+                graph_nodes,
+                graph_edges,
                 "healthy",
                 {
                     "connector_type": connector.connector_type,
@@ -1881,7 +2120,7 @@ class SyncEngine:
         limit = getattr(self.config.graph, "max_nodes", None)
         if not limit:
             return None
-        nodes = self.graph_builder.graph.number_of_nodes()
+        nodes, _edges = self._graph_counts()
         if nodes <= int(limit):
             return None
         # ~2.4 KB of process RSS per node, flat across four measured scales —
@@ -1918,9 +2157,10 @@ class SyncEngine:
 
     @property
     def stats(self) -> dict[str, int]:
+        nodes, edges = self._graph_counts()
         return {
-            "node_count": self.graph_builder.graph.number_of_nodes(),
-            "edge_count": self.graph_builder.graph.number_of_edges(),
+            "node_count": nodes,
+            "edge_count": edges,
             "artifact_count": int(self.state.rows("SELECT COUNT(*) AS c FROM artifacts")[0]["c"]),
             "chunk_count": int(self.state.rows("SELECT COUNT(*) AS c FROM chunks")[0]["c"]),
         }
@@ -1964,7 +2204,7 @@ class SyncEngine:
         try:
             now = utc_now()
             if self._snapshot_due(kb_id, now, storage.graph_snapshot_interval_seconds):
-                self.graph_store.write_snapshot(kb_id, self.graph_builder.graph, now)
+                self.graph_store.snapshot_current(kb_id, now)
             max_bytes = int(float(storage.max_state_size_gb) * 1024**3)
             self.graph_store.enforce_retention(kb_id, max_bytes)
         except Exception as exc:  # noqa: BLE001 - snapshots must not fail sync
@@ -2239,6 +2479,7 @@ class SyncEngine:
         # A node missing from the graph is as broken as a missing chunk row —
         # it is the case an interrupted sync leaves behind, and it is what
         # makes "repair" cheaper than "index it all again".
+        self._ensure_persisted_graph_loaded()
         if not self.graph_builder.graph.has_node(artifact_id):
             return True
         return (

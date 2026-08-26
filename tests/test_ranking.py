@@ -107,16 +107,54 @@ def test_postgres_uses_the_rarest_terms_to_bound_the_candidate_set(monkeypatch) 
     }
     monkeypatch.setattr(
         "pheasant.search.sqlite_store._postgres_document_frequencies",
-        lambda _state, _tokens: (19_865, frequencies),
+        lambda _state, _tokens, _source=None: (19_865, frequencies),
     )
 
-    expression, params, match_tokens = _postgres_rank_expression(
-        object(), list(frequencies)
-    )
+    expression, params, match_tokens = _postgres_rank_expression(object(), list(frequencies))
 
     assert match_tokens == ["architecture", "components", "openwiki", "main"]
     assert params[:4] == match_tokens
     assert expression.count("ts_rank_cd") == len(frequencies)
+
+
+def test_postgres_rank_statistics_are_routed_to_the_requested_source(monkeypatch) -> None:
+    seen: list[str | None] = []
+
+    def frequencies(_state, _tokens, source_name=None):
+        seen.append(source_name)
+        return 10, {"needle": 1}
+
+    monkeypatch.setattr("pheasant.search.sqlite_store._postgres_document_frequencies", frequencies)
+
+    _postgres_rank_expression(object(), ["needle"], "docs")
+
+    assert seen == ["docs"]
+
+
+def test_postgres_source_filter_is_qualified_across_joined_tables() -> None:
+    class Dialect:
+        is_postgres = True
+
+    class State:
+        dialect = Dialect()
+
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        def rows(self, sql, params=()):
+            self.queries.append(sql)
+            if "FROM unnest" in sql:
+                return [{"term": term, "df": 1} for term in params[0]]
+            if "count(*) AS n" in sql:
+                return [{"n": 1}]
+            return []
+
+    state = State()
+
+    SearchStore(state).search("needle", source_name="docs")
+
+    main_query = next(sql for sql in state.queries if "ORDER BY rank_score" in sql)
+    assert "AND chunks_fts.source_id = ?" in main_query
 
 
 # -------------------------------------------------------------- name matching

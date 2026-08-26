@@ -30,8 +30,11 @@ spec:
         # Sum across replicas: the depth is a per-knowledge-base number that
         # every pod reports identically, so max() would be right too — but
         # sum/count is robust to a pod that has not scraped yet.
-        query: (max(pheasant_index_queue_depth) or vector(0)) + ceil((max(pheasant_index_preparation_backlog) or vector(0)) / 500)
-        # One worker per two queued sources. Deliberately conservative: a
+        # Include in-flight work: pending depth becomes zero as soon as the
+        # indexer claims a source, before it necessarily has a live worker.
+        # Omitting this term can strand a claimed source at scale-to-zero.
+        query: (max(pheasant_index_queue_depth) or vector(0)) + (max(pheasant_index_inflight) or vector(0)) + ceil((max(pheasant_index_preparation_backlog) or vector(0)) / 500)
+        # One worker per queued/claimed source. Deliberately conservative: a
         # source is a long task, and over-provisioning workers does not make
         # a single source index faster — only several sources at once.
         threshold: "1"
@@ -66,6 +69,13 @@ spec:
         target:
           type: AverageValue
           averageValue: "500"
+    - type: External
+      external:
+        metric:
+          name: pheasant_index_inflight
+        target:
+          type: AverageValue
+          averageValue: "1"
     # CPU as a floor, not the primary signal: it catches a fleet that is
     # saturated on files within one already-claimed source, which the queue
     # depth cannot see.

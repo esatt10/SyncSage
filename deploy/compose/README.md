@@ -8,7 +8,7 @@ stored in YAML.
 |---|---|---|---|
 | `local-small.yaml` | Local SQLite, no broker or workers | BM25/text search and extractive answers; MCP and durable memory remain enabled | Laptop, offline, small corpus |
 | `local-advanced.yaml` | Single-node SQLite | Hybrid + graph retrieval by default, LanceDB, both WASM accelerators, `text-embedding-3-small`, and the `gpt-5.6-luna` agentic workflow | One capable workstation/container |
-| `fleet.yaml` | PostgreSQL, NATS JetStream, shared durable volumes, and stateless gRPC preparation workers | Same hybrid + graph retrieval stack with aggressive concurrency limits | Multi-container, horizontally scaled ingestion |
+| `fleet.yaml` | PostgreSQL, NATS JetStream, shared durable volumes, and stateless gRPC preparation workers | Same hybrid + graph retrieval stack with adaptive concurrency; durable memory is explicitly enabled when wanted | Multi-container, horizontally scaled ingestion |
 
 `worker.yaml` is the deliberately minimal trust-boundary config for the
 fleet's stateless gRPC workers. It has no source list, database DSN, OpenAI key,
@@ -85,15 +85,24 @@ The UI is at <http://127.0.0.1:8765> and streamable HTTP MCP is at
   They do not accelerate the external embedding API. Scale workers for
   preparation and create another shard for another commit authority. Extra
   indexers for one shard are elected hot standbys, not throughput replicas.
+- PDF, DOCX and other offline document extraction is dispatched to the worker
+  tier. Each document is its own bounded task envelope, and native MuPDF work
+  is serialized within a worker process while replicas continue in parallel.
 - URL-managed repositories use the persistent `pheasant-workspace` volume by
   default. The indexer mounts it read/write so its persisted clone recipe can
   fetch and fast-forward before each sync; the API mounts it read-only. Set
   `PHEASANT_FLEET_WORKSPACE_PATH` to use a specific host directory instead.
-- The memory volume is mounted read/write by both API and indexers. Calls to
-  MCP `memory_write` (or `POST /memory`) index immediately, while watcher and
-  scheduler settings provide recovery if a write or process is interrupted.
+- The memory volume is mounted read/write by both API and indexers, but the
+  fleet does not create or schedule a memory source until `POST /memory/enable`
+  is called. Once enabled, calls to MCP `memory_write` (or `POST /memory`) index
+  immediately, while watcher and scheduler settings provide recovery if a
+  write or process is interrupted.
   Ordinary chat questions and answers are not silently recorded as memory;
   an agent must explicitly choose what to remember.
 - PostgreSQL and NATS make the source queue and manifests durable. LanceDB
   remains under the shared `/state/vectors` volume; the API reads it and the
   indexer tier writes it.
+- The API has a 3 GiB Compose limit because it owns the resident serving graph;
+  this is headroom for graph/UI traversal, not indexing capacity. Kubernetes
+  keeps the API independently replicated and CPU-autoscaled, while worker
+  scaling follows queue + in-flight + preparation backlog.

@@ -67,19 +67,24 @@ export function progressCaption(row: SourceProgress): string {
  */
 export function ProgressBar({
   fraction,
+  active = true,
   stalled = false,
   compact = false,
 }: {
   fraction: number | null;
+  active?: boolean;
   stalled?: boolean;
   compact?: boolean;
 }) {
-  const percent = fraction === null ? undefined : Math.round(fraction * 100);
+  const indeterminate = active && fraction === null;
+  const percent = indeterminate
+    ? undefined
+    : Math.round((fraction ?? 0) * 100);
   return (
     <div
       className={[
         "job__bar",
-        fraction === null ? "job__bar--indeterminate" : "",
+        indeterminate ? "job__bar--indeterminate" : "",
         stalled ? "job__bar--stalled" : "",
         compact ? "job__bar--compact" : "",
       ]
@@ -109,7 +114,12 @@ export function SourceSyncProgress({ row }: { row: SourceProgress }) {
         </span>
         {row.stalled ? <span className="badge badge--warn">stalled</span> : null}
       </div>
-      <ProgressBar fraction={row.fraction} stalled={row.stalled} compact />
+      <ProgressBar
+        fraction={row.active ? row.fraction : row.status === "succeeded" ? 1 : (row.fraction ?? 0)}
+        active={row.active}
+        stalled={row.stalled}
+        compact
+      />
       <div className="source-progress__meta muted small">{progressCaption(row)}</div>
       {row.failures.length > 0 ? (
         <ul className="source-progress__failures small">

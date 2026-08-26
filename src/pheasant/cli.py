@@ -343,6 +343,20 @@ class _OrchestrationSupervisor:
                 self._lease.release()
 
 
+def _durable_backlog_depth(cfg, state) -> int:
+    """Pending/in-flight durable work that should outrank startup scans."""
+
+    from pheasant.sync.queue import queue_from_config
+
+    queue = queue_from_config(cfg, state)
+    try:
+        depth = queue.depth() if queue is not None else {}
+    finally:
+        if queue is not None:
+            queue.close()
+    return int(depth.get("pending", 0)) + int(depth.get("inflight", 0))
+
+
 def _orchestration_supervisor(
     app_obj,
     cfg,
@@ -365,6 +379,19 @@ def _orchestration_supervisor(
         import logging
 
         from pheasant.sync.worker import WorkerBackedEngine
+
+        # Explicit durable work outranks opportunistic on-startup freshness.
+        # After a restart, scanning every repository before reclaiming a task
+        # made recovery take minutes and could repeat the very stress workload
+        # an operator was trying to resume. Watcher/scheduler beats still
+        # reconcile these sources once the backlog is gone.
+        queued = _durable_backlog_depth(cfg, app_obj.state.state)
+        if queued:
+            logging.getLogger("pheasant.cli").info(
+                "Deferring startup source reconciliation until %d durable task(s) drain",
+                queued,
+            )
+            return
 
         sources = [
             source.name
@@ -440,7 +467,14 @@ class _QueueDrainer:
         from pheasant.sync.queue import drain, owner_id, queue_from_config
 
         log = logging.getLogger("pheasant.cli")
-        engine = _engine(Path(self.config_path))
+        # This long-lived engine coordinates queue/state only. Each claimed
+        # task runs in an isolated child that owns graph and vector commits;
+        # eagerly loading the same graph here silently doubles peak RSS.
+        engine = _engine(
+            Path(self.config_path),
+            load_persisted_graph=False,
+            initialize_indexing_components=False,
+        )
         queue = queue_from_config(self.cfg, engine.state)
         if queue is None:
             log.warning("role 'indexer' has no queue configured; nothing will be drained")
@@ -486,13 +520,7 @@ class _QueueDrainer:
                         )
 
                     try:
-                        result = worker.sync_source(
-                            task.source_id,
-                            task.mode,
-                            max_depth=task.max_depth,
-                            full_scan=task.full_scan,
-                            on_progress=forward,
-                        )
+                        result = worker.apply_index_task(task, on_progress=forward)
                     except Exception as exc:
                         jobs.finish(job.id, "failed", error=str(exc))
                         raise
@@ -621,7 +649,13 @@ def _graph_refresher(cfg, engine, policy):
     return _GraphRefresher(engine, interval)
 
 
-def _engine(config_path: Path):
+def _engine(
+    config_path: Path,
+    *,
+    load_persisted_graph: bool = True,
+    defer_persisted_graph_load: bool = False,
+    initialize_indexing_components: bool = True,
+):
     from pheasant.config.loader import load_config
     from pheasant.persistence.paths import StatePaths
     from pheasant.persistence.state_store import StateStore
@@ -631,7 +665,14 @@ def _engine(config_path: Path):
     paths = StatePaths.from_config(cfg)
     paths.ensure()
     state = StateStore.from_config(cfg, paths.sqlite)
-    return SyncEngine(cfg, paths, state)
+    return SyncEngine(
+        cfg,
+        paths,
+        state,
+        load_persisted_graph=load_persisted_graph,
+        defer_persisted_graph_load=defer_persisted_graph_load,
+        initialize_indexing_components=initialize_indexing_components,
+    )
 
 
 #: Progress lines carry this marker so the parent can tell them apart from the
@@ -1013,6 +1054,8 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=argparse.SUPPRESS,
     )
+    sync_p.add_argument("--task-payload", default=None, help=argparse.SUPPRESS)
+    sync_p.add_argument("--worker-child", action="store_true", help=argparse.SUPPRESS)
     scan_p = sub.add_parser(
         "scan",
         help="estimate what a source would index — file count, size, depth options — "
@@ -1363,7 +1406,7 @@ def main(argv: list[str] | None = None) -> int:
         from pheasant.sync.locks import EngineLeaseError
 
         on_progress = _progress_emitter() if getattr(args, "progress", False) else None
-        engine = _engine(Path(args.config))
+        engine = _engine(Path(args.config), defer_persisted_graph_load=True)
         if args.wait_for_lease is not None:
             engine.lease.wait_timeout_s = max(0.0, args.wait_for_lease)
         try:
@@ -1373,24 +1416,43 @@ def main(argv: list[str] | None = None) -> int:
             # the server, which is the whole point of running sync out of
             # process.
             engine.ensure_node_index()
-            results = (
-                engine.sync_all(
-                    args.mode,
-                    max_depth=args.depth,
-                    full_scan=args.full_scan,
-                    on_progress=on_progress,
+            if args.task_payload:
+                import base64
+                import json as _json
+
+                from pheasant.sync.queue import IndexTask
+
+                task_payload = _json.loads(
+                    base64.urlsafe_b64decode(args.task_payload.encode("ascii")).decode("utf-8")
                 )
-                if args.all or not args.source
-                else [
-                    engine.sync_source(
-                        args.source,
+                delivery_attempt = int(task_payload.pop("_delivery_attempt", 0) or 0)
+                task = IndexTask(
+                    id="worker-control-task",
+                    source_id=str(args.source or ""),
+                    mode=str(args.mode),
+                    payload=task_payload,
+                    attempts=delivery_attempt,
+                )
+                results = [engine.apply_index_task(task, on_progress=on_progress)]
+            else:
+                results = (
+                    engine.sync_all(
                         args.mode,
                         max_depth=args.depth,
                         full_scan=args.full_scan,
                         on_progress=on_progress,
                     )
-                ]
-            )
+                    if args.all or not args.source
+                    else [
+                        engine.sync_source(
+                            args.source,
+                            args.mode,
+                            max_depth=args.depth,
+                            full_scan=args.full_scan,
+                            on_progress=on_progress,
+                        )
+                    ]
+                )
         except EngineLeaseError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
@@ -1417,7 +1479,18 @@ def main(argv: list[str] | None = None) -> int:
                 ],
             }
             print(_json.dumps(payload))
-            return 0 if all(r.status != "limit_exceeded" for r in results) else 1
+            exit_code = 0 if all(r.status != "limit_exceeded" for r in results) else 1
+            if args.worker_child:
+                # Every store, lease and vector writer was explicitly closed
+                # above. Letting CPython recursively destroy a million-node
+                # graph after reporting success adds tens of seconds to the
+                # queue ack and looks like a save hang. This flag is hidden
+                # and only supplied by the supervised subprocess boundary, so
+                # an embedded/public ``main([...])`` call is never terminated.
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(exit_code)
+            return exit_code
         exit_code = 0
         for r in results:
             if r.status == "limit_exceeded":
@@ -1507,12 +1580,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.queue_command == "drain":
                 results = drain(
                     queue,
-                    lambda task: engine.sync_source(
-                        task.source_id,
-                        task.mode,
-                        max_depth=task.max_depth,
-                        full_scan=task.full_scan,
-                    ),
+                    lambda task: engine.apply_index_task(task),
                     idle_timeout=float(args.idle_timeout or 0.0),
                 )
                 for result in results:

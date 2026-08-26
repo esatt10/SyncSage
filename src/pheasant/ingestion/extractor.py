@@ -73,11 +73,17 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import zlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from pheasant.ingestion._modal import sidecar_text as _sidecar_text
+
+# MuPDF's global caches are not safe to drive concurrently from many threads
+# in one worker process.  Serialize native MuPDF access per process; horizontal
+# worker replicas still extract separate documents in parallel.
+_NATIVE_MUPDF_LOCK = threading.Lock()
 
 if TYPE_CHECKING:
     from pheasant.config.schema import ExtractorSettings
@@ -581,8 +587,9 @@ class NativeExtractor:
                 logger.debug("pymupdf unavailable; using builtin PDF extraction")
                 return extract_pdf_text_builtin(content)
         try:
-            with pymupdf.open(stream=content, filetype="pdf") as document:
-                pages = [page.get_text() or "" for page in document]
+            with _NATIVE_MUPDF_LOCK:
+                with pymupdf.open(stream=content, filetype="pdf") as document:
+                    pages = [page.get_text() or "" for page in document]
             return _tidy("\n\n".join(pages))
         except Exception as exc:
             # A corrupt/encrypted PDF must not abort a sync: fall back to the
@@ -606,8 +613,9 @@ class NativeExtractor:
             except ModuleNotFoundError:
                 return extract_builtin("epub", content)
         try:
-            with pymupdf.open(stream=content, filetype="epub") as document:
-                pages = [page.get_text() or "" for page in document]
+            with _NATIVE_MUPDF_LOCK:
+                with pymupdf.open(stream=content, filetype="epub") as document:
+                    pages = [page.get_text() or "" for page in document]
             text = _tidy("\n\n".join(pages))
             return text or extract_builtin("epub", content)
         except Exception as exc:

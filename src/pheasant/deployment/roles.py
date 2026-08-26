@@ -31,12 +31,11 @@ to prevent; instead its sync requests are *published* and an indexer picks
 them up. That makes the queue a hard requirement for that role, checked at
 startup rather than discovered when a sync silently goes nowhere.
 
-Routes are deliberately **not** hidden per role. It is tempting, and it would
-be defence in depth, but the thing that actually keeps search traffic off an
-indexer is the Service selector in front of it — and a role whose `/search`
-404s is much harder to debug than one that simply has no clients. What a role
-changes is what the process *does on its own*, which is the part no external
-routing can control.
+Routes are deliberately **not** hidden per role. The indexer coordinator does
+not load the persisted graph in its parent process, however: sync children own
+graph commits, and the Service selector keeps queries on API replicas. This
+avoids holding two complete graph copies during every index while preserving
+health, readiness, queue and control-plane diagnostics on the indexer.
 """
 
 from __future__ import annotations

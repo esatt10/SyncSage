@@ -75,11 +75,10 @@ const INITIAL: SessionState = {
   centerId: null,
   depth: DEFAULT_DEPTH,
   showAll: false,
-  // Force-directed is the default now — "auto" degrades to "concentric"
-  // above FORCE_LAYOUT_ELEMENT_LIMIT (GraphCanvas.tsx), which reads as a
-  // surprising layout switch on a knowledge base large enough to cross
-  // that threshold rather than the force layout most users expect.
-  layout: "cose",
+  // Start with a stable radial overview. It keeps the selected/root node at
+  // the centre, makes hop distance legible, and avoids the long force-layout
+  // animation on the first view of a large knowledge base.
+  layout: "concentric",
   railCollapsed: false,
   surfacedIds: [],
   focusIds: [],
