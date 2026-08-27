@@ -83,6 +83,29 @@ def test_reindex_embeds_existing_content_and_is_idempotent(
     assert second["vector_count"] == first["vector_count"]
 
 
+def test_status_does_not_materialize_every_vector(
+    loaded_config, workspace_copy: Path, monkeypatch
+) -> None:
+    app = _app(loaded_config, workspace_copy)
+    client = TestClient(app)
+    client.put(
+        "/search/embeddings",
+        json={"enabled": True, "provider": "stub", "store_provider": "numpy", "persist": False},
+    )
+    client.post("/search/embeddings/reindex")
+    store = app.state.engine.vectors.store
+    monkeypatch.setattr(
+        store,
+        "all_vectors",
+        lambda: (_ for _ in ()).throw(AssertionError("status loaded the full vector index")),
+    )
+
+    status = client.get("/search/embeddings")
+
+    assert status.status_code == 200
+    assert status.json()["dimensions_on_disk"] > 0
+
+
 def test_vector_mode_returns_hits_once_built(loaded_config, workspace_copy: Path) -> None:
     client = TestClient(_app(loaded_config, workspace_copy))
     empty = client.post("/search", json={"query": "sync engine", "mode": "vector"}).json()

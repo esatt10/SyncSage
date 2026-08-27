@@ -8,7 +8,7 @@ stored in YAML.
 |---|---|---|---|
 | `local-small.yaml` | Local SQLite, no broker or workers | BM25/text search and extractive answers; MCP and durable memory remain enabled | Laptop, offline, small corpus |
 | `local-advanced.yaml` | Single-node SQLite | Hybrid + graph retrieval by default, LanceDB, both WASM accelerators, `text-embedding-3-small`, and the `gpt-5.6-luna` agentic workflow | One capable workstation/container |
-| `fleet.yaml` | PostgreSQL, NATS JetStream, shared durable volumes, and stateless gRPC preparation workers | Same hybrid + graph retrieval stack with adaptive concurrency; durable memory is explicitly enabled when wanted | Multi-container, horizontally scaled ingestion |
+| `fleet.yaml` | PostgreSQL, NATS JetStream, shared durable volumes, a dedicated graph-query service, and stateless gRPC preparation workers | Same hybrid + graph retrieval stack with adaptive concurrency; API replicas keep no full graph resident | Multi-container, horizontally scaled ingestion and serving |
 
 `worker.yaml` is the deliberately minimal trust-boundary config for the
 fleet's stateless gRPC workers. It has no source list, database DSN, OpenAI key,
@@ -57,6 +57,7 @@ Scalable fleet:
 
 ```bash
 # Set OPENAI_API_KEY and a random PHEASANT_INDEX_WORKER_TOKEN in .env.
+# Compose reuses that random value as the internal graph-service token.
 docker compose --env-file .env -f deploy/compose/docker-compose.scale.yml up -d --build \
   --scale indexer=1 --scale worker=4
 ```
@@ -102,7 +103,16 @@ The UI is at <http://127.0.0.1:8765> and streamable HTTP MCP is at
 - PostgreSQL and NATS make the source queue and manifests durable. LanceDB
   remains under the shared `/state/vectors` volume; the API reads it and the
   indexer tier writes it.
-- The API has a 3 GiB Compose limit because it owns the resident serving graph;
-  this is headroom for graph/UI traversal, not indexing capacity. Kubernetes
-  keeps the API independently replicated and CPU-autoscaled, while worker
-  scaling follows queue + in-flight + preparation backlog.
+- The `graph` service is the only serving tier that owns `graph.latest.json` in
+  RAM. It refreshes after indexer commits and exposes authenticated, bounded
+  operations over the internal network. API/MCP replicas have a 2 GiB limit
+  and never fall back to loading the graph locally. Scale API for request
+  traffic, graph replicas for graph-query traffic, workers for preparation,
+  and whole stacks for knowledge-base sharding.
+- Keep the extra service only when it buys something: API replicas are
+  multiplying graph RAM, a 3 GiB API remains above roughly 60-70% steady
+  memory, or graph-query traffic needs an independently scalable tier. It does
+  not accelerate graph save/enrichment; when those dominate, shard whole
+  repositories or document collections into separate knowledge bases. Below
+  the residency/query thresholds, the default single-container/local-graph
+  profile is simpler and usually faster because it avoids an HTTP hop.

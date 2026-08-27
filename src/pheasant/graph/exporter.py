@@ -19,6 +19,16 @@ def node_link(
     ``total_nodes``/``total_links`` always report the unfiltered graph, so
     the caller can tell "filtered out" from "truncated away".
     """
+    remote = getattr(graph, "remote_node_link", None)
+    if callable(remote):
+        return remote(
+            node_limit=node_limit,
+            link_limit=link_limit,
+            node_types=sorted(node_types) if node_types else None,
+            exclude_node_types=sorted(exclude_node_types) if exclude_node_types else None,
+            source_id=source_id,
+        )
+
     filtering = bool(node_types or exclude_node_types or source_id)
 
     def keep(node: dict) -> bool:
@@ -91,6 +101,9 @@ def node_link(
 
 
 def cytoscape(graph: SimpleMultiDiGraph) -> dict:
+    remote = getattr(graph, "remote_cytoscape", None)
+    if callable(remote):
+        return remote()
     payload = graph.to_node_link()
     elements = {"nodes": [{"data": data} for data in payload["nodes"]], "edges": []}
     for edge in payload["links"]:

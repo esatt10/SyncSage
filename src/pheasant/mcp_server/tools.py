@@ -13,6 +13,7 @@ import yaml
 
 from pheasant.config.loader import dump_config_yaml
 from pheasant.config.schema import PheasantConfig, SourceConfig, SourceType
+from pheasant.graph.query_service import graph_for_config
 from pheasant.ingestion.pipeline import utc_now
 from pheasant.jobs import JobRegistry
 from pheasant.persistence.paths import StatePaths
@@ -64,7 +65,14 @@ class PheasantTools:
         self.paths.ensure()
         self.state = StateStore.from_config(config, self.paths.sqlite)
         self.state.migrate()
-        self.engine = SyncEngine(config, self.paths, self.state)
+        self._remote_graph = bool(str(config.graph.query_service_url or "").strip())
+        self.engine = SyncEngine(
+            config,
+            self.paths,
+            self.state,
+            load_persisted_graph=not self._remote_graph,
+        )
+        self.graph = graph_for_config(config, lambda: self.engine.graph_builder.graph)
         # MCP and A2A callers cannot consume the HTTP server's in-process job
         # registry.  Keep the same progress contract on the tool facade so an
         # agent can start a long first index, retain the job id, and inspect it
@@ -80,6 +88,40 @@ class PheasantTools:
             default_memory_policy=config.memory.default_policy,
             usage_tracking=config.memory.usage_tracking,
         )
+
+    def _publish_sync(
+        self,
+        source_name: str,
+        mode: str,
+        max_depth: int | None = None,
+        full_scan: bool = False,
+    ) -> dict:
+        """Route fleet MCP writes through the same durable queue as HTTP."""
+
+        from pheasant.sync.queue import IndexTask, queue_from_config
+
+        payload = {"max_depth": max_depth, "full_scan": bool(full_scan)}
+        digest = hashlib.sha256(
+            (
+                f"{self.config.knowledge_base_id}\0{source_name}\0{mode}\0"
+                + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            ).encode()
+        ).hexdigest()[:24]
+        task = IndexTask(
+            id=f"idx-{digest}",
+            source_id=source_name,
+            mode=mode,
+            payload=payload,
+            max_attempts=max(1, int(self.config.sync.queue.max_attempts or 1)),
+        )
+        queue = queue_from_config(self.config, self.state)
+        if queue is None:
+            raise RuntimeError("remote graph fleet needs an enabled sync queue")
+        try:
+            queue.publish(task)
+        finally:
+            queue.close()
+        return {"source_id": source_name, "status": "queued", "task_id": task.id}
 
     def list_knowledge_bases(self) -> dict:
         return {"knowledge_bases": KnowledgeBaseRegistry(self.state).list()}
@@ -185,6 +227,11 @@ class PheasantTools:
                 return active.as_dict()
             job = self.jobs.create("sync", f"Indexing {source_name}", [source_name])
 
+        if self._remote_graph:
+            result = self._publish_sync(source_name, mode, max_depth, full_scan)
+            self.jobs.finish(job.id, "succeeded", result=result)
+            return self.jobs.get(job.id) or job.as_dict()
+
         def run() -> None:
             def progress(phase: str, current: int, total: int | None, detail: str) -> None:
                 self.jobs.progress(
@@ -280,6 +327,10 @@ class PheasantTools:
     ) -> dict:
         self._require_knowledge_base(knowledge_base)
         self._require_source(source_name)
+        if self._remote_graph:
+            raise RuntimeError(
+                "source removal changes the graph and must run on the indexer/control plane"
+            )
         self.engine.graph_builder.remove_source_content(source_name)
         self.engine.graph_store.save(self.config.knowledge_base_id, self.engine.graph_builder.graph)
         self.engine.manifests.delete(source_name)
@@ -373,6 +424,10 @@ class PheasantTools:
         full_scan: bool = False,
     ) -> dict:
         self._require_knowledge_base(knowledge_base)
+        if self._remote_graph:
+            result = self._publish_sync(source_name, mode, max_depth, full_scan)
+            self._audit(source_name, "sync_source", "mcp", "mcp", None, utc_now(), result)
+            return result
         result = self.engine.sync_source(
             source_name,
             mode,  # type: ignore[arg-type]
@@ -390,6 +445,16 @@ class PheasantTools:
         full_scan: bool = False,
     ) -> dict:
         self._require_knowledge_base(knowledge_base)
+        if self._remote_graph:
+            results = [
+                self._publish_sync(source.name, mode, max_depth, full_scan)
+                for source in self.engine.enabled_sources()
+            ]
+            for result in results:
+                self._audit(
+                    result["source_id"], "sync_source", "mcp", "mcp", None, utc_now(), result
+                )
+            return {"results": results}
         results = [
             r.__dict__
             for r in self.engine.sync_all(
@@ -461,11 +526,14 @@ class PheasantTools:
         # Degrade to deferred indexing instead: the scheduler and the next sync
         # both pick it up.
         if sync and created:
-            try:
-                result["sync"] = self.engine.sync_source(source.name, "incremental").__dict__
-            except Exception as exc:
-                logger.warning("memory write indexed later: %s", exc)
-                result["sync_deferred"] = str(exc)
+            if self._remote_graph:
+                result["sync"] = self._publish_sync(source.name, "incremental")
+            else:
+                try:
+                    result["sync"] = self.engine.sync_source(source.name, "incremental").__dict__
+                except Exception as exc:
+                    logger.warning("memory write indexed later: %s", exc)
+                    result["sync_deferred"] = str(exc)
         self._audit(
             source.name,
             "memory_write",
@@ -594,7 +662,7 @@ class PheasantTools:
             mode,
             fetch,
             source_name,
-            graph=self.engine.graph_builder.graph,
+            graph=self.graph,
             principal=principal,
             principal_groups=principal_groups,
             security=self.config.security,
@@ -721,7 +789,10 @@ class PheasantTools:
 
         bridged: set[str] = set()
         by_signal: dict[str, int] = {}
-        graph = self.engine.graph_builder.graph
+        graph = self.graph
+        remote = getattr(graph, "remote_memory_coverage", None)
+        if callable(remote):
+            return remote(artifact_ids=sorted(artifacts))
         with graph.reading():
             for (source, _target), edge_map in graph.iter_edges():
                 if source not in artifacts:
@@ -817,7 +888,7 @@ class PheasantTools:
             query,
             self.config.search.default_mode,
             self.config.search.max_results_default,
-            graph=self.engine.graph_builder.graph,
+            graph=self.graph,
             security=self.config.security,
         )
         candidate = self.search_context(
@@ -908,7 +979,7 @@ class PheasantTools:
             search=self.searcher,
             knowledge_base=knowledge_base or self.config.knowledge_base_id,
             config=self.config,
-            graph=self.engine.graph_builder.graph,
+            graph=self.graph,
             state=self.state,
             mode=mode,
             max_results=max_results,
@@ -956,7 +1027,11 @@ class PheasantTools:
         edge_types: list[str] | None = None,
     ) -> dict:
         self._require_knowledge_base(knowledge_base)
-        graph = self.engine.graph_builder.graph
+        if getattr(self.graph, "is_remote_graph", False):
+            from pheasant.api.app import graph_neighbors
+
+            return graph_neighbors(self.graph, node_id, depth, edge_types)
+        graph = self.graph
         if node_id not in graph:
             return {"node_id": node_id, "neighbors": []}
         max_depth = max(1, min(int(depth or 1), 10))
@@ -1025,7 +1100,7 @@ class PheasantTools:
 
     def explain_node(self, knowledge_base: str, node_id: str) -> dict:
         self._require_knowledge_base(knowledge_base)
-        graph = self.engine.graph_builder.graph
+        graph = self.graph
         attrs = graph.nodes.get(node_id)
         if attrs is None:
             return {"node_id": node_id, "explanation": "Node is not present in the current graph."}
@@ -1087,8 +1162,12 @@ class PheasantTools:
         limit: int = 100,
     ) -> dict:
         self._require_knowledge_base(knowledge_base)
+        if getattr(self.graph, "is_remote_graph", False):
+            from pheasant.api.app import graph_slice
+
+            return graph_slice(self.graph, node_id, depth, edge_types, limit)
         traversal = self.get_graph_neighbors(knowledge_base, node_id, depth, edge_types)
-        graph = self.engine.graph_builder.graph
+        graph = self.graph
         node_ids = [node_id] + [item["node_id"] for item in traversal["neighbors"][:limit]]
         node_set = set(node_ids)
         links = []

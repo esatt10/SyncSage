@@ -147,6 +147,34 @@ graph:
   max_nodes: 1500000   # null disables the warning
 ```
 
+## When to separate graph queries from API replicas
+
+The fleet profile can put the resident graph behind an authenticated internal
+service:
+
+```yaml
+graph:
+  query_service_url: http://graph:8765
+  query_service_token_env: PHEASANT_GRAPH_SERVICE_TOKEN
+  query_service_timeout_seconds: 30
+```
+
+The `graph` role loads and refreshes the snapshot; API/MCP replicas keep only a
+bounded proxy. This is worth the extra network hop and service when either:
+
+* API graph residency is regularly above roughly **60-70% of a 3 GiB limit**;
+* two or more API replicas would otherwise duplicate a large graph; or
+* graph-query CPU/latency needs to scale independently from text/vector/API
+  traffic.
+
+It does **not** make graph enrichment or snapshot saves faster: those remain in
+the single commit authority. If save/enrichment dominates an indexing run,
+split sources into multiple knowledge-base shards below so each indexer and
+graph service owns a smaller snapshot. For one API below the memory threshold,
+the default local graph is simpler, uses less total fleet memory, and avoids the
+HTTP hop. There is no automatic local fallback in remote mode because an outage
+must not cause every API replica to materialize the graph simultaneously.
+
 ## When you cross the line: shard
 
 Split the corpus across several pheasant regions and let the
@@ -250,13 +278,13 @@ Past one container, the shape is
 [three tiers](worker-fleet.md#running-the-whole-fleet). What the file count
 predicts:
 
-| Corpus | Shards | Indexers | API replicas | Workers | Memory each |
-|---|---|---|---|---|---|
-| < 25,000 | 1 | 1 | — single container | 0 | 0.5–1 Gi |
-| 75,000 | 1 | 1 | 2 | 3 | 1 Gi |
-| 150,000 | 1 | 1 | 2 | 6 | 2 Gi |
-| 250,000 | 2 | 2 | 2 | 16 | 4 Gi |
-| 600,000 | 3 | 3 | 3 | 24 | 8 Gi |
+| Corpus | Shards | Indexers | Graph services | API replicas | Workers | Graph/index memory each |
+|---|---|---|---|---|---|---|
+| < 25,000 | 1 | 1 | — local | — single container | 0 | 0.5–1 Gi |
+| 75,000 | 1 | 1 | 1 | 2 | 3 | 1 Gi |
+| 150,000 | 1 | 1 | 1 | 2 | 6 | 2 Gi |
+| 250,000 | 2 | 2 | 2 | 2 | 16 | 4 Gi |
+| 600,000 | 3 | 3 | 3 | 3 | 24 | 8 Gi |
 
 Two of those columns are honest guesses and it is worth saying which:
 **api replicas** track request traffic, which a file count cannot predict —
@@ -287,4 +315,6 @@ symbols, so adopting its figure would have halved every memory projection.
 
 - [Monitor indexing](monitor-indexing.md) — throughput, ETA and stall detection.
 - [Speed up indexing](indexing-performance.md) — worker counts and executors.
+- [Separate graph queries](graph-query-service.md) — setup, failure semantics,
+  and the measured 2026-08-26 fleet decision.
 - [Attach to a Synapse fleet](attach-to-synapse.md) — running several regions.

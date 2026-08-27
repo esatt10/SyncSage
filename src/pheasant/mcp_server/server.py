@@ -489,7 +489,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         """Return the current graph snapshot as JSON."""
 
         tools._require_knowledge_base(kb_id)
-        return _json(node_link(tools.engine.graph_builder.graph))
+        return _json(node_link(tools.graph))
 
     @mcp.resource("pheasant://knowledge-bases/{kb_id}/sources/{source_id}/manifest")
     def source_manifest_resource(kb_id: str, source_id: str) -> str:

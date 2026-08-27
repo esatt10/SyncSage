@@ -114,6 +114,9 @@ sync:
 graph:
   memory_entity_bridging: true
   wasm_cross_source_resolution: true
+  query_service_url: http://graph:8765
+  query_service_token_env: PHEASANT_GRAPH_SERVICE_TOKEN
+  query_service_timeout_seconds: 30.0
   max_nodes: null
 security:
   allow_workspace_roots:

@@ -72,6 +72,7 @@ Configuration details belong in the documentation:
 - [Attach a coding agent](docs/how-to/attach-to-coding-agent.md)
 - [Monitor indexing](docs/how-to/monitor-indexing.md)
 - [Scale a worker fleet](docs/how-to/worker-fleet.md)
+- [Separate graph queries from API replicas](docs/how-to/graph-query-service.md)
 - [Capacity planning](docs/how-to/capacity-planning.md)
 
 ## Develop

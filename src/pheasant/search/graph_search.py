@@ -42,6 +42,16 @@ def search_graph(
     merge text and graph hits uniformly.
     """
 
+    remote = getattr(graph, "remote_search", None)
+    if callable(remote):
+        return remote(
+            query=query,
+            max_results=max_results,
+            source_name=source_name,
+            include_relationships=include_relationships,
+            wasm_relationship_search=wasm_relationship_search,
+        )
+
     q = query.strip().lower()
     tokens = _tokens(query)
     if not q and not tokens:

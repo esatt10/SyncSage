@@ -21,16 +21,14 @@ something in pheasant's design, so they are stated with the reason:
    ConfigMap.
 
 2. **A ReadWriteMany volume for `/state`.** The knowledge graph is a file the
-   indexer writes and every api replica reads, so RWO (one node) cannot work
-   with api replicas spread across nodes. EFS, Azure Files, CephFS and NFS all
-   qualify; most default StorageClasses do not. Set `storageClassName` in
-   `state-pvc.yaml`.
+   indexer writes and the graph-query service reads; API replicas also read
+   shared vector/manifests. RWO (one node) cannot work with replicas spread
+   across nodes. EFS, Azure Files, CephFS and NFS qualify; most default
+   StorageClasses do not. Set `storageClassName` in `state-pvc.yaml`.
 
-   API replicas poll that file (`server.api.graph_refresh_seconds`, 30s) and
-   reload when it changes. Without the poll they would answer graph queries
-   from whatever the graph was when the pod started — text and vector search
-   read the database and are always current, which is exactly what makes the
-   staleness easy to miss.
+   The graph role polls that file (`server.api.graph_refresh_seconds`, 30s) and
+   atomically reloads it. API replicas keep no full graph resident and fail
+   readiness if their authenticated graph-service dependency is unavailable.
 
 3. **A volume for `/exports`**, if anything outside pheasant consumes the
    corpus. `exports-cronjob.yaml` writes the Parquet extract there nightly and
@@ -53,6 +51,11 @@ something in pheasant's design, so they are stated with the reason:
    `pheasant_index_queue_depth` needs [prometheus-adapter] or [KEDA] to expose
    it; `worker-hpa.yaml` ships the KEDA form and the CPU fallback.
 
+6. **An internal graph bearer token.** Add
+   `PHEASANT_GRAPH_SERVICE_TOKEN` to `pheasant-secrets` (see
+   `secret.example.yaml`). It is consumed only by API/MCP clients and the graph
+   service; never place its value in the ConfigMap.
+
 [prometheus-adapter]: https://github.com/kubernetes-sigs/prometheus-adapter
 [KEDA]: https://keda.sh
 
@@ -61,6 +64,7 @@ something in pheasant's design, so they are stated with the reason:
 | Workload | Kind | Scales on | Why |
 |---|---|---|---|
 | `pheasant-api` | Deployment | CPU (HPA) | Request traffic. Stateless — the MCP server is `stateless_http`, so an agent's two requests may land on different replicas. |
+| `pheasant-graph` | Deployment | graph-query CPU/latency | Owns and refreshes the resident graph; scale replicas for availability/query throughput, or deploy one stack per KB shard. |
 | `pheasant-indexer` | StatefulSet, 1 replica | not autoscaled | Owns the watcher and scheduler. **One per shard**, not one per cluster: two indexers on one shard is not faster, it is two processes taking turns. |
 | `pheasant-worker` | Deployment | queue depth (HPA/KEDA) | Parse/chunk only. The elastic tier — no state, no credentials, safe to kill. |
 

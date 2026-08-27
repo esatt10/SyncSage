@@ -192,7 +192,7 @@ thing to run.
 
 ## Running the whole fleet
 
-The pieces above assemble into three tiers. Both runtimes ship a working
+The pieces above assemble into four tiers. Both runtimes ship a working
 version, and both are the *other* trade from the single container — take them
 only past the point where one container stops being enough
 ([capacity planning](capacity-planning.md)).
@@ -206,7 +206,9 @@ docker compose --env-file .env -f deploy/compose/docker-compose.scale.yml up -d 
   --scale indexer=1 --scale worker=4
 ```
 
-Postgres, NATS JetStream, one API, one elected indexer and four gRPC workers.
+Postgres, NATS JetStream, one API, one graph-query service, one elected indexer
+and four gRPC workers. The API keeps no persisted graph resident; authenticated
+graph and hybrid operations go to the graph service over the Compose network.
 The indexer owns watcher, scheduler, queue drain and the global commit stream;
 those producers share one lock, while a `sync --all` child can still prepare
 several sources concurrently. Starting extra indexers creates hot standbys:
@@ -225,31 +227,32 @@ load balancer in front of them; Compose deliberately publishes one API endpoint.
 kubectl apply -f deploy/kubernetes/namespace.yaml
 kubectl -n pheasant create secret generic pheasant-secrets \
   --from-literal=PHEASANT_DATABASE_URL='postgresql://…' \
-  --from-literal=PHEASANT_INDEX_WORKER_TOKEN="$(openssl rand -hex 32)"
+  --from-literal=PHEASANT_INDEX_WORKER_TOKEN="$(openssl rand -hex 32)" \
+  --from-literal=PHEASANT_GRAPH_SERVICE_TOKEN="$(openssl rand -hex 32)"
 kubectl apply -f deploy/kubernetes/scaled/
 ```
 
 | Workload | Kind | Scales on |
 |---|---|---|
 | `pheasant-api` | Deployment | CPU (HPA) |
+| `pheasant-graph` | Deployment | graph-query CPU/latency; one per shard minimum |
 | `pheasant-indexer` | StatefulSet, 1 replica | not autoscaled |
 | `pheasant-worker` | Deployment | queued sources + `pheasant_index_preparation_backlog` |
 
 `deploy/kubernetes/scaled/README.md` lists what you must provide first. Two
 requirements are easy to miss and neither is optional:
 
-* **A ReadWriteMany volume for `/state`.** The knowledge graph is a file the
-  indexer writes and every api replica reads. With RWO the volume attaches to
-  one node, so api replicas scheduled elsewhere cannot read it at all. Most
-  default StorageClasses are RWO.
+* **A ReadWriteMany volume for `/state`.** The indexer writes the graph; the
+  graph-query service and API replicas read state/vector data. With RWO the
+  volume attaches to one node, so replicas scheduled elsewhere cannot mount
+  it. Most default StorageClasses are RWO.
 * **Postgres.** SQLite permits one writer per file, and it is not one file
   across pods.
 
-Api replicas poll the graph file every `server.api.graph_refresh_seconds`
-(30 s) and reload when it changes. Without that they would answer graph
-queries from whatever the graph was when the pod started — while text and
-vector search stayed current from the shared database, which is exactly what
-makes the staleness easy to miss.
+The graph role polls the graph file every `server.api.graph_refresh_seconds`
+(30 s) and atomically swaps generations. API readiness includes an authenticated
+graph-service probe; a broken dependency removes that API replica from routing
+instead of silently serving stale graph results.
 
 ### Scale on the backlog, not on CPU
 

@@ -105,12 +105,14 @@ try to index the same source. Roles say which jobs a process has:
 | `all` | yes | yes | no | in-process | one container — **the default** |
 | `api` | no | no | no | **never** | N replicas behind a Service |
 | `indexer` | yes | yes | yes | in-process | one per shard |
+| `graph` | no | no | no | no | internal graph-query service |
 | `worker` | no | no | no | no | M replicas, autoscaled |
 
 ```bash
 pheasant serve                     # all — unchanged
 pheasant serve --role api          # serve; publish index work
 pheasant serve --role indexer      # watch, schedule, drain
+pheasant serve --role graph        # authenticated graph reads + snapshot refresh
 pheasant worker --transport grpc   # preparation only
 ```
 
@@ -133,6 +135,13 @@ blocking sync (`wait: true`) against an api replica returns **409** with the
 fix, because publishing is a different promise from "run this and return the
 result".
 
+With `graph.query_service_url` set, API and mounted MCP replicas do not load
+`graph.latest.json`; the `graph` role is the only serving process that keeps it
+resident and refreshes it after indexer commits. API readiness fails when that
+service is unreachable. There is deliberately no fallback to a local graph:
+fallback would duplicate the graph into every replica at the exact moment the
+graph tier is unhealthy and memory headroom is most valuable.
+
 Routes are *not* hidden per role. What keeps search traffic off an indexer is
 the Service selector in front of it; a role whose `/search` returned 404 would
 be much harder to debug than one that simply has no clients. What a role
@@ -151,7 +160,7 @@ multi-hour first index would take the whole Service down for that time.
 |---|---|---|---|
 | `max_concurrent_requests` | integer | `0` | In-flight requests before the surplus is refused with **429 + `Retry-After`**. `0` disables it. |
 | `drain_seconds` | integer | `0` | Seconds to keep serving after SIGTERM while `/ready` already reports 503. `0` disables the delay. |
-| `graph_refresh_seconds` | integer | `30` | How often an **`api`-role** replica re-reads a graph written by the indexer. `0` disables it; the other roles ignore it. |
+| `graph_refresh_seconds` | integer | `30` | How often a legacy local-graph `api` or dedicated `graph` role re-reads a graph written by the indexer. A remote-graph API ignores it. `0` disables it. |
 
 Both default off, and that is a decision rather than caution.
 
@@ -636,6 +645,9 @@ lands in config or on disk.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
+| `query_service_url` | string \| null | `null` | Internal graph-service base URL. When set, API/MCP serving replicas hold a bounded proxy instead of the full graph. Use `null` for standalone. |
+| `query_service_token_env` | string | `PHEASANT_GRAPH_SERVICE_TOKEN` | Environment variable containing the bearer token shared by graph clients and the `graph` role. |
+| `query_service_timeout_seconds` | float | `30.0` | Deadline per graph operation, including graph/hybrid search. Transport failures are explicit; they never trigger a local full-graph fallback. |
 | `memory_entity_bridging` | bool | `true` | Wire agent-memory records into the graph (`about` edges to what a record refers to, `supersedes` between corrections). A no-op without a memory source. |
 | `wasm_cross_source_resolution` | bool | `false` | Run `resolve_cross_source_edges` (import/link resolution across sources) through the vendored WASM accelerator (Synapse 34.5a) instead of pure Python. Needs the `[wasm]` extra; falls back to pure Python on any failure or if the extra is missing. Conditional win per the 34.4 benchmark — loses to Python below roughly 1,300-2,500 edges, wins modestly above it; opt in for large/growing multi-source graphs, leave off for small ones. **The Docker image turns this on** in a config it generates itself, on the assumption that a container's graph grows past the crossover; set it to `false` in your config if you are indexing a small, static corpus. |
 

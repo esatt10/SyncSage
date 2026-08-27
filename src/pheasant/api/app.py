@@ -26,10 +26,11 @@ from pheasant.config.loader import (
 )
 from pheasant.config.profiles import profile_names
 from pheasant.config.schema import PheasantConfig, SourceConfig, SourceType
+from pheasant.deployment.roles import Role, resolve_role, validate_role
 from pheasant.deployment.roles import describe as describe_role
-from pheasant.deployment.roles import resolve_role, validate_role
 from pheasant.deployment.serving import RETRY_AFTER_SECONDS, ConcurrencyLimiter, DrainState
 from pheasant.graph.exporter import cytoscape, node_link
+from pheasant.graph.query_service import graph_for_config
 from pheasant.graph.simple import SimpleMultiDiGraph
 from pheasant.ingestion.pipeline import read_text, utc_now
 from pheasant.jobs import JobRegistry
@@ -364,6 +365,13 @@ class RemotePrepareBatchRequest(BaseModel):
     deadline_seconds: float | None = None
 
 
+class GraphQueryRequest(BaseModel):
+    """One bounded operation on the internal graph-query service."""
+
+    operation: str
+    parameters: dict[str, Any] = {}
+
+
 #: One line per retrieval knob, so a UI (or an agent reading
 #: ``describe_retrieval``) can explain a setting without the caller having to
 #: go and read the workflow module's docstring.
@@ -549,6 +557,16 @@ def graph_neighbors(
     depth-3 slice take minutes. Truncation is in BFS order either way, so the
     kept set is identical — only the work is smaller.
     """
+    remote = getattr(graph, "remote_neighbors", None)
+    if callable(remote):
+        return remote(
+            node_id=node_id,
+            depth=depth,
+            edge_types=edge_types,
+            max_nodes=max_nodes,
+            exclude_edge_types=sorted(exclude_edge_types) if exclude_edge_types else None,
+            exclude_node_types=sorted(exclude_node_types) if exclude_node_types else None,
+        )
     if node_id not in graph:
         return {"node_id": node_id, "depth": depth, "neighbors": []}
     max_depth = max(1, min(int(depth or 1), 10))
@@ -723,6 +741,16 @@ def graph_slice(
     exclude_node_types: set[str] | None = None,
 ) -> dict:
     """Connected sub-graph around a node (mirrors PheasantTools.get_graph_slice)."""
+    remote = getattr(graph, "remote_slice", None)
+    if callable(remote):
+        return remote(
+            node_id=node_id,
+            depth=depth,
+            edge_types=edge_types,
+            limit=limit,
+            exclude_edge_types=sorted(exclude_edge_types) if exclude_edge_types else None,
+            exclude_node_types=sorted(exclude_node_types) if exclude_node_types else None,
+        )
     # Ask for one more neighbour than the caller will receive.  Without that
     # sentinel a bounded UI slice silently looked complete whenever it filled
     # its budget, which made large documents appear to have lost chunks.
@@ -793,16 +821,25 @@ def create_app(
     state = StateStore.from_config(config, paths.sqlite)
     state.migrate()
     SourceRegistry(config, state).initialize()
-    # The fleet indexer is a coordinator: each sync runs in an isolated child
-    # that owns the graph commit. Loading the same multi-gigabyte graph in the
-    # parent doubles peak RSS for no serving benefit. API/all roles still load
-    # it because they answer graph queries.
+    # Only a standalone process, the dedicated graph service, or a legacy API
+    # without a remote graph endpoint keeps the snapshot resident. Indexers
+    # coordinate child commits; workers prepare immutable files; remote APIs
+    # query the graph service. None of those needs a second graph copy.
+    remote_graph = bool(str(config.graph.query_service_url or "").strip())
+    loads_graph = role_policy.role in {Role.ALL, Role.GRAPH} or (
+        role_policy.role is Role.API and not remote_graph
+    )
     engine = SyncEngine(
         config,
         paths,
         state,
-        load_persisted_graph=role_policy.name != "indexer",
-        initialize_indexing_components=role_policy.name != "indexer",
+        load_persisted_graph=loads_graph,
+        initialize_indexing_components=role_policy.role not in {Role.INDEXER, Role.GRAPH},
+    )
+    serving_graph = graph_for_config(
+        config,
+        lambda: engine.graph_builder.graph,
+        force_local=role_policy.role is not Role.API,
     )
     search = HybridSearch(
         SearchStore(state),
@@ -904,6 +941,7 @@ def create_app(
     app.state.config = config
     app.state.state = state
     app.state.engine = engine
+    app.state.serving_graph = serving_graph
     app.state.config_path = resolved_config_path
     # Chat API keys a user pastes in the browser live here and nowhere else:
     # process memory, TTL'd, gone on restart.
@@ -1055,6 +1093,17 @@ def create_app(
             "knowledge_base": config.knowledge_base_id,
             **describe_role(role_policy),
         }
+        # ``Role.API`` can refresh a legacy local snapshot, but a remote API
+        # deliberately has no local snapshot or refresher. Report the work the
+        # running process actually performs rather than the role's capability.
+        if role_policy.role is Role.API and remote_graph:
+            payload["refreshes_graph"] = False
+        if role_policy.role is Role.GRAPH:
+            token_env = config.graph.query_service_token_env
+            if not os.environ.get(token_env or "", ""):
+                payload["status"] = "not_ready"
+                payload["reason"] = "graph query service token is not configured"
+                return JSONResponse(status_code=503, content=payload)  # type: ignore[return-value]
         if drain_state.draining:
             # SIGTERM has arrived. Reporting not-ready *before* the process
             # stops accepting work is the entire drain mechanism: Kubernetes
@@ -1087,6 +1136,14 @@ def create_app(
             payload["status"] = "not_ready"
             payload["reason"] = "state store unreachable"
             return JSONResponse(status_code=503, content=payload)  # type: ignore[return-value]
+        if getattr(serving_graph, "is_remote_graph", False):
+            try:
+                await asyncio.wait_for(asyncio.to_thread(serving_graph.ping), timeout=2.0)
+            except Exception as exc:  # noqa: BLE001 - any failure means not ready
+                logger.warning("graph-service readiness probe failed: %s", exc)
+                payload["status"] = "not_ready"
+                payload["reason"] = "graph query service unreachable"
+                return JSONResponse(status_code=503, content=payload)  # type: ignore[return-value]
         return payload
 
     def _authorize_worker(authorization: str | None) -> None:
@@ -1230,7 +1287,7 @@ def create_app(
         write path drifts the moment any path forgets to update it.
         """
 
-        graph = engine.graph_builder.graph
+        graph = serving_graph
         sample: dict[str, object] = {
             "pheasant_graph_nodes": graph.number_of_nodes(),
             "pheasant_graph_edges": graph.number_of_edges(),
@@ -1382,7 +1439,7 @@ def create_app(
         if req.sync_now:
             if req.wait:
                 try:
-                    result = engine.sync_source(source.name, req.sync_mode).__dict__
+                    result = _index(source.name, req.sync_mode)["results"][0]
                 except (KeyError, ValueError) as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
             else:
@@ -1896,7 +1953,7 @@ def create_app(
         if sync_now:
             if wait:
                 try:
-                    sync_result = engine.sync_source(name, "incremental").__dict__
+                    sync_result = _index(name, "incremental")["results"][0]
                 except (KeyError, ValueError) as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
             else:
@@ -1995,11 +2052,15 @@ def create_app(
         # Degrade to deferred indexing instead: the scheduler and the next sync
         # both pick it up.
         if req.sync and created:
-            try:
-                payload["sync"] = engine.sync_source(source.name, "incremental").__dict__
-            except Exception as exc:
-                logger.warning("memory write indexed later: %s", exc)
-                payload["sync_deferred"] = str(exc)
+            if role_policy.indexes_locally:
+                try:
+                    payload["sync"] = engine.sync_source(source.name, "incremental").__dict__
+                except Exception as exc:
+                    logger.warning("memory write indexed later: %s", exc)
+                    payload["sync_deferred"] = str(exc)
+            else:
+                _job_id, queued = _start_background_sync(source.name, "incremental")
+                payload["queued_tasks"] = queued
         # Writing a memory is a mutation of what this region will later assert
         # as fact, which is exactly what the audit log is for. The MCP path has
         # always recorded it; this one silently did not, so the same action was
@@ -2263,7 +2324,7 @@ def create_app(
                 req.mode,
                 req.max_results * 4 if filtering else req.max_results,
                 req.source_name,
-                graph=engine.graph_builder.graph,
+                graph=serving_graph,
                 principal=req.principal,
                 principal_groups=req.principal_groups,
                 security=config.security,
@@ -2393,7 +2454,7 @@ def create_app(
 
     @app.get("/nodes/content")
     def node_content(node_id: str, principal: str | None = None) -> dict:
-        graph = engine.graph_builder.graph
+        graph = serving_graph
         attrs = graph.nodes.get(node_id)
         if attrs is None:
             raise HTTPException(status_code=404, detail=f"Unknown node: {node_id}")
@@ -2450,7 +2511,10 @@ def create_app(
             taxonomy_tree,
         )
 
-        graph_obj = engine.graph_builder.graph
+        graph_obj = serving_graph
+        remote = getattr(graph_obj, "remote_taxonomy", None)
+        if callable(remote):
+            return remote(source=source, path=path, max_nodes=max_nodes)
         by_document: dict[str, list[SectionHeading]] = {}
         seen = 0
         for _node_id, data in graph_obj.node_map().items():
@@ -2525,7 +2589,7 @@ def create_app(
             return items or None
 
         return node_link(
-            engine.graph_builder.graph,
+            serving_graph,
             node_limit=limit,
             link_limit=link_limit,
             node_types=_set(types),
@@ -2535,11 +2599,11 @@ def create_app(
 
     @app.get("/graph/export/node-link-json")
     def graph_node_link() -> dict:
-        return node_link(engine.graph_builder.graph)
+        return node_link(serving_graph)
 
     @app.get("/graph/export/cytoscape-json")
     def graph_cyto() -> dict:
-        return cytoscape(engine.graph_builder.graph)
+        return cytoscape(serving_graph)
 
     @app.get("/graph/neighbors")
     def graph_neighbors_route(
@@ -2550,7 +2614,7 @@ def create_app(
     ) -> dict:
         types = [t for t in edge_types.split(",") if t] if edge_types else None
         return graph_neighbors(
-            engine.graph_builder.graph,
+            serving_graph,
             node_id,
             depth,
             types,
@@ -2576,7 +2640,7 @@ def create_app(
 
         types = [t for t in edge_types.split(",") if t] if edge_types else None
         return graph_slice(
-            engine.graph_builder.graph,
+            serving_graph,
             node_id,
             depth,
             types,
@@ -2594,7 +2658,10 @@ def create_app(
         and how the sources compare. One pinned read of the graph — this walks
         it, so it must not be on a hot path the UI polls.
         """
-        graph_obj = engine.graph_builder.graph
+        graph_obj = serving_graph
+        remote = getattr(graph_obj, "remote_diagnostics", None)
+        if callable(remote):
+            return remote(top=top)
         # `iter_edges`/`node_map` hand back the live mappings instead of
         # copying 850k edges per call; both require holding `reading()` for
         # the whole walk, which is exactly what this block does.
@@ -2646,7 +2713,14 @@ def create_app(
         hops apart are never on screen together. Bidirectional BFS so a miss
         on a large graph costs two shallow frontiers rather than one deep one.
         """
-        graph_obj = engine.graph_builder.graph
+        graph_obj = serving_graph
+        remote = getattr(graph_obj, "remote_path", None)
+        if callable(remote):
+            payload = remote(source=source, target=target, max_depth=max_depth)
+            missing = payload.pop("missing", None)
+            if missing:
+                raise HTTPException(status_code=404, detail=f"Unknown node: {missing}")
+            return payload
         if source not in graph_obj:
             raise HTTPException(status_code=404, detail=f"Unknown node: {source}")
         if target not in graph_obj:
@@ -2665,7 +2739,7 @@ def create_app(
 
     @app.get("/nodes/explain")
     def explain_node(node_id: str) -> dict:
-        g = engine.graph_builder.graph
+        g = serving_graph
         attrs = g.nodes.get(node_id)
         if attrs is None:
             return {"node_id": node_id, "explanation": "Node is not present in the current graph."}
@@ -2678,6 +2752,160 @@ def create_app(
             "provenance": node.get("provenance"),
             "node": node,
         }
+
+    def _authorize_graph_query(authorization: str | None) -> None:
+        """Keep the graph service private even on a flat container network."""
+
+        if role_policy.role is not Role.GRAPH:
+            raise HTTPException(status_code=404, detail="graph query service is not enabled")
+        import hmac
+
+        env_name = config.graph.query_service_token_env
+        expected = os.environ.get(env_name or "", "")
+        if not expected:
+            raise HTTPException(
+                status_code=503,
+                detail=f"graph query token environment variable {env_name!r} is empty",
+            )
+        scheme, _, supplied = (authorization or "").partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(supplied, expected):
+            raise HTTPException(status_code=401, detail="invalid graph query token")
+
+    @app.post("/internal/graph/query")
+    def internal_graph_query(
+        req: GraphQueryRequest,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict:
+        """Execute one graph operation where the snapshot is resident.
+
+        The operation surface is intentionally query-shaped. There is no
+        generic graph dump hidden behind search/neighbors, so API replicas
+        cannot accidentally reconstruct and retain the full graph.
+        """
+
+        _authorize_graph_query(authorization)
+        parameters = dict(req.parameters or {})
+        graph_obj = engine.graph_builder.graph
+        operation = req.operation.strip().lower()
+
+        if operation == "stats":
+            with graph_obj.reading():
+                result = {
+                    "total_nodes": graph_obj.number_of_nodes(),
+                    "total_links": graph_obj.number_of_edges(),
+                    "node_types": graph_obj.type_counts(),
+                }
+        elif operation == "node":
+            attrs = graph_obj.nodes.get(str(parameters.get("node_id") or ""))
+            result = dict(attrs) if attrs is not None else None
+        elif operation == "search":
+            from pheasant.search.graph_search import search_graph
+
+            result = search_graph(
+                graph_obj,
+                str(parameters.get("query") or ""),
+                int(parameters.get("max_results") or 10),
+                parameters.get("source_name"),
+                bool(parameters.get("include_relationships", True)),
+                node_index=engine.node_index,
+                wasm_relationship_search=bool(parameters.get("wasm_relationship_search", False)),
+            )
+        elif operation == "neighbors":
+            result = graph_neighbors(
+                graph_obj,
+                str(parameters.get("node_id") or ""),
+                int(parameters.get("depth") or 1),
+                parameters.get("edge_types"),
+                parameters.get("max_nodes"),
+                set(parameters.get("exclude_edge_types") or []) or None,
+                set(parameters.get("exclude_node_types") or []) or None,
+            )
+        elif operation == "slice":
+            result = graph_slice(
+                graph_obj,
+                str(parameters.get("node_id") or ""),
+                int(parameters.get("depth") or 1),
+                parameters.get("edge_types"),
+                int(parameters.get("limit") or 100),
+                set(parameters.get("exclude_edge_types") or []) or None,
+                set(parameters.get("exclude_node_types") or []) or None,
+            )
+        elif operation == "node_link":
+            result = node_link(
+                graph_obj,
+                node_limit=parameters.get("node_limit"),
+                link_limit=parameters.get("link_limit"),
+                node_types=set(parameters.get("node_types") or []) or None,
+                exclude_node_types=set(parameters.get("exclude_node_types") or []) or None,
+                source_id=parameters.get("source_id"),
+            )
+        elif operation == "cytoscape":
+            result = cytoscape(graph_obj)
+        elif operation == "diagnostics":
+            result = graph_diagnostics(int(parameters.get("top") or 20))
+        elif operation == "taxonomy":
+            result = taxonomy(
+                source=parameters.get("source"),
+                path=parameters.get("path"),
+                max_nodes=int(parameters.get("max_nodes") or 2000),
+            )
+        elif operation == "path":
+            source_id = str(parameters.get("source") or "")
+            target_id = str(parameters.get("target") or "")
+            missing = source_id if source_id not in graph_obj else None
+            if missing is None and target_id not in graph_obj:
+                missing = target_id
+            if missing is not None:
+                result = {"source": source_id, "target": target_id, "missing": missing}
+            else:
+                path_nodes = _shortest_path(
+                    graph_obj,
+                    source_id,
+                    target_id,
+                    max_depth=int(parameters.get("max_depth") or 8),
+                )
+                result = {
+                    "source": source_id,
+                    "target": target_id,
+                    "found": path_nodes is not None,
+                    "hops": len(path_nodes) - 1 if path_nodes else None,
+                    "path": [
+                        {"node_id": node_id, **dict(graph_obj.nodes.get(node_id) or {})}
+                        for node_id in (path_nodes or [])
+                    ],
+                }
+        elif operation == "facts":
+            from pheasant.assistant.chat import collect_facts
+
+            result = collect_facts(
+                graph_obj,
+                [str(item) for item in parameters.get("node_ids") or []],
+                int(parameters.get("limit") or 12),
+            )
+        elif operation == "memory_coverage":
+            from pheasant.memory.bridge import ABOUT_EDGE
+
+            artifacts = {str(item) for item in parameters.get("artifact_ids") or []}
+            bridged: set[str] = set()
+            by_signal: dict[str, int] = {}
+            with graph_obj.reading():
+                for (source_id, _target), edge_map in graph_obj.iter_edges():
+                    if source_id not in artifacts:
+                        continue
+                    for data in edge_map.values():
+                        if data.get("type") == ABOUT_EDGE:
+                            bridged.add(source_id)
+                            signal = str(data.get("match_signal") or "unknown")
+                            by_signal[signal] = by_signal.get(signal, 0) + 1
+            result = {
+                "records": len(artifacts),
+                "bridged": len(bridged),
+                "unbridged": len(artifacts) - len(bridged),
+                "by_signal": by_signal,
+            }
+        else:
+            raise HTTPException(status_code=400, detail=f"unknown graph operation: {operation}")
+        return {"result": result}
 
     @app.get("/fs/list")
     def fs_list(path: str | None = None) -> dict:
@@ -2820,11 +3048,9 @@ def create_app(
         if engine.vectors is not None:
             try:
                 vector_count = int(engine.vectors.store.count())
-                vectors = getattr(engine.vectors.store, "all_vectors", None)
-                if callable(vectors):
-                    sample = vectors()
-                    if sample:
-                        dimensions_on_disk = len(sample[0][1])
+                dimensions = getattr(engine.vectors.store, "dimensions", None)
+                if callable(dimensions):
+                    dimensions_on_disk = dimensions()
             except Exception as exc:  # a broken store must still render a page
                 store_error = str(exc)
                 active = False
@@ -3220,7 +3446,7 @@ def create_app(
     # ------------------------------------------------------------------
     @app.get("/overview")
     def overview() -> dict:
-        graph_obj = engine.graph_builder.graph
+        graph_obj = serving_graph
         # One pinned read of aggregates the graph maintains on write. This
         # used to walk every node to tally types on an endpoint the UI hits on
         # every page load — seconds of latency for numbers already known.
@@ -3339,7 +3565,7 @@ def create_app(
             search=search,
             knowledge_base=config.knowledge_base_id,
             config=config,
-            graph=engine.graph_builder.graph,
+            graph=serving_graph,
             state=state,
             credential=app.state.session_keys.get(req.session_id),
             env=dict(os.environ),
@@ -3392,7 +3618,7 @@ def create_app(
                     search=search,
                     knowledge_base=config.knowledge_base_id,
                     config=config,
-                    graph=engine.graph_builder.graph,
+                    graph=serving_graph,
                     state=state,
                     credential=credential,
                     env=environ,
@@ -3628,11 +3854,9 @@ def create_app(
         queued_tasks: list[str] = []
         if req.sync_now:
             if req.wait:
-                from dataclasses import asdict
-
                 for entry in created:
                     try:
-                        results.append(asdict(engine.sync_source(entry["name"], req.sync_mode)))
+                        results.extend(_index(entry["name"], req.sync_mode)["results"])
                     except Exception as exc:  # surfaced per-source; others still run
                         results.append(
                             {"source_id": entry["name"], "status": "error", "error": str(exc)}

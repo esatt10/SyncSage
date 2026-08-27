@@ -627,6 +627,22 @@ class _GraphRefresher:
             return False
         self._seen = stamp
         self.engine.reload_graph()
+        # The generation swap drops the old graph, but CPython's allocator can
+        # keep hundreds of MiB of its now-empty arenas mapped forever. Repeated
+        # refreshes then make steady RSS look like a leak and eventually erase
+        # the headroom reserved for the next atomic swap. Collection removes
+        # cycles; glibc's optional trim returns fully free pages to the OS.
+        import gc
+
+        gc.collect()
+        try:
+            import ctypes
+
+            trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+            if trim is not None:
+                trim(0)
+        except (AttributeError, OSError, TypeError):  # non-glibc platforms
+            pass
         return True
 
     def _run(self) -> None:
@@ -644,6 +660,11 @@ def _graph_refresher(cfg, engine, policy):
     """The refresh loop, or ``None`` when this role indexes its own graph."""
 
     interval = float(getattr(cfg.server.api, "graph_refresh_seconds", 0) or 0)
+    # A remote API has no local snapshot by design. Starting its legacy file
+    # refresher would quietly re-materialize the full graph and erase the
+    # memory isolation this deployment mode exists to provide.
+    if policy.name == "api" and getattr(cfg.graph, "query_service_url", None):
+        return None
     if not policy.refreshes_graph or interval <= 0:
         return None
     return _GraphRefresher(engine, interval)
@@ -1078,7 +1099,7 @@ def main(argv: list[str] | None = None) -> int:
     serve_p.add_argument("--config", "-c", default=server_config_default)
     serve_p.add_argument(
         "--role",
-        choices=("all", "api", "indexer", "worker"),
+        choices=("all", "api", "indexer", "graph", "worker"),
         default=None,
         help="Which jobs this process takes on. Default: server.role, or 'all'.",
     )
@@ -1608,7 +1629,11 @@ def main(argv: list[str] | None = None) -> int:
         engine = _engine(Path(args.config))
         sizes = []
         try:
-            for source in cfg.sources:
+            # UI/API registrations live in the durable source registry and do
+            # not have to be written back into the read-only fleet YAML.  Plan
+            # from the engine's hydrated view so the command sees the same
+            # corpus the scheduler and queue drain actually index.
+            for source in engine.enabled_sources():
                 if not source.enabled:
                     continue
                 # `scan` walks without reading, so planning a split of a corpus

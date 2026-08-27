@@ -80,6 +80,7 @@ nav:
       - Speed up indexing: how-to/indexing-performance.md
       - Monitor indexing: how-to/monitor-indexing.md
       - Running a worker fleet: how-to/worker-fleet.md
+      - Separate graph-query service: how-to/graph-query-service.md
       - Capacity planning: how-to/capacity-planning.md
       - Attach to a Synapse fleet: how-to/attach-to-synapse.md
       - Export a corpus as Parquet: how-to/parquet-exports.md

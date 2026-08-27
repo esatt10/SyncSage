@@ -125,6 +125,10 @@ class VectorStore(Protocol):
 
     def count(self) -> int: ...
 
+    def dimensions(self) -> int | None:
+        """Stored vector width without materializing the vector index."""
+        ...
+
     def existing_ids(self, chunk_ids: list[str]) -> set[str]: ...
 
     def source_chunk_ids(self, source_id: str) -> set[str]: ...
@@ -709,6 +713,17 @@ class NumpyVectorStore:
     def count(self) -> int:
         return len(self._items())
 
+    def dimensions(self) -> int | None:
+        items = self._items()
+        if not items:
+            return None
+        blob = str(next(iter(items.values())).get("v") or "")
+        if not blob:
+            return None
+        # Vectors are packed float32 values. Inspecting the encoded byte width
+        # avoids decoding every vector merely to render the settings page.
+        return len(base64.b64decode(blob.encode("ascii"))) // 4
+
     def existing_ids(self, chunk_ids: list[str]) -> set[str]:
         items = self._items()
         return {chunk_id for chunk_id in chunk_ids if chunk_id in items}
@@ -871,6 +886,14 @@ class LanceDBVectorStore:
     def count(self) -> int:
         table = self._table()
         return 0 if table is None else table.count_rows()
+
+    def dimensions(self) -> int | None:
+        table = self._table()
+        if table is None:
+            return None
+        vector_type = table.schema.field("vector").type
+        width = getattr(vector_type, "list_size", None)
+        return int(width) if width is not None else None
 
     def existing_ids(self, chunk_ids: list[str]) -> set[str]:
         with self._id_cache_lock:

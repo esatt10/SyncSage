@@ -1,28 +1,26 @@
-# The serving tier. Stateless, horizontally scalable, and it never indexes:
-# a sync request here is published to the queue for the indexer to run.
+# The graph-query tier owns the published snapshot for all API replicas.
+# Scale replicas for query throughput/availability; deploy one stack per
+# knowledge-base shard when a single snapshot approaches its memory ceiling.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: pheasant-api
+  name: pheasant-graph
   namespace: pheasant
   labels:
     app.kubernetes.io/name: pheasant
-    app.kubernetes.io/component: api
+    app.kubernetes.io/component: graph
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: pheasant
-      app.kubernetes.io/component: api
+      app.kubernetes.io/component: graph
   template:
     metadata:
       labels:
         app.kubernetes.io/name: pheasant
-        app.kubernetes.io/component: api
+        app.kubernetes.io/component: graph
     spec:
-      # 30s: comfortably more than the 15s drain configured in the ConfigMap,
-      # so the pod finishes draining before the kubelet escalates to SIGKILL.
-      # Raising drain_seconds without raising this kills pods mid-drain.
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -32,7 +30,7 @@ spec:
         - name: pheasant
           image: ghcr.io/esatt10/pheasant:0.10.3
           imagePullPolicy: IfNotPresent
-          args: ["serve", "--role", "api"]
+          args: ["serve", "--role", "graph"]
           ports:
             - name: http
               containerPort: 8765
@@ -53,8 +51,6 @@ spec:
             - name: config
               mountPath: /config
               readOnly: true
-            # Read-only: an api replica reads the graph the indexer wrote and
-            # must never write /state. Needs ReadWriteMany — see README.
             - name: state
               mountPath: /state
               readOnly: true
@@ -63,38 +59,32 @@ spec:
               readOnly: true
             - name: exports
               mountPath: /exports
-          # Liveness asks only "is this process gone", and slowly: pheasant
-          # answers from one Python process, so a heavy question holds the GIL
-          # and even /health waits its turn. A tight budget does not detect a
-          # problem, it invents one.
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 20
+            initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 10
             failureThreshold: 10
-          # Readiness is tighter here than on the single-container install,
-          # because with replicas it does something useful: it takes ONE pod
-          # out while the others serve. It is also how draining works — on
-          # SIGTERM this starts failing 15s before the process stops.
           readinessProbe:
             httpGet:
               path: /ready
               port: http
-            initialDelaySeconds: 10
+            initialDelaySeconds: 20
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
           resources:
             requests:
-              cpu: 500m
-              memory: 512Mi
-            limits:
-              cpu: "2"
-              # Full graph residency belongs to pheasant-graph, not each API.
+              cpu: "1"
               memory: 2Gi
+            limits:
+              cpu: "3"
+              # Reload briefly owns old + new generations. Size this for two
+              # snapshots, not just the steady graph.
+              memory: 6Gi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -118,53 +108,17 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: pheasant-api
+  name: pheasant-graph
   namespace: pheasant
   labels:
     app.kubernetes.io/name: pheasant
-    app.kubernetes.io/component: api
+    app.kubernetes.io/component: graph
 spec:
   type: ClusterIP
   selector:
     app.kubernetes.io/name: pheasant
-    app.kubernetes.io/component: api
+    app.kubernetes.io/component: graph
   ports:
     - name: http
       port: 8765
       targetPort: http
----
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: pheasant-api
-  namespace: pheasant
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: pheasant-api
-  minReplicas: 2
-  maxReplicas: 10
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
-  behavior:
-    scaleDown:
-      # Five minutes avoids replica churn under bursty assistant fan-out.
-      stabilizationWindowSeconds: 300
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: pheasant-api
-  namespace: pheasant
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: pheasant
-      app.kubernetes.io/component: api

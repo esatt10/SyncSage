@@ -17,6 +17,7 @@ Role         Watch   Schedule   Drain  Index      Typical deployment
 ``all``      yes     yes        no     in-proc    one container (the default)
 ``api``      no      no         no     **never**  N replicas behind a Service
 ``indexer``  yes     yes        yes    in-proc    one per shard, a StatefulSet
+``graph``    no      no         no     no         internal graph query service
 ``worker``   no      no         no     no         M replicas, autoscaled
 ===========  ======  =========  =====  =========  ==============================
 
@@ -48,6 +49,7 @@ class Role(StrEnum):
     ALL = "all"
     API = "api"
     INDEXER = "indexer"
+    GRAPH = "graph"
     WORKER = "worker"
 
 
@@ -114,6 +116,17 @@ POLICIES: dict[Role, RolePolicy] = {
         drains_queue=True,
         indexes_locally=True,
         serves_ui=False,
+    ),
+    Role.GRAPH: RolePolicy(
+        role=Role.GRAPH,
+        runs_watcher=False,
+        runs_scheduler=False,
+        drains_queue=False,
+        indexes_locally=False,
+        serves_ui=False,
+        # The indexer commits snapshots on shared state. Only this service
+        # reloads them when APIs use the remote graph boundary.
+        refreshes_graph=True,
     ),
     Role.WORKER: RolePolicy(
         role=Role.WORKER,

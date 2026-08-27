@@ -220,7 +220,7 @@ def test_the_api_role_starts_with_a_queue(tmp_path: Path) -> None:
     assert client.get("/health").json()["role"] == "api"
 
 
-@pytest.mark.parametrize("role", ["all", "indexer", "worker"])
+@pytest.mark.parametrize("role", ["all", "indexer", "graph", "worker"])
 def test_other_roles_need_no_queue(tmp_path: Path, role: str) -> None:
     """Only `api` depends on a queue: the rest can index or do nothing."""
 
@@ -685,10 +685,10 @@ def test_queue_drainer_parent_never_loads_the_worker_graph(
 # --------------------------------------------------------------------------
 
 
-def test_only_the_api_role_refreshes_the_graph() -> None:
-    """The other roles index their own graph and reload through the worker."""
+def test_only_query_serving_roles_refresh_the_graph() -> None:
+    """Legacy APIs and the graph service follow indexer snapshot commits."""
 
-    assert [role.value for role in Role if POLICIES[role].refreshes_graph] == ["api"]
+    assert [role.value for role in Role if POLICIES[role].refreshes_graph] == ["api", "graph"]
 
 
 def test_an_api_replica_picks_up_a_graph_another_process_wrote(tmp_path: Path) -> None:
@@ -749,6 +749,7 @@ def test_no_refresher_is_built_for_a_role_that_indexes(tmp_path: Path) -> None:
         for role in ("all", "indexer", "worker"):
             assert _graph_refresher(config, engine, resolve_role(config, role)) is None
         assert _graph_refresher(config, engine, resolve_role(config, "api")) is not None
+        assert _graph_refresher(config, engine, resolve_role(config, "graph")) is not None
 
         # And it is switchable off, for a deployment where the graph is not
         # shared between pods at all.
@@ -835,6 +836,7 @@ def test_background_services_start_only_for_their_roles(tmp_path: Path, monkeypa
     assert sorted(run_for("all")) == ["scheduler", "ui", "watcher"]
     assert sorted(run_for("api")) == ["refresher", "ui"]
     assert sorted(run_for("indexer")) == ["drainer", "scheduler", "watcher"]
+    assert sorted(run_for("graph")) == ["refresher"]
     assert sorted(run_for("worker")) == []
 
 

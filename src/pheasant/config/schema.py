@@ -267,8 +267,9 @@ class ServerSettings(ModelMixin):
     port: int = 8765
     #: Which jobs this process takes on: ``all`` (the default and today's
     #: behavior), ``api`` (serve only — publishes index work instead of
-    #: running it), ``indexer`` (watch, schedule and drain the queue) or
-    #: ``worker`` (preparation only). `pheasant serve --role` overrides this.
+    #: running it), ``indexer`` (watch, schedule and drain the queue),
+    #: ``graph`` (serve the resident graph only), or ``worker`` (preparation
+    #: only). `pheasant serve --role` overrides this.
     #: See :mod:`pheasant.deployment.roles`.
     role: str = "all"
     mcp: McpSettings = field(default_factory=McpSettings)
@@ -627,6 +628,17 @@ class SyncSettings(ModelMixin):
 @dataclass
 class GraphSettings(ModelMixin):
     """How much graph the knowledge graph should actually keep."""
+
+    #: Optional internal graph-query service. When set, API and MCP serving
+    #: processes keep no persisted graph in RAM and send graph reads to this
+    #: endpoint instead. Standalone remains in-process when this is ``None``.
+    query_service_url: str | None = None
+    #: Bearer token environment variable shared by graph clients and the
+    #: graph-service role. The secret itself never belongs in YAML.
+    query_service_token_env: str = "PHEASANT_GRAPH_SERVICE_TOKEN"
+    #: Per-call deadline. Graph/hybrid search fails explicitly at this bound;
+    #: it never falls back to loading a full graph into an API replica.
+    query_service_timeout_seconds: float = 30.0
 
     #: Wire agent-memory records into the graph (Step 33.7): `about` edges to
     #: what a record refers to, plus `supersedes` between corrections. A no-op

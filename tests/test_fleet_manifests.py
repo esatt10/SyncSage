@@ -122,7 +122,7 @@ def test_every_workload_passes_a_role_this_code_knows(scaled: list[dict[str, Any
         assert args[1] == "--role"
         assert args[2] in valid, f"unknown role {args[2]!r}"
         seen.add(args[2])
-    assert seen == {"api", "indexer", "worker"}
+    assert seen == {"api", "graph", "indexer", "worker"}
 
 
 def test_the_embedded_configs_are_valid_for_the_role_that_uses_them(
@@ -217,6 +217,10 @@ def test_api_replicas_mount_state_read_only(scaled: list[dict[str, Any]]) -> Non
     api = next(w for w in _workloads(scaled) if _container(w)["args"][2] == "api")
     mounts = {mount["name"]: mount for mount in _container(api)["volumeMounts"]}
     assert mounts["state"].get("readOnly") is True
+
+    graph = next(w for w in _workloads(scaled) if _container(w)["args"][2] == "graph")
+    graph_mounts = {mount["name"]: mount for mount in _container(graph)["volumeMounts"]}
+    assert graph_mounts["state"].get("readOnly") is True
 
     indexer = next(w for w in _workloads(scaled) if _container(w)["args"][2] == "indexer")
     indexer_mounts = {mount["name"]: mount for mount in _container(indexer)["volumeMounts"]}
@@ -510,7 +514,7 @@ def test_compose_manifests_live_under_the_deployment_directory() -> None:
 
 
 def test_the_compose_fleet_has_the_high_throughput_topology() -> None:
-    """Three Pheasant tiers, one migrator, and durable infrastructure."""
+    """Four Pheasant tiers, one migrator, and durable infrastructure."""
 
     compose = yaml.safe_load(COMPOSE_FLEET.read_text(encoding="utf-8"))
     services = compose["services"]
@@ -520,16 +524,17 @@ def test_the_compose_fleet_has_the_high_throughput_topology() -> None:
         "db-init",
         "workspace-init",
         "api",
+        "graph",
         "indexer",
         "worker",
     }
 
     roles = {}
-    for name in ("api", "indexer"):
+    for name in ("api", "graph", "indexer"):
         command = services[name]["command"]
         assert command[:2] == ["serve", "--role"]
         roles[name] = command[2]
-    assert roles == {"api": "api", "indexer": "indexer"}
+    assert roles == {"api": "api", "graph": "graph", "indexer": "indexer"}
 
     worker_command = services["worker"]["command"]
     assert worker_command[:3] == ["worker", "--transport", "grpc"]
@@ -537,7 +542,7 @@ def test_the_compose_fleet_has_the_high_throughput_topology() -> None:
     assert "scale" not in services["indexer"]
 
     assert services["db-init"]["restart"] == "no"
-    for name in ("api", "indexer"):
+    for name in ("api", "graph", "indexer"):
         assert services[name]["depends_on"]["db-init"] == {
             "condition": "service_completed_successfully"
         }
@@ -586,7 +591,7 @@ def test_the_compose_configs_are_valid_for_their_roles() -> None:
         yaml.safe_load((COMPOSE_CONFIG / "worker.yaml").read_text(encoding="utf-8"))
     )
 
-    for role in ("api", "indexer"):
+    for role in ("api", "graph", "indexer"):
         validate_role(resolve_role(fleet, role), fleet)
     validate_role(resolve_role(worker, "worker"), worker)
 
@@ -599,6 +604,8 @@ def test_the_compose_configs_are_valid_for_their_roles() -> None:
     assert fleet.sync.concurrency.worker_transport == "grpc"
     assert worker.sync.concurrency.remote_worker_enabled is True
     assert fleet.server.api.drain_seconds > 0
+    assert fleet.graph.query_service_url == "http://graph:8765"
+    assert fleet.graph.query_service_token_env == "PHEASANT_GRAPH_SERVICE_TOKEN"
 
 
 def test_the_three_compose_profiles_cover_small_advanced_and_fleet() -> None:
