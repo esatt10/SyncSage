@@ -45,7 +45,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.27,<2"]
+mcp = ["mcp>=2.1,<3"]
 vector = ["lancedb>=0.6"]
 # Phase 35.2: the Postgres state backend. Gated so a standalone region —
 # which is every default install — carries no database driver and the

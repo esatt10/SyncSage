@@ -7,6 +7,7 @@ from typing import Any
 from pheasant.config.schema import PheasantConfig
 from pheasant.graph.exporter import node_link
 from pheasant.mcp_server.tools import PheasantTools
+from pheasant.version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -25,29 +26,23 @@ def create_mcp_tools(config: PheasantConfig) -> PheasantTools:
 def create_mcp_server(config: PheasantConfig) -> Any:
     """Create the official MCP SDK server around the pheasant tool facade."""
 
-    try:
-        from mcp.server.fastmcp import FastMCP
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "The MCP runtime is not installed. Install pheasant with the mcp extra "
-            "or use the Docker image, which includes it."
-        ) from exc
-
+    server_class = _mcp_server_class()
     tools = create_mcp_tools(config)
-    mcp = FastMCP(
+    mcp = server_class(
+        # Keep the name positional and everything else keyword: SDK 2.x
+        # inserted `title` and `description` ahead of `instructions` in the
+        # positional order, so a positional second argument now silently
+        # lands in `title` and the server stops sending instructions at all.
         "pheasant",
         instructions=(
             "Use pheasant to sync configured knowledge sources, search indexed context, "
             "inspect graph relationships, and record or recall agent memory."
         ),
-        # Stateless by design, and load-bearing for horizontal scale (Phase
-        # 35.6): with no per-session server state, two requests from one agent
-        # may land on different replicas and both answer correctly. A sticky
-        # session would make the replica count a lie. Pinned by a test.
-        stateless_http=True,
-        json_response=True,
+        # An unversioned SDK 2.x server reports an empty `serverInfo.version`
+        # (1.x reported the SDK's own version, which was never pheasant's).
+        # An agent logging which region answered it should see the release.
+        version=__version__,
     )
-    _configure_transport_settings(mcp, config)
 
     @mcp.tool()
     def list_knowledge_bases() -> dict:
@@ -580,35 +575,83 @@ def create_mcp_server(config: PheasantConfig) -> Any:
     return mcp
 
 
-def _apply_transport_security(settings: Any, config: PheasantConfig) -> None:
-    """Point FastMCP's DNS-rebinding guard at pheasant's own CORS policy.
+# The SDK's own allow-list for a server bound to loopback. Kept as the floor
+# pheasant only ever widens from, so a config that never mentions CORS behaves
+# exactly as the SDK intends.
+_LOOPBACK_HOSTS = ("127.0.0.1:*", "localhost:*", "[::1]:*")
+_LOOPBACK_ORIGINS = ("http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*")
 
-    FastMCP defaults the guard to ``127.0.0.1``/``localhost``/``[::1]`` only,
-    which is right for a laptop and wrong for the container this normally runs
-    in: reach the very same server as ``http://pheasant:8765`` or by LAN IP and
-    every MCP request answers **421 Misdirected Request**.
 
-    Rather than invent a second allow-list, this derives one from
-    ``server.api.cors_origins`` — the knob an operator already uses to say who
-    may reach this API — and honours ``cors_allow_all_origins`` as the same
-    documented escape hatch it already is. FastMCP's localhost defaults are
+def _mcp_server_class() -> Any:
+    """Import the SDK server class, or explain which half of it is missing.
+
+    Two failures look identical from a traceback and need opposite fixes: the
+    ``[mcp]`` extra was never installed, or it is installed at 1.x, where the
+    class was ``mcp.server.fastmcp.FastMCP``. 2.x renamed it to
+    ``mcp.server.mcpserver.MCPServer`` and left the old module raising
+    ``ModuleNotFoundError`` deliberately, so distinguish the two here rather
+    than let a 1.x install read as "no MCP runtime".
+    """
+
+    try:
+        from mcp.server.mcpserver import MCPServer
+    except ModuleNotFoundError as exc:
+        try:
+            import mcp  # noqa: F401
+        except ModuleNotFoundError:
+            raise RuntimeError(
+                "The MCP runtime is not installed. Install pheasant with the mcp extra "
+                "or use the Docker image, which includes it."
+            ) from exc
+        raise RuntimeError(
+            "pheasant needs MCP SDK 2.x (mcp>=2.1,<3); the installed mcp package is 1.x, "
+            "where the server class was still FastMCP. Reinstall pheasant with the mcp "
+            "extra to pick it up."
+        ) from exc
+    return MCPServer
+
+
+def _transport_security(config: PheasantConfig) -> Any:
+    """Build the DNS-rebinding guard from pheasant's own CORS policy.
+
+    Two failures sit either side of this function, and the SDK's default hits
+    one or the other depending on the bind address — never the thing pheasant
+    wants.
+
+    Too narrow: the SDK's own allow-list is ``127.0.0.1``/``localhost``/
+    ``[::1]`` only, which is right for a laptop and wrong for the container
+    this normally runs in. Reach the very same server as
+    ``http://pheasant:8765`` or by LAN IP and every MCP request answers
+    **421 Misdirected Request**.
+
+    Too wide: the SDK only reaches for that allow-list when the bind address
+    is loopback — a decision 1.x took from the constructor's own default (so
+    pheasant got the guard whatever it bound) and 2.x takes in
+    ``streamable_http_app()``/``run()`` from the real one. pheasant binds
+    ``0.0.0.0``, so the 2.x default is no guard at all: every host admitted,
+    in every container deployment, with nothing raised to say so. Passing
+    these settings explicitly is what keeps the guard on.
+
+    Between the two, rather than invent a second allow-list, this derives one
+    from ``server.api.cors_origins`` — the knob an operator already uses to
+    say who may reach this API — and honours ``cors_allow_all_origins`` as the
+    same documented escape hatch it already is. The SDK's loopback entries are
     kept alongside, so this only ever *widens* to hosts the operator already
-    admitted, and a config that never mentions CORS behaves as FastMCP intends.
+    admitted, and a config that never mentions CORS behaves as the SDK
+    intends for a laptop.
     """
     from urllib.parse import urlsplit
 
-    security = getattr(settings, "transport_security", None)
-    if security is None:
-        return
+    from mcp.server.transport_security import TransportSecuritySettings
+
     api = config.server.api
     if getattr(api, "cors_allow_all_origins", False):
         # The operator has declared this API open (their own authenticating
         # ingress fronts it). Refusing MCP on host grounds here would be
         # inconsistent with every other route on the same port.
-        security.enable_dns_rebinding_protection = False
-        return
-    hosts = list(security.allowed_hosts)
-    origins = list(security.allowed_origins)
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    hosts = list(_LOOPBACK_HOSTS)
+    origins = list(_LOOPBACK_ORIGINS)
     for origin in api.cors_origins or []:
         parsed = urlsplit(origin)
         if not parsed.netloc:
@@ -617,8 +660,32 @@ def _apply_transport_security(settings: Any, config: PheasantConfig) -> None:
             hosts.append(parsed.netloc)
         if origin not in origins:
             origins.append(origin)
-    security.allowed_hosts = hosts
-    security.allowed_origins = origins
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=hosts,
+        allowed_origins=origins,
+    )
+
+
+def _streamable_http_options(config: PheasantConfig) -> dict[str, Any]:
+    """Streamable-HTTP transport options, in one place for both entry points.
+
+    SDK 2.x moved these off the server constructor and deleted the settings
+    object that used to carry them, so the mounted ASGI app and
+    ``pheasant mcp --transport streamable-http`` have to be handed the same
+    dict or they drift apart.
+
+    ``stateless_http`` is by design, and load-bearing for horizontal scale
+    (Phase 35.6): with no per-session server state, two requests from one
+    agent may land on different replicas and both answer correctly. A sticky
+    session would make the replica count a lie. Pinned by a test.
+    """
+    return {
+        "json_response": True,
+        "stateless_http": True,
+        "transport_security": _transport_security(config),
+        "host": config.server.host,
+    }
 
 
 def streamable_http_app(config: PheasantConfig) -> Any:
@@ -641,46 +708,46 @@ def streamable_http_app(config: PheasantConfig) -> Any:
         return None
     try:
         mcp = create_mcp_server(config)
-        # The route inside FastMCP's app becomes the *mount* point's suffix, so
-        # its internal path has to be "/" — leaving it at "/mcp" while mounting
-        # at "/mcp" would serve "/mcp/mcp". Mounting the app at "/" instead
-        # would put an ASGI catch-all ahead of the UI's static files.
-        settings = getattr(mcp, "settings", None)
-        if settings is not None:
-            settings.streamable_http_path = "/"
-            _apply_transport_security(settings, config)
-        return mcp.streamable_http_app()
+        # The route inside the SDK's app becomes the *mount* point's suffix,
+        # so its internal path has to be "/" — leaving it at "/mcp" while
+        # mounting at "/mcp" would serve "/mcp/mcp". Mounting the app at "/"
+        # instead would put an ASGI catch-all ahead of the UI's static files.
+        return mcp.streamable_http_app(
+            streamable_http_path="/",
+            **_streamable_http_options(config),
+        )
     except Exception:  # pragma: no cover - depends on the installed mcp version
         logger.warning("MCP streamable-http app unavailable; /mcp not mounted", exc_info=True)
         return None
 
 
 def run_mcp_server(config: PheasantConfig, transport: str = "stdio") -> None:
-    """Run the MCP server with the selected transport."""
+    """Run the MCP server with the selected transport.
+
+    Every transport parameter is passed here rather than to the constructor:
+    SDK 2.x takes them on ``run()``, per transport, and raises ``TypeError``
+    on a keyword the chosen transport does not accept.
+    """
 
     mcp = create_mcp_server(config)
     if transport == "stdio":
-        mcp.run(transport=transport)
+        mcp.run(transport="stdio")
         return
-    path = "/mcp" if transport == "streamable-http" else "/sse"
-    try:
-        mcp.run(transport=transport, host=config.server.host, port=config.server.port, path=path)
-    except TypeError:
-        mcp.run(transport=transport)
-
-
-def _configure_transport_settings(mcp: Any, config: PheasantConfig) -> None:
-    settings = getattr(mcp, "settings", None)
-    if settings is None:
+    if transport == "sse":
+        mcp.run(
+            transport="sse",
+            host=config.server.host,
+            port=config.server.port,
+            sse_path="/sse",
+            transport_security=_transport_security(config),
+        )
         return
-    for name, value in {
-        "host": config.server.host,
-        "port": config.server.port,
-        "streamable_http_path": "/mcp",
-        "sse_path": "/sse",
-    }.items():
-        if hasattr(settings, name):
-            setattr(settings, name, value)
+    mcp.run(
+        transport=transport,
+        port=config.server.port,
+        streamable_http_path="/mcp",
+        **_streamable_http_options(config),
+    )
 
 
 def _json(payload: Any) -> str:

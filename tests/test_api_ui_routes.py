@@ -534,7 +534,7 @@ sources: []
     }
     headers = {"accept": "application/json, text/event-stream"}
     try:
-        # The `with` matters: FastMCP's session manager starts in the app's
+        # The `with` matters: the SDK's session manager starts in the app's
         # lifespan, and mounting a sub-app does not run its lifespan for it.
         with fastapi_testclient.TestClient(app, base_url="http://localhost:8765") as client:
             advertised = client.get("/mcp/info").json()
@@ -564,11 +564,18 @@ sources: []
 def test_mcp_transport_security_follows_the_configured_cors_origins(tmp_path) -> None:
     """A container is not reached at `localhost`, and MCP must survive that.
 
-    FastMCP's DNS-rebinding guard allows only 127.0.0.1/localhost/[::1] by
+    The SDK's DNS-rebinding guard allows only 127.0.0.1/localhost/[::1] by
     default, so the same server reached as `http://pheasant:8765` answers 421
     Misdirected Request to every MCP call. pheasant already has an operator
     knob for who may reach this API — `server.api.cors_origins` — so the guard
     is driven from that rather than from a second, separate allow-list.
+
+    The second assertion does more work than it looks like since SDK 2.x: the
+    guard is no longer auto-enabled from a constructor default but from the
+    *real* bind address handed to `streamable_http_app()`, and pheasant binds
+    `0.0.0.0`. Leave transport security to the SDK's default there and DNS
+    rebinding protection is off entirely — every host admitted, no error, and
+    nothing else in the suite the wiser.
     """
     pytest.importorskip("mcp")
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
@@ -608,7 +615,7 @@ sources: []
     headers = {"accept": "application/json, text/event-stream"}
 
     def handshake_status(host: str) -> int:
-        # A fresh app per call: FastMCP's session manager refuses to `run()`
+        # A fresh app per call: the SDK's session manager refuses to `run()`
         # twice, so two TestClient contexts cannot share one app.
         app = create_app(load_config(config_path), config_path=str(config_path))
         try:
@@ -622,3 +629,134 @@ sources: []
     )
     # Narrowed to the operator's list, not switched off.
     assert handshake_status("evil.example:8765") == 421, "an unlisted host should be refused"
+
+
+@pytest.mark.asyncio
+async def test_the_mounted_mcp_endpoint_speaks_the_modern_protocol_revision(tmp_path) -> None:
+    """The point of the SDK 2.x upgrade, pinned so a slide back is loud.
+
+    Everything else about the MCP surface is revision-agnostic — the same
+    tools, resources and prompts answer on SDK 1.x, whose newest protocol is
+    2025-11-25 — so a dependency that resolved back to 1.x would pass every
+    other MCP test in this file while every 2026-era client renegotiated down.
+
+    It has to be a real client, not a hand-rolled `initialize` POST: the
+    2026-07-28 revision does not use `initialize` at all, so the raw
+    handshake the sibling tests send is inherently a legacy one and is
+    answered — correctly — with the newest *legacy* revision. Driving the
+    mounted app through `httpx2.ASGITransport` connects the way a 2026-era
+    agent will, without a socket.
+
+    The serverInfo assertion pins a second thing the upgrade changed: 1.x
+    reported the *SDK's* version as the server's, so `/mcp` announced itself
+    to every agent as "1.29.1". 2.x reports an empty string unless the server
+    names itself, which pheasant now does.
+    """
+    pytest.importorskip("mcp")
+    import httpx2
+    from mcp import Client
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.types import LATEST_PROTOCOL_VERSION
+
+    from pheasant.api.app import create_app
+    from pheasant.config.loader import load_config
+    from pheasant.version import __version__
+
+    assert LATEST_PROTOCOL_VERSION >= "2026-07-28", (
+        "the installed MCP SDK predates the 2026-07-28 protocol revision; "
+        "pheasant declares mcp>=2.1,<3"
+    )
+
+    config_path = tmp_path / "pheasant.yaml"
+    config_path.write_text(
+        f"""pheasant:
+  name: mcp-protocol
+  state_path: {tmp_path / "state"}
+  exports_path: {tmp_path / "exports"}
+  workspace_root: {tmp_path}
+sync:
+  watcher:
+    enabled: false
+  scheduler:
+    enabled: false
+sources: []
+""",
+        encoding="utf-8",
+    )
+    app = create_app(load_config(config_path), config_path=str(config_path))
+    base = "http://localhost:8765"
+    try:
+        # The lifespan is what starts the session manager; a mounted sub-app
+        # never runs its own, which is why the API app enters it by hand.
+        async with app.router.lifespan_context(app):
+            async with httpx2.AsyncClient(
+                transport=httpx2.ASGITransport(app=app), base_url=base
+            ) as http_client:
+                transport = streamable_http_client(f"{base}/mcp/", http_client=http_client)
+                async with Client(transport) as client:
+                    assert client.protocol_version == LATEST_PROTOCOL_VERSION
+                    assert client.server_info is not None
+                    assert client.server_info.name == "pheasant"
+                    assert client.server_info.version == __version__
+                    assert client.instructions, "the model-facing instructions must still be sent"
+                    tools = await client.list_tools()
+                    assert {"search_context", "memory_write"} <= {t.name for t in tools.tools}
+    finally:
+        app.state.engine.close()
+
+
+def test_mcp_transport_security_honours_the_cors_escape_hatch(tmp_path) -> None:
+    """`cors_allow_all_origins` opens MCP too, or it opens nothing.
+
+    The knob means "my own authenticating ingress fronts this"; refusing MCP
+    on host grounds while every other route on the same port answers would be
+    an inconsistency an operator has no way to resolve.
+    """
+    pytest.importorskip("mcp")
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from pheasant.api.app import create_app
+    from pheasant.config.loader import load_config
+
+    config_path = tmp_path / "pheasant.yaml"
+    config_path.write_text(
+        f"""pheasant:
+  name: mcp-open
+  state_path: {tmp_path / "state"}
+  exports_path: {tmp_path / "exports"}
+  workspace_root: {tmp_path}
+server:
+  api:
+    cors_allow_all_origins: true
+sync:
+  watcher:
+    enabled: false
+  scheduler:
+    enabled: false
+sources: []
+""",
+        encoding="utf-8",
+    )
+    handshake = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "pheasant-tests", "version": "1"},
+        },
+    }
+    app = create_app(load_config(config_path), config_path=str(config_path))
+    try:
+        with fastapi_testclient.TestClient(app, base_url="http://anywhere.example:8765") as client:
+            response = client.post(
+                "/mcp/",
+                json=handshake,
+                headers={"accept": "application/json, text/event-stream"},
+            )
+            assert response.status_code == 200, (
+                "an operator who allowed every origin should not be refused by the "
+                f"MCP host guard (HTTP {response.status_code})"
+            )
+    finally:
+        app.state.engine.close()

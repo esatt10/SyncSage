@@ -607,14 +607,20 @@ def test_the_mcp_server_is_stateless(tmp_path: Path) -> None:
 
     pytest.importorskip("mcp", reason="the [mcp] extra is optional")
 
-    from pheasant.mcp_server.server import create_mcp_server
+    from pheasant.mcp_server.server import streamable_http_app
 
     config = _config(tmp_path, state_name="mcp")
-    server = create_mcp_server(config)
 
-    settings = server.settings
-    assert settings.stateless_http is True
-    assert settings.json_response is True
+    # Read off the app pheasant actually mounts, not off a settings object:
+    # MCP SDK 2.x moved transport configuration onto `streamable_http_app()`
+    # and deleted the constructor fields this used to assert on, so a server
+    # built without those keywords is a *stateful* one that still passes any
+    # assertion made against the constructor.
+    app = streamable_http_app(config)
+    assert app is not None, "the streamable-http transport is on by default"
+    session_manager = app.routes[0].endpoint.session_manager
+    assert session_manager.stateless is True
+    assert session_manager.json_response is True
 
 
 def test_the_mcp_instructions_do_not_advertise_a_removed_tool(tmp_path: Path) -> None:

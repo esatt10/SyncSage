@@ -85,7 +85,7 @@ pheasant-kb/
 │   │                            bridge, maintenance, benchmark
 │   ├── persistence/           ← state_store, backends (sqlite|postgres),
 │   │                            schema, graph_store, manifest, migrate, paths
-│   ├── mcp_server/            ← server.py (FastMCP), tools.py (PheasantTools)
+│   ├── mcp_server/            ← server.py (MCPServer), tools.py (PheasantTools)
 │   ├── api/app.py             ← the HTTP surface
 │   ├── assistant/             ← grounded answering + workflows
 │   ├── sandbox/               ← WASM runtime, sandboxed connector, accel/
@@ -406,6 +406,18 @@ Each of these cost real time. They are listed because the shape recurs.
   published nothing and reported it as a *skipped* run — indistinguishable
   from having nothing to do. #52 sat live on main with no image for four days
   behind that skip.
+- **A security default that keys off a value you override is not a default
+  you have.** MCP SDK 2.x moved transport configuration off the server
+  constructor and onto `streamable_http_app()`/`run()`, and with it the rule
+  that auto-enables DNS-rebinding protection — which fires only when the bind
+  address is loopback. 1.x read that from the *constructor's* own default, so
+  pheasant got the guard whatever it bound; 2.x reads the real address, and
+  pheasant binds `0.0.0.0`. The mechanical port compiled, served, and
+  answered every client — with host checking silently off in every container
+  deployment. `_transport_security()` now always builds the settings object
+  explicitly. Caught by `tests/test_api_ui_routes.py` asserting an unlisted
+  host still gets **421**, which is the only assertion in the suite that
+  fails when the guard disappears.
 
 ---
 

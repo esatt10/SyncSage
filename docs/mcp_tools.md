@@ -4,7 +4,9 @@ MCP is the primary agent interface. Tool responses should be compact, ranked, an
 
 ## Server transports
 
-pheasant exposes MCP through the official Python MCP SDK when the `mcp` extra is installed. The Docker image includes this runtime.
+pheasant exposes MCP through the official Python MCP SDK (`mcp>=2.1,<3`) when the `mcp` extra is installed. The Docker image includes this runtime.
+
+That SDK line speaks the **2026-07-28** protocol revision and still answers the earlier ones, so a client negotiates the newest revision both ends support and an older agent keeps working unchanged. Three transports are available — `stdio` (the default), `streamable-http`, and `sse` — selected with `--transport` and gated per deployment by `server.mcp.transports`. The streamable-HTTP endpoint is also mounted inside `pheasant serve` at `/mcp`; `GET /mcp/info` reports which transports this region offers and the URL to use.
 
 ```bash
 pheasant mcp --config /config/pheasant.yaml --transport stdio

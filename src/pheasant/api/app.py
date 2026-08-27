@@ -804,7 +804,7 @@ def create_app(
     )
 
     # Built before the lifespan so the lifespan closure can start its session
-    # manager: FastMCP's streamable-http app is useless without its own
+    # manager: the SDK's streamable-http app is useless without its own
     # lifespan running ("Task group is not initialized"), and a plain
     # app.mount() does not run a sub-app's lifespan.
     mcp_asgi_app = _mcp_asgi_app(config)
