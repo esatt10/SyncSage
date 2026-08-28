@@ -14,8 +14,11 @@ regress silently:
 from __future__ import annotations
 
 import json
+import os
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -369,3 +372,171 @@ def test_an_unknown_backend_falls_back_rather_than_failing_startup(state: StateS
         }
     )
     assert isinstance(log_queue_from_config(config, state), LogQueue)
+
+
+# --------------------------------------------------------------------------
+# Postgres: where the parameterized claim is actually contended
+# --------------------------------------------------------------------------
+
+POSTGRES_DSN = os.environ.get("PHEASANT_TEST_POSTGRES_DSN", "").strip()
+
+postgres = pytest.mark.skipif(
+    not POSTGRES_DSN,
+    reason="set PHEASANT_TEST_POSTGRES_DSN to a throwaway database to run the log-queue race test",
+)
+
+
+def _pg_stores() -> tuple[Any, list[Any]]:
+    from pheasant.persistence.backends import PostgresBackend
+
+    stores: list[Any] = []
+
+    def new_store() -> StateStore:
+        store = StateStore(backend=PostgresBackend(POSTGRES_DSN, pool_size=6))
+        stores.append(store)
+        return store
+
+    return new_store, stores
+
+
+@postgres
+def test_the_log_claim_is_race_free_on_postgres() -> None:
+    """The claim was parameterized by table so the log tier could reuse it
+    rather than copy it. SQLite cannot tell whether that broke anything --
+    one writer at a time means two claimants are serialized by the file lock
+    and every guard is redundant. Postgres runs them concurrently, and under
+    READ COMMITTED the loser's UPDATE re-evaluates its WHERE after the winner
+    commits, which is what the outer `status`/`visible_at` clauses are for.
+
+    The sibling of `test_the_claim_statement_is_race_free_on_postgres`, and
+    the reason the two queues share one implementation of this statement.
+    """
+
+    pytest.importorskip("psycopg", reason="the [postgres] extra is optional")
+    new_store, stores = _pg_stores()
+
+    seed = new_store()
+    seed.migrate()
+    seed.execute("DELETE FROM log_tasks", ())
+    queue = LogQueue(seed)
+    for index in range(20):
+        queue.publish(LogTask(id=f"pg-log-{index}", payload={"events": []}))
+
+    claimed: list[str] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(5)
+
+    def worker(name: str) -> None:
+        own = LogQueue(new_store())
+        barrier.wait(timeout=15)
+        while True:
+            task = own.claim(name, visibility_seconds=300.0)
+            if task is None:
+                return
+            with lock:
+                claimed.append(task.id)
+
+    threads = [threading.Thread(target=worker, args=(f"pg-l{index}",)) for index in range(5)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        assert sorted(claimed) == sorted(f"pg-log-{index}" for index in range(20))
+        assert len(claimed) == len(set(claimed)), "two workers claimed the same batch"
+    finally:
+        for store in stores:
+            store.close()
+
+
+@postgres
+def test_the_two_queues_do_not_contend_on_postgres() -> None:
+    """Separate tables, so an indexer draining sources and a logger draining
+    batches never see each other's rows -- the isolation this is a second
+    table for."""
+
+    pytest.importorskip("psycopg", reason="the [postgres] extra is optional")
+    new_store, stores = _pg_stores()
+    try:
+        seed = new_store()
+        seed.migrate()
+        seed.execute("DELETE FROM log_tasks", ())
+        seed.execute("DELETE FROM index_tasks", ())
+
+        index_queue, log_queue = LocalQueue(seed), LogQueue(seed)
+        index_queue.publish(IndexTask(id="idx-a", source_id="docs"))
+        log_queue.publish(LogTask(id="log-a", payload={"events": []}))
+
+        assert index_queue.claim("i").id == "idx-a"
+        assert index_queue.claim("i") is None
+        assert log_queue.claim("l").id == "log-a"
+        assert log_queue.claim("l") is None
+    finally:
+        for store in stores:
+            store.close()
+
+
+@postgres
+def test_the_ledger_round_trips_on_postgres() -> None:
+    """Three shapes this repo has already been bitten by, all on this path:
+    a declared FK a maintenance path violates, a discarded `cursor.rowcount`,
+    and `INSERT OR IGNORE` where `ON CONFLICT DO NOTHING` is required. The
+    ledger's idempotent insert and its bounded chunked delete exercise the
+    last two directly."""
+
+    pytest.importorskip("psycopg", reason="the [postgres] extra is optional")
+    new_store, stores = _pg_stores()
+    try:
+        store = new_store()
+        store.migrate()
+        store.execute("DELETE FROM interaction_events", ())
+
+        events = [_event(index) for index in range(1200)]
+        assert write_events(store, events) == 1200
+        # Redelivery: the portable ON CONFLICT form, not SQLite's INSERT OR
+        # IGNORE, which Postgres does not have at all.
+        assert write_events(store, events) == 1200
+        assert hot_row_count(store) == 1200
+
+        settings = PheasantConfig().observability.interactions
+        settings.hot_retention_days = 0
+        store.execute(
+            "UPDATE interaction_events SET started_at=?", ("2020-03-04T05:06:07.000000Z",)
+        )
+        # Crosses the 500-row delete chunk boundary several times.
+        report = roll(store, settings, exports_path=Path("/tmp"))
+        assert report["rolled"] == 1200
+        assert hot_row_count(store) == 0
+    finally:
+        for store in stores:
+            store.close()
+
+
+@postgres
+def test_the_new_tables_are_in_the_postgres_schema_probe() -> None:
+    """`_migrate_postgres` skips DDL when a marker says the schema is current.
+    A table absent from the `required` probe is a table a stale marker can
+    skip -- which is why index_tasks, source_leases and sync_fingerprints are
+    all listed there."""
+
+    pytest.importorskip("psycopg", reason="the [postgres] extra is optional")
+    import inspect
+
+    from pheasant.persistence.state_store import StateStore as Store
+
+    source = inspect.getsource(Store._migrate_postgres)
+    assert '"log_tasks"' in source
+    assert '"interaction_events"' in source
+
+    new_store, stores = _pg_stores()
+    try:
+        store = new_store()
+        store.migrate()
+        # Replaying is idempotent and leaves both tables usable.
+        store.migrate()
+        for table in ("log_tasks", "interaction_events"):
+            assert store.backend.table_columns(table)
+    finally:
+        for store in stores:
+            store.close()
