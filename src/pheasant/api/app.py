@@ -406,6 +406,15 @@ def _state_is_writable(config: PheasantConfig, state: object) -> bool:
     `docker-compose.scale.yml` mounts `/state:ro` on API replicas so the
     indexer is the only writer, and probing beats asking an operator to
     configure per-role what the mount already decided.
+
+    Verified against the two forms that mount can take, because they are not
+    equivalent. A read-only **mount** -- what `:ro` actually is -- is reported
+    unwritable even to uid 0, since the kernel checks `MS_RDONLY` before it
+    checks anything else. Read-only **permission bits** are not: root bypasses
+    them, so this returns True and the first insert raises instead. That
+    failure is caught and counted as a dropped batch rather than surfacing to
+    a caller, so the worst case is a degraded ledger, not a broken request --
+    and the manifests express it as a mount, which is the case that works.
     """
 
     backend = str(getattr(config.storage, "backend", "sqlite") or "sqlite").lower()

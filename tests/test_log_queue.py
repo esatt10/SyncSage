@@ -540,3 +540,64 @@ def test_the_new_tables_are_in_the_postgres_schema_probe() -> None:
     finally:
         for store in stores:
             store.close()
+
+
+# --------------------------------------------------------------------------
+# Across processes, which is the only reason the queue is durable at all
+# --------------------------------------------------------------------------
+
+
+def test_a_batch_published_by_one_process_is_drained_by_another(tmp_path: Path) -> None:
+    """The property the whole tier rests on, and one an in-process fake cannot
+    show: a `--role logger` is a *different process* from the API replica that
+    observed the call. Cross-process visibility is also where this codebase has
+    been bitten before (an in-memory registry that looked fine in one process),
+    so it is asserted rather than assumed.
+    """
+
+    import subprocess
+    import sys
+    import textwrap
+
+    db = tmp_path / "p.db"
+    store = StateStore(db)
+    store.migrate()
+    QueueSink(LogQueue(store), kb_id="kb").write([_event(1), _event(2), _event(3)])
+    store.close()
+
+    # A genuinely separate interpreter, holding its own connection.
+    drained = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(f"""
+                from pheasant.persistence.state_store import StateStore
+                from pheasant.sync.log_queue import LogQueue, handle_batch, hot_row_count
+                from pheasant.sync.queue import drain
+
+                store = StateStore({str(db)!r})
+                store.migrate()
+                written = drain(
+                    LogQueue(store),
+                    lambda task: handle_batch(store, task),
+                    owner="logger-process",
+                )
+                print(sum(written), hot_row_count(store))
+                store.close()
+            """),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert drained.returncode == 0, drained.stderr
+    assert drained.stdout.split() == ["3", "3"]
+
+    # And the first process sees the result, not a stale view of its own.
+    store = StateStore(db)
+    try:
+        assert hot_row_count(store) == 3
+        assert LogQueue(store).depth()[DONE] == 1
+    finally:
+        store.close()
