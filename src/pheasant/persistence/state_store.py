@@ -216,6 +216,8 @@ class StateStore:
                 "index_tasks": "id",
                 "source_leases": "source_id",
                 "sync_fingerprints": "scope",
+                "log_tasks": "id",
+                "interaction_events": "id",
             }
             schema_present = all(
                 column in self.backend.table_columns(table) for table, column in required.items()

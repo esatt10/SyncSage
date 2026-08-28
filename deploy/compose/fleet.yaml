@@ -166,5 +166,29 @@ assistant:
     verify_citations: true
     max_facts: 32
 sources: []
+# The observation plane and its log tier. Off, exactly as it ships: turning it
+# on means recording queries and principals, which is an operator's decision
+# rather than a default. Bring up the `logger` service with it:
+#
+#   docker compose --profile observability -f docker-compose.scale.yml up
+#
+# `serve --role logger` refuses to start unless both flags below are true, so
+# a half-configured tier fails loudly instead of idling while healthy.
+observability:
+  otlp_endpoint: null
+  interactions:
+    enabled: false
+    hot_retention_days: 7
+    # Rolls expired rows to Parquet under /exports/interactions/dt=... before
+    # deleting them. That directory enforces no access control and these rows
+    # carry principals and query text -- put the access control on the volume.
+    cold_enabled: false
+    cold_retention_days: null
+    queue:
+      enabled: false
+      backend: nats
+      nats_stream: PHEASANT_LOGS
+      nats_subject: pheasant.logs.batches
+      nats_durable: pheasant-loggers
 synapse:
   publish: false

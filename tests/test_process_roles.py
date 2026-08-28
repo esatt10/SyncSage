@@ -36,6 +36,7 @@ def _config(
     sources: int = 2,
     queue: bool = False,
     role: str | None = None,
+    observability: bool = False,
 ) -> PheasantConfig:
     workspace = tmp_path / f"workspace-{state_name}"
     entries = []
@@ -67,6 +68,8 @@ def _config(
     }
     if queue:
         payload["sync"]["queue"] = {"enabled": True}
+    if observability:
+        payload["observability"] = {"interactions": {"enabled": True, "queue": {"enabled": True}}}
     if role is not None:
         payload["server"] = {"role": role}
     return PheasantConfig.model_validate(payload)
@@ -111,6 +114,7 @@ def test_every_role_has_a_policy_and_describes_itself(role: Role) -> None:
         "watcher",
         "scheduler",
         "drains_queue",
+        "drains_log_queue",
         "indexes_locally",
         "refreshes_graph",
     }
@@ -125,6 +129,24 @@ def test_only_the_indexer_drains_and_only_serving_roles_index() -> None:
         "indexer",
     ]
     assert sorted(role.value for role in Role if POLICIES[role].runs_watcher) == ["all", "indexer"]
+    # The log tier is its own drain. `all` is absent for the same reason it is
+    # absent from `drains_queue`: a single container must behave identically
+    # whether or not a queue exists, so it rolls its own logs inline on the
+    # maintenance beat instead of growing a second worker.
+    assert [role.value for role in Role if POLICIES[role].drains_log_queue] == ["logger"]
+    # And the log tier does nothing else. If this ever grows a second True,
+    # the tier has stopped being an isolated failure domain.
+    logger_policy = POLICIES[Role.LOGGER]
+    assert not any(
+        (
+            logger_policy.runs_watcher,
+            logger_policy.runs_scheduler,
+            logger_policy.drains_queue,
+            logger_policy.indexes_locally,
+            logger_policy.serves_ui,
+            logger_policy.refreshes_graph,
+        )
+    )
 
 
 def test_indexer_orchestration_has_one_leader_and_fails_over(tmp_path: Path) -> None:
@@ -802,11 +824,20 @@ def test_background_services_start_only_for_their_roles(tmp_path: Path, monkeypa
     def run_for(role: str) -> list[str]:
         bucket: list[str] = []
         started[role] = bucket
-        config = _config(tmp_path, state_name=f"svc-{role}", sources=1, queue=True)
+        config = _config(
+            tmp_path,
+            state_name=f"svc-{role}",
+            sources=1,
+            queue=True,
+            # `validate_role` refuses `logger` without it, which is the point
+            # of that guard: a log tier with nothing to drain is a pod that
+            # reports healthy and does nothing forever.
+            observability=role == "logger",
+        )
         monkeypatch.setattr(
             cli,
             "_sync_services",
-            lambda engine, cfg, config_path=None: (
+            lambda engine, cfg, config_path=None, policy=None: (
                 Recorder("watcher", bucket),
                 Recorder("scheduler", bucket),
                 threading.Lock(),
@@ -817,6 +848,13 @@ def test_background_services_start_only_for_their_roles(tmp_path: Path, monkeypa
             "_queue_drainer",
             lambda cfg, path, policy, **_kwargs: (
                 Recorder("drainer", bucket) if policy.drains_queue else None
+            ),
+        )
+        monkeypatch.setattr(
+            cli,
+            "_log_drainer",
+            lambda cfg, engine, policy: (
+                Recorder("log-drainer", bucket) if policy.drains_log_queue else None
             ),
         )
         monkeypatch.setattr(
@@ -838,6 +876,9 @@ def test_background_services_start_only_for_their_roles(tmp_path: Path, monkeypa
     assert sorted(run_for("indexer")) == ["drainer", "scheduler", "watcher"]
     assert sorted(run_for("graph")) == ["refresher"]
     assert sorted(run_for("worker")) == []
+    # The log tier runs one thing and nothing else -- no watcher, no
+    # scheduler, no index drainer, no UI. That isolation *is* the tier.
+    assert sorted(run_for("logger")) == ["log-drainer"]
 
 
 def test_a_thread_is_not_left_running_after_stop(tmp_path: Path) -> None:

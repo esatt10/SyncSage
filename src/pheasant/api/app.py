@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import threading
 import time
 from collections import deque
@@ -391,11 +392,131 @@ RETRIEVAL_FIELD_HELP: dict[str, str] = {
     "max_facts": "graph facts surfaced alongside the answer.",
 }
 
+
 #: Config sections that can be changed on a running server, and what changing
 #: one actually costs. ``True`` means the live process picks it up; ``False``
 #: means it is written to the file and needs a restart. Being honest about the
 #: difference is the whole point — a UI that says "saved" for a setting the
 #: process is still ignoring has lied to the user.
+def _state_is_writable(config: PheasantConfig, state: object) -> bool:
+    """Can this process actually write the hot store?
+
+    Under PostgreSQL, yes, from every replica -- which is why the shipped
+    fleet needs no spool at all. Under SQLite the answer is the filesystem's:
+    `docker-compose.scale.yml` mounts `/state:ro` on API replicas so the
+    indexer is the only writer, and probing beats asking an operator to
+    configure per-role what the mount already decided.
+    """
+
+    backend = str(getattr(config.storage, "backend", "sqlite") or "sqlite").lower()
+    if backend != "sqlite":
+        return True
+    path = getattr(config.storage, "sqlite_path", None)
+    if path is None:
+        return True
+    return os.access(Path(path).parent, os.W_OK)
+
+
+def _build_interaction_buffer(
+    config: PheasantConfig,
+    state: object,
+    app: FastAPI,
+    role_policy: object,
+) -> object | None:
+    """Wire the observation plane, or return ``None`` when it is off.
+
+    Never raises. Telemetry that can break startup is worse than no telemetry,
+    and this runs before anything has served a request.
+    """
+
+    settings = getattr(getattr(config, "observability", None), "interactions", None)
+    if settings is None or not getattr(settings, "enabled", False):
+        return None
+    try:
+        from pheasant.sync.log_queue import log_queue_from_config
+        from pheasant.telemetry.interactions import (
+            InteractionBuffer,
+            configure_tracing,
+            resolve_sink,
+            set_process_buffer,
+        )
+
+        configure_tracing(config.observability)
+        queue = log_queue_from_config(config, state)
+        app.state.log_queue = queue
+        sink = resolve_sink(
+            settings,
+            state=state,
+            queue=queue,
+            kb_id=config.pheasant.name,
+            state_writable=_state_is_writable(config, state),
+            owner=f"{socket.gethostname()}-{os.getpid()}",
+        )
+        buffer = InteractionBuffer(
+            sink,
+            capacity=int(getattr(settings, "buffer_size", 10_000)),
+            batch_size=int(getattr(settings, "flush_batch_size", 500)),
+            interval_seconds=float(getattr(settings, "flush_interval_seconds", 5.0)),
+        )
+        buffer.start()
+        # The mounted MCP app observes through this same buffer rather than
+        # opening a second one -- see `interactions.set_process_buffer`.
+        set_process_buffer(buffer)
+        logger.info(
+            "Observation plane on (sink=%s, role=%s). Interactions are rows with a "
+            "retention policy, never indexed content.",
+            buffer.sink_name,
+            getattr(role_policy, "name", "?"),
+        )
+        return buffer
+    except Exception:  # noqa: BLE001 - telemetry must never break startup
+        logger.warning(
+            "Could not start the observation plane; continuing without it", exc_info=True
+        )
+        return None
+
+
+def _observe_shed(
+    buffer: object | None, request: object, path: str, config: PheasantConfig
+) -> None:
+    """Record a 429 without going through `observe`.
+
+    Separate because the shed path has no handler to wrap: the response is
+    built and returned before anything else runs.
+    """
+
+    if buffer is None:
+        return
+    try:
+        from pheasant.telemetry.interactions import InteractionContext, InteractionEvent, utc_now
+
+        headers = request.headers  # type: ignore[attr-defined]
+        context = InteractionContext.create(
+            "ui",
+            principal=headers.get("x-pheasant-principal"),
+            session_id=headers.get("x-pheasant-session"),
+            client_id=headers.get("x-pheasant-client"),
+            traceparent=headers.get("traceparent"),
+        )
+        buffer.record(  # type: ignore[attr-defined]
+            InteractionEvent(
+                kb_id=config.pheasant.name,
+                operation=path,
+                modality=str(context.modality),
+                principal=context.principal,
+                session_id=context.session_id,
+                client_id=context.client_id,
+                trace_id=context.trace_id,
+                span_id=context.span_id,
+                parent_span_id=context.parent_span_id,
+                started_at=utc_now().isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                status="shed",
+            )
+        )
+    except Exception:  # noqa: BLE001 - an observation must never fail a request
+        logger.debug("could not observe a shed request", exc_info=True)
+
+
 LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
     "search": True,
     "assistant": True,
@@ -405,6 +526,11 @@ LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
     "sync": False,  # watcher/scheduler services are started at boot
     "security": False,  # path policy is read per request, but ACL wiring is not
     "synapse": True,
+    # The tracer provider, the exporter and the buffer's flusher thread are
+    # all wired once at app construction, and the log tier's queue binding
+    # with them. Same reason `sync` is False: these are services, not
+    # values read per request.
+    "observability": False,
     "storage": False,
     "server": False,
     "pheasant": False,
@@ -946,6 +1072,19 @@ def create_app(
                 async with mcp_asgi_app.router.lifespan_context(app):
                     yield
         finally:
+            buffer = getattr(app.state, "interaction_buffer", None)
+            if buffer is not None:
+                app.state.interaction_buffer = None
+                try:
+                    from pheasant.telemetry.interactions import set_process_buffer
+
+                    set_process_buffer(None)
+                    # Drains what is buffered, with a bounded join. A shutdown
+                    # that hangs on the log tier is worse than one that loses a
+                    # handful of observations.
+                    buffer.stop()
+                except Exception:  # pragma: no cover - shutdown must not raise
+                    logger.debug("could not stop the interaction buffer", exc_info=True)
             held = getattr(app.state, "metrics_queue", None)
             if held is not None:
                 app.state.metrics_queue = None
@@ -1011,6 +1150,14 @@ def create_app(
     limiter: ConcurrencyLimiter = app.state.limiter
     drain_state: DrainState = app.state.drain
 
+    # The observation plane (off by default). Built here rather than in the
+    # lifespan so a TestClient sees the same wiring a served process does, and
+    # so `interaction_buffer` is a stable attribute a route can read without
+    # caring whether observation is on.
+    app.state.log_queue = None
+    app.state.interaction_buffer = _build_interaction_buffer(config, state, app, role_policy)
+    interaction_buffer = app.state.interaction_buffer
+
     @app.middleware("http")
     async def bound_concurrency(request, call_next):  # type: ignore[no-untyped-def]
         """Admit or refuse immediately; never block.
@@ -1023,6 +1170,10 @@ def create_app(
         path = request.url.path
         if not limiter.acquire(path):
             metrics.REGISTRY.inc("pheasant_requests_shed_total", path=_metric_path(path))
+            # A shed request is still an observation: it is exactly the signal
+            # that says a formation threshold is being reached more slowly than
+            # the traffic suggests, and losing it would hide that.
+            _observe_shed(interaction_buffer, request, _metric_path(path), config)
             return JSONResponse(
                 status_code=429,
                 content={
@@ -1034,9 +1185,54 @@ def create_app(
                 headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
             )
         try:
-            return await call_next(request)
+            # `/mcp` is observed one level down, by the decorator that wraps
+            # every tool and resource. That observation names the tool and
+            # carries its criteria and results; this one could only ever say
+            # "something happened at /mcp", and recording both would
+            # double-count every call a formation threshold counts.
+            if interaction_buffer is None or path.startswith("/mcp"):
+                return await call_next(request)
+            # One bounded append per request and nothing else. Everything the
+            # ledger costs beyond this happens on the flusher thread or on the
+            # log tier — see `pheasant.telemetry.interactions`.
+            from pheasant.telemetry.interactions import InteractionContext, observe
+
+            context = InteractionContext.create(
+                _request_modality(request),
+                principal=request.headers.get("x-pheasant-principal"),
+                session_id=request.headers.get("x-pheasant-session"),
+                client_id=request.headers.get("x-pheasant-client"),
+                traceparent=request.headers.get("traceparent"),
+            )
+            with observe(
+                interaction_buffer,
+                context,
+                kb_id=config.pheasant.name,
+                operation=_metric_path(path),
+            ) as event:
+                response = await call_next(request)
+                event.status = "ok" if response.status_code < 400 else "error"
+                event.attributes["http_status"] = response.status_code
+                event.attributes["method"] = request.method
+                return response
         finally:
             limiter.release(path)
+
+    def _request_modality(request) -> str:  # type: ignore[no-untyped-def]
+        """Which surface this call arrived on.
+
+        An explicit header wins; otherwise the `/mcp` mount is the only thing
+        that can be told apart from a UI or script call by its path, and
+        everything else is `ui` — which is what the existing `audit()` closure
+        has always hardcoded. Making it a guess with a header override is
+        strictly better than making it a constant, and honest about being a
+        guess: nothing here is authenticated.
+        """
+
+        declared = request.headers.get("x-pheasant-modality")
+        if declared:
+            return declared
+        return "mcp" if request.url.path.startswith("/mcp") else "ui"
 
     def _metric_path(path: str) -> str:
         """Collapse to the first segment: a label per artifact id is a leak.

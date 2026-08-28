@@ -122,6 +122,11 @@ def test_every_workload_passes_a_role_this_code_knows(scaled: list[dict[str, Any
         assert args[1] == "--role"
         assert args[2] in valid, f"unknown role {args[2]!r}"
         seen.add(args[2])
+    # No "logger": the log tier lives in scaled/observability/, which
+    # `kubectl apply -f scaled/` does not recurse into — the Kubernetes
+    # equivalent of the Compose `observability` profile. Applying it means
+    # first editing the shared ConfigMap to record queries and principals,
+    # which must be a decision rather than a default.
     assert seen == {"api", "graph", "indexer", "worker"}
 
 
@@ -392,8 +397,14 @@ def test_the_worker_autoscaler_reads_source_and_file_backlog(scaled: list[dict[s
     assert "pheasant_index_inflight" in metrics.REGISTRY.render()
     assert "pheasant_index_preparation_backlog" in metrics.REGISTRY.render()
 
-    keda = next(doc for doc in _by_kind(scaled, "ScaledObject"))
-    assert keda["spec"]["scaleTargetRef"]["name"] == "pheasant-worker"
+    # Select by name: the log tier has its own ScaledObject, on its own
+    # backlog. Taking "the first ScaledObject" would silently start asserting
+    # about whichever manifest sorted first.
+    keda = next(
+        doc
+        for doc in _by_kind(scaled, "ScaledObject")
+        if doc["spec"]["scaleTargetRef"]["name"] == "pheasant-worker"
+    )
     assert "pheasant_index_queue_depth" in keda["spec"]["triggers"][0]["metadata"]["query"]
     assert "pheasant_index_inflight" in keda["spec"]["triggers"][0]["metadata"]["query"]
     assert "pheasant_index_preparation_backlog" in keda["spec"]["triggers"][0]["metadata"]["query"]
@@ -541,8 +552,14 @@ def test_the_compose_fleet_has_the_high_throughput_topology() -> None:
         "api",
         "graph",
         "indexer",
+        "logger",
         "worker",
     }
+    # The log tier is defined but not part of the default `up`: recording
+    # queries and principals is an operator's decision, not a default, and a
+    # logger with observation off refuses to start rather than idling green.
+    assert services["logger"]["profiles"] == ["observability"]
+    assert all("profiles" not in services[name] for name in set(services) - {"logger"})
 
     roles = {}
     for name in ("api", "graph", "indexer"):

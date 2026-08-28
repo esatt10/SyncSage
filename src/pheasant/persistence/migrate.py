@@ -53,6 +53,14 @@ TABLE_ORDER = (
     # CLAUDE.md's delete_source_artifacts note).
     "memory_compactions",
     "sync_fingerprints",
+    # The observation plane. Retention-bounded, but within its window it is
+    # what memory formation counts, so dropping it on a backend migration
+    # would silently reset every formation threshold — the same argument the
+    # memory counters make for being carried across a projection rebuild.
+    # `log_tasks` is deliberately absent alongside `index_tasks` and
+    # `source_leases`: in-flight claim state is meaningless once detached
+    # from the process that claimed it.
+    "interaction_events",
 )
 
 #: Rows per INSERT batch. Large enough that a million-row table is not a

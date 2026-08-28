@@ -522,6 +522,60 @@ def register_default_metrics(version: str) -> None:
         "neither half — they never would have become a record.",
     )
 
+    # The observation plane and its log tier. Every label set here is bounded
+    # by construction — modality is a four-value enum, operation is a tool or
+    # route name, status is ok|error|shed. Query text, principals and session
+    # ids never become labels: that is the `_metric_path` cardinality lesson,
+    # and here it is also a privacy one.
+    REGISTRY.counter(
+        "pheasant_interaction_events_total",
+        "Interactions observed, by surface, operation and outcome.",
+        ("modality", "operation", "status"),
+    )
+    # The number that says whether the tier is keeping up. A log tier falling
+    # behind must degrade to data loss, never to request latency, so this
+    # counter rising is the *designed* failure mode — but an unwatched one is
+    # silent formation starvation, since every formation threshold counts a
+    # stream this thins.
+    REGISTRY.counter(
+        "pheasant_interaction_events_dropped_total",
+        "Observations discarded rather than recorded, by reason: "
+        "'buffer_full' (the request-path ring overflowed), 'queue_full' "
+        "(the log queue is past max_queue_depth), 'no_sink' (nowhere "
+        "writable and no spool configured), or 'error'.",
+        ("reason",),
+    )
+    REGISTRY.gauge(
+        "pheasant_interaction_rows",
+        "Interaction rows currently in the hot store (/state).",
+    )
+    REGISTRY.gauge(
+        "pheasant_interaction_buffer_depth",
+        "Events buffered on this process, awaiting a flush.",
+    )
+    REGISTRY.gauge(
+        "pheasant_log_queue_depth",
+        "Log-tier batches awaiting a worker, by status. The signal a "
+        "`--role logger` tier scales on — deliberately separate from "
+        "`pheasant_index_queue_depth`, since the two queues are different "
+        "tables with different failure modes.",
+        ("status",),
+    )
+    REGISTRY.gauge(
+        "pheasant_log_dead_letters",
+        "Log batches set aside after exhausting their attempts.",
+    )
+    REGISTRY.histogram(
+        "pheasant_log_roll_seconds",
+        "One hot-to-cold roll pass (Parquet write plus the delete that follows it).",
+    )
+    REGISTRY.counter(
+        "pheasant_log_rolled_rows_total",
+        "Interaction rows moved out of the hot store, by disposition: "
+        "'cold' (written to Parquet first) or 'dropped' (cold storage off).",
+        ("disposition",),
+    )
+
     # Remote preparation workers (Phase 35.5 hardens these; the gauge exists
     # now so a scaling policy has something to read from the first release).
     REGISTRY.gauge(

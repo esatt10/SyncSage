@@ -190,8 +190,32 @@ class LocalQueue(TaskQueue):
     unkilled; it is kept because the case is real and the clause is free.
     """
 
+    #: The table this queue lives in, and the columns it carries beyond the
+    #: generic lifecycle set. Both are class-level seams so the log tier can
+    #: reuse **this** claim -- the one with the race argument above -- instead
+    #: of copying it into a second table where it could drift. The index
+    #: queue's own generated SQL is unchanged by the parameterization, and
+    #: `tests/test_log_queue.py` asserts exactly that rather than trusting it.
+    TABLE = "index_tasks"
+    EXTRA_COLUMNS: tuple[str, ...] = ("source_id", "mode")
+
     def __init__(self, state: Any) -> None:
         self.state = state
+
+    # -- subclass seams ----------------------------------------------------
+
+    def _extra_values(self, task: Any) -> tuple[Any, ...]:
+        return (task.source_id, task.mode)
+
+    def _build_task(self, row: Any) -> Any:
+        return IndexTask(
+            id=str(row["id"]),
+            source_id=str(row["source_id"]),
+            mode=str(row["mode"]),
+            payload=json.loads(row["payload"] or "{}"),
+            attempts=int(row["attempts"]),
+            max_attempts=int(row["max_attempts"]),
+        )
 
     def publish(self, task: IndexTask) -> IndexTask:
         """Enqueue a task, or re-arm one that has already run.
@@ -214,34 +238,43 @@ class LocalQueue(TaskQueue):
         """
 
         now = _now()
-        self.state.execute(
-            "INSERT INTO index_tasks("
-            "id, source_id, mode, payload, status, attempts, max_attempts, owner, "
+        self.state.execute(self._publish_sql(), self._publish_params(task, now))
+        return task
+
+    def _publish_sql(self) -> str:
+        extra = "".join(f"{name}, " for name in self.EXTRA_COLUMNS)
+        # 10 lifecycle columns (id, payload, status, attempts, max_attempts,
+        # owner, visible_at, enqueued_at, updated_at, last_error) plus whatever
+        # this queue's rows carry of their own.
+        slots = ",".join("?" for _ in range(10 + len(self.EXTRA_COLUMNS)))
+        return (
+            f"INSERT INTO {self.TABLE}("
+            f"id, {extra}payload, status, attempts, max_attempts, owner, "
             "visible_at, enqueued_at, updated_at, last_error"
-            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
+            f") VALUES({slots}) "
             "ON CONFLICT(id) DO UPDATE SET "
             "status=excluded.status, attempts=0, owner=NULL, "
             "payload=excluded.payload, max_attempts=excluded.max_attempts, "
             "visible_at=excluded.visible_at, enqueued_at=excluded.enqueued_at, "
             "updated_at=excluded.updated_at, last_error=NULL "
-            "WHERE index_tasks.status=?",
-            (
-                task.id,
-                task.source_id,
-                task.mode,
-                json.dumps(task.payload, sort_keys=True),
-                PENDING,
-                0,
-                int(task.max_attempts),
-                None,
-                _iso(now),
-                _iso(now),
-                _iso(now),
-                None,
-                DONE,
-            ),
+            f"WHERE {self.TABLE}.status=?"
         )
-        return task
+
+    def _publish_params(self, task: Any, now: datetime) -> tuple[Any, ...]:
+        return (
+            task.id,
+            *self._extra_values(task),
+            json.dumps(task.payload, sort_keys=True),
+            PENDING,
+            0,
+            int(task.max_attempts),
+            None,
+            _iso(now),
+            _iso(now),
+            _iso(now),
+            None,
+            DONE,
+        )
 
     def claim(
         self, owner: str, *, visibility_seconds: float = DEFAULT_VISIBILITY_SECONDS
@@ -254,12 +287,7 @@ class LocalQueue(TaskQueue):
             # SQLite holds the write lock against every other claimant and
             # makes the claim invisible to another process entirely.
             rows = self.state.execute_returning(
-                "UPDATE index_tasks SET status=?, owner=?, attempts=attempts+1, "
-                "visible_at=?, updated_at=? WHERE id=("
-                "  SELECT id FROM index_tasks WHERE status IN (?,?) AND visible_at<=? "
-                "  ORDER BY enqueued_at, id LIMIT 1"
-                ") AND status IN (?,?) AND visible_at<=? "
-                "RETURNING id, source_id, mode, payload, attempts, max_attempts",
+                self._claim_sql(),
                 (
                     INFLIGHT,
                     owner,
@@ -280,31 +308,42 @@ class LocalQueue(TaskQueue):
                 if not self._has_claimable(now):
                     return None
                 continue
-            row = rows[0]
-            task = IndexTask(
-                id=str(row["id"]),
-                source_id=str(row["source_id"]),
-                mode=str(row["mode"]),
-                payload=json.loads(row["payload"] or "{}"),
-                attempts=int(row["attempts"]),
-                max_attempts=int(row["max_attempts"]),
-            )
+            task = self._build_task(rows[0])
             if task.attempts > task.max_attempts:
                 self._dead_letter(task, "exceeded max_attempts before running")
                 continue
             return task
         return None
 
+    def _claim_sql(self) -> str:
+        """The conditional UPDATE the class docstring's race argument is about.
+
+        Built from :attr:`TABLE` and :attr:`EXTRA_COLUMNS` and nothing else --
+        every predicate is a literal, so parameterizing the table cannot move a
+        guard.
+        """
+
+        returning = "".join(f"{name}, " for name in self.EXTRA_COLUMNS)
+        return (
+            f"UPDATE {self.TABLE} SET status=?, owner=?, attempts=attempts+1, "
+            "visible_at=?, updated_at=? WHERE id=("
+            f"  SELECT id FROM {self.TABLE} WHERE status IN (?,?) AND visible_at<=? "
+            "  ORDER BY enqueued_at, id LIMIT 1"
+            ") AND status IN (?,?) AND visible_at<=? "
+            f"RETURNING id, {returning}payload, attempts, max_attempts"
+        )
+
     def _has_claimable(self, now: datetime) -> bool:
         rows = self.state.rows(
-            "SELECT COUNT(*) AS c FROM index_tasks WHERE status IN (?,?) AND visible_at<=?",
+            f"SELECT COUNT(*) AS c FROM {self.TABLE} WHERE status IN (?,?) AND visible_at<=?",
             (PENDING, INFLIGHT, _iso(now)),
         )
         return bool(rows and int(rows[0]["c"]) > 0)
 
     def ack(self, task: IndexTask) -> None:
         self.state.execute(
-            "UPDATE index_tasks SET status=?, owner=NULL, updated_at=?, last_error=NULL WHERE id=?",
+            f"UPDATE {self.TABLE} SET status=?, owner=NULL, updated_at=?, last_error=NULL "
+            "WHERE id=?",
             (DONE, _iso(_now()), task.id),
         )
 
@@ -314,7 +353,7 @@ class LocalQueue(TaskQueue):
             return
         now = _now()
         self.state.execute(
-            "UPDATE index_tasks SET status=?, owner=NULL, visible_at=?, updated_at=?, "
+            f"UPDATE {self.TABLE} SET status=?, owner=NULL, visible_at=?, updated_at=?, "
             "last_error=? WHERE id=?",
             (
                 PENDING,
@@ -327,14 +366,15 @@ class LocalQueue(TaskQueue):
 
     def _dead_letter(self, task: IndexTask, error: str) -> None:
         logger.error(
-            "Index task %s for source %s dead-lettered after %d attempt(s): %s",
+            "%s task %s (%s) dead-lettered after %d attempt(s): %s",
+            self.TABLE,
             task.id,
-            task.source_id,
+            getattr(task, "source_id", "-"),
             task.attempts,
             error,
         )
         self.state.execute(
-            "UPDATE index_tasks SET status=?, owner=NULL, updated_at=?, last_error=? WHERE id=?",
+            f"UPDATE {self.TABLE} SET status=?, owner=NULL, updated_at=?, last_error=? WHERE id=?",
             (DEAD, _iso(_now()), error[:500], task.id),
         )
 
@@ -343,14 +383,14 @@ class LocalQueue(TaskQueue):
     ) -> None:
         now = _now()
         self.state.execute(
-            "UPDATE index_tasks SET visible_at=?, updated_at=? WHERE id=? AND status=?",
+            f"UPDATE {self.TABLE} SET visible_at=?, updated_at=? WHERE id=? AND status=?",
             (_iso(now + timedelta(seconds=visibility_seconds)), _iso(now), task.id, INFLIGHT),
         )
 
     def depth(self) -> dict[str, int]:
         counts = {PENDING: 0, INFLIGHT: 0, DONE: 0, DEAD: 0}
         for row in self.state.rows(
-            "SELECT status, COUNT(*) AS c FROM index_tasks GROUP BY status", ()
+            f"SELECT status, COUNT(*) AS c FROM {self.TABLE} GROUP BY status", ()
         ):
             counts[str(row["status"])] = int(row["c"])
         return counts
@@ -359,10 +399,10 @@ class LocalQueue(TaskQueue):
         """Replay dead-lettered tasks after the cause is fixed."""
 
         now = _now()
-        rows = self.state.rows("SELECT id FROM index_tasks WHERE status=?", (DEAD,))
+        rows = self.state.rows(f"SELECT id FROM {self.TABLE} WHERE status=?", (DEAD,))
         for row in rows:
             self.state.execute(
-                "UPDATE index_tasks SET status=?, attempts=0, owner=NULL, visible_at=?, "
+                f"UPDATE {self.TABLE} SET status=?, attempts=0, owner=NULL, visible_at=?, "
                 "updated_at=? WHERE id=?",
                 (PENDING, _iso(now), _iso(now), str(row["id"])),
             )
@@ -373,10 +413,10 @@ class LocalQueue(TaskQueue):
 
         cutoff = _iso(_now() - timedelta(seconds=max(0.0, older_than_seconds)))
         rows = self.state.rows(
-            "SELECT id FROM index_tasks WHERE status=? AND updated_at<?", (DONE, cutoff)
+            f"SELECT id FROM {self.TABLE} WHERE status=? AND updated_at<?", (DONE, cutoff)
         )
         for row in rows:
-            self.state.execute("DELETE FROM index_tasks WHERE id=?", (str(row["id"]),))
+            self.state.execute(f"DELETE FROM {self.TABLE} WHERE id=?", (str(row["id"]),))
         return len(rows)
 
 
@@ -820,7 +860,7 @@ def drain(
             try:
                 results.append(handler(task))
             except Exception as exc:  # noqa: BLE001 - one bad source must not stop the rest
-                logger.exception("Index task %s for source %s failed", task.id, task.source_id)
+                logger.exception("Task %s (%s) failed", task.id, getattr(task, "source_id", "-"))
                 queue.nack(task, f"{type(exc).__name__}: {exc}")
                 continue
         queue.ack(task)

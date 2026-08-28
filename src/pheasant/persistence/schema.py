@@ -342,6 +342,78 @@ CREATE TABLE IF NOT EXISTS index_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_index_tasks_claim
   ON index_tasks(status, visible_at, enqueued_at);
+-- The log tier's own queue, deliberately NOT a `kind` column on index_tasks.
+-- Observations arrive at request rate against a corpus that changes hourly at
+-- most, so sharing a table would mean request-rate churn on the very index
+-- (idx_index_tasks_claim) the indexer claims from, plus the vacuum pressure
+-- that comes with it under Postgres — exactly the burden the separate tier
+-- exists to avoid. The cost of separating is small because the abstraction was
+-- already right: `drain()` is task-agnostic and is reused verbatim, and the
+-- race-free conditional-UPDATE claim stays one implementation parameterized by
+-- table name.
+--
+-- No `source_id`/`mode`: those are indexing vocabulary. A batch is opaque JSON
+-- and the payload is the whole task.
+CREATE TABLE IF NOT EXISTS log_tasks (
+  id TEXT PRIMARY KEY,
+  payload TEXT,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 2,
+  owner TEXT,
+  visible_at TEXT NOT NULL,
+  enqueued_at TEXT NOT NULL,
+  updated_at TEXT,
+  last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_log_tasks_claim
+  ON log_tasks(status, visible_at, enqueued_at);
+-- The observation plane: one row per API/MCP call, when
+-- `observability.interactions.enabled`.
+--
+-- **These are not memory records and must never become them.** A row here is
+-- never a file, never chunked, never indexed, and never returned by a search;
+-- a UI session's chat does not become knowledge because it was observed. The
+-- only path from here into memory is a *candidate* that something admits,
+-- and admission goes through MemoryStore.append like every other write. See
+-- docs/memory-formation.md.
+--
+-- Unlike every other table in this file, this one is high-churn and
+-- retention-bounded: rows are deleted once past
+-- `interactions.hot_retention_days`, after being rolled to Parquet under
+-- /exports when `cold_enabled`. That is the one sanctioned exception to
+-- "nothing is ever deleted" (CLAUDE.md rule 2) and it is why the retention is
+-- a declared, documented policy rather than an implementation detail.
+--
+-- `id` is blake2b(trace_id|span_id), so at-least-once redelivery of a batch
+-- is a no-op rather than a duplicate — the same argument index_tasks makes
+-- from content sha256, reached a different way.
+CREATE TABLE IF NOT EXISTS interaction_events (
+  id TEXT PRIMARY KEY,
+  kb_id TEXT NOT NULL,
+  trace_id TEXT NOT NULL,
+  span_id TEXT NOT NULL,
+  parent_span_id TEXT,
+  modality TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  principal TEXT,
+  session_id TEXT,
+  client_id TEXT,
+  started_at TEXT NOT NULL,
+  duration_ms REAL,
+  status TEXT NOT NULL,
+  query_text TEXT,
+  criteria_json TEXT,
+  result_ids_json TEXT,
+  result_count INTEGER,
+  top_score REAL,
+  attributes_json TEXT,
+  schema_version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_interaction_events_time
+  ON interaction_events(started_at);
+CREATE INDEX IF NOT EXISTS idx_interaction_events_session
+  ON interaction_events(session_id, started_at);
 """
 
 #: SQLite-only: WAL, plus the FTS5 virtual tables.
