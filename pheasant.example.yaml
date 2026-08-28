@@ -377,6 +377,79 @@ memory:
     # help (complementary partials, progressive refinement, abstraction).
     max_jaccard: 0.55
 
+# Tracing, and the observation plane memory formation reads.
+#
+# Both off. Turning interactions on means the region records queries and
+# principals -- an operator's decision, never a default.
+#
+# The boundary that makes it safe: an observation is a ROW with a retention
+# policy. Never a file, never chunked, never indexed, never returned by a
+# search. A UI session's chat does not become knowledge because it was
+# observed; only an explicit admission writes a memory record, and it goes
+# through the ordinary write path. See docs/memory-formation.md.
+observability:
+  # OTLP collector endpoint. null attaches no exporter at all -- spans are
+  # still created and still feed the ledger, they just do not leave the box.
+  # Exporting needs the [otel] extra.
+  otlp_endpoint: null
+  otlp_protocol: http/protobuf
+  # The NAME of the env var holding `key=value,key=value` exporter headers,
+  # never the value -- same rule as storage.dsn_env.
+  otlp_headers_env: PHEASANT_OTLP_HEADERS
+  service_name: pheasant
+  # Head sampling for EXPORTED spans only. It deliberately does not thin the
+  # ledger: sampling out a span your collector does not need should not also
+  # cost the region a data point formation counts on.
+  sample_ratio: 1.0
+  interactions:
+    enabled: false
+    # Store a placeholder instead of the query string. Identity, modality,
+    # criteria and result ids are still recorded, so the structural formation
+    # rules still work; only the lexical one goes quiet.
+    redact_query_text: false
+    # A backpressure knob, not a throughput one. The buffer is bounded and
+    # overflow drops the OLDEST event rather than blocking a request: a log
+    # tier falling behind must degrade to data loss, never to request latency.
+    buffer_size: 10000
+    flush_interval_seconds: 5.0
+    # Events per published batch. Batching is what keeps the ledger off the
+    # request path: one publish per N events, not one write per request.
+    flush_batch_size: 500
+    # Stop publishing (and start dropping, counted separately) past this
+    # depth. Without it a stalled log tier turns a bounded memory buffer into
+    # an unbounded table.
+    max_queue_depth: 50000
+    # How long events stay queryable in /state.
+    # 0 = COLD-ONLY: batches go straight to Parquet and /state never grows.
+    hot_retention_days: 7
+    # Roll expired rows to <exports_path>/interactions/dt=YYYY-MM-DD/ before
+    # deleting them. A Parquet directory enforces nothing and these rows carry
+    # principals and query text -- put the access control on the directory.
+    cold_enabled: false
+    cold_retention_days: null  # null = keep cold partitions forever
+    # Upper bound on rows one roll pass moves. Load-bearing in one container,
+    # where the roll runs on the scheduler beat under the sync lock.
+    max_rows_per_pass: 50000
+    # Where a replica spools when /state is read-only and no queue is set --
+    # the degraded path for a custom SQLite multi-process deployment. The
+    # shipped fleet runs Postgres, so every replica writes directly.
+    spool_path: null
+    queue:
+      # Off, whoever observed a call writes it. On, batches go to their OWN
+      # queue (log_tasks, never index_tasks) and a `serve --role logger`
+      # drains them -- so persistence, rolling and cold compaction never touch
+      # a request or the indexer's sync lock. Worth it in a fleet; pure
+      # overhead in one container.
+      enabled: false
+      backend: local  # local | nats
+      visibility_seconds: 120
+      # Below the index queue's 3 on purpose: a batch is best-effort, and
+      # retrying a poisoned one three times costs more than the data.
+      max_attempts: 2
+      nats_stream: PHEASANT_LOGS
+      nats_subject: pheasant.logs.batches
+      nats_durable: pheasant-loggers
+
 # byte-for-byte deterministic.
 #
 # With no provider reachable the assistant still answers, extractively: the

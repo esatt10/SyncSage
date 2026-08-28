@@ -72,7 +72,8 @@ pheasant-kb/
 │   ├── jobs.py                ← per-source progress: phase, rate, ETA, stalled
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
 │   ├── sync/                  ← engine, connectors, watcher, scheduler, locks,
-│   │                            queue, worker_pool, worker_transport, grpc
+│   │                            queue, log_queue, worker_pool,
+│   │                            worker_transport, grpc
 │   ├── connectors/            ← first-party SDK plugins: notion, gdrive,
 │   │                            slack, confluence, imap
 │   ├── ingestion/             ← pipeline, chunking, content_types, taxonomy,
@@ -92,7 +93,8 @@ pheasant-kb/
 │   ├── deployment/            ← roles, serving durability, mounts, host
 │   ├── security/              ← path_policy, acl, idp
 │   ├── synapse/               ← contract publisher, events, signing
-│   └── telemetry/metrics.py   ← Prometheus exposition
+│   └── telemetry/             ← metrics.py (Prometheus exposition),
+│                                interactions.py (the observation plane)
 ├── ui/                        ← React + Vite workspace (baked into the image)
 └── tests/                     ← 87 pytest modules, offline by design
 ```
@@ -266,20 +268,42 @@ record, indexed by the ordinary pipeline. Recall *is* search. On top of that:
 - **Graph** — records get `memory_record` nodes, `supersedes` edges, and
   `about` edges via a precedence ladder (reference → symbol → heading →
   entity), capped at three targets.
+- **Observation** (`observability.interactions`, off) — every API/MCP call
+  becomes a **row with a retention policy**: never a file, never chunked,
+  never indexed, never returned by a search. A UI session's chat does not
+  become knowledge because it was observed. The only path from here into
+  memory is a candidate that something *admits*, and admission goes through
+  `MemoryStore.append` like every other write, so invariant 1 never bends.
+  Dimensioned by identity / session / modality (`ui|mcp|a2a|cli`) / criteria.
+  `docs/memory-formation.md`.
 
 ### Scale
 
-One container until it shouldn't be. Then three independent axes:
+One container until it shouldn't be. Then four independent axes:
 
 | Axis | Mechanism | Scales on |
 |---|---|---|
 | Request traffic | `serve --role api` replicas; publish instead of index | CPU / RPS |
 | Ingest throughput | `--role indexer` claiming from a durable queue, `--role worker` preparing | `pheasant_index_queue_depth` |
 | Corpus size | `pheasant shard plan` packs **whole sources** per region | graph nodes |
+| Observation volume | `--role logger` draining its **own** queue (`log_tasks`, never `index_tasks`) | `pheasant_log_queue_depth` |
 
 Selectable backends, dependency-free side first: `storage.backend`
 sqlite|postgres, `sync.queue.backend` off|local|nats,
-`sync.concurrency.worker_transport` http|grpc.
+`sync.concurrency.worker_transport` http|grpc,
+`observability.interactions.queue.backend` off|local|nats.
+
+The fourth axis rises with **request traffic, not corpus churn**, which is why
+it is a separate queue and a separate role rather than a `kind` column: sharing
+`index_tasks` would put request-rate churn on the index claim path. Two things
+it must keep true. **The request path only appends to a bounded ring** — a
+ledger write per request puts a database write on the same Postgres the lexical
+arm already contends on (`docs/architecture.md`'s measured bottleneck). **The
+hot→cold roll never runs under `sync_lock`**, which the scheduler beat holds
+across all its work; a multi-million-row Parquet write there stalls incremental
+sync for every source. Under pressure the tier drops observations rather than
+slowing a request, so formation thresholds count a stream thinned under load: a
+busy region forms memory more slowly, not incorrectly.
 
 Service-to-service traffic is durable by construction: pooled keep-alive
 connections, batching, full-jitter retry honouring `Retry-After`, a per-endpoint
@@ -356,6 +380,23 @@ Each of these cost real time. They are listed because the shape recurs.
   fabricating a state the default config cannot produce. A derived metric
   needs its own inputs at its own granularity, and its test needs the real
   write path.
+- **A batch insert makes one bad row cost every good row beside it.** A
+  queued batch of observations is written inside one transaction, so a single
+  event carrying a null `trace_id` — a truncated spool line, a garbled
+  payload — raised `IntegrityError` and rolled back the whole batch. The batch
+  then nacked, retried, failed identically and dead-lettered: one bad line for
+  hundreds of good observations. Validation has to happen *before* the
+  statement (`InteractionEvent.is_writable`), because a rolled-back
+  transaction cannot drop the one bad row and keep the rest. Found by a test
+  written for the batch path, not by reading it.
+- **Telemetry ids that are minted twice name two different calls.** The
+  interaction ledger mints W3C trace/span ids itself, because they are a row's
+  primary key and must exist without the `[otel]` extra. With the extra
+  installed the SDK mints its own — so the row and the exported span
+  disagreed, and an operator correlating a slow span in their collector to a
+  ledger row found nothing, which is most of the reason to export spans at
+  all. The span starts first now and the row adopts *its* ids. Caught by
+  running against a real SDK, not by the offline suite, which had no opinion.
 - **`wasmtime.Trap` and `wasmtime.WasmtimeError` are siblings**, not parent and
   child. Catch `guest_failures()`.
 - **A mutation harness must `touch` the restored file and purge
@@ -453,5 +494,7 @@ Each of these cost real time. They are listed because the shape recurs.
   — `/exports` is a PVC/named volume an outside reader mounts; nothing is
   served over HTTP
 - **Memory:** `docs/memory-system.md`, `docs/how-to/agent-memory.md`
+- **Observation & formation:** `docs/memory-formation.md` — the two planes,
+  the log tier, and the two combination designs that were rejected
 - **Synapse region spec:** `docs/SYNAPSE_INTEGRATION.md`
 - **Deployment:** `docs/deployment.md`, `deploy/kubernetes/`

@@ -46,6 +46,19 @@ def _metrics() -> None:
     register_default_metrics("0.0.0-test")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_tracing() -> Any:
+    """`TRACING` is process-wide, so a test that configures it must not leave
+    it configured for the next one -- which would silently turn an offline
+    assertion into one that depends on whatever the previous test attached."""
+
+    from pheasant.telemetry import interactions as module
+
+    previous = (module.TRACING.tracer, module.TRACING.enabled)
+    yield
+    module.TRACING.tracer, module.TRACING.enabled = previous
+
+
 @pytest.fixture
 def state(tmp_path: Path) -> StateStore:
     store = StateStore(tmp_path / "p.db")
@@ -369,16 +382,30 @@ def test_a_configured_endpoint_without_the_extra_degrades_rather_than_raising(
     caplog: Any,
 ) -> None:
     settings = PheasantConfig().observability
-    settings.otlp_endpoint = "http://localhost:4318/v1/traces"
+    settings.otlp_endpoint = "http://127.0.0.1:4318/v1/traces"
 
     with caplog.at_level("WARNING"):
         attached = configure_tracing(settings)
 
-    # Either the extra is installed and it attaches, or it is not and we say
-    # so -- never a crash, and never a silent no-op.
-    assert attached in (True, False)
-    if not attached:
-        assert any("[otel] extra" in record.message for record in caplog.records)
+    try:
+        # Either the extra is installed and it attaches, or it is not and we
+        # say so -- never a crash, and never a silent no-op.
+        assert attached in (True, False)
+        if not attached:
+            assert any("[otel] extra" in record.message for record in caplog.records)
+    finally:
+        # Nothing is exported here -- no span is created through this provider
+        # -- but the batch processor it installed owns a thread, and leaving it
+        # attached would make a later test's spans try to reach a collector
+        # that is not there. The suite is offline by construction, and this is
+        # the one place that could make it otherwise.
+        if attached:
+            from opentelemetry import trace as ot_trace
+
+            provider = ot_trace.get_tracer_provider()
+            shutdown = getattr(provider, "shutdown", None)
+            if shutdown is not None:
+                shutdown()
 
 
 def test_the_process_buffer_is_a_single_shared_slot() -> None:
@@ -393,3 +420,126 @@ def test_the_process_buffer_is_a_single_shared_slot() -> None:
     finally:
         set_process_buffer(None)
     assert process_buffer() is None
+
+
+# --------------------------------------------------------------------------
+# OpenTelemetry, when the extra is installed
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def otel_spans() -> Any:
+    """A real SDK exporting into memory. Skipped without the [otel] extra."""
+
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry import trace as ot_trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from pheasant.telemetry import interactions as module
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    ot_trace.set_tracer_provider(provider)
+
+    previous = (module.TRACING.tracer, module.TRACING.enabled)
+    module.TRACING.tracer = provider.get_tracer("pheasant")
+    module.TRACING.enabled = True
+    try:
+        yield exporter
+    finally:
+        module.TRACING.tracer, module.TRACING.enabled = previous
+
+
+def test_a_ledger_row_and_its_exported_span_name_the_same_call(otel_spans: Any) -> None:
+    """Most of the reason to export spans at all.
+
+    The event is built with locally minted ids, because they are its primary
+    key and must exist with or without the extra. When a real span is running,
+    *its* ids are what the operator's collector shows -- so the row has to
+    adopt them, or correlating a slow span to a row finds nothing.
+    """
+
+    buffer = InteractionBuffer(NullSink(), capacity=10, batch_size=99, interval_seconds=99)
+
+    with observe(
+        buffer, InteractionContext.create(Modality.MCP), kb_id="kb", operation="search_context"
+    ):
+        pass
+
+    span = otel_spans.get_finished_spans()[0]
+    event = buffer._drain(1)[0]
+    assert event.trace_id == format(span.get_span_context().trace_id, "032x")
+    assert event.span_id == format(span.get_span_context().span_id, "016x")
+
+
+def test_an_inbound_trace_continues_into_the_exported_span(otel_spans: Any) -> None:
+    """Otherwise the SDK starts its own root trace for a call the caller
+    already had one for, and the collector shows two unrelated traces where
+    there was one request."""
+
+    buffer = InteractionBuffer(NullSink(), capacity=10, batch_size=99, interval_seconds=99)
+    context = InteractionContext.create(
+        Modality.MCP, traceparent="00-" + "a" * 32 + "-" + "b" * 16 + "-01"
+    )
+
+    with observe(buffer, context, kb_id="kb", operation="search_context"):
+        pass
+
+    span = otel_spans.get_finished_spans()[0]
+    assert format(span.get_span_context().trace_id, "032x") == "a" * 32
+    assert format(span.parent.span_id, "016x") == "b" * 16
+
+
+def test_a_span_carries_the_shape_of_a_call_and_never_its_content(otel_spans: Any) -> None:
+    """A collector is a different system with different retention. Query text
+    and principal are the ledger's business, governed by `redact_query_text`
+    there; they must not leak out through a span."""
+
+    buffer = InteractionBuffer(NullSink(), capacity=10, batch_size=99, interval_seconds=99)
+    context = InteractionContext.create(Modality.MCP, principal="user:ada", session_id="s1")
+
+    with observe(buffer, context, kb_id="kb", operation="search_context") as event:
+        event.query_text = "who owns billing"
+        event.result_ids = ["chunk:a", "chunk:b"]
+
+    attributes = dict(otel_spans.get_finished_spans()[0].attributes)
+    assert attributes == {
+        "pheasant.kb": "kb",
+        "pheasant.modality": "mcp",
+        "pheasant.operation": "search_context",
+        "pheasant.result_count": 2,
+    }
+    serialized = str(attributes)
+    assert "who owns billing" not in serialized
+    assert "user:ada" not in serialized
+    assert "s1" not in serialized
+
+
+def test_a_failing_call_marks_its_span_as_an_error(otel_spans: Any) -> None:
+    from opentelemetry.trace import StatusCode
+
+    buffer = InteractionBuffer(NullSink(), capacity=10, batch_size=99, interval_seconds=99)
+
+    with pytest.raises(ValueError):
+        with observe(buffer, InteractionContext.create(Modality.UI), kb_id="kb", operation="boom"):
+            raise ValueError("nope")
+
+    assert otel_spans.get_finished_spans()[0].status.status_code is StatusCode.ERROR
+
+
+def test_exporter_headers_come_from_an_environment_variable_never_the_config() -> None:
+    """The config file names the variable; the value stays out of it. Same
+    rule `storage.dsn_env` follows, for the same reason."""
+
+    from pheasant.telemetry.interactions import _parse_headers
+
+    assert _parse_headers("authorization=Bearer x,x-scope=team") == {
+        "authorization": "Bearer x",
+        "x-scope": "team",
+    }
+    assert _parse_headers("") == {}
+    assert _parse_headers("nonsense") == {}
+    assert PheasantConfig().observability.otlp_headers_env == "PHEASANT_OTLP_HEADERS"
