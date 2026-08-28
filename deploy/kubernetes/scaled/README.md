@@ -72,6 +72,33 @@ Sharding across several knowledge bases means one of these stacks per shard,
 each with its own `pheasant.name` and its own database. `pheasant shard plan`
 proposes the split.
 
+## Retrieval and autoscaling scope
+
+The scaled ConfigMap fans assistant retrieval over `vector`, `graph`, and
+`hybrid`. Hybrid already executes text, vector, and graph internally, so a
+standalone text arm would repeat PostgreSQL full-text ranking. Exact text mode
+remains available to API/MCP callers, and lexical evidence remains in hybrid.
+The local profiles keep their existing defaults.
+
+Treat one namespace/Helm release as one knowledge-base shard and scope every
+metric by that shard's labels. Do not let the queue depth from shard A scale
+workers for shard B. Each shard needs a distinct `pheasant.name`, database
+scope, NATS durable/subject, state claim, and internal tokens. Synapse or an
+upstream router fans search across shards; Kubernetes replicas inside one
+shard all serve the same complete index.
+
+| Workload | Scale-out condition | Scale-down/stability rule |
+|---|---|---|
+| API | sustained request CPU/latency | keep at least two; retain the five-minute stabilization window |
+| Graph | sustained graph-query latency/CPU or failure-domain availability | each pod needs memory for old + new snapshots during refresh |
+| Worker | queue depth + in-flight sources + preparation backlog | KEDA may reach zero; keep the 300 s cooldown |
+| Indexer | never for throughput | one active writer; add only a standby or another complete shard |
+
+Graph save, enrichment, embedding-provider throttling, and ordered commits are
+not worker/API HPA signals. If save/enrichment becomes dominant, split whole
+repositories or document collections between shards so each shard owns a
+smaller graph and an independent commit authority.
+
 ## What is deliberately not here
 
 * **No HPA on the indexer.** Its work is serialized per source by a lease, so

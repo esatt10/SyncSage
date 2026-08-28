@@ -275,7 +275,7 @@ a bigger container. `--json` includes it as a `projection` object.
 ## Sizing a fleet
 
 Past one container, the shape is
-[three tiers](worker-fleet.md#running-the-whole-fleet). What the file count
+[four tiers](worker-fleet.md#running-the-whole-fleet). What the file count
 predicts:
 
 | Corpus | Shards | Indexers | Graph services | API replicas | Workers | Graph/index memory each |
@@ -294,6 +294,23 @@ workers buying only 1.113x on a commit-dominated fixture; the tier helps when
 parsing is expensive (PDFs, large documents), not uniformly.
 
 Only **shards** and **memory** come straight from measurement.
+
+Keep the scaling scopes separate:
+
+| Constraint observed | Scale | Do not scale |
+|---|---|---|
+| HTTP/MCP request saturation | API replicas | indexers |
+| Graph-query latency/CPU | Graph replicas, preferably across nodes | workers |
+| Parse/extraction backlog | Stateless workers | graph replicas |
+| Graph save, enrichment, or ordered commit | Whole knowledge-base shards | indexer replicas within one shard |
+| Embedding 429s/provider latency | Provider quota or lower embedding concurrency | preparation workers |
+
+Docker Compose shares one host, so extra replicas can compete for the same CPU
+and database; the shipped default stays at one graph service, one active
+indexer, and four workers. Kubernetes makes API, graph, and worker scaling
+independent, but one namespace/release should still describe one shard. Give
+each shard its own name, database scope, NATS durable/subject, RWX state, and
+tokens, then fan retrieval across shards rather than sharing a writable graph.
 
 ## Measure your own
 

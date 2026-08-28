@@ -124,8 +124,7 @@ def test_the_sandboxed_pdf_extractor_is_not_swept_in_with_the_accelerators() -> 
 
 def test_fresh_ui_one_liner_is_documented() -> None:
     command = (
-        "docker compose -f deploy/compose/docker-compose.fresh.yml "
-        "up -d --build --force-recreate"
+        "docker compose -f deploy/compose/docker-compose.fresh.yml up -d --build --force-recreate"
     )
     # Documented where someone looks for it — the how-to guide — and in the
     # compose file's own header. The README is the product front door and

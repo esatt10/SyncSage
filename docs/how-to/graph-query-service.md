@@ -49,6 +49,23 @@ reuses the generated random worker token as an internal graph token. Kubernetes
 expects a separate `PHEASANT_GRAPH_SERVICE_TOKEN` key in
 `pheasant-secrets`.
 
+The scalable assistant uses:
+
+```yaml
+assistant:
+  retrieval:
+    retrieval_modes: [vector, graph, hybrid]
+```
+
+This does not remove lexical search. Hybrid executes text, vector, and graph
+in parallel, so a second `text` fanout repeated the same PostgreSQL ranking
+work. The measured high-frequency text median was 18.44 s versus 839 ms for
+vector and 598 ms for graph; the duplicate text arm therefore had the weakest
+cost/recall case. Explicit `mode=text` remains useful for exact identifiers,
+and vector/graph remain explicit in assistant fanout to retain arm-specific
+top candidates before hybrid fusion truncates its result set. Local profile
+defaults are unchanged.
+
 Start the Compose fleet from the repository root:
 
 ```bash
@@ -119,6 +136,13 @@ remote graph boundary; moving or replicating edges cannot solve lexical
 candidate ranking. Treat the 20.2-20.9 s figure above as the comparable
 original workload and keep the high-hit query set as an adversarial capacity
 test.
+
+CI also protects this boundary with an offline repository architecture gate.
+It deterministically samples Spark, MLflow, VS Code, LangGraph, and Deep Agents;
+runs full and unchanged incremental indexing with stub embeddings; executes
+vector, graph, and hybrid searches; and fails on correctness or material
+throughput, wall-time, search-p95, and memory regressions. See
+[Architecture regression testing](architecture-regression.md).
 
 ### Incremental and document baselines
 

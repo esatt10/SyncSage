@@ -31,8 +31,7 @@ REMOTE_DOCUMENT_EXTENSIONS = frozenset(DOCUMENT_EXTENSIONS)
 def _remote_text_path(path: str) -> bool:
     candidate = Path(path)
     return (
-        candidate.suffix.lower() in REMOTE_TEXT_EXTENSIONS
-        or candidate.name.lower() == "dockerfile"
+        candidate.suffix.lower() in REMOTE_TEXT_EXTENSIONS or candidate.name.lower() == "dockerfile"
     )
 
 
@@ -137,9 +136,7 @@ def task_payload(
         # intentionally narrower than forwarding the whole ingestion config:
         # captioner/transcriber settings can name credential-bearing services.
         "extractor": (
-            extractor_settings.model_dump(mode="json")
-            if extractor_settings is not None
-            else None
+            extractor_settings.model_dump(mode="json") if extractor_settings is not None else None
         ),
     }
 
@@ -153,8 +150,9 @@ def prepare_task(task: dict[str, Any]) -> dict[str, Any] | None:
         raise RemoteWorkerError("Remote preparation does not support taxonomy-enabled sources")
     extractor_raw = task.get("extractor")
     extractor_settings = (
-        PheasantConfig.model_validate({"ingestion": {"extractor": extractor_raw}})
-        .ingestion.extractor
+        PheasantConfig.model_validate(
+            {"ingestion": {"extractor": extractor_raw}}
+        ).ingestion.extractor
         if isinstance(extractor_raw, dict)
         else None
     )

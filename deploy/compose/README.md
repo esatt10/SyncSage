@@ -8,7 +8,7 @@ stored in YAML.
 |---|---|---|---|
 | `local-small.yaml` | Local SQLite, no broker or workers | BM25/text search and extractive answers; MCP and durable memory remain enabled | Laptop, offline, small corpus |
 | `local-advanced.yaml` | Single-node SQLite | Hybrid + graph retrieval by default, LanceDB, both WASM accelerators, `text-embedding-3-small`, and the `gpt-5.6-luna` agentic workflow | One capable workstation/container |
-| `fleet.yaml` | PostgreSQL, NATS JetStream, shared durable volumes, a dedicated graph-query service, and stateless gRPC preparation workers | Same hybrid + graph retrieval stack with adaptive concurrency; API replicas keep no full graph resident | Multi-container, horizontally scaled ingestion and serving |
+| `fleet.yaml` | PostgreSQL, NATS JetStream, shared durable volumes, a dedicated graph-query service, and stateless gRPC preparation workers | Vector + graph + hybrid assistant fanout with adaptive concurrency; API replicas keep no full graph resident | Multi-container, horizontally scaled ingestion and serving |
 
 `worker.yaml` is the deliberately minimal trust-boundary config for the
 fleet's stateless gRPC workers. It has no source list, database DSN, OpenAI key,
@@ -76,7 +76,36 @@ before using it.
 The UI is at <http://127.0.0.1:8765> and streamable HTTP MCP is at
 `http://127.0.0.1:8765/mcp` for both Docker profiles.
 
+## Fleet retrieval fanout
+
+Hybrid already runs lexical, vector, and graph retrieval concurrently. The
+fleet therefore does not add a separate `text` assistant fanout: it repeated
+the PostgreSQL lexical ranking query that stress testing identified as the
+slowest arm for common terms. Text remains available as an explicit API/MCP
+mode and remains part of every hybrid request. The explicit vector and graph
+modes preserve arm-specific candidates that can be truncated by hybrid fusion.
+
+This is a fleet-profile choice, not a schema-default change. The small and
+advanced profiles and the setup wizard defaults are unchanged.
+
 ## Throughput and durability notes
+
+Scale only the tier that owns the constrained work:
+
+| Signal | Compose action | What it cannot fix |
+|---|---|---|
+| API request saturation | Put a load balancer in front, then scale `api` | indexing or graph-query CPU |
+| Graph-query CPU/latency | scale `graph`, after measuring host headroom | graph save/enrichment |
+| Preparation backlog | scale `worker` | embedding quota or ordered commits |
+| Indexer failure | start a standby `indexer`; one lease stays active | write throughput |
+| Save/enrichment/commit dominance | create another whole knowledge-base shard | a single shard's global graph |
+
+One Docker host has one CPU, disk, and PostgreSQL resource pool. The measured
+single-host graph test became slower at two replicas, so the shipped Compose
+default remains one graph service, one active indexer, and four workers. A
+second complete Compose project needs distinct project/volume names,
+`pheasant.name`, database scope, ports, and graph/worker tokens; treat it as a
+knowledge-base shard rather than another writer for the same graph.
 
 - The fleet profile batches 128 chunks per embedding request and permits 8
   embedding requests in flight. That is an aggressive but bounded ceiling;

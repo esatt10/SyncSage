@@ -11,13 +11,15 @@ source.
 ```bash
 pheasant serve                    # all: today's behavior, the default
 pheasant serve --role api         # serve; publish index work to the queue
+pheasant serve --role graph       # serve read-only graph operations
 pheasant serve --role indexer     # watch, schedule, drain the queue
 pheasant worker --transport grpc  # preparation only
 ```
 
-`api` replicas scale with request traffic and never index; one `indexer` per
-shard does the indexing; `worker` pods do the parsing. The hand-off between
-api and indexer is the [queue](#queue-the-backlog), which is why `--role api`
+`api` replicas scale with request traffic and never index; `graph` replicas
+serve a complete read-only snapshot; one `indexer` per shard does the
+indexing; `worker` pods do the parsing. The hand-off between api and indexer is
+the [queue](#queue-the-backlog), which is why `--role api`
 refuses to start without it — a sync request that is accepted and then goes
 nowhere is worse than one that is refused.
 
@@ -276,9 +278,11 @@ task until redelivery.
 matters because idle workers are pure cost) and a plain HPA for clusters
 without it.
 
-The api tier scales on CPU with a five-minute scale-down window, because a new
-replica loads the whole graph into memory at startup: shedding a replica
-eagerly and adding it back pays that twice.
+The API tier scales on CPU with a five-minute scale-down window to avoid churn
+under bursty assistant fanout. It keeps only a bounded graph proxy. The graph
+tier owns snapshot residency; scale it independently on graph-query latency or
+CPU, and give every graph replica enough memory for the old and new snapshot
+during an atomic refresh.
 
 ## Related
 

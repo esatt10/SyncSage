@@ -792,6 +792,16 @@ typed home, which is what makes them validated, editable from the UI
 | `verify_citations` | bool \| null | `true` | Drop `[n]` markers that do not resolve to a real citation. |
 | `max_facts` | int \| null | `12` | Graph facts surfaced alongside the answer. |
 
+`hybrid` is already a concurrent fusion of text, vector, and graph. The
+generated scalable profile deliberately uses `[vector, graph, hybrid]` and
+omits a second standalone `text` fanout: stress testing found PostgreSQL
+full-text ranking to be the slowest arm for high-frequency terms, so repeating
+it had a weak cost/recall case. This does not disable text search. Explicit
+`mode=text` still serves exact-identifier queries and hybrid still contains
+lexical results. Vector and graph remain explicit to preserve arm-specific top
+candidates that may fall beyond hybrid's fused result limit. The schema
+default above and the local profile defaults are unchanged.
+
 **Precedence is deliberately low.** Values merge in this order, later winning:
 
 ```

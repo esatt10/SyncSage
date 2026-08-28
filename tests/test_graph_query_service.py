@@ -61,9 +61,12 @@ def test_graph_role_exposes_only_authenticated_query_operations(
     client = TestClient(app)
 
     assert client.get("/health").json()["role"] == "graph"
-    assert client.post(
-        "/internal/graph/query", json={"operation": "stats", "parameters": {}}
-    ).status_code == 401
+    assert (
+        client.post(
+            "/internal/graph/query", json={"operation": "stats", "parameters": {}}
+        ).status_code
+        == 401
+    )
 
     headers = {"Authorization": "Bearer secret"}
     stats = client.post(

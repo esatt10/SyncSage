@@ -73,6 +73,7 @@ Configuration details belong in the documentation:
 - [Monitor indexing](docs/how-to/monitor-indexing.md)
 - [Scale a worker fleet](docs/how-to/worker-fleet.md)
 - [Separate graph queries from API replicas](docs/how-to/graph-query-service.md)
+- [Run the offline architecture regression](docs/how-to/architecture-regression.md)
 - [Capacity planning](docs/how-to/capacity-planning.md)
 
 ## Develop

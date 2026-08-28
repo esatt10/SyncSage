@@ -633,9 +633,7 @@ class NatsQueue(TaskQueue):
             PENDING: int(getattr(consumer, "num_pending", 0) or 0),
             INFLIGHT: int(getattr(consumer, "num_ack_pending", 0) or 0),
             DONE: int(
-                getattr(consumer, "ack_floor", None)
-                and consumer.ack_floor.consumer_seq
-                or 0
+                getattr(consumer, "ack_floor", None) and consumer.ack_floor.consumer_seq or 0
             ),
             DEAD: int(getattr(dead_consumer, "num_pending", 0) or 0)
             + int(getattr(dead_consumer, "num_ack_pending", 0) or 0),

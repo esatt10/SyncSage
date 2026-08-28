@@ -124,7 +124,7 @@
   "assistant.retrieval.max_rounds": 2,
   "assistant.retrieval.per_query_results": 16,
   "assistant.retrieval.max_context_passages": 24,
-  "assistant.retrieval.retrieval_modes": ["text", "vector", "graph", "hybrid"],
+  "assistant.retrieval.retrieval_modes": ["vector", "graph", "hybrid"],
   "assistant.retrieval.expand_graph": true,
   "assistant.retrieval.expand_depth": 2,
   "assistant.retrieval.expand_per_node": 8,

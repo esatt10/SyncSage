@@ -156,7 +156,6 @@ assistant:
     per_query_results: 16
     max_context_passages: 24
     retrieval_modes:
-      - text
       - vector
       - graph
       - hybrid

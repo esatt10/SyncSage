@@ -76,9 +76,7 @@ class GraphQueryClient:
                 self._replica_resolved_at = now
             if not self._replica_addresses:
                 return f"{self.base_url}/internal/graph/query", None
-            address = self._replica_addresses[
-                self._replica_ordinal % len(self._replica_addresses)
-            ]
+            address = self._replica_addresses[self._replica_ordinal % len(self._replica_addresses)]
             self._replica_ordinal += 1
         netloc = f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
         path = parsed.path.rstrip("/") + "/internal/graph/query"
@@ -227,9 +225,7 @@ class RemoteGraph:
         return dict(self.client.query("diagnostics", top=top))
 
     def remote_path(self, source: str, target: str, max_depth: int = 8) -> dict[str, Any]:
-        return dict(
-            self.client.query("path", source=source, target=target, max_depth=max_depth)
-        )
+        return dict(self.client.query("path", source=source, target=target, max_depth=max_depth))
 
     def remote_taxonomy(
         self,
@@ -237,9 +233,7 @@ class RemoteGraph:
         path: str | None = None,
         max_nodes: int = 2000,
     ) -> dict[str, Any]:
-        return dict(
-            self.client.query("taxonomy", source=source, path=path, max_nodes=max_nodes)
-        )
+        return dict(self.client.query("taxonomy", source=source, path=path, max_nodes=max_nodes))
 
     def remote_facts(self, node_ids: list[str], limit: int = 12) -> list[dict[str, Any]]:
         return list(self.client.query("facts", node_ids=node_ids, limit=limit) or [])

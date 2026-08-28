@@ -169,6 +169,21 @@ def test_the_api_and_indexer_share_one_knowledge_base(scaled: list[dict[str, Any
     assert fleet.pheasant.name
 
 
+def test_scaled_assistant_avoids_redundant_text_fanout(
+    scaled: list[dict[str, Any]],
+) -> None:
+    """Hybrid already includes lexical search; a text arm repeats that query."""
+
+    fleet = next(
+        PheasantConfig.model_validate(yaml.safe_load(raw))
+        for doc in _by_kind(scaled, "ConfigMap")
+        if doc["metadata"]["name"] == "pheasant-fleet-config"
+        for raw in doc["data"].values()
+    )
+
+    assert fleet.assistant.retrieval.retrieval_modes == ["vector", "graph", "hybrid"]
+
+
 # --------------------------------------------------------------------------
 # The trust boundary
 # --------------------------------------------------------------------------
@@ -637,7 +652,6 @@ def test_the_three_compose_profiles_cover_small_advanced_and_fleet() -> None:
 
     assert advanced.assistant.retrieval.retrieval_modes == ["hybrid", "graph"]
     assert fleet.assistant.retrieval.retrieval_modes == [
-        "text",
         "vector",
         "graph",
         "hybrid",
