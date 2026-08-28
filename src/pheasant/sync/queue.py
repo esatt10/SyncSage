@@ -54,6 +54,13 @@ DEAD = "dead"
 #: *silence*, not work.
 DEFAULT_VISIBILITY_SECONDS = 300.0
 
+#: JetStream's default ``ack_wait`` is 30 seconds. The visibility setting is
+#: also used by the local queue and is commonly much larger, so deriving the
+#: first heartbeat from it alone can let NATS redeliver a healthy task before
+#: the first ping. Ten seconds is below that broker default and negligible
+#: overhead compared with a repository sync.
+MAX_HEARTBEAT_INTERVAL_SECONDS = 10.0
+
 #: Attempts before a task is dead-lettered. Three is the point at which a
 #: failure has stopped looking transient; a dead task is kept, never deleted,
 #: so `pheasant queue requeue-dead` can replay it after a fix.
@@ -88,6 +95,10 @@ class IndexTask:
     payload: dict[str, Any] = field(default_factory=dict)
     attempts: int = 0
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    #: One publish invocation, distinct from the logical task id. JetStream's
+    #: duplicate window suppresses this value; a fresh IndexTask with the same
+    #: logical id is therefore a legitimate new run after the prior one ends.
+    publish_id: str = field(default_factory=lambda: uuid.uuid4().hex, repr=False, compare=False)
     #: Backend-specific handle (a JetStream message, say). Never persisted.
     handle: Any = None
 
@@ -400,13 +411,22 @@ class NatsQueue(TaskQueue):
         self.servers = list(servers)
         self.stream = stream
         self.subject = subject
+        self.dead_subject = f"{subject}.dead"
         self.durable = durable
+        self.dead_durable = f"{durable}-dead"
         self.connect_timeout = float(connect_timeout)
         self._loop: Any = None
         self._thread: threading.Thread | None = None
         self._client: Any = None
         self._js: Any = None
         self._subscription: Any = None
+        self._dead_subscription: Any = None
+        # ``sync_all`` may run several drain loops in a ThreadPoolExecutor.
+        # asyncio event loops and nats-py subscriptions are not safe to drive
+        # concurrently from those threads, so every loop/state transition is
+        # marshalled through one re-entrant gate. Handlers still run outside
+        # the gate, preserving source-level parallelism.
+        self._loop_lock = threading.RLock()
 
     # JetStream's client is asyncio-only while the indexing engine is
     # threaded, so every call is marshalled onto one private event loop. A
@@ -433,47 +453,70 @@ class NatsQueue(TaskQueue):
     def _run(self, coroutine: Any) -> Any:
         import asyncio
 
-        if self._loop is None:
-            self._loop = asyncio.new_event_loop()
-            self._thread = threading.Thread(
-                target=self._loop.run_forever,
-                name="pheasant-nats-queue-loop",
-                daemon=True,
-            )
-            self._thread.start()
-        return asyncio.run_coroutine_threadsafe(coroutine, self._loop).result()
+        with self._loop_lock:
+            if self._loop is None:
+                self._loop = asyncio.new_event_loop()
+                self._thread = threading.Thread(
+                    target=self._loop.run_forever,
+                    name="pheasant-nats-queue-loop",
+                    daemon=True,
+                )
+                self._thread.start()
+            loop = self._loop
+        return asyncio.run_coroutine_threadsafe(coroutine, loop).result()
 
     def _connect(self) -> Any:
-        if self._js is not None:
+        with self._loop_lock:
+            if self._js is not None:
+                return self._js
+
+            async def setup() -> Any:
+                import nats
+
+                self._client = await nats.connect(
+                    servers=self.servers, connect_timeout=self.connect_timeout
+                )
+                js = self._client.jetstream()
+                try:
+                    await js.add_stream(
+                        name=self.stream,
+                        subjects=[self.subject, self.dead_subject],
+                    )
+                except Exception:
+                    # Already provisioned by another indexer, which is the normal
+                    # case in a fleet and not worth distinguishing.
+                    logger.debug("JetStream stream %s already exists", self.stream)
+                    try:
+                        info = await js.stream_info(self.stream)
+                        subjects = set(getattr(info.config, "subjects", None) or [])
+                        wanted = {self.subject, self.dead_subject}
+                        if not wanted.issubset(subjects):
+                            await js.update_stream(
+                                name=self.stream,
+                                subjects=sorted(subjects | wanted),
+                            )
+                    except Exception:
+                        logger.warning(
+                            "Could not add explicit dead-letter subject %s to stream %s",
+                            self.dead_subject,
+                            self.stream,
+                            exc_info=True,
+                        )
+                return js
+
+            self._js = self._run(setup())
             return self._js
-
-        async def setup() -> Any:
-            import nats
-
-            self._client = await nats.connect(
-                servers=self.servers, connect_timeout=self.connect_timeout
-            )
-            js = self._client.jetstream()
-            try:
-                await js.add_stream(name=self.stream, subjects=[self.subject])
-            except Exception:
-                # Already provisioned by another indexer, which is the normal
-                # case in a fleet and not worth distinguishing.
-                logger.debug("JetStream stream %s already exists", self.stream)
-            return js
-
-        self._js = self._run(setup())
-        return self._js
 
     def publish(self, task: IndexTask) -> IndexTask:
         js = self._connect()
         body = json.dumps(task.as_dict(), sort_keys=True).encode("utf-8")
 
         async def send() -> None:
-            # Content-addressed message id: JetStream de-duplicates on it, so
-            # a coordinator that retries a publish after a timeout does not
-            # enqueue the same source twice.
-            await js.publish(self.subject, body, headers={"Nats-Msg-Id": task.id})
+            # A retry of this task object is de-duplicated, while a new task
+            # object with the same logical id is a new requested run. Using
+            # ``task.id`` here made JetStream silently suppress every rapid
+            # re-run for its default two-minute duplicate window.
+            await js.publish(self.subject, body, headers={"Nats-Msg-Id": task.publish_id})
 
         self._run(send())
         return task
@@ -487,14 +530,31 @@ class NatsQueue(TaskQueue):
         would never scale *up*, which is the one thing it exists to do.
         """
 
-        if self._subscription is not None:
-            return
-        js = self._connect()
+        with self._loop_lock:
+            if self._subscription is not None:
+                return
+            js = self._connect()
 
-        async def subscribe() -> Any:
-            return await js.pull_subscribe(self.subject, durable=self.durable)
+            async def subscribe() -> Any:
+                return await js.pull_subscribe(self.subject, durable=self.durable)
 
-        self._subscription = self._run(subscribe())
+            self._subscription = self._run(subscribe())
+
+    def _subscribe_dead(self) -> None:
+        """Create the durable DLQ view used by depth and explicit replay."""
+
+        with self._loop_lock:
+            if self._dead_subscription is not None:
+                return
+            js = self._connect()
+
+            async def subscribe() -> Any:
+                return await js.pull_subscribe(
+                    self.dead_subject,
+                    durable=self.dead_durable,
+                )
+
+            self._dead_subscription = self._run(subscribe())
 
     def claim(
         self, owner: str, *, visibility_seconds: float = DEFAULT_VISIBILITY_SECONDS
@@ -538,6 +598,31 @@ class NatsQueue(TaskQueue):
                 task.attempts,
                 error,
             )
+            sequence = getattr(
+                getattr(getattr(task.handle, "metadata", None), "sequence", None),
+                "stream",
+                0,
+            )
+            dead = {
+                **task.as_dict(),
+                "attempts": task.attempts,
+                "dead_letter": {
+                    "error": str(error),
+                    "failed_at": _iso(_now()),
+                    "deliveries": task.attempts,
+                },
+            }
+
+            async def publish_dead() -> None:
+                await self._connect().publish(
+                    self.dead_subject,
+                    json.dumps(dead, sort_keys=True).encode("utf-8"),
+                    headers={"Nats-Msg-Id": f"dlq:{self.stream}:{sequence or task.id}"},
+                )
+
+            # Never term first: if the broker cannot durably accept the DLQ
+            # record, leave the main task eligible for recovery.
+            self._run(publish_dead())
             self._run(task.handle.term())
             return
         self._run(task.handle.nak(delay=max(0.0, retry_in_seconds)))
@@ -561,19 +646,61 @@ class NatsQueue(TaskQueue):
         js = self._connect()
 
         async def info() -> Any:
-            return await js.consumer_info(self.stream, self.durable)
+            main = await js.consumer_info(self.stream, self.durable)
+            dead = await js.consumer_info(self.stream, self.dead_durable)
+            return main, dead
 
         try:
             self._subscribe()
-            consumer = self._run(info())
+            self._subscribe_dead()
+            consumer, dead_consumer = self._run(info())
         except Exception:  # pragma: no cover - broker unreachable at scrape time
             return {PENDING: 0, INFLIGHT: 0, DONE: 0, DEAD: 0}
         return {
             PENDING: int(getattr(consumer, "num_pending", 0) or 0),
             INFLIGHT: int(getattr(consumer, "num_ack_pending", 0) or 0),
-            DONE: int(getattr(consumer, "delivered", None) and consumer.delivered.stream_seq or 0),
-            DEAD: 0,
+            DONE: int(
+                getattr(consumer, "ack_floor", None) and consumer.ack_floor.consumer_seq or 0
+            ),
+            DEAD: int(getattr(dead_consumer, "num_pending", 0) or 0)
+            + int(getattr(dead_consumer, "num_ack_pending", 0) or 0),
         }
+
+    def requeue_dead(self) -> int:
+        """Replay every explicit DLQ record after its cause has been fixed."""
+
+        self._subscribe_dead()
+        replayed = 0
+        while True:
+
+            async def pull() -> list[Any]:
+                try:
+                    return await self._dead_subscription.fetch(32, timeout=0.25)
+                except Exception:
+                    return []
+
+            messages = self._run(pull())
+            if not messages:
+                return replayed
+            for message in messages:
+                raw = json.loads(message.data.decode("utf-8"))
+                sequence = getattr(
+                    getattr(getattr(message, "metadata", None), "sequence", None),
+                    "stream",
+                    replayed,
+                )
+                task = IndexTask(
+                    id=str(raw.get("id") or uuid.uuid4().hex),
+                    source_id=str(raw["source"]),
+                    mode=str(raw.get("mode") or "incremental"),
+                    payload=dict(raw.get("payload") or {}),
+                    attempts=0,
+                    max_attempts=int(raw.get("max_attempts") or DEFAULT_MAX_ATTEMPTS),
+                    publish_id=f"requeue:{self.stream}:{sequence}",
+                )
+                self.publish(task)
+                self._run(message.ack())
+                replayed += 1
 
     def close(self) -> None:
         if self._client is None:
@@ -621,6 +748,7 @@ class NatsQueue(TaskQueue):
             self._loop = None
             self._thread = None
             self._subscription = None
+            self._dead_subscription = None
 
 
 class QueueUnavailable(RuntimeError):
@@ -718,7 +846,7 @@ def _keepalive(queue: TaskQueue, task: IndexTask, visibility_seconds: float):
     here would fail a sync that is going fine.
     """
 
-    interval = max(1.0, visibility_seconds / 3.0)
+    interval = _heartbeat_interval(visibility_seconds)
     done = threading.Event()
 
     def beat() -> None:
@@ -735,3 +863,7 @@ def _keepalive(queue: TaskQueue, task: IndexTask, visibility_seconds: float):
     finally:
         done.set()
         thread.join(timeout=5.0)
+
+
+def _heartbeat_interval(visibility_seconds: float) -> float:
+    return min(MAX_HEARTBEAT_INTERVAL_SECONDS, max(1.0, visibility_seconds / 3.0))

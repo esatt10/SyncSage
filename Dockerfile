@@ -66,8 +66,14 @@ RUN apt-get update \
 # added later — numpy (21.4) and zstandard (21.6a) — breaking the smoke test).
 ARG PHEASANT_EXTRAS=mcp,agent,vector,wasm,a2a,postgres,grpc,queue,analytics
 COPY pyproject.toml README.md LICENSE /app/
+# Resolve runtime dependencies before copying application source. A one-line
+# code edit should not invalidate and redownload the entire universal stack;
+# this layer now changes only when pyproject.toml or the selected extras do.
+RUN PHEASANT_EXTRAS="${PHEASANT_EXTRAS}" python -c "import os,subprocess,sys,tomllib; p=tomllib.load(open('pyproject.toml','rb'))['project']; extras=[x for x in os.environ.get('PHEASANT_EXTRAS','').split(',') if x]; optional=p.get('optional-dependencies',{}); missing=[x for x in extras if x not in optional]; missing and (_ for _ in ()).throw(ValueError(f'unknown extras: {missing}')); deps=list(p['dependencies']) + [dep for x in extras for dep in optional[x]]; subprocess.check_call([sys.executable,'-m','pip','install','--no-cache-dir',*deps])"
 COPY src /app/src
-RUN pip install --no-cache-dir ".[${PHEASANT_EXTRAS}]"
+# Install only Pheasant's wheel/entry point; dependencies are the cached layer
+# above and PYTHONPATH still points at the copied source tree.
+RUN pip install --no-cache-dir --no-deps .
 
 COPY --from=ui /ui/dist /app/ui
 COPY pheasant.example.yaml /app/pheasant.default.yaml
@@ -86,8 +92,8 @@ RUN chmod +x /app/docker-entrypoint.sh /app/docker-fresh-entrypoint.sh
 # generates one there on first boot. A read-only bind mount still wins — the
 # entrypoint only writes when the file is absent.
 RUN useradd --create-home --uid 10001 pheasant \
-    && mkdir -p /state /exports /workspace /config \
-    && chown -R pheasant:pheasant /state /exports /app /config
+    && mkdir -p /state /exports /workspace /config /memory \
+    && chown -R pheasant:pheasant /state /exports /app /config /memory
 USER pheasant
 
 EXPOSE 8765

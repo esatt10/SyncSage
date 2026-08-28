@@ -54,6 +54,15 @@ _TS_RANK_WEIGHTS = "0.125, 0.25, 0.375, 1.0"
 # the document that matched two of the three query terms.
 _TS_RANK_NORMALIZATION = 32
 
+# Postgres has to evaluate ``ts_rank_cd`` against the stored position list for
+# every candidate row.  An OR query made from a planner's whole sentence can
+# admit most of a code corpus ("main", framework names, and so on), then pay
+# that cost once per query term.  Use the rarest terms to choose candidates
+# while retaining a wider, bounded set for final IDF-weighted ranking.  Queries
+# of four terms or fewer are unchanged.
+_POSTGRES_MAX_MATCH_TERMS = 4
+_POSTGRES_MAX_RANK_TERMS = 12
+
 # Structural priors, applied as a DIVISOR on the (negative) BM25 cost, so they
 # scale a match rather than displacing it: a strong deep hit still beats a weak
 # shallow one, but ties break toward the more central file. An additive penalty
@@ -141,7 +150,9 @@ def _exclusion_sql(steering: Any) -> tuple[str, list[object]]:
     return clauses, params
 
 
-def _postgres_document_frequencies(state: Any, tokens: list[str]) -> tuple[int, dict[str, int]]:
+def _postgres_document_frequencies(
+    state: Any, tokens: list[str], source_name: str | None = None
+) -> tuple[int, dict[str, int]]:
     """``(total chunks, {term: how many chunks contain it})`` in one round trip.
 
     Computed per query rather than maintained in a table. It is a GIN index
@@ -152,17 +163,22 @@ def _postgres_document_frequencies(state: Any, tokens: list[str]) -> tuple[int, 
 
     if not tokens:
         return 0, {}
+    source_join = " AND f.source_id = ?" if source_name else ""
+    params: tuple[object, ...] = (list(tokens), source_name) if source_name else (list(tokens),)
     rows = state.rows(
         "SELECT t.term AS term, count(f.chunk_id) AS df "
         "FROM unnest(?::text[]) AS t(term) "
         "LEFT JOIN chunks_fts f ON f.search_vector @@ to_tsquery('simple', t.term) "
+        f"{source_join} "
         "GROUP BY t.term",
-        (list(tokens),),
+        params,
     )
-    return _postgres_total_chunks(state), {str(row["term"]): int(row["df"]) for row in rows}
+    return _postgres_total_chunks(state, source_name), {
+        str(row["term"]): int(row["df"]) for row in rows
+    }
 
 
-def _postgres_total_chunks(state: Any) -> int:
+def _postgres_total_chunks(state: Any, source_name: str | None = None) -> int:
     """Corpus size for IDF — from the planner's estimate, not ``count(*)``.
 
     This was a correlated ``(SELECT count(*) FROM chunks_fts)`` inside the
@@ -180,6 +196,15 @@ def _postgres_total_chunks(state: Any) -> int:
     would zero out every score, so both fall back to the real count — paid once
     on a cold database rather than on every query forever.
     """
+
+    # A source-filtered query is already routed to one logical shard. Its
+    # btree-backed exact count is small and, importantly, prevents source-local
+    # ranking from paying for or being skewed by every unrelated corpus.
+    if source_name:
+        exact = state.rows(
+            "SELECT count(*) AS n FROM chunks_fts WHERE source_id = ?", (source_name,)
+        )
+        return int(exact[0]["n"]) if exact else 0
 
     rows = state.rows(
         "SELECT reltuples AS estimate FROM pg_class WHERE oid = 'chunks_fts'::regclass"
@@ -206,7 +231,9 @@ def _idf(total_docs: int, document_frequency: int) -> float:
     return math.log(1.0 + (n - df + 0.5) / (df + 0.5))
 
 
-def _postgres_rank_expression(state: Any, tokens: list[str]) -> tuple[str, list[object]]:
+def _postgres_rank_expression(
+    state: Any, tokens: list[str], source_name: str | None = None
+) -> tuple[str, list[object], list[str]]:
     """A BM25-shaped ranking expression for Postgres.
 
     ``ts_rank_cd`` has **no inverse document frequency**: it accumulates cover
@@ -226,23 +253,37 @@ def _postgres_rank_expression(state: Any, tokens: list[str]) -> tuple[str, list[
     where every IDF would be identical anyway.
     """
 
-    total, frequencies = _postgres_document_frequencies(state, tokens)
+    unique = list(dict.fromkeys(tokens))
+    total, frequencies = _postgres_document_frequencies(state, unique, source_name)
     if not tokens or not total:
         return (
             f"ts_rank_cd('{{{_TS_RANK_WEIGHTS}}}', chunks_fts.search_vector, "
             f"query_ts, {_TS_RANK_NORMALIZATION})",
             [],
+            unique,
         )
+    # A zero-frequency token cannot admit or score a row.  Among terms that
+    # exist, lower document frequency means higher retrieval signal and a much
+    # smaller GIN candidate set.  Lexical position is the deterministic tie
+    # break because ``_query_tokens`` is sorted.
+    ranked_tokens = sorted(
+        (token for token in unique if frequencies.get(token, 0) > 0),
+        key=lambda token: (frequencies.get(token, 0), token),
+    )
+    if not ranked_tokens:
+        ranked_tokens = unique
+    match_tokens = ranked_tokens[:_POSTGRES_MAX_MATCH_TERMS]
+    score_tokens = ranked_tokens[:_POSTGRES_MAX_RANK_TERMS]
     terms: list[str] = []
     params: list[object] = []
-    for token in dict.fromkeys(tokens):
+    for token in score_tokens:
         weight = _idf(total, frequencies.get(token, 0))
         terms.append(
             f"{weight:.6f} * ts_rank_cd('{{{_TS_RANK_WEIGHTS}}}', chunks_fts.search_vector, "
             f"to_tsquery('simple', ?), {_TS_RANK_NORMALIZATION})"
         )
         params.append(token)
-    return "(" + " + ".join(terms) + ")", params
+    return "(" + " + ".join(terms) + ")", params, match_tokens
 
 
 class SearchStore:
@@ -295,8 +336,10 @@ class SearchStore:
         prior_sql, prior_params = _structural_prior(steering, tokens, postgres=postgres)
         rank_sql, rank_params = "", []
         if postgres:
-            match_expr = " | ".join(dict.fromkeys(tokens)) if tokens else query
-            rank_sql, rank_params = _postgres_rank_expression(self.state, tokens)
+            rank_sql, rank_params, match_tokens = _postgres_rank_expression(
+                self.state, tokens, source_name
+            )
+            match_expr = " | ".join(match_tokens) if match_tokens else query
         # Params are positional, so they must be assembled in the order the
         # placeholders appear in the final SQL. On Postgres the ranking
         # expression (`-{rank_sql}`) precedes the divisor (`/ {prior_sql}`),
@@ -307,7 +350,10 @@ class SearchStore:
         where = "search_vector @@ query_ts" if postgres else "chunks_fts MATCH ?"
         exclusion_where, exclusion_params = _exclusion_sql(steering)
         if source_name:
-            where += " AND source_id = ?"
+            # All three joined Postgres tables carry source_id. Leaving this
+            # unqualified makes the primary query fail as ambiguous and used
+            # to send every scoped search down the corpus-wide LIKE fallback.
+            where += " AND chunks_fts.source_id = ?"
             params.append(source_name)
         # Restrict to one section of a document's taxonomy. Pushed into SQL
         # rather than filtered afterwards: a section is a narrow slice, and
@@ -374,6 +420,9 @@ class SearchStore:
         except Exception:
             fallback_where = "(chunks.text LIKE ? OR artifacts.relative_path LIKE ?)"
             fallback_params: list[object] = [f"%{query}%", f"%{query}%"]
+            if source_name:
+                fallback_where += " AND chunks.source_id = ?"
+                fallback_params.append(source_name)
             if section_needle(section):
                 fallback_where += " AND LOWER(COALESCE(chunks.heading_path, '')) LIKE ?"
                 fallback_params.append(f"%{section_needle(section)}%")

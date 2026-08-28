@@ -762,3 +762,22 @@ def test_structure_survives_a_region_with_no_state() -> None:
 
     assert "Sources:" in context
     assert "Search modes available" in context
+
+
+def test_directory_rollup_uses_postgres_string_functions() -> None:
+    from pheasant.assistant.retrieval import _top_directories_sql
+
+    postgres_state = type(
+        "State",
+        (),
+        {"dialect": type("Dialect", (), {"is_postgres": True})()},
+    )()
+    sqlite_state = type(
+        "State",
+        (),
+        {"dialect": type("Dialect", (), {"is_postgres": False})()},
+    )()
+
+    assert "strpos(" in _top_directories_sql(postgres_state)
+    assert "instr(" not in _top_directories_sql(postgres_state)
+    assert "instr(" in _top_directories_sql(sqlite_state)

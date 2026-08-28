@@ -267,8 +267,9 @@ class ServerSettings(ModelMixin):
     port: int = 8765
     #: Which jobs this process takes on: ``all`` (the default and today's
     #: behavior), ``api`` (serve only — publishes index work instead of
-    #: running it), ``indexer`` (watch, schedule and drain the queue) or
-    #: ``worker`` (preparation only). `pheasant serve --role` overrides this.
+    #: running it), ``indexer`` (watch, schedule and drain the queue),
+    #: ``graph`` (serve the resident graph only), or ``worker`` (preparation
+    #: only). `pheasant serve --role` overrides this.
     #: See :mod:`pheasant.deployment.roles`.
     role: str = "all"
     mcp: McpSettings = field(default_factory=McpSettings)
@@ -368,6 +369,11 @@ class EmbeddingsSettings(ModelMixin):
     #: malformed request is never retried.
     max_retries: int = 4
     retry_backoff_seconds: float = 1.0
+    #: A 429 during bulk indexing is provider flow control, not a failed
+    #: source.  Keep retrying within this cumulative wait budget before the
+    #: error is allowed to escape and let the durable source queue retry it.
+    #: Zero restores the ordinary ``max_retries`` behavior.
+    rate_limit_max_wait_seconds: float = 300.0
 
 
 @dataclass
@@ -622,6 +628,17 @@ class SyncSettings(ModelMixin):
 @dataclass
 class GraphSettings(ModelMixin):
     """How much graph the knowledge graph should actually keep."""
+
+    #: Optional internal graph-query service. When set, API and MCP serving
+    #: processes keep no persisted graph in RAM and send graph reads to this
+    #: endpoint instead. Standalone remains in-process when this is ``None``.
+    query_service_url: str | None = None
+    #: Bearer token environment variable shared by graph clients and the
+    #: graph-service role. The secret itself never belongs in YAML.
+    query_service_token_env: str = "PHEASANT_GRAPH_SERVICE_TOKEN"
+    #: Per-call deadline. Graph/hybrid search fails explicitly at this bound;
+    #: it never falls back to loading a full graph into an API replica.
+    query_service_timeout_seconds: float = 30.0
 
     #: Wire agent-memory records into the graph (Step 33.7): `about` edges to
     #: what a record refers to, plus `supersedes` between corrections. A no-op
@@ -995,6 +1012,12 @@ class RepoSettings(ModelMixin):
     include_uncommitted: bool = True
     commit_trigger: bool = True
     dependency_graph: dict[str, Any] = field(default_factory=dict)
+    # Populated by URL quick-add. Local repository sources leave these unset.
+    # Keeping the materialization recipe with the source is what lets every
+    # later sync advance the managed checkout before it indexes it.
+    clone_url: str | None = None
+    clone_path: str | None = None
+    clone_ref: str | None = None
 
 
 @dataclass

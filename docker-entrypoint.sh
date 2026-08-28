@@ -105,15 +105,34 @@ ensure_config || true
 
 case "${1:-serve}" in
     serve)
+        shift
         if [ ! -f "$CONFIG_PATH" ]; then
             echo "pheasant: no config at $CONFIG_PATH and its directory is not writable." >&2
             echo "pheasant: mount a config there, or set PHEASANT_CONFIG." >&2
             exit 1
         fi
-        index_workspace_if_present
-        exec python -m pheasant serve --config "$CONFIG_PATH"
+        # A role-split fleet owns its configured sources; it must not turn a
+        # non-empty workspace mount into an implicit source on every replica.
+        # The zero-config, single-container path still keeps its convenient
+        # auto-add behaviour.
+        serve_role=all
+        expect_role=false
+        for arg in "$@"; do
+            if [ "$expect_role" = true ]; then
+                serve_role=$arg
+                break
+            fi
+            case "$arg" in
+                --role) expect_role=true ;;
+                --role=*) serve_role=${arg#--role=} ; break ;;
+            esac
+        done
+        if [ "$serve_role" = all ]; then
+            index_workspace_if_present
+        fi
+        exec python -m pheasant serve --config "$CONFIG_PATH" "$@"
         ;;
-    setup|up|sync|start|mcp|scan|doctor|validate|init|config|host|mount|repair|backup|restore|\
+    setup|up|sync|start|mcp|scan|doctor|validate|init|config|host|mount|repair|backup|restore|worker|\
     client-config|compose-env)
         exec python -m pheasant "$@"
         ;;

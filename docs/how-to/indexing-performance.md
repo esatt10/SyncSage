@@ -11,6 +11,19 @@ pheasant separates work that can scale from state that must stay ordered:
 This preserves stable IDs, incremental skips and deterministic graph bytes at
 every worker count.
 
+In a fleet, scale the **preparation workers**, not the indexer. Each shard has
+one elected indexer/commit authority; additional indexer replicas are hot
+standbys. If commit/enrichment/graph-save time dominates after preparation is
+fast, split sources into another shard instead of adding writers to the same
+graph.
+
+Keep the dispatch window bounded. A remote batch holds every file's bytes on
+the indexer and worker, so the practical in-flight payload is roughly
+`max_parallel_files * remote_worker_batch_size`. The fleet profile uses 16 x
+16 (256 files), four worker containers with two request threads each, and 8
+embedding requests in flight. That leaves CPU and memory for Postgres, NATS,
+the API and the graph owner on an 8-core development host.
+
 ## Choose a local executor
 
 ```yaml
@@ -72,11 +85,33 @@ sync:
     remote_worker_timeout_seconds: 120
 ```
 
-The coordinator reads each connector payload and sends immutable text bytes plus
+The coordinator reads each connector payload and sends immutable content plus
 source/chunking metadata round-robin. Workers return deterministic parsed chunks
-and never receive write access to `/state`. Binary documents, images/audio,
-taxonomy-enabled sources and repair passes currently prepare locally because
-they rely on local sidecars or handler/graph state.
+and never receive write access to `/state`. PDF, DOCX and EPUB extraction is
+remote-safe and each binary document gets its own bounded task envelope. Images,
+audio, taxonomy-enabled sources and repair passes still prepare locally because
+they rely on credentials, sidecars or live graph state.
+
+## Delta generations and recovery
+
+Unchanged CLI/worker syncs defer graph deserialization. They list and compare
+content-addressed manifest entries, update the checkpoint, and read counts from
+`graph.latest.meta.json`; the full graph is loaded only when a changed artifact
+must mutate it. Changed generations publish graph bytes first, generation
+metadata second, and source manifests last, so a crash causes safe reprocessing
+instead of an ahead-of-graph manifest.
+
+A redelivered **full** task resumes as an incremental delta only after a
+graph+manifest checkpoint was durably published. Before that boundary it
+restarts as full. This avoids repeating an entire large repository after a
+late provider failure without trusting an uncommitted partial manifest.
+
+These boundaries adopt the useful parts of GitHub Blackbird's architecture:
+event-driven delta crawling, an ordered ingest stream, immutable index
+generations and later compaction. Pheasant keeps source/repository shards
+rather than blob shards because cross-document graph relationships are part of
+its retrieval contract; use `pheasant shard plan` when graph commit/save time,
+not parsing, becomes the limiting phase.
 
 Do not expose `/internal/indexing/prepare` to the public internet. It is disabled
 by default and bearer-authenticated when enabled, but task payloads contain the

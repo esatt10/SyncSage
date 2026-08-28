@@ -455,6 +455,10 @@ sources:
       branch_policy: current
       include_uncommitted: true
       commit_trigger: true
+      # Set automatically by URL quick-add; null keeps this a local checkout.
+      clone_url: null
+      clone_path: null
+      clone_ref: null
       dependency_graph:
         enabled: true
         languages:

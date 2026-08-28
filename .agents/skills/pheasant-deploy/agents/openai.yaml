@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pheasant Deploy"
+  short_description: "Configure and deploy a local Pheasant stack"
+  default_prompt: "Use $pheasant-deploy to configure and deploy Pheasant from a blank canvas or a repository preset."

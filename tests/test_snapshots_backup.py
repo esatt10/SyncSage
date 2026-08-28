@@ -55,6 +55,39 @@ def test_write_and_read_snapshot_round_trips(tmp_path: Path) -> None:
     assert restored.number_of_edges() == graph.number_of_edges()
 
 
+def test_current_generation_snapshot_copies_published_bytes(tmp_path: Path) -> None:
+    store = GraphStore(tmp_path / "graphs")
+    graph = _graph(6)
+    current = store.save("kb", graph)
+
+    snapshot = store.snapshot_current("kb", "2026-06-18T01:00:00Z")
+
+    assert snapshot.read_bytes() == current.read_bytes()
+    restored = store.read_snapshot(snapshot)
+    assert (restored.number_of_nodes(), restored.number_of_edges()) == (6, 5)
+
+
+def test_save_publishes_small_generation_metadata_for_count_only_readers(
+    tmp_path: Path,
+) -> None:
+    store = GraphStore(tmp_path / "graphs")
+    graph = _graph(7)
+
+    store.save("kb", graph)
+
+    assert store.metadata_path("kb").exists()
+    assert store.counts("kb") == (7, 6)
+
+
+def test_counting_a_legacy_graph_migrates_it_to_metadata_only_reads(tmp_path: Path) -> None:
+    store = GraphStore(tmp_path / "graphs")
+    store.save("kb", _graph(4))
+    store.metadata_path("kb").unlink()
+
+    assert store.counts("kb") == (4, 3)
+    assert store.metadata_path("kb").exists()
+
+
 def test_list_snapshots_is_oldest_first(tmp_path: Path) -> None:
     store = GraphStore(tmp_path / "graphs")
     for ts in ("2026-06-18T03:00:00Z", "2026-06-18T01:00:00Z", "2026-06-18T02:00:00Z"):
@@ -137,8 +170,15 @@ def test_snapshot_interval_respected(config_path: Path, monkeypatch: pytest.Monk
         run_sync(engine, source_name="architecture-notes", mode="incremental")
         assert len(engine.graph_store.list_snapshots(kb)) == 1
 
-        # Sync after the interval -> a new snapshot.
+        # An unchanged generation is not snapshotted just because the clock
+        # moved; immutable-generation history stores changes, not duplicates.
         clock["now"] = "2026-06-18T03:00:00Z"
+        run_sync(engine, source_name="architecture-notes", mode="incremental")
+        assert len(engine.graph_store.list_snapshots(kb)) == 1
+
+        # A changed generation after the interval does publish new history.
+        source = next(item for item in cfg.sources if item.name == "architecture-notes")
+        (source.path / "generation.md").write_text("# New generation\n", encoding="utf-8")
         run_sync(engine, source_name="architecture-notes", mode="incremental")
         assert len(engine.graph_store.list_snapshots(kb)) == 2
     finally:

@@ -230,6 +230,8 @@ async def test_a_wait_true_upload_offloads_its_blocking_work(
     import threading
     import types
 
+    from pheasant.sync.worker import WorkerBackedEngine
+
     app = create_app(config=loaded_config, config_path=config_path)
 
     calling_thread: list[int] = []
@@ -238,7 +240,11 @@ async def test_a_wait_true_upload_offloads_its_blocking_work(
         calling_thread.append(threading.get_ident())
         return types.SimpleNamespace(status="succeeded", indexed_artifacts=0, skipped_artifacts=0)
 
-    monkeypatch.setattr(app.state.engine, "sync_source", _recording_sync_source)
+    # The scaled architecture deliberately executes wait=true syncs through
+    # WorkerBackedEngine so CPU-bound indexing happens in a child process.
+    # Replace that boundary here to observe the thread used by the upload
+    # route without starting a real child process.
+    monkeypatch.setattr(WorkerBackedEngine, "sync_source", _recording_sync_source)
 
     from httpx import ASGITransport, AsyncClient
 
@@ -250,9 +256,9 @@ async def test_a_wait_true_upload_offloads_its_blocking_work(
         )
 
     assert response.status_code == 200
-    assert calling_thread, "engine.sync_source was never called"
+    assert calling_thread, "WorkerBackedEngine.sync_source was never called"
     assert calling_thread[0] != threading.get_ident(), (
-        "engine.sync_source ran on the event loop's own thread, not a worker "
+        "WorkerBackedEngine.sync_source ran on the event loop's own thread, not a worker "
         "thread — a slow sync_source call here would block every other "
         "request in the process"
     )

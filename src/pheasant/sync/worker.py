@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -33,9 +36,14 @@ logger = logging.getLogger(__name__)
 
 #: A sync that has produced no output at all for this long is presumed hung.
 DEFAULT_TIMEOUT_S = 6 * 60 * 60
+DEFAULT_INACTIVITY_TIMEOUT_S = 30 * 60
 # Leave a little time for the child to report a useful lease-timeout error
 # before the parent subprocess timeout expires.
 DEFAULT_LEASE_WAIT_S = DEFAULT_TIMEOUT_S - 60
+
+
+class SyncWorkerStalled(RuntimeError):
+    """A child stayed alive but emitted no progress for the stall budget."""
 
 
 def run_sync(
@@ -47,6 +55,7 @@ def run_sync(
     full_scan: bool = False,
     depth: int | None = None,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
+    task_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Index in a child process and return its report.
 
@@ -70,6 +79,7 @@ def run_sync(
         "--mode",
         mode,
         "--json",
+        "--worker-child",
     ]
     if source_name:
         command += ["--source", source_name]
@@ -81,6 +91,13 @@ def run_sync(
         command += ["--depth", str(depth)]
     if on_progress is not None:
         command += ["--progress"]
+    if task_payload:
+        import base64
+
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(task_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
+        command += ["--task-payload", encoded]
     # Server-owned workers queue behind another legitimate writer. The public
     # CLI remains fail-fast, which is important for scripts and diagnostics.
     command += ["--wait-for-lease", str(DEFAULT_LEASE_WAIT_S)]
@@ -88,6 +105,14 @@ def run_sync(
     logger.info("Starting sync worker: %s", " ".join(command[3:]))
     try:
         returncode, stdout, stderr = _run_streaming(command, timeout, on_progress)
+    except SyncWorkerStalled as exc:
+        logger.error("Sync worker stalled: %s", exc)
+        return {
+            "status": "timeout",
+            "source_id": source_name,
+            "error": str(exc),
+            "results": [],
+        }
     except subprocess.TimeoutExpired:
         logger.error("Sync worker timed out after %.0fs", timeout)
         return {"status": "timeout", "source_id": source_name, "results": []}
@@ -126,11 +151,8 @@ def _run_streaming(
         )
         return completed.returncode, completed.stdout, completed.stderr
 
-    import json as _json
-
     from pheasant.cli import PROGRESS_MARKER
 
-    collected: list[str] = []
     with subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -139,32 +161,123 @@ def _run_streaming(
         bufsize=1,
     ) as process:
         assert process.stdout is not None
-        for line in process.stdout:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            payload = None
-            if line.startswith("{"):
-                try:
-                    payload = _json.loads(line)
-                except _json.JSONDecodeError:
-                    payload = None
-            if isinstance(payload, dict) and payload.get("marker") == PROGRESS_MARKER:
-                try:
-                    on_progress(payload)
-                except Exception:  # pragma: no cover - never fail a sync for this
-                    logger.debug("progress forwarding failed", exc_info=True)
-                continue
-            # Not progress — keep it for _parse_report, which looks for the
-            # final JSON report among whatever the child printed.
-            collected.append(line)
+        assert process.stderr is not None
+        return _monitor_streaming_process(
+            process,
+            command,
+            timeout,
+            on_progress,
+            PROGRESS_MARKER,
+        )
+
+
+def _monitor_streaming_process(
+    process: subprocess.Popen,
+    command: list[str],
+    timeout: float,
+    on_progress: Callable[[dict[str, Any]], None],
+    progress_marker: str,
+) -> tuple[int, str, str]:
+    """Drain both pipes while enforcing total and no-progress deadlines.
+
+    Reading stdout in the caller thread made its later ``wait(timeout=...)``
+    unreachable until the child exited. It also left stderr undrained, so a
+    noisy failure could fill that pipe and deadlock both processes. Dedicated
+    readers make the watchdog independent of either pipe's activity.
+    """
+
+    import json as _json
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    events: queue.Queue[tuple[str, str | None]] = queue.Queue()
+
+    def read_stream(name: str, stream) -> None:  # type: ignore[no-untyped-def]
         try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+            for raw in stream:
+                events.put((name, raw.rstrip("\n")))
+        finally:
+            events.put((name, None))
+
+    readers = [
+        threading.Thread(
+            target=read_stream,
+            args=("stdout", process.stdout),
+            name="pheasant-sync-stdout",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=read_stream,
+            args=("stderr", process.stderr),
+            name="pheasant-sync-stderr",
+            daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+
+    collected: list[str] = []
+    errors: list[str] = []
+    started = time.monotonic()
+    deadline = started + max(0.0, float(timeout))
+    last_progress = started
+    stall_budget = max(0.01, float(DEFAULT_INACTIVITY_TIMEOUT_S))
+    ended: set[str] = set()
+
+    while len(ended) < 2:
+        now = time.monotonic()
+        if now >= deadline:
             process.kill()
-            raise
-        stderr = process.stderr.read() if process.stderr else ""
-    return process.returncode, "\n".join(collected), stderr
+            process.wait(timeout=5)
+            raise subprocess.TimeoutExpired(command, timeout)
+        silent_for = now - last_progress
+        if silent_for >= stall_budget:
+            process.kill()
+            process.wait(timeout=5)
+            raise SyncWorkerStalled(
+                f"no progress for {stall_budget:.0f}s; child was terminated so its "
+                "queue task can be retried"
+            )
+        wait_for = min(0.5, deadline - now, stall_budget - silent_for)
+        try:
+            stream_name, line = events.get(timeout=max(0.01, wait_for))
+        except queue.Empty:
+            continue
+        if line is None:
+            ended.add(stream_name)
+            continue
+        if stream_name == "stderr":
+            errors.append(line)
+            continue
+
+        # Only stdout is protocol progress. Repeated stderr warnings from a
+        # stuck child must not keep the watchdog alive indefinitely.
+        last_progress = time.monotonic()
+        if not line:
+            continue
+        payload = None
+        if line.startswith("{"):
+            try:
+                payload = _json.loads(line)
+            except _json.JSONDecodeError:
+                payload = None
+        if isinstance(payload, dict) and payload.get("marker") == progress_marker:
+            try:
+                on_progress(payload)
+            except Exception:  # pragma: no cover - never fail a sync for this
+                logger.debug("progress forwarding failed", exc_info=True)
+            continue
+        collected.append(line)
+
+    try:
+        process.wait(timeout=max(0.01, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+        raise
+    for reader in readers:
+        reader.join(timeout=1)
+    return process.returncode, "\n".join(collected), "\n".join(errors)
 
 
 class WorkerBackedEngine:
@@ -257,6 +370,29 @@ class WorkerBackedEngine:
         results = self._adopt(report)
         return results[0] if results else self._empty(source_name, report)
 
+    def apply_index_task(self, task: Any, *, on_progress: Any = None) -> Any:
+        """Run an ordinary sync or queued graph control operation in a child."""
+
+        if not self._can_delegate():
+            return self._engine.apply_index_task(
+                task,
+                on_progress=_as_engine_hook(on_progress),
+            )
+        report = run_sync(
+            self._config_path,
+            str(task.source_id),
+            str(task.mode),
+            full_scan=task.full_scan,
+            depth=task.max_depth,
+            on_progress=on_progress,
+            task_payload={
+                **dict(task.payload or {}),
+                "_delivery_attempt": int(getattr(task, "attempts", 0) or 0),
+            },
+        )
+        results = self._adopt(report)
+        return results[0] if results else self._empty(str(task.source_id), report)
+
     def sync_all(
         self,
         mode: str = "incremental",
@@ -280,7 +416,15 @@ class WorkerBackedEngine:
             full_scan=full_scan,
             on_progress=on_progress,
         )
-        return self._adopt(report)
+        results = self._adopt(report)
+        # A child-process failure has no per-source result payload. Returning
+        # an empty list made callers conclude that there were zero failures
+        # and mark the UI job succeeded even though the worker exited nonzero.
+        # Preserve the failure as one synthetic result so every caller's
+        # existing ``status in {failed, timeout}`` check sees it.
+        if not results and report.get("status") != "ok":
+            return [self._empty(None, report)]
+        return results
 
     def startup(self) -> list[Any]:
         engine = self._engine
@@ -292,7 +436,13 @@ class WorkerBackedEngine:
         # search when it ran here). The worker builds it — see the CLI sync
         # path — and until it exists, graph search falls back to scanning.
         engine.reconcile_embeddings()
-        names = [s.name for s in engine.config.sources if s.enabled and s.sync.on_startup]
+        enabled = engine.enabled_sources()
+        names = [source.name for source in enabled if source.sync.on_startup]
+        # The normal deployment starts every enabled source. Delegate that as
+        # one sync-all child so the engine can apply its bounded source-level
+        # parallelism and rebuild the shared graph index once at the end.
+        if names and len(names) == len(enabled) and self._can_delegate():
+            return self.sync_all("incremental")
         results = []
         for name in names:
             results.append(self.sync_source(name, "incremental"))

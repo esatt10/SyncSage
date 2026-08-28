@@ -477,7 +477,7 @@ somewhere it can actually be made.
 
 On **SQLite**, the export must run where `/state` is writable. SQLite creates
 its `-wal` and `-shm` sidecars even to read, so a read-only `/state` — which is
-what `docker-compose.scale.yml` gives the api replicas — fails outright:
+what `deploy/compose/docker-compose.scale.yml` gives the api replicas — fails outright:
 
 ```
 ERROR: could not open the SQLite state at /state/pheasant.db: unable to open
@@ -617,7 +617,7 @@ backend, and never on the sync path. That boundary is deliberate:
   be expressed at all.
 - DuckDB takes an exclusive **file lock**: while one process holds the database
   read-write, no other process can open it, even read-only. SQLite's WAL is what
-  lets `docker-compose.scale.yml` mount `/state:ro` on the API replicas while the
+  lets `deploy/compose/docker-compose.scale.yml` mount `/state:ro` on the API replicas while the
   indexer writes.
 
 So it earns its place on the read side, owning nothing. For state, the choice

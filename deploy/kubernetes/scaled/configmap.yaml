@@ -78,6 +78,22 @@ data:
         remote_worker_token_env: PHEASANT_INDEX_WORKER_TOKEN
         remote_worker_batch_size: 8
         worker_transport: http
+    graph:
+      # The API tier keeps no full graph resident. This Service can be scaled
+      # independently or deployed once per knowledge-base shard.
+      query_service_url: http://pheasant-graph:8765
+      query_service_token_env: PHEASANT_GRAPH_SERVICE_TOKEN
+      query_service_timeout_seconds: 30
+    assistant:
+      # Hybrid already executes lexical + vector + graph retrieval. A second
+      # standalone text fanout repeats PostgreSQL ranking and largely
+      # duplicates the evidence hybrid returns. Text remains an explicit API
+      # mode for exact-identifier probes and remains inside hybrid.
+      retrieval:
+        retrieval_modes:
+          - vector
+          - graph
+          - hybrid
     security:
       allow_workspace_roots:
         - /workspace

@@ -147,6 +147,34 @@ graph:
   max_nodes: 1500000   # null disables the warning
 ```
 
+## When to separate graph queries from API replicas
+
+The fleet profile can put the resident graph behind an authenticated internal
+service:
+
+```yaml
+graph:
+  query_service_url: http://graph:8765
+  query_service_token_env: PHEASANT_GRAPH_SERVICE_TOKEN
+  query_service_timeout_seconds: 30
+```
+
+The `graph` role loads and refreshes the snapshot; API/MCP replicas keep only a
+bounded proxy. This is worth the extra network hop and service when either:
+
+* API graph residency is regularly above roughly **60-70% of a 3 GiB limit**;
+* two or more API replicas would otherwise duplicate a large graph; or
+* graph-query CPU/latency needs to scale independently from text/vector/API
+  traffic.
+
+It does **not** make graph enrichment or snapshot saves faster: those remain in
+the single commit authority. If save/enrichment dominates an indexing run,
+split sources into multiple knowledge-base shards below so each indexer and
+graph service owns a smaller snapshot. For one API below the memory threshold,
+the default local graph is simpler, uses less total fleet memory, and avoids the
+HTTP hop. There is no automatic local fallback in remote mode because an outage
+must not cause every API replica to materialize the graph simultaneously.
+
 ## When you cross the line: shard
 
 Split the corpus across several pheasant regions and let the
@@ -197,13 +225,15 @@ big" means. A single source over budget on its own is reported rather than
 split — no arrangement of whole sources fixes that, and the honest answers are
 more memory for that region or a narrower `include`/`exclude`.
 
-### Writing to one knowledge base from several indexers
+### One commit authority per knowledge-base shard
 
-Separate from sharding, and only on Postgres: the write lease is **per source**
-there rather than per state directory, so two indexers can commit two different
-sources concurrently. On SQLite the whole-state lease remains, because SQLite
-genuinely permits one writer per file — that is an accurate model, not a
-limitation to route around.
+Postgres allows API replicas and durable coordination, but the persisted graph
+is one whole-file snapshot and its node FTS is one global projection. Several
+indexers committing different sources from stale graph snapshots can overwrite
+one another even when relational rows are source-scoped. Pheasant therefore
+elects one indexer to own watcher, scheduler, queue drain and graph commits per
+shard. Extra indexers are hot standbys. Parallelism stays in multi-source
+preparation inside that authority and in the stateless worker tier.
 
 ## Which storage backend
 
@@ -212,14 +242,14 @@ Independent of the graph, and a different question:
 | | SQLite (default) | Postgres |
 |---|---|---|
 | Setup | none | a database to run |
-| Writers | **one process per knowledge base** | **one per source** — several indexers at once |
+| Writers | **one process per knowledge base** | **one elected indexer per shard**, with standby failover |
 | Read replicas | one container | many |
 | Ranking | BM25 | see [configuration](../configuration.md#where-state-lives-storagebackend) |
 
-Use SQLite unless you need several processes writing one knowledge base, or
-several replicas serving it. It is not slower for a single container, and it is
-one fewer thing to operate. Postgres is what lifts the one-writer limit; it does
-**not** change the graph numbers above, because the graph is held in memory
+Use SQLite unless you need several replicas serving one knowledge base,
+database-backed leader election, or a durable broker-backed fleet. It is not
+slower for a single container, and it is one fewer thing to operate. Postgres
+does **not** change the graph numbers above, because the graph is held in memory
 either way.
 
 ## Ask pheasant instead of reading the table
@@ -245,16 +275,16 @@ a bigger container. `--json` includes it as a `projection` object.
 ## Sizing a fleet
 
 Past one container, the shape is
-[three tiers](worker-fleet.md#running-the-whole-fleet). What the file count
+[four tiers](worker-fleet.md#running-the-whole-fleet). What the file count
 predicts:
 
-| Corpus | Shards | Indexers | API replicas | Workers | Memory each |
-|---|---|---|---|---|---|
-| < 25,000 | 1 | 1 | — single container | 0 | 0.5–1 Gi |
-| 75,000 | 1 | 1 | 2 | 3 | 1 Gi |
-| 150,000 | 1 | 1 | 2 | 6 | 2 Gi |
-| 250,000 | 2 | 2 | 2 | 16 | 4 Gi |
-| 600,000 | 3 | 3 | 3 | 24 | 8 Gi |
+| Corpus | Shards | Indexers | Graph services | API replicas | Workers | Graph/index memory each |
+|---|---|---|---|---|---|---|
+| < 25,000 | 1 | 1 | — local | — single container | 0 | 0.5–1 Gi |
+| 75,000 | 1 | 1 | 1 | 2 | 3 | 1 Gi |
+| 150,000 | 1 | 1 | 1 | 2 | 6 | 2 Gi |
+| 250,000 | 2 | 2 | 2 | 2 | 16 | 4 Gi |
+| 600,000 | 3 | 3 | 3 | 3 | 24 | 8 Gi |
 
 Two of those columns are honest guesses and it is worth saying which:
 **api replicas** track request traffic, which a file count cannot predict —
@@ -264,6 +294,23 @@ workers buying only 1.113x on a commit-dominated fixture; the tier helps when
 parsing is expensive (PDFs, large documents), not uniformly.
 
 Only **shards** and **memory** come straight from measurement.
+
+Keep the scaling scopes separate:
+
+| Constraint observed | Scale | Do not scale |
+|---|---|---|
+| HTTP/MCP request saturation | API replicas | indexers |
+| Graph-query latency/CPU | Graph replicas, preferably across nodes | workers |
+| Parse/extraction backlog | Stateless workers | graph replicas |
+| Graph save, enrichment, or ordered commit | Whole knowledge-base shards | indexer replicas within one shard |
+| Embedding 429s/provider latency | Provider quota or lower embedding concurrency | preparation workers |
+
+Docker Compose shares one host, so extra replicas can compete for the same CPU
+and database; the shipped default stays at one graph service, one active
+indexer, and four workers. Kubernetes makes API, graph, and worker scaling
+independent, but one namespace/release should still describe one shard. Give
+each shard its own name, database scope, NATS durable/subject, RWX state, and
+tokens, then fan retrieval across shards rather than sharing a writable graph.
 
 ## Request concurrency and the thread pool
 
@@ -305,4 +352,6 @@ symbols, so adopting its figure would have halved every memory projection.
 
 - [Monitor indexing](monitor-indexing.md) — throughput, ETA and stall detection.
 - [Speed up indexing](indexing-performance.md) — worker counts and executors.
+- [Separate graph queries](graph-query-service.md) — setup, failure semantics,
+  and the measured 2026-08-26 fleet decision.
 - [Attach to a Synapse fleet](attach-to-synapse.md) — running several regions.

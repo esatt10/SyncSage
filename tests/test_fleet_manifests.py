@@ -122,7 +122,7 @@ def test_every_workload_passes_a_role_this_code_knows(scaled: list[dict[str, Any
         assert args[1] == "--role"
         assert args[2] in valid, f"unknown role {args[2]!r}"
         seen.add(args[2])
-    assert seen == {"api", "indexer", "worker"}
+    assert seen == {"api", "graph", "indexer", "worker"}
 
 
 def test_the_embedded_configs_are_valid_for_the_role_that_uses_them(
@@ -167,6 +167,21 @@ def test_the_api_and_indexer_share_one_knowledge_base(scaled: list[dict[str, Any
         volumes = {volume["name"]: volume for volume in _pod_spec(workload)["volumes"]}
         assert volumes["config"]["configMap"]["name"] == "pheasant-fleet-config"
     assert fleet.pheasant.name
+
+
+def test_scaled_assistant_avoids_redundant_text_fanout(
+    scaled: list[dict[str, Any]],
+) -> None:
+    """Hybrid already includes lexical search; a text arm repeats that query."""
+
+    fleet = next(
+        PheasantConfig.model_validate(yaml.safe_load(raw))
+        for doc in _by_kind(scaled, "ConfigMap")
+        if doc["metadata"]["name"] == "pheasant-fleet-config"
+        for raw in doc["data"].values()
+    )
+
+    assert fleet.assistant.retrieval.retrieval_modes == ["vector", "graph", "hybrid"]
 
 
 # --------------------------------------------------------------------------
@@ -217,6 +232,10 @@ def test_api_replicas_mount_state_read_only(scaled: list[dict[str, Any]]) -> Non
     api = next(w for w in _workloads(scaled) if _container(w)["args"][2] == "api")
     mounts = {mount["name"]: mount for mount in _container(api)["volumeMounts"]}
     assert mounts["state"].get("readOnly") is True
+
+    graph = next(w for w in _workloads(scaled) if _container(w)["args"][2] == "graph")
+    graph_mounts = {mount["name"]: mount for mount in _container(graph)["volumeMounts"]}
+    assert graph_mounts["state"].get("readOnly") is True
 
     indexer = next(w for w in _workloads(scaled) if _container(w)["args"][2] == "indexer")
     indexer_mounts = {mount["name"]: mount for mount in _container(indexer)["volumeMounts"]}
@@ -359,7 +378,7 @@ def test_the_indexer_pdb_permits_a_node_drain(scaled: list[dict[str, Any]]) -> N
     assert pdbs["pheasant-api"]["spec"]["minAvailable"] == 1
 
 
-def test_the_worker_autoscaler_reads_the_queue_depth_metric(scaled: list[dict[str, Any]]) -> None:
+def test_the_worker_autoscaler_reads_source_and_file_backlog(scaled: list[dict[str, Any]]) -> None:
     """CPU is a lagging signal here; the backlog is the leading one.
 
     Also asserts the metric name against the registry, so renaming the series
@@ -370,10 +389,14 @@ def test_the_worker_autoscaler_reads_the_queue_depth_metric(scaled: list[dict[st
 
     metrics.register_default_metrics("test")
     assert "pheasant_index_queue_depth" in metrics.REGISTRY.render()
+    assert "pheasant_index_inflight" in metrics.REGISTRY.render()
+    assert "pheasant_index_preparation_backlog" in metrics.REGISTRY.render()
 
     keda = next(doc for doc in _by_kind(scaled, "ScaledObject"))
     assert keda["spec"]["scaleTargetRef"]["name"] == "pheasant-worker"
     assert "pheasant_index_queue_depth" in keda["spec"]["triggers"][0]["metadata"]["query"]
+    assert "pheasant_index_inflight" in keda["spec"]["triggers"][0]["metadata"]["query"]
+    assert "pheasant_index_preparation_backlog" in keda["spec"]["triggers"][0]["metadata"]["query"]
     assert keda["spec"]["minReplicaCount"] == 0, "an idle fleet should not pay for workers"
 
     hpa = next(
@@ -382,7 +405,12 @@ def test_the_worker_autoscaler_reads_the_queue_depth_metric(scaled: list[dict[st
         if doc["spec"]["scaleTargetRef"]["name"] == "pheasant-worker"
     )
     external = [entry for entry in hpa["spec"]["metrics"] if entry["type"] == "External"]
-    assert external[0]["external"]["metric"]["name"] == "pheasant_index_queue_depth"
+    external_names = {entry["external"]["metric"]["name"] for entry in external}
+    assert external_names == {
+        "pheasant_index_queue_depth",
+        "pheasant_index_inflight",
+        "pheasant_index_preparation_backlog",
+    }
 
 
 def test_the_indexer_points_at_the_worker_service(scaled: list[dict[str, Any]]) -> None:
@@ -486,26 +514,79 @@ def _manifest_paths(directory: Path) -> list[str]:
 # Compose
 # --------------------------------------------------------------------------
 
-COMPOSE_FLEET = REPO_ROOT / "docker-compose.scale.yml"
+COMPOSE_FLEET = REPO_ROOT / "deploy" / "compose" / "docker-compose.scale.yml"
 COMPOSE_CONFIG = REPO_ROOT / "deploy" / "compose"
 
 
-def test_the_compose_fleet_matches_the_kubernetes_shape() -> None:
-    """Three tiers, the same roles, and only the worker meant to be scaled."""
+def test_compose_manifests_live_under_the_deployment_directory() -> None:
+    assert not list(REPO_ROOT.glob("docker-compose*.yml"))
+    assert {
+        "docker-compose.yml",
+        "docker-compose.advanced.yml",
+        "docker-compose.scale.yml",
+        "docker-compose.fresh.yml",
+    }.issubset({path.name for path in COMPOSE_CONFIG.glob("docker-compose*.yml")})
+
+
+def test_the_compose_fleet_has_the_high_throughput_topology() -> None:
+    """Four Pheasant tiers, one migrator, and durable infrastructure."""
 
     compose = yaml.safe_load(COMPOSE_FLEET.read_text(encoding="utf-8"))
     services = compose["services"]
-    assert set(services) == {"postgres", "api", "indexer", "worker"}
+    assert set(services) == {
+        "postgres",
+        "nats",
+        "db-init",
+        "workspace-init",
+        "api",
+        "graph",
+        "indexer",
+        "worker",
+    }
 
     roles = {}
-    for name in ("api", "indexer", "worker"):
+    for name in ("api", "graph", "indexer"):
         command = services[name]["command"]
         assert command[:2] == ["serve", "--role"]
         roles[name] = command[2]
-    assert roles == {"api": "api", "indexer": "indexer", "worker": "worker"}
+    assert roles == {"api": "api", "graph": "graph", "indexer": "indexer"}
 
-    # One indexer, pinned: two would take turns on one lease, not double up.
-    assert services["indexer"]["scale"] == 1
+    worker_command = services["worker"]["command"]
+    assert worker_command[:3] == ["worker", "--transport", "grpc"]
+    assert "--max-workers" in worker_command
+    assert "scale" not in services["indexer"]
+
+    assert services["db-init"]["restart"] == "no"
+    for name in ("api", "graph", "indexer"):
+        assert services[name]["depends_on"]["db-init"] == {
+            "condition": "service_completed_successfully"
+        }
+        assert services[name]["depends_on"]["workspace-init"] == {
+            "condition": "service_completed_successfully"
+        }
+
+
+def test_the_compose_fleet_starts_from_an_isolated_workspace_volume() -> None:
+    compose = yaml.safe_load(COMPOSE_FLEET.read_text(encoding="utf-8"))
+
+    assert "pheasant-workspace" in compose["volumes"]
+    assert (
+        "${PHEASANT_FLEET_WORKSPACE_PATH:-pheasant-workspace}:/workspace:ro"
+        in compose["services"]["api"]["volumes"]
+    )
+    assert (
+        "${PHEASANT_FLEET_WORKSPACE_PATH:-pheasant-workspace}:/workspace"
+        in compose["services"]["indexer"]["volumes"]
+    )
+    initializer = compose["services"]["workspace-init"]
+    assert initializer["user"] == "0:0"
+    init_command = initializer["command"]
+    assert len(init_command) == 1
+    assert "mkdir -p /workspace/sources" in init_command[0]
+    assert "chown 10001:10001 /workspace /workspace/sources" in init_command[0]
+    assert initializer["volumes"] == [
+        "${PHEASANT_FLEET_WORKSPACE_PATH:-pheasant-workspace}:/workspace"
+    ]
 
 
 def test_the_compose_worker_gets_no_database_url() -> None:
@@ -525,28 +606,97 @@ def test_the_compose_configs_are_valid_for_their_roles() -> None:
         yaml.safe_load((COMPOSE_CONFIG / "worker.yaml").read_text(encoding="utf-8"))
     )
 
-    for role in ("api", "indexer"):
+    for role in ("api", "graph", "indexer"):
         validate_role(resolve_role(fleet, role), fleet)
     validate_role(resolve_role(worker, "worker"), worker)
 
     assert fleet.sync.queue.enabled is True
+    assert fleet.sync.queue.backend == "nats"
+    assert fleet.sync.queue.nats_servers == ["nats://nats:4222"]
     assert fleet.storage.backend == "postgres"
     # Addressed by Compose service name, so `--scale worker=N` needs no edit.
-    assert fleet.sync.concurrency.remote_worker_urls == ["http://worker:8765"]
+    assert fleet.sync.concurrency.remote_worker_urls == ["grpc://worker:8766"]
+    assert fleet.sync.concurrency.worker_transport == "grpc"
     assert worker.sync.concurrency.remote_worker_enabled is True
     assert fleet.server.api.drain_seconds > 0
+    assert fleet.graph.query_service_url == "http://graph:8765"
+    assert fleet.graph.query_service_token_env == "PHEASANT_GRAPH_SERVICE_TOKEN"
+
+
+def test_the_three_compose_profiles_cover_small_advanced_and_fleet() -> None:
+    small = PheasantConfig.model_validate(
+        yaml.safe_load((COMPOSE_CONFIG / "local-small.yaml").read_text(encoding="utf-8"))
+    )
+    advanced = PheasantConfig.model_validate(
+        yaml.safe_load((COMPOSE_CONFIG / "local-advanced.yaml").read_text(encoding="utf-8"))
+    )
+    fleet = PheasantConfig.model_validate(
+        yaml.safe_load((COMPOSE_CONFIG / "fleet.yaml").read_text(encoding="utf-8"))
+    )
+
+    assert small.storage.backend == "sqlite"
+    assert small.search.embeddings.enabled is False
+    assert small.assistant.provider == "none"
+
+    for config in (advanced, fleet):
+        assert config.search.embeddings.model == "text-embedding-3-small"
+        assert config.search.vector_store.provider == "lancedb"
+        assert config.search.wasm_relationship_search is True
+        assert config.graph.wasm_cross_source_resolution is True
+        assert config.graph.memory_entity_bridging is True
+        assert config.assistant.model == "gpt-5.6-luna"
+        assert config.assistant.workflow == "agentic"
+        assert config.search.default_mode == "hybrid"
+        assert config.assistant.retrieval.expand_graph is True
+        assert config.server.mcp.enabled is True
+
+    assert advanced.assistant.retrieval.retrieval_modes == ["hybrid", "graph"]
+    assert fleet.assistant.retrieval.retrieval_modes == [
+        "vector",
+        "graph",
+        "hybrid",
+    ]
+
+    assert any(source.type.value == "memory" for source in advanced.sources)
+    assert not any(source.type.value == "memory" for source in fleet.sources)
+    assert fleet.ingestion.extractor.provider == "auto"
+    assert fleet.search.embeddings.rate_limit_max_wait_seconds == 900.0
+
+    assert advanced.storage.backend == "sqlite"
+    assert advanced.sync.queue.enabled is False
+    assert fleet.storage.backend == "postgres"
+    assert fleet.sync.queue.enabled is True
+    assert fleet.sync.queue.backend == "nats"
 
 
 def test_the_default_compose_file_is_still_one_container() -> None:
     """Rule 7: `docker compose up` must keep needing no infrastructure."""
 
-    compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    compose = yaml.safe_load(
+        (REPO_ROOT / "deploy" / "compose" / "docker-compose.yml").read_text(encoding="utf-8")
+    )
     services = compose["services"]
+    assert set(services) == {"pheasant"}
     assert "postgres" not in services
     assert "worker" not in services
-    # The UI sidecar is the only extra, and it is behind a profile.
-    assert services["pheasant-ui"]["profiles"] == ["ui"]
     assert "command" not in services["pheasant"], "the default container must not pass a role"
+    assert services["pheasant"]["volumes"][:2] == [
+        "pheasant-config:/config",
+        "${PHEASANT_WORKSPACE_PATH:-pheasant-workspace}:/workspace",
+    ]
+    assert services["pheasant"]["environment"]["PHEASANT_WORKSPACE"] == ("/ui-managed-sources")
+
+
+def test_the_advanced_compose_profile_is_one_node_and_uses_its_generated_config() -> None:
+    compose = yaml.safe_load(
+        (COMPOSE_CONFIG / "docker-compose.advanced.yml").read_text(encoding="utf-8")
+    )
+    assert set(compose["services"]) == {"pheasant"}
+    service = compose["services"]["pheasant"]
+    assert "postgres" not in compose["services"]
+    assert "nats" not in compose["services"]
+    assert "./local-advanced.yaml:/config/pheasant.yaml:ro" in service["volumes"]
+    assert "OPENAI_API_KEY" in service["environment"]
 
 
 # --------------------------------------------------------------------------

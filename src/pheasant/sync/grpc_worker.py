@@ -150,26 +150,56 @@ def _secure(url: str) -> bool:
 class GrpcTransport:
     """Speak :mod:`pheasant.sync.worker_transport`'s interface over gRPC.
 
-    Channels are the pooled "connections" the worker pool hands in and out.
-    A gRPC channel multiplexes concurrent streams over one HTTP/2 connection,
-    so reusing one across a whole source is both correct and the point.
+    One channel per service endpoint multiplexes concurrent streams over
+    HTTP/2. Sharing it across a whole source is both correct and the point:
+    its round-robin picker sees every RPC and distributes batches across all
+    addresses returned for a scaled Docker or cluster service.
     """
 
     def __init__(self) -> None:
         self._pb2, self._pb2_grpc = load_protos()
+        self._channels: dict[str, Any] = {}
+        self._channels_lock = threading.Lock()
 
-    def _channel(self, url: str) -> Any:
+    def _new_channel(self, url: str) -> Any:
         import grpc
 
         options = [
             ("grpc.max_send_message_length", MAX_MESSAGE_BYTES),
             ("grpc.max_receive_message_length", MAX_MESSAGE_BYTES),
             ("grpc.keepalive_time_ms", 30_000),
+            # Docker's scaled service name resolves to every worker replica.
+            # gRPC otherwise defaults to pick_first and pins this long-lived
+            # HTTP/2 channel to one container for the entire source sync.
+            ("grpc.lb_policy_name", "round_robin"),
         ]
         target = _target(url)
         if _secure(url):
             return grpc.secure_channel(target, grpc.ssl_channel_credentials(), options=options)
         return grpc.insecure_channel(target, options=options)
+
+    def _channel(self, url: str) -> Any:
+        """Return one thread-safe multiplexed channel per service endpoint.
+
+        Sharing is important for DNS-backed worker fleets: one round-robin
+        picker sees every concurrent batch and distributes the RPCs across all
+        resolved replicas. A separate channel per caller would give every
+        picker its own first choice and could still concentrate the first wave
+        of a sync on one worker.
+        """
+
+        with self._channels_lock:
+            channel = self._channels.get(url)
+            if channel is None:
+                channel = self._new_channel(url)
+                self._channels[url] = channel
+            return channel
+
+    def _drop_channel(self, url: str, channel: Any) -> None:
+        with self._channels_lock:
+            if self._channels.get(url) is channel:
+                self._channels.pop(url, None)
+        self.discard(channel)
 
     def discard(self, connection: Any) -> None:
         try:
@@ -206,7 +236,7 @@ class GrpcTransport:
                 )
             )
         except grpc.RpcError as exc:
-            self.discard(channel)
+            self._drop_channel(url, channel)
             raise _from_rpc_error(exc, url) from exc
         results: list[dict[str, Any]] = []
         for response in responses:
@@ -216,7 +246,17 @@ class GrpcTransport:
             results.append(
                 {"parsed": json.loads(response.parsed_json) if response.parsed_json else None}
             )
-        return {"results": results}, channel
+        # gRPC channels are thread-safe and multiplex streams. Keep this one
+        # in the transport-wide cache instead of handing it to WorkerPool's
+        # exclusive HTTP connection pool.
+        return {"results": results}, None
+
+    def close(self) -> None:
+        with self._channels_lock:
+            channels = list(self._channels.values())
+            self._channels.clear()
+        for channel in channels:
+            self.discard(channel)
 
 
 def _from_rpc_error(exc: Any, url: str) -> Exception:
@@ -342,6 +382,9 @@ class PreparationWorkerServicer:
 
         pb2, _ = load_protos()
         self._authenticate(context)
+        prepared_count = 0
+        cached_count = 0
+        refused_count = 0
         for request in request_iterator:
             remaining = context.time_remaining()
             if remaining is not None and remaining <= 0:
@@ -350,6 +393,7 @@ class PreparationWorkerServicer:
             if key:
                 found, cached = self.cache.get(key)
                 if found:
+                    cached_count += 1
                     yield pb2.PrepareResponse(
                         idempotency_key=key,
                         parsed_json=json.dumps(cached) if cached is not None else "",
@@ -362,14 +406,22 @@ class PreparationWorkerServicer:
                 # Per-item, not per-stream: streaming is what makes it
                 # possible to refuse one file and still serve the rest, and
                 # the coordinator prepares the refused one locally.
+                refused_count += 1
                 yield pb2.PrepareResponse(idempotency_key=key, error=str(exc))
                 continue
             if key:
                 self.cache.put(key, parsed)
+            prepared_count += 1
             yield pb2.PrepareResponse(
                 idempotency_key=key,
                 parsed_json=json.dumps(parsed) if parsed is not None else "",
             )
+        logger.info(
+            "gRPC preparation batch complete: prepared=%d cached=%d refused=%d",
+            prepared_count,
+            cached_count,
+            refused_count,
+        )
 
     def Check(self, request: Any, context: Any):  # noqa: N802 - gRPC spelling
         pb2, _ = load_protos()

@@ -610,7 +610,7 @@ def build_sections() -> list[Section]:
                 Question(key="server.port", prompt="Port", kind="int"),
                 Question(
                     key="server.role",
-                    prompt="Process role (all | api | indexer | worker)",
+                    prompt="Process role (all | api | indexer | graph | worker)",
                     kind="str",
                     help="'all' is right for one container. Split roles only in a "
                     "fleet, where several serving replicas must not each watch the "

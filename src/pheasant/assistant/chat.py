@@ -410,6 +410,9 @@ def collect_facts(graph: Any, node_ids: list[str], limit: int = 12) -> list[dict
     """
     if graph is None:
         return []
+    remote = getattr(graph, "remote_facts", None)
+    if callable(remote):
+        return remote(node_ids=node_ids, limit=limit)
 
     def label_of(node_id: str) -> str:
         try:

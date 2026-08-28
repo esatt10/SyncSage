@@ -7,7 +7,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-COMPOSE_PATH = ROOT / "docker-compose.fresh.yml"
+COMPOSE_PATH = ROOT / "deploy" / "compose" / "docker-compose.fresh.yml"
 ENTRYPOINT_PATH = ROOT / "docker-entrypoint.sh"
 
 
@@ -15,7 +15,7 @@ def test_fresh_ui_compose_is_standalone_and_volume_backed() -> None:
     raw = yaml.safe_load(COMPOSE_PATH.read_text(encoding="utf-8"))
     service = raw["services"]["pheasant"]
 
-    assert service["build"] == {"context": "."}
+    assert service["build"] == {"context": "../.."}
     assert service["container_name"] == "${PHEASANT_CONTAINER_NAME:-pheasant}"
     assert service["ports"] == ["${PHEASANT_BIND:-127.0.0.1}:${PHEASANT_PORT:-8765}:8765"]
     assert service["environment"]["PHEASANT_CONFIG"] == "/config/pheasant.yaml"
@@ -97,6 +97,14 @@ def test_the_entrypoint_gates_wasm_on_the_extra_being_installed() -> None:
     assert "--answers" in script
 
 
+def test_the_entrypoint_preserves_roles_and_dispatches_grpc_workers() -> None:
+    script = ENTRYPOINT_PATH.read_text(encoding="utf-8")
+
+    assert 'exec python -m pheasant serve --config "$CONFIG_PATH" "$@"' in script
+    assert "restore|worker|" in script
+    assert 'if [ "$serve_role" = all ]; then' in script
+
+
 def test_the_sandboxed_pdf_extractor_is_not_swept_in_with_the_accelerators() -> None:
     """It is a fidelity trade, not an acceleration one.
 
@@ -115,7 +123,9 @@ def test_the_sandboxed_pdf_extractor_is_not_swept_in_with_the_accelerators() -> 
 
 
 def test_fresh_ui_one_liner_is_documented() -> None:
-    command = "docker compose -f docker-compose.fresh.yml up -d --build --force-recreate"
+    command = (
+        "docker compose -f deploy/compose/docker-compose.fresh.yml up -d --build --force-recreate"
+    )
     # Documented where someone looks for it — the how-to guide — and in the
     # compose file's own header. The README is the product front door and
     # deliberately does not carry every operational one-liner.

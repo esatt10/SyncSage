@@ -24,6 +24,7 @@ import logging
 import sqlite3
 import threading
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,10 @@ BUSY_TIMEOUT_MS = 60_000
 
 #: Postgres equivalent, applied per session.
 STATEMENT_TIMEOUT_MS = 0  # 0 = no limit; indexing commits can be long.
+
+# Stable, process-independent Postgres advisory-lock key for schema DDL
+# (``PHEASANT`` in ASCII, below Postgres's signed BIGINT ceiling).
+SCHEMA_LOCK_KEY = 0x5048454153414E54
 
 
 class StateBackend(ABC):
@@ -96,6 +101,12 @@ class StateBackend(ABC):
         differently (``PRAGMA table_info`` vs ``information_schema``), and the
         one-shot additive migrations in the store need the answer.
         """
+
+    @contextmanager
+    def schema_lock(self):
+        """Serialize schema/cache DDL across processes where necessary."""
+
+        yield
 
     @property
     def description(self) -> str:
@@ -527,6 +538,41 @@ class PostgresBackend(StateBackend):
             (table,),
         )
         return {str(row["column_name"]) for row in found}
+
+    @contextmanager
+    def schema_lock(self):
+        """Hold a session advisory lock while migration/cache DDL runs.
+
+        ``executescript`` commits internally, so a transaction advisory lock
+        would disappear halfway through the schema. Pinning the pooled
+        connection keeps this session lock on the connection that acquired it.
+        """
+
+        self.enter_transaction()
+        conn = self._conn()
+        acquired = False
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_lock(%s)", (SCHEMA_LOCK_KEY,))
+            acquired = True
+            yield
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:  # pragma: no cover - broken connection
+                pass
+            raise
+        finally:
+            if acquired:
+                try:
+                    with conn.cursor() as cursor:
+                        cursor.execute("SELECT pg_advisory_unlock(%s)", (SCHEMA_LOCK_KEY,))
+                    conn.commit()
+                except Exception:  # pragma: no cover - connection loss releases it
+                    logger.warning("Could not explicitly release the schema advisory lock")
+            self._local.dirty = False
+            self.exit_transaction()
+            self._finish()
 
     @property
     def description(self) -> str:

@@ -48,11 +48,13 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import email.utils
 import hashlib
 import importlib.util
 import json
 import logging
 import os
+import random
 import re
 import socket
 import ssl
@@ -122,6 +124,10 @@ class VectorStore(Protocol):
         ...
 
     def count(self) -> int: ...
+
+    def dimensions(self) -> int | None:
+        """Stored vector width without materializing the vector index."""
+        ...
 
     def existing_ids(self, chunk_ids: list[str]) -> set[str]: ...
 
@@ -201,8 +207,8 @@ _RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 #: real 12k-file index actually died on.
 _TRANSIENT_ERRORS = (ssl.SSLError, URLError, TimeoutError, ConnectionError, socket.timeout)
 
-#: Ceiling on the backoff, so a long outage retries steadily rather than
-#: sleeping for minutes on the last attempt.
+#: Ceiling on locally invented backoff. A provider's explicit Retry-After is
+#: intentionally not capped: waking before its quota resets causes another 429.
 _MAX_BACKOFF_SECONDS = 30.0
 
 
@@ -211,11 +217,104 @@ def _retry_after_seconds(header: str | None, fallback: float) -> float:
     if not header:
         return fallback
     try:
-        return max(0.0, min(float(header), _MAX_BACKOFF_SECONDS))
+        return max(0.0, float(header))
     except (TypeError, ValueError):
-        # The HTTP-date form is legal but rare from these APIs; our own
-        # backoff is a better answer than parsing it wrong.
-        return fallback
+        try:
+            retry_at = email.utils.parsedate_to_datetime(header)
+            return max(0.0, retry_at.timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return fallback
+
+
+_RESET_PART_RE = re.compile(r"([0-9]*\.?[0-9]+)\s*(ms|s|m|h)", re.IGNORECASE)
+
+
+def _reset_after_seconds(header: str | None) -> float | None:
+    """Parse OpenAI-style ``x-ratelimit-reset-*`` duration headers."""
+
+    if not header:
+        return None
+    multipliers = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+    parts = _RESET_PART_RE.findall(str(header))
+    if not parts:
+        try:
+            return max(0.0, float(header))
+        except (TypeError, ValueError):
+            return None
+    return sum(float(value) * multipliers[unit.lower()] for value, unit in parts)
+
+
+class _AdaptiveRateGate:
+    """One shared cooldown and AIMD concurrency gate per embedder/model."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._ceiling = 1
+        self._limit = 1
+        self._active = 0
+        self._successes = 0
+        self._blocked_until = 0.0
+        self.rate_limit_events = 0
+        self.throttle_seconds = 0.0
+
+    def configure(self, ceiling: int) -> None:
+        with self._condition:
+            self._ceiling = max(1, int(ceiling or 1))
+            self._limit = self._ceiling
+            self._condition.notify_all()
+
+    def acquire(self) -> None:
+        while True:
+            deadline = 0.0
+            with self._condition:
+                remaining = self._blocked_until - time.monotonic()
+                if remaining > 0:
+                    deadline = self._blocked_until
+                elif self._active < self._limit:
+                    self._active += 1
+                    return
+                else:
+                    self._condition.wait(timeout=0.1)
+                    continue
+            time.sleep(max(0.0, deadline - time.monotonic()))
+            self.finish_cooldown(deadline)
+
+    def succeeded(self) -> None:
+        with self._condition:
+            self._active = max(0, self._active - 1)
+            self._successes += 1
+            if self._limit < self._ceiling and self._successes >= self._limit * 4:
+                self._limit += 1
+                self._successes = 0
+            self._condition.notify_all()
+
+    def failed(self) -> None:
+        with self._condition:
+            self._active = max(0, self._active - 1)
+            self._condition.notify_all()
+
+    def throttled(self, wait: float) -> float:
+        with self._condition:
+            self._active = max(0, self._active - 1)
+            self._limit = max(1, self._limit // 2)
+            self._successes = 0
+            self.rate_limit_events += 1
+            self.throttle_seconds += max(0.0, wait)
+            deadline = time.monotonic() + max(0.0, wait)
+            self._blocked_until = max(self._blocked_until, deadline)
+            self._condition.notify_all()
+            return deadline
+
+    def finish_cooldown(self, deadline: float) -> None:
+        with self._condition:
+            if self._blocked_until <= deadline:
+                self._blocked_until = 0.0
+            self._condition.notify_all()
+
+    @property
+    def concurrency(self) -> int:
+        with self._condition:
+            return self._limit
 
 
 class OpenAISpecEmbedder:
@@ -238,6 +337,7 @@ class OpenAISpecEmbedder:
         timeout: int = 30,
         max_retries: int = 4,
         retry_backoff_seconds: float = 1.0,
+        rate_limit_max_wait_seconds: float = 300.0,
     ):
         self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
         self.model = model
@@ -248,9 +348,16 @@ class OpenAISpecEmbedder:
         # Bounded retry on transient transport failures — see _post_with_retry.
         self.max_retries = max(0, int(max_retries))
         self.retry_backoff_seconds = max(0.1, float(retry_backoff_seconds))
+        self.rate_limit_max_wait_seconds = max(0.0, float(rate_limit_max_wait_seconds))
         self.calls = 0
         self.texts_embedded = 0
         self._counter_lock = threading.Lock()
+        self._rate_gate = _AdaptiveRateGate()
+
+    def configure_parallelism(self, ceiling: int) -> None:
+        """Share the indexer's requested concurrency across all HTTP threads."""
+
+        self._rate_gate.configure(ceiling)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         vectors: list[list[float]] = []
@@ -278,34 +385,87 @@ class OpenAISpecEmbedder:
         the same way, so both surface immediately.
         """
         delay = self.retry_backoff_seconds
+        transient_attempt = 0
+        rate_limit_attempt = 0
+        rate_limit_waited = 0.0
         last: Exception | None = None
-        for attempt in range(self.max_retries + 1):
+        while True:
+            self._rate_gate.acquire()
             try:
                 with urlopen(request, timeout=self.timeout) as response:
-                    return json.loads(response.read().decode("utf-8"))
+                    payload = json.loads(response.read().decode("utf-8"))
             except HTTPError as exc:  # noqa: PERF203 - retry loop
-                if exc.code not in _RETRYABLE_STATUS or attempt == self.max_retries:
+                headers = exc.headers
+                if exc.code == 429:
+                    retry_after = headers.get("Retry-After") if headers else None
+                    resets = [
+                        value
+                        for value in (
+                            _reset_after_seconds(
+                                headers.get("x-ratelimit-reset-requests") if headers else None
+                            ),
+                            _reset_after_seconds(
+                                headers.get("x-ratelimit-reset-tokens") if headers else None
+                            ),
+                        )
+                        if value is not None
+                    ]
+                    fallback = random.uniform(delay * 0.75, delay * 1.25)
+                    wait = max([_retry_after_seconds(retry_after, fallback), *resets])
+                    rate_limit_attempt += 1
+                    budget_exhausted = (
+                        not self.rate_limit_max_wait_seconds
+                        or rate_limit_waited + wait > self.rate_limit_max_wait_seconds
+                        or rate_limit_attempt > 100
+                    )
+                    deadline = self._rate_gate.throttled(0.0 if budget_exhausted else wait)
+                    if budget_exhausted:
+                        raise
+                    rate_limit_waited += wait
+                    last = exc
+                    request_id = headers.get("x-request-id") if headers else None
+                    logger.warning(
+                        "embedding provider throttled model=%s request_id=%s; shared cooldown "
+                        "%.1fs, concurrency=%d [rate-limit %d, %.1fs cumulative]",
+                        self.model,
+                        request_id or "unknown",
+                        wait,
+                        self._rate_gate.concurrency,
+                        rate_limit_attempt,
+                        rate_limit_waited,
+                    )
+                    time.sleep(wait)
+                    self._rate_gate.finish_cooldown(deadline)
+                    delay = min(delay * 2, _MAX_BACKOFF_SECONDS)
+                    continue
+                self._rate_gate.failed()
+                if exc.code not in _RETRYABLE_STATUS or transient_attempt >= self.max_retries:
                     raise
                 last = exc
-                # Honour the server's own pacing when it offers one; guessing
-                # shorter than a stated Retry-After is how a 429 becomes a ban.
                 header = exc.headers.get("Retry-After") if exc.headers else None
                 wait = _retry_after_seconds(header, delay)
             except _TRANSIENT_ERRORS as exc:
-                if attempt == self.max_retries:
+                self._rate_gate.failed()
+                if transient_attempt >= self.max_retries:
                     raise
                 last = exc
-                wait = delay
+                wait = random.uniform(delay * 0.75, delay * 1.25)
+            except BaseException:
+                self._rate_gate.failed()
+                raise
+            else:
+                self._rate_gate.succeeded()
+                return payload
+            transient_attempt += 1
             logger.warning(
                 "embedding request failed (%s), retrying in %.1fs [%d/%d]",
                 type(last).__name__,
                 wait,
-                attempt + 1,
+                transient_attempt,
                 self.max_retries,
             )
             time.sleep(wait)
             delay = min(delay * 2, _MAX_BACKOFF_SECONDS)
-        raise RuntimeError("unreachable: retry loop exhausted without raising")
 
     def _embed_batch(self, batch: list[str]) -> list[list[float]]:
         body: dict[str, Any] = {"model": self.model, "input": list(batch)}
@@ -553,6 +713,17 @@ class NumpyVectorStore:
     def count(self) -> int:
         return len(self._items())
 
+    def dimensions(self) -> int | None:
+        items = self._items()
+        if not items:
+            return None
+        blob = str(next(iter(items.values())).get("v") or "")
+        if not blob:
+            return None
+        # Vectors are packed float32 values. Inspecting the encoded byte width
+        # avoids decoding every vector merely to render the settings page.
+        return len(base64.b64decode(blob.encode("ascii"))) // 4
+
     def existing_ids(self, chunk_ids: list[str]) -> set[str]:
         items = self._items()
         return {chunk_id for chunk_id in chunk_ids if chunk_id in items}
@@ -592,6 +763,13 @@ class LanceDBVectorStore:
     def __init__(self, directory: str | Path):
         self.directory = Path(directory)
         self._db = None
+        # Membership is queried once per artifact by ``VectorIndexer``.  A
+        # Lance table scan there makes a full index O(files * vectors), which
+        # becomes the dominant cost long before embedding does.  One
+        # coordinator owns vector writes, so keep its chunk-id membership in
+        # memory and update it with every successful mutation.
+        self._id_cache: set[str] | None = None
+        self._id_cache_lock = threading.RLock()
 
     def _database(self):
         if self._db is None:
@@ -645,9 +823,21 @@ class LanceDBVectorStore:
         table = self._table()
         if table is None:
             self._database().create_table(self.TABLE, data=rows)
+            with self._id_cache_lock:
+                self._id_cache = set(chunk_ids)
             return
-        self.delete(chunk_ids=chunk_ids)
+        # Content-addressed ids are overwhelmingly new during a sync.  Lance
+        # creates a new table version for delete(), so only pay that price for
+        # ids that actually replace existing rows.
+        replaced = self.existing_ids(chunk_ids)
+        if replaced:
+            self.delete(chunk_ids=sorted(replaced))
         table.add(rows)
+        with self._id_cache_lock:
+            if self._id_cache is None:
+                self._id_cache = set(chunk_ids)
+            else:
+                self._id_cache.update(chunk_ids)
 
     def delete(
         self,
@@ -664,7 +854,15 @@ class LanceDBVectorStore:
             table.delete(f"chunk_id IN ({quoted})")
         if artifact_id is not None:
             table.delete(f"artifact_id = {self._quote(artifact_id)}")
-        return before - table.count_rows()
+        removed = before - table.count_rows()
+        with self._id_cache_lock:
+            if artifact_id is not None:
+                # The artifact predicate can remove ids the caller did not
+                # enumerate; reload membership lazily on the next lookup.
+                self._id_cache = None
+            elif self._id_cache is not None:
+                self._id_cache.difference_update(ids)
+        return removed
 
     def search(self, query_vec: list[float], k: int) -> list[tuple[str, float, dict[str, Any]]]:
         table = self._table()
@@ -689,9 +887,19 @@ class LanceDBVectorStore:
         table = self._table()
         return 0 if table is None else table.count_rows()
 
+    def dimensions(self) -> int | None:
+        table = self._table()
+        if table is None:
+            return None
+        vector_type = table.schema.field("vector").type
+        width = getattr(vector_type, "list_size", None)
+        return int(width) if width is not None else None
+
     def existing_ids(self, chunk_ids: list[str]) -> set[str]:
-        stored = {row["chunk_id"] for row in self._rows(["chunk_id"])}
-        return {chunk_id for chunk_id in chunk_ids if chunk_id in stored}
+        with self._id_cache_lock:
+            if self._id_cache is None:
+                self._id_cache = {row["chunk_id"] for row in self._rows(["chunk_id"])}
+            return set(chunk_ids).intersection(self._id_cache)
 
     def source_chunk_ids(self, source_id: str) -> set[str]:
         return {
@@ -713,6 +921,8 @@ class LanceDBVectorStore:
             return 0
         removed = table.count_rows()
         self._database().drop_table(self.TABLE)
+        with self._id_cache_lock:
+            self._id_cache = set()
         return removed
 
     def flush(self) -> None:
@@ -755,6 +965,9 @@ class VectorIndexer:
         self.embedder = embedder
         self.store = store
         self.max_parallel_embeddings = max(1, int(max_parallel_embeddings or 1))
+        configure_parallelism = getattr(embedder, "configure_parallelism", None)
+        if callable(configure_parallelism):
+            configure_parallelism(self.max_parallel_embeddings)
         # Queue one provider-sized group per concurrency slot. This fills each
         # request without allowing pending text to grow with source size.
         provider_batch_size = int(getattr(embedder, "batch_size", 64) or 64)
@@ -966,6 +1179,7 @@ def build_embedder(settings: EmbeddingsSettings) -> Embedder:
             batch_size=settings.batch_size,
             max_retries=getattr(settings, "max_retries", 4),
             retry_backoff_seconds=getattr(settings, "retry_backoff_seconds", 1.0),
+            rate_limit_max_wait_seconds=getattr(settings, "rate_limit_max_wait_seconds", 300.0),
         )
     raise ValueError(
         f"Unsupported search.embeddings.provider {settings.provider!r}; "

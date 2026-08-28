@@ -11,13 +11,15 @@ source.
 ```bash
 pheasant serve                    # all: today's behavior, the default
 pheasant serve --role api         # serve; publish index work to the queue
+pheasant serve --role graph       # serve read-only graph operations
 pheasant serve --role indexer     # watch, schedule, drain the queue
 pheasant worker --transport grpc  # preparation only
 ```
 
-`api` replicas scale with request traffic and never index; one `indexer` per
-shard does the indexing; `worker` pods do the parsing. The hand-off between
-api and indexer is the [queue](#queue-the-backlog), which is why `--role api`
+`api` replicas scale with request traffic and never index; `graph` replicas
+serve a complete read-only snapshot; one `indexer` per shard does the
+indexing; `worker` pods do the parsing. The hand-off between api and indexer is
+the [queue](#queue-the-backlog), which is why `--role api`
 refuses to start without it — a sync request that is accepted and then goes
 nowhere is worse than one that is refused.
 
@@ -192,7 +194,7 @@ thing to run.
 
 ## Running the whole fleet
 
-The pieces above assemble into three tiers. Both runtimes ship a working
+The pieces above assemble into four tiers. Both runtimes ship a working
 version, and both are the *other* trade from the single container — take them
 only past the point where one container stops being enough
 ([capacity planning](capacity-planning.md)).
@@ -201,12 +203,25 @@ only past the point where one container stops being enough
 
 ```bash
 export PHEASANT_INDEX_WORKER_TOKEN=$(openssl rand -hex 32)
-docker compose -f docker-compose.scale.yml up -d --scale worker=4
+export OPENAI_API_KEY=...
+docker compose --env-file .env -f deploy/compose/docker-compose.scale.yml up -d \
+  --scale indexer=1 --scale worker=4
 ```
 
-Postgres, one api, one indexer, four workers. Only `worker` is safe to scale
-here: `api` would need a load balancer Compose does not have, and a second
-`indexer` would spend its life losing lease races.
+Postgres, NATS JetStream, one API, one graph-query service, one elected indexer
+and four gRPC workers. The API keeps no persisted graph resident; authenticated
+graph and hybrid operations go to the graph service over the Compose network.
+The indexer owns watcher, scheduler, queue drain and the global commit stream;
+those producers share one lock, while a `sync --all` child can still prepare
+several sources concurrently. Starting extra indexers creates hot standbys:
+one database lease elects the leader and promotes a standby after failure.
+It does not add write throughput because the graph file, manifests, vectors
+and graph FTS must reach one end state. The gRPC coordinator keeps one
+multiplexed channel to Docker's
+scaled service name and selects `round_robin`, so concurrent preparation
+batches reach distinct worker replicas instead of gRPC's `pick_first` default
+pinning the source to one container. Scale API replicas only after putting a
+load balancer in front of them; Compose deliberately publishes one API endpoint.
 
 ### Kubernetes
 
@@ -214,51 +229,60 @@ here: `api` would need a load balancer Compose does not have, and a second
 kubectl apply -f deploy/kubernetes/namespace.yaml
 kubectl -n pheasant create secret generic pheasant-secrets \
   --from-literal=PHEASANT_DATABASE_URL='postgresql://…' \
-  --from-literal=PHEASANT_INDEX_WORKER_TOKEN="$(openssl rand -hex 32)"
+  --from-literal=PHEASANT_INDEX_WORKER_TOKEN="$(openssl rand -hex 32)" \
+  --from-literal=PHEASANT_GRAPH_SERVICE_TOKEN="$(openssl rand -hex 32)"
 kubectl apply -f deploy/kubernetes/scaled/
 ```
 
 | Workload | Kind | Scales on |
 |---|---|---|
 | `pheasant-api` | Deployment | CPU (HPA) |
+| `pheasant-graph` | Deployment | graph-query CPU/latency; one per shard minimum |
 | `pheasant-indexer` | StatefulSet, 1 replica | not autoscaled |
-| `pheasant-worker` | Deployment | `pheasant_index_queue_depth` (KEDA or HPA) |
+| `pheasant-worker` | Deployment | queued sources + `pheasant_index_preparation_backlog` |
 
 `deploy/kubernetes/scaled/README.md` lists what you must provide first. Two
 requirements are easy to miss and neither is optional:
 
-* **A ReadWriteMany volume for `/state`.** The knowledge graph is a file the
-  indexer writes and every api replica reads. With RWO the volume attaches to
-  one node, so api replicas scheduled elsewhere cannot read it at all. Most
-  default StorageClasses are RWO.
+* **A ReadWriteMany volume for `/state`.** The indexer writes the graph; the
+  graph-query service and API replicas read state/vector data. With RWO the
+  volume attaches to one node, so replicas scheduled elsewhere cannot mount
+  it. Most default StorageClasses are RWO.
 * **Postgres.** SQLite permits one writer per file, and it is not one file
   across pods.
 
-Api replicas poll the graph file every `server.api.graph_refresh_seconds`
-(30 s) and reload when it changes. Without that they would answer graph
-queries from whatever the graph was when the pod started — while text and
-vector search stayed current from the shared database, which is exactly what
-makes the staleness easy to miss.
+The graph role polls the graph file every `server.api.graph_refresh_seconds`
+(30 s) and atomically swaps generations. API readiness includes an authenticated
+graph-service probe; a broken dependency removes that API replica from routing
+instead of silently serving stale graph results.
 
 ### Scale on the backlog, not on CPU
 
-CPU is a lagging signal for the worker tier: workers only get busy once the
-indexer is already sending them work, so a CPU-driven autoscaler adds capacity
-after the queue has built up. `pheasant_index_queue_depth` rises the moment
-sources are enqueued.
+CPU is a lagging signal for the worker tier. Source queue depth rises before a
+source is claimed, then falls to zero while one large source may still have
+thousands of files to prepare. Scale from both signals.
 
 ```promql
-sum(pheasant_index_queue_depth) or vector(0)
+(max(pheasant_index_queue_depth) or vector(0))
+  + (max(pheasant_index_inflight) or vector(0))
+  + ceil((max(pheasant_index_preparation_backlog) or vector(0)) / 500)
 ```
+
+The in-flight term is required for scale-to-zero. Pending depth drops as soon
+as an indexer claims a source; without the claimed-work signal the scaler can
+remove every worker before preparation starts and strand an otherwise healthy
+task until redelivery.
 
 `deploy/kubernetes/scaled/worker-hpa.yaml` ships both a KEDA `ScaledObject`
 (preferred — reads Prometheus directly and can scale to **zero**, which
 matters because idle workers are pure cost) and a plain HPA for clusters
 without it.
 
-The api tier scales on CPU with a five-minute scale-down window, because a new
-replica loads the whole graph into memory at startup: shedding a replica
-eagerly and adding it back pays that twice.
+The API tier scales on CPU with a five-minute scale-down window to avoid churn
+under bursty assistant fanout. It keeps only a bounded graph proxy. The graph
+tier owns snapshot residency; scale it independently on graph-query latency or
+CPU, and give every graph replica enough memory for the old and new snapshot
+during an atomic refresh.
 
 ## Related
 

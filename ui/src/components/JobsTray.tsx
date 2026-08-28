@@ -17,10 +17,10 @@ import { ProgressBar, formatDuration, formatRate, progressCaption } from "./Sync
  * like the seven that were fine — and the denominator moved under your feet as
  * each source discovered its own file list.
  *
- * Polling, not SSE: the server offers `/jobs/stream`, but a poll that runs
- * *only while something is active* is simpler, survives a proxy that buffers
- * event streams, and costs nothing when the system is idle — which is almost
- * always. The stream is there for clients that want it.
+ * Polling, not SSE: the server offers `/jobs/stream`, but polling survives a
+ * proxy that buffers event streams. A slow idle poll discovers work claimed by
+ * another process; active work switches to one-second updates. The stream is
+ * there for clients that want it.
  */
 export function JobsTray() {
   const [expanded, setExpanded] = useState(false);
@@ -33,12 +33,9 @@ export function JobsTray() {
   const jobs = useQuery({
     queryKey: ["jobs"],
     queryFn: () => api.jobs(false),
-    // Poll while work is running, and keep polling briefly after it stops so
-    // the terminal state (and any error) actually renders. Idle costs nothing.
-    refetchInterval: (query) => (query.state.data?.active_count ? 1000 : false),
-    // A slow poll keeps the tray from being permanently blind once it has
-    // gone idle — a sync started elsewhere (the scheduler, the CLI, another
-    // browser tab) has to be able to wake it up again.
+    // Fleet jobs start in another process, so an idle tray must keep a slow
+    // discovery poll; once one appears, switch to one-second progress updates.
+    refetchInterval: (query) => (query.state.data?.active_count ? 1000 : 5000),
     refetchIntervalInBackground: false,
     staleTime: 500,
   });
@@ -126,7 +123,17 @@ function JobRow({ job, onClear }: { job: JobRecord; onClear: () => void }) {
         ) : null}
       </div>
 
-      <ProgressBar fraction={job.progress.fraction} stalled={job.stalled} />
+      <ProgressBar
+        fraction={
+          job.active
+            ? job.progress.fraction
+            : job.status === "succeeded"
+              ? 1
+              : (job.progress.fraction ?? 0)
+        }
+        active={job.active}
+        stalled={job.stalled}
+      />
 
       <div className="job__detail muted small">
         {job.error ? (

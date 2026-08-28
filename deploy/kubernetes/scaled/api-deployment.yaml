@@ -44,6 +44,11 @@ spec:
                 secretKeyRef:
                   name: pheasant-secrets
                   key: PHEASANT_DATABASE_URL
+            - name: PHEASANT_GRAPH_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: pheasant-secrets
+                  key: PHEASANT_GRAPH_SERVICE_TOKEN
           volumeMounts:
             - name: config
               mountPath: /config
@@ -88,12 +93,11 @@ spec:
           resources:
             requests:
               cpu: 500m
-              memory: 2Gi
+              memory: 512Mi
             limits:
               cpu: "2"
-              # Serving holds the graph in memory like any other role, so this
-              # tracks the capacity-planning table, not the request rate.
-              memory: 6Gi
+              # Full graph residency belongs to pheasant-graph, not each API.
+              memory: 2Gi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -153,9 +157,7 @@ spec:
           averageUtilization: 70
   behavior:
     scaleDown:
-      # Five minutes, because a new replica's first request is expensive: it
-      # loads the whole graph into memory at startup. Scaling down eagerly and
-      # back up buys nothing and pays that cost twice.
+      # Five minutes avoids replica churn under bursty assistant fan-out.
       stabilizationWindowSeconds: 300
 ---
 apiVersion: policy/v1

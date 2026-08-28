@@ -10,6 +10,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -126,6 +127,76 @@ def test_only_the_indexer_drains_and_only_serving_roles_index() -> None:
     assert sorted(role.value for role in Role if POLICIES[role].runs_watcher) == ["all", "indexer"]
 
 
+def test_indexer_orchestration_has_one_leader_and_fails_over(tmp_path: Path) -> None:
+    """Extra indexers are hot standbys, never duplicate schedulers."""
+
+    from pheasant.cli import _OrchestrationSupervisor
+    from pheasant.persistence.state_store import StateStore
+
+    class Service:
+        def __init__(self) -> None:
+            self.running = False
+            self.starts = 0
+
+        def start(self) -> None:
+            self.running = True
+            self.starts += 1
+
+        def stop(self) -> None:
+            self.running = False
+
+    path = tmp_path / "leadership.db"
+    stores = [StateStore(path), StateStore(path)]
+    for store in stores:
+        store.migrate()
+    service_sets = [[Service(), Service(), Service()] for _ in stores]
+    promotions = [0, 0]
+
+    def promoted(index: int) -> None:
+        promotions[index] += 1
+
+    supervisors = [
+        _OrchestrationSupervisor(
+            store,
+            "kb",
+            watcher=services[0],
+            scheduler=services[1],
+            drainer=services[2],
+            on_promote=lambda index=index: promoted(index),
+            promotion_lock=threading.Lock(),
+            poll_interval=0.05,
+        )
+        for index, (store, services) in enumerate(zip(stores, service_sets, strict=True))
+    ]
+
+    def wait_until(predicate, timeout: float = 5.0) -> None:  # type: ignore[no-untyped-def]
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.02)
+        raise AssertionError("condition did not become true")
+
+    try:
+        for supervisor in supervisors:
+            supervisor.start()
+        wait_until(lambda: sum(item.leader for item in supervisors) == 1)
+        wait_until(lambda: sum(promotions) == 1)
+        leader = next(item for item in supervisors if item.leader)
+        standby = next(item for item in supervisors if not item.leader)
+        assert sum(service.running for services in service_sets for service in services) == 3
+
+        leader.stop()
+        wait_until(lambda: standby.leader)
+        wait_until(lambda: sum(promotions) == 2)
+        assert all(service.running for service in service_sets[supervisors.index(standby)])
+    finally:
+        for supervisor in supervisors:
+            supervisor.stop()
+        for store in stores:
+            store.close()
+
+
 # --------------------------------------------------------------------------
 # The startup refusal
 # --------------------------------------------------------------------------
@@ -149,7 +220,7 @@ def test_the_api_role_starts_with_a_queue(tmp_path: Path) -> None:
     assert client.get("/health").json()["role"] == "api"
 
 
-@pytest.mark.parametrize("role", ["all", "indexer", "worker"])
+@pytest.mark.parametrize("role", ["all", "indexer", "graph", "worker"])
 def test_other_roles_need_no_queue(tmp_path: Path, role: str) -> None:
     """Only `api` depends on a queue: the rest can index or do nothing."""
 
@@ -176,6 +247,25 @@ def test_health_and_ready_identify_the_pod(tmp_path: Path) -> None:
     assert body["role"] == "indexer"
     assert body["drains_queue"] is True
     assert body["knowledge_base"] == config.knowledge_base_id
+
+
+def test_indexer_coordinator_does_not_duplicate_the_persisted_graph(tmp_path: Path) -> None:
+    from pheasant.sync.engine import SyncEngine
+
+    config = _config(tmp_path, state_name="coordinator-graph", role="indexer")
+    writer = SyncEngine(config)
+    try:
+        writer.sync_source("src0", "full")
+        persisted_nodes = writer.graph_builder.graph.number_of_nodes()
+    finally:
+        writer.close()
+
+    assert persisted_nodes > 1
+    app = create_app(config, role="indexer")
+    assert app.state.engine._loads_persisted_graph is False
+    assert app.state.engine.graph_builder.graph.number_of_nodes() == 1
+    assert app.state.engine.vectors is None
+    assert app.state.engine.extractor is None
 
 
 def test_ready_reports_503_when_the_state_store_is_unreachable(tmp_path: Path) -> None:
@@ -232,6 +322,103 @@ def test_the_api_role_publishes_a_sync_instead_of_running_it(tmp_path: Path) -> 
     assert int(rows[0]["c"]) == 0
 
 
+def test_the_api_role_never_runs_startup_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Configured on-startup sources belong to the indexer tier, not the API."""
+
+    called = threading.Event()
+
+    def startup(_self: Any) -> list[Any]:
+        called.set()
+        return []
+
+    monkeypatch.setattr("pheasant.sync.worker.WorkerBackedEngine.startup", startup)
+    config = _config(tmp_path, state_name="api-startup", role="api", queue=True)
+
+    with TestClient(create_app(config, role="api")):
+        time.sleep(0.05)
+
+    assert not called.is_set()
+
+
+def test_an_orchestrated_indexer_defers_startup_to_leader_promotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called = threading.Event()
+
+    def startup(_self: Any) -> list[Any]:
+        called.set()
+        return []
+
+    monkeypatch.setattr("pheasant.sync.worker.WorkerBackedEngine.startup", startup)
+    config = _config(tmp_path, state_name="standby-startup", role="indexer", queue=True)
+    app = create_app(config, role="indexer")
+    app.state.orchestration = object()
+
+    with TestClient(app):
+        time.sleep(0.05)
+
+    assert not called.is_set()
+
+
+def test_durable_backlog_takes_priority_over_startup_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pheasant.cli import _durable_backlog_depth
+    from pheasant.sync.queue import IndexTask, queue_from_config
+
+    config = _config(tmp_path, state_name="backlog-first", role="indexer", queue=True)
+    app = create_app(config, role="indexer")
+    queue = queue_from_config(config, app.state.state)
+    assert queue is not None
+    queue.publish(IndexTask(id="operator-task", source_id="src0"))
+    assert _durable_backlog_depth(config, app.state.state) == 1
+    assert queue.depth()[PENDING] == 1
+    queue.close()
+
+
+def test_the_api_role_defers_repository_clone_to_the_indexer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The API has read-only mounts; the queued indexer materializes URLs."""
+
+    def must_not_fetch(_target: Any) -> None:
+        raise AssertionError("the API role attempted to clone a repository")
+
+    monkeypatch.setattr("pheasant.targets.fetch_target", must_not_fetch)
+    config = _config(
+        tmp_path,
+        state_name="api-remote-source",
+        sources=0,
+        role="api",
+        queue=True,
+    )
+    client = TestClient(create_app(config, role="api"))
+
+    response = client.post(
+        "/sources/quick-add",
+        json={
+            "target": "https://github.com/example/managed-repo",
+            "sync_now": True,
+            "wait": False,
+        },
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    source = body["sources"][0]
+    expected = Path(config.pheasant.workspace_root) / "sources" / "managed-repo"
+    assert source["path"] == str(expected.resolve())
+    assert source["repo"] == {
+        "clone_url": "https://github.com/example/managed-repo",
+        "clone_path": str(expected.resolve()),
+        "clone_ref": None,
+    }
+    assert body["status"] == "registered"
+    assert body["queued_tasks"]
+
+
 def test_the_api_role_deduplicates_a_double_click(tmp_path: Path) -> None:
     config = _config(tmp_path, state_name="api-dedup", role="api", queue=True)
     client = TestClient(create_app(config, role="api"))
@@ -244,6 +431,61 @@ def test_the_api_role_deduplicates_a_double_click(tmp_path: Path) -> None:
     # clicks deduplicated.
     assert first["queued_tasks"], "nothing was published"
     assert first["queued_tasks"] == second["queued_tasks"]
+    assert LocalQueue(client.app.state.engine.state).depth()[PENDING] == 1
+
+
+def test_api_source_removal_is_an_ordered_writer_task(tmp_path: Path) -> None:
+    config = _config(tmp_path, state_name="api-remove", role="api", queue=True)
+    client = TestClient(create_app(config, role="api"))
+
+    response = client.delete("/sources/src0")
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["status"] == "removal_queued"
+    assert body["queued_tasks"]
+    row = client.app.state.state.get_source("src0")
+    assert row is not None
+    assert int(row["enabled"]) == 0
+    queue = LocalQueue(client.app.state.state)
+    task = queue.claim("test-control-writer")
+    assert task is not None
+    assert task.payload["operation"] == "delete_source"
+
+
+def test_sync_all_includes_a_source_registered_only_in_state(tmp_path: Path) -> None:
+    """Scheduler/API all-sync must not forget UI sources after restart."""
+
+    from pheasant.registry.source_registry import SourceRegistry
+
+    config = _config(
+        tmp_path,
+        state_name="api-runtime-all",
+        sources=0,
+        role="api",
+        queue=True,
+    )
+    client = TestClient(create_app(config, role="api"))
+    folder = Path(config.pheasant.workspace_root) / "runtime"
+    folder.mkdir(parents=True)
+    source = PheasantConfig.model_validate(
+        {
+            "sources": [
+                {
+                    "name": "runtime-docs",
+                    "type": "markdown_folder",
+                    "path": str(folder),
+                    "include": ["**/*.md"],
+                }
+            ]
+        }
+    ).sources[0]
+    SourceRegistry(config, client.app.state.engine.state).register_source(source)
+
+    response = client.post("/sync", json={"mode": "incremental", "wait": False})
+
+    assert response.status_code == 200
+    assert response.json()["sources"] == ["runtime-docs"]
     assert LocalQueue(client.app.state.engine.state).depth()[PENDING] == 1
 
 
@@ -348,6 +590,38 @@ def test_the_indexer_drains_what_an_api_replica_published(tmp_path: Path) -> Non
     assert [(row["source_id"], int(row["c"])) for row in rows] == [("src0", 1), ("src1", 1)]
 
 
+def test_the_drainer_does_not_claim_while_a_sync_coordinator_owns_the_lock(
+    tmp_path: Path,
+) -> None:
+    from pheasant.cli import _QueueDrainer
+    from pheasant.config.loader import load_config
+
+    config = _config(tmp_path, state_name="locked-handoff", sources=1, queue=True)
+    config_path = _write_config_file(config, tmp_path / "pheasant.yaml", role="indexer")
+    api = TestClient(create_app(config, role="api"))
+    api.post("/sync/src0", json={"mode": "full", "wait": False})
+
+    sync_lock = threading.Lock()
+    sync_lock.acquire()
+    drainer = _QueueDrainer(load_config(config_path), str(config_path), sync_lock=sync_lock)
+    drainer.start()
+    try:
+        time.sleep(1.0)
+        assert LocalQueue(api.app.state.engine.state).depth()[PENDING] == 1
+    finally:
+        sync_lock.release()
+
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if LocalQueue(api.app.state.engine.state).depth()[DONE] == 1:
+                break
+            time.sleep(0.25)
+    finally:
+        drainer.stop()
+    assert LocalQueue(api.app.state.engine.state).depth()[DONE] == 1
+
+
 def test_a_drainer_stops_promptly(tmp_path: Path) -> None:
     """SIGTERM must not wait out an idle poll, let alone a multi-hour index."""
 
@@ -375,15 +649,46 @@ def test_no_drainer_is_built_for_a_role_that_does_not_drain(tmp_path: Path) -> N
     assert _queue_drainer(config, "pheasant.yaml", resolve_role(config, "indexer")) is not None
 
 
+def test_queue_drainer_parent_never_loads_the_worker_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pheasant.cli import _QueueDrainer
+
+    captured: dict[str, Any] = {}
+
+    class Coordinator:
+        state = object()
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    def fake_engine(_path: Path, **kwargs: Any) -> Coordinator:
+        captured.update(kwargs)
+        return Coordinator()
+
+    monkeypatch.setattr("pheasant.cli._engine", fake_engine)
+    monkeypatch.setattr("pheasant.sync.queue.queue_from_config", lambda *_args: None)
+    drainer = _QueueDrainer(SimpleNamespace(), "pheasant.yaml")
+    drainer._stop = threading.Event()
+
+    drainer._run()
+
+    assert captured == {
+        "load_persisted_graph": False,
+        "initialize_indexing_components": False,
+    }
+
+
 # --------------------------------------------------------------------------
 # The api role's graph refresh
 # --------------------------------------------------------------------------
 
 
-def test_only_the_api_role_refreshes_the_graph() -> None:
-    """The other roles index their own graph and reload through the worker."""
+def test_only_query_serving_roles_refresh_the_graph() -> None:
+    """Legacy APIs and the graph service follow indexer snapshot commits."""
 
-    assert [role.value for role in Role if POLICIES[role].refreshes_graph] == ["api"]
+    assert [role.value for role in Role if POLICIES[role].refreshes_graph] == ["api", "graph"]
 
 
 def test_an_api_replica_picks_up_a_graph_another_process_wrote(tmp_path: Path) -> None:
@@ -444,6 +749,7 @@ def test_no_refresher_is_built_for_a_role_that_indexes(tmp_path: Path) -> None:
         for role in ("all", "indexer", "worker"):
             assert _graph_refresher(config, engine, resolve_role(config, role)) is None
         assert _graph_refresher(config, engine, resolve_role(config, "api")) is not None
+        assert _graph_refresher(config, engine, resolve_role(config, "graph")) is not None
 
         # And it is switchable off, for a deployment where the graph is not
         # shared between pods at all.
@@ -503,12 +809,15 @@ def test_background_services_start_only_for_their_roles(tmp_path: Path, monkeypa
             lambda engine, cfg, config_path=None: (
                 Recorder("watcher", bucket),
                 Recorder("scheduler", bucket),
+                threading.Lock(),
             ),
         )
         monkeypatch.setattr(
             cli,
             "_queue_drainer",
-            lambda cfg, path, policy: Recorder("drainer", bucket) if policy.drains_queue else None,
+            lambda cfg, path, policy, **_kwargs: (
+                Recorder("drainer", bucket) if policy.drains_queue else None
+            ),
         )
         monkeypatch.setattr(
             cli,
@@ -527,6 +836,7 @@ def test_background_services_start_only_for_their_roles(tmp_path: Path, monkeypa
     assert sorted(run_for("all")) == ["scheduler", "ui", "watcher"]
     assert sorted(run_for("api")) == ["refresher", "ui"]
     assert sorted(run_for("indexer")) == ["drainer", "scheduler", "watcher"]
+    assert sorted(run_for("graph")) == ["refresher"]
     assert sorted(run_for("worker")) == []
 
 

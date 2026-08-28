@@ -20,7 +20,7 @@ import pytest
 from pheasant.config.schema import PheasantConfig
 from pheasant.persistence.paths import StatePaths
 from pheasant.persistence.state_store import StateStore
-from pheasant.sync.engine import SyncEngine
+from pheasant.sync.engine import FULL_RESUME_SCOPE, SyncEngine
 from pheasant.sync.queue import (
     DEAD,
     DONE,
@@ -28,10 +28,16 @@ from pheasant.sync.queue import (
     PENDING,
     IndexTask,
     LocalQueue,
+    _heartbeat_interval,
     drain,
     owner_id,
     queue_from_config,
 )
+
+
+def test_queue_heartbeat_precedes_jetstream_default_ack_wait() -> None:
+    assert _heartbeat_interval(900.0) == 10.0
+    assert _heartbeat_interval(3.0) == 1.0
 
 
 def _write_docs(workspace: Path, prefix: str, count: int = 2) -> None:
@@ -171,6 +177,55 @@ def test_queued_sync_all_preserves_configured_source_order(tmp_path: Path) -> No
     finally:
         engine.close()
     assert [result.source_id for result in results] == ["src0", "src1", "src2", "src3"]
+
+
+def test_control_tasks_use_the_same_idempotent_single_writer_path(tmp_path: Path) -> None:
+    config = _config(tmp_path, state_name="control", sources=1, queue={"enabled": True})
+    engine = SyncEngine(config)
+    try:
+        engine.sync_source("src0", "full")
+        task = _task(
+            "src0",
+            id="delete-src0",
+            payload={"operation": "delete_source"},
+        )
+
+        first = engine.apply_index_task(task)
+        second = engine.apply_index_task(task)
+
+        assert first.status == second.status == "removed"
+        assert engine.state.get_source("src0") is None
+        assert not any(
+            attrs.get("source_id") == "src0"
+            for _node_id, attrs in engine.graph_builder.graph.iter_nodes()
+        )
+    finally:
+        engine.close()
+
+
+def test_redelivered_full_task_resumes_from_its_published_checkpoint(tmp_path: Path) -> None:
+    config = _config(tmp_path, state_name="resume-full", sources=1, queue={"enabled": True})
+    engine = SyncEngine(config)
+    try:
+        engine.sync_source("src0", "full")
+        (Path(config.sources[0].path) / "new.md").write_text(
+            "# New\n\nOnly this delta remains after the checkpoint.\n",
+            encoding="utf-8",
+        )
+        engine.state.set_fingerprint(
+            FULL_RESUME_SCOPE.format(name="src0"),
+            "checkpointed",
+            "2026-08-25T00:00:00Z",
+        )
+        task = _task("src0", id="retry-full", mode="full", attempts=2)
+
+        result = engine.apply_index_task(task)
+
+        assert result.indexed_artifacts == 1
+        assert result.details["resumed_interrupted_full"] is True
+        assert engine.state.get_fingerprint(FULL_RESUME_SCOPE.format(name="src0")) is None
+    finally:
+        engine.close()
 
 
 def test_queued_sync_all_works_with_several_source_workers(tmp_path: Path) -> None:
@@ -847,14 +902,24 @@ def test_nats_round_trips_a_task(nats_queue: Any) -> None:
 
 
 @nats_broker
-def test_nats_publish_is_deduplicated_by_task_id(nats_queue: Any) -> None:
-    """A retried publish must not enqueue the same source twice."""
+def test_nats_publish_retry_is_deduplicated(nats_queue: Any) -> None:
+    """Retrying one publish must not enqueue the same invocation twice."""
 
+    task = _task("docs", id="same-id")
     for _ in range(3):
-        nats_queue.publish(_task("docs", id="same-id"))
+        nats_queue.publish(task)
 
     drained = drain(nats_queue, lambda task: task.source_id)
     assert drained == ["docs"]
+
+
+@nats_broker
+def test_nats_accepts_a_new_run_with_the_same_logical_task_id(nats_queue: Any) -> None:
+    for _ in range(2):
+        nats_queue.publish(_task("docs", id="repeatable-id"))
+
+    drained = drain(nats_queue, lambda task: task.source_id)
+    assert drained == ["docs", "docs"]
 
 
 @nats_broker
@@ -897,7 +962,7 @@ def test_nats_redelivers_a_nacked_task(nats_queue: Any) -> None:
 
 @nats_broker
 def test_nats_terminates_a_task_that_exhausts_its_attempts(nats_queue: Any) -> None:
-    """JetStream's `term` is the dead letter: redelivery stops for good."""
+    """Exhaustion creates an observable, replayable DLQ record."""
 
     nats_queue.publish(_task("docs", id="doomed", max_attempts=2))
 
@@ -908,6 +973,15 @@ def test_nats_terminates_a_task_that_exhausts_its_attempts(nats_queue: Any) -> N
 
     assert nats_queue.claim("worker") is None
     assert nats_queue.depth()[PENDING] == 0
+    assert nats_queue.depth()[DEAD] == 1
+
+    assert nats_queue.requeue_dead() == 1
+    assert nats_queue.depth()[DEAD] == 0
+    replay = nats_queue.claim("worker")
+    assert replay is not None
+    assert replay.id == "doomed"
+    assert replay.attempts == 1
+    nats_queue.ack(replay)
 
 
 def _nats_server_binary_available() -> bool:

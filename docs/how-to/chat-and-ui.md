@@ -7,7 +7,7 @@ cites the passages it used, and lights up the corresponding nodes on the
 knowledge graph.
 
 Start it with `pheasant host <target>` (containers, UI included on `:8080`),
-`docker compose up -d --build` from a clone, or by building `ui/dist` and
+`docker compose -f deploy/compose/docker-compose.yml up -d --build` from a clone, or by building `ui/dist` and
 letting `pheasant start` serve it on `:8765`. Full step-by-step for each —
 and what to do when the UI will not come up or looks stale — is in
 [Run the web UI](run-the-ui.md).

@@ -120,7 +120,6 @@ def set_pyproject_version(version: str) -> None:
 
 def replacements(version: str) -> list[Replacement]:
     image = f"ghcr.io/esatt10/pheasant:{version}"
-    ui_image = f"ghcr.io/esatt10/pheasant-ui:{version}"
     return [
         Replacement(
             path=Path("deploy/helm/Chart.yaml"),
@@ -149,19 +148,10 @@ def replacements(version: str) -> list[Replacement]:
             label="Kubernetes deployment image",
         ),
         Replacement(
-            path=Path("docker-compose.yml"),
+            path=Path("deploy/compose/docker-compose.yml"),
             pattern=re.compile(r"ghcr\.io/esatt10/pheasant:[0-9A-Za-z._+-]+"),
             replacement=image,
             label="Docker Compose default image",
-        ),
-        # The UI sidecar is published from the same commit under the same
-        # version tag, so it moves with the backend rather than drifting on a
-        # hand-edited tag of its own.
-        Replacement(
-            path=Path("docker-compose.yml"),
-            pattern=re.compile(r"ghcr\.io/esatt10/pheasant-ui:[0-9A-Za-z._+-]+"),
-            replacement=ui_image,
-            label="Docker Compose UI image",
         ),
         Replacement(
             path=Path("pheasant.example.yaml"),
@@ -172,16 +162,18 @@ def replacements(version: str) -> list[Replacement]:
             label="example compose image tag",
         ),
         # Everything below names a published image in a file someone actually
-        # runs. They were unmanaged until docker-compose.fresh.yml was found
+        # runs. They were unmanaged until the fresh Compose file was found
         # three releases behind on 0.9.0 — a stale default tag is not a typo,
         # it silently starts an old build that has none of the fixes the
         # checkout it came with advertises.
         *_image_reference_replacements(
             version,
             {
-                Path("docker-compose.fresh.yml"): 1,
-                Path("docker-compose.scale.yml"): 3,
+                Path("deploy/compose/docker-compose.fresh.yml"): 1,
+                Path("deploy/compose/docker-compose.advanced.yml"): 1,
+                Path("deploy/compose/docker-compose.scale.yml"): 6,
                 Path("deploy/kubernetes/scaled/api-deployment.yaml"): 1,
+                Path("deploy/kubernetes/scaled/graph-deployment.yaml"): 1,
                 Path("deploy/kubernetes/scaled/indexer-statefulset.yaml"): 1,
                 Path("deploy/kubernetes/scaled/worker-deployment.yaml"): 1,
                 Path("deploy/kubernetes/scaled/exports-cronjob.yaml"): 1,
@@ -190,16 +182,10 @@ def replacements(version: str) -> list[Replacement]:
         # Commented-out examples, but they are the values a user copies into a
         # real .env — and a copied 0.8.0 pins them to 0.8.0.
         Replacement(
-            path=Path(".env.example"),
+            path=Path("deploy/compose/.env.example"),
             pattern=re.compile(r"ghcr\.io/esatt10/pheasant:[0-9A-Za-z._+-]+"),
             replacement=image,
             label="example .env image",
-        ),
-        Replacement(
-            path=Path(".env.example"),
-            pattern=re.compile(r"ghcr\.io/esatt10/pheasant-ui:[0-9A-Za-z._+-]+"),
-            replacement=ui_image,
-            label="example .env UI image",
         ),
     ]
 

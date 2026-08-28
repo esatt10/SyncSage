@@ -175,6 +175,26 @@ def test_endpoint_urls_are_normalised_to_grpc_targets(url: str, expected: str) -
     assert _target(url) == expected
 
 
+def test_dns_worker_service_uses_one_round_robin_channel(monkeypatch: Any) -> None:
+    """A scaled Compose service must not pin every batch to one replica."""
+
+    created: list[tuple[str, list[tuple[str, Any]]]] = []
+    sentinel = object()
+
+    def insecure_channel(target: str, *, options: list[tuple[str, Any]]) -> object:
+        created.append((target, options))
+        return sentinel
+
+    monkeypatch.setattr(grpc, "insecure_channel", insecure_channel)
+    transport = GrpcTransport()
+
+    assert transport._channel("grpc://worker:8766") is sentinel
+    assert transport._channel("grpc://worker:8766") is sentinel
+    assert len(created) == 1
+    assert created[0][0] == "worker:8766"
+    assert ("grpc.lb_policy_name", "round_robin") in created[0][1]
+
+
 # --------------------------------------------------------------------------
 # Against a real server
 # --------------------------------------------------------------------------
@@ -290,8 +310,8 @@ def test_the_grpc_channel_is_reused_across_batches(tmp_path: Path, grpc_worker: 
     channels: list[int] = []
 
     class Counting(GrpcTransport):
-        def _channel(self, url: str) -> Any:
-            channel = super()._channel(url)
+        def _new_channel(self, url: str) -> Any:
+            channel = super()._new_channel(url)
             channels.append(id(channel))
             return channel
 

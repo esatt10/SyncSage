@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pheasant.graph.simple import SimpleMultiDiGraph
@@ -70,11 +72,25 @@ class GraphStore:
 
         return self.kb_dir(kb_id) / "graph.latest.json"
 
+    def metadata_path(self, kb_id: str) -> Path:
+        """Small publication record for the current immutable graph generation.
+
+        Readers that only need counts must not decompress and materialize a
+        multi-gigabyte graph.  The file also gives refreshers a generation
+        boundary: it is replaced only after ``graph.latest.json.zst`` is
+        durable, so a reader never treats metadata for an unpublished graph as
+        current.
+        """
+
+        return self.kb_dir(kb_id) / "graph.latest.meta.json"
+
     def save(self, kb_id: str, graph: SimpleMultiDiGraph) -> Path:
         import zstandard as zstd
 
         path = self.graph_path(kb_id)
         tmp = _tmp_for(path)
+        metadata_path = self.metadata_path(kb_id)
+        metadata_tmp = _tmp_for(metadata_path)
         # Durable tmp+rename (Synapse step 21.2): fsync the file before the
         # rename and best-effort fsync the directory after it, so a crash
         # never leaves a torn or vanished graph.latest.json.
@@ -86,21 +102,90 @@ class GraphStore:
                 payload = json.dumps(
                     graph.to_node_link(), sort_keys=True, separators=(",", ":")
                 ).encode("utf-8")
+                compressed = zstd.ZstdCompressor(level=3).compress(payload)
                 with tmp.open("wb") as fh:
                     # Level 3: the write path is latency-sensitive (it runs
                     # mid-sync), and levels above this cost far more CPU for a
                     # few percent of size. Snapshots, written rarely, use 10.
-                    fh.write(zstd.ZstdCompressor(level=3).compress(payload))
+                    fh.write(compressed)
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(tmp, path)
+                # Build the publication record from the file after its atomic
+                # rename.  Its stat tuple lets ``counts`` reject stale metadata
+                # if a process was killed between these two replacements.
+                stat = path.stat()
+                metadata = {
+                    "version": 1,
+                    "published_at": datetime.now(UTC).isoformat(),
+                    "nodes": graph.number_of_nodes(),
+                    "edges": graph.number_of_edges(),
+                    "compressed_bytes": stat.st_size,
+                    "graph_mtime_ns": stat.st_mtime_ns,
+                }
+                with metadata_tmp.open("w", encoding="utf-8", newline="\n") as fh:
+                    json.dump(metadata, fh, sort_keys=True, separators=(",", ":"))
+                    fh.write("\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(metadata_tmp, metadata_path)
         except BaseException:
             tmp.unlink(missing_ok=True)
+            metadata_tmp.unlink(missing_ok=True)
             raise
         self._fsync_dir(path.parent)
         self._retire_legacy(kb_id)
         self._sweep_stale_tmp(path.parent)
         return path
+
+    def counts(self, kb_id: str) -> tuple[int, int]:
+        """Return published graph counts without loading the graph when possible.
+
+        Old state directories have no metadata file.  They transparently pay
+        one legacy load; their next graph save writes the sidecar.
+        """
+
+        path = self.graph_path(kb_id)
+        metadata_path = self.metadata_path(kb_id)
+        if path.exists() and metadata_path.exists():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                stat = path.stat()
+                if (
+                    int(metadata.get("compressed_bytes", -1)) == stat.st_size
+                    and int(metadata.get("graph_mtime_ns", -1)) == stat.st_mtime_ns
+                ):
+                    return int(metadata.get("nodes", 0)), int(metadata.get("edges", 0))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        graph = self.load(kb_id)
+        nodes, edges = graph.number_of_nodes(), graph.number_of_edges()
+        # One-time migration for pre-generation state.  The expensive legacy
+        # load has already happened; record its counts now so every subsequent
+        # unchanged sync remains metadata-only.
+        if path.exists():
+            metadata_tmp = _tmp_for(metadata_path)
+            try:
+                with self._write_lock:
+                    stat = path.stat()
+                    metadata = {
+                        "version": 1,
+                        "published_at": datetime.now(UTC).isoformat(),
+                        "nodes": nodes,
+                        "edges": edges,
+                        "compressed_bytes": stat.st_size,
+                        "graph_mtime_ns": stat.st_mtime_ns,
+                    }
+                    with metadata_tmp.open("w", encoding="utf-8", newline="\n") as fh:
+                        json.dump(metadata, fh, sort_keys=True, separators=(",", ":"))
+                        fh.write("\n")
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(metadata_tmp, metadata_path)
+                self._fsync_dir(metadata_path.parent)
+            except OSError:
+                metadata_tmp.unlink(missing_ok=True)
+        return nodes, edges
 
     @staticmethod
     def _sweep_stale_tmp(directory: Path, max_age_s: float = 3600.0) -> None:
@@ -174,6 +259,34 @@ class GraphStore:
                     fh.write(compressed)
                     fh.flush()
                     os.fsync(fh.fileno())
+                os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        self._fsync_dir(path.parent)
+        return path
+
+    def snapshot_current(self, kb_id: str, utc_ts: str) -> Path:
+        """Preserve the already-published immutable generation as history.
+
+        Re-serializing the in-memory graph and recompressing it at level 10
+        made a snapshot an inline compaction pass after every otherwise-fast
+        source commit. ``graph.latest.json.zst`` is already complete,
+        compressed and durable; copying those exact bytes is both more
+        consistent and orders of magnitude cheaper.
+        """
+
+        source = self.graph_path(kb_id)
+        if not source.exists():
+            raise FileNotFoundError(f"No published graph generation for {kb_id}")
+        path = self.snapshot_path(kb_id, utc_ts)
+        tmp = _tmp_for(path)
+        try:
+            with self._write_lock:
+                with source.open("rb") as src, tmp.open("wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+                    dst.flush()
+                    os.fsync(dst.fileno())
                 os.replace(tmp, path)
         except BaseException:
             tmp.unlink(missing_ok=True)

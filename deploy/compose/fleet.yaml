@@ -1,8 +1,7 @@
-# Config for the api and indexer tiers of docker-compose.scale.yml.
-# The role is NOT set here — each service passes `--role` on the command
-# line, so one file describes one knowledge base rather than one process.
 pheasant:
-  name: compose-fleet
+  name: pheasant-scalable
+  description: High-throughput Pheasant fleet with PostgreSQL, NATS JetStream, gRPC
+    workers, LanceDB, OpenAI, WASM, MCP, and opt-in durable memory
   environment: compose
   log_level: INFO
   state_path: /state
@@ -11,6 +10,7 @@ pheasant:
 server:
   host: 0.0.0.0
   port: 8765
+  role: all
   mcp:
     enabled: true
     transports:
@@ -20,47 +20,151 @@ server:
   api:
     enabled: true
     openapi: true
-    cors_origins:
-      - http://localhost:8765
-      - http://127.0.0.1:8765
-    max_concurrent_requests: 64
-    drain_seconds: 10
-    graph_refresh_seconds: 15
+    max_concurrent_requests: 32
+    drain_seconds: 20
+    graph_refresh_seconds: 30
   ui:
     enabled: true
     graph_visualization: true
 storage:
-  # One writer per SQLite file, and it is not one file across containers.
-  # Only the env var NAME appears here; the DSN comes from the environment.
   backend: postgres
   dsn_env: PHEASANT_DATABASE_URL
-  pool_size: 10
+  pool_size: 16
   graph_snapshots: true
-sync:
-  # The hand-off: api publishes, indexer drains.
-  queue:
+  graph_snapshot_interval_seconds: 900
+  graph_checkpoint_seconds: 120
+  checkpoint_mtbf_seconds: 86400
+  graph_checkpoint_max_seconds: 300
+  compression: zstd
+  max_state_size_gb: 250
+search:
+  default_mode: hybrid
+  max_results_default: 100
+  embeddings:
     enabled: true
-    backend: local
-    visibility_seconds: 300
-    max_attempts: 3
+    provider: openai-spec
+    model: text-embedding-3-small
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    dimensions: 1536
+    batch_size: 128
+    max_retries: 10
+    retry_backoff_seconds: 2.0
+    rate_limit_max_wait_seconds: 900.0
+  vector_store:
+    provider: lancedb
+    path: /state/vectors
+  wasm_relationship_search: true
+ingestion:
+  captioner:
+    provider: openai-spec
+    model: gpt-5.6-luna
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+  transcriber:
+    provider: openai-spec
+    model: whisper-1
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+  extractor:
+    provider: auto
+    html_text: true
+sync:
   watcher:
     enabled: true
+    max_watch_paths: 20000
+    debounce_ms: 250
+    batch_window_ms: 1000
+  git:
+    enabled: true
+    detect_commit_changes: true
+    detect_branch_switch: true
+    reindex_on_commit: true
   scheduler:
     enabled: true
     interval_seconds: 900
+  limits:
+    max_files: null
+    max_file_size_mb: 100
+    max_total_mb: null
+    follow_symlinks: false
   concurrency:
     max_parallel_sources: 4
-    max_parallel_files: 8
-    # `worker` is the Compose service name; DNS round-robins across the
-    # scaled replicas, so `--scale worker=8` needs no config change.
+    max_parallel_files: 16
+    max_parallel_embeddings: 8
     file_executor: remote
     remote_worker_urls:
-      - http://worker:8765
+      - grpc://worker:8766
+    remote_worker_enabled: false
     remote_worker_token_env: PHEASANT_INDEX_WORKER_TOKEN
-    remote_worker_batch_size: 8
-    worker_transport: http
+    remote_worker_timeout_seconds: 120
+    remote_worker_batch_size: 16
+    worker_transport: grpc
+    lock_timeout_seconds: 300
+  queue:
+    enabled: true
+    backend: nats
+    visibility_seconds: 300
+    max_attempts: 5
+    nats_servers:
+      - nats://nats:4222
+    nats_stream: PHEASANT_INDEX
+    nats_subject: pheasant.index.tasks
+    nats_durable: pheasant-indexers
+graph:
+  memory_entity_bridging: true
+  wasm_cross_source_resolution: true
+  query_service_url: http://graph:8765
+  query_service_token_env: PHEASANT_GRAPH_SERVICE_TOKEN
+  query_service_timeout_seconds: 30.0
+  max_nodes: null
 security:
   allow_workspace_roots:
     - /workspace
+    - /memory
     - /state
+    - /exports
+  allow_user_selected_source_paths: false
+  read_only_sources: true
+  deny_path_traversal: true
+  default_exclude_secrets: true
+  acl_enforced: false
+memory:
+  consolidation_enabled: true
+  session_ttl_days: null
+  user_ttl_days: null
+  org_ttl_days: null
+  default_policy: prefer
+  steering_enabled: true
+  usage_tracking: true
+  max_records: null
+  about_max_targets: 12
+assistant:
+  enabled: true
+  provider: openai
+  model: gpt-5.6-luna
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  allow_session_keys: false
+  max_context_chunks: 24
+  max_output_tokens: 16384
+  request_timeout_seconds: 180.0
+  max_facts: 32
+  workflow: agentic
+  retrieval:
+    max_rounds: 2
+    per_query_results: 16
+    max_context_passages: 24
+    retrieval_modes:
+      - vector
+      - graph
+      - hybrid
+    expand_graph: true
+    expand_depth: 2
+    expand_per_node: 8
+    grade_evidence: true
+    verify_citations: true
+    max_facts: 32
 sources: []
+synapse:
+  publish: false

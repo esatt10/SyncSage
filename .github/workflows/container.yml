@@ -20,8 +20,8 @@ env:
   IMAGE_NAME: pheasant
   # The web UI is a separate workload (static bundle + nginx), so it is a
   # separate image — but it is published from the same commit and tagged with
-  # the same version, so `pheasant host` and docker-compose.yml can pin the two
-  # together. Without this, the compose files reference a UI image that was
+  # the same version, so `pheasant host` can pin the two together. Without
+  # this, generated sidecar manifests reference a UI image that was
   # never pushed and the sidecar fails to start.
   UI_IMAGE_NAME: pheasant-ui
 

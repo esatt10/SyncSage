@@ -40,7 +40,7 @@ from pheasant.ingestion.extractor import (
     scan_pdf_content_stream,
     source_includes_documents,
 )
-from pheasant.ingestion.pipeline import read_text, read_text_bytes
+from pheasant.ingestion.pipeline import parse_file, read_text, read_text_bytes
 from pheasant.ingestion.transcriber import source_includes_audio
 from pheasant.search.hybrid import HybridSearch
 from pheasant.search.sqlite_store import SearchStore
@@ -51,6 +51,34 @@ HANDBOOK = DOCS / "handbook.pdf"
 REPORT = DOCS / "report.docx"
 SCANNED = DOCS / "scanned.pdf"
 SCANNED_SIDECAR = DOCS / "scanned.pdf.extract.txt"
+
+
+def test_text_nul_is_removed_before_chunk_persistence(tmp_path: Path) -> None:
+    document = tmp_path / "binary-fixture.txt"
+    document.write_bytes(b"before\x00after")
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "nul-safe",
+                "state_path": str(tmp_path / "state"),
+                "workspace_root": str(tmp_path),
+                "exports_path": str(tmp_path / "exports"),
+            },
+            "sources": [
+                {
+                    "name": "fixtures",
+                    "type": "document_folder",
+                    "path": str(tmp_path),
+                    "include": ["**/*.txt"],
+                }
+            ],
+        }
+    )
+
+    parsed = parse_file(config.sources[0], document, git_metadata=(None, None, False))
+
+    assert parsed is not None
+    assert "".join(chunk.text for chunk in parsed.chunks) == "beforeafter"
 
 
 def _make_document_engine(tmp_path: Path, *, provider: str = "auto") -> SyncEngine:
@@ -115,6 +143,50 @@ def test_pdf_and_docx_yield_text_once_an_extractor_is_supplied() -> None:
 
     docx_text = read_text_bytes(REPORT.read_bytes(), "report.docx", extractor)
     assert "OKAPI" in docx_text
+
+
+def test_stateless_worker_prepares_pdf_with_forwarded_offline_extractor_settings(
+    tmp_path: Path,
+) -> None:
+    """The fleet path must actually handle documents, not fall back locally."""
+
+    from pheasant.sync.connectors import ConnectorItem, ConnectorPayload
+    from pheasant.sync.remote_worker import prepare_task, task_payload
+
+    config = PheasantConfig.model_validate(
+        {
+            "ingestion": {"extractor": {"provider": "builtin"}},
+            "sources": [
+                {
+                    "name": "documents",
+                    "type": "document_folder",
+                    "path": str(tmp_path),
+                    "include": ["**/*.pdf"],
+                }
+            ],
+        }
+    )
+    content = HANDBOOK.read_bytes()
+    item = ConnectorItem(
+        identity="handbook",
+        relative_path="handbook.pdf",
+        uri=(tmp_path / "handbook.pdf").as_uri(),
+        size_bytes=len(content),
+    )
+    payload = ConnectorPayload(item=item, content=content, size_bytes=len(content))
+    wire = prepare_task(
+        task_payload(
+            config.sources[0],
+            item,
+            payload,
+            None,
+            config.ingestion.extractor,
+        )
+    )
+
+    assert wire is not None
+    assert wire["relative_path"] == "handbook.pdf"
+    assert any("ZEBRAFISH" in chunk["text"] for chunk in wire["chunks"])
 
 
 # ---------------------------------------------------------------------------

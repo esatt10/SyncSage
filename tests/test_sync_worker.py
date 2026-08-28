@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from pheasant.config.loader import load_config
 from pheasant.sync.engine import SyncEngine
@@ -92,3 +93,57 @@ def test_report_parsing_ignores_noise_on_stdout() -> None:
 
     assert _parse_report("no json here", "x")["status"] == "unknown"
     assert _parse_report("", None)["results"] == []
+
+
+def test_sync_all_preserves_a_child_failure_as_a_result(monkeypatch) -> None:
+    from pheasant.sync import worker as worker_module
+
+    class Engine:
+        paths = type("Paths", (), {"sqlite": Path("/state/pheasant.db")})()
+
+    backed = WorkerBackedEngine(Engine(), "/config/pheasant.yaml")
+    monkeypatch.setattr(backed, "_can_delegate", lambda: True)
+    monkeypatch.setattr(
+        worker_module,
+        "run_sync",
+        lambda *_args, **_kwargs: {
+            "status": "failed",
+            "error": "HTTP Error 429: Too Many Requests",
+            "results": [],
+        },
+    )
+
+    results = backed.sync_all("full")
+    assert len(results) == 1
+    assert results[0].status == "failed"
+    assert "429" in results[0].details["error"]
+
+
+def test_startup_parallelizes_all_persisted_enabled_sources(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class Engine:
+        paths = SimpleNamespace(ensure=lambda: None)
+        state = SimpleNamespace(migrate=lambda: None)
+
+        @staticmethod
+        def reconcile_embeddings() -> None:
+            return None
+
+        @staticmethod
+        def enabled_sources():
+            return [
+                SimpleNamespace(name="yaml-source", sync=SimpleNamespace(on_startup=True)),
+                SimpleNamespace(name="persisted-source", sync=SimpleNamespace(on_startup=True)),
+            ]
+
+    backed = WorkerBackedEngine(Engine(), "/config/pheasant.yaml")
+    monkeypatch.setattr(backed, "_can_delegate", lambda: True)
+    monkeypatch.setattr(
+        backed,
+        "sync_all",
+        lambda mode: calls.append(mode) or ["yaml-source", "persisted-source"],
+    )
+
+    assert backed.startup() == ["yaml-source", "persisted-source"]
+    assert calls == ["incremental"]

@@ -105,14 +105,23 @@ try to index the same source. Roles say which jobs a process has:
 | `all` | yes | yes | no | in-process | one container — **the default** |
 | `api` | no | no | no | **never** | N replicas behind a Service |
 | `indexer` | yes | yes | yes | in-process | one per shard |
+| `graph` | no | no | no | no | internal graph-query service |
 | `worker` | no | no | no | no | M replicas, autoscaled |
 
 ```bash
 pheasant serve                     # all — unchanged
 pheasant serve --role api          # serve; publish index work
 pheasant serve --role indexer      # watch, schedule, drain
+pheasant serve --role graph        # authenticated graph reads + snapshot refresh
 pheasant worker --transport grpc   # preparation only
 ```
+
+On PostgreSQL, `indexer` replicas elect one orchestrator per knowledge-base
+shard. Only the leader starts watcher, scheduler and queue drain; standbys
+report `leader: false` and `/ready` returns 503 until promotion. Inside the
+leader, all three work producers share one child-sync lock. Scale preparation
+workers for throughput and shard the knowledge base for more commit capacity;
+extra indexers provide failover, not parallel graph writers.
 
 `all` deliberately does **not** drain the queue: a single container turns the
 queue on for [crash resumption](#the-index-work-queue-syncqueue), not to
@@ -125,6 +134,13 @@ refuses to start in that case rather than letting you find out later. A
 blocking sync (`wait: true`) against an api replica returns **409** with the
 fix, because publishing is a different promise from "run this and return the
 result".
+
+With `graph.query_service_url` set, API and mounted MCP replicas do not load
+`graph.latest.json`; the `graph` role is the only serving process that keeps it
+resident and refreshes it after indexer commits. API readiness fails when that
+service is unreachable. There is deliberately no fallback to a local graph:
+fallback would duplicate the graph into every replica at the exact moment the
+graph tier is unhealthy and memory headroom is most valuable.
 
 Routes are *not* hidden per role. What keeps search traffic off an indexer is
 the Service selector in front of it; a role whose `/search` returned 404 would
@@ -144,7 +160,7 @@ multi-hour first index would take the whole Service down for that time.
 |---|---|---|---|
 | `max_concurrent_requests` | integer | `0` | In-flight requests before the surplus is refused with **429 + `Retry-After`**. `0` disables it. |
 | `drain_seconds` | integer | `0` | Seconds to keep serving after SIGTERM while `/ready` already reports 503. `0` disables the delay. |
-| `graph_refresh_seconds` | integer | `30` | How often an **`api`-role** replica re-reads a graph written by the indexer. `0` disables it; the other roles ignore it. |
+| `graph_refresh_seconds` | integer | `30` | How often a legacy local-graph `api` or dedicated `graph` role re-reads a graph written by the indexer. A remote-graph API ignores it. `0` disables it. |
 
 Both default off, and that is a decision rather than caution.
 
@@ -296,6 +312,9 @@ with body matches on rare ones. The top hit agrees on the gold set;
 | `embeddings.api_key_env` | string | `OPENAI_API_KEY` | Name of the env var holding the API key (key never lands in config/state). |
 | `embeddings.dimensions` | integer \| null | `null` | Unset by default — the `dimensions` request field is simply omitted, so the provider returns the model's own native size (e.g. 1536 for `text-embedding-3-small`, 3072 for `text-embedding-3-large`). Set an explicit number only to shrink vectors for storage (OpenAI's `-3` models support this) or to pin an exact size across a Synapse fleet. |
 | `embeddings.batch_size` | integer | `64` | Texts per embedding HTTP request. |
+| `embeddings.max_retries` | integer | `4` | Retries for transient transport and 5xx failures. Authentication and malformed requests fail immediately. |
+| `embeddings.retry_backoff_seconds` | number | `1.0` | Initial exponential-backoff delay. Locally chosen waits cap at 30 seconds and use jitter. |
+| `embeddings.rate_limit_max_wait_seconds` | number | `300.0` | Cumulative wait budget for provider 429 responses before the durable source task is allowed to fail. Provider `Retry-After`/quota-reset headers are honored in full; concurrent embedding threads share one cooldown and reduce/ramp concurrency adaptively. Set `0` to use ordinary bounded retries. |
 | `vector_store.provider` | string | `lancedb` | `lancedb` (optional `[vector]` extra) or `numpy` (always-available flat file). |
 | `vector_store.path` | absolute path | `<state>/vectors` | Vector index root; vectors live under `<path>/<kb_id>/`. Created only when embeddings are enabled. |
 | `ranking.prefer_exact_path_matches` | bool | `true` (example) | Boost exact path matches. |
@@ -645,6 +664,9 @@ lands in config or on disk.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
+| `query_service_url` | string \| null | `null` | Internal graph-service base URL. When set, API/MCP serving replicas hold a bounded proxy instead of the full graph. Use `null` for standalone. |
+| `query_service_token_env` | string | `PHEASANT_GRAPH_SERVICE_TOKEN` | Environment variable containing the bearer token shared by graph clients and the `graph` role. |
+| `query_service_timeout_seconds` | float | `30.0` | Deadline per graph operation, including graph/hybrid search. Transport failures are explicit; they never trigger a local full-graph fallback. |
 | `memory_entity_bridging` | bool | `true` | Wire agent-memory records into the graph (`about` edges to what a record refers to, `supersedes` between corrections). A no-op without a memory source. |
 | `wasm_cross_source_resolution` | bool | `false` | Run `resolve_cross_source_edges` (import/link resolution across sources) through the vendored WASM accelerator (Synapse 34.5a) instead of pure Python. Needs the `[wasm]` extra; falls back to pure Python on any failure or if the extra is missing. Conditional win per the 34.4 benchmark — loses to Python below roughly 1,300-2,500 edges, wins modestly above it; opt in for large/growing multi-source graphs, leave off for small ones. **The Docker image turns this on** in a config it generates itself, on the assumption that a container's graph grows past the crossover; set it to `false` in your config if you are indexing a small, static corpus. |
 
@@ -805,6 +827,16 @@ typed home, which is what makes them validated, editable from the UI
 | `verify_citations` | bool \| null | `true` | Drop `[n]` markers that do not resolve to a real citation. |
 | `max_facts` | int \| null | `12` | Graph facts surfaced alongside the answer. |
 
+`hybrid` is already a concurrent fusion of text, vector, and graph. The
+generated scalable profile deliberately uses `[vector, graph, hybrid]` and
+omits a second standalone `text` fanout: stress testing found PostgreSQL
+full-text ranking to be the slowest arm for high-frequency terms, so repeating
+it had a weak cost/recall case. This does not disable text search. Explicit
+`mode=text` still serves exact-identifier queries and hybrid still contains
+lexical results. Vector and graph remain explicit to preserve arm-specific top
+candidates that may fall beyond hybrid's fused result limit. The schema
+default above and the local profile defaults are unchanged.
+
 **Precedence is deliberately low.** Values merge in this order, later winning:
 
 ```
@@ -897,6 +929,25 @@ Each source item supports:
 | `include_uncommitted` | bool | `true` | Include working tree changes. |
 | `commit_trigger` | bool | `true` | Trigger sync on commit change events. |
 | `dependency_graph` | object | `{}` | Optional language-specific dependency graph config. |
+| `clone_url` | string/null | `null` | Remote cloned by URL quick-add. When set, every sync fetches and safely fast-forwards before indexing. Use `GITHUB_TOKEN`/`GH_TOKEN` for private GitHub repositories; never put credentials in this URL. |
+| `clone_path` | string/null | `null` | Root of the managed checkout. This differs from `sources[].path` when a GitHub tree URL selects a repository subdirectory. |
+| `clone_ref` | string/null | `null` | Branch or tag requested by a GitHub tree URL. Otherwise the clone's tracked default branch is used. |
+
+URL-added repositories are managed checkouts. Before `incremental`, `full`,
+`repair`, or `validate_only`, Pheasant fetches `origin`, resolves the tracked
+revision, and permits only a fast-forward. It then records the remote, local,
+and indexed commit IDs in the source checkpoint. `GET /sources` and the
+Sources page report `remote current` only when all three commits match.
+
+Pheasant will fail with `remote_error` instead of indexing stale content when
+the fetch cannot authenticate, the checkout has working-tree changes or local
+commits, the history diverged, or `origin` does not match `clone_url`. Local
+repository sources (`clone_url: null`) are never fetched or modified.
+
+Sources created with URL quick-add live immediately in operational state. Use
+the Sources page's **promote** action to add the generated source block to
+`pheasant.yaml` when scheduler/startup synchronization must survive a complete
+server restart.
 
 ### `sources[].chunking`
 

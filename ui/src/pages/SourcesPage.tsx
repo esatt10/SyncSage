@@ -31,9 +31,9 @@ export function SourcesPage() {
     queryFn: api.sources,
     // Sync now runs in the background (wait: false) rather than blocking
     // the request that started it, so this is how its progress actually
-    // reaches the page — poll while anything is in flight, stop the moment
-    // nothing is (a static page shouldn't tick a network request forever).
-    refetchInterval: (query) => (query.state.data?.some((s) => s.syncing) ? 1000 : false),
+    // reaches the page. A role-split indexer starts in another process, so a
+    // slow idle poll is required to discover it; active work updates each second.
+    refetchInterval: (query) => (query.state.data?.some((s) => s.syncing) ? 1000 : 5000),
   });
   const [quickAdd, setQuickAdd] = useState(false);
   const [showWizard, setShowWizard] = useState(false);
@@ -124,6 +124,26 @@ export function SourcesPage() {
                 ) : (
                   (source.last_status ?? "—")
                 )}
+                {source.repository?.managed ? (
+                  <div
+                    className={
+                      source.repository.fresh || repositoryVerificationPending(source)
+                        ? ""
+                        : "error"
+                    }
+                    title={repositoryFreshnessTitle(source)}
+                  >
+                    remote{" "}
+                    {source.repository.fresh
+                      ? "current"
+                      : repositoryVerificationPending(source)
+                        ? "verification pending"
+                        : "not verified"}
+                    {source.repository.indexed_commit
+                      ? ` · ${source.repository.indexed_commit.slice(0, 8)}`
+                      : ""}
+                  </div>
+                ) : null}
               </td>
               <td className="actions-cell">
                 <SyncControl
@@ -224,6 +244,29 @@ export function SourcesPage() {
         </div>
       )}
     </div>
+  );
+}
+
+function repositoryFreshnessTitle(source: SourceRecord): string {
+  const repository = source.repository;
+  if (!repository) return "";
+  return [
+    repository.remote_url,
+    repository.tracking_ref ? `tracking: ${repository.tracking_ref}` : null,
+    repository.remote_commit ? `remote: ${repository.remote_commit}` : null,
+    repository.local_commit ? `checkout: ${repository.local_commit}` : null,
+    repository.indexed_commit ? `indexed: ${repository.indexed_commit}` : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function repositoryVerificationPending(source: SourceRecord): boolean {
+  return Boolean(
+    source.repository?.managed &&
+      !source.repository.fresh &&
+      !source.repository.indexed_commit &&
+      source.last_status === "registered",
   );
 }
 

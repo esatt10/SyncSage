@@ -17,6 +17,7 @@ Role         Watch   Schedule   Drain  Index      Typical deployment
 ``all``      yes     yes        no     in-proc    one container (the default)
 ``api``      no      no         no     **never**  N replicas behind a Service
 ``indexer``  yes     yes        yes    in-proc    one per shard, a StatefulSet
+``graph``    no      no         no     no         internal graph query service
 ``worker``   no      no         no     no         M replicas, autoscaled
 ===========  ======  =========  =====  =========  ==============================
 
@@ -31,12 +32,11 @@ to prevent; instead its sync requests are *published* and an indexer picks
 them up. That makes the queue a hard requirement for that role, checked at
 startup rather than discovered when a sync silently goes nowhere.
 
-Routes are deliberately **not** hidden per role. It is tempting, and it would
-be defence in depth, but the thing that actually keeps search traffic off an
-indexer is the Service selector in front of it — and a role whose `/search`
-404s is much harder to debug than one that simply has no clients. What a role
-changes is what the process *does on its own*, which is the part no external
-routing can control.
+Routes are deliberately **not** hidden per role. The indexer coordinator does
+not load the persisted graph in its parent process, however: sync children own
+graph commits, and the Service selector keeps queries on API replicas. This
+avoids holding two complete graph copies during every index while preserving
+health, readiness, queue and control-plane diagnostics on the indexer.
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ class Role(StrEnum):
     ALL = "all"
     API = "api"
     INDEXER = "indexer"
+    GRAPH = "graph"
     WORKER = "worker"
 
 
@@ -115,6 +116,17 @@ POLICIES: dict[Role, RolePolicy] = {
         drains_queue=True,
         indexes_locally=True,
         serves_ui=False,
+    ),
+    Role.GRAPH: RolePolicy(
+        role=Role.GRAPH,
+        runs_watcher=False,
+        runs_scheduler=False,
+        drains_queue=False,
+        indexes_locally=False,
+        serves_ui=False,
+        # The indexer commits snapshots on shared state. Only this service
+        # reloads them when APIs use the remote graph boundary.
+        refreshes_graph=True,
     ),
     Role.WORKER: RolePolicy(
         role=Role.WORKER,

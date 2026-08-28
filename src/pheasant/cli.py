@@ -96,6 +96,7 @@ def _sync_services(engine, cfg, config_path=None):
     return (
         WatcherService(engine, cfg, sync_lock=sync_lock),
         SchedulerService(engine, cfg, sync_lock=sync_lock),
+        sync_lock,
     )
 
 
@@ -128,15 +129,34 @@ def _serve_app(cfg, config_path: str, *, report_ui: bool = True, role: str | Non
     app_obj = create_app(cfg, config_path=config_path, role=policy.name)
     if report_ui and policy.serves_ui:
         _report_ui(app_obj, cfg)
-    watcher, scheduler = _sync_services(app_obj.state.engine, cfg, config_path=config_path)
-    drainer = _queue_drainer(cfg, config_path, policy)
+    watcher, scheduler, sync_lock = _sync_services(
+        app_obj.state.engine, cfg, config_path=config_path
+    )
+    # Standalone startup syncs and every background producer share this gate.
+    # Postgres indexers additionally hand it to the leader supervisor below.
+    app_obj.state.sync_lock = sync_lock
+    drainer = _queue_drainer(cfg, config_path, policy, sync_lock=sync_lock)
     refresher = _graph_refresher(cfg, app_obj.state.engine, policy)
-    if policy.runs_watcher:
-        watcher.start()
-    if policy.runs_scheduler:
-        scheduler.start()
-    if drainer is not None:
-        drainer.start()
+    orchestration = _orchestration_supervisor(
+        app_obj,
+        cfg,
+        policy,
+        watcher=watcher,
+        scheduler=scheduler,
+        drainer=drainer,
+        config_path=config_path,
+        sync_lock=sync_lock,
+    )
+    if orchestration is not None:
+        app_obj.state.orchestration = orchestration
+        orchestration.start()
+    else:
+        if policy.runs_watcher:
+            watcher.start()
+        if policy.runs_scheduler:
+            scheduler.start()
+        if drainer is not None:
+            drainer.start()
     if refresher is not None:
         refresher.start()
     if not policy.is_default:
@@ -146,11 +166,260 @@ def _serve_app(cfg, config_path: str, *, report_ui: bool = True, role: str | Non
     finally:
         if refresher is not None:
             refresher.stop()
-        if drainer is not None:
-            drainer.stop()
-        scheduler.stop()
-        watcher.stop()
+        if orchestration is not None:
+            orchestration.stop()
+        else:
+            if drainer is not None:
+                drainer.stop()
+            scheduler.stop()
+            watcher.stop()
         app_obj.state.engine.close()
+
+
+class _OrchestrationSupervisor:
+    """Elect one active indexer per knowledge-base shard, with failover.
+
+    Preparation workers are the scalable tier. The graph, manifests, vectors
+    and graph-node FTS are one coordinated commit stream, so starting the
+    watcher, scheduler and queue drainer on every indexer creates duplicate
+    scans and stale whole-graph overwrites. A durable database lease leaves
+    extra indexers as hot standbys and promotes one automatically when the
+    leader dies or loses its database session.
+    """
+
+    def __init__(
+        self,
+        state,
+        knowledge_base: str,
+        *,
+        watcher,
+        scheduler,
+        drainer,
+        on_promote=None,
+        promotion_lock=None,
+        poll_interval: float = 1.0,
+    ) -> None:
+        from pheasant.sync.queue import owner_id
+
+        self.state = state
+        self.lease_name = f"__pheasant_orchestrator__:{knowledge_base}"
+        self.owner = owner_id()
+        self.watcher = watcher
+        self.scheduler = scheduler
+        self.drainer = drainer
+        self.on_promote = on_promote
+        self.promotion_lock = promotion_lock
+        self.poll_interval = max(0.1, float(poll_interval))
+        self._leader = False
+        self._stop = None
+        self._thread = None
+        self._lease = None
+        self._promotion_thread = None
+
+    @property
+    def leader(self) -> bool:
+        return self._leader
+
+    def start(self) -> None:
+        import threading
+
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="pheasant-orchestrator-election", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=35)
+            self._thread = None
+        if self._promotion_thread is not None:
+            self._promotion_thread.join(timeout=10)
+
+    def _set_metric(self, value: float) -> None:
+        try:
+            from pheasant.telemetry import metrics
+
+            metrics.REGISTRY.set("pheasant_indexer_leader", value)
+        except Exception:  # pragma: no cover - telemetry cannot own leadership
+            pass
+
+    def _promote(self) -> None:
+        import logging
+        import threading
+
+        self._leader = True
+        self._set_metric(1.0)
+        if self.on_promote is not None and (
+            self._promotion_thread is None or not self._promotion_thread.is_alive()
+        ):
+            # Reserve the global sync gate before any producer starts. The
+            # promotion worker releases it after startup reconciliation, while
+            # watcher/scheduler/drainer can start immediately and wait behind
+            # it without claiming queue work.
+            if self.promotion_lock is not None:
+                self.promotion_lock.acquire()
+
+            def reconcile() -> None:
+                try:
+                    self.on_promote()
+                except Exception:
+                    logging.getLogger("pheasant.cli").exception(
+                        "leader startup reconciliation failed"
+                    )
+                finally:
+                    if self.promotion_lock is not None:
+                        self.promotion_lock.release()
+
+            self._promotion_thread = threading.Thread(
+                target=reconcile,
+                name="pheasant-leader-startup",
+                daemon=True,
+            )
+            self._promotion_thread.start()
+        if self.watcher is not None:
+            self.watcher.start()
+        if self.scheduler is not None:
+            self.scheduler.start()
+        if self.drainer is not None:
+            self.drainer.start()
+        logging.getLogger("pheasant.cli").info(
+            "indexer elected orchestrator for %s", self.lease_name
+        )
+
+    def _demote(self) -> None:
+        import logging
+
+        if not self._leader:
+            return
+        # Stop claims first, then producers. This prevents a demoted leader
+        # from beginning another queued source while its successor promotes.
+        if self.drainer is not None:
+            self.drainer.stop()
+        if self.scheduler is not None:
+            self.scheduler.stop()
+        if self.watcher is not None:
+            self.watcher.stop()
+        self._leader = False
+        self._set_metric(0.0)
+        logging.getLogger("pheasant.cli").warning(
+            "indexer relinquished orchestrator leadership for %s", self.lease_name
+        )
+
+    def _run(self) -> None:
+        import logging
+
+        from pheasant.sync.locks import SourceLease
+
+        log = logging.getLogger("pheasant.cli")
+        self._set_metric(0.0)
+        try:
+            while not self._stop.is_set():
+                if self._lease is None:
+                    self._lease = SourceLease(
+                        self.state,
+                        self.lease_name,
+                        owner=self.owner,
+                        heartbeat_interval_s=5.0,
+                        stale_after_s=20.0,
+                    )
+                if not self._lease.held:
+                    self._demote()
+                    try:
+                        won = self._lease.try_acquire()
+                    except Exception:
+                        log.warning("orchestrator election failed; retrying", exc_info=True)
+                        won = False
+                    if won:
+                        self._promote()
+                self._stop.wait(self.poll_interval)
+        finally:
+            self._demote()
+            if self._lease is not None:
+                self._lease.release()
+
+
+def _durable_backlog_depth(cfg, state) -> int:
+    """Pending/in-flight durable work that should outrank startup scans."""
+
+    from pheasant.sync.queue import queue_from_config
+
+    queue = queue_from_config(cfg, state)
+    try:
+        depth = queue.depth() if queue is not None else {}
+    finally:
+        if queue is not None:
+            queue.close()
+    return int(depth.get("pending", 0)) + int(depth.get("inflight", 0))
+
+
+def _orchestration_supervisor(
+    app_obj,
+    cfg,
+    policy,
+    *,
+    watcher,
+    scheduler,
+    drainer,
+    config_path=None,
+    sync_lock=None,
+):
+    """Elect Postgres indexers; standalone/SQLite keeps its direct services."""
+
+    from pheasant.deployment.roles import Role
+
+    if policy.role is not Role.INDEXER or not app_obj.state.state.dialect.is_postgres:
+        return None
+
+    def reconcile_on_promotion() -> None:
+        import logging
+
+        from pheasant.sync.worker import WorkerBackedEngine
+
+        # Explicit durable work outranks opportunistic on-startup freshness.
+        # After a restart, scanning every repository before reclaiming a task
+        # made recovery take minutes and could repeat the very stress workload
+        # an operator was trying to resume. Watcher/scheduler beats still
+        # reconcile these sources once the backlog is gone.
+        queued = _durable_backlog_depth(cfg, app_obj.state.state)
+        if queued:
+            logging.getLogger("pheasant.cli").info(
+                "Deferring startup source reconciliation until %d durable task(s) drain",
+                queued,
+            )
+            return
+
+        sources = [
+            source.name
+            for source in app_obj.state.engine.enabled_sources()
+            if source.sync.on_startup
+        ]
+        if not sources:
+            return
+        log = logging.getLogger("pheasant.cli")
+        log.info("Leader startup sync for sources: %s", ", ".join(sources))
+        results = WorkerBackedEngine(app_obj.state.engine, config_path).startup()
+        app_obj.state.startup_sync_results = results
+        log.info(
+            "Leader startup sync complete: sources=%s indexed=%s skipped=%s",
+            len(results),
+            sum(result.indexed_artifacts for result in results),
+            sum(result.skipped_artifacts for result in results),
+        )
+
+    return _OrchestrationSupervisor(
+        app_obj.state.state,
+        cfg.knowledge_base_id,
+        watcher=watcher if policy.runs_watcher else None,
+        scheduler=scheduler if policy.runs_scheduler else None,
+        drainer=drainer,
+        on_promote=reconcile_on_promotion,
+        promotion_lock=sync_lock,
+    )
 
 
 class _QueueDrainer:
@@ -167,9 +436,10 @@ class _QueueDrainer:
     every embedded caller too.
     """
 
-    def __init__(self, cfg, config_path: str) -> None:
+    def __init__(self, cfg, config_path: str, *, sync_lock=None) -> None:
         self.cfg = cfg
         self.config_path = config_path
+        self.sync_lock = sync_lock
         self._stop = None
         self._thread = None
 
@@ -193,10 +463,18 @@ class _QueueDrainer:
     def _run(self) -> None:
         import logging
 
+        from pheasant.jobs import JobRegistry
         from pheasant.sync.queue import drain, owner_id, queue_from_config
 
         log = logging.getLogger("pheasant.cli")
-        engine = _engine(Path(self.config_path))
+        # This long-lived engine coordinates queue/state only. Each claimed
+        # task runs in an isolated child that owns graph and vector commits;
+        # eagerly loading the same graph here silently doubles peak RSS.
+        engine = _engine(
+            Path(self.config_path),
+            load_persisted_graph=False,
+            initialize_indexing_components=False,
+        )
         queue = queue_from_config(self.cfg, engine.state)
         if queue is None:
             log.warning("role 'indexer' has no queue configured; nothing will be drained")
@@ -205,6 +483,7 @@ class _QueueDrainer:
         from pheasant.sync.worker import WorkerBackedEngine
 
         worker = WorkerBackedEngine(engine, self.config_path)
+        jobs = JobRegistry(shared_path=Path(self.cfg.pheasant.state_path) / "jobs")
         owner = owner_id()
         visibility = float(self.cfg.sync.queue.visibility_seconds or 300)
         log.info("draining index queue as %s", owner)
@@ -214,18 +493,71 @@ class _QueueDrainer:
                 # returns when the backlog clears, and the outer loop is what
                 # notices the stop event. Blocking inside `drain` for minutes
                 # would make SIGTERM take minutes.
-                drain(
-                    queue,
-                    lambda task: worker.sync_source(
-                        task.source_id,
-                        task.mode,
-                        max_depth=task.max_depth,
-                        full_scan=task.full_scan,
-                    ),
-                    owner=owner,
-                    idle_timeout=2.0,
-                    visibility_seconds=visibility,
-                )
+                def handle(task):
+                    job = jobs.create(
+                        "sync",
+                        f"Indexing {task.source_id}",
+                        [task.source_id],
+                        job_id=task.id,
+                    )
+                    jobs.progress(
+                        job.id,
+                        phase="claimed",
+                        detail=f"Claimed by {owner}",
+                        source=task.source_id,
+                    )
+
+                    def forward(event: dict) -> None:
+                        meta = event.get("meta") or {}
+                        jobs.progress(
+                            job.id,
+                            phase=event.get("phase"),
+                            current=event.get("current"),
+                            total=event.get("total"),
+                            detail=event.get("detail"),
+                            source=meta.get("source") or task.source_id,
+                            stats=meta,
+                        )
+
+                    try:
+                        result = worker.apply_index_task(task, on_progress=forward)
+                    except Exception as exc:
+                        jobs.finish(job.id, "failed", error=str(exc))
+                        raise
+                    failed = result.status in {"failed", "timeout", "limit_exceeded"}
+                    jobs.finish(
+                        job.id,
+                        "failed" if failed else "succeeded",
+                        error=(result.details.get("error") or result.status) if failed else None,
+                        result={
+                            "source_id": result.source_id,
+                            "indexed_artifacts": result.indexed_artifacts,
+                            "skipped_artifacts": result.skipped_artifacts,
+                            "status": result.status,
+                        },
+                    )
+                    if failed:
+                        raise RuntimeError(result.details.get("error") or result.status)
+                    return result
+
+                def drain_once() -> None:
+                    drain(
+                        queue,
+                        handle,
+                        owner=owner,
+                        idle_timeout=2.0,
+                        visibility_seconds=visibility,
+                    )
+
+                if self.sync_lock is None:
+                    drain_once()
+                else:
+                    # Acquire before claiming, not inside ``handle``. Otherwise
+                    # this drainer can reserve one of a sync-all child's tasks,
+                    # block on the lock, and split one shared graph commit over
+                    # two child processes after the visibility timeout.
+                    with self.sync_lock:
+                        drain_once()
         except Exception:  # noqa: BLE001 - a drainer that dies silently is worse
             log.exception("index queue drainer stopped")
         finally:
@@ -233,12 +565,12 @@ class _QueueDrainer:
             engine.close()
 
 
-def _queue_drainer(cfg, config_path: str, policy):
+def _queue_drainer(cfg, config_path: str, policy, *, sync_lock=None):
     """The drain loop, or ``None`` when this role does not claim tasks."""
 
     if not policy.drains_queue:
         return None
-    return _QueueDrainer(cfg, config_path)
+    return _QueueDrainer(cfg, config_path, sync_lock=sync_lock)
 
 
 class _GraphRefresher:
@@ -295,6 +627,22 @@ class _GraphRefresher:
             return False
         self._seen = stamp
         self.engine.reload_graph()
+        # The generation swap drops the old graph, but CPython's allocator can
+        # keep hundreds of MiB of its now-empty arenas mapped forever. Repeated
+        # refreshes then make steady RSS look like a leak and eventually erase
+        # the headroom reserved for the next atomic swap. Collection removes
+        # cycles; glibc's optional trim returns fully free pages to the OS.
+        import gc
+
+        gc.collect()
+        try:
+            import ctypes
+
+            trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+            if trim is not None:
+                trim(0)
+        except (AttributeError, OSError, TypeError):  # non-glibc platforms
+            pass
         return True
 
     def _run(self) -> None:
@@ -312,12 +660,23 @@ def _graph_refresher(cfg, engine, policy):
     """The refresh loop, or ``None`` when this role indexes its own graph."""
 
     interval = float(getattr(cfg.server.api, "graph_refresh_seconds", 0) or 0)
+    # A remote API has no local snapshot by design. Starting its legacy file
+    # refresher would quietly re-materialize the full graph and erase the
+    # memory isolation this deployment mode exists to provide.
+    if policy.name == "api" and getattr(cfg.graph, "query_service_url", None):
+        return None
     if not policy.refreshes_graph or interval <= 0:
         return None
     return _GraphRefresher(engine, interval)
 
 
-def _engine(config_path: Path):
+def _engine(
+    config_path: Path,
+    *,
+    load_persisted_graph: bool = True,
+    defer_persisted_graph_load: bool = False,
+    initialize_indexing_components: bool = True,
+):
     from pheasant.config.loader import load_config
     from pheasant.persistence.paths import StatePaths
     from pheasant.persistence.state_store import StateStore
@@ -327,8 +686,14 @@ def _engine(config_path: Path):
     paths = StatePaths.from_config(cfg)
     paths.ensure()
     state = StateStore.from_config(cfg, paths.sqlite)
-    state.migrate()
-    return SyncEngine(cfg, paths, state)
+    return SyncEngine(
+        cfg,
+        paths,
+        state,
+        load_persisted_graph=load_persisted_graph,
+        defer_persisted_graph_load=defer_persisted_graph_load,
+        initialize_indexing_components=initialize_indexing_components,
+    )
 
 
 #: Progress lines carry this marker so the parent can tell them apart from the
@@ -710,6 +1075,8 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=argparse.SUPPRESS,
     )
+    sync_p.add_argument("--task-payload", default=None, help=argparse.SUPPRESS)
+    sync_p.add_argument("--worker-child", action="store_true", help=argparse.SUPPRESS)
     scan_p = sub.add_parser(
         "scan",
         help="estimate what a source would index — file count, size, depth options — "
@@ -732,7 +1099,7 @@ def main(argv: list[str] | None = None) -> int:
     serve_p.add_argument("--config", "-c", default=server_config_default)
     serve_p.add_argument(
         "--role",
-        choices=("all", "api", "indexer", "worker"),
+        choices=("all", "api", "indexer", "graph", "worker"),
         default=None,
         help="Which jobs this process takes on. Default: server.role, or 'all'.",
     )
@@ -1060,7 +1427,7 @@ def main(argv: list[str] | None = None) -> int:
         from pheasant.sync.locks import EngineLeaseError
 
         on_progress = _progress_emitter() if getattr(args, "progress", False) else None
-        engine = _engine(Path(args.config))
+        engine = _engine(Path(args.config), defer_persisted_graph_load=True)
         if args.wait_for_lease is not None:
             engine.lease.wait_timeout_s = max(0.0, args.wait_for_lease)
         try:
@@ -1070,24 +1437,43 @@ def main(argv: list[str] | None = None) -> int:
             # the server, which is the whole point of running sync out of
             # process.
             engine.ensure_node_index()
-            results = (
-                engine.sync_all(
-                    args.mode,
-                    max_depth=args.depth,
-                    full_scan=args.full_scan,
-                    on_progress=on_progress,
+            if args.task_payload:
+                import base64
+                import json as _json
+
+                from pheasant.sync.queue import IndexTask
+
+                task_payload = _json.loads(
+                    base64.urlsafe_b64decode(args.task_payload.encode("ascii")).decode("utf-8")
                 )
-                if args.all or not args.source
-                else [
-                    engine.sync_source(
-                        args.source,
+                delivery_attempt = int(task_payload.pop("_delivery_attempt", 0) or 0)
+                task = IndexTask(
+                    id="worker-control-task",
+                    source_id=str(args.source or ""),
+                    mode=str(args.mode),
+                    payload=task_payload,
+                    attempts=delivery_attempt,
+                )
+                results = [engine.apply_index_task(task, on_progress=on_progress)]
+            else:
+                results = (
+                    engine.sync_all(
                         args.mode,
                         max_depth=args.depth,
                         full_scan=args.full_scan,
                         on_progress=on_progress,
                     )
-                ]
-            )
+                    if args.all or not args.source
+                    else [
+                        engine.sync_source(
+                            args.source,
+                            args.mode,
+                            max_depth=args.depth,
+                            full_scan=args.full_scan,
+                            on_progress=on_progress,
+                        )
+                    ]
+                )
         except EngineLeaseError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
@@ -1114,7 +1500,18 @@ def main(argv: list[str] | None = None) -> int:
                 ],
             }
             print(_json.dumps(payload))
-            return 0 if all(r.status != "limit_exceeded" for r in results) else 1
+            exit_code = 0 if all(r.status != "limit_exceeded" for r in results) else 1
+            if args.worker_child:
+                # Every store, lease and vector writer was explicitly closed
+                # above. Letting CPython recursively destroy a million-node
+                # graph after reporting success adds tens of seconds to the
+                # queue ack and looks like a save hang. This flag is hidden
+                # and only supplied by the supervised subprocess boundary, so
+                # an embedded/public ``main([...])`` call is never terminated.
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(exit_code)
+            return exit_code
         exit_code = 0
         for r in results:
             if r.status == "limit_exceeded":
@@ -1204,12 +1601,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.queue_command == "drain":
                 results = drain(
                     queue,
-                    lambda task: engine.sync_source(
-                        task.source_id,
-                        task.mode,
-                        max_depth=task.max_depth,
-                        full_scan=task.full_scan,
-                    ),
+                    lambda task: engine.apply_index_task(task),
                     idle_timeout=float(args.idle_timeout or 0.0),
                 )
                 for result in results:
@@ -1237,7 +1629,11 @@ def main(argv: list[str] | None = None) -> int:
         engine = _engine(Path(args.config))
         sizes = []
         try:
-            for source in cfg.sources:
+            # UI/API registrations live in the durable source registry and do
+            # not have to be written back into the read-only fleet YAML.  Plan
+            # from the engine's hydrated view so the command sees the same
+            # corpus the scheduler and queue drain actually index.
+            for source in engine.enabled_sources():
                 if not source.enabled:
                     continue
                 # `scan` walks without reading, so planning a split of a corpus
@@ -1495,12 +1891,19 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
     if args.command == "worker":
+        import logging
+
         from pheasant.config.loader import load_config
         from pheasant.sync.grpc_worker import GrpcUnavailable
         from pheasant.sync.grpc_worker import serve as serve_grpc_worker
         from pheasant.version import __version__
 
         cfg = load_config(Path(args.config))
+        level = getattr(logging, str(cfg.pheasant.log_level).upper(), logging.INFO)
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
         if not cfg.sync.concurrency.remote_worker_enabled:
             print(
                 "Refusing to start: sync.concurrency.remote_worker_enabled is false.\n"

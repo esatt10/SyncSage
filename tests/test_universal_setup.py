@@ -17,8 +17,10 @@ Acceptance:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -219,6 +221,7 @@ def test_fetch_target_passes_the_clone_url_through_to_git_env(
     # The token must never appear as an argv element (visible in a `ps`/Task
     # Manager listing) -- only via the env-var-based git config mechanism.
     assert not any("ghp_secret123" in str(part) for part in captured["cmd"])
+    assert captured["cmd"][1:6] == ["clone", "--quiet", "--depth", "1", "--no-tags"]
 
 
 def test_local_shapes_are_classified(tmp_path: Path, roots) -> None:
@@ -269,6 +272,11 @@ def test_remote_and_connector_targets_resolve_without_touching_disk(roots) -> No
     assert repo.clone_url == "https://github.com/owner/proj"
     assert repo.name == "proj"
     assert repo.path.endswith("proj")
+    assert repo.to_source_dict()["repo"] == {
+        "clone_url": "https://github.com/owner/proj",
+        "clone_path": repo.clone_path,
+        "clone_ref": None,
+    }
 
     subtree = resolve_target(
         "https://github.com/apache/spark/tree/master/python",
@@ -290,6 +298,236 @@ def test_remote_and_connector_targets_resolve_without_touching_disk(roots) -> No
     assert branch_root.clone_url == "https://github.com/apache/spark"
     assert branch_root.clone_ref == "master"
     assert branch_root.path.endswith("spark")
+
+
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def test_existing_remote_clone_fast_forwards_before_reuse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A second materialization must advance HEAD, not merely fetch refs."""
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    from pheasant.targets import fetch_target, managed_repository_state
+
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    seed.mkdir()
+    _git(seed, "init")
+    _git(seed, "config", "user.email", "tests@example.com")
+    _git(seed, "config", "user.name", "Pheasant tests")
+    (seed / "README.md").write_text("one\n", encoding="utf-8")
+    _git(seed, "add", "README.md")
+    _git(seed, "commit", "-m", "one")
+    _git(seed, "branch", "-M", "main")
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "-u", "origin", "main")
+
+    # Production rejects local-path clone transports. This test substitutes
+    # one only to exercise real git fetch/merge behavior without a network.
+    monkeypatch.setattr("pheasant.targets.validate_clone_url", lambda url: url)
+    monkeypatch.setattr("pheasant.targets._git_env", lambda _url=None: dict(os.environ))
+    target = ResolvedTarget(
+        name="managed",
+        type="repository",
+        path=str(checkout),
+        description="test",
+        clone_url=str(remote),
+        clone_path=str(checkout),
+        clone_ref="main",
+    )
+    fetch_target(target)
+    first = _git(checkout, "rev-parse", "HEAD")
+
+    (seed / "README.md").write_text("two\n", encoding="utf-8")
+    _git(seed, "add", "README.md")
+    _git(seed, "commit", "-m", "two")
+    _git(seed, "push")
+    second = _git(seed, "rev-parse", "HEAD")
+
+    fetch_target(target)
+
+    assert first != second
+    assert _git(checkout, "rev-parse", "HEAD") == second
+    assert (checkout / "README.md").read_text(encoding="utf-8") == "two\n"
+    assert managed_repository_state(target)["fresh"] is True
+
+
+def test_managed_remote_refuses_to_index_a_dirty_or_ahead_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    from pheasant.targets import fetch_target
+
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    seed.mkdir()
+    _git(seed, "init")
+    _git(seed, "config", "user.email", "tests@example.com")
+    _git(seed, "config", "user.name", "Pheasant tests")
+    (seed / "README.md").write_text("remote\n", encoding="utf-8")
+    _git(seed, "add", "README.md")
+    _git(seed, "commit", "-m", "initial")
+    _git(seed, "branch", "-M", "main")
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "-u", "origin", "main")
+    monkeypatch.setattr("pheasant.targets.validate_clone_url", lambda url: url)
+    monkeypatch.setattr("pheasant.targets._git_env", lambda _url=None: dict(os.environ))
+    target = ResolvedTarget(
+        name="managed",
+        type="repository",
+        path=str(checkout),
+        description="test",
+        clone_url=str(remote),
+        clone_path=str(checkout),
+        clone_ref="main",
+    )
+    fetch_target(target)
+    (checkout / "README.md").write_text("local edit\n", encoding="utf-8")
+
+    with pytest.raises(TargetError, match="working-tree changes"):
+        fetch_target(target)
+
+    _git(checkout, "config", "user.email", "tests@example.com")
+    _git(checkout, "config", "user.name", "Pheasant tests")
+    _git(checkout, "add", "README.md")
+    _git(checkout, "commit", "-m", "local-only")
+    with pytest.raises(TargetError, match="ahead of or diverged"):
+        fetch_target(target)
+
+
+def test_sync_records_remote_checkout_and_indexed_commit_equality(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    from pheasant.config.schema import PheasantConfig
+    from pheasant.registry.source_registry import SourceRegistry
+    from pheasant.sync.engine import SyncEngine
+
+    checkout = tmp_path / "managed"
+    checkout.mkdir()
+    _git(checkout, "init")
+    _git(checkout, "config", "user.email", "tests@example.com")
+    _git(checkout, "config", "user.name", "Pheasant tests")
+    (checkout / "README.md").write_text("managed content\n", encoding="utf-8")
+    _git(checkout, "add", "README.md")
+    _git(checkout, "commit", "-m", "initial")
+    commit = _git(checkout, "rev-parse", "HEAD")
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "managed-test",
+                "state_path": str(tmp_path / "state"),
+                "workspace_root": str(tmp_path),
+                "exports_path": str(tmp_path / "exports"),
+            },
+            "sources": [
+                {
+                    "name": "managed",
+                    "type": "repository",
+                    "path": str(checkout),
+                    "include": ["**/*.md"],
+                    "repo": {
+                        "clone_url": "https://github.com/example/managed",
+                        "clone_path": str(checkout),
+                        "clone_ref": "main",
+                    },
+                }
+            ],
+        }
+    )
+    calls: list[str] = []
+
+    def refreshed(source):
+        calls.append(source.name)
+        return {
+            "managed": True,
+            "remote_url": source.repo.clone_url,
+            "requested_ref": source.repo.clone_ref,
+            "tracking_ref": "refs/remotes/origin/main",
+            "branch": "main",
+            "local_commit": commit,
+            "remote_commit": commit,
+            "fresh": True,
+        }
+
+    monkeypatch.setattr("pheasant.targets.refresh_managed_repository", refreshed)
+    engine = SyncEngine(config)
+    try:
+        result = engine.sync_source("managed", "full")
+        listed = SourceRegistry(config, engine.state).list_sources()
+    finally:
+        engine.close()
+
+    assert calls == ["managed"]
+    assert result.details["repository"]["indexed_commit"] == commit
+    assert result.details["repository"]["fresh"] is True
+    assert result.details["checkpoint"]["high_watermark"]["repository"]["fresh"] is True
+    assert listed[0]["repository"]["indexed_commit"] == commit
+    assert listed[0]["repository"]["fresh"] is True
+
+
+def test_remote_update_failure_marks_source_and_aborts_before_indexing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from pheasant.config.schema import PheasantConfig
+    from pheasant.sync.engine import SyncEngine
+
+    checkout = tmp_path / "managed"
+    checkout.mkdir()
+    (checkout / "README.md").write_text("stale content\n", encoding="utf-8")
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "managed-failure-test",
+                "state_path": str(tmp_path / "state"),
+                "workspace_root": str(tmp_path),
+                "exports_path": str(tmp_path / "exports"),
+            },
+            "sources": [
+                {
+                    "name": "managed",
+                    "type": "repository",
+                    "path": str(checkout),
+                    "repo": {
+                        "clone_url": "https://github.com/example/managed",
+                        "clone_path": str(checkout),
+                    },
+                }
+            ],
+        }
+    )
+
+    def fail(_source):
+        raise TargetError("authentication failed")
+
+    monkeypatch.setattr("pheasant.targets.refresh_managed_repository", fail)
+    engine = SyncEngine(config)
+    try:
+        with pytest.raises(TargetError, match="authentication failed"):
+            engine.sync_source("managed", "incremental")
+        row = engine.state.get_source("managed")
+        artifacts = engine.state.rows("SELECT id FROM artifacts WHERE source_id=?", ("managed",))
+    finally:
+        engine.close()
+
+    assert row is not None and row["last_status"] == "remote_error"
+    assert artifacts == []
 
 
 def test_github_subtree_rejects_encoded_path_traversal(roots) -> None:

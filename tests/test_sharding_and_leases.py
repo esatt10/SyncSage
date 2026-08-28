@@ -19,6 +19,7 @@ import pytest
 from pheasant.config.schema import PheasantConfig
 from pheasant.persistence.backends import PostgresBackend
 from pheasant.persistence.state_store import StateStore
+from pheasant.registry.source_registry import SourceRegistry
 from pheasant.sharding import SourceSize, plan_shards, render_plan
 from pheasant.sync.locks import SourceLease, SourceLeaseError
 
@@ -130,6 +131,75 @@ def test_planning_an_empty_corpus_is_not_an_error() -> None:
     assert plan["shards"] == []
     assert plan["warnings"]
     assert "Nothing to plan" in render_plan(plan)
+
+
+def test_cli_plans_sources_registered_at_runtime(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The fleet YAML is read-only; UI-added sources exist only in state."""
+
+    from pheasant.cli import main
+    from pheasant.sync.engine import SyncEngine
+
+    workspace = tmp_path / "runtime-source"
+    workspace.mkdir()
+    (workspace / "a.md").write_text("# Runtime source\n", encoding="utf-8")
+    config_path = tmp_path / "pheasant.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "pheasant:",
+                "  name: runtime-planner",
+                f"  state_path: {tmp_path / 'state'}",
+                f"  workspace_root: {tmp_path}",
+                f"  exports_path: {tmp_path / 'exports'}",
+                "storage:",
+                "  graph_snapshots: false",
+                "sync:",
+                "  watcher:",
+                "    enabled: false",
+                "  scheduler:",
+                "    enabled: false",
+                "sources: []",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "runtime-planner",
+                "state_path": str(tmp_path / "state"),
+                "workspace_root": str(tmp_path),
+                "exports_path": str(tmp_path / "exports"),
+            },
+            "storage": {"graph_snapshots": False},
+            "sync": {"watcher": {"enabled": False}, "scheduler": {"enabled": False}},
+            "sources": [],
+        }
+    )
+    engine = SyncEngine(config)
+    try:
+        source = PheasantConfig.model_validate(
+            {
+                "sources": [
+                    {
+                        "name": "runtime-source",
+                        "type": "markdown_folder",
+                        "path": str(workspace),
+                        "include": ["**/*.md"],
+                    }
+                ]
+            }
+        ).sources[0]
+        SourceRegistry(config, engine.state).register_source(source)
+    finally:
+        engine.close()
+
+    assert main(["shard", "plan", "--config", str(config_path), "--shards", "1"]) == 0
+    output = capsys.readouterr().out
+    assert "runtime-source" in output
+    assert "Nothing to plan" not in output
 
 
 # ---------------------------------------------------------------------------

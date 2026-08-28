@@ -292,6 +292,9 @@ class WorkerPool:
                 except IndexError:
                     break
                 self._transport.discard(connection)
+        close_transport = getattr(self._transport, "close", None)
+        if callable(close_transport):
+            close_transport()
 
     def __enter__(self) -> WorkerPool:
         return self

@@ -1,0 +1,39 @@
+name: pheasant
+
+services:
+  pheasant:
+    image: ${PHEASANT_IMAGE:-ghcr.io/esatt10/pheasant:0.10.5}
+    container_name: ${PHEASANT_CONTAINER_NAME:-pheasant}
+    build:
+      context: ../..
+    restart: unless-stopped
+    ports:
+      - "${PHEASANT_BIND:-127.0.0.1}:${PHEASANT_PORT:-8765}:8765"
+    environment:
+      PHEASANT_CONFIG: /config/pheasant.yaml
+      # Keep first boot source-free; add paths or URLs from the UI/MCP.
+      PHEASANT_WORKSPACE: /ui-managed-sources
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GH_TOKEN: ${GH_TOKEN:-}
+    volumes:
+      - pheasant-config:/config
+      - ${PHEASANT_WORKSPACE_PATH:-pheasant-workspace}:/workspace
+      - pheasant-state:/state
+      - pheasant-memory:/memory
+      - pheasant-exports:/exports
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  pheasant-config:
+  pheasant-workspace:
+  pheasant-state:
+  pheasant-memory:
+  pheasant-exports:

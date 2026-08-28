@@ -314,6 +314,7 @@ def test_vector_store_roundtrip(store_backend: Any) -> None:
         payloads,
     )
     assert store_backend.count() == 3
+    assert store_backend.dimensions() == 3
     assert store_backend.existing_ids(["c1", "missing"]) == {"c1"}
     assert store_backend.source_chunk_ids("s1") == {"c1", "c2"}
 
@@ -337,11 +338,13 @@ def test_vector_store_roundtrip(store_backend: Any) -> None:
     # five-dimensional embedding space even though the table is empty.
     assert store_backend.reset() == 1
     assert store_backend.count() == 0
+    assert store_backend.dimensions() is None
     store_backend.upsert(
         ["c4"],
         [[1.0, 0.0, 0.0, 0.0, 0.0]],
         [{"source_id": "s3", "artifact_id": "a3", "text_hash": "h4"}],
     )
+    assert store_backend.dimensions() == 5
     assert len(store_backend.all_vectors()[0][1]) == 5
 
 
@@ -354,6 +357,49 @@ def test_engine_embeds_with_lancedb_backend(tmp_path: Path) -> None:
     assert engine.vectors.store.count() >= 2
     payload = _search(engine, "car", "vector")
     assert "vehicles.md" in _result_paths(payload)[0]
+
+
+def test_lancedb_membership_is_cached_and_new_ids_skip_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-artifact membership checks must not rescan a growing Lance table.
+
+    New content-addressed ids also must not create pointless Lance delete
+    versions before their first insert.
+    """
+    pytest.importorskip(
+        "lancedb", reason="lancedb not installed (pip install 'pheasant-kb[vector]')"
+    )
+    from pheasant.search.vector_store import LanceDBVectorStore
+
+    store = LanceDBVectorStore(tmp_path / "vectors")
+    store.upsert(["c1"], [[1.0, 0.0]], [{"source_id": "s1", "artifact_id": "a1"}])
+
+    row_reads = 0
+    original_rows = store._rows
+
+    def counted_rows(columns: list[str]) -> list[dict[str, Any]]:
+        nonlocal row_reads
+        row_reads += 1
+        return original_rows(columns)
+
+    monkeypatch.setattr(store, "_rows", counted_rows)
+    assert store.existing_ids(["c1", "missing"]) == {"c1"}
+    assert store.existing_ids(["c1"]) == {"c1"}
+    assert row_reads == 0, "the successful initial write populated membership"
+
+    deleted: list[list[str] | None] = []
+    original_delete = store.delete
+
+    def counted_delete(chunk_ids: list[str] | None = None, artifact_id: str | None = None) -> int:
+        deleted.append(chunk_ids)
+        return original_delete(chunk_ids=chunk_ids, artifact_id=artifact_id)
+
+    monkeypatch.setattr(store, "delete", counted_delete)
+    store.upsert(["c2"], [[0.0, 1.0]], [{"source_id": "s1", "artifact_id": "a2"}])
+    assert deleted == [], "a never-seen id does not need a Lance delete version"
+    store.upsert(["c1"], [[0.5, 0.5]], [{"source_id": "s1", "artifact_id": "a1"}])
+    assert deleted == [["c1"]]
 
 
 def test_numpy_store_caches_the_decoded_matrix(tmp_path: Path) -> None:
