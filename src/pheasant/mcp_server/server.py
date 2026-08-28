@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import logging
 from typing import Any
@@ -27,6 +28,11 @@ def create_mcp_server(config: PheasantConfig) -> Any:
     """Create the official MCP SDK server around the pheasant tool facade."""
 
     server_class = _mcp_server_class()
+    # `ToolError` and `ResourceError` are siblings, and each surface only
+    # forwards the text of its own: a `ToolError` raised inside a resource
+    # handler is an `UnexpectedResourceError` with the message stripped.
+    anticipated = _anticipated_failures("tool")
+    anticipated_resource = _anticipated_failures("resource")
     tools = create_mcp_tools(config)
     mcp = server_class(
         # Keep the name positional and everything else keyword: SDK 2.x
@@ -45,12 +51,14 @@ def create_mcp_server(config: PheasantConfig) -> Any:
     )
 
     @mcp.tool()
+    @anticipated
     def list_knowledge_bases() -> dict:
         """Return registered knowledge bases and their status."""
 
         return tools.list_knowledge_bases()
 
     @mcp.tool()
+    @anticipated
     def register_source(
         knowledge_base: str,
         name: str,
@@ -90,6 +98,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         )
 
     @mcp.tool()
+    @anticipated
     def start_sync_source(
         knowledge_base: str,
         source_name: str,
@@ -102,18 +111,21 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         return tools.start_sync_source(knowledge_base, source_name, mode, max_depth, full_scan)
 
     @mcp.tool()
+    @anticipated
     def get_job(job_id: str) -> dict:
         """Inspect phase, counts, messages, and outcome of a background job."""
 
         return tools.get_job(job_id)
 
     @mcp.tool()
+    @anticipated
     def list_jobs(active_only: bool = False, limit: int = 50) -> dict:
         """List recent background jobs, with active jobs first."""
 
         return tools.list_jobs(active_only, limit)
 
     @mcp.tool()
+    @anticipated
     def list_sources(
         knowledge_base: str,
         enabled: bool | None = None,
@@ -127,18 +139,21 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         return tools.list_sources(knowledge_base, enabled, status, source_type, limit, offset)
 
     @mcp.tool()
+    @anticipated
     def disable_source(knowledge_base: str, source_name: str) -> dict:
         """Disable a source without deleting its state."""
 
         return tools.disable_source(knowledge_base, source_name)
 
     @mcp.tool()
+    @anticipated
     def remove_source(knowledge_base: str, source_name: str) -> dict:
         """Remove a source and its indexed state."""
 
         return tools.remove_source(knowledge_base, source_name)
 
     @mcp.tool()
+    @anticipated
     def promote_runtime_source_to_config(
         knowledge_base: str,
         source_name: str,
@@ -155,6 +170,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         )
 
     @mcp.tool()
+    @anticipated
     def sync_source(
         knowledge_base: str,
         source_name: str,
@@ -175,6 +191,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         )
 
     @mcp.tool()
+    @anticipated
     def scan_source(
         knowledge_base: str,
         source_name: str,
@@ -185,6 +202,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         return tools.scan_source(knowledge_base, source_name, max_depth=max_depth)
 
     @mcp.tool()
+    @anticipated
     def memory_write(
         knowledge_base: str,
         text: str,
@@ -223,12 +241,14 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         )
 
     @mcp.tool()
+    @anticipated
     def memory_consolidate(knowledge_base: str) -> dict:
         """Archive superseded/expired memory records and re-index the memory source."""
 
         return tools.memory_consolidate(knowledge_base)
 
     @mcp.tool()
+    @anticipated
     def memory_synthesize(knowledge_base: str) -> dict:
         """LLM-merge a near-duplicate memory cluster deterministic compaction
         could not resolve into one canonical record. Off by default
@@ -237,6 +257,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         return tools.memory_synthesize(knowledge_base)
 
     @mcp.tool()
+    @anticipated
     def sync_all(
         knowledge_base: str,
         mode: str = "incremental",
@@ -248,6 +269,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         return tools.sync_all(knowledge_base, mode, max_depth=max_depth, full_scan=full_scan)
 
     @mcp.tool()
+    @anticipated
     def search_context(  # noqa: PLR0913 - additive principal params (32.2)
         knowledge_base: str,
         query: str,
@@ -315,6 +337,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         )
 
     @mcp.tool()
+    @anticipated
     def describe_retrieval(knowledge_base: str) -> dict:
         """Report how this knowledge base retrieves, and what you can override.
 
@@ -329,6 +352,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         return tools.describe_retrieval(knowledge_base)
 
     @mcp.tool()
+    @anticipated
     def preview_retrieval(  # noqa: PLR0913 - mirrors search_context's criteria
         knowledge_base: str,
         query: str,
@@ -365,6 +389,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         )
 
     @mcp.tool()
+    @anticipated
     def ask_knowledge_base(  # noqa: PLR0913 - mirrors the HTTP surface
         knowledge_base: str,
         question: str,
@@ -400,6 +425,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         )
 
     @mcp.tool()
+    @anticipated
     def get_relevant_files(
         knowledge_base: str,
         task: str,
@@ -420,6 +446,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         )
 
     @mcp.tool()
+    @anticipated
     def get_graph_neighbors(
         knowledge_base: str,
         node_id: str,
@@ -431,6 +458,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         return tools.get_graph_neighbors(knowledge_base, node_id, depth, edge_types)
 
     @mcp.tool()
+    @anticipated
     def get_file_summary(
         knowledge_base: str,
         path: str,
@@ -441,30 +469,35 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         return tools.get_file_summary(knowledge_base, path, source_name)
 
     @mcp.tool()
+    @anticipated
     def get_repo_map(knowledge_base: str, source_name: str, depth: int = 3) -> dict:
         """Return a compact repository map for one source."""
 
         return tools.get_repo_map(knowledge_base, source_name, depth)
 
     @mcp.tool()
+    @anticipated
     def explain_node(knowledge_base: str, node_id: str) -> dict:
         """Explain what an indexed graph node represents."""
 
         return tools.explain_node(knowledge_base, node_id)
 
     @mcp.tool()
+    @anticipated
     def get_sync_status(knowledge_base: str) -> dict:
         """Return source freshness and last sync status."""
 
         return tools.get_sync_status(knowledge_base)
 
     @mcp.tool()
+    @anticipated
     def get_contract(knowledge_base: str) -> dict:
         """Return this region's published Synapse semantic contract."""
 
         return tools.get_contract(knowledge_base)
 
     @mcp.tool()
+    @anticipated
     def get_sync_history(
         knowledge_base: str,
         source_name: str | None = None,
@@ -476,18 +509,21 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         return tools.get_sync_history(knowledge_base, source_name, limit, offset)
 
     @mcp.resource("pheasant://knowledge-bases")
+    @anticipated_resource
     def knowledge_bases_resource() -> str:
         """Return registered knowledge bases as JSON."""
 
         return _json(tools.list_knowledge_bases())
 
     @mcp.resource("pheasant://knowledge-bases/{kb_id}/sources")
+    @anticipated_resource
     def sources_resource(kb_id: str) -> str:
         """Return configured source status for a knowledge base as JSON."""
 
         return _json(tools.get_sync_status(kb_id))
 
     @mcp.resource("pheasant://knowledge-bases/{kb_id}/graph")
+    @anticipated_resource
     def graph_resource(kb_id: str) -> str:
         """Return the current graph snapshot as JSON."""
 
@@ -495,42 +531,49 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         return _json(node_link(tools.engine.graph_builder.graph))
 
     @mcp.resource("pheasant://knowledge-bases/{kb_id}/sources/{source_id}/manifest")
+    @anticipated_resource
     def source_manifest_resource(kb_id: str, source_id: str) -> str:
         """Return the manifest for one source as JSON."""
 
         return _json(tools.get_source_manifest(kb_id, source_id))
 
     @mcp.resource("pheasant://knowledge-bases/{kb_id}/sources/{source_id}/history")
+    @anticipated_resource
     def source_history_resource(kb_id: str, source_id: str) -> str:
         """Return lifecycle history for one source as JSON."""
 
         return _json(tools.get_sync_history(kb_id, source_id))
 
     @mcp.resource("pheasant://knowledge-bases/{kb_id}/sync-history")
+    @anticipated_resource
     def sync_history_resource(kb_id: str) -> str:
         """Return lifecycle history for a knowledge base as JSON."""
 
         return _json(tools.get_sync_history(kb_id))
 
     @mcp.resource("pheasant://knowledge-bases/{kb_id}/sources/{source_id}/repo-map")
+    @anticipated_resource
     def source_repo_map_resource(kb_id: str, source_id: str) -> str:
         """Return a repository map resource for one source as JSON."""
 
         return _json(tools.get_repo_map(kb_id, source_id))
 
     @mcp.resource("pheasant://knowledge-bases/{kb_id}/nodes/{node_id}")
+    @anticipated_resource
     def node_resource(kb_id: str, node_id: str) -> str:
         """Return an explanation for one graph node as JSON."""
 
         return _json(tools.explain_node(kb_id, node_id))
 
     @mcp.resource("pheasant://knowledge-bases/{kb_id}/graph-slices/{node_id}")
+    @anticipated_resource
     def graph_slice_resource(kb_id: str, node_id: str) -> str:
         """Return a small graph slice rooted at one node as JSON."""
 
         return _json(tools.get_graph_slice(kb_id, node_id, depth=2))
 
     @mcp.resource("pheasant://knowledge-bases/{kb_id}/memory")
+    @anticipated_resource
     def memory_resource(kb_id: str) -> str:
         """Return this region's current agent-memory records as JSON.
 
@@ -545,6 +588,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         return _json(tools.memory_list(kb_id, current_only=True))
 
     @mcp.resource("pheasant://knowledge-bases/{kb_id}/contract")
+    @anticipated_resource
     def contract_resource(kb_id: str) -> str:
         """Return this region's published Synapse semantic contract as JSON."""
 
@@ -609,6 +653,56 @@ def _mcp_server_class() -> Any:
             "extra to pick it up."
         ) from exc
     return MCPServer
+
+
+def _anticipated_failures(surface: str) -> Any:
+    """A decorator that lets a refusal's own reason reach the agent.
+
+    SDK 2.x sorts a handler's exceptions into two buckets: ``ToolError`` /
+    ``ResourceError`` are deliberate refusals whose text is appended to what
+    the client sees, and *everything else* is a crash, reported as a bare
+    "Error executing tool <name>" with the exception's text kept on the
+    server. That default is right for a crash and wrong for pheasant, which
+    refuses deliberately and informatively — "Unknown knowledge base: x",
+    "Unknown source: y", "Path ... is outside allowed roots" — by raising
+    plain ``ValueError``/``KeyError``. 1.x appended every exception's text
+    regardless, so porting without this blanks the reason on every refusal
+    across the whole tool surface, and an agent that mistypes a source name
+    is told only that something went wrong.
+
+    The translation lives here, at the SDK boundary, because
+    ``PheasantTools`` is also the HTTP surface's facade and must stay free of
+    the MCP SDK. ``PathPolicyError`` subclasses ``ValueError``, so these two
+    types cover every deliberate raise in the facade; anything else stays a
+    crash and keeps its text off the wire.
+
+    ``surface`` picks which of the two the wrapper raises: the tool and
+    resource paths each forward only their own exception type, so the wrong
+    one is stripped exactly like a crash.
+    """
+
+    from mcp.server.mcpserver.exceptions import ResourceError, ToolError
+
+    deliberate = ToolError if surface == "tool" else ResourceError
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except (ValueError, KeyError) as exc:
+                # `str(KeyError("x"))` is `"'x'"`; the message reads better
+                # to a model without the quoting `repr` adds.
+                message = (
+                    exc.args[0]
+                    if isinstance(exc, KeyError) and exc.args and isinstance(exc.args[0], str)
+                    else str(exc)
+                )
+                raise deliberate(message) from exc
+
+        return wrapper
+
+    return decorate
 
 
 def _transport_security(config: PheasantConfig) -> Any:

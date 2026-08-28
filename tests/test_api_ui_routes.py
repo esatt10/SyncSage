@@ -760,3 +760,89 @@ sources: []
             )
     finally:
         app.state.engine.close()
+
+
+def test_a_refused_mcp_call_still_carries_its_reason(tmp_path) -> None:
+    """An agent that mistypes a name has to be told which name was wrong.
+
+    MCP SDK 2.x sorts handler exceptions into deliberate refusals
+    (`ToolError`/`ResourceError`, whose text is forwarded) and crashes
+    (everything else, reported as a bare "Error executing tool <name>" with
+    the text kept server-side). `PheasantTools` refuses deliberately but by
+    raising plain `ValueError`/`KeyError`, and 1.x appended every exception's
+    text regardless — so the SDK upgrade silently blanked the reason on every
+    refusal across all 27 tools and 11 resources, leaving a model no way to
+    correct itself. `server.py` translates the facade's anticipated failures
+    at the SDK boundary; this is what says so.
+    """
+    pytest.importorskip("mcp")
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    from pheasant.api.app import create_app
+    from pheasant.config.loader import load_config
+
+    config_path = tmp_path / "pheasant.yaml"
+    config_path.write_text(
+        f"""pheasant:
+  name: mcp-errors
+  state_path: {tmp_path / "state"}
+  exports_path: {tmp_path / "exports"}
+  workspace_root: {tmp_path}
+sync:
+  watcher:
+    enabled: false
+  scheduler:
+    enabled: false
+sources: []
+""",
+        encoding="utf-8",
+    )
+    app = create_app(load_config(config_path), config_path=str(config_path))
+    # Stateless mode answers a call that never handshook, so each of these is
+    # one self-contained POST.
+    headers = {
+        "accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2025-11-25",
+    }
+    try:
+        with fastapi_testclient.TestClient(app, base_url="http://localhost:8765") as client:
+            refused = client.post(
+                "/mcp/",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "search_context",
+                        "arguments": {"knowledge_base": "nope", "query": "anything"},
+                    },
+                },
+                headers=headers,
+            )
+            assert refused.status_code == 200, refused.text[:200]
+            result = refused.json()["result"]
+            assert result["isError"] is True
+            text = result["content"][0]["text"]
+            assert "Unknown knowledge base: nope" in text, (
+                f"the refusal reached the agent without its reason: {text!r}"
+            )
+
+            # Resources take the other half of the same fork: a `ToolError`
+            # raised in a resource handler is stripped exactly like a crash,
+            # so the wrapper has to raise `ResourceError` there instead.
+            resource = client.post(
+                "/mcp/",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "resources/read",
+                    "params": {"uri": "pheasant://knowledge-bases/nope/graph"},
+                },
+                headers=headers,
+            )
+            assert resource.status_code == 200, resource.text[:200]
+            message = resource.json()["error"]["message"]
+            assert "Unknown knowledge base: nope" in message, (
+                f"the resource refusal reached the agent without its reason: {message!r}"
+            )
+    finally:
+        app.state.engine.close()

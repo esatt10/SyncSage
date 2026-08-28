@@ -6,6 +6,7 @@ tested here is that a single container is unaffected.
 
 from __future__ import annotations
 
+import json
 import signal
 import threading
 import time
@@ -606,7 +607,9 @@ def test_the_mcp_server_is_stateless(tmp_path: Path) -> None:
     """
 
     pytest.importorskip("mcp", reason="the [mcp] extra is optional")
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
 
+    from pheasant.api.app import create_app
     from pheasant.mcp_server.server import streamable_http_app
 
     config = _config(tmp_path, state_name="mcp")
@@ -621,6 +624,58 @@ def test_the_mcp_server_is_stateless(tmp_path: Path) -> None:
     session_manager = app.routes[0].endpoint.session_manager
     assert session_manager.stateless is True
     assert session_manager.json_response is True
+
+    # And the behaviour the flag is a proxy for, because a flag can be read
+    # off a manager the requests never reach. Two things have to hold for a
+    # replica to be safe: the server hands out no session to be sticky to,
+    # and a request that never handshook is still answered.
+    served = create_app(_config(tmp_path, state_name="mcp-replica"))
+    try:
+        with fastapi_testclient.TestClient(served, base_url="http://localhost:8765") as client:
+            headers = {"accept": "application/json, text/event-stream"}
+            handshake = client.post(
+                "/mcp/",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "pheasant-tests", "version": "1"},
+                    },
+                },
+                headers=headers,
+            )
+            assert handshake.status_code == 200, handshake.text[:200]
+            assert not [k for k in handshake.headers if k.lower() == "mcp-session-id"], (
+                "a session id makes the replica count a lie: an agent handed one "
+                "must come back to the replica that issued it"
+            )
+
+            # No initialize on this exchange and no session to quote — what a
+            # second replica sees when a load balancer sends it the agent's
+            # next call. (The genuinely-two-processes case was verified
+            # against a live pair; one app is what stays fast and reliable
+            # here, and in stateless mode the server cannot tell them apart.)
+            cold = client.post(
+                "/mcp/",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "list_knowledge_bases", "arguments": {}},
+                },
+                headers={**headers, "MCP-Protocol-Version": "2025-11-25"},
+            )
+            assert cold.status_code == 200, (
+                f"a replica that never saw the handshake refused the call: {cold.text[:200]}"
+            )
+            listed = json.loads(cold.json()["result"]["content"][0]["text"])
+            assert listed["knowledge_bases"], "the cold call answered, but with nothing in it"
+            assert not [k for k in cold.headers if k.lower() == "mcp-session-id"]
+    finally:
+        served.state.engine.close()
 
 
 def test_the_mcp_instructions_do_not_advertise_a_removed_tool(tmp_path: Path) -> None:
