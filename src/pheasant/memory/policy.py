@@ -78,6 +78,14 @@ class MemoryPolicy:
     #: block and `GET /memory`; this governs only whether they are *returned
     #: as passages*. Set true to see them in results anyway.
     include_rules: bool = False
+    #: Which tiers (`hot`, `cold`) this query may see (Phase 3). `None` (the
+    #: default) defers to :func:`allowed_tiers`: hot only, unless `as_of` is
+    #: set or `current_only` is off, in which case cold is included too —
+    #: the same signal that already widens the validity window widens the
+    #: tier set, since a subsumed-but-valid record and a retained-but-
+    #: superseded one are both "history a normal query does not want but an
+    #: explicit one can ask for". An explicit value here always wins.
+    tiers: tuple[str, ...] | None = None
 
     @property
     def is_default(self) -> bool:
@@ -87,9 +95,10 @@ class MemoryPolicy:
 
         **Not** the same question as "does this policy filter anything" — the
         default policy filters plenty (`current_only` drops corrected records,
-        `include_rules=False` drops steering rules), which is why those two are
-        deliberately absent from the check below. Ask :func:`may_filter` for
-        that; conflating the two is what caused the vector/graph under-fetch.
+        `include_rules=False` drops steering rules, and — Phase 3 — an unset
+        `tiers` still means hot-only), which is why those are deliberately
+        absent from the check below. Ask :func:`may_filter` for that;
+        conflating the two is what caused the vector/graph under-fetch.
         """
         return (
             self.mode == DEFAULT_MODE
@@ -97,6 +106,7 @@ class MemoryPolicy:
             and not self.subject
             and self.as_of is None
             and self.max_results is None
+            and self.tiers is None
         )
 
     @classmethod
@@ -124,6 +134,10 @@ class MemoryPolicy:
         if isinstance(raw_scopes, str):
             raw_scopes = [raw_scopes]
         scopes = tuple(str(scope) for scope in raw_scopes) if raw_scopes else None
+        raw_tiers = value.get("tiers")
+        if isinstance(raw_tiers, str):
+            raw_tiers = [raw_tiers]
+        tiers = tuple(str(tier) for tier in raw_tiers) if raw_tiers else None
         max_results = value.get("max_results")
         return cls(
             mode=mode if mode in VALID_MODES else DEFAULT_MODE,
@@ -133,6 +147,7 @@ class MemoryPolicy:
             as_of=(str(value["as_of"]) if value.get("as_of") else None),
             max_results=(int(max_results) if max_results is not None else None),
             include_rules=bool(value.get("include_rules", False)),
+            tiers=tiers,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -144,12 +159,39 @@ class MemoryPolicy:
             "as_of": self.as_of,
             "max_results": self.max_results,
             "include_rules": self.include_rules,
+            "tiers": list(self.tiers) if self.tiers else None,
         }
 
 
 def utc_now_iso() -> str:
     """The instant validity is evaluated at, in the format records store."""
     return datetime.now(tz=UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+#: The full tier set (Phase 3). `hot` is every result set a query would
+#: normally see; `cold` is a subsumed-but-valid or retained-but-superseded
+#: record — reachable, never returned by default.
+ALL_TIERS = ("hot", "cold")
+DEFAULT_TIERS = ("hot",)
+
+
+def allowed_tiers(policy: MemoryPolicy) -> tuple[str, ...]:
+    """Which tiers a policy may see (Phase 3). The single owner of this
+    rule — :func:`admits` and :func:`sql_predicate` both call it rather than
+    each inlining the logic, the same arrangement :func:`validity_instant`
+    has for the validity window.
+
+    An explicit `policy.tiers` always wins. Otherwise: `as_of` or
+    `current_only=False` widens to every tier — the same signal that
+    already asks for corrected history is the signal that asks for demoted
+    history too, since both are "not what a normal query wants, but
+    reachable on request." A plain default policy sees `hot` only.
+    """
+    if policy.tiers:
+        return tuple(policy.tiers)
+    if policy.as_of or not policy.current_only:
+        return ALL_TIERS
+    return DEFAULT_TIERS
 
 
 def validity_instant(policy: MemoryPolicy, now: str) -> str | None:
@@ -176,6 +218,8 @@ def admits(policy: MemoryPolicy, record: Mapping[str, Any] | None, *, now: str) 
     if policy.mode == "off":
         return False
     if not policy.include_rules and str(record.get("kind") or "") in STEERING_KINDS:
+        return False
+    if str(record.get("tier") or "hot") not in allowed_tiers(policy):
         return False
     if policy.scopes and str(record.get("scope") or "") not in policy.scopes:
         return False
@@ -252,6 +296,18 @@ def sql_predicate(
         placeholders = ",".join("?" for _ in STEERING_KINDS)
         clauses.append(f"COALESCE({alias}.kind, '') NOT IN ({placeholders})")
         params.extend(STEERING_KINDS)
+    tiers = allowed_tiers(policy)
+    tier_placeholders = ",".join("?" for _ in tiers)
+    # `NULLIF(tier,'')` before `COALESCE`, not `COALESCE` alone: `admits`'s
+    # `record.get("tier") or "hot"` treats an empty string as unset (falsy)
+    # and substitutes "hot", but plain `COALESCE` only replaces NULL — an
+    # empty string passes through as itself and would then fail to match
+    # 'hot' in the IN-list, silently excluding the row. NULLIF converts ''
+    # to NULL first so COALESCE actually catches it. (`valid_from`/
+    # `valid_until` don't need this: their "unset" branch is a bare OR that
+    # skips the comparison entirely rather than substituting a default.)
+    clauses.append(f"COALESCE(NULLIF({alias}.tier, ''), 'hot') IN ({tier_placeholders})")
+    params.extend(tiers)
     if policy.scopes:
         placeholders = ",".join("?" for _ in policy.scopes)
         clauses.append(f"{alias}.scope IN ({placeholders})")
@@ -281,7 +337,8 @@ def sql_predicate(
 #: `SELECT *` so adding a column (33.9's counters) cannot silently widen what a
 #: search result reports about a memory.
 INDEX_COLUMNS = (
-    "artifact_id, source_id, record_id, scope, subject, kind, asserted_at, valid_from, valid_until"
+    "artifact_id, source_id, record_id, scope, subject, kind, asserted_at, valid_from, "
+    "valid_until, tier"
 )
 
 
@@ -397,4 +454,8 @@ def describe(record: Mapping[str, Any]) -> dict[str, Any]:
         "subject": record.get("subject"),
         "kind": record.get("kind"),
         "asserted_at": record.get("asserted_at"),
+        # Phase 3, additive: a hit only reaches here at all when its tier is
+        # in `allowed_tiers(policy)`, so `cold` only ever appears when the
+        # caller explicitly asked for history — worth labeling, not hiding.
+        "tier": str(record.get("tier") or "hot"),
     }

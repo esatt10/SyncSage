@@ -319,6 +319,43 @@ Each of these cost real time. They are listed because the shape recurs.
 - **Under Postgres READ COMMITTED only the *outer* `WHERE` is re-evaluated**
   after a blocking UPDATE's winner commits — not the subquery. The outer clause
   must be a predicate the winner's own write falsifies.
+- **A declared FK a maintenance path deliberately violates is fine under
+  SQLite and fatal under Postgres.** `memory_records` carried
+  `FOREIGN KEY (artifact_id) REFERENCES artifacts(id)`; `delete_artifacts`/
+  `delete_source_artifacts` delete the `artifacts` row while intentionally
+  leaving the `memory_records` row (preserving earned `uses`/`salience`/
+  `observations` — `replace_memory_records` rebuilds the row anyway).
+  SQLite never enforces a declared FK (no `PRAGMA foreign_keys=ON`
+  anywhere); Postgres enforces every one by default and aborted the whole
+  transaction. Two siblings, found the same way: `PostgresBackend.statement()`
+  discarded `cursor.rowcount`, so any caller reading it (`subsume_records`,
+  `delete_artifacts`) raised `AttributeError`; and one `INSERT OR IGNORE`
+  (SQLite-only) needed `INSERT … ON CONFLICT … DO NOTHING`, the portable
+  form already used everywhere else in this file. None of the three
+  surfaced in the offline suite; all three surfaced in one run against a
+  real local Postgres server, first try (`tests/test_backend_parity.py`).
+- **A dedup that reports success must dedup into something still reachable.**
+  Memory reinforcement folded a write into whatever row carried its
+  canonical key, answering `created=False` / `outcome="reinforced"` — "we
+  already hold this". When that row was *superseded* or compaction-*demoted*
+  it was true of the counter and false of the store: the assertion was
+  unreachable through every default query while the caller believed it was
+  recorded. `supersede_retention_days` widened the window from one scheduler
+  beat to days, which is what turned a latent edge into a live one. The rule
+  now: a fold only ever targets a record a default query can return —
+  corrected claims become new records, demoted ones redirect through
+  `subsumed_by` — and the fold's validity predicate is spelled *exactly* as
+  `MemoryPolicy.sql_predicate` spells it, empty-string corner included.
+- **A ratio derived from a public enum measures the enum, not the thing.**
+  `pheasant_memory_reinforcement_ratio` was computed from
+  `writes_total{outcome}`, but `outcome` is public API and deliberately does
+  not distinguish "folded a paraphrase" (what reinforcement newly does) from
+  "folded a byte-identical repeat" (free since long before it). With the
+  feature *on*, exact repeats report `reinforced`, so the gauge counted the
+  thing its own docstring said it excluded, and its test passed only by
+  fabricating a state the default config cannot produce. A derived metric
+  needs its own inputs at its own granularity, and its test needs the real
+  write path.
 - **`wasmtime.Trap` and `wasmtime.WasmtimeError` are siblings**, not parent and
   child. Catch `guest_failures()`.
 - **A mutation harness must `touch` the restored file and purge

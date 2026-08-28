@@ -791,6 +791,66 @@ class AssistantSettings(ModelMixin):
 
 
 @dataclass
+class MemorySynthesisSettings(ModelMixin):
+    """L3 compaction (Phase 4): abstractive merge of a near-duplicate
+    cluster deterministic methods cannot resolve — complementary partial
+    facts, progressive refinement, or genuine abstraction across records.
+    See `docs/memory-system.md` §8 for what deterministic clustering (L1/L2)
+    already handles and why this tier exists for what it cannot.
+
+    Mirrors `AssistantSettings` field-for-field on purpose: an operator who
+    has already configured the assistant's model recognizes every knob
+    here, and the fields feed the exact same `assistant.llm`/
+    `assistant.catalog` machinery — no second provider stack.
+
+    **Off by default and never on an automatic beat.** Unlike consolidation
+    or compaction (Phase 3), which are pure metadata operations, this makes
+    a network call — CLAUDE.md rule 1 forbids an LLM on the indexing path,
+    and the scheduler's maintenance beat is exactly that path. Synthesis
+    runs only through the explicit `memory_synthesize` MCP tool /
+    `POST /memory/synthesize`, never automatically, so `pytest` stays
+    network-free by construction (the default `provider` resolves to
+    nothing reachable) rather than by mocking.
+    """
+
+    enabled: bool = False
+    provider: str = "auto"  # auto | anthropic | openai | gemini | none
+    model: str | None = None
+    base_url: str | None = None
+    api_key_env: str | None = None
+    max_output_tokens: int = 1024
+    request_timeout_seconds: float = 60.0
+    #: Hard cap on model calls in one pass. The content-addressed cache
+    #: (a cluster's member-id set + model id + rule id, checked against the
+    #: `memory_compactions` ledger before any call) already makes a repeat
+    #: pass over unchanged clusters cost zero regardless — this bounds the
+    #: *first* pass over a large store, or one after many new clusters
+    #: appeared at once.
+    max_calls_per_pass: int = 20
+    #: Conservative char-based proxy for input size — no tokenizer
+    #: dependency, matching the no-extra-dependency posture the rest of
+    #: this module keeps. A cluster whose combined member text exceeds this
+    #: is skipped rather than truncated silently into a partial merge.
+    max_input_chars: int = 6000
+    #: A cluster below this size is not a synthesis candidate — medoid
+    #: promotion (L2, Phase 3) already resolves anything smaller cleanly
+    #: and losslessly; synthesis is reserved for what that tier cannot.
+    min_cluster_size: int = 3
+    #: The other half of that gate, and the one that decides *what the model
+    #: is asked to do* without a model. A cluster whose members are already
+    #: near-identical (high Jaccard over normalized tokens) is what medoid
+    #: promotion solves losslessly and for free; synthesis exists for the
+    #: opposite shape — records about one subject that say genuinely
+    #: *different* things (complementary partials, progressive refinement,
+    #: abstraction across instances). Above this similarity a cluster is
+    #: skipped, so spend goes only where deterministic compaction provably
+    #: cannot help. Matters most when `compaction_enabled` is off (the
+    #: default): nothing has been demoted, so without this gate every
+    #: near-duplicate bucket would reach the model.
+    max_jaccard: float = 0.55
+
+
+@dataclass
 class MemorySettings(ModelMixin):
     """Agent-memory consolidation policy (Step 33.2).
 
@@ -804,6 +864,26 @@ class MemorySettings(ModelMixin):
     session_ttl_days: int | None = None
     user_ttl_days: int | None = None
     org_ttl_days: int | None = None
+    #: Days a superseded or TTL-expired record stays indexed — hidden from
+    #: default results by the existing `valid_until` query-time predicate,
+    #: but still reachable via `as_of` / `current_only=False` — before
+    #: consolidation actually archives its file (Phase 2). `0` (the
+    #: default) reproduces the pre-Phase-2 behavior: archive the instant a
+    #: record is no longer current.
+    #:
+    #: **Opt-in, not on by default, and that is a measured trade-off, not
+    #: caution for its own sake.** Retaining a corrected record's near-
+    #: duplicate text alongside its correction gives the hybrid RRF fusion
+    #: two close competitors for one query instead of one — `stale_leak_rate`
+    #: stays 0.0 (the query-time `valid_until` predicate does correctly
+    #: exclude the old record from every result set), but `update_accuracy`
+    #: was observed to swing 0.75-1.0 run to run on the same seed in
+    #: `tests/test_memory_benchmark.py` at the default `retention=7`, from
+    #: exactly this near-duplicate ranking competition. A region that wants
+    #: the documented `as_of` guarantee — "what did we believe last week" —
+    #: sets this explicitly and accepts that cost; one that does not is
+    #: unaffected.
+    supersede_retention_days: int = 0
 
     # --- retrieval (Steps 33.6-33.9) -------------------------------------
     #: How memory takes part in a search that does not say: ``auto`` (like any
@@ -819,12 +899,70 @@ class MemorySettings(ModelMixin):
     #: recording what a person looks up is a choice an operator should make.
     usage_tracking: bool = False
     #: Archive the least salient records once the store exceeds this many.
-    #: ``None`` = unbounded, which is the pre-33.9 behavior.
+    #: ``None`` = unbounded, which is the pre-33.9 behavior. Runs as the
+    #: **backstop** over whatever the per-scope/per-subject caps below leave
+    #: behind (Phase 5) — those isolate their own pools first, this cap
+    #: cleans up anything still over budget after that.
     max_records: int | None = None
+
+    # --- per-scope budgets (Phase 5) ----------------------------------------
+    #: Mirrors ``session_ttl_days``/``user_ttl_days``/``org_ttl_days`` above,
+    #: but for count rather than age. ``max_records`` alone ranks the whole
+    #: store as one pool, so with the default ``SCOPE_WEIGHT`` a session
+    #: flood only ever *outranks* org facts by a fixed multiplier — it never
+    #: fully isolates them. These three cap each scope's own pool
+    #: independently, before the global backstop runs. ``None`` = that
+    #: scope is unbounded (the pre-Phase-5 behavior).
+    session_max_records: int | None = None
+    user_max_records: int | None = None
+    org_max_records: int | None = None
+    #: Cap on live records sharing one ``subject`` (across scopes), grouped
+    #: the same way graph bridging already groups by subject. Records with
+    #: no ``subject`` are exempt — there is no single entity to cap them
+    #: against. ``None`` = unbounded.
+    max_records_per_subject: int | None = None
+
     #: Cap on `about` edges drawn per record by the graph bridge (Step 33.7).
     #: Total `about` edges stay bounded by this times the record count — the
     #: ceiling the retired concept layer never had.
     about_max_targets: int = 3
+
+    # --- compaction (Phase 1) ---------------------------------------------
+    #: L0 write-path admission: a write whose *normalized* text already
+    #: matches a live record in the same (scope, subject, kind, ACL
+    #: partition) bucket reinforces that record (bumps `observations`,
+    #: records the surface form as a `variant`) instead of creating a new
+    #: file — collapsing exact repeats and paraphrases alike, which today
+    #: are indistinguishable "new" writes. **On by default**, unlike
+    #: `usage_tracking` above: this is a write-path counter with none of
+    #: that flag's read-path privacy argument (recording what an agent
+    #: *wrote* is not recording what anyone *looked up*), and shipped off it
+    #: would be exactly as inert as `uses` is while `usage_tracking` stays
+    #: at its own default.
+    reinforcement_enabled: bool = True
+
+    # --- clustering (Phase 3) ----------------------------------------------
+    #: L1/L2 near-duplicate clustering and medoid promotion, on the same
+    #: consolidation pass as archival and capacity pruning. Off by default —
+    #: unlike reinforcement, this changes what a *default* query sees
+    #: (subsumed records drop to the cold tier and stop appearing in results
+    #: a plain `current_only=True` query returns), so it is an explicit
+    #: opt-in rather than an assumed-safe default, the same posture
+    #: `supersede_retention_days` takes.
+    compaction_enabled: bool = False
+    #: Exact-Jaccard threshold (over normalized content tokens — see
+    #: `pheasant.memory.normalize`) above which two records in the same
+    #: (scope, subject, kind, ACL) bucket link into one cluster.
+    compaction_similarity_threshold: float = 0.6
+    #: A cluster below this size is left alone. `2` is the floor — anything
+    #: less is not a cluster.
+    compaction_min_cluster_size: int = 2
+
+    # --- synthesis (Phase 4) -----------------------------------------------
+    #: L3: abstractive merge for what L1/L2 cannot resolve deterministically.
+    #: See `MemorySynthesisSettings` — off by default, never on an automatic
+    #: beat.
+    synthesis: MemorySynthesisSettings = field(default_factory=MemorySynthesisSettings)
 
 
 @dataclass
@@ -1059,6 +1197,9 @@ class PheasantConfig(ModelMixin):
             if dc is AssistantSettings:
                 if "retrieval" in raw and isinstance(raw["retrieval"], dict):
                     raw["retrieval"] = build(RetrievalSettings, raw["retrieval"])
+            if dc is MemorySettings:
+                if "synthesis" in raw and isinstance(raw["synthesis"], dict):
+                    raw["synthesis"] = build(MemorySynthesisSettings, raw["synthesis"])
             if dc is IngestionSettings:
                 if "captioner" in raw and isinstance(raw["captioner"], dict):
                     raw["captioner"] = build(CaptionerSettings, raw["captioner"])

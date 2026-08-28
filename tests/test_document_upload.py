@@ -203,6 +203,67 @@ def test_upload_with_wait_false_returns_a_job_to_follow(loaded_config, config_pa
     assert client.get(f"/jobs/{body['job_id']}").status_code == 200
 
 
+@pytest.mark.asyncio
+async def test_a_wait_true_upload_offloads_its_blocking_work(
+    loaded_config, config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: ``engine.sync_source`` — and the disk write, source
+    registry and audit log before it — used to run directly on the event
+    loop for a ``wait=true`` upload, because the route was ``async def``
+    with nothing offloading the blocking work inside it. Measured before
+    the fix: one in-flight upload delayed a *concurrently issued* GET
+    /ready to the same ~5s latency the upload itself took — a single
+    upload stalled every other request in the process, not just uploads.
+
+    Checked directly by *which thread* the blocking call actually runs on,
+    rather than by racing two concurrent requests against one event loop
+    and timing the result. That race is exactly the kind of interleaving a
+    test cannot reliably control: a coroutine blocked on a genuinely
+    synchronous call yields the loop to nothing at all, including this
+    test's own polling or a competing request's dispatch, so an attempt to
+    *observe* the block while it is happening is a race the test can lose
+    even when the bug is real. Which thread ``engine.sync_source`` runs on
+    has no such timing window — it is decided once, at the call, and stays
+    true for the call's whole duration.
+    """
+
+    import threading
+    import types
+
+    from pheasant.sync.worker import WorkerBackedEngine
+
+    app = create_app(config=loaded_config, config_path=config_path)
+
+    calling_thread: list[int] = []
+
+    def _recording_sync_source(*args, **kwargs):
+        calling_thread.append(threading.get_ident())
+        return types.SimpleNamespace(status="succeeded", indexed_artifacts=0, skipped_artifacts=0)
+
+    # The scaled architecture deliberately executes wait=true syncs through
+    # WorkerBackedEngine so CPU-bound indexing happens in a child process.
+    # Replace that boundary here to observe the thread used by the upload
+    # route without starting a real child process.
+    monkeypatch.setattr(WorkerBackedEngine, "sync_source", _recording_sync_source)
+
+    from httpx import ASGITransport, AsyncClient
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/sources/upload",
+            files=[_file("slow.md")],
+            data={"source_name": "uploads", "sync_now": "true", "wait": "true"},
+        )
+
+    assert response.status_code == 200
+    assert calling_thread, "WorkerBackedEngine.sync_source was never called"
+    assert calling_thread[0] != threading.get_ident(), (
+        "WorkerBackedEngine.sync_source ran on the event loop's own thread, not a worker "
+        "thread — a slow sync_source call here would block every other "
+        "request in the process"
+    )
+
+
 def test_a_traversing_filename_lands_inside_the_upload_directory(
     loaded_config, config_path: Path
 ) -> None:

@@ -383,3 +383,60 @@ def test_chat_stream_reports_steps_before_the_answer(loaded_config) -> None:
     answer = next(event["answer"] for event in events if event["type"] == "answer")
     assert answer["question"] == "what is the sync engine?"
     assert "citations" in answer
+
+
+def test_chat_stream_uses_an_async_generator_not_a_threadpool_wrapped_one(
+    loaded_config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for the old sync ``def publish()`` generator.
+
+    Starlette's ``StreamingResponse`` wraps a *sync* generator in
+    ``iterate_in_threadpool`` (``isinstance(content, AsyncIterable)`` is
+    ``False`` for a plain generator object) — which dispatches each
+    ``next()`` call through anyio's thread pool and holds a worker-thread
+    token for as long as that call blocks (``events.get()`` in the old
+    code, i.e. until the workflow finishes or the client gives up). An
+    *async* generator is already an ``AsyncIterable`` and passes straight
+    through, never touching the pool.
+
+    Checked directly against that dispatch decision rather than by timing:
+    a timing-based test here would need to actually hold a real streaming
+    connection open while inspecting anyio's thread-pool state from the
+    same event loop the app runs requests on — fragile through several
+    layers of test-client plumbing — where this is a two-line, deterministic
+    check of the exact fork in the road that decides whether the pool gets
+    touched at all.
+    """
+
+    from collections.abc import AsyncIterable
+
+    from fastapi.testclient import TestClient
+    from starlette.responses import StreamingResponse
+
+    from pheasant.api.app import create_app
+
+    captured: dict[str, bool] = {}
+    original_init = StreamingResponse.__init__
+
+    def spy_init(self, content, *args, **kwargs):
+        original_init(self, content, *args, **kwargs)
+        captured["content_was_already_async"] = isinstance(content, AsyncIterable)
+
+    monkeypatch.setattr(StreamingResponse, "__init__", spy_init)
+
+    app = create_app(config=loaded_config)
+    app.state.engine.sync_source("architecture-notes", "full")
+    client = TestClient(app)
+
+    with client.stream(
+        "POST", "/assistant/chat/stream", json={"question": "what is the sync engine?"}
+    ) as response:
+        assert response.status_code == 200
+        for _ in response.iter_lines():
+            pass  # drain so the connection closes cleanly
+
+    assert captured.get("content_was_already_async") is True, (
+        "publish() is a sync generator, so Starlette wraps it in "
+        "iterate_in_threadpool — an open or abandoned stream then holds a "
+        "worker-thread token for as long as the connection stays open"
+    )

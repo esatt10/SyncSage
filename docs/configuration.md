@@ -165,15 +165,34 @@ multi-hour first index would take the whole Service down for that time.
 Both default off, and that is a decision rather than caution.
 
 **Shedding only makes sense when there is somewhere else to go.** With one
-process, a burst piles up behind the GIL and every request gets slower — but
-waiting is still the best available answer, and a 429 to the only user is
-worse. With N replicas behind a load balancer a fast 429 is strictly better
-than a request that sits for thirty seconds and times out anyway. So set this
-on replicas, not on a laptop.
+process, a burst piles up behind anyio's shared worker-thread pool (see
+below) and every request gets slower — but waiting is still the best
+available answer, and a 429 to the only user is worse. With N replicas
+behind a load balancer a fast 429 is strictly better than a request that sits
+for thirty seconds and times out anyway. So set this on replicas, not on a
+laptop.
 
 `/health`, `/ready` and `/metrics` are **never** shed. A pod that answers 429
 to its own liveness probe gets restarted by the thing meant to be protecting
-it, turning a busy replica into a crash-looping one.
+it, turning a busy replica into a crash-looping one. All three are `async
+def` routes for the same reason: they answer without needing a worker-thread
+token from the pool below, so a saturated pool no longer delays them either.
+
+**`max_concurrent_requests` and the thread pool are two separate budgets.**
+Every sync `def` HTTP route — most of them — and every MCP tool call made
+against the `/mcp` mount in this same process (`mcp_server/server.py`'s
+`@mcp.tool()` handlers are correctly synchronous; ingestion-path determinism
+forbids an async LLM call on the pipeline they share) run on anyio's shared
+worker-thread pool, 40 tokens by default and otherwise unrelated to
+`max_concurrent_requests`. On startup, if `max_concurrent_requests` is set,
+this process raises that pool's token count to at least match it (never
+lowers it) — so a request the limiter admits never silently queues for a
+thread instead, which would reintroduce the blocking behavior shedding
+exists to replace. Size `max_concurrent_requests` for HTTP *and* MCP traffic
+together, not HTTP alone, since both draw from the one pool.
+`GET /metrics`'s `pheasant_threadpool_tokens_total` /
+`_tokens_available` show the pool's current headroom next to
+`pheasant_requests_inflight`.
 
 **Draining exists because Kubernetes does two things at once.** SIGTERM and
 endpoint removal happen concurrently, and endpoint propagation is not instant
@@ -725,15 +744,31 @@ memory source itself. See [Agent memory](how-to/agent-memory.md).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `consolidation_enabled` | bool | `true` | Archive superseded records (an explicit correction) and per-scope TTL-expired records on the scheduler beat or via `memory_consolidate` / `POST /memory/consolidate`. Archiving renames `<id>.md` → `<id>.md.archived` in place — bytes preserved, never deleted — then a full re-sync prunes it from the index. |
+| `consolidation_enabled` | bool | `true` | Archive superseded records (an explicit correction) and per-scope TTL-expired records on the scheduler beat or via `memory_consolidate` / `POST /memory/consolidate`. Archiving renames `<id>.md` → `<id>.md.archived` in place — bytes preserved, never deleted — then the archived records' indexed state is dropped directly (or, above a few hundred in one pass, a full re-sync prunes them). |
 | `session_ttl_days` | integer \| null | `null` | TTL for `session`-scoped records. `null` = never expires by age. |
 | `user_ttl_days` | integer \| null | `null` | TTL for `user`-scoped records. |
 | `org_ttl_days` | integer \| null | `null` | TTL for `org`-scoped records. |
+| `supersede_retention_days` | integer | `0` | Days a superseded/TTL-expired record stays a live, indexed file — hidden from default results by the existing `valid_until` predicate, reachable via `as_of` / `current_only=False` — before consolidation archives it. `0` = archive on the very next pass (pre-Phase-2 behavior). A deliberate trade-off, not free: retaining near-duplicate corrected text alongside its correction measurably costs ranking in hybrid RRF fusion (see `docs/memory-system.md` §4). |
 | `default_policy` | `auto` \| `off` \| `only` \| `prefer` | `auto` | How memory takes part in a search that does not say. A per-call `memory` argument (MCP `search_context`, `POST /search`, `POST /assistant/chat`) always wins. `auto` = like any other source; `only` = memory and nothing else; `prefer` = memory is guaranteed a share of the result slots. |
 | `steering_enabled` | bool | `false` | Let `alias` / `preference` / `exclusion` records re-rank results rather than merely be retrievable. Off by default: a memory that silently re-orders searches is a surprise unless it was asked for. See [Agent memory](how-to/agent-memory.md#steering). |
 | `usage_tracking` | bool | `false` | Count which records retrieval actually returns, so salience reflects use. Off by default — it is a write on the read path, and recording what someone looks up is an operator's decision. |
-| `max_records` | integer \| null | `null` | Archive the least salient records once the store exceeds this many. `null` = unbounded. Pruning uses the same in-place `.md.archived` rename as consolidation; nothing is deleted. |
+| `max_records` | integer \| null | `null` | Archive the least salient records once the store exceeds this many. `null` = unbounded. Pruning uses the same in-place `.md.archived` rename as consolidation; nothing is deleted. Runs as a **backstop** after the per-scope/per-subject caps below. |
+| `session_max_records` | integer \| null | `null` | Cap on `session`-scoped records alone, mirroring `session_ttl_days`. Isolates the pool: `max_records` alone ranks the whole store together, so a session flood only *outranks* an org fact by `scope_weight`, never fully protects it. |
+| `user_max_records` | integer \| null | `null` | Cap on `user`-scoped records alone. |
+| `org_max_records` | integer \| null | `null` | Cap on `org`-scoped records alone. |
+| `max_records_per_subject` | integer \| null | `null` | Cap on live records sharing one `subject`, across scopes. Records with no `subject` are exempt. |
 | `about_max_targets` | integer | `3` | Cap on `about` edges the graph bridge draws per record. Total `about` edges stay bounded by this times the record count — the ceiling the retired concept layer never had. |
+| `reinforcement_enabled` | bool | `true` | Before creating a file, check a write's normalized text against the same `(scope, subject, kind, ACL partition)` bucket; a match — exact repeat or paraphrase — reinforces the existing record (`observations`, `last_seen`, a bounded `variants` list) instead of creating a new one. On by default: unlike `usage_tracking`, this records what was *written*, not what was *looked up*. See [Agent memory](how-to/agent-memory.md) and `docs/memory-system.md` §8. |
+| `compaction_enabled` | bool | `false` | Offline near-duplicate clustering and medoid promotion, on the consolidation pass. Demoted records go to `tier='cold'` (never deleted or renamed — reachable via an explicit tier filter or `current_only=False`/`as_of`) and their `observations` are absorbed by the surviving canonical record. Off by default: unlike reinforcement, this changes what a *default* query returns. See `docs/memory-system.md` §8. |
+| `compaction_similarity_threshold` | float | `0.6` | Exact-Jaccard threshold over normalized content tokens above which two records in the same bucket link into one cluster. |
+| `compaction_min_cluster_size` | integer | `2` | A cluster below this size is left alone. |
+| `synthesis.enabled` | bool | `false` | LLM-merge (Phase 4) for what deterministic clustering cannot resolve — complementary partial facts, progressive refinement, abstraction across records. Opt-in *and* never automatic: only the explicit `memory_synthesize` tool / `POST /memory/synthesize` runs it, never the scheduler beat. Mirrors `assistant.*` field for field. |
+| `synthesis.provider` | `auto` \| `anthropic` \| `openai` \| `gemini` \| `none` | `auto` | Same semantics as `assistant.provider`. |
+| `synthesis.model` | string \| null | `null` | Explicit model id; `null` uses the provider's default. |
+| `synthesis.max_calls_per_pass` | integer | `20` | Hard cap on model calls in one pass. A repeat pass over already-subsumed clusters costs zero regardless — this bounds a large first pass. |
+| `synthesis.max_input_chars` | integer | `6000` | A cluster whose combined member text exceeds this is skipped rather than truncated into a partial merge. |
+| `synthesis.min_cluster_size` | integer | `3` | Below this, medoid promotion (L2) already resolves the cluster losslessly. |
+| `synthesis.max_jaccard` | float | `0.55` | Above this mean pairwise similarity (over normalized tokens, measured exactly as L1 clustering measures it) a cluster is skipped: near-identical rephrasings are what medoid promotion resolves for free, so spend goes only where deterministic compaction provably cannot help. Matters most with `compaction_enabled` off (the default), where nothing has been demoted. |
 
 **Corrected records are excluded from retrieval automatically**, at query time,
 without waiting for a consolidation pass — pass `{"current_only": false}` or an

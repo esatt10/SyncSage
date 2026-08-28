@@ -496,6 +496,7 @@ class PheasantTools:
         itself. All three are optional and default to the pre-33.5 behavior
         (CLAUDE.md §4 rule 8: additive only).
         """
+        from pheasant.memory.reinforcement import StateReinforcementIndex
         from pheasant.memory.store import MemoryStore, memory_source
 
         self._require_knowledge_base(knowledge_base)
@@ -508,7 +509,19 @@ class PheasantTools:
                 "      type: memory\n"
                 "      path: memory"
             )
-        record, created = MemoryStore(source.path).append(
+        # Phase 1: a write whose *normalized* text already matches a live
+        # record in the same (scope, subject, kind, ACL) bucket reinforces
+        # that record instead of creating a new one. `reinforcement_enabled`
+        # defaults on (see MemorySettings) but stays a real knob, and a
+        # cold/absent projection degrades `find()` to "no match" — never
+        # blocks the write.
+        reinforcement = (
+            StateReinforcementIndex(self.state)
+            if self.config.memory.reinforcement_enabled
+            else None
+        )
+        store = MemoryStore(source.path)
+        record, created = store.append(
             text,
             scope=scope,
             subject=subject,
@@ -517,8 +530,31 @@ class PheasantTools:
             kind=kind,
             written_by=principal,
             valid_until=valid_until,
+            reinforcement=reinforcement,
         )
-        result: dict = {"record": record.as_dict(), "created": created, "source": source.name}
+        outcome = store.last_outcome or ("created" if created else "duplicate")
+
+        from pheasant.telemetry import metrics as _metrics
+
+        _metrics.record_memory_write(outcome, store.last_fold)
+        result: dict = {
+            "record": record.as_dict(),
+            "created": created,
+            "source": source.name,
+            # Additive (rule 8): "created" | "reinforced" | "duplicate".
+            # `created` is unchanged and still means exactly what it always
+            # has; `outcome` distinguishes the two ways `created=False` can
+            # now happen.
+            "outcome": outcome,
+        }
+        submitted = (text or "").strip()
+        if not created and submitted and submitted != record.text:
+            # Only possible for outcome="reinforced": an exact-digest match
+            # (outcome="duplicate") is byte-identical to `record.text` by
+            # construction. The caller gets back a record whose stored text
+            # is not what it wrote — worth surfacing rather than leaving
+            # implicit.
+            result["submitted_text"] = submitted
         # The record is already durably on disk; this sync only makes it
         # *searchable now*. Failing the whole request when it cannot run — most
         # often because another writer holds the engine lease, which a live run
@@ -530,7 +566,12 @@ class PheasantTools:
                 result["sync"] = self._publish_sync(source.name, "incremental")
             else:
                 try:
-                    result["sync"] = self.engine.sync_source(source.name, "incremental").__dict__
+                    # Avoid making an interactive write pay the whole-graph
+                    # enrichment walk. The next ordinary sync clears the
+                    # persisted dirty marker and completes enrichment.
+                    result["sync"] = self.engine.sync_source(
+                        source.name, "incremental", enrich="deferred"
+                    ).__dict__
                 except Exception as exc:
                     logger.warning("memory write indexed later: %s", exc)
                     result["sync_deferred"] = str(exc)
@@ -568,10 +609,27 @@ class PheasantTools:
         if source is None:
             return {"enabled": False, "records": []}
         records = MemoryStore(source.path).list_records(scope, current_only=current_only)
+        # Phase 3: tier/subsumed_by are SQL-only (earned by a compaction
+        # pass, not a file field), so a record's file-based `as_dict()` is
+        # annotated with them here rather than the store growing a state
+        # handle. Best-effort — a cold/absent projection just means every
+        # record reports the pre-Phase-3 default (hot, unsubsumed), same as
+        # a region that has never run compaction.
+        try:
+            compaction = {str(row["record_id"]): row for row in self.state.memory_compaction_rows()}
+        except Exception:
+            compaction = {}
+        out = []
+        for record in records:
+            payload = record.as_dict()
+            row = compaction.get(record.record_id)
+            payload["tier"] = str(row["tier"]) if row and row.get("tier") else "hot"
+            payload["subsumed_by"] = row.get("subsumed_by") if row else None
+            out.append(payload)
         return {
             "enabled": True,
             "source": source.name,
-            "records": [record.as_dict() for record in records],
+            "records": out,
         }
 
     def memory_consolidate(self, knowledge_base: str) -> dict:
@@ -594,6 +652,27 @@ class PheasantTools:
         self._audit(
             result["source"], "memory_consolidate", "mcp", "mcp", None, utc_now(), result["report"]
         )
+        return result
+
+    def memory_synthesize(self, knowledge_base: str) -> dict:
+        """Run one LLM-merge pass now (Phase 4). Off by default and never
+        automatic — see `MemorySynthesisSettings`. Merges a near-duplicate
+        cluster deterministic compaction could not resolve into one new
+        canonical record, subsuming the originals exactly as medoid
+        promotion does. Returns `{"skipped": reason}` when synthesis is
+        disabled, no `type: memory` source is configured, or no model is
+        reachable.
+        """
+        from pheasant.memory.store import MemoryStore, memory_source
+        from pheasant.memory.synthesis import run_synthesis
+
+        self._require_knowledge_base(knowledge_base)
+        source = memory_source(self.config, self.state)
+        if source is None:
+            return {"skipped": "no `type: memory` source is configured"}
+        records = MemoryStore(source.path).list_records()
+        result = run_synthesis(self.engine, records, self.config.memory.synthesis, source)
+        self._audit(source.name, "memory_synthesize", "mcp", "mcp", None, utc_now(), result)
         return result
 
     def search_context(

@@ -416,6 +416,7 @@ class NatsQueue(TaskQueue):
         self.dead_durable = f"{durable}-dead"
         self.connect_timeout = float(connect_timeout)
         self._loop: Any = None
+        self._thread: threading.Thread | None = None
         self._client: Any = None
         self._js: Any = None
         self._subscription: Any = None
@@ -429,14 +430,40 @@ class NatsQueue(TaskQueue):
 
     # JetStream's client is asyncio-only while the indexing engine is
     # threaded, so every call is marshalled onto one private event loop. A
-    # thread per queue operation would be worse: this keeps exactly one.
+    # thread per queue operation would be worse: this keeps exactly one — and
+    # that one thread must actually keep running the loop between calls, not
+    # just for the duration of each one.
+    #
+    # An earlier version spun the loop only via ``run_until_complete`` per
+    # call, leaving it idle in between. nats-py's own background tasks —
+    # the socket reader and its ping/keepalive coroutine, both created by
+    # ``nats.connect()`` — only run while *something* is driving the loop,
+    # so an indexer idle between ``claim()`` polls never processed the
+    # server's own keepalive pings. Reproduced against a real broker
+    # (``ping_interval: 1s, ping_max: 2``, a scaled-down analogue of
+    # production's ``2min``/``2``): after 8s idle the connection was broken
+    # server-side, and the client's own ``is_connected`` still incorrectly
+    # reported ``True`` right up until the next call failed outright.
+    #
+    # The fix is to keep the loop itself running continuously on a
+    # dedicated daemon thread (``run_forever``, not spun per call), and
+    # marshal each call in with ``run_coroutine_threadsafe`` instead of
+    # ``run_until_complete`` — verified against the same broker to survive
+    # the identical idle window.
     def _run(self, coroutine: Any) -> Any:
         import asyncio
 
         with self._loop_lock:
             if self._loop is None:
                 self._loop = asyncio.new_event_loop()
-            return self._loop.run_until_complete(coroutine)
+                self._thread = threading.Thread(
+                    target=self._loop.run_forever,
+                    name="pheasant-nats-queue-loop",
+                    daemon=True,
+                )
+                self._thread.start()
+            loop = self._loop
+        return asyncio.run_coroutine_threadsafe(coroutine, loop).result()
 
     def _connect(self) -> Any:
         with self._loop_lock:
@@ -701,6 +728,16 @@ class NatsQueue(TaskQueue):
             logger.debug("NATS close failed", exc_info=True)
         finally:
             if self._loop is not None:
+                # The loop is running continuously on its own thread now
+                # (``run_forever``), not just for the duration of the last
+                # call — so it must be stopped and that thread joined
+                # *before* any further method is called on it directly.
+                # ``run_until_complete``/``close()`` are only safe once
+                # ``run_forever`` has actually returned; calling them while
+                # another thread is still driving the loop raises.
+                self._loop.call_soon_threadsafe(self._loop.stop)
+                if self._thread is not None:
+                    self._thread.join(timeout=5.0)
                 try:
                     self._loop.run_until_complete(self._loop.shutdown_asyncgens())
                 except Exception:  # pragma: no cover - loop already unusable
@@ -709,6 +746,7 @@ class NatsQueue(TaskQueue):
             self._client = None
             self._js = None
             self._loop = None
+            self._thread = None
             self._subscription = None
             self._dead_subscription = None
 

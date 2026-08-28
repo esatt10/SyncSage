@@ -283,6 +283,7 @@ def test_a_region_without_memory_gets_an_unchanged_graph(tmp_path: Path) -> None
             "records": 0,
             "about": 0,
             "supersedes": 0,
+            "subsumes": 0,
             "unbridged": [],
             "by_signal": {},
         }

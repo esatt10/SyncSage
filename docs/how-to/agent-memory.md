@@ -52,6 +52,25 @@ decides its read ACL, so a newline in a field value would otherwise let a
 caller forge frontmatter and escalate a private note to `org`. Everything else
 — colons, unicode, punctuation — round-trips unchanged.
 
+**Restating a fact reinforces it, it does not duplicate it.** An agent that
+asserts the same thing in fresh words every time it comes up — the normal
+case at agent write rates — does not grow the store one record per
+paraphrase. `memory.reinforcement_enabled` (on by default) checks a new
+write's normalized text (case/whitespace/framing folded, nothing else — see
+`docs/memory-system.md` §8) against the same `(scope, subject, kind)` bucket
+before creating a file; a match reinforces the existing record instead. The
+response's `outcome` says which happened:
+
+```jsonc
+{"created": false, "outcome": "reinforced", "record": {"record_id": "mem-..."}, "submitted_text": "the staging cluster runs in us-east-2"}
+```
+
+`outcome` is `"created"` (a genuinely new record), `"reinforced"` (folded
+into an existing one — exact repeat or paraphrase alike), or `"duplicate"`
+(reinforcement disabled, exact repeat only — the pre-compaction behavior).
+Two principals can never reinforce each other's `user`/`session`-scope
+memories this way; see §8 of the memory-system doc.
+
 ## 3. Recall is just search
 
 ```bash
@@ -90,9 +109,11 @@ Pass `supersedes: <record_id>` when a memory corrects an earlier one. The
 old record is then no longer *current* — `GET /memory?current_only=true`
 filters it immediately — and the next **consolidation pass** archives it:
 the file is renamed `<id>.md.archived` in place (bytes preserved forever,
-nothing deleted) and a full re-sync of the memory source drops it from the
-index, so search stops surfacing the stale fact while the audit trail
-remains on disk.
+nothing deleted), so search stops surfacing the stale fact while the audit
+trail remains on disk. Below a few hundred archived records the pass drops
+just those records' indexed state directly; above that it falls back to a
+full re-sync of the (small) memory source — either way the result is the
+same, only the cost differs.
 
 Consolidation runs automatically on the scheduler beat, or on demand via
 the `memory_consolidate` MCP tool / `POST /memory/consolidate`. Per-scope
@@ -104,7 +125,21 @@ memory:
   session_ttl_days: 14          # opt-in: scratch session memories decay
   user_ttl_days: null           # null = the scope never expires (default)
   org_ttl_days: null
+  supersede_retention_days: 0   # opt-in: keep a correction's old record
+                                 # indexed (reachable via as_of) for this
+                                 # many days before archiving it. 0 = archive
+                                 # on the very next pass. See "point-in-time
+                                 # recall" note below.
 ```
+
+**Want `as_of` to reliably reach a value from last week?** Set
+`supersede_retention_days` above `0`. It is opt-in rather than the default
+because it is a real trade-off, not a free fix: a superseded record's file
+stays indexed alongside its correction for that many days, and near-duplicate
+text competing for the same query measurably affects ranking under hybrid
+(RRF) fusion — see `docs/memory-system.md` §4 for the numbers. At `0`
+(default), a corrected fact is dropped from the index on the very next
+consolidation pass, same as before this knob existed.
 
 ## Fleet routing
 
@@ -136,10 +171,17 @@ or an object for the rest:
     "scopes": ["user"],
     "subject": "deploy",
     "as_of": "2026-01-01T00:00:00Z",
-    "current_only": false
+    "current_only": false,
+    "tiers": ["cold"]
   }
 }
 ```
+
+`tiers` (Phase 3, `["hot"]` \| `["cold"]` \| `["hot","cold"]`) reaches
+records demoted by [compaction](#compaction) — omit it and a plain query
+sees `hot` only, exactly like before compaction existed; `current_only:
+false` or `as_of` widen to `["hot","cold"]` automatically, the same signal
+that already widens the validity window.
 
 **A corrected record is never returned by default.** Supersession is enforced
 at query time, so you do not have to wait for a consolidation pass to stop
@@ -214,6 +256,84 @@ directions — they neither consume slots nor get archived — because ranking a
 deliberate rule against ordinary facts, on a formula built for facts, meant
 crossing the cap could silently switch off an `exclusion` and change ranking
 for every future query.
+
+`max_records` alone ranks the whole store as one pool, so a `session`-scope
+flood only ever *outranks* an `org` fact by the fixed `scope_weight`
+multiplier — it never fully protects it. `session_max_records`,
+`user_max_records` and `org_max_records` (mirroring the `*_ttl_days` trio)
+cap each scope's own pool independently, and `max_records_per_subject` caps
+how many live records can pile up about one named entity, across scopes.
+Each defaults to unbounded; where a record's own scope cap, its subject's
+cap, and the global `max_records` backstop all apply, it is archived once,
+not three times.
+
+## Compaction — folding near-duplicates without losing them {#compaction}
+
+An agent restates the same fact in fresh words every time it comes up.
+Reinforcement (above the write examples) already folds *exact* restatements
+at write time; `memory.compaction_enabled` (off by default) additionally
+clusters genuinely-different-wording near-duplicates **offline**, on the
+consolidation pass:
+
+```yaml
+memory:
+  compaction_enabled: false            # opt-in
+  compaction_similarity_threshold: 0.6 # exact-Jaccard, over normalized tokens
+  compaction_min_cluster_size: 2
+```
+
+Within one `(scope, subject, kind, ACL partition)` bucket — never crossing
+any of those, same as reinforcement's isolation — near-duplicate records
+above the threshold cluster together, and the member with the highest
+summed similarity to the rest of the cluster is promoted as the canonical
+record, **as-is**: nothing is synthesized or machine-authored. Every other
+member is demoted to `tier: cold` and gets `subsumed_by: <canonical id>` —
+**never renamed or deleted**. A demoted record stays on disk, stays
+indexed, and stays reachable:
+
+```bash
+curl -s localhost:8765/search -X POST -H 'content-type: application/json' -d '{
+  "query": "staging cluster region",
+  "memory": {"tiers": ["cold"]}
+}'
+```
+
+Every subsumption is recorded in the `memory_compactions` ledger
+(`op`, `member_id`, `canonical_id`, `rule_id`, `params_hash`, `at` — see
+`docs/reference/export-schema.md`), so "why is this record cold" always has
+an answer. Off by default because, unlike reinforcement, it changes what a
+plain query returns — the same posture `supersede_retention_days` takes.
+
+### When clustering isn't enough: synthesis
+
+Clustering folds redundancy — many phrasings of one claim. It cannot
+**merge** two records that are each true and each say something the other
+doesn't ("runs in us-east-2" + "owned by ada"), or abstract across several
+("deploy failed Mon/Tue/Wed" → "failing all week"). For that,
+`memory.synthesis` calls a model — opt-in, and unlike everything else on
+this page, **never automatic**: only an explicit call runs it.
+
+```yaml
+memory:
+  synthesis:
+    enabled: false      # opt-in
+    provider: auto        # auto | anthropic | openai | gemini | none
+    model: null
+    max_calls_per_pass: 20
+```
+
+```bash
+curl -s localhost:8765/memory/synthesize -X POST
+```
+
+The model only ever sees clusters clustering already tried and couldn't
+fully resolve; a successful merge subsumes its inputs exactly like medoid
+promotion (`tier: cold`, `subsumed_by`), tagged `llm-synthesized` and
+recorded in the ledger with the model id — never `supersedes`, since the
+inputs weren't wrong, just redundant. It is a writer, not an indexer: the
+merged text becomes an ordinary record through the normal write path, so
+no LLM call ever happens on the indexing path itself, and a repeat call
+over an unchanged, already-subsumed cluster costs nothing.
 
 ## In the UI
 

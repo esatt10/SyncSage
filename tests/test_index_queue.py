@@ -984,6 +984,95 @@ def test_nats_terminates_a_task_that_exhausts_its_attempts(nats_queue: Any) -> N
     nats_queue.ack(replay)
 
 
+def _nats_server_binary_available() -> bool:
+    import shutil
+
+    return shutil.which("nats-server") is not None
+
+
+nats_server_binary = pytest.mark.skipif(
+    not _nats_server_binary_available(),
+    reason="the nats-server binary is not on PATH",
+)
+
+
+@nats_server_binary
+def test_nats_survives_an_idle_period_between_calls(tmp_path: Path) -> None:
+    """Regression: the loop must keep running between calls, not just for
+    the duration of each one.
+
+    Before the fix, ``NatsQueue._run`` spun its private event loop only via
+    ``run_until_complete`` per call and let it sit idle in between. nats-py's
+    own background tasks — the socket reader and its ping/keepalive
+    coroutine, both created by ``nats.connect()`` — only run while something
+    is actually driving the loop, so an indexer idle between ``claim()``
+    polls never processed the server's own keepalive pings and the
+    connection was silently broken server-side; the next call failed with a
+    ``TimeoutError``.
+
+    Runs its own broker (rather than the shared ``nats_broker`` fixture)
+    with an aggressive ``ping_interval``/``ping_max`` — a scaled-down
+    analogue of production's ``2min``/``2`` — so the idle window that would
+    take minutes against a default broker takes seconds here. This is a
+    regression guard for the mechanism, not a timing-exact reproduction of
+    production's window.
+    """
+
+    pytest.importorskip("nats", reason="the [queue] extra is optional")
+    import socket
+    import subprocess
+
+    from pheasant.sync.queue import NatsQueue
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    conf_path = tmp_path / "nats.conf"
+    js_dir = tmp_path / "jsdata"
+    js_dir.mkdir()
+    conf_path.write_text(
+        f'port: {port}\nping_interval: "1s"\nping_max: 2\njetstream {{ store_dir: "{js_dir}" }}\n'
+    )
+    server = subprocess.Popen(
+        ["nats-server", "-c", str(conf_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            pytest.fail("test-scoped nats-server never became reachable")
+
+        queue = NatsQueue(
+            [f"nats://127.0.0.1:{port}"],
+            stream="IDLE_TEST",
+            subject="idle.test.tasks",
+            durable="idle-test",
+        )
+        try:
+            queue.publish(_task("docs", id="before-idle"))
+            # The loop must survive this unattended — nothing here drives it.
+            time.sleep(8.0)
+            queue.publish(_task("docs", id="after-idle"))
+            claimed = drain(queue, lambda task: task.source_id)
+            assert claimed == ["docs", "docs"]
+        finally:
+            queue.close()
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+            server.kill()
+
+
 @nats_broker
 def test_a_full_sync_all_runs_over_nats(tmp_path: Path) -> None:
     """End to end: the broker really does drive a real index."""

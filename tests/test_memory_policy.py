@@ -18,6 +18,7 @@ import pytest
 from pheasant.config.loader import load_config
 from pheasant.mcp_server.tools import PheasantTools
 from pheasant.memory.policy import (
+    INDEX_COLUMNS,
     MemoryPolicy,
     admits,
     sql_predicate,
@@ -82,6 +83,7 @@ RECORD_MATRIX = [
         "kind": "fact",
         "valid_from": NOW,
         "valid_until": None,
+        "tier": None,
     },
     {
         "record_id": "b",
@@ -90,6 +92,7 @@ RECORD_MATRIX = [
         "subject": "prefs",
         "valid_from": "2026-01-01T00:00:00Z",
         "valid_until": "2026-06-01T00:00:00Z",
+        "tier": None,
     },
     {
         "record_id": "c",
@@ -98,6 +101,7 @@ RECORD_MATRIX = [
         "subject": None,
         "valid_from": "2027-01-01T00:00:00Z",
         "valid_until": None,
+        "tier": None,
     },
     {
         "record_id": "d",
@@ -106,6 +110,12 @@ RECORD_MATRIX = [
         "kind": "",
         "valid_from": "",
         "valid_until": "",
+        # The empty-string corner (Phase 3): SQL's `COALESCE(tier,'hot')`
+        # treats '' as a real value (it IS one), same as `admits`'s
+        # `record.get("tier") or "hot"` treats a falsy '' as unset — so an
+        # empty-string tier must fall back to "hot" identically on both
+        # sides, exactly the corner `valid_from`/`valid_until` already cover.
+        "tier": "",
     },
     # A steering rule: retrieval machinery, excluded from *content* results
     # unless asked for, which both halves of the predicate must agree on.
@@ -116,6 +126,7 @@ RECORD_MATRIX = [
         "kind": "alias",
         "valid_from": NOW,
         "valid_until": None,
+        "tier": None,
     },
     {
         "record_id": "e",
@@ -124,6 +135,20 @@ RECORD_MATRIX = [
         "subject": "deploy",
         "valid_from": "2026-01-01T00:00:00Z",
         "valid_until": "2027-01-01T00:00:00Z",
+        "tier": None,
+    },
+    # A cold (subsumed) record (Phase 3): currently *valid* by every other
+    # measure — this is what distinguishes tier from the validity window —
+    # excluded from default results, reachable via an explicit tiers filter
+    # or the same current_only=False/as_of that already reaches history.
+    {
+        "record_id": "g",
+        "scope": "org",
+        "subject": "infra",
+        "kind": "fact",
+        "valid_from": NOW,
+        "valid_until": None,
+        "tier": "cold",
     },
 ]
 
@@ -140,6 +165,11 @@ POLICY_MATRIX = [
     MemoryPolicy(mode="only", scopes=("org",), subject="infra"),
     MemoryPolicy(include_rules=True),
     MemoryPolicy(mode="only", include_rules=True),
+    # Phase 3: an explicit tiers filter, and the two signals that widen the
+    # tier set implicitly (current_only=False, as_of) exercised together
+    # with a record that is cold but otherwise fully valid.
+    MemoryPolicy(tiers=("cold",)),
+    MemoryPolicy(tiers=("hot", "cold")),
 ]
 
 
@@ -159,16 +189,16 @@ def test_sql_and_python_halves_of_the_rule_agree(policy: MemoryPolicy) -> None:
     conn.row_factory = sqlite3.Row
     conn.execute(
         "CREATE TABLE memory_records (record_id TEXT, scope TEXT, subject TEXT, "
-        "kind TEXT, valid_from TEXT, valid_until TEXT)"
+        "kind TEXT, valid_from TEXT, valid_until TEXT, tier TEXT)"
     )
     for record in RECORD_MATRIX:
         conn.execute(
             "INSERT INTO memory_records VALUES (:record_id,:scope,:subject,:kind,"
-            ":valid_from,:valid_until)",
+            ":valid_from,:valid_until,:tier)",
             record,
         )
     # A non-memory row, modelled the way the real LEFT JOIN produces one.
-    conn.execute("INSERT INTO memory_records VALUES (NULL,NULL,NULL,NULL,NULL,NULL)")
+    conn.execute("INSERT INTO memory_records VALUES (NULL,NULL,NULL,NULL,NULL,NULL,NULL)")
 
     condition, params = sql_predicate(policy, now=NOW, alias="memory_records")
     sql_ids = {
@@ -187,6 +217,48 @@ def test_sql_and_python_halves_of_the_rule_agree(policy: MemoryPolicy) -> None:
         python_ids.add(None)
 
     assert sql_ids == python_ids, f"SQL and Python disagree for {policy}"
+
+
+def test_admits_reads_only_indexed_columns() -> None:
+    """The one drift the parity test above cannot see.
+
+    `admits` and `sql_predicate` are pinned to agree over `RECORD_MATRIX`,
+    but that only proves they agree on the columns the *test* happens to
+    populate. If a column `admits` reads (e.g. a future `tier`-like field)
+    is added to the Python side but never added to `INDEX_COLUMNS`, the SQL
+    `SELECT` that `load_memory_index` runs never fetches it — the vector and
+    graph arms then see it as always-missing (`record.get(...)` -> None)
+    and silently diverge from the text arm, which reads the real column
+    straight off the table. That drift is invisible to the parity test
+    because both halves still "agree" on a record neither can see.
+    """
+
+    class RecordingRecord(dict):
+        """A Mapping that remembers every key `.get()` was asked for."""
+
+        def __init__(self, data: dict):
+            super().__init__(data)
+            self.touched: set[str] = set()
+
+        def get(self, key, default=None):
+            self.touched.add(key)
+            return super().get(key, default)
+
+    indexed_columns = {name.strip() for name in INDEX_COLUMNS.split(",")}
+    touched: set[str] = set()
+    for policy in POLICY_MATRIX:
+        for record in RECORD_MATRIX:
+            wrapped = RecordingRecord(record)
+            admits(policy, wrapped, now=NOW)
+            touched |= wrapped.touched
+
+    missing = touched - indexed_columns
+    assert not missing, (
+        f"admits() reads {sorted(missing)}, not present in INDEX_COLUMNS "
+        f"({sorted(indexed_columns)}) — load_memory_index would never fetch "
+        "it, so the vector/graph arms would silently diverge from the text "
+        "arm's SQL-side view of the same column."
+    )
 
 
 def test_parse_accepts_the_one_word_form_and_an_object() -> None:

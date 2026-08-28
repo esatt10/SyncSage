@@ -203,8 +203,14 @@ WHERE m.valid_until IS NULL;
 | `tags` | VARCHAR | Free-form tags. |
 | `written_by` | VARCHAR | Principal that wrote it. |
 | `salience` | DOUBLE | Ranking weight. |
-| `uses` | BIGINT | Times recalled. |
-| `last_used_at` | VARCHAR | ISO-8601 UTC. |
+| `uses` | BIGINT | Times recalled (only counted with `memory.usage_tracking` on). |
+| `last_used_at` | VARCHAR | ISO-8601 UTC — last time `uses` was bumped. |
+| `canon_key` | VARCHAR | Normalized-content dedup key (scope/subject/kind/ACL/text — see `pheasant.memory.normalize`); NULL for a record from before compaction. Derived, not earned: recomputed on every re-sync. |
+| `observations` | BIGINT | Times a write re-asserted this record — exactly or as a paraphrase — instead of creating a new file. |
+| `last_seen` | VARCHAR | ISO-8601 UTC — last time `observations` was bumped. |
+| `variants` | VARCHAR | JSON array of distinct surface forms (up to 8) that reinforced this record, when any differed from the stored text. |
+| `tier` | VARCHAR | `hot` (default) or `cold` (demoted by compaction — see `memory_compactions.parquet`). Earned, carried over on re-sync. |
+| `subsumed_by` | VARCHAR | → `memory_records.record_id` — the canonical record a near-duplicate cluster promoted, when this one was demoted. **Distinct from `supersedes`**: a subsumed record is redundant but still true, so this never narrows `valid_until`. |
 | `schema_version` | BIGINT | Record-format version. |
 
 Two semantics an outside reader must apply itself, because pheasant applies
@@ -219,6 +225,34 @@ them at query time rather than at write time:
   are rules that change ranking; pheasant excludes them from result lists by
   default. A reader that joins `memory_records` to `chunks` without filtering
   will surface rule syntax dressed as retrieved content.
+- **Compaction is a tier, not a deletion.** `WHERE tier = 'hot'` is "what a
+  default query would return"; a `cold` row is redundant, still valid, and
+  still fully present — join `memory_compactions` (below) to see which
+  canonical record absorbed it and why.
+
+### `memory_compactions.parquet`
+
+The audit trail for every near-duplicate cluster compaction has resolved:
+one row per demoted (`tier='cold'`) record. Primary key `id`.
+
+```sql
+SELECT c.member_id, c.canonical_id, c.rule_id, c.at, m_text.text AS member_text, c_text.text AS canonical_text
+FROM memory_compactions c
+JOIN memory_records mr ON mr.record_id = c.member_id
+JOIN chunks m_text ON m_text.artifact_id = mr.artifact_id
+JOIN memory_records cr ON cr.record_id = c.canonical_id
+JOIN chunks c_text ON c_text.artifact_id = cr.artifact_id;
+```
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | VARCHAR | Deterministic hash of `(op, member_id, canonical_id, params_hash)` — a re-run over unchanged content with unchanged parameters produces the same id, which is what makes the pass idempotent. |
+| `op` | VARCHAR | `subsume` (deterministic medoid promotion) or `synthesize` (Phase 4's LLM merge — `rule_id='llm-synthesis-v1'` and `params_hash` encodes the model id). |
+| `member_id` | VARCHAR | → `memory_records.record_id` — the demoted record. |
+| `canonical_id` | VARCHAR | → `memory_records.record_id` — the promoted medoid. |
+| `rule_id` | VARCHAR | The algorithm version, e.g. `jaccard-medoid-v1`. |
+| `params_hash` | VARCHAR | Hash of the similarity threshold, minimum cluster size, and normalizer version this decision was made under. |
+| `at` | VARCHAR | ISO-8601 UTC — when the pass made this decision. |
 
 ### `sync_events.parquet`
 

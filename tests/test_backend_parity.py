@@ -675,3 +675,116 @@ def psycopg_dropped_tables(config: Any):
     finally:
         state.close()
     yield
+
+
+# ---------------------------------------------------------------------------
+# Agent-memory maintenance on Postgres (compaction plan, Phase 3/5)
+# ---------------------------------------------------------------------------
+#
+# The three cases below each reproduce a real bug SQLite's unenforced-FK,
+# sqlite3-only-syntax path let through silently: (1) `memory_records`
+# declared a `FOREIGN KEY (artifact_id) REFERENCES artifacts(id)` that
+# `delete_source_artifacts`/`delete_artifacts` deliberately violate by
+# design (they leave a memory's row while deleting its artifact row, to
+# preserve earned `uses`/`salience`/`observations` — see those methods'
+# docstrings); Postgres enforces that FK and aborted the whole transaction.
+# (2) `PostgresBackend.statement()` discarded `cursor.rowcount`, so
+# `subsume_records`/`delete_artifacts` raised `AttributeError` the moment
+# either ran against a real Postgres connection. (3) `subsume_records`'s
+# ledger insert used SQLite-only `INSERT OR IGNORE`, a hard `SyntaxError`
+# under Postgres, where the portable form is `INSERT ... ON CONFLICT ...
+# DO NOTHING` (used everywhere else in this codebase already). None of
+# these three surfaced in the offline suite, because SQLite never enforces
+# a declared FK (no `PRAGMA foreign_keys=ON` anywhere) and never rejects
+# its own `OR IGNORE`/`rowcount` shape. CLAUDE.md rule 10.
+
+
+def _memory_config(root: Path, **memory_settings: Any) -> PheasantConfig:
+    (root / "memory").mkdir(exist_ok=True)
+    data: dict[str, Any] = {
+        "pheasant": {
+            "name": "pgmem",
+            "state_path": str(root / "state"),
+            "workspace_root": str(root),
+            "exports_path": str(root / "exports"),
+        },
+        "storage": {"backend": "postgres", "dsn_env": "PHEASANT_TEST_POSTGRES_DSN"},
+        "sync": {"watcher": {"enabled": False}, "scheduler": {"enabled": False}},
+        "memory": memory_settings,
+        "sources": [{"name": "agent-memory", "type": "memory", "path": "memory"}],
+    }
+    return PheasantConfig.model_validate(data)
+
+
+@postgres
+def test_targeted_archive_survives_the_memory_records_artifact_fk(tmp_path: Path) -> None:
+    """(1) and (2) together: a superseded record's targeted archive
+    (`_drop_archived` -> `state.delete_artifacts`, Phase 0) deletes the
+    `artifacts` row for a `memory_records` row it deliberately leaves in
+    place, and reads `cursor.rowcount` off the result."""
+
+    from pheasant.mcp_server.tools import PheasantTools
+    from pheasant.memory.maintenance import run_memory_maintenance
+
+    config = _memory_config(tmp_path)
+    tools = PheasantTools(config)
+    try:
+        old = tools.memory_write("pgmem", "The paydb service runs in us-east-2.", scope="org")[
+            "record"
+        ]
+        tools.memory_write(
+            "pgmem",
+            "The paydb service now runs in eu-west-1.",
+            scope="org",
+            supersedes=old["record_id"],
+        )
+
+        result = run_memory_maintenance(tools.engine)
+        assert result is not None
+        assert result["report"]["archived_superseded"] == [old["record_id"]]
+        assert result["sync"]["removed"] == [old["record_id"]]
+    finally:
+        tools.engine.close()
+
+
+@postgres
+def test_compaction_and_scope_budgets_run_against_postgres(tmp_path: Path) -> None:
+    """(2) and (3): `subsume_records`'s `UPDATE ... RETURNING`-free
+    demotion (rowcount) and its ledger `INSERT ... ON CONFLICT DO NOTHING`
+    (Phase 3), driven by a per-scope budget prune (Phase 5) in the same
+    maintenance pass."""
+
+    from pheasant.mcp_server.tools import PheasantTools
+    from pheasant.memory.maintenance import run_memory_maintenance
+
+    config = _memory_config(tmp_path, compaction_enabled=True, session_max_records=1)
+    tools = PheasantTools(config)
+    try:
+        tools.memory_write(
+            "pgmem",
+            "The paydb service runs in us-east-2 and is owned by ada.",
+            scope="org",
+            subject="paydb",
+        )
+        tools.memory_write(
+            "pgmem",
+            "The paydb service runs in us-east-2 and is owned by ada, per the latest inventory.",
+            scope="org",
+            subject="paydb",
+        )
+        tools.memory_write("pgmem", "Session scratch note alpha.", scope="session")
+        tools.memory_write("pgmem", "Session scratch note beta.", scope="session")
+
+        result = run_memory_maintenance(tools.engine)
+        assert result is not None
+        assert result.get("compaction", {}).get("subsumed")
+        assert result.get("pruned")
+
+        # A second pass over the same content does nothing new — the
+        # idempotency the ledger's `INSERT ... ON CONFLICT DO NOTHING`
+        # exists to guarantee, verified against a real Postgres connection
+        # rather than SQLite's unenforced version of the same statement.
+        again = run_memory_maintenance(tools.engine)
+        assert not again.get("compaction", {}).get("subsumed")
+    finally:
+        tools.engine.close()

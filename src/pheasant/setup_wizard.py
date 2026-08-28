@@ -737,6 +737,42 @@ def build_sections() -> list[Section]:
                     kind="int",
                     advanced=True,
                 ),
+                Question(
+                    key="memory.session_max_records",
+                    prompt="Maximum session-scope records (blank = unbounded)",
+                    help=(
+                        "Caps session scratch notes on their own, so a busy agent "
+                        "session cannot use its share of max_records to crowd out "
+                        "org-wide facts — each scope is its own pool."
+                    ),
+                    kind="int",
+                    advanced=True,
+                ),
+                Question(
+                    key="memory.user_max_records",
+                    prompt="Maximum per-user records (blank = unbounded)",
+                    help="Same isolation, for one user's own memories.",
+                    kind="int",
+                    advanced=True,
+                ),
+                Question(
+                    key="memory.org_max_records",
+                    prompt="Maximum org-scope records (blank = unbounded)",
+                    help="The shared, everyone-reads-it pool's own cap, isolated the same way.",
+                    kind="int",
+                    advanced=True,
+                ),
+                Question(
+                    key="memory.max_records_per_subject",
+                    prompt="Maximum records per subject, across scopes (blank = unbounded)",
+                    help=(
+                        "Caps how many records can accumulate about one named entity "
+                        "(a service, a person, a project) before the least salient are "
+                        "archived. Records with no subject are unaffected."
+                    ),
+                    kind="int",
+                    advanced=True,
+                ),
             ],
         ),
         Section(

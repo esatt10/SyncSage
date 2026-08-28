@@ -861,6 +861,23 @@ def create_app(
     async def lifespan(app: FastAPI):
         import asyncio
 
+        import anyio.to_thread
+
+        # `max_concurrent_requests` bounds how many requests
+        # `ConcurrencyLimiter` admits before shedding with a 429 (Phase
+        # 35.6); anyio's shared worker-thread pool — what every sync `def`
+        # HTTP route and every `/mcp` tool call actually runs on — is a
+        # *separate* budget, defaulted to 40 by anyio and never sized
+        # against this one. Admitting more requests than the pool has
+        # tokens re-admits exactly the silent queuing the limiter exists to
+        # replace with a fast, explicit 429. Only ever raised, never
+        # lowered: this field's job is "shed above N", not "run with fewer
+        # worker threads than anyio's own default".
+        max_concurrent = cors_settings.max_concurrent_requests
+        if max_concurrent > 0:
+            pool = anyio.to_thread.current_default_thread_limiter()
+            pool.total_tokens = max(pool.total_tokens, max_concurrent)
+
         # Drain-on-SIGTERM is installed *here*, not before `uvicorn.run()`.
         # uvicorn installs its own graceful-shutdown handler inside `run()`,
         # so a handler installed earlier is simply replaced and never fires.
@@ -1063,6 +1080,15 @@ def create_app(
         Carries the role so a pod can be identified from a probe response —
         "which of these five containers is the indexer" is otherwise a
         question you answer by reading manifests.
+
+        ``async def`` — deliberately, though this handler does no I/O at
+        all — because a sync ``def`` route is dispatched through anyio's
+        shared worker-thread pool exactly like every other sync route, and
+        that pool has nothing to do with the shed-exemption below. This is
+        the liveness probe: a busy pod that fails it gets restarted by the
+        thing meant to protect it. Measured: with the pool's forty tokens
+        held by other sync handlers, a sync ``def /health`` took 4.29s to
+        answer; this one, unaffected by the pool, took 0.05s.
         """
 
         payload = {"status": "ok", "service": "pheasant", "role": role_policy.name}
@@ -1086,6 +1112,15 @@ def create_app(
         replica that stayed unready through a multi-hour first index would
         take the whole Service down for that time — which is the opposite of
         what the readiness probe is for.
+
+        ``async def`` for the same reason as `/health`: this route is
+        exempt from shedding (`deployment/serving.py`'s ``ALWAYS_ALLOWED``),
+        and that exemption is worthless if the route still queues for an
+        anyio thread-pool token like a non-exempt one would. The one blocking
+        call left (`state.rows`) is offloaded explicitly below rather than
+        left to make the whole route sync, so a saturated pool can still
+        delay this probe briefly on that one call — but never on FastAPI's
+        own dispatch, which no longer costs a token at all.
         """
 
         payload: dict[str, object] = {
@@ -1273,7 +1308,7 @@ def create_app(
             return queue
 
     @app.get("/metrics")
-    def metrics_endpoint() -> PlainTextResponse:
+    async def metrics_endpoint() -> PlainTextResponse:
         """Prometheus exposition text (Phase 35.1).
 
         Named ``metrics_endpoint``, not ``metrics``: every route in this module
@@ -1285,15 +1320,33 @@ def create_app(
         Graph size and job state are sampled here rather than tracked
         incrementally: both are cheap to read, and a gauge updated from a
         write path drifts the moment any path forgets to update it.
+
+        ``async def`` for the same reason as `/health` and `/ready`: this
+        route is shed-exempt and that exemption means nothing if it still
+        queues for an anyio thread-pool token. Only `queue.depth()` is
+        genuinely blocking (a SQL query, or on the ``nats`` backend a broker
+        round trip through `sync/queue.py`'s own event-loop bridge), so only
+        that call is offloaded; the graph and job reads above it are
+        in-memory and stay on the loop.
         """
 
+        import anyio.to_thread
+
         graph = serving_graph
+        pool = anyio.to_thread.current_default_thread_limiter()
         sample: dict[str, object] = {
             "pheasant_graph_nodes": graph.number_of_nodes(),
             "pheasant_graph_edges": graph.number_of_edges(),
             "pheasant_requests_inflight": limiter.inflight,
             "pheasant_requests_capacity_remaining": limiter.capacity_remaining,
             "pheasant_draining": 1.0 if drain_state.draining else 0.0,
+            # The budget every sync HTTP route and every /mcp tool call
+            # shares (see docs/configuration.md's "Serving durability"
+            # section). Sits next to pheasant_requests_inflight because a
+            # pool that's the actual bottleneck should be visible next to
+            # the request-admission count, not just inferred from it.
+            "pheasant_threadpool_tokens_total": pool.total_tokens,
+            "pheasant_threadpool_tokens_available": pool.available_tokens,
         }
         sample.update(jobs.metrics_sample())
         # With the durable queue on, the backlog outlives this process, so
@@ -1311,7 +1364,7 @@ def create_app(
             # Closed by the lifespan's `finally`.
             queue = _metrics_queue()
             if queue is not None:
-                depth = queue.depth()
+                depth = await anyio.to_thread.run_sync(queue.depth)
                 sample["pheasant_index_queue_depth"] = depth.get(PENDING, 0)
                 sample["pheasant_index_inflight"] = depth.get(INFLIGHT, 0)
                 sample["pheasant_index_dead_letters"] = depth.get(DEAD, 0)
@@ -1895,6 +1948,8 @@ def create_app(
         Uploading again into the same source name adds to it rather than
         replacing it, which is what "drop a few more files in" should mean.
         """
+        import anyio.to_thread
+
         from pheasant.api.uploads import safe_filename, store_upload, upload_root
 
         if not files:
@@ -1904,72 +1959,86 @@ def create_app(
         limits = config.sync.limits
         max_bytes = (limits.max_file_size_mb or 0) * 1024 * 1024 or None
 
-        stored: list[dict] = []
-        rejected: list[dict] = []
-        for upload in files:
-            data = await upload.read()
-            try:
-                record = store_upload(
-                    directory,
-                    upload.filename or "upload",
-                    data,
-                    max_bytes=max_bytes,
-                )
-            except ValueError as exc:
-                # One bad file must not lose the good ones in the same drop.
-                rejected.append({"filename": upload.filename, "error": str(exc)})
-                continue
-            stored.append(record.__dict__)
-        if not stored:
-            raise HTTPException(
-                status_code=400,
-                detail="; ".join(item["error"] for item in rejected) or "Nothing stored",
-            )
+        # Reading each upload's body is genuine async I/O and stays on the
+        # event loop. Everything after it — the disk write, the source
+        # registry, the audit log, and (wait=True) the whole sync pipeline —
+        # is blocking, synchronous work, so it moves onto a worker thread
+        # below. Left on the loop, one slow upload stalls every other
+        # request this process is serving: measured, a single wait=true
+        # upload delayed a *concurrently issued* GET /ready by the same ~5s
+        # the upload itself took.
+        pairs: list[tuple[str | None, bytes]] = [
+            (upload.filename, await upload.read()) for upload in files
+        ]
 
-        registry = SourceRegistry(config, state)
-        existing = next((s for s in config.sources if s.name == name), None)
-        if existing is None:
-            source = _source_from_payload(
-                {
-                    "name": name,
-                    "type": "document_folder",
-                    "path": str(directory),
-                    "description": f"Documents uploaded through the UI ({name})",
-                    # Uploads are arbitrary documents, not a code tree: the
-                    # default include list is code-shaped and would silently
-                    # drop a dropped PDF or .docx.
-                    "include": ["**/*"],
-                }
-            )
-            registry.register_source(source)
-            config.sources = [s for s in config.sources if s.name != name]
-            config.sources.append(source)
-        audit(name, "upload_documents", {"files": [item["filename"] for item in stored]})
-
-        syncing = False
-        job_id = None
-        queued: list[str] = []
-        sync_result = None
-        if sync_now:
-            if wait:
+        def _finish_upload() -> dict:
+            stored: list[dict] = []
+            rejected: list[dict] = []
+            for filename, data in pairs:
                 try:
-                    sync_result = _index(name, "incremental")["results"][0]
-                except (KeyError, ValueError) as exc:
-                    raise HTTPException(status_code=400, detail=str(exc)) from exc
-            else:
-                job_id, queued = _start_background_sync(name, "incremental")
-                syncing = job_id is not None or bool(queued)
-        return {
-            "status": "stored",
-            "source_name": name,
-            "path": str(directory),
-            "stored": stored,
-            "rejected": rejected,
-            "syncing": syncing,
-            "job_id": job_id,
-            "queued_tasks": queued,
-            "sync_result": sync_result,
-        }
+                    record = store_upload(
+                        directory,
+                        filename or "upload",
+                        data,
+                        max_bytes=max_bytes,
+                    )
+                except ValueError as exc:
+                    # One bad file must not lose the good ones in the same drop.
+                    rejected.append({"filename": filename, "error": str(exc)})
+                    continue
+                stored.append(record.__dict__)
+            if not stored:
+                raise HTTPException(
+                    status_code=400,
+                    detail="; ".join(item["error"] for item in rejected) or "Nothing stored",
+                )
+
+            registry = SourceRegistry(config, state)
+            existing = next((s for s in config.sources if s.name == name), None)
+            if existing is None:
+                source = _source_from_payload(
+                    {
+                        "name": name,
+                        "type": "document_folder",
+                        "path": str(directory),
+                        "description": f"Documents uploaded through the UI ({name})",
+                        # Uploads are arbitrary documents, not a code tree: the
+                        # default include list is code-shaped and would silently
+                        # drop a dropped PDF or .docx.
+                        "include": ["**/*"],
+                    }
+                )
+                registry.register_source(source)
+                config.sources = [s for s in config.sources if s.name != name]
+                config.sources.append(source)
+            audit(name, "upload_documents", {"files": [item["filename"] for item in stored]})
+
+            syncing = False
+            job_id = None
+            queued: list[str] = []
+            sync_result = None
+            if sync_now:
+                if wait:
+                    try:
+                        sync_result = _index(name, "incremental")["results"][0]
+                    except (KeyError, ValueError) as exc:
+                        raise HTTPException(status_code=400, detail=str(exc)) from exc
+                else:
+                    job_id, queued = _start_background_sync(name, "incremental")
+                    syncing = job_id is not None or bool(queued)
+            return {
+                "status": "stored",
+                "source_name": name,
+                "path": str(directory),
+                "stored": stored,
+                "rejected": rejected,
+                "syncing": syncing,
+                "job_id": job_id,
+                "queued_tasks": queued,
+                "sync_result": sync_result,
+            }
+
+        return await anyio.to_thread.run_sync(_finish_upload)
 
     @app.get("/fs/host-path")
     def fs_host_path(path: str) -> dict:
@@ -2008,6 +2077,7 @@ def create_app(
 
     @app.post("/memory")
     def memory_write(req: MemoryWriteRequest) -> dict:
+        from pheasant.memory.reinforcement import StateReinforcementIndex
         from pheasant.memory.store import MemoryStore, memory_source
 
         source = memory_source(config, state)
@@ -2019,8 +2089,13 @@ def create_app(
                     "source to pheasant.yaml"
                 ),
             )
+        # Phase 1: see the matching comment in mcp_server/tools.py:memory_write.
+        reinforcement = (
+            StateReinforcementIndex(state) if config.memory.reinforcement_enabled else None
+        )
         try:
-            record, created = MemoryStore(source.path).append(
+            store = MemoryStore(source.path)
+            record, created = store.append(
                 req.text,
                 scope=req.scope,
                 subject=req.subject,
@@ -2029,6 +2104,7 @@ def create_app(
                 kind=req.kind,
                 written_by=req.principal,
                 valid_until=req.valid_until,
+                reinforcement=reinforcement,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2044,7 +2120,17 @@ def create_app(
                     "will not do."
                 ),
             ) from exc
-        payload: dict = {"record": record.as_dict(), "created": created, "source": source.name}
+        outcome = store.last_outcome or ("created" if created else "duplicate")
+        metrics.record_memory_write(outcome, store.last_fold)
+        payload: dict = {
+            "record": record.as_dict(),
+            "created": created,
+            "source": source.name,
+            "outcome": outcome,
+        }
+        submitted = (req.text or "").strip()
+        if not created and submitted and submitted != record.text:
+            payload["submitted_text"] = submitted
         # The record is already durably on disk; this sync only makes it
         # *searchable now*. Failing the whole request when it cannot run — most
         # often because another writer holds the engine lease, which a live run
@@ -2054,7 +2140,11 @@ def create_app(
         if req.sync and created:
             if role_policy.indexes_locally:
                 try:
-                    payload["sync"] = engine.sync_source(source.name, "incremental").__dict__
+                    # Interactive writes skip whole-graph enrichment and leave
+                    # a durable dirty marker for the next ordinary sync.
+                    payload["sync"] = engine.sync_source(
+                        source.name, "incremental", enrich="deferred"
+                    ).__dict__
                 except Exception as exc:
                     logger.warning("memory write indexed later: %s", exc)
                     payload["sync_deferred"] = str(exc)
@@ -2095,7 +2185,19 @@ def create_app(
             records = MemoryStore(source.path).list_records(scope, current_only=current_only)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"source": source.name, "records": [r.as_dict() for r in records]}
+        # Phase 3: see the matching comment in mcp_server/tools.py:memory_list.
+        try:
+            compaction = {str(row["record_id"]): row for row in state.memory_compaction_rows()}
+        except Exception:
+            compaction = {}
+        out = []
+        for record in records:
+            payload = record.as_dict()
+            row = compaction.get(record.record_id)
+            payload["tier"] = str(row["tier"]) if row and row.get("tier") else "hot"
+            payload["subsumed_by"] = row.get("subsumed_by") if row else None
+            out.append(payload)
+        return {"source": source.name, "records": out}
 
     @app.post("/memory/enable")
     def memory_enable(req: MemoryEnableRequest) -> dict:
@@ -2193,6 +2295,28 @@ def create_app(
                 )
             }
         audit(result["source"], "memory_consolidate", result["report"])
+        return result
+
+    @app.post("/memory/synthesize")
+    def memory_synthesize() -> dict:
+        """LLM-merge a near-duplicate memory cluster deterministic
+        compaction could not resolve into one canonical record. Off by
+        default (`memory.synthesis.enabled`) and never automatic — see
+        `MemorySynthesisSettings`. 200 with `{"skipped": reason}` when
+        synthesis is disabled, no memory source is configured, or no model
+        is reachable — matching `POST /memory/consolidate`'s posture: this
+        is a well-formed request the server declined by its own
+        configuration, not a client error.
+        """
+        from pheasant.memory.store import MemoryStore, memory_source
+        from pheasant.memory.synthesis import run_synthesis
+
+        source = memory_source(config, state)
+        if source is None:
+            return {"skipped": "no `type: memory` source is configured"}
+        records = MemoryStore(source.path).list_records()
+        result = run_synthesis(engine, records, config.memory.synthesis, source)
+        audit(source.name, "memory_synthesize", result)
         return result
 
     @app.post("/security/idp/sync")
@@ -3592,8 +3716,20 @@ def create_app(
         waiting rather than wondering. The work runs in a worker thread and
         the steps arrive through a queue, so a slow reader can never stall the
         workflow itself.
+
+        ``publish`` below is deliberately an **async** generator polling the
+        queue with ``get_nowait``, not a sync generator blocking on
+        ``events.get()`` — the same reasoning as ``/jobs/stream`` above.
+        Starlette runs a sync generator in the anyio thread pool and cannot
+        interrupt it, so a client that disconnects (or just an agentic
+        workflow that runs long) leaves that worker thread — and its
+        thread-pool token — held until ``run()``'s ``finally`` finally puts
+        the ``None`` sentinel. Measured: ten abandoned streams pinned ten of
+        the pool's forty tokens for the whole ~8s a stubbed workflow took to
+        finish. An async generator never touches the pool at all.
         """
 
+        import asyncio
         import json as json_module
         import queue as queue_module
         import threading
@@ -3649,9 +3785,15 @@ def create_app(
 
         threading.Thread(target=run, name="pheasant-chat-stream", daemon=True).start()
 
-        def publish():
+        poll_seconds = 0.25
+
+        async def publish():
             while True:
-                item = events.get()
+                try:
+                    item = events.get_nowait()
+                except queue_module.Empty:
+                    await asyncio.sleep(poll_seconds)
+                    continue
                 if item is None:
                     return
                 yield f"data: {json_module.dumps(item)}\n\n"
