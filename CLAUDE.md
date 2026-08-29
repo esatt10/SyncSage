@@ -275,6 +275,13 @@ record, indexed by the ordinary pipeline. Recall *is* search. On top of that:
   memory is a candidate that something *admits*, and admission goes through
   `MemoryStore.append` like every other write, so invariant 1 never bends.
   Dimensioned by identity / session / modality (`ui|mcp|a2a|cli`) / criteria.
+  Trace and timestamp are guaranteed, not best-effort: `NOT NULL` in the
+  schema, rejected-and-counted before the insert if absent, `duration_ms`
+  always set and taken from a **monotonic** clock while `started_at` is wall
+  clock. The trace is ambient for the call and injected into every hop
+  pheasant makes of its own — the graph-query call, remote preparation, and
+  `index_tasks.payload` (attached *after* the id digest, or the content-
+  addressed dedup that makes two replicas enqueue one task would break).
   `docs/memory-formation.md`.
 
 ### Scale

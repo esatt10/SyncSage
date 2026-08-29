@@ -20,6 +20,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
+from pheasant.telemetry.interactions import inject_traceparent
+
 
 class GraphQueryError(RuntimeError):
     """The configured graph-query service could not answer a request."""
@@ -104,6 +106,11 @@ class GraphQueryClient:
             }
             if host_header:
                 headers["Host"] = host_header
+            # Carry the caller's trace across the hop. Without it a trace stops
+            # dead at this boundary: an operator sees "search took four
+            # seconds" and cannot see that most of it was this one call. A
+            # no-op outside a traced request, which is every sync.
+            inject_traceparent(headers)
             request = Request(target, data=body, method="POST", headers=headers)
             try:
                 with self._opener.open(request, timeout=self.timeout) as response:

@@ -541,8 +541,9 @@ def register_default_metrics(version: str) -> None:
         "pheasant_interaction_events_dropped_total",
         "Observations discarded rather than recorded, by reason: "
         "'buffer_full' (the request-path ring overflowed), 'queue_full' "
-        "(the log queue is past max_queue_depth), 'no_sink' (nowhere "
-        "writable and no spool configured), or 'error'.",
+        "(the log queue is past max_queue_depth), 'malformed' (no trace id "
+        "or no timestamp -- the two things every row must have), 'no_sink' "
+        "(nowhere writable and no spool configured), or 'error'.",
         ("reason",),
     )
     REGISTRY.gauge(

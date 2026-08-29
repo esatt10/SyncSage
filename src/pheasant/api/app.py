@@ -1293,7 +1293,7 @@ def create_app(
         finally:
             limiter.release(path)
 
-    def _record_stream_answer(parent: Any, req: Any, answer: Any) -> None:
+    def _record_stream_answer(parent: Any, req: Any, answer: Any, started: Any) -> None:
         """Observe a streamed answer as a child of the request that opened it.
 
         The request's own event was buffered the moment this route returned
@@ -1309,7 +1309,11 @@ def create_app(
 
             settings = config.observability.interactions
             event = child_event(parent, "/assistant/chat/stream")
-            event.duration_ms = None
+            # Timed from the child's own start, not the request's: this span
+            # exists precisely to say how long generating the answer took,
+            # which is the slowest thing in the region and the only part the
+            # request's own span cannot see.
+            event.duration_ms = round((time.perf_counter() - started) * 1000.0, 3)
             record_retrieval(
                 None,
                 query=req.question,
@@ -2141,6 +2145,7 @@ def create_app(
         import hashlib
 
         from pheasant.sync.queue import IndexTask, queue_from_config
+        from pheasant.telemetry.interactions import traceparent_header
 
         queue = queue_from_config(config, state)
         if queue is None:  # pragma: no cover - validate_role refuses this at startup
@@ -2162,6 +2167,15 @@ def create_app(
                         + json.dumps(payload, sort_keys=True, separators=(",", ":"))
                     ).encode()
                 ).hexdigest()[:24]
+                # Attached *after* the digest, never before: the task id is
+                # content-addressed over the payload so two replicas answering
+                # one double-click enqueue one task, and a per-request value in
+                # there would defeat that entirely. A task already pending
+                # keeps the first requester's trace, which is honest -- that is
+                # the request the run belongs to.
+                traceparent = traceparent_header()
+                if traceparent:
+                    payload = {**payload, "traceparent": traceparent}
                 task = IndexTask(
                     id=f"idx-{digest}",
                     source_id=name,
@@ -4070,6 +4084,9 @@ def create_app(
         # Captured here, in the request, because `run()` executes on a worker
         # thread after this route has already returned its response object.
         parent_event = observed(request)
+        # Monotonic, like every other duration here: a wall-clock delta across a
+        # generation that can take a minute is exactly where an NTP step shows up.
+        answer_started = time.perf_counter()
 
         def run() -> None:
             try:
@@ -4100,7 +4117,7 @@ def create_app(
                         }
                     ),
                 )
-                _record_stream_answer(parent_event, req, answer)
+                _record_stream_answer(parent_event, req, answer, answer_started)
                 events.put({"type": "answer", "answer": answer})
             except Exception as exc:  # surfaced to the client, never a 500 mid-stream
                 logger.exception("streaming chat failed")

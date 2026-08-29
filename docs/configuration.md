@@ -833,9 +833,9 @@ attached — `pytest` stays network-free by construction rather than by mocking.
 
 | Field | Notes |
 |---|---|
-| `id`, `trace_id`, `span_id`, `parent_span_id` | Correlation. `id` is `blake2b(trace_id\|span_id)`, so a redelivered batch dedups instead of double-counting. An inbound W3C `traceparent` is adopted, so an agent's trace continues into this one. A streamed answer is a **child** row: it outlives the request that opened it, so it gets its own span under the same trace rather than a racing late edit of the request's. |
+| `id`, `trace_id`, `span_id`, `parent_span_id` | Correlation, and `NOT NULL` apart from the parent (a root span genuinely has none). `id` is `blake2b(trace_id\|span_id)`, so a redelivered batch dedups instead of double-counting. An inbound W3C `traceparent` is adopted, so an agent's trace continues into this one. A streamed answer is a **child** row: it outlives the request that opened it, so it gets its own span under the same trace rather than a racing late edit of the request's. |
 | `modality`, `operation`, `principal`, `session_id`, `client_id` | The four dimensions formation slices on. All caller-asserted, exactly like `principal` already is everywhere else in pheasant. |
-| `started_at`, `duration_ms`, `status` | `status` is `ok` \| `error` \| `shed`; a 429 under saturation is recorded, because it is the signal that says thresholds are being reached more slowly than traffic suggests. |
+| `started_at`, `duration_ms`, `status` | `started_at` and `status` are `NOT NULL`. `duration_ms` is always set, including on a call that raised, and comes from a monotonic clock so an NTP step cannot produce a negative one. `status` is `ok` \| `error` \| `shed`; a 429 under saturation is recorded, because it is the signal that says thresholds are being reached more slowly than traffic suggests. |
 | `query_text` | The question, from MCP tool arguments or an HTTP request body. |
 | `answer_text` | The assistant's answer, when there was one. Capped by `max_answer_chars`. |
 | `criteria_json` | The filter object the caller passed — mode, source filters, `min_score`, section. |

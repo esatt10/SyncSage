@@ -11,6 +11,7 @@ take on trust:
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from typing import Any
@@ -841,3 +842,164 @@ def test_a_streamed_answer_is_a_child_of_the_request_that_opened_it(tmp_path: Pa
     # body, and the answer did not exist when its span closed. Formation reads
     # rows with a question, which is exactly the child.
     assert parent["query_text"] is None
+
+
+# --------------------------------------------------------------------------
+# Timestamps and traces: the two things every row must have
+# --------------------------------------------------------------------------
+
+
+def test_every_row_carries_a_trace_and_a_timestamp() -> None:
+    """The schema says NOT NULL on both; `is_writable` is what keeps a batch
+    from failing wholesale on a row that lacks them."""
+
+    from pheasant.persistence.schema import CORE_SCHEMA
+
+    table = CORE_SCHEMA[CORE_SCHEMA.index("CREATE TABLE IF NOT EXISTS interaction_events") :]
+    table = table[: table.index(");")]
+    for column in ("trace_id", "span_id", "started_at", "status"):
+        assert f"{column} TEXT NOT NULL" in table, f"{column} must be NOT NULL"
+    # A root span genuinely has no parent, so this one is nullable on purpose.
+    assert "parent_span_id TEXT," in table
+
+
+def test_a_duration_is_always_recorded() -> None:
+    """`duration_ms` is the one column an operator reads to find slow calls.
+    A null there is a row that cannot answer the question it exists for."""
+
+    buffer = InteractionBuffer(NullSink(), capacity=10, batch_size=99, interval_seconds=99)
+
+    with observe(buffer, InteractionContext.create(Modality.UI), kb_id="kb", operation="/search"):
+        pass
+    with pytest.raises(ValueError):
+        with observe(buffer, InteractionContext.create(Modality.UI), kb_id="kb", operation="x"):
+            raise ValueError("boom")
+
+    recorded = buffer._drain(2)
+    assert len(recorded) == 2
+    # Including the failed call: how long a request took before it failed is
+    # exactly as interesting as how long a successful one took.
+    assert all(event.duration_ms is not None and event.duration_ms >= 0 for event in recorded)
+
+
+def test_durations_come_from_a_monotonic_clock() -> None:
+    """Subtracting two wall-clock readings makes an NTP step mid-request emit
+    a negative or wildly inflated duration -- nonsense in the one column an
+    operator reads to find slow calls."""
+
+    import pheasant.telemetry.interactions as module
+
+    source = inspect.getsource(module.observe)
+    assert "time.perf_counter()" in source
+    assert "utc_now() - started" not in source
+
+
+def test_a_trace_is_ambient_only_for_the_duration_of_a_call() -> None:
+    buffer = InteractionBuffer(NullSink(), capacity=10, batch_size=99, interval_seconds=99)
+    from pheasant.telemetry.interactions import current_trace, traceparent_header
+
+    assert current_trace() is None
+    with observe(buffer, InteractionContext.create(Modality.UI), kb_id="kb", operation="/search"):
+        inside = traceparent_header()
+        assert inside is not None
+        assert current_trace() is not None
+    assert current_trace() is None
+    assert traceparent_header() is None
+
+
+def test_an_outbound_hop_carries_the_callers_trace() -> None:
+    """Without this a trace stops dead at pheasant's own boundary: an operator
+    sees "search took four seconds" and cannot see that most of it was one
+    graph-query call to another pod."""
+
+    from pheasant.telemetry.interactions import inject_traceparent
+
+    buffer = InteractionBuffer(NullSink(), capacity=10, batch_size=99, interval_seconds=99)
+    context = InteractionContext.create(
+        Modality.MCP, traceparent="00-" + "a" * 32 + "-" + "b" * 16 + "-01"
+    )
+
+    with observe(buffer, context, kb_id="kb", operation="/search"):
+        headers = inject_traceparent({"Authorization": "Bearer x"})
+
+    assert headers["Authorization"] == "Bearer x"
+    # Same trace as the caller's, a new span for our own work.
+    assert headers["traceparent"].startswith("00-" + "a" * 32 + "-")
+    assert "b" * 16 not in headers["traceparent"]
+
+
+def test_no_ambient_trace_means_no_header_rather_than_an_empty_one() -> None:
+    """Every sync is in this state today. A blank or zeroed traceparent would
+    be worse than none: the spec reserves all-zero ids as invalid, and a
+    collector would collapse every such hop into one shared trace."""
+
+    from pheasant.telemetry.interactions import inject_traceparent
+
+    assert inject_traceparent({"a": "1"}) == {"a": "1"}
+
+
+def test_a_queued_task_carries_the_trace_of_the_request_that_queued_it() -> None:
+    """`POST /sync` and the indexer that runs it, minutes later in another
+    process, must be one trace -- not two unrelated ones for one thing a
+    person asked for."""
+
+    from pheasant.telemetry.interactions import adopt_trace, traceparent_header
+
+    published = "00-" + "c" * 32 + "-" + "d" * 16 + "-01"
+
+    assert traceparent_header() is None
+    with adopt_trace(published):
+        assert traceparent_header() == published
+        # And every hop the indexer makes onward inherits it.
+        from pheasant.telemetry.interactions import inject_traceparent
+
+        assert inject_traceparent({})["traceparent"] == published
+    assert traceparent_header() is None
+
+
+@pytest.mark.parametrize("value", [None, "", "garbage", "00-" + "0" * 32 + "-" + "d" * 16 + "-01"])
+def test_an_unusable_queued_trace_is_no_trace_never_a_failure(value: str) -> None:
+    """A sync must never fail because a header was malformed."""
+
+    from pheasant.telemetry.interactions import adopt_trace, traceparent_header
+
+    with adopt_trace(value):
+        assert traceparent_header() is None
+
+
+def test_the_trace_a_row_carries_is_the_one_hops_propagate(otel_spans: Any) -> None:
+    """With the SDK running, the row adopts the SDK's ids -- so the ambient
+    trace has to be re-published, or an outbound hop would carry the ids we
+    minted before the SDK spoke and the collector would show two traces."""
+
+    from pheasant.telemetry.interactions import inject_traceparent
+
+    buffer = InteractionBuffer(NullSink(), capacity=10, batch_size=99, interval_seconds=99)
+    with observe(buffer, InteractionContext.create(Modality.MCP), kb_id="kb", operation="/search"):
+        propagated = inject_traceparent({})["traceparent"]
+
+    event = buffer._drain(1)[0]
+    span = otel_spans.get_finished_spans()[0]
+    assert propagated == f"00-{event.trace_id}-{event.span_id}-01"
+    assert event.trace_id == format(span.get_span_context().trace_id, "032x")
+
+
+def test_an_event_without_a_trace_is_counted_not_silently_dropped() -> None:
+    """A defect that only ever shows up as a slightly smaller ledger is a
+    defect nobody finds."""
+
+    from pheasant.telemetry.interactions import events_from_batch
+
+    before = _dropped("malformed")
+    events = events_from_batch(
+        {
+            "events": [
+                _event(1).as_json(),
+                {"kb_id": "kb", "operation": "x"},  # no trace, no timestamp
+                "not-an-event",
+            ]
+        }
+    )
+
+    assert len(events) == 1
+    assert _dropped("malformed") - before == 2

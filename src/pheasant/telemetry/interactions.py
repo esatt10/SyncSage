@@ -39,12 +39,14 @@ by construction rather than by mocking: an exporter is attached only when
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
 import re
 import secrets
 import threading
+import time
 from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
@@ -157,6 +159,86 @@ def parse_traceparent(header: str | None) -> tuple[str, str] | None:
     if trace == _ALL_ZERO_TRACE or span == _ALL_ZERO_SPAN:
         return None
     return trace, span
+
+
+#: The trace the calling thread is inside, if any.
+#:
+#: A context variable rather than an argument because the alternative is
+#: threading `(trace_id, span_id)` through every call between a request
+#: handler and an outbound HTTP hop -- a signature change on code that has no
+#: other reason to know about tracing, which is how propagation gets dropped
+#: the first time someone adds a call site.
+#:
+#: Note it does **not** cross a bare `threading.Thread`: contextvars follow
+#: asyncio tasks, not raw threads. That is why the sync path (which prepares
+#: files on an executor) is not propagated through here -- a sync has no
+#: ambient interaction trace to begin with, so the helpers below return None
+#: there and every call site is a harmless no-op until syncs are traced too.
+_CURRENT_TRACE: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "pheasant_current_trace", default=None
+)
+
+
+def current_trace() -> tuple[str, str] | None:
+    """``(trace_id, span_id)`` for the call in progress, or ``None``."""
+
+    return _CURRENT_TRACE.get()
+
+
+def traceparent_header(sampled: bool = True) -> str | None:
+    """The W3C ``traceparent`` for the call in progress, or ``None``.
+
+    What makes a trace survive pheasant's own service hops. Without it a
+    trace stops dead at the region's boundary: an operator sees "search took
+    four seconds" and cannot see that most of it was one graph-query call to
+    another pod.
+    """
+
+    trace = current_trace()
+    if trace is None:
+        return None
+    trace_id, span_id = trace
+    return f"00-{trace_id}-{span_id}-{'01' if sampled else '00'}"
+
+
+def inject_traceparent(headers: dict[str, str]) -> dict[str, str]:
+    """Add ``traceparent`` to an outbound header dict, when there is one.
+
+    Mutates and returns, so a call site reads as one line beside the other
+    headers it already sets.
+    """
+
+    header = traceparent_header()
+    if header:
+        headers["traceparent"] = header
+    return headers
+
+
+@contextmanager
+def adopt_trace(traceparent: str | None) -> Iterator[None]:
+    """Run a block inside a trace that arrived from somewhere else.
+
+    What links a request to the work it queued. `POST /sync` publishes a task
+    carrying its `traceparent`; the indexer that claims it -- a different
+    process, possibly minutes later -- runs the sync inside that trace, so the
+    preparation calls it makes onward carry it too. Without this the chain
+    breaks at the queue and an operator sees two unrelated traces for one
+    thing a person asked for.
+
+    An unparseable value is not an error: it means "no trace", and a sync must
+    never fail because a header was malformed.
+    """
+
+    parsed = parse_traceparent(traceparent)
+    if parsed is None:
+        yield
+        return
+    trace_id, span_id = parsed
+    token = _CURRENT_TRACE.set((trace_id, span_id))
+    try:
+        yield
+    finally:
+        _CURRENT_TRACE.reset(token)
 
 
 def event_id(trace_id: str, span_id: str) -> str:
@@ -880,6 +962,12 @@ def observe(
     """
 
     started = utc_now()
+    # Wall clock for `started_at` (it has to be comparable across processes and
+    # sortable in SQL), monotonic for the duration. Subtracting two wall-clock
+    # readings makes an NTP step mid-request emit a negative or wildly inflated
+    # duration -- a nonsense row in the one column an operator reads to find
+    # slow calls.
+    ticked = time.perf_counter()
     event = InteractionEvent(
         kb_id=kb_id,
         operation=operation,
@@ -892,6 +980,7 @@ def observe(
         parent_span_id=context.parent_span_id,
         started_at=_iso(started),
     )
+    token = _CURRENT_TRACE.set((event.trace_id, event.span_id))
     span_cm = None
     if TRACING.enabled and TRACING.tracer is not None:
         span_cm = TRACING.tracer.start_as_current_span(
@@ -905,13 +994,17 @@ def observe(
         adopted = TRACING.current_ids()
         if adopted is not None:
             event.trace_id, event.span_id = adopted
+            # Re-publish: an outbound hop must carry the ids the collector
+            # will show, not the ones we minted before the SDK spoke.
+            _CURRENT_TRACE.reset(token)
+            token = _CURRENT_TRACE.set((event.trace_id, event.span_id))
     try:
         yield event
     except Exception:
         event.status = "error"
         raise
     finally:
-        event.duration_ms = round((utc_now() - started).total_seconds() * 1000.0, 3)
+        event.duration_ms = round((time.perf_counter() - ticked) * 1000.0, 3)
         if event.result_count is None and event.result_ids:
             event.result_count = len(event.result_ids)
         if span_cm is not None:
@@ -920,6 +1013,7 @@ def observe(
                 span_cm.__exit__(None, None, None)
             except Exception:  # noqa: BLE001 - a span must not break a request
                 logger.debug("Span exit failed", exc_info=True)
+        _CURRENT_TRACE.reset(token)
         if buffer is not None:
             buffer.record(event)
 
@@ -1075,15 +1169,25 @@ def events_from_batch(payload: dict[str, Any]) -> list[InteractionEvent]:
     """Parse a queued batch back into events, skipping anything malformed."""
 
     out: list[InteractionEvent] = []
+    malformed = 0
     for raw in payload.get("events") or []:
         if not isinstance(raw, dict):
+            malformed += 1
             continue
         try:
             event = InteractionEvent.from_json(raw)
         except (TypeError, ValueError):
+            malformed += 1
             continue
         if event.is_writable:
             out.append(event)
+        else:
+            malformed += 1
+    # Counted, not silent. A trace id and a timestamp are the two things every
+    # row must have, so an event arriving without them is a defect somewhere
+    # upstream -- and a defect that only ever manifests as a slightly smaller
+    # ledger is a defect nobody finds.
+    _dropped("malformed", malformed)
     return out
 
 

@@ -276,6 +276,55 @@ matches against, so a `preference` rule minted from them can actually fire.
 lets `retrieval-gap-v1` tell "nothing matched" from "matched more than we
 bothered to record".
 
+### Timestamps and traces are guaranteed, not best-effort
+
+`trace_id`, `span_id`, `started_at` and `status` are `NOT NULL` in the schema,
+and an event missing any of them is rejected before the insert — counted as
+`pheasant_interaction_events_dropped_total{reason="malformed"}` rather than
+silently skipped, because a defect that only ever shows up as a slightly
+smaller ledger is a defect nobody finds. `parent_span_id` is nullable on
+purpose: a root span genuinely has no parent.
+
+`duration_ms` is always set, including on a call that raised — how long a
+request took before it failed is exactly as interesting as how long a
+successful one took. It comes from a **monotonic** clock while `started_at`
+comes from the wall clock: `started_at` has to be comparable across processes
+and sortable in SQL, but subtracting two wall-clock readings makes an NTP step
+mid-request emit a negative or wildly inflated duration, which is nonsense in
+the one column an operator reads to find slow calls.
+
+**A trace survives pheasant's own hops.** The trace of the call in progress is
+ambient, and every outbound hop injects it:
+
+```
+agent (traceparent) ─► POST /sync ──► index_tasks.payload.traceparent
+                          │                      │
+                          │                      ▼  claimed, minutes later,
+                          │              indexer adopts the trace
+                          ▼                      │
+                   graph-query hop        remote preparation hop
+```
+
+Without that, a trace stops dead at the region's boundary: an operator sees
+"search took four seconds" and cannot see that most of it was one graph-query
+call to another pod, or that a sync a person asked for is the same event as
+the indexing that happened later in a different process.
+
+Two details that matter. The task's `traceparent` is attached **after** the
+task id digest, never before — the id is content-addressed over the payload so
+that two replicas answering one double-click enqueue one task, and a
+per-request value inside the digest would defeat that entirely. And a
+malformed or all-zero inbound `traceparent` means "no trace", never an error:
+the spec reserves all-zero ids as invalid, and a sync must not fail because a
+header was garbled.
+
+The ambient trace is a context variable, which follows asyncio but **not** a
+raw thread. A role that indexes locally runs its sync on a background thread,
+so the hand-off there is untraced; the fleet hand-off — an `api` replica
+publishing to a queue an indexer drains — happens inline in the request and is
+carried. Syncs do not yet start traces of their own, so every injection point
+is a no-op until one is ambient.
+
 **A streamed answer is a child row.** `/assistant/chat/stream` returns its
 response object before the answer exists, so the request's own event is
 already buffered by then; mutating it afterwards would be a race whose outcome

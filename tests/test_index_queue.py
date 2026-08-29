@@ -8,6 +8,7 @@ timeouts, concurrent claims — exists to make that first claim safe.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -1100,3 +1101,71 @@ def test_a_full_sync_all_runs_over_nats(tmp_path: Path) -> None:
 
     assert [result.source_id for result in results] == ["src0", "src1", "src2"]
     assert all(result.indexed_artifacts == 2 for result in results)
+
+
+def test_a_queued_sync_carries_the_trace_of_the_request_that_asked_for_it(
+    tmp_path: Path,
+) -> None:
+    """`POST /sync` publishes; an indexer in another process runs it. Without a
+    trace on the task those are two unrelated traces for one thing a person
+    asked for.
+
+    The trace is attached *after* the task id digest, never before: the id is
+    content-addressed over the payload so two replicas answering one
+    double-click enqueue one task, and a per-request value inside the digest
+    would defeat that entirely.
+    """
+
+    from fastapi.testclient import TestClient
+
+    from pheasant.api.app import create_app
+
+    # The `api` role, because that is the one that publishes: a role that
+    # indexes locally runs the sync on a background thread instead, and a
+    # contextvar does not cross a raw thread -- so the trace is carried where
+    # the hand-off actually is, which is the fleet.
+    config = _config(tmp_path, state_name="traced", sources=1, queue={"enabled": True})
+    config.observability.interactions.enabled = True
+    app = create_app(config, role="api")
+    inbound = "00-" + "a" * 32 + "-" + "b" * 16 + "-01"
+
+    with TestClient(app) as client:
+        # `wait: false` is the path that publishes instead of syncing inline.
+        first = client.post("/sync", json={"wait": False}, headers={"traceparent": inbound})
+        assert first.status_code < 400, first.text
+        second = client.post("/sync", json={"wait": False}, headers={"traceparent": inbound})
+        assert second.status_code < 400, second.text
+
+    store = _store(config)
+    try:
+        rows = store.rows("SELECT id, payload FROM index_tasks", ())
+        # Still one task: the digest did not move.
+        assert len(rows) == 1
+        payload = json.loads(rows[0]["payload"] or "{}")
+        assert payload["traceparent"].startswith("00-" + "a" * 32 + "-")
+    finally:
+        store.close()
+
+
+def test_an_untraced_sync_queues_a_task_with_no_traceparent(tmp_path: Path) -> None:
+    """Observation is off by default, so the ordinary case must be byte-for-byte
+    what it always was -- no extra payload key, and therefore the same task id."""
+
+    from fastapi.testclient import TestClient
+
+    from pheasant.api.app import create_app
+
+    config = _config(tmp_path, state_name="untraced", sources=1, queue={"enabled": True})
+    app = create_app(config, role="api")
+    with TestClient(app) as client:
+        response = client.post("/sync", json={"wait": False})
+        assert response.status_code < 400, response.text
+
+    store = _store(config)
+    try:
+        payload = json.loads(
+            store.rows("SELECT payload FROM index_tasks", ())[0]["payload"] or "{}"
+        )
+        assert "traceparent" not in payload
+    finally:
+        store.close()
