@@ -1,5 +1,6 @@
 import type {
   MemoryConsolidateResponse,
+  MemoryCandidateListResponse,
   MemoryListResponse,
   MemoryWriteResponse,
   AssistantStatus,
@@ -421,6 +422,23 @@ export const api = {
       method: "POST",
       body: JSON.stringify({}),
     }),
+
+  // Formation candidates. These are NOT memories: nothing listed here is
+  // retrievable, and nothing becomes retrievable until somebody promotes it.
+  // That review step is what lets a region learn from how it is used without
+  // a session's traffic quietly turning into knowledge.
+  memoryCandidates: (params: { status?: string; rule_id?: string } = {}) =>
+    request<MemoryCandidateListResponse>(`/memory/candidates${qs(params)}`),
+  memoryCandidatePromote: (id: string) =>
+    request<{ candidate_id: string; record_id: string }>(
+      `/memory/candidates/${encodeURIComponent(id)}/promote`,
+      { method: "POST" },
+    ),
+  memoryCandidateReject: (id: string) =>
+    request<{ candidate_id: string; rejected: boolean }>(
+      `/memory/candidates/${encodeURIComponent(id)}/reject`,
+      { method: "POST" },
+    ),
 
   // Graph diagnostics + path finding (the full-screen workspace)
   graphDiagnostics: (top = 20) =>

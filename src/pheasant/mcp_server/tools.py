@@ -632,6 +632,65 @@ class PheasantTools:
             "records": out,
         }
 
+    def list_memory_candidates(
+        self,
+        knowledge_base: str,
+        status: str = "pending",
+        rule_id: str | None = None,
+        principal: str | None = None,
+        max_results: int = 50,
+    ) -> dict:
+        """List memory the region has *proposed* but nothing has admitted yet.
+
+        These are not memories. Nothing here is retrievable, and nothing
+        becomes retrievable until it is promoted --- which is the whole reason
+        a region can learn from how it is used without a UI session's traffic
+        quietly turning into knowledge.
+
+        Each candidate carries the evidence behind it: which rule proposed it,
+        how many times the pattern was observed, and across how many sessions.
+        Read that before promoting; a proposal is a suggestion, not a finding.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        return {
+            "candidates": self.engine.state.list_memory_candidates(
+                status=status or None,
+                rule_id=rule_id,
+                principal=principal,
+                limit=max(1, min(int(max_results), 200)),
+            ),
+            "counts": self.engine.state.memory_candidate_counts(),
+        }
+
+    def promote_memory_candidate(
+        self, knowledge_base: str, candidate_id: str, principal: str | None = None
+    ) -> dict:
+        """Admit one proposal, making it an ordinary memory record.
+
+        The record is written through the same path `memory_write` uses and
+        indexed by the same pipeline, so it competes for a slot on the same
+        ranking as anything else --- it simply was not typed by anyone.
+        """
+
+        from pheasant.memory.formation import admit
+
+        self._require_knowledge_base(knowledge_base)
+        return admit(self.engine, candidate_id, admitted_by=principal or "mcp")
+
+    def reject_memory_candidate(
+        self, knowledge_base: str, candidate_id: str, principal: str | None = None
+    ) -> dict:
+        """Decline one proposal, permanently.
+
+        The rule that proposed it will not suggest it again.
+        """
+
+        from pheasant.memory.formation import reject
+
+        self._require_knowledge_base(knowledge_base)
+        return reject(self.engine, candidate_id, rejected_by=principal or "mcp")
+
     def memory_consolidate(self, knowledge_base: str) -> dict:
         """Run one memory-consolidation pass now (Step 33.2).
 

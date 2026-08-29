@@ -342,6 +342,46 @@ CREATE TABLE IF NOT EXISTS index_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_index_tasks_claim
   ON index_tasks(status, visible_at, enqueued_at);
+-- Memory candidates: what formation proposes, before anything admits it.
+--
+-- Evidence, never memory. A row here is a *suggestion* derived from the
+-- observation plane; it becomes knowledge only when something admits it, and
+-- admission goes through MemoryStore.append like every other write. That is
+-- what keeps memory's first invariant intact while still letting the region
+-- learn from how it is used.
+--
+-- `id` is content-addressed over (rule, scope, subject, kind, normalized text,
+-- params_hash), so a rule re-deriving the same proposal on the next beat
+-- updates the counters on the row it already wrote instead of piling up
+-- duplicates -- the same property `memory_compactions` gets from hashing its
+-- own fields.
+--
+-- **A rejected candidate is never re-proposed.** The upsert below only ever
+-- refreshes a row that is still `pending`, so `rejected` stays rejected and
+-- `admitted` stays admitted, exactly as `index_tasks` keeps a dead task dead.
+-- Without that, a rule would re-suggest on every beat something a person has
+-- already said no to.
+CREATE TABLE IF NOT EXISTS memory_candidates (
+  id TEXT PRIMARY KEY,
+  rule_id TEXT NOT NULL,
+  params_hash TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  subject TEXT,
+  kind TEXT NOT NULL DEFAULT 'fact',
+  text TEXT NOT NULL,
+  written_by TEXT,
+  evidence_json TEXT,
+  observations INTEGER NOT NULL DEFAULT 1,
+  sessions INTEGER NOT NULL DEFAULT 1,
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  admitted_by TEXT,
+  record_id TEXT,
+  decided_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memory_candidates_status
+  ON memory_candidates(status, last_seen);
 -- The log tier's own queue, deliberately NOT a `kind` column on index_tasks.
 -- Observations arrive at request rate against a corpus that changes hourly at
 -- most, so sharing a table would mean request-rate churn on the very index

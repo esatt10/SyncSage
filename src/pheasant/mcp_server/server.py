@@ -249,6 +249,51 @@ def create_mcp_server(config: PheasantConfig) -> Any:
 
     @mcp.tool()
     @anticipated
+    def list_memory_candidates(
+        knowledge_base: str,
+        status: str = "pending",
+        rule_id: str | None = None,
+        principal: str | None = None,
+        max_results: int = 50,
+    ) -> dict:
+        """List memory this region has proposed but nothing has admitted yet.
+
+        These are NOT memories: nothing here is retrievable, and nothing
+        becomes retrievable until it is promoted. Each carries the evidence
+        behind it (which rule, how many observations, across how many
+        sessions) -- read that before promoting. A proposal is a suggestion,
+        not a finding.
+        """
+
+        return tools.list_memory_candidates(knowledge_base, status, rule_id, principal, max_results)
+
+    @mcp.tool()
+    @anticipated
+    def promote_memory_candidate(
+        knowledge_base: str, candidate_id: str, principal: str | None = None
+    ) -> dict:
+        """Admit one proposed memory, making it an ordinary record.
+
+        It is written through the same path memory_write uses and indexed
+        identically, so it competes on the same ranking as anything else.
+        """
+
+        return tools.promote_memory_candidate(knowledge_base, candidate_id, principal)
+
+    @mcp.tool()
+    @anticipated
+    def reject_memory_candidate(
+        knowledge_base: str, candidate_id: str, principal: str | None = None
+    ) -> dict:
+        """Decline one proposed memory, permanently.
+
+        The rule that proposed it will not suggest it again.
+        """
+
+        return tools.reject_memory_candidate(knowledge_base, candidate_id, principal)
+
+    @mcp.tool()
+    @anticipated
     def memory_consolidate(knowledge_base: str) -> dict:
         """Archive superseded/expired memory records and re-index the memory source."""
 

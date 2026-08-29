@@ -22,8 +22,11 @@ from pheasant.memory.formation import (
     MAX_QUERIES,
     SESSION_DIGEST_RULE,
     SessionObservations,
+    admit,
     collect_sessions,
     digest_text,
+    reject,
+    run_candidate_rules,
     run_session_digests,
 )
 from pheasant.memory.maintenance import run_memory_maintenance
@@ -535,3 +538,383 @@ def test_a_session_with_no_principal_still_forms(tmp_path: Path, bad: str | None
 
     store = MemoryStore(memory_source(engine.config, engine.state).path)
     assert store.list_records(current_only=True)[0].written_by is None
+
+
+# --------------------------------------------------------------------------
+# Candidates: the crossing, and the review gate in front of it
+# --------------------------------------------------------------------------
+
+
+def _corpus_engine(tmp_path: Path, **formation: Any) -> Any:
+    """An engine over a corpus that says `pheasant-flock` where a team says
+    `router` -- the shape every mining rule is looking for."""
+
+    from pheasant.api.app import create_app
+
+    config, path = _config(tmp_path, **formation)
+    docs = tmp_path / "ws" / "docs"
+    (docs / "deploy").mkdir(parents=True, exist_ok=True)
+    (docs / "deploy" / "rollout.md").write_text(
+        "# Rollout\n\nThe pheasant-flock service coordinates every rollout.\n", encoding="utf-8"
+    )
+    (docs / "deploy" / "canary.md").write_text(
+        "# Canary\n\nCanary steps are driven by the pheasant-flock service.\n", encoding="utf-8"
+    )
+    app = create_app(config, config_path=str(path))
+    app.state.engine.sync_source("docs", "full")
+    return app.state.engine
+
+
+def _ask(engine: Any, session: str, query: str, *, start: int, hits: list[str]) -> None:
+    ids, paths = [], []
+    for stable_id in hits:
+        ids.append(f"file:docs:{stable_id}:branch=none")
+        paths.append(stable_id)
+    write_events(
+        engine.state,
+        [
+            InteractionEvent(
+                kb_id="kb",
+                operation="/search",
+                modality="ui",
+                principal="user:ada",
+                session_id=session,
+                trace_id=f"{start:032x}",
+                span_id=f"{start:016x}",
+                started_at=f"2026-01-01T00:00:{start:02d}.000000Z",
+                status="ok",
+                query_text=query,
+                result_ids=ids,
+                result_paths=paths,
+                result_count=len(hits),
+                top_score=0.8 if hits else None,
+            )
+        ],
+    )
+
+
+def test_a_word_the_corpus_never_uses_becomes_an_alias_proposal(tmp_path: Path) -> None:
+    """The rule that finds team vocabulary. Aliases are the one part of memory
+    that improves queries returning no memory at all, and this finds them
+    without anyone writing them by hand."""
+
+    engine = _corpus_engine(tmp_path, min_observations=2, min_sessions=2)
+    for index, session in enumerate(("s1", "s2")):
+        _ask(engine, session, "router rollout", start=index * 10, hits=["deploy/rollout.md"])
+        _ask(engine, session, "router canary", start=index * 10 + 1, hits=["deploy/canary.md"])
+
+    run_candidate_rules(engine)
+
+    aliases = engine.state.list_memory_candidates(rule_id="alias-cooccurrence-v1")
+    assert [c["text"] for c in aliases] == ["router -> pheasant-flock"]
+    assert aliases[0]["kind"] == "alias"
+    assert aliases[0]["scope"] == "org"
+    assert aliases[0]["sessions"] == 2
+
+
+def test_a_different_inflection_is_not_proposed_as_an_alias(tmp_path: Path) -> None:
+    """Without this guard the rule proposes things like `coordination ->
+    check`: the word is literally absent from documents that say "coordinates",
+    so the absence test passes and the rule reaches for whatever term they
+    share. Found on a real fixture, not imagined."""
+
+    engine = _corpus_engine(tmp_path, min_observations=2, min_sessions=2)
+    for index, session in enumerate(("s1", "s2")):
+        _ask(
+            engine,
+            session,
+            "rollout coordination",
+            start=index * 10,
+            hits=["deploy/rollout.md", "deploy/canary.md"],
+        )
+        _ask(
+            engine,
+            session,
+            "rollout coordination steps",
+            start=index * 10 + 1,
+            hits=["deploy/rollout.md", "deploy/canary.md"],
+        )
+
+    run_candidate_rules(engine)
+
+    proposals = [c["text"] for c in engine.state.list_memory_candidates()]
+    assert not any(text.startswith("coordination ->") for text in proposals)
+
+
+def test_a_query_family_that_lands_in_one_directory_becomes_a_preference(
+    tmp_path: Path,
+) -> None:
+    engine = _corpus_engine(tmp_path, min_observations=2, min_sessions=2)
+    for index, session in enumerate(("s1", "s2")):
+        _ask(engine, session, "router rollout", start=index * 10, hits=["deploy/rollout.md"])
+        _ask(engine, session, "router canary", start=index * 10 + 1, hits=["deploy/canary.md"])
+
+    run_candidate_rules(engine)
+
+    prefs = engine.state.list_memory_candidates(rule_id="path-affinity-v1")
+    assert "when: router -> prefer: deploy/" in [c["text"] for c in prefs]
+    # A `preference` rule, parseable by the steering engine that will run it.
+    from pheasant.memory.steering import parse_rule
+
+    assert parse_rule("preference", prefs[0]["text"]) is not None
+
+
+def test_a_prefix_is_cut_at_a_directory_boundary() -> None:
+    """`docs/deploy.md` and `docs/deployment.md` share the characters
+    `docs/deploy`, which is not a directory -- a preference rule matching it
+    would match neither file the way an operator expects."""
+
+    from pheasant.memory.formation import _path_prefix
+
+    assert _path_prefix(["docs/deploy.md", "docs/deployment.md"]) == "docs/"
+    assert _path_prefix(["a/b/one.md", "a/b/two.md"]) == "a/b/"
+    # One path is a hit, not a pattern.
+    assert _path_prefix(["a/b/one.md"]) is None
+    # Nothing in common is not an affinity.
+    assert _path_prefix(["a/one.md", "b/two.md"]) is None
+    # A root-level file has no directory to prefer.
+    assert _path_prefix(["one.md", "two.md"]) is None
+
+
+def test_a_question_nothing_answers_becomes_a_gap_proposal(tmp_path: Path) -> None:
+    """A gap is "no results at all", never "nothing scored well". Fused RRF
+    scores are small positive numbers whose scale depends on how many arms
+    contributed, so a score threshold would be a tuning knob pretending to be
+    a fact."""
+
+    engine = _corpus_engine(tmp_path, min_observations=2, min_sessions=2)
+    for index, session in enumerate(("s1", "s2")):
+        _ask(engine, session, "how do I rotate the vault seal", start=index * 10, hits=[])
+
+    run_candidate_rules(engine)
+
+    gaps = engine.state.list_memory_candidates(rule_id="retrieval-gap-v1")
+    assert len(gaps) == 1
+    assert "how do I rotate the vault seal" in gaps[0]["text"]
+    # About the corpus, not about whoever hit it.
+    assert gaps[0]["scope"] == "org"
+    assert gaps[0]["written_by"] is None
+
+
+def test_a_pattern_seen_in_one_session_only_is_not_proposed(tmp_path: Path) -> None:
+    """One session repeating itself is a habit; several agreeing is a signal.
+    Without `min_sessions` a single loop could mint steering that re-ranks
+    results for everyone."""
+
+    engine = _corpus_engine(tmp_path, min_observations=2, min_sessions=2)
+    _ask(engine, "s1", "router rollout", start=0, hits=["deploy/rollout.md"])
+    _ask(engine, "s1", "router canary", start=1, hits=["deploy/canary.md"])
+
+    run_candidate_rules(engine)
+
+    assert engine.state.list_memory_candidates() == []
+
+
+def test_promoting_a_candidate_writes_an_ordinary_record(tmp_path: Path) -> None:
+    """**The crossing.** Through `MemoryStore.append`, so the result is an
+    ordinary file indexed by the ordinary pipeline -- no second ingestion
+    path for a formed record any more than for a written one."""
+
+    engine = _corpus_engine(tmp_path, min_observations=2, min_sessions=2)
+    for index, session in enumerate(("s1", "s2")):
+        _ask(engine, session, "router rollout", start=index * 10, hits=["deploy/rollout.md"])
+        _ask(engine, session, "router canary", start=index * 10 + 1, hits=["deploy/canary.md"])
+    run_candidate_rules(engine)
+    candidate = engine.state.list_memory_candidates(rule_id="alias-cooccurrence-v1")[0]
+
+    result = admit(engine, candidate["id"], admitted_by="user:ada")
+
+    store = MemoryStore(memory_source(engine.config, engine.state).path)
+    record = next(r for r in store.list_records() if r.record_id == result["record_id"])
+    assert record.text == "router -> pheasant-flock"
+    assert record.kind == "alias"
+    assert "formed" in record.tags
+    assert "alias-cooccurrence-v1" in record.tags
+    # And the candidate now points at what it became.
+    decided = engine.state.get_memory_candidate(candidate["id"])
+    assert decided["status"] == "admitted"
+    assert decided["record_id"] == result["record_id"]
+    assert decided["admitted_by"] == "user:ada"
+
+
+def test_a_rejected_proposal_is_never_proposed_again(tmp_path: Path) -> None:
+    """Re-suggesting what somebody just declined is the fastest way to make a
+    review queue worth ignoring."""
+
+    engine = _corpus_engine(tmp_path, min_observations=2, min_sessions=2)
+    for index, session in enumerate(("s1", "s2")):
+        _ask(engine, session, "router rollout", start=index * 10, hits=["deploy/rollout.md"])
+        _ask(engine, session, "router canary", start=index * 10 + 1, hits=["deploy/canary.md"])
+    run_candidate_rules(engine)
+    candidate = engine.state.list_memory_candidates(rule_id="alias-cooccurrence-v1")[0]
+    reject(engine, candidate["id"], rejected_by="user:ada")
+
+    # The evidence has not gone anywhere, so the rule re-derives the same
+    # proposal -- and the upsert must refuse to reopen it.
+    run_candidate_rules(engine)
+
+    assert engine.state.get_memory_candidate(candidate["id"])["status"] == "rejected"
+    assert engine.state.list_memory_candidates(rule_id="alias-cooccurrence-v1") == []
+
+
+def test_a_decision_is_final(tmp_path: Path) -> None:
+    """Two reviewers racing on one candidate must not both admit it, or the
+    region gets two identical records."""
+
+    engine = _corpus_engine(tmp_path, min_observations=2, min_sessions=2)
+    for index, session in enumerate(("s1", "s2")):
+        _ask(engine, session, "router rollout", start=index * 10, hits=["deploy/rollout.md"])
+        _ask(engine, session, "router canary", start=index * 10 + 1, hits=["deploy/canary.md"])
+    run_candidate_rules(engine)
+    candidate = engine.state.list_memory_candidates()[0]
+    admit(engine, candidate["id"], admitted_by="user:ada")
+
+    with pytest.raises(ValueError, match="already admitted"):
+        admit(engine, candidate["id"], admitted_by="user:bo")
+
+
+def test_promoting_something_that_does_not_exist_says_so(tmp_path: Path) -> None:
+    engine = _corpus_engine(tmp_path)
+
+    with pytest.raises(KeyError, match="Unknown memory candidate"):
+        admit(engine, "nope", admitted_by="user:ada")
+
+
+def test_auto_admit_is_off_by_default_and_admits_when_on(tmp_path: Path) -> None:
+    """Off for the same reason `compaction_enabled` is: it changes what a
+    *default* query returns."""
+
+    engine = _corpus_engine(tmp_path, min_observations=2, min_sessions=2)
+    for index, session in enumerate(("s1", "s2")):
+        _ask(engine, session, "router rollout", start=index * 10, hits=["deploy/rollout.md"])
+        _ask(engine, session, "router canary", start=index * 10 + 1, hits=["deploy/canary.md"])
+
+    report = run_candidate_rules(engine)
+    assert "admitted" not in report
+    assert engine.state.memory_candidate_counts().get("admitted") is None
+
+    engine.config.memory.formation.auto_admit = True
+    admitted = run_candidate_rules(engine)["admitted"]
+    assert admitted
+    store = MemoryStore(memory_source(engine.config, engine.state).path)
+    formed = [r for r in store.list_records() if "formed" in r.tags]
+    assert formed
+    # Still distinguishable from something a person wrote.
+    decided = engine.state.list_memory_candidates(status="admitted")
+    assert all(c["admitted_by"].startswith("rule:") for c in decided)
+
+
+def test_candidates_expire_but_rejections_do_not(tmp_path: Path) -> None:
+    """A stale proposal is noise in a queue; a rejection is a decision."""
+
+    from datetime import timedelta
+
+    from pheasant.memory.formation import expire_candidates
+
+    engine = _corpus_engine(tmp_path, min_observations=2, min_sessions=2, candidate_ttl_days=1)
+    for index, session in enumerate(("s1", "s2")):
+        _ask(engine, session, "router rollout", start=index * 10, hits=["deploy/rollout.md"])
+        _ask(engine, session, "router canary", start=index * 10 + 1, hits=["deploy/canary.md"])
+    run_candidate_rules(engine)
+    rejected = engine.state.list_memory_candidates()[0]
+    reject(engine, rejected["id"], rejected_by="user:ada")
+
+    later = datetime.now(UTC) + timedelta(days=400)
+    assert expire_candidates(engine, now=later) >= 1
+
+    counts = engine.state.memory_candidate_counts()
+    assert counts.get("rejected") == 1
+    assert counts.get("pending") is None
+
+
+def test_tightening_a_threshold_proposes_anew_rather_than_rewriting(tmp_path: Path) -> None:
+    """`params_hash` is part of the candidate id, so a proposal a person has
+    already seen is never silently re-evidenced under different parameters."""
+
+    from pheasant.memory.formation import params_hash
+
+    loose = _config(tmp_path, min_observations=2)[0].memory.formation
+    tight = _config(tmp_path, min_observations=9)[0].memory.formation
+    assert params_hash(loose) != params_hash(tight)
+
+
+# --------------------------------------------------------------------------
+# The review surfaces
+# --------------------------------------------------------------------------
+
+
+def test_the_http_surface_lists_promotes_and_rejects(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from pheasant.api.app import create_app
+
+    config, path = _config(tmp_path, min_observations=2, min_sessions=2)
+    docs = tmp_path / "ws" / "docs"
+    (docs / "deploy").mkdir(parents=True, exist_ok=True)
+    (docs / "deploy" / "rollout.md").write_text(
+        "# Rollout\n\nThe pheasant-flock service coordinates every rollout.\n", encoding="utf-8"
+    )
+    (docs / "deploy" / "canary.md").write_text(
+        "# Canary\n\nCanary steps are driven by the pheasant-flock service.\n", encoding="utf-8"
+    )
+    app = create_app(config, config_path=str(path))
+    engine = app.state.engine
+    engine.sync_source("docs", "full")
+    for index, session in enumerate(("s1", "s2")):
+        _ask(engine, session, "router rollout", start=index * 10, hits=["deploy/rollout.md"])
+        _ask(engine, session, "router canary", start=index * 10 + 1, hits=["deploy/canary.md"])
+    run_candidate_rules(engine)
+
+    with TestClient(app) as client:
+        listing = client.get("/memory/candidates")
+        assert listing.status_code == 200
+        candidates = listing.json()["candidates"]
+        assert candidates, "the rules proposed nothing to review"
+
+        promoted = client.post(f"/memory/candidates/{candidates[0]['id']}/promote")
+        assert promoted.status_code == 200
+        assert promoted.json()["record_id"].startswith("mem-")
+
+        # A decision is final, and the surface says so rather than writing a
+        # second identical record.
+        again = client.post(f"/memory/candidates/{candidates[0]['id']}/promote")
+        assert again.status_code == 409
+
+        rejected = client.post(f"/memory/candidates/{candidates[1]['id']}/reject")
+        assert rejected.status_code == 200
+
+        assert client.post("/memory/candidates/nope/promote").status_code == 404
+        assert client.post("/memory/candidates/nope/reject").status_code == 404
+
+        remaining = client.get("/memory/candidates").json()
+        assert all(
+            c["id"] not in {candidates[0]["id"], candidates[1]["id"]}
+            for c in remaining["candidates"]
+        )
+        assert remaining["counts"]["admitted"] == 1
+        assert remaining["counts"]["rejected"] == 1
+
+
+def test_the_mcp_surface_is_additive(tmp_path: Path) -> None:
+    """Rule 8: the tool surface is public API. These are new names, and the
+    tools that were there before still answer exactly as they did."""
+
+    from pheasant.mcp_server.tools import PheasantTools
+
+    config, _path = _config(tmp_path)
+    tools = PheasantTools(config)
+    try:
+        for name in (
+            "list_memory_candidates",
+            "promote_memory_candidate",
+            "reject_memory_candidate",
+        ):
+            assert callable(getattr(tools, name))
+        # Nothing renamed or removed alongside them.
+        for existing in ("memory_write", "memory_consolidate", "search_context"):
+            assert callable(getattr(tools, existing))
+
+        listed = tools.list_memory_candidates("kb")
+        assert listed["candidates"] == []
+    finally:
+        tools.engine.close()

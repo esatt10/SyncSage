@@ -1314,6 +1314,24 @@ def main(argv: list[str] | None = None) -> int:
     # DuckDB itself is imported lazily, inside the functions that need it.
     from pheasant.analytics import EXPORTABLE
 
+    eval_p = sub.add_parser(
+        "eval", help="Build evaluation sets from what this region was really asked."
+    )
+    eval_sub = eval_p.add_subparsers(dest="eval_command", required=True)
+    eval_boot_p = eval_sub.add_parser(
+        "bootstrap",
+        help="Turn the interaction ledger into a de-identified evaluation case set.",
+    )
+    eval_boot_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
+    eval_boot_p.add_argument(
+        "--out",
+        default=None,
+        help="Where to write it. Default: <exports_path>/eval/cases.json",
+    )
+    eval_boot_p.add_argument(
+        "--limit", type=int, default=500, help="Maximum distinct questions (default: 500)"
+    )
+
     export_p = sub.add_parser(
         "export", help="Write Parquet exports of indexed state, and query them."
     )
@@ -1838,6 +1856,33 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             engine.close()
         print("Repair complete")
+        return 0
+    if args.command == "eval":
+        from pheasant.config.loader import load_config
+        from pheasant.evalset import bootstrap
+
+        cfg = load_config(Path(args.config))
+        # No graph: this reads the ledger and writes a JSON file. Materializing
+        # a graph for it would cost the whole corpus's memory for nothing.
+        engine = _engine(Path(args.config), load_persisted_graph=False)
+        try:
+            target = (
+                Path(args.out)
+                if args.out
+                else Path(cfg.pheasant.exports_path) / "eval" / "cases.json"
+            )
+            report = bootstrap(engine.state, target, limit=args.limit)
+        finally:
+            engine.close()
+        print(
+            f"Wrote {report['cases']} case(s) to {report['path']} "
+            f"({report['answered']} with a promoted answer, "
+            f"{report['unanswered']} that found nothing)."
+        )
+        print(
+            "Principals and sessions are per-export pseudonyms; two exports "
+            "cannot be joined to re-identify anyone."
+        )
         return 0
     if args.command == "export":
         from pheasant.analytics import (

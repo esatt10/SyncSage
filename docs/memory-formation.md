@@ -376,12 +376,42 @@ nothing, and "why does this candidate exist" always has an answer.
 | `path-affinity-v1` | a query family that consistently lands in one path prefix | a `preference` steering candidate |
 | `retrieval-gap-v1` | a query repeatedly returning nothing above `min_score` | a surfaced gap — what the region *cannot* answer |
 
-Three of the four produce **steering**, which is the direct answer to "memories
+Two of the four produce **steering**, which is the direct answer to "memories
 should be skills or helpful tidbits, and passive as much as possible".
 Steering is the one part of memory that improves queries returning no memory at
 all, it is excluded from result lists by default, and it is already measured:
 the config-level ablation moved team-vocabulary queries from 0.029 to 0.467
-while control queries moved by 0.000.
+while control queries moved by 0.000. These rules find such rules without
+anyone writing them by hand.
+
+#### How each one decides
+
+**`alias-cooccurrence-v1`** looks for a word the corpus does not use. If a
+query token retrieves documents and appears in *none* of them, the match came
+from the rest of the query — so the token is the team's word and the
+documents' own shared term is the corpus's. On a fixture where the docs say
+`pheasant-flock` and everyone asks about the `router`, it proposes exactly
+`router -> pheasant-flock`.
+
+It refuses two things. A term shared by *most* of the retrieved documents is a
+coincidence, so the target must appear in **all** of them; and a token that is
+merely a different form of a word they do use is an inflection, not a
+vocabulary gap. Without that second guard the rule proposes things like
+`coordination -> check`, because "coordination" is literally absent from
+documents that say "coordinates" — found on a real fixture, not imagined.
+
+**`path-affinity-v1`** proposes `when: <token> -> prefer: <dir>/` when a query
+family consistently lands in one place. The prefix is cut at a directory
+boundary: `docs/deploy.md` and `docs/deployment.md` share the characters
+`docs/deploy`, which is not a directory and would match neither file the way an
+operator expects.
+
+**`retrieval-gap-v1`** proposes a record naming a question the corpus keeps
+failing to answer. A gap is **no results at all**, never "nothing scored well":
+fused RRF scores are small positive numbers whose scale depends on how many
+arms contributed, so a threshold there is a tuning knob pretending to be a
+fact. `org` scope and no writer — a gap is a property of the corpus, not of
+whoever happened to hit it.
 
 `retrieval-gap-v1` is the honest form of *"more usage of the knowledge base
 expands its knowledge"*. Usage cannot conjure facts the corpus does not
@@ -459,6 +489,24 @@ field nobody authenticates.
 | **Review** | a person, in the Memory tab | **on** |
 | **Auto-admit** | a rule, above threshold | off |
 
+Promotion goes through `MemoryStore.append` — the same call a person or an
+agent makes — so a formed record is an ordinary file indexed by the ordinary
+pipeline. There is no second ingestion path for a formed record any more than
+for a written one, which is the entire point of making admission the only
+crossing.
+
+A **rejection is permanent**. The rule that proposed it re-derives the same
+proposal on the next beat and the store refuses to reopen it, because
+re-suggesting what somebody just declined is the fastest way to make a review
+queue worth ignoring. A pending proposal nobody acted on expires after
+`candidate_ttl_days`; a rejection never does.
+
+Surfaces: `GET /memory/candidates`, `POST /memory/candidates/{id}/promote`,
+`POST /memory/candidates/{id}/reject`, the MCP tools `list_memory_candidates` /
+`promote_memory_candidate` / `reject_memory_candidate`, and a **Proposed**
+section at the top of the Memory tab showing each proposal with the evidence
+behind it.
+
 Review is the default because plan 2 asked for it and because it is the
 conservative reading: a candidate is a suggestion until a person agrees. Every
 candidate shows the evidence that produced it.
@@ -480,13 +528,27 @@ with the results the region actually returned and — where a promotion followed
 set `memory/benchmark.py` consumes, alongside the synthetic generator that
 exists today.
 
+```bash
+pheasant eval bootstrap            # → <exports_path>/eval/cases.json
+```
+
+Distinct *questions*, not rows: the same query asked forty times is one case
+with `asked: 40`, which is both a smaller file and a better weight for a
+harness that wants to know what matters rather than what repeated. A question
+that found nothing is kept and counted — it is the most useful case in the set,
+because it is the one the region fails.
+
 **The export is derived and de-identified, never the raw table.**
 `analytics.py` excludes `source_audit_events` and `idp_groups` from Parquet
 exports on principle — *"who a principal is, which groups they are in, and what
 they did. An export is a file people pass around; identity and audit data is
 not that."* An interaction ledger is exactly that category, so principal and
-session are dropped or hashed on the way out, and cold storage lives outside
-`parquet/<kb_id>/`.
+session become **per-export pseudonyms**: stable within one file, so a harness
+can still tell that two cases came from one conversation, and useless for
+answering "what did Ada ask". The salt is random per export, so two exports
+cannot be intersected to re-identify anybody. Nothing else leaves — no trace
+ids, no client ids, no timings. Cold storage lives outside
+`parquet/<kb_id>/` for the same reason.
 
 ---
 

@@ -68,6 +68,7 @@ pheasant-kb/
 │   ├── quickstart.py          ← `pheasant up` config generation
 │   ├── capacity.py            ← the one home for sizing coefficients
 │   ├── analytics.py           ← Parquet exports + the DuckDB query surface
+│   ├── evalset.py             ← de-identified eval cases from the ledger
 │   ├── sharding.py            ← `pheasant shard plan`
 │   ├── jobs.py                ← per-source progress: phase, rate, ETA, stalled
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
@@ -83,7 +84,7 @@ pheasant-kb/
 │   ├── search/                ← sqlite_store (FTS5/tsvector + BM25),
 │   │                            graph_search, hybrid (RRF), criteria, vector
 │   ├── memory/                ← store, projection, policy, steering, salience,
-│   │                            bridge, maintenance, benchmark
+│   │                            bridge, maintenance, formation, benchmark
 │   ├── persistence/           ← state_store, backends (sqlite|postgres),
 │   │                            schema, graph_store, manifest, migrate, paths
 │   ├── mcp_server/            ← server.py (MCPServer), tools.py (PheasantTools)
@@ -132,6 +133,7 @@ pheasant backup|restore
 pheasant export parquet [--table NAME]      # /exports/parquet/<kb_id>/*.parquet
 pheasant export query "SELECT …"            # SQL over an export directory
 pheasant export tables [--schema]           # what is exportable; --schema for columns
+pheasant eval bootstrap                     # de-identified eval cases from real traffic
 pheasant mcp --transport stdio
 pheasant client-config claude-code|cursor|vscode
 pheasant config show                       # resolved config after profile+YAML+--set
@@ -293,7 +295,14 @@ record, indexed by the ordinary pipeline. Recall *is* search. On top of that:
   knowledge, which still takes an explicit promotion. Two guards keep a
   repeat pass free: a text short-circuit (cheap) and the store's own id
   dedup (sound, because `supersedes` is deliberately absent from the id
-  digest).
+  digest). Three further rules **propose** rather than write:
+  `alias-cooccurrence-v1` (a query word absent from everything it retrieved,
+  guarded against inflections — `coordination -> check` was a real false
+  positive), `path-affinity-v1` (prefix cut at a directory boundary) and
+  `retrieval-gap-v1` (a gap is *no results*, never a score threshold: fused
+  RRF scores have no absolute scale). A candidate crosses into memory only
+  through `MemoryStore.append`; a rejection is permanent, because
+  re-suggesting what someone declined makes a review queue worth ignoring.
 
 ### Scale
 

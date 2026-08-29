@@ -103,9 +103,25 @@ def _run(engine: Any, config: Any, settings: Any, source: Any, *, now: datetime 
     # digest written now should not be pruned by a pass that already ran, and
     # the record list above is the one it needs. Off by default; no-ops fast.
     if getattr(getattr(settings, "formation", None), "enabled", False):
-        from pheasant.memory.formation import run_session_digests
+        from pheasant.memory.formation import (
+            expire_candidates,
+            run_candidate_rules,
+            run_session_digests,
+        )
 
         formation = run_session_digests(engine, now=now, records=store.list_records())
+        candidates = run_candidate_rules(engine, now=now)
+        expired = expire_candidates(engine, now=now)
+        if candidates or expired:
+            result["candidates"] = {**candidates, **({"expired": expired} if expired else {})}
+            metrics.REGISTRY.replace(
+                "pheasant_memory_candidates",
+                {
+                    status: float(count)
+                    for status, count in engine.state.memory_candidate_counts().items()
+                },
+                label="status",
+            )
         if formation:
             result["formation"] = formation
             for outcome, key in (("created", "created"), ("refined", "refined")):

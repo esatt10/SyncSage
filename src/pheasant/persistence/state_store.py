@@ -230,6 +230,7 @@ class StateStore:
                 # before these existed would otherwise skip the DDL below and
                 # leave every ledger insert failing on a missing column.
                 "interaction_events": "answer_text",
+                "memory_candidates": "id",
             }
             schema_present = all(
                 column in self.backend.table_columns(table) for table, column in required.items()
@@ -1082,6 +1083,146 @@ class StateStore:
                     (row_id, op, member_id, canonical_id, rule_id, params_hash, now),
                 )
         return demoted
+
+    # -- memory candidates (formation) -------------------------------------
+
+    def upsert_memory_candidate(self, candidate: dict[str, Any]) -> bool:
+        """Record a proposal, or refresh the counters of one already open.
+
+        Returns True when the row is (still) ``pending`` afterwards --- that
+        is, when this proposal is live and awaiting a decision.
+
+        The ``WHERE`` on the conflict branch is the load-bearing part: it only
+        ever updates a row that is still pending, so **a rejected candidate is
+        never re-proposed** and an admitted one is never reopened. Without it a
+        rule would re-suggest on every beat the very thing a person just said
+        no to, which is the fastest way to make a review queue worthless. Same
+        shape `index_tasks` uses to keep a dead task dead.
+        """
+
+        rows = self.execute_returning(
+            "INSERT INTO memory_candidates("
+            "id, rule_id, params_hash, scope, subject, kind, text, written_by, "
+            "evidence_json, observations, sessions, first_seen, last_seen, status"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "observations=excluded.observations, sessions=excluded.sessions, "
+            "evidence_json=excluded.evidence_json, last_seen=excluded.last_seen "
+            "WHERE memory_candidates.status='pending' "
+            "RETURNING id",
+            (
+                str(candidate["id"]),
+                str(candidate["rule_id"]),
+                str(candidate["params_hash"]),
+                str(candidate["scope"]),
+                candidate.get("subject"),
+                str(candidate.get("kind") or "fact"),
+                str(candidate["text"]),
+                candidate.get("written_by"),
+                candidate.get("evidence_json"),
+                int(candidate.get("observations") or 1),
+                int(candidate.get("sessions") or 1),
+                str(candidate["first_seen"]),
+                str(candidate["last_seen"]),
+                "pending",
+            ),
+        )
+        return bool(rows)
+
+    def list_memory_candidates(
+        self,
+        *,
+        status: str | None = "pending",
+        rule_id: str | None = None,
+        principal: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Open proposals, most recently reinforced first.
+
+        ``principal`` narrows to what one caller may see: a candidate carrying
+        a writer is that principal's business alone, because the record it
+        would become is scoped to them. One with no writer is region-wide and
+        is visible to everybody --- the same rule `normalize_acl` applies to
+        the records themselves.
+        """
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if rule_id:
+            clauses.append("rule_id = ?")
+            params.append(rule_id)
+        if principal is not None:
+            clauses.append("(written_by IS NULL OR written_by = ?)")
+            params.append(principal)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(int(limit))
+        rows = self.rows(
+            "SELECT id, rule_id, params_hash, scope, subject, kind, text, written_by, "
+            "evidence_json, observations, sessions, first_seen, last_seen, status, "
+            "admitted_by, record_id, decided_at "
+            f"FROM memory_candidates{where} ORDER BY last_seen DESC, id LIMIT ?",
+            tuple(params),
+        )
+        return [dict(row) for row in rows]
+
+    def get_memory_candidate(self, candidate_id: str) -> dict[str, Any] | None:
+        rows = self.rows(
+            "SELECT id, rule_id, params_hash, scope, subject, kind, text, written_by, "
+            "evidence_json, observations, sessions, first_seen, last_seen, status, "
+            "admitted_by, record_id, decided_at "
+            "FROM memory_candidates WHERE id = ?",
+            (candidate_id,),
+        )
+        return dict(rows[0]) if rows else None
+
+    def decide_memory_candidate(
+        self,
+        candidate_id: str,
+        *,
+        status: str,
+        admitted_by: str,
+        record_id: str | None = None,
+        when: str,
+    ) -> bool:
+        """Mark a candidate admitted or rejected. Returns False if already decided.
+
+        Guarded on ``status='pending'`` so two reviewers racing on one
+        candidate cannot both admit it --- the second gets False and can say
+        so, instead of writing a second identical record.
+        """
+
+        rows = self.execute_returning(
+            "UPDATE memory_candidates SET status=?, admitted_by=?, record_id=?, "
+            "decided_at=? WHERE id=? AND status='pending' RETURNING id",
+            (str(status), str(admitted_by), record_id, str(when), str(candidate_id)),
+        )
+        return bool(rows)
+
+    def expire_memory_candidates(self, *, older_than: str) -> int:
+        """Retire proposals nobody acted on. Rejections are never touched.
+
+        A pending candidate that has gone stale is noise in a review queue; a
+        rejection is a decision, and re-proposing what someone already declined
+        is the thing the upsert guard exists to prevent.
+        """
+
+        rows = self.execute_returning(
+            "UPDATE memory_candidates SET status='expired', decided_at=? "
+            "WHERE status='pending' AND last_seen < ? RETURNING id",
+            (str(older_than), str(older_than)),
+        )
+        return len(rows)
+
+    def memory_candidate_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for row in self.rows(
+            "SELECT status, COUNT(*) AS c FROM memory_candidates GROUP BY status", ()
+        ):
+            counts[str(row["status"])] = int(row["c"])
+        return counts
 
     def memory_compaction_ledger(
         self,

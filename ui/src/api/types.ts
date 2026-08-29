@@ -307,6 +307,33 @@ export interface MemoryListResponse {
   records: MemoryRecord[];
 }
 
+/** A proposal formation has made. Deliberately not a `MemoryRecord`: nothing
+ *  here is retrievable, and nothing becomes retrievable until it is promoted. */
+export interface MemoryCandidate {
+  id: string;
+  rule_id: string;
+  scope: string;
+  subject?: string | null;
+  kind: string;
+  text: string;
+  written_by?: string | null;
+  /** Why the rule proposed this: counts, the tokens, the sessions involved. */
+  evidence_json?: string | null;
+  observations: number;
+  sessions: number;
+  first_seen: string;
+  last_seen: string;
+  status: string;
+  admitted_by?: string | null;
+  record_id?: string | null;
+  decided_at?: string | null;
+}
+
+export interface MemoryCandidateListResponse {
+  candidates: MemoryCandidate[];
+  counts: Record<string, number>;
+}
+
 export interface MemoryWriteResponse {
   record: MemoryRecord;
   created: boolean;

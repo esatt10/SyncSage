@@ -2593,6 +2593,66 @@ def create_app(
         audit(source.name, "memory_enable", {"path": str(path)})
         return {"status": "enabled", "source": source.model_dump(mode="json")}
 
+    @app.get("/memory/candidates")
+    def memory_candidates(
+        status: str = "pending",
+        rule_id: str | None = None,
+        principal: str | None = None,
+        limit: int = 100,
+    ) -> dict:
+        """Proposals formation has made, awaiting a decision.
+
+        Evidence, not memory: nothing listed here is retrievable, and nothing
+        becomes retrievable until it is promoted. `principal` narrows to what
+        one caller may see -- a candidate carrying a writer is that principal's
+        business, because the record it would become is scoped to them.
+        """
+
+        return {
+            "candidates": state.list_memory_candidates(
+                status=status or None,
+                rule_id=rule_id,
+                principal=principal,
+                limit=max(1, min(int(limit), 500)),
+            ),
+            "counts": state.memory_candidate_counts(),
+        }
+
+    @app.post("/memory/candidates/{candidate_id}/promote")
+    def memory_candidate_promote(candidate_id: str, principal: str | None = None) -> dict:
+        """Admit one proposal. **This is the crossing** from evidence to memory.
+
+        It writes through the ordinary `MemoryStore.append`, so the result is
+        an ordinary record in an ordinary file, indexed by the ordinary
+        pipeline -- there is no second ingestion path here any more than there
+        is for a record a person typed.
+        """
+
+        from pheasant.memory.formation import admit
+
+        try:
+            return admit(engine, candidate_id, admitted_by=principal or "ui")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/memory/candidates/{candidate_id}/reject")
+    def memory_candidate_reject(candidate_id: str, principal: str | None = None) -> dict:
+        """Decline one proposal, permanently.
+
+        A rejection is a decision: the rule that proposed it will not suggest
+        it again. Re-proposing what somebody already declined is the fastest
+        way to make a review queue worth ignoring.
+        """
+
+        from pheasant.memory.formation import reject
+
+        try:
+            return reject(engine, candidate_id, rejected_by=principal or "ui")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+
     @app.post("/memory/consolidate")
     def memory_consolidate() -> dict:
         from pheasant.memory.maintenance import run_memory_maintenance

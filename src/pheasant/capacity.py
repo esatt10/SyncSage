@@ -192,6 +192,43 @@ def project(
     )
 
 
+#: Bytes one interaction row costs in ``/state``, including its indexes.
+#:
+#: Measured on SQLite with a WAL checkpoint, over a realistic row: a query, a
+#: criteria object, five result ids and five paths, and the usual attributes.
+#: 892 B at 5k rows, 937 at 20k, 949 at 50k --- flat across a 10x range, so the
+#: number is the row and not the page overhead of a small file. Rounded up.
+BYTES_PER_INTERACTION_EVENT = 950
+
+#: The same row when a chat answer rides along, at the 4,000-character default
+#: cap. 2,124 B at 5k rows and 2,169 at 20k.
+#:
+#: The ratio is the point: **a chat turn costs about 2.3x a search**, which is
+#: why `max_answer_chars` exists and why `0` turns answers off entirely. A
+#: region whose traffic is mostly chat should size for this row, not the other
+#: one.
+BYTES_PER_CHAT_INTERACTION = 2200
+
+
+def observation_state_bytes(
+    events_per_day: int,
+    retention_days: int,
+    *,
+    chat_share: float = 0.0,
+) -> int:
+    """How much ``/state`` an enabled observation plane will hold.
+
+    Retention-bounded rather than corpus-bounded, which makes it the one part
+    of ``/state`` that grows with *traffic* --- the reason the log tier scales
+    on its own axis. ``chat_share`` is the fraction of observations that carry
+    an answer.
+    """
+
+    share = min(1.0, max(0.0, float(chat_share)))
+    per_event = BYTES_PER_INTERACTION_EVENT * (1.0 - share) + BYTES_PER_CHAT_INTERACTION * share
+    return int(max(0, events_per_day) * max(0, retention_days) * per_event)
+
+
 def fleet_for(files: int) -> dict[str, Any]:
     """Replica counts for a corpus of this size.
 
@@ -214,6 +251,12 @@ def fleet_for(files: int) -> dict[str, Any]:
         "indexers": shards,
         "api_replicas": 2 if files < 250_000 else 3,
         "workers": workers,
+        # The log tier scales on request traffic, which a file count cannot
+        # predict at all -- so this is a floor for a region that has enabled
+        # observation, not a projection. One replica handles a great deal: a
+        # batch is 500 observations and the work per batch is a multi-row
+        # insert. Scale it on `pheasant_log_queue_depth`, never on this.
+        "loggers": 1,
         "memory_per_region": projection.recommended_memory,
         "single_container_is_enough": shards == 1 and files < 150_000,
     }

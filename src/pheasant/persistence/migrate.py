@@ -61,6 +61,10 @@ TABLE_ORDER = (
     # `source_leases`: in-flight claim state is meaningless once detached
     # from the process that claimed it.
     "interaction_events",
+    # After memory_records: an admitted candidate names the record it became.
+    # The FK is not declared (same reason as memory_compactions), but the copy
+    # order follows it anyway.
+    "memory_candidates",
 )
 
 #: Rows per INSERT batch. Large enough that a million-row table is not a

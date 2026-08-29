@@ -377,6 +377,30 @@ memory:
     # help (complementary partials, progressive refinement, abstraction).
     max_jaccard: 0.55
 
+  # Turning observed interactions into memory. Off; nothing is read and no
+  # candidate is minted until it is on. See docs/memory-formation.md.
+  formation:
+    enabled: false
+    # One record per session, refined by superseding itself. Written directly
+    # rather than proposed, and only because of scope: it is session-scoped
+    # and written_by its own principal, so it never becomes shared knowledge.
+    session_digest: true
+    # Admit a proposal without review. Off for the same reason
+    # compaction_enabled is: it changes what a *default* query returns.
+    auto_admit: false
+    min_observations: 3
+    # ...and across this many distinct sessions. One session repeating itself
+    # is a habit; several agreeing is a signal.
+    min_sessions: 2
+    max_candidates_per_pass: 50
+    # A pending proposal nobody acted on expires. A rejection never does.
+    candidate_ttl_days: 30
+    rules:
+      - session-digest-v1
+      - alias-cooccurrence-v1
+      - path-affinity-v1
+      - retrieval-gap-v1
+
 # Tracing, and the observation plane memory formation reads.
 #
 # Both off. Turning interactions on means the region records queries and

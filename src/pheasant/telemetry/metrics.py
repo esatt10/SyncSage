@@ -497,6 +497,13 @@ def register_default_metrics(version: str) -> None:
     # Formation: records written from the observation plane rather than by a
     # caller. `rule_id` is versioned, so a rule whose logic changes shows up
     # here as a new series rather than silently continuing the old one's count.
+    REGISTRY.gauge(
+        "pheasant_memory_candidates",
+        "Open proposals awaiting a decision, by status. A queue that only ever "
+        "grows means nobody is reviewing it; one stuck at zero with traffic "
+        "means the thresholds are never met.",
+        ("status",),
+    )
     REGISTRY.counter(
         "pheasant_memory_formations_total",
         "Records formed from observed interactions, by rule and outcome "
