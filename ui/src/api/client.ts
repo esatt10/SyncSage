@@ -52,6 +52,24 @@ function numericEnv(value: unknown, fallback: number): number {
 const GRAPH_NODE_LIMIT = numericEnv(import.meta.env.VITE_PHEASANT_GRAPH_NODE_LIMIT, 1200);
 const GRAPH_LINK_LIMIT = numericEnv(import.meta.env.VITE_PHEASANT_GRAPH_LINK_LIMIT, 3600);
 
+/**
+ * A failed request, carrying the HTTP status alongside the server's detail.
+ *
+ * The status matters where two failures read identically as text but mean
+ * opposite things to whoever is looking: a 404 on a content-addressed id is
+ * "the index moved on from this", a 403 is "this is not yours to read".
+ * Callers that only render `String(error)` are unaffected --- `name` stays
+ * "Error", so the text is byte-identical to what a plain Error produced.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
@@ -65,7 +83,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       /* response had no JSON body */
     }
-    throw new Error(detail);
+    throw new ApiError(detail, response.status);
   }
   return (await response.json()) as T;
 }

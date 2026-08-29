@@ -221,13 +221,37 @@ def _shoot(port: int, shots: dict[str, str]) -> None:
             if name == "memory":
                 # Open the layers. A screenshot of collapsed rows shows the
                 # triage view and hides the thing that makes a proposal
-                # reviewable at all: what was asked, what came back, and the
-                # spans behind it.
+                # reviewable at all: what was asked, what came back, the
+                # spans behind it, and what is behind one of those keys.
                 page.get_by_role("button", name="Show evidence").first.click()
                 page.wait_for_load_state("networkidle")
                 page.wait_for_timeout(600)
                 page.get_by_role("button", name="Trace").first.click()
                 page.wait_for_timeout(500)
+                # Layer 4, and the reason to drive it here rather than assert
+                # it in a unit test: this is the only place the whole chain
+                # runs against a real corpus -- a search records a result id,
+                # a rule carries that id into a candidate, and the panel
+                # resolves it back to the indexed text. A mock of
+                # /nodes/content would prove none of that.
+                keys = page.get_by_title("the content-addressed ids this call returned")
+                if keys.count():
+                    keys.first.click()
+                    page.wait_for_timeout(400)
+                    content_key = page.locator(".sidepanel__key")
+                    if content_key.count():
+                        content_key.first.click()
+                        page.wait_for_load_state("networkidle")
+                        page.wait_for_timeout(600)
+                        resolved = page.locator(".sidepanel__resolved pre").count()
+                        print(f"  panel: key selected, resolved={resolved}")
+                        if not resolved:
+                            raise SystemExit(
+                                "the selected content key did not resolve to text -- "
+                                "the recorded result ids and /nodes/content disagree"
+                            )
+                else:
+                    raise SystemExit("no content keys on the trace -- nothing to select")
             out = TARGET / f"{name}.png"
             page.screenshot(path=str(out))
             print(f"  {out.relative_to(REPO)}  ({out.stat().st_size // 1024} KiB)")

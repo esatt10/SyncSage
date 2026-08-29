@@ -6,6 +6,7 @@ region actually performs, in order, with nothing stubbed between the steps:
     a search  ->  an OTel span + a ledger event
               ->  a batch published to the log tier's own queue
               ->  drained by a worker into the hot store
+              ->  its recorded keys resolving back to the indexed text
               ->  rolled to cold Parquet under /exports
               ->  read back out of cold storage by DuckDB
               ->  mined into a memory candidate
@@ -222,7 +223,27 @@ def test_the_whole_loop_from_a_search_to_a_memory_a_search_finds(region: Any) ->
             "the corpus should answer this one"
         )
 
-        # -- 5. rolled out of /state into cold Parquet ---------------------------
+        # -- 5. a recorded key resolves back to the text it names ---------------
+        # The join the review UI's side panel makes, and the one hop in this
+        # chain with no test of its own: `result_ids` are only evidence if they
+        # still address something. They are written by `extract_results` and
+        # read by `/nodes/content`, two modules that share no code and could
+        # drift apart on the id grammar without either side going red --- which
+        # would leave a reviewer a list of keys that resolve to nothing.
+        #
+        # `_chunk_texts` is why these are artifact ids rather than chunk ids:
+        # the alias rule asks whether the *document* that matched contains a
+        # token, so narrowing them to the one matching chunk would answer a
+        # different question. Asserted here so that stays a decision.
+        keys = json.loads(answered[0]["result_ids_json"] or "[]")
+        assert keys, "an answered search must record the ids it returned"
+        resolved = client.get("/nodes/content", params={"node_id": keys[0]})
+        assert resolved.status_code == 200, keys[0]
+        assert "pheasant-flock" in (resolved.json()["content"] or ""), (
+            f"the key {keys[0]} does not address the text the search returned"
+        )
+
+        # -- 6. rolled out of /state into cold Parquet ---------------------------
         state.execute(
             "UPDATE interaction_events SET started_at=?", ("2020-03-04T05:06:07.000000Z",)
         )
@@ -236,7 +257,7 @@ def test_the_whole_loop_from_a_search_to_a_memory_a_search_finds(region: Any) ->
         partitions = sorted((root / "exports" / "interactions").glob("dt=*"))
         assert [p.name for p in partitions] == ["dt=2020-03-04"]
 
-        # -- 6. an outside reader gets it back out of cold storage ---------------
+        # -- 7. an outside reader gets it back out of cold storage ---------------
         duckdb = pytest.importorskip("duckdb")
         with _Phase("cold_read"):
             connection = duckdb.connect(":memory:")
@@ -248,7 +269,7 @@ def test_the_whole_loop_from_a_search_to_a_memory_a_search_finds(region: Any) ->
         assert cold[1] == 2, "both sessions survived the round trip through Parquet"
         assert cold[2] == 2, "both traces survived it too"
 
-        # -- 7. the ledger becomes memory ----------------------------------------
+        # -- 8. the ledger becomes memory ----------------------------------------
         # Replay cold back into the hot window. Formation reads hot, and step 5
         # emptied it on purpose to prove the roll actually moves rows -- so this
         # doubles as the assertion that a cold partition is a complete, faithful
@@ -283,7 +304,7 @@ def test_the_whole_loop_from_a_search_to_a_memory_a_search_finds(region: Any) ->
         gaps = [c for c in proposals if c["rule_id"] == "retrieval-gap-v1"]
         assert gaps, "a question nothing answered should have been noticed"
 
-        # -- 8. promotion is the one crossing into memory ------------------------
+        # -- 9. promotion is the one crossing into memory ------------------------
         with _Phase("promote"):
             promoted = admit(engine, gaps[0]["id"], admitted_by="user:ada")
         store = MemoryStore(memory_source(region["config"], state).path)
@@ -291,7 +312,7 @@ def test_the_whole_loop_from_a_search_to_a_memory_a_search_finds(region: Any) ->
         assert "vault seal rotation" in record.text
         assert "formed" in record.tags
 
-        # -- 9. it is an ordinary record, indexed by the ordinary pipeline -------
+        # -- 10. it is an ordinary record, indexed by the ordinary pipeline -------
         with _Phase("index_memory"):
             engine.sync_source("agent-memory", "full")
         projected = state.rows(
@@ -300,7 +321,7 @@ def test_the_whole_loop_from_a_search_to_a_memory_a_search_finds(region: Any) ->
         )
         assert projected, "a promoted record must reach the projection like any other"
 
-        # -- 10. and a search finds it -------------------------------------------
+        # -- 11. and a search finds it -------------------------------------------
         with _Phase("recall"):
             found = client.post(
                 "/search",

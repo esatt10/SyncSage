@@ -501,7 +501,8 @@ re-suggesting what somebody just declined is the fastest way to make a review
 queue worth ignoring. A pending proposal nobody acted on expires after
 `candidate_ttl_days`; a rejection never does.
 
-Surfaces: `GET /memory/candidates`, `POST /memory/candidates/{id}/promote`,
+Surfaces: `GET /memory/candidates`,
+`GET /memory/candidates/{id}/evidence`, `POST /memory/candidates/{id}/promote`,
 `POST /memory/candidates/{id}/reject`, the MCP tools `list_memory_candidates` /
 `promote_memory_candidate` / `reject_memory_candidate`, and a **Proposed**
 section at the top of the Memory tab showing each proposal with the evidence
@@ -509,7 +510,26 @@ behind it.
 
 Review is the default because plan 2 asked for it and because it is the
 conservative reading: a candidate is a suggestion until a person agrees. Every
-candidate shows the evidence that produced it.
+candidate shows the evidence that produced it, in four layers, because a
+reviewer asks four questions in order and each one is narrower than the last:
+
+| Layer | The question | What it shows |
+|---|---|---|
+| 1. the row | what is claimed | rule, kind, scope, how strong |
+| 2. expand | on what basis | the calls: what was asked, what came back |
+| 3. expand again | how do I check it | the spans: trace, parent, when, how long |
+| 4. select a key | what is actually behind it | a side panel on that one call — the ids in full, the criteria the search ran under, and the content keys it returned, each resolving to the text it names |
+
+Everything below layer 1 is fetched on open, and layer 4's content lookup only
+on selection: a hundred proposals must not be a hundred evidence queries, and
+one opened proposal must not be a chunk fetch per result id.
+
+Layer 4 resolves a key through `GET /nodes/content`, which is ACL-guarded, so a
+reviewer sees the text behind an id exactly where they could have searched for
+it. A key that does not resolve is reported rather than hidden: result ids are
+content-addressed, so a 404 means the text has changed or been removed since
+the call — which is itself the answer, and the same posture layer 2 takes when
+evidence has aged out of the hot window.
 
 `auto_admit` is off for the same reason `compaction_enabled` and
 `supersede_retention_days` are off: it changes what a default query returns,

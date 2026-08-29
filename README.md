@@ -49,7 +49,7 @@ every passage. Connect a model and the same retrieval gets synthesized instead.
 MCP, HTTP and the UI all run that one ranking.
 
 <p align="center">
-  <img src="docs/assets/ui/memory.png" alt="The Memory tab, showing proposed memories mined from real usage alongside recorded ones" width="900">
+  <img src="docs/assets/ui/memory.png" alt="The Memory tab: a proposed memory expanded to its calls and spans, with a side panel resolving one returned key to the text behind it" width="900">
 </p>
 
 Memory is ordinary indexed Markdown, so recall is just search. The **Proposed**
@@ -60,10 +60,15 @@ while the documents say `pheasant-flock`.
 A proposal is reviewable, not just assertable. Open one and it shows the calls
 it came from — what was asked, what came back, from which session — and opening
 again shows the trace: each span, its timing, and the step where the rule
-consolidated them into the proposal. Proposals group by rule, filter by text,
-and promote or reject in bulk, because a region under real traffic offers
-dozens at a time and the work is triage. Nothing proposed is retrievable until
-someone promotes it, and a rejection is permanent.
+consolidated them into the proposal. Select a span or the criteria and a side
+panel opens on that one call: the ids in full, the criteria the search ran
+under, and the keys it returned — each of which resolves to the text it names,
+so "why was this proposed" ends at real content rather than at a hash.
+
+Proposals group by rule, filter by text, and promote or reject in bulk, because
+a region under real traffic offers dozens at a time and the work is triage.
+Nothing proposed is retrievable until someone promotes it, and a rejection is
+permanent.
 
 <p align="center">
   <img src="docs/assets/ui/graph.png" alt="The knowledge graph, showing files, symbols and the relationships between them" width="900">
