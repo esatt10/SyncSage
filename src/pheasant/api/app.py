@@ -576,6 +576,21 @@ def _observe_shed(
         logger.debug("could not observe a shed request", exc_info=True)
 
 
+#: Routes the observation plane ignores.
+#:
+#: Liveness and scrape endpoints are machine chatter, not interactions: no
+#: query, no session, no principal, and nothing a formation rule could ever
+#: read. Recording them is not merely useless, it is expensive --- a container
+#: health check every 3s is 28,800 rows per replica per day, about 26 MB, so a
+#: three-replica fleet holding a week of history would carry half a gigabyte
+#: of probes. Measured on the CI log-tier run, where the row count visibly
+#: climbed between assertions with no traffic but the probes.
+#:
+#: `/mcp` is here for a different reason: it is observed one level down, by
+#: the decorator that wraps every tool, which knows the tool name and its
+#: criteria. Counting it twice would double every formation threshold.
+UNOBSERVED_PATHS = frozenset({"/health", "/ready", "/metrics", "/mcp"})
+
 LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
     "search": True,
     "assistant": True,
@@ -1244,12 +1259,7 @@ def create_app(
                 headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
             )
         try:
-            # `/mcp` is observed one level down, by the decorator that wraps
-            # every tool and resource. That observation names the tool and
-            # carries its criteria and results; this one could only ever say
-            # "something happened at /mcp", and recording both would
-            # double-count every call a formation threshold counts.
-            if interaction_buffer is None or path.startswith("/mcp"):
+            if interaction_buffer is None or _metric_path(path) in UNOBSERVED_PATHS:
                 return await call_next(request)
             # One bounded append per request and nothing else. Everything the
             # ledger costs beyond this happens on the flusher thread or on the

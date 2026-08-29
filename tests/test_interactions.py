@@ -1010,3 +1010,46 @@ def test_an_event_without_a_trace_is_counted_not_silently_dropped() -> None:
 
     assert len(events) == 1
     assert _dropped("malformed") - before == 2
+
+
+def test_liveness_probes_are_not_interactions(tmp_path: Path) -> None:
+    """A health check is machine chatter: no query, no session, no principal,
+    and nothing a formation rule could read.
+
+    Recording them is not merely useless, it is expensive. A container probe
+    every 3s is 28,800 rows per replica per day; a three-replica fleet holding
+    a week would carry half a gigabyte of them. Found by reading a CI log-tier
+    run where the row count climbed between assertions with no traffic but the
+    probes.
+    """
+
+    from fastapi.testclient import TestClient
+
+    from pheasant.api.app import UNOBSERVED_PATHS
+
+    app = _app_with_corpus(tmp_path)
+    with TestClient(app) as client:
+        for _ in range(5):
+            assert client.get("/health").status_code == 200
+            assert client.get("/ready").status_code in (200, 503)
+            assert client.get("/metrics").status_code == 200
+        # One real call, so this cannot pass by observing nothing at all.
+        client.post("/search", json={"query": "filewatch daemon", "max_results": 3})
+        app.state.interaction_buffer.flush()
+
+    operations = [
+        str(row["operation"])
+        for row in app.state.state.rows("SELECT operation FROM interaction_events", ())
+    ]
+    assert operations == ["/search"], f"probes leaked into the ledger: {operations}"
+    assert {"/health", "/ready", "/metrics"} <= UNOBSERVED_PATHS
+
+
+def test_the_mcp_mount_is_unobserved_at_the_http_layer() -> None:
+    """It is observed one level down, by the decorator that wraps every tool,
+    which knows the tool name and its criteria. Counting both would double
+    every formation threshold."""
+
+    from pheasant.api.app import UNOBSERVED_PATHS
+
+    assert "/mcp" in UNOBSERVED_PATHS
