@@ -192,6 +192,15 @@ class StateStore:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_memory_records_tier ON memory_records(tier, scope)"
         )
+        # The observation plane's free-text and result-path columns. Guarded
+        # like every other additive column here: `executescript` creates the
+        # table only when it is absent, so a /state written before these
+        # existed keeps the old shape unless something adds them.
+        interaction_columns = self.backend.table_columns("interaction_events")
+        if interaction_columns and "answer_text" not in interaction_columns:
+            self.conn.execute("ALTER TABLE interaction_events ADD COLUMN answer_text TEXT")
+        if interaction_columns and "result_paths_json" not in interaction_columns:
+            self.conn.execute("ALTER TABLE interaction_events ADD COLUMN result_paths_json TEXT")
         self.conn.commit()
         self._migrate_fts_titles()
 
@@ -217,7 +226,10 @@ class StateStore:
                 "source_leases": "source_id",
                 "sync_fingerprints": "scope",
                 "log_tasks": "id",
-                "interaction_events": "id",
+                # The *newest* column, not just the table: a marker written
+                # before these existed would otherwise skip the DDL below and
+                # leave every ledger insert failing on a missing column.
+                "interaction_events": "answer_text",
             }
             schema_present = all(
                 column in self.backend.table_columns(table) for table, column in required.items()
@@ -227,6 +239,17 @@ class StateStore:
             self.backend.executescript(schema_for(self.backend.dialect))
             if "acl" not in self.backend.table_columns("artifacts"):
                 self.conn.execute("ALTER TABLE artifacts ADD COLUMN acl TEXT")
+            # Postgres returns early from `migrate()`, so the guarded column
+            # adds there never run here -- an additive column needs saying
+            # twice or it exists on exactly one backend. `CREATE TABLE IF NOT
+            # EXISTS` above cannot widen a table that already exists.
+            interaction_columns = self.backend.table_columns("interaction_events")
+            if interaction_columns and "answer_text" not in interaction_columns:
+                self.conn.execute("ALTER TABLE interaction_events ADD COLUMN answer_text TEXT")
+            if interaction_columns and "result_paths_json" not in interaction_columns:
+                self.conn.execute(
+                    "ALTER TABLE interaction_events ADD COLUMN result_paths_json TEXT"
+                )
             self.conn.execute(
                 "INSERT INTO pheasant_schema_meta(key, value, updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "

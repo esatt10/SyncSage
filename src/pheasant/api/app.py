@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import yaml
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
@@ -483,6 +483,56 @@ def _build_interaction_buffer(
             "Could not start the observation plane; continuing without it", exc_info=True
         )
         return None
+
+
+def observed(request: Any) -> Any:
+    """The live interaction event for this request, or ``None``.
+
+    The seam between the middleware, which knows the timing and the status,
+    and a handler, which is the only thing that has seen the request body and
+    the results. A handler enriches through this and never has to know whether
+    observation is on -- with it off there is no event and this returns None.
+
+    Free text set here is capped and redacted by the middleware afterwards, so
+    a handler never has to remember to do either.
+    """
+
+    return getattr(getattr(request, "state", None), "interaction", None)
+
+
+def record_retrieval(
+    request: Any,
+    *,
+    query: str | None,
+    payload: Any,
+    criteria: dict[str, Any] | None = None,
+    answer: str | None = None,
+    event: Any = None,
+) -> None:
+    """Fill in what only a handler knows: the question, the hits, the answer.
+
+    A no-op when observation is off, so a route calls it unconditionally and
+    never branches on telemetry. Free text set here is capped and redacted by
+    the middleware on the way out, so a handler cannot forget to do either.
+    """
+
+    event = event if event is not None else observed(request)
+    if event is None:
+        return
+    try:
+        from pheasant.telemetry.interactions import extract_results
+
+        event.query_text = query
+        if criteria:
+            event.criteria = criteria
+        if answer is not None:
+            event.answer_text = answer
+        ids, paths, top, count = extract_results(payload)
+        event.result_ids, event.result_paths = ids, paths
+        event.top_score = top
+        event.result_count = count
+    except Exception:  # noqa: BLE001 - an observation must never fail a request
+        logger.debug("could not record retrieval detail", exc_info=True)
 
 
 def _observe_shed(
@@ -1204,7 +1254,12 @@ def create_app(
             # One bounded append per request and nothing else. Everything the
             # ledger costs beyond this happens on the flusher thread or on the
             # log tier — see `pheasant.telemetry.interactions`.
-            from pheasant.telemetry.interactions import InteractionContext, observe
+            from pheasant.telemetry.interactions import (
+                InteractionContext,
+                cap_answer,
+                observe,
+                redact,
+            )
 
             context = InteractionContext.create(
                 _request_modality(request),
@@ -1213,19 +1268,61 @@ def create_app(
                 client_id=request.headers.get("x-pheasant-client"),
                 traceparent=request.headers.get("traceparent"),
             )
+            settings = config.observability.interactions
             with observe(
                 interaction_buffer,
                 context,
                 kb_id=config.pheasant.name,
                 operation=_metric_path(path),
             ) as event:
+                # The middleware cannot see a request body without consuming
+                # the stream, and it cannot see a response body at all. So it
+                # publishes the live event and the handlers that know what was
+                # asked and what came back fill it in -- see `observed()`.
+                # Without this, every UI search recorded a path and a status
+                # and no content, and three of the four formation rules would
+                # have worked for MCP agents only.
+                request.state.interaction = event
                 response = await call_next(request)
                 event.status = "ok" if response.status_code < 400 else "error"
                 event.attributes["http_status"] = response.status_code
                 event.attributes["method"] = request.method
+                cap_answer(event, max_chars=int(getattr(settings, "max_answer_chars", 4000)))
+                redact(event, enabled=bool(getattr(settings, "redact_text", False)))
                 return response
         finally:
             limiter.release(path)
+
+    def _record_stream_answer(parent: Any, req: Any, answer: Any) -> None:
+        """Observe a streamed answer as a child of the request that opened it.
+
+        The request's own event was buffered the moment this route returned
+        its `StreamingResponse`, which is long before there is an answer to
+        record -- so this is a second event rather than a late mutation of a
+        first, and the trace is what joins them.
+        """
+
+        if parent is None or interaction_buffer is None:
+            return
+        try:
+            from pheasant.telemetry.interactions import cap_answer, child_event, redact
+
+            settings = config.observability.interactions
+            event = child_event(parent, "/assistant/chat/stream")
+            event.duration_ms = None
+            record_retrieval(
+                None,
+                query=req.question,
+                payload=answer,
+                criteria={"workflow": req.workflow} if req.workflow else None,
+                answer=str(answer.get("answer") or "") or None,
+                event=event,
+            )
+            cap_answer(event, max_chars=int(getattr(settings, "max_answer_chars", 4000)))
+            redact(event, enabled=bool(getattr(settings, "redact_text", False)))
+            interaction_buffer.record(event)
+        except Exception:  # noqa: BLE001 - an observation must never fail a stream
+            logger.debug("could not observe a streamed answer", exc_info=True)
 
     def _request_modality(request) -> str:  # type: ignore[no-untyped-def]
         """Which surface this call arrived on.
@@ -2629,7 +2726,7 @@ def create_app(
         }
 
     @app.post("/search")
-    def search_context(req: SearchRequest) -> dict:
+    def search_context(req: SearchRequest, request: Request) -> dict:
         from pheasant.search.criteria import (
             apply_retrieval_criteria,
             criteria_active,
@@ -2689,10 +2786,16 @@ def create_app(
                 req.source_types,
                 req.exclude_source_types,
             )
+        record_retrieval(
+            request,
+            query=req.query,
+            payload=payload,
+            criteria={"mode": req.mode, **(payload.get("criteria") or {})},
+        )
         return payload
 
     @app.post("/relevant-files")
-    def relevant_files(req: SearchRequest) -> dict:
+    def relevant_files(req: SearchRequest, request: Request) -> dict:
         # Same retrieval as /search, so it must run under the same ACL
         # enforcement: dropping `security`/`principal` here silently returned
         # unfiltered results for every caller whenever acl_enforced was on.
@@ -2721,7 +2824,9 @@ def create_app(
             if relative_path and relative_path not in seen:
                 seen.add(relative_path)
                 files.append(result)
-        return {"files": files}
+        answer = {"files": files}
+        record_retrieval(request, query=req.query, payload=answer, criteria={"mode": "hybrid"})
+        return answer
 
     def _acl_guard(
         artifact_id: str | None,
@@ -3882,14 +3987,14 @@ def create_app(
         return {"revoked": app.state.session_keys.revoke(session_id)}
 
     @app.post("/assistant/chat")
-    def assistant_chat(req: ChatRequest) -> dict:
+    def assistant_chat(req: ChatRequest, request: Request) -> dict:
         from pheasant.assistant.chat import answer_question
 
         if not config.assistant.enabled:
             raise HTTPException(status_code=403, detail="The assistant is disabled")
         if not req.question.strip():
             raise HTTPException(status_code=400, detail="question must not be empty")
-        return answer_question(
+        answer = answer_question(
             req.question,
             search=search,
             knowledge_base=config.knowledge_base_id,
@@ -3909,9 +4014,20 @@ def create_app(
             options=req.options,
             memory=req.memory,
         )
+        # A chat turn is the richest evidence the ledger gets: the question, the
+        # passages that answered it, and the answer itself. `citations` is what
+        # `extract_results` reads for ids and paths.
+        record_retrieval(
+            request,
+            query=req.question,
+            payload=answer,
+            criteria={"mode": req.mode, "workflow": req.workflow} if req.mode else None,
+            answer=str(answer.get("answer") or "") or None,
+        )
+        return answer
 
     @app.post("/assistant/chat/stream")
-    def assistant_chat_stream(req: ChatRequest):
+    def assistant_chat_stream(req: ChatRequest, request: Request):
         """The same answer as ``/assistant/chat``, with progress as it happens.
 
         Server-sent events: one ``step`` per workflow stage the moment it
@@ -3951,6 +4067,9 @@ def create_app(
         events: queue_module.Queue = queue_module.Queue()
         credential = app.state.session_keys.get(req.session_id)
         environ = dict(os.environ)
+        # Captured here, in the request, because `run()` executes on a worker
+        # thread after this route has already returned its response object.
+        parent_event = observed(request)
 
         def run() -> None:
             try:
@@ -3981,6 +4100,7 @@ def create_app(
                         }
                     ),
                 )
+                _record_stream_answer(parent_event, req, answer)
                 events.put({"type": "answer", "answer": answer})
             except Exception as exc:  # surfaced to the client, never a 500 mid-stream
                 logger.exception("streaming chat failed")

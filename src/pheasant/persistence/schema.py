@@ -403,8 +403,14 @@ CREATE TABLE IF NOT EXISTS interaction_events (
   duration_ms REAL,
   status TEXT NOT NULL,
   query_text TEXT,
+  answer_text TEXT,
   criteria_json TEXT,
+  -- Stable node ids and source-relative paths, kept in two homogeneous lists
+  -- rather than one heterogeneous one. `result_ids` joins to graph_nodes and
+  -- chunks; `result_paths` is in the grammar steering rules already match
+  -- against, so a `preference` rule minted from these can actually fire.
   result_ids_json TEXT,
+  result_paths_json TEXT,
   result_count INTEGER,
   top_score REAL,
   attributes_json TEXT,

@@ -403,10 +403,18 @@ observability:
   sample_ratio: 1.0
   interactions:
     enabled: false
-    # Store a placeholder instead of the query string. Identity, modality,
-    # criteria and result ids are still recorded, so the structural formation
-    # rules still work; only the lexical one goes quiet.
-    redact_query_text: false
+    # Record no free text at all -- neither the question nor the answer.
+    # Named for what it does rather than one of the two fields it covers:
+    # redacting the question while keeping an answer that quotes the corpus
+    # back at it would be incoherent. Identity, modality, criteria, result ids
+    # and result paths survive, so the structural formation rules still work;
+    # only the lexical one goes quiet.
+    redact_text: false
+    # Cap on a recorded assistant answer, in characters. 0 records no answers
+    # at all -- the same "0 means off" shape hot_retention_days uses. A cap
+    # because an answer is model output at 10-50x a question's bytes, and
+    # unbounded it would let chat dominate a ledger sized for search.
+    max_answer_chars: 4000
     # A backpressure knob, not a throughput one. The buffer is bounded and
     # overflow drops the OLDEST event rather than blocking a request: a log
     # tier falling behind must degrade to data loss, never to request latency.

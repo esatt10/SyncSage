@@ -329,15 +329,18 @@ def test_an_observation_is_never_a_memory_record(state: StateStore) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_redaction_keeps_everything_the_structural_rules_need() -> None:
-    """A region can keep learning its own shape without keeping what anyone
-    typed. Only the lexical rule goes quiet."""
+def test_redaction_drops_question_and_answer_together() -> None:
+    """Redacting the question while keeping an answer that quotes the corpus
+    back at it would be incoherent, which is why the setting is `redact_text`
+    and not `redact_query_text`."""
 
     event = redact(
         _event(
             criteria={"mode": "hybrid"},
             query_text="who owns billing",
+            answer_text="Billing is owned by the finance service [1].",
             result_ids=["chunk:a"],
+            result_paths=["finance/billing.md"],
             principal="user:ada",
             session_id="s1",
         ),
@@ -345,17 +348,137 @@ def test_redaction_keeps_everything_the_structural_rules_need() -> None:
     )
 
     assert event.query_text is None
-    assert event.attributes["query_redacted"] is True
+    assert event.answer_text is None
+    assert event.attributes["text_redacted"] is True
     # Everything `path-affinity-v1` and `retrieval-gap-v1` count on survives.
     assert event.criteria == {"mode": "hybrid"}
     assert event.result_ids == ["chunk:a"]
+    assert event.result_paths == ["finance/billing.md"]
     # Identity is deliberately *not* what this knob redacts: it is what scopes
     # a formed memory, and dropping it would make every observation org-wide.
     assert (event.principal, event.session_id) == ("user:ada", "s1")
 
 
-def test_redaction_off_leaves_the_query_alone() -> None:
-    assert redact(_event(query_text="q"), enabled=False).query_text == "q"
+def test_redaction_off_leaves_the_text_alone() -> None:
+    event = redact(_event(query_text="q", answer_text="a"), enabled=False)
+    assert (event.query_text, event.answer_text) == ("q", "a")
+
+
+def test_an_answer_is_capped_and_the_cut_is_recorded() -> None:
+    """A rule counting phrases in an answer must be able to tell a short
+    answer from a clipped one."""
+
+    from pheasant.telemetry.interactions import cap_answer
+
+    short = cap_answer(_event(answer_text="brief"), max_chars=100)
+    assert short.answer_text == "brief"
+    assert "answer_truncated" not in short.attributes
+
+    long = cap_answer(_event(answer_text="x" * 500), max_chars=100)
+    assert len(long.answer_text) == 100
+    assert long.attributes["answer_truncated"] is True
+
+
+def test_a_zero_cap_records_no_answers_at_all() -> None:
+    """`0` means off, the same shape `hot_retention_days` and
+    `supersede_retention_days` already use."""
+
+    from pheasant.telemetry.interactions import cap_answer
+
+    assert cap_answer(_event(answer_text="anything"), max_chars=0).answer_text is None
+    assert PheasantConfig().observability.interactions.max_answer_chars == 4000
+
+
+# --------------------------------------------------------------------------
+# Extracting results: one grammar, both surfaces
+# --------------------------------------------------------------------------
+
+
+def test_results_split_into_ids_and_paths_in_the_grammars_rules_need() -> None:
+    """Ids join to graph_nodes and chunks; paths are `relative_path`, which is
+    what `steering` matches against -- so a `preference` rule minted from
+    these can actually fire."""
+
+    from pheasant.telemetry.interactions import extract_results
+
+    ids, paths, top, count = extract_results(
+        {
+            "results": [
+                {"node_id": "file:docs:a.md:branch=none", "relative_path": "a.md", "score": 0.9},
+                {
+                    "chunk_id": "chunk:docs:b.md:sha256=x:chunk=0",
+                    "relative_path": "b.md",
+                    "score": 0.4,
+                },
+            ]
+        }
+    )
+
+    assert ids == ["file:docs:a.md:branch=none", "chunk:docs:b.md:sha256=x:chunk=0"]
+    assert paths == ["a.md", "b.md"]
+    assert top == 0.9
+    assert count == 2
+
+
+@pytest.mark.parametrize("key", ["results", "files", "citations"])
+def test_every_surface_shape_is_understood(key: str) -> None:
+    """`/search` answers with `results`, `/relevant-files` with `files`, chat
+    with `citations`. A rule must not care which."""
+
+    from pheasant.telemetry.interactions import extract_results
+
+    ids, paths, _top, count = extract_results({key: [{"node_id": "n1", "relative_path": "p.md"}]})
+    assert (ids, paths, count) == (["n1"], ["p.md"], 1)
+
+
+def test_a_bare_path_list_still_yields_paths() -> None:
+    from pheasant.telemetry.interactions import extract_results
+
+    assert extract_results({"files": ["a.md", "b.md"]})[1] == ["a.md", "b.md"]
+
+
+def test_extraction_never_raises_on_a_shape_it_does_not_know() -> None:
+    """27 tools return 27 shapes; a rule that covers what it knows beats a
+    crash on the rest."""
+
+    from pheasant.telemetry.interactions import extract_results
+
+    assert extract_results(None) == ([], [], None, 0)
+    assert extract_results({"nothing": "useful"}) == ([], [], None, 0)
+    assert extract_results({"results": "not a list"}) == ([], [], None, 0)
+    assert extract_results({"results": [None, 42, {"score": "high"}]}) == ([], [], None, 3)
+
+
+def test_a_recorded_result_list_is_capped() -> None:
+    """A `max_results: 500` query must not put 500 ids in one row; the count
+    still reports the real total, which is what lets `retrieval-gap-v1` tell
+    'nothing matched' from 'more than we recorded'."""
+
+    from pheasant.telemetry.interactions import MAX_RESULTS_RECORDED, extract_results
+
+    ids, paths, _top, count = extract_results(
+        {"results": [{"node_id": f"n{i}", "relative_path": f"{i}.md"} for i in range(200)]}
+    )
+    assert len(ids) == len(paths) == MAX_RESULTS_RECORDED
+    assert count == 200
+
+
+def test_a_child_event_shares_its_parents_trace() -> None:
+    """A streamed answer outlives the request that opened it, so it gets its
+    own event rather than a late mutation of one already handed to the
+    buffer -- and the trace is what joins them."""
+
+    from pheasant.telemetry.interactions import child_event
+
+    parent = _event(1, principal="user:ada", session_id="s1")
+    child = child_event(parent, "/assistant/chat/stream")
+
+    assert child.trace_id == parent.trace_id
+    assert child.parent_span_id == parent.span_id
+    assert child.span_id != parent.span_id
+    assert (child.principal, child.session_id) == ("user:ada", "s1")
+    assert child.operation == "/assistant/chat/stream"
+    assert child.is_writable
 
 
 # --------------------------------------------------------------------------
@@ -586,3 +709,135 @@ def test_a_writable_state_is_detected(tmp_path: Path) -> None:
     config = PheasantConfig()
     config.storage.sqlite_path = tmp_path / "p.db"
     assert _state_is_writable(config, object()) is True
+
+
+# --------------------------------------------------------------------------
+# The HTTP surface records content, not just a path and a status
+# --------------------------------------------------------------------------
+
+
+def _app_with_corpus(tmp_path: Path, **interactions: Any) -> Any:
+    import yaml
+    from fastapi.testclient import TestClient  # noqa: F401  (imported by callers)
+
+    from pheasant.api.app import create_app
+
+    docs = tmp_path / "ws" / "docs"
+    docs.mkdir(parents=True)
+    (docs / "runbook.md").write_text(
+        "# Kestrel Runbook\n\nThe filewatch daemon restarts nightly at 0300 UTC.\n",
+        encoding="utf-8",
+    )
+    for name in ("state", "exports"):
+        (tmp_path / name).mkdir(parents=True, exist_ok=True)
+    raw = {
+        "pheasant": {
+            "name": "kb",
+            "state_path": str(tmp_path / "state"),
+            "workspace_root": str(tmp_path / "ws"),
+            "exports_path": str(tmp_path / "exports"),
+        },
+        "storage": {"graph_snapshots": False},
+        "observability": {"interactions": {"enabled": True, "flush_batch_size": 1, **interactions}},
+        "sources": [
+            {
+                "name": "docs",
+                "type": "markdown_folder",
+                "path": str(docs),
+                "include": ["**/*.md"],
+                # Indexed explicitly below instead: the startup sync runs on an
+                # executor, so a request made straight after `TestClient(...)`
+                # would race it and search an empty index.
+                "sync": {"on_startup": False},
+            }
+        ],
+    }
+    path = tmp_path / "pheasant.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    app = create_app(PheasantConfig.model_validate(raw), config_path=str(path))
+    app.state.engine.sync_source("docs", "full")
+    return app
+
+
+def test_a_ui_search_records_the_question_and_what_came_back(tmp_path: Path) -> None:
+    """The gap this closes: the middleware cannot read a request body without
+    consuming the stream, so before handlers enriched the event every UI
+    search recorded a path and a status and no content -- and three of the
+    four formation rules would have worked for MCP agents only, on the very
+    surface plan 2 was written about.
+    """
+
+    from fastapi.testclient import TestClient
+
+    app = _app_with_corpus(tmp_path)
+    with TestClient(app) as client:
+        response = client.post(
+            "/search",
+            json={"query": "filewatch daemon nightly", "mode": "hybrid", "max_results": 5},
+            headers={"X-Pheasant-Session": "sess-7", "X-Pheasant-Principal": "user:ada"},
+        )
+        assert response.status_code == 200
+        app.state.interaction_buffer.flush()
+
+    row = dict(
+        app.state.state.rows(
+            "SELECT query_text, criteria_json, result_ids_json, result_paths_json, "
+            "result_count, top_score, session_id, principal, modality "
+            "FROM interaction_events WHERE operation='/search'",
+            (),
+        )[0]
+    )
+    assert row["query_text"] == "filewatch daemon nightly"
+    assert row["session_id"] == "sess-7"
+    assert row["principal"] == "user:ada"
+    assert row["modality"] == "ui"
+    assert '"mode": "hybrid"' in row["criteria_json"]
+    # Stable ids join to the graph; paths are source-relative, the grammar a
+    # steering `preference` rule matches against.
+    assert "runbook.md" in json.loads(row["result_paths_json"])
+    assert json.loads(row["result_ids_json"])[0].startswith("file:docs:")
+    assert row["result_count"] >= 1
+    assert row["top_score"] is not None
+
+
+def test_a_streamed_answer_is_a_child_of_the_request_that_opened_it(tmp_path: Path) -> None:
+    """The route returns its response object before the answer exists, so the
+    request's event is already buffered by then. The answer gets its own event
+    under the same trace rather than a racing late mutation of that one."""
+
+    import time
+
+    from fastapi.testclient import TestClient
+
+    app = _app_with_corpus(tmp_path)
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/assistant/chat/stream",
+            json={"question": "what restarts nightly?"},
+            headers={"X-Pheasant-Session": "sess-7"},
+        ) as response:
+            for _ in response.iter_lines():
+                pass
+        time.sleep(1.0)
+        app.state.interaction_buffer.flush()
+
+    rows = [
+        dict(row)
+        for row in app.state.state.rows(
+            "SELECT operation, trace_id, span_id, parent_span_id, query_text, answer_text "
+            "FROM interaction_events ORDER BY started_at",
+            (),
+        )
+    ]
+    parent = next(row for row in rows if row["operation"] == "/assistant")
+    child = next(row for row in rows if row["operation"] == "/assistant/chat/stream")
+
+    assert child["trace_id"] == parent["trace_id"]
+    assert child["parent_span_id"] == parent["span_id"]
+    assert child["query_text"] == "what restarts nightly?"
+    assert child["answer_text"]
+    # The parent carries no content on purpose: the middleware never sees the
+    # body, and the answer did not exist when its span closed. Formation reads
+    # rows with a question, which is exactly the child.
+    assert parent["query_text"] is None

@@ -810,7 +810,8 @@ attached — `pytest` stays network-free by construction rather than by mocking.
 | `service_name` | string | `pheasant` | `service.name` on every exported span. |
 | `sample_ratio` | float | `1.0` | Head sampling for *exported* spans only. It deliberately does not thin the ledger: sampling out a span your collector does not need should not also cost the region a data point formation counts on. |
 | `interactions.enabled` | bool | `false` | Record interactions. Off, the region behaves exactly as it did before this existed. On, it is recording queries and principals — a deliberate choice, not a default. |
-| `interactions.redact_query_text` | bool | `false` | Store a placeholder instead of the query string. Identity, modality, criteria and result ids are still recorded, so `path-affinity-v1` and `retrieval-gap-v1` still work; the lexical rule `alias-cooccurrence-v1` goes quiet. |
+| `interactions.redact_text` | bool | `false` | Record no free text at all — neither the question nor the answer. Named for what it does rather than one of the two fields it covers: redacting a question while keeping an answer that quotes the corpus back at it would be incoherent. Identity, modality, criteria, result ids and result paths are still recorded, so `path-affinity-v1` and `retrieval-gap-v1` still work; only the lexical rule `alias-cooccurrence-v1` goes quiet. |
+| `interactions.max_answer_chars` | integer | `4000` | Cap on a recorded assistant answer, in characters. **`0` records no answers at all** — the same "0 means off" shape `hot_retention_days` and `supersede_retention_days` use. A cap rather than an unbounded field because an answer is model output at 10-50x a question's bytes; left unbounded, chat traffic would dominate a ledger sized for search. A truncated answer is marked `answer_truncated` in `attributes`. |
 | `interactions.buffer_size` | integer | `10000` | Events held in memory before a flush. **A backpressure knob, not a throughput one**: the buffer is bounded and overflow drops the oldest event rather than blocking a request. |
 | `interactions.flush_interval_seconds` | float | `5.0` | Flush at least this often, even below `flush_batch_size`. |
 | `interactions.flush_batch_size` | integer | `500` | Events per published batch. Batching is what keeps the ledger off the request path: one publish per N events rather than one write per request. |
@@ -827,6 +828,26 @@ attached — `pytest` stays network-free by construction rather than by mocking.
 | `interactions.queue.nats_stream` | string | `PHEASANT_LOGS` | JetStream stream name. |
 | `interactions.queue.nats_subject` | string | `pheasant.logs.batches` | JetStream subject. |
 | `interactions.queue.nats_durable` | string | `pheasant-loggers` | Durable consumer name. |
+
+### What one interaction row holds
+
+| Field | Notes |
+|---|---|
+| `id`, `trace_id`, `span_id`, `parent_span_id` | Correlation. `id` is `blake2b(trace_id\|span_id)`, so a redelivered batch dedups instead of double-counting. An inbound W3C `traceparent` is adopted, so an agent's trace continues into this one. A streamed answer is a **child** row: it outlives the request that opened it, so it gets its own span under the same trace rather than a racing late edit of the request's. |
+| `modality`, `operation`, `principal`, `session_id`, `client_id` | The four dimensions formation slices on. All caller-asserted, exactly like `principal` already is everywhere else in pheasant. |
+| `started_at`, `duration_ms`, `status` | `status` is `ok` \| `error` \| `shed`; a 429 under saturation is recorded, because it is the signal that says thresholds are being reached more slowly than traffic suggests. |
+| `query_text` | The question, from MCP tool arguments or an HTTP request body. |
+| `answer_text` | The assistant's answer, when there was one. Capped by `max_answer_chars`. |
+| `criteria_json` | The filter object the caller passed — mode, source filters, `min_score`, section. |
+| `result_ids_json` | Stable node ids, which join to `graph_nodes` and through them to `chunks`. |
+| `result_paths_json` | Source-relative `relative_path` values — the same grammar [steering](how-to/agent-memory.md#steering) matches against, so a `preference` rule minted from these can actually fire. |
+| `result_count`, `top_score` | The full result count (the id/path lists are capped at 50) and the best score. Together they are what lets a rule tell "nothing matched" from "matched more than we recorded". |
+| `attributes_json` | Free-form: HTTP status and method, and the `answer_truncated` / `text_redacted` markers. |
+
+Two lists rather than one, deliberately: a rule that had to sniff whether a
+value was an id or a path would behave differently depending on which surface
+produced the row, which is the opposite of the determinism every formation rule
+downstream is built on.
 
 **A log tier falling behind degrades to data loss, never to request latency.**
 The buffer is bounded, the queue depth is bounded, and nothing on the request

@@ -245,6 +245,45 @@ Modality is the one that did not previously exist in any usable form.
 MCP server never passed them, so every MCP audit row read literally
 `("mcp", "mcp", NULL)`, and HTTP hardcoded `("ui", "http", None)`.
 
+### What one row holds
+
+```jsonc
+{
+  "id": "…",  "trace_id": "…", "span_id": "…", "parent_span_id": null,
+  "modality": "ui",  "operation": "/search",  "status": "ok",
+  "principal": "user:ada",  "session_id": "sess-7",  "client_id": null,
+  "started_at": "2026-08-29T09:14:02.118431Z",  "duration_ms": 34.2,
+
+  "query_text":    "filewatch daemon nightly",
+  "answer_text":   null,                     // set for a chat turn, capped
+  "criteria":      {"mode": "hybrid"},
+  "result_ids":    ["file:docs:runbook.md:branch=none"],   // → graph_nodes, chunks
+  "result_paths":  ["runbook.md"],                          // → what steering matches
+  "result_count":  1,   "top_score": 0.0328,
+  "attributes":    {"http_status": 200, "method": "POST"}
+}
+```
+
+**Ids and paths are two lists, not one.** A rule that had to sniff whether a
+value was an id or a path would behave differently depending on which surface
+produced the row — the opposite of the determinism every rule here rests on.
+Ids join to `graph_nodes` and through them to `chunks`, which is how
+`alias-cooccurrence-v1` asks whether a retrieved document actually contains the
+token that found it. Paths are `relative_path`, the same grammar steering
+matches against, so a `preference` rule minted from them can actually fire.
+
+**`result_count` is the real total; the lists are capped at 50.** That is what
+lets `retrieval-gap-v1` tell "nothing matched" from "matched more than we
+bothered to record".
+
+**A streamed answer is a child row.** `/assistant/chat/stream` returns its
+response object before the answer exists, so the request's own event is
+already buffered by then; mutating it afterwards would be a race whose outcome
+depends on flush timing. The answer gets its own event instead, sharing the
+trace and naming the request's span — which is what a parent/child span
+relationship is for. Formation reads rows that have a question, which is
+exactly the child and never the content-free parent.
+
 In the graph, formation fills in node and edge types that
 [the graph model](graph_model.md) has **declared since the initial build and
 never emitted** — `query`, `agent_action`, and the `retrieved_by` edge — plus a
@@ -390,9 +429,9 @@ steering.
 - **A session id is caller-asserted**, exactly like `principal`. One caller can
   claim another's session. Same category as *"`supersedes` is not
   authorization-checked"*: by design for now rather than by decision.
-- **The ledger records query text and principals.** `redact_query_text` exists;
-  the honest default is that an operator enabling observation is choosing to
-  record it.
+- **The ledger records query text, answers and principals.** `redact_text`
+  drops all free text and `max_answer_chars: 0` drops answers alone; the honest
+  default is that an operator enabling observation is choosing to record them.
 - **Formation counts a sampled stream.** Under sustained load, thresholds are
   reached later, and a region that sheds heavily forms memory slowly.
 - **There is no A2A protocol surface to instrument.** `modality: a2a` is

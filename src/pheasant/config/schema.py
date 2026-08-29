@@ -1251,9 +1251,8 @@ class InteractionSettings(ModelMixin):
     what came back.
 
     **Off by default, because it records queries and principals.** An
-    operator turning this on is choosing to keep that; `redact_query_text`
-    exists for regions that want the shape of the traffic without its
-    content.
+    operator turning this on is choosing to keep that; `redact_text` exists
+    for regions that want the shape of the traffic without its content.
 
     Observations are rows, never files. They are not chunked, not indexed,
     and never returned by ``search_context`` — a UI session's chat does not
@@ -1261,11 +1260,25 @@ class InteractionSettings(ModelMixin):
     """
 
     enabled: bool = False
-    #: Store a placeholder instead of the query string. The identity,
-    #: modality, criteria and result ids are still recorded, so
-    #: `path-affinity-v1` and `retrieval-gap-v1` still work; the lexical
-    #: rules (`alias-cooccurrence-v1`) go quiet.
-    redact_query_text: bool = False
+    #: Record no free text at all -- neither the question nor the answer.
+    #:
+    #: Named for what it does rather than for one of the two fields it
+    #: covers: redacting a question while keeping the answer that quotes the
+    #: corpus back at it would be incoherent, so this is deliberately not
+    #: `redact_query_text`. Identity, modality, criteria, result ids and
+    #: paths are still recorded, so `path-affinity-v1` and
+    #: `retrieval-gap-v1` still work; only the lexical rule
+    #: (`alias-cooccurrence-v1`) goes quiet.
+    redact_text: bool = False
+    #: Cap on a recorded answer, in characters. **`0` records no answers at
+    #: all** -- the same "0 means off" shape `hot_retention_days` and
+    #: `supersede_retention_days` already use.
+    #:
+    #: A cap rather than an unbounded field because an answer is model output
+    #: and runs 10-50x a question's bytes; left unbounded, chat traffic would
+    #: dominate the ledger's size on a corpus that barely changed. Truncation
+    #: is honest: a truncated answer is marked in `attributes`.
+    max_answer_chars: int = 4000
 
     # --- the request path ---------------------------------------------------
     #: Events held in memory before a flush. **This is a backpressure knob,

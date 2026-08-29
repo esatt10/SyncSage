@@ -83,8 +83,10 @@ COLUMNS: tuple[str, ...] = (
     "duration_ms",
     "status",
     "query_text",
+    "answer_text",
     "criteria_json",
     "result_ids_json",
+    "result_paths_json",
     "result_count",
     "top_score",
     "attributes_json",
@@ -242,8 +244,22 @@ class InteractionEvent:
     duration_ms: float | None = None
     status: str = "ok"
     query_text: str | None = None
+    #: The assistant's generated answer, when this call produced one. Capped
+    #: by `observability.interactions.max_answer_chars` (0 = never recorded),
+    #: because model output runs 10-50x a question's bytes and would
+    #: otherwise let chat traffic dominate a ledger sized for search.
+    answer_text: str | None = None
     criteria: dict[str, Any] | None = None
+    #: Stable node ids -- what joins to `graph_nodes` and, through them, to
+    #: `chunks`. Deliberately homogeneous: a rule that has to sniff whether a
+    #: value is an id or a path is a rule that behaves differently per
+    #: surface, which is the opposite of deterministic.
     result_ids: list[str] = field(default_factory=list)
+    #: Source-relative paths, in the same grammar `steering` matches against
+    #: (`relative_path`, not the absolute path). `path-affinity-v1` mints a
+    #: `preference` rule from these, so the two must agree or the rule it
+    #: writes cannot fire.
+    result_paths: list[str] = field(default_factory=list)
     result_count: int | None = None
     top_score: float | None = None
     attributes: dict[str, Any] = field(default_factory=dict)
@@ -299,8 +315,10 @@ class InteractionEvent:
             self.duration_ms,
             self.status,
             self.query_text,
+            self.answer_text,
             json.dumps(self.criteria, sort_keys=True) if self.criteria else None,
             json.dumps(self.result_ids) if self.result_ids else None,
+            json.dumps(self.result_paths) if self.result_paths else None,
             self.result_count,
             self.top_score,
             json.dumps(self.attributes, sort_keys=True) if self.attributes else None,
@@ -930,18 +948,127 @@ def _annotate_span(event: InteractionEvent) -> None:
 
 
 def redact(event: InteractionEvent, *, enabled: bool) -> InteractionEvent:
-    """Drop the query string, keeping everything the structural rules need.
+    """Drop every free-text field, keeping what the structural rules need.
 
-    Identity, modality, criteria and result ids survive, so ``path-affinity-v1``
-    and ``retrieval-gap-v1`` still work; only the lexical rule
-    ``alias-cooccurrence-v1`` goes quiet. That asymmetry is the point: a region
-    can keep learning its own shape without keeping what anyone typed.
+    Question **and** answer together: redacting the question while keeping an
+    answer that quotes the corpus back at it would be incoherent, which is why
+    the setting is `redact_text` rather than `redact_query_text`.
+
+    Identity, modality, criteria, result ids and result paths survive, so
+    ``path-affinity-v1`` and ``retrieval-gap-v1`` still work; only the lexical
+    rule ``alias-cooccurrence-v1`` goes quiet. That asymmetry is the point: a
+    region can keep learning its own shape without keeping what anyone typed.
     """
 
-    if enabled and event.query_text is not None:
+    if enabled and (event.query_text is not None or event.answer_text is not None):
         event.query_text = None
-        event.attributes = {**event.attributes, "query_redacted": True}
+        event.answer_text = None
+        event.attributes = {**event.attributes, "text_redacted": True}
     return event
+
+
+def cap_answer(event: InteractionEvent, *, max_chars: int) -> InteractionEvent:
+    """Bound a recorded answer, marking it when it was cut.
+
+    ``0`` drops answers entirely. Truncation is recorded rather than silent,
+    because a rule counting phrases in an answer must be able to tell a short
+    answer from a clipped one.
+    """
+
+    if event.answer_text is None:
+        return event
+    if max_chars <= 0:
+        event.answer_text = None
+        return event
+    if len(event.answer_text) > max_chars:
+        event.answer_text = event.answer_text[:max_chars]
+        event.attributes = {**event.attributes, "answer_truncated": True}
+    return event
+
+
+#: How many hits one row records. A cap, because a `max_results: 500` query
+#: would otherwise put 500 ids and 500 paths in a single ledger row, and the
+#: rules only ever look at the head of a ranked list.
+MAX_RESULTS_RECORDED = 50
+
+
+def child_event(parent: InteractionEvent, operation: str) -> InteractionEvent:
+    """A second observation for work that outlives the request that started it.
+
+    A streaming chat returns its response object immediately and produces the
+    answer on a worker thread afterwards, so the request's own event has
+    already been handed to the buffer by the time there is anything to say
+    about the answer. Mutating it then is a race whose outcome depends on
+    flush timing.
+
+    So the answer gets its own event instead, sharing the parent's trace and
+    naming the parent's span -- the request span says "a stream was opened",
+    this one says "an answer was produced", and the trace joins them. Which is
+    what a parent/child span relationship is for.
+    """
+
+    return InteractionEvent(
+        kb_id=parent.kb_id,
+        operation=operation,
+        modality=parent.modality,
+        principal=parent.principal,
+        session_id=parent.session_id,
+        client_id=parent.client_id,
+        trace_id=parent.trace_id,
+        span_id=new_span_id(),
+        parent_span_id=parent.span_id,
+        started_at=_iso(utc_now()),
+    )
+
+
+def extract_results(payload: Any) -> tuple[list[str], list[str], float | None, int]:
+    """``(stable ids, source-relative paths, top score, count)`` from a result
+    payload, whatever surface produced it.
+
+    One implementation, two callers, on purpose. A formation rule that saw
+    ids from MCP and paths from HTTP would mine different evidence depending
+    on which surface a user happened to be on -- which is the opposite of the
+    determinism every rule downstream of this is built on.
+
+    Ids join to `graph_nodes` and, through them, to `chunks`, which is how a
+    rule asks whether a retrieved document actually contains the token that
+    found it. Paths are `relative_path`: the same grammar `steering` matches
+    against, so a `preference` rule minted from these can actually fire.
+
+    Shape-tolerant because the surfaces genuinely differ -- `/search` answers
+    with `results`, `/relevant-files` with `files`, chat with `citations` --
+    and a rule that covers the shapes it knows beats a crash on the rest.
+    """
+
+    if not isinstance(payload, dict):
+        return [], [], None, 0
+    items = payload.get("results") or payload.get("files") or payload.get("citations")
+    if not isinstance(items, list):
+        return [], [], None, 0
+
+    ids: list[str] = []
+    paths: list[str] = []
+    scores: list[float] = []
+    for item in items[:MAX_RESULTS_RECORDED]:
+        if isinstance(item, str):
+            # `get_relevant_files` and friends answer with bare paths.
+            paths.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        identifier = item.get("node_id") or item.get("chunk_id") or item.get("stable_id")
+        if identifier:
+            ids.append(str(identifier))
+        path = item.get("relative_path") or item.get("path")
+        if path:
+            paths.append(str(path))
+        score = item.get("score")
+        if isinstance(score, (int, float)):
+            scores.append(float(score))
+    # `count` is the full result set; the lists are capped. Keeping the real
+    # count is what lets `retrieval-gap-v1` tell "nothing matched" from
+    # "matched more than we bothered to record".
+    return ids, paths, (max(scores) if scores else None), len(items)
 
 
 def events_from_batch(payload: dict[str, Any]) -> list[InteractionEvent]:

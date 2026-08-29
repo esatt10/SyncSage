@@ -121,9 +121,20 @@ def test_registration_is_idempotent_and_never_clears_recorded_values() -> None:
     not blank the counters the first one's traffic produced."""
 
     metrics.register_default_metrics("9.9.9")
+
+    # A delta, not an absolute. `REGISTRY` is process-wide by design (see its
+    # docstring), so any test asserting a counter's absolute value is really
+    # asserting that no earlier test in the same process produced traffic —
+    # which an unrelated test doing a real search silently falsifies. The
+    # delta still catches exactly what this is for: re-registration must not
+    # *clear* what is already recorded.
+    def value() -> float:
+        return metrics.REGISTRY.value("pheasant_search_total", mode="hybrid", outcome="ok") or 0.0
+
+    before = value()
     metrics.REGISTRY.inc("pheasant_search_total", 4, mode="hybrid", outcome="ok")
     metrics.register_default_metrics("9.9.9")
-    assert metrics.REGISTRY.value("pheasant_search_total", mode="hybrid", outcome="ok") == 4
+    assert value() == before + 4
 
 
 # ---------------------------------------------------------------------------

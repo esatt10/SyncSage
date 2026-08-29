@@ -760,32 +760,6 @@ def _interaction_buffer() -> Any:
         return None
 
 
-def _result_ids(result: Any) -> list[str]:
-    """Best-effort: which artifacts or chunks a tool actually returned.
-
-    This is the half of an observation that makes `path-affinity-v1` and
-    `retrieval-gap-v1` possible -- a query with no ids above threshold is
-    precisely the gap those rules exist to surface. Shape-tolerant on purpose:
-    27 tools return 27 shapes, and a rule that only works for `search_context`
-    is better than a crash for the other 26.
-    """
-
-    if not isinstance(result, dict):
-        return []
-    items = result.get("results") or result.get("files") or result.get("matches")
-    if not isinstance(items, list):
-        return []
-    ids: list[str] = []
-    for item in items[:50]:
-        if isinstance(item, dict):
-            value = item.get("stable_id") or item.get("id") or item.get("path")
-            if value:
-                ids.append(str(value))
-        elif isinstance(item, str):
-            ids.append(item)
-    return ids
-
-
 def _observed(buffer: Any, operation: str, kwargs: dict[str, Any], run: Any) -> Any:
     """Wrap one tool call in an observation.
 
@@ -796,7 +770,12 @@ def _observed(buffer: Any, operation: str, kwargs: dict[str, Any], run: Any) -> 
     to read them from and there deliberately is not going to be one.
     """
 
-    from pheasant.telemetry.interactions import InteractionContext, Modality, observe
+    from pheasant.telemetry.interactions import (
+        InteractionContext,
+        Modality,
+        extract_results,
+        observe,
+    )
 
     context = InteractionContext.create(
         Modality.MCP,
@@ -830,14 +809,13 @@ def _observed(buffer: Any, operation: str, kwargs: dict[str, Any], run: Any) -> 
             and value is not None
         } or None
         result = run()
-        event.result_ids = _result_ids(result)
-        scores = [
-            item.get("score")
-            for item in (result.get("results") or [])
-            if isinstance(result, dict) and isinstance(item, dict)
-        ]
-        numeric = [float(score) for score in scores if isinstance(score, (int, float))]
-        event.top_score = max(numeric) if numeric else None
+        # The same extractor the HTTP surface uses. Two implementations would
+        # mean a rule mining different evidence depending on which surface a
+        # caller happened to be on.
+        ids, paths, top, count = extract_results(result)
+        event.result_ids, event.result_paths = ids, paths
+        event.top_score = top
+        event.result_count = count
         return result
 
 

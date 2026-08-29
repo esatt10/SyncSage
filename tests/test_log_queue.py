@@ -57,6 +57,11 @@ def _event(index: int, *, when: str = "2026-01-01T00:00:00.000000Z") -> Interact
         started_at=when,
         session_id=f"s{index % 3}",
         query_text=f"query {index}",
+        answer_text=f"answer {index}",
+        result_ids=[f"file:docs:{index}.md:branch=none"],
+        result_paths=[f"{index}.md"],
+        result_count=1,
+        top_score=0.5,
     )
 
 
@@ -508,6 +513,50 @@ def test_the_ledger_round_trips_on_postgres() -> None:
         report = roll(store, settings, exports_path=Path("/tmp"))
         assert report["rolled"] == 1200
         assert hot_row_count(store) == 0
+    finally:
+        for store in stores:
+            store.close()
+
+
+@postgres
+def test_an_older_postgres_ledger_gains_the_new_columns() -> None:
+    """Postgres returns early from `migrate()` and takes its own path, so an
+    additive column has to be added in *both* places or it exists on exactly
+    one backend -- and `CREATE TABLE IF NOT EXISTS` cannot widen a table that
+    is already there. Without this, a Postgres /state written by an earlier
+    build would fail every ledger insert on a missing column.
+    """
+
+    pytest.importorskip("psycopg", reason="the [postgres] extra is optional")
+    new_store, stores = _pg_stores()
+    try:
+        store = new_store()
+        store.execute("DROP TABLE IF EXISTS interaction_events", ())
+        # The shape before answer_text and result_paths_json existed.
+        store.execute(
+            """CREATE TABLE interaction_events (
+                 id TEXT PRIMARY KEY, kb_id TEXT NOT NULL, trace_id TEXT NOT NULL,
+                 span_id TEXT NOT NULL, parent_span_id TEXT, modality TEXT NOT NULL,
+                 operation TEXT NOT NULL, principal TEXT, session_id TEXT, client_id TEXT,
+                 started_at TEXT NOT NULL, duration_ms REAL, status TEXT NOT NULL,
+                 query_text TEXT, criteria_json TEXT, result_ids_json TEXT,
+                 result_count INTEGER, top_score REAL, attributes_json TEXT,
+                 schema_version INTEGER NOT NULL DEFAULT 1)""",
+            (),
+        )
+        # A stale marker must not let the upgrade be skipped, which is why the
+        # probe names the newest column rather than just the table.
+        store.execute("DELETE FROM pheasant_schema_meta WHERE key=?", ("core",))
+        store.migrate()
+
+        columns = store.backend.table_columns("interaction_events")
+        assert {"answer_text", "result_paths_json"} <= columns
+        assert write_events(store, [_event(1)]) == 1
+        row = dict(
+            store.rows("SELECT answer_text, result_paths_json FROM interaction_events", ())[0]
+        )
+        assert row["answer_text"] == "answer 1"
+        assert json.loads(row["result_paths_json"]) == ["1.md"]
     finally:
         for store in stores:
             store.close()
