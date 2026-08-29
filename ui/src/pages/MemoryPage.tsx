@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
+import { CandidateReview } from "../memory/CandidateReview";
 import type { MemoryRecord, MemoryScope } from "../api/types";
 
 const SCOPES: MemoryScope[] = ["session", "user", "org"];
@@ -66,32 +67,6 @@ export function MemoryPage() {
     },
   });
 
-  // Proposals the region has made from how it is used. Never fatal: formation
-  // is off by default, so an error here means "nothing to review", not a
-  // broken page.
-  const candidates = useQuery({
-    queryKey: ["memory-candidates"],
-    queryFn: () => api.memoryCandidates({ status: "pending" }),
-    retry: false,
-  });
-  const decide = useMutation({
-    // The two branches answer different shapes (a promotion names the record
-    // it wrote; a rejection does not), and only the invalidation below cares
-    // about either -- so the union is narrowed to what this actually uses.
-    mutationFn: async ({ id, promote }: { id: string; promote: boolean }) => {
-      if (promote) {
-        const result = await api.memoryCandidatePromote(id);
-        return { id, recordId: result.record_id };
-      }
-      await api.memoryCandidateReject(id);
-      return { id, recordId: null };
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["memory-candidates"] });
-      queryClient.invalidateQueries({ queryKey: ["memory"] });
-    },
-  });
-  const pending = candidates.data?.candidates ?? [];
 
   const records = listing.data?.records ?? [];
   const bySubject = useMemo(() => {
@@ -149,49 +124,7 @@ export function MemoryPage() {
         </div>
       ) : (
         <>
-          {pending.length > 0 && (
-            <section className="section">
-              <h2>Proposed ({pending.length})</h2>
-              <p className="section__hint">
-                Patterns this region noticed in how it is used. These are not
-                memories yet — nothing here is retrievable until you promote it.
-                Rejecting one is permanent: it will not be proposed again.
-              </p>
-              <ul className="memory-list">
-                {pending.map((candidate) => (
-                  <li key={candidate.id} className="memory-item">
-                    <div className="memory-item__meta">
-                      <span className="chip">{candidate.rule_id}</span>
-                      <span className="chip">{candidate.kind}</span>
-                      <span className="chip">{candidate.scope}</span>
-                      <span className="memory-item__when">
-                        seen {candidate.observations}× across {candidate.sessions}{" "}
-                        session{candidate.sessions === 1 ? "" : "s"}
-                      </span>
-                    </div>
-                    <p className="memory-item__text">{candidate.text}</p>
-                    <div className="memory-item__actions">
-                      <button
-                        className="button button--primary"
-                        onClick={() => decide.mutate({ id: candidate.id, promote: true })}
-                        disabled={decide.isPending}
-                      >
-                        Promote
-                      </button>
-                      <button
-                        className="button"
-                        onClick={() => decide.mutate({ id: candidate.id, promote: false })}
-                        disabled={decide.isPending}
-                      >
-                        Reject
-                      </button>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-              {decide.isError && <p className="error">{String(decide.error)}</p>}
-            </section>
-          )}
+          <CandidateReview />
 
           <section className="section">
             <h2>Write a memory</h2>

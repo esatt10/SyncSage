@@ -1,5 +1,6 @@
 import type {
   MemoryConsolidateResponse,
+  MemoryCandidateEvidence,
   MemoryCandidateListResponse,
   MemoryListResponse,
   MemoryWriteResponse,
@@ -429,6 +430,13 @@ export const api = {
   // a session's traffic quietly turning into knowledge.
   memoryCandidates: (params: { status?: string; rule_id?: string } = {}) =>
     request<MemoryCandidateListResponse>(`/memory/candidates${qs(params)}`),
+  // Layers 2 and 3 of the review: the calls a proposal came from, and their
+  // spans. Fetched per candidate, only when one is opened -- a hundred
+  // proposals must not be a hundred evidence queries nobody asked for.
+  memoryCandidateEvidence: (id: string) =>
+    request<MemoryCandidateEvidence>(
+      `/memory/candidates/${encodeURIComponent(id)}/evidence`,
+    ),
   memoryCandidatePromote: (id: string) =>
     request<{ candidate_id: string; record_id: string }>(
       `/memory/candidates/${encodeURIComponent(id)}/promote`,

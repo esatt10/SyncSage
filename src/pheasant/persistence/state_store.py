@@ -1224,6 +1224,33 @@ class StateStore:
             counts[str(row["status"])] = int(row["c"])
         return counts
 
+    def interaction_events_by_id(self, event_ids: list[str]) -> list[dict[str, Any]]:
+        """The ledger rows a proposal was derived from, oldest first.
+
+        What turns a candidate from an assertion with a count attached into
+        something a reviewer can check: the questions that produced it, what
+        came back, and the spans that carried them.
+
+        Rows may be absent --- the hot window is retention-bounded, so
+        evidence can age out from under a proposal that is still pending. The
+        caller gets what survives rather than an error, because a partial
+        trail is more useful than none.
+        """
+
+        if not event_ids:
+            return []
+        placeholders = ",".join("?" for _ in event_ids)
+        rows = self.rows(
+            "SELECT id, trace_id, span_id, parent_span_id, modality, operation, "
+            "principal, session_id, started_at, duration_ms, status, query_text, "
+            "answer_text, criteria_json, result_ids_json, result_paths_json, "
+            "result_count, top_score "
+            f"FROM interaction_events WHERE id IN ({placeholders}) "
+            "ORDER BY started_at, id",
+            tuple(event_ids),
+        )
+        return [dict(row) for row in rows]
+
     def memory_compaction_ledger(
         self,
         *,

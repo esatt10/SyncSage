@@ -9,6 +9,7 @@ principal who did not produce it.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -118,6 +119,7 @@ def _observe(
                 span_id=f"{start + index:016x}",
                 started_at=f"2026-01-01T00:00:{start + index:02d}.000000Z",
                 status="ok",
+                duration_ms=12.5,
                 query_text=query,
                 result_paths=list(paths or ["runbook.md"]) if answered else [],
                 result_count=1 if answered else 0,
@@ -583,6 +585,9 @@ def _ask(engine: Any, session: str, query: str, *, start: int, hits: list[str]) 
                 span_id=f"{start:016x}",
                 started_at=f"2026-01-01T00:00:{start:02d}.000000Z",
                 status="ok",
+                # `observe()` always sets this; a fixture that leaves it None
+                # would let an assertion about it pass for the wrong reason.
+                duration_ms=12.5,
                 query_text=query,
                 result_ids=ids,
                 result_paths=paths,
@@ -964,3 +969,139 @@ def test_the_mcp_surface_is_additive(tmp_path: Path) -> None:
         assert listed["candidates"] == []
     finally:
         tools.engine.close()
+
+
+# --------------------------------------------------------------------------
+# The evidence trail behind a proposal
+# --------------------------------------------------------------------------
+
+
+def test_a_proposal_names_the_calls_it_came_from(tmp_path: Path) -> None:
+    """Without this a candidate is an assertion with a count attached. A
+    reviewer looking at `router -> pheasant-flock` could see it was seen four
+    times and nothing at all about what was asked or what came back."""
+
+    engine = _corpus_engine(tmp_path, min_observations=2, min_sessions=2)
+    for index, session in enumerate(("s1", "s2")):
+        _ask(engine, session, "router rollout", start=index * 10, hits=["deploy/rollout.md"])
+        _ask(engine, session, "router canary", start=index * 10 + 1, hits=["deploy/canary.md"])
+
+    run_candidate_rules(engine)
+
+    candidate = engine.state.list_memory_candidates(rule_id="alias-cooccurrence-v1")[0]
+    evidence = json.loads(candidate["evidence_json"])
+    assert len(evidence["event_ids"]) == 4
+
+    # And every named id resolves to a row a reviewer can read.
+    rows = engine.state.interaction_events_by_id(evidence["event_ids"])
+    assert len(rows) == 4
+    assert {row["query_text"] for row in rows} == {"router rollout", "router canary"}
+    assert all(
+        row["trace_id"] and row["span_id"] and row["duration_ms"] is not None for row in rows
+    )
+
+
+def test_the_named_calls_are_bounded(tmp_path: Path) -> None:
+    """A token asked four hundred times must not carry four hundred ids in the
+    candidate row. The counts beside it stay the true totals."""
+
+    from pheasant.memory.formation import MAX_EVIDENCE_EVENTS
+
+    engine = _corpus_engine(tmp_path, min_observations=2, min_sessions=2)
+    for index in range(40):
+        session = "s1" if index % 2 else "s2"
+        _ask(engine, session, "router rollout", start=index, hits=["deploy/rollout.md"])
+
+    run_candidate_rules(engine)
+
+    candidate = engine.state.list_memory_candidates(rule_id="alias-cooccurrence-v1")[0]
+    evidence = json.loads(candidate["evidence_json"])
+    assert len(evidence["event_ids"]) == MAX_EVIDENCE_EVENTS
+    assert candidate["observations"] == 40
+
+
+def test_the_evidence_endpoint_serves_all_three_layers(tmp_path: Path) -> None:
+    """What is claimed, on what basis, and how to check it — the three
+    questions a reviewer asks in order."""
+
+    from fastapi.testclient import TestClient
+
+    from pheasant.api.app import create_app
+
+    config, path = _config(tmp_path, min_observations=2, min_sessions=2)
+    docs = tmp_path / "ws" / "docs"
+    (docs / "deploy").mkdir(parents=True, exist_ok=True)
+    (docs / "deploy" / "rollout.md").write_text(
+        "# Rollout\n\nThe pheasant-flock service coordinates every rollout.\n", encoding="utf-8"
+    )
+    (docs / "deploy" / "canary.md").write_text(
+        "# Canary\n\nCanary steps are driven by the pheasant-flock service.\n", encoding="utf-8"
+    )
+    app = create_app(config, config_path=str(path))
+    engine = app.state.engine
+    engine.sync_source("docs", "full")
+    for index, session in enumerate(("s1", "s2")):
+        _ask(engine, session, "router rollout", start=index * 10, hits=["deploy/rollout.md"])
+        _ask(engine, session, "router canary", start=index * 10 + 1, hits=["deploy/canary.md"])
+    run_candidate_rules(engine)
+    candidate = engine.state.list_memory_candidates(rule_id="alias-cooccurrence-v1")[0]
+
+    with TestClient(app) as client:
+        response = client.get(f"/memory/candidates/{candidate['id']}/evidence")
+        assert response.status_code == 200
+        payload = response.json()
+
+        # 1. what is claimed
+        assert payload["candidate"]["text"] == "router -> pheasant-flock"
+        # 2. on what basis
+        assert payload["named"] == payload["found"] == 4
+        asked = {call["query_text"] for call in payload["interactions"]}
+        assert asked == {"router rollout", "router canary"}
+        assert any(json.loads(c["result_paths_json"] or "[]") for c in payload["interactions"])
+        # 3. how to check it
+        for call in payload["interactions"]:
+            assert call["trace_id"] and call["span_id"]
+            assert call["duration_ms"] is not None
+            assert call["status"] == "ok"
+
+        assert client.get("/memory/candidates/nope/evidence").status_code == 404
+
+
+def test_evidence_that_aged_out_is_reported_not_hidden(tmp_path: Path) -> None:
+    """The hot window is retention-bounded, so a pending proposal can outlive
+    the rows behind it. A short list that looks like the whole story is worse
+    than saying how much is missing."""
+
+    from fastapi.testclient import TestClient
+
+    from pheasant.api.app import create_app
+
+    config, path = _config(tmp_path, min_observations=2, min_sessions=2)
+    docs = tmp_path / "ws" / "docs"
+    (docs / "deploy").mkdir(parents=True, exist_ok=True)
+    (docs / "deploy" / "rollout.md").write_text(
+        "# Rollout\n\nThe pheasant-flock service coordinates every rollout.\n", encoding="utf-8"
+    )
+    (docs / "deploy" / "canary.md").write_text(
+        "# Canary\n\nCanary steps are driven by the pheasant-flock service.\n", encoding="utf-8"
+    )
+    app = create_app(config, config_path=str(path))
+    engine = app.state.engine
+    engine.sync_source("docs", "full")
+    for index, session in enumerate(("s1", "s2")):
+        _ask(engine, session, "router rollout", start=index * 10, hits=["deploy/rollout.md"])
+        _ask(engine, session, "router canary", start=index * 10 + 1, hits=["deploy/canary.md"])
+    run_candidate_rules(engine)
+    candidate = engine.state.list_memory_candidates(rule_id="alias-cooccurrence-v1")[0]
+
+    # The roll takes the evidence, exactly as retention would.
+    engine.state.execute("DELETE FROM interaction_events", ())
+
+    with TestClient(app) as client:
+        payload = client.get(f"/memory/candidates/{candidate['id']}/evidence").json()
+
+    assert payload["named"] == 4
+    assert payload["found"] == 0
+    assert payload["interactions"] == []
+    # The proposal itself is untouched: the counts remain what the rule saw.
+    assert payload["candidate"]["observations"] == 4

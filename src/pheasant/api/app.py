@@ -2628,6 +2628,42 @@ def create_app(
             "counts": state.memory_candidate_counts(),
         }
 
+    @app.get("/memory/candidates/{candidate_id}/evidence")
+    def memory_candidate_evidence(candidate_id: str) -> dict:
+        """Why this was proposed: the calls behind it, and their spans.
+
+        Three layers, because a reviewer asks three questions in order. *What
+        is being claimed* is the candidate itself. *On what basis* is the set
+        of interactions — what was asked, what came back. *How do I check it*
+        is the trace: each call's span, its parent, when it ran and how long
+        it took, which is what lets somebody follow one proposal back through
+        the collector to the request that produced it.
+
+        Evidence can age out from under a pending proposal — the hot window is
+        retention-bounded — so this reports what survives and says how much is
+        missing rather than failing.
+        """
+
+        candidate = state.get_memory_candidate(candidate_id)
+        if candidate is None:
+            raise HTTPException(status_code=404, detail=f"Unknown memory candidate: {candidate_id}")
+        try:
+            evidence = json.loads(candidate.get("evidence_json") or "{}")
+        except (TypeError, ValueError):
+            evidence = {}
+        event_ids = [str(item) for item in (evidence.get("event_ids") or [])]
+        interactions = state.interaction_events_by_id(event_ids)
+        return {
+            "candidate": candidate,
+            "evidence": evidence,
+            "interactions": interactions,
+            # The head of the id list is what was recorded; `named` vs
+            # `found` is how a reviewer knows the trail is partial rather
+            # than assuming the rule only ever saw this much.
+            "named": len(event_ids),
+            "found": len(interactions),
+        }
+
     @app.post("/memory/candidates/{candidate_id}/promote")
     def memory_candidate_promote(candidate_id: str, principal: str | None = None) -> dict:
         """Admit one proposal. **This is the crossing** from evidence to memory.

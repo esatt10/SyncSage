@@ -55,7 +55,14 @@ MCP, HTTP and the UI all run that one ranking.
 Memory is ordinary indexed Markdown, so recall is just search. The **Proposed**
 section is [memory formation](docs/memory-formation.md): patterns the region
 noticed in how it is actually used — here, that everyone searches for `router`
-while the documents say `pheasant-flock`. Nothing proposed is retrievable until
+while the documents say `pheasant-flock`.
+
+A proposal is reviewable, not just assertable. Open one and it shows the calls
+it came from — what was asked, what came back, from which session — and opening
+again shows the trace: each span, its timing, and the step where the rule
+consolidated them into the proposal. Proposals group by rule, filter by text,
+and promote or reject in bulk, because a region under real traffic offers
+dozens at a time and the work is triage. Nothing proposed is retrievable until
 someone promotes it, and a rejection is permanent.
 
 <p align="center">

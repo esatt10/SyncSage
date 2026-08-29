@@ -88,6 +88,24 @@ def _answered(result_count: Any) -> bool:
 
 
 @dataclass
+class Interaction:
+    """One observed call, as the mining rules see it.
+
+    Carries its own ``event_id`` so a proposal can name the rows it was
+    derived from. Without that a candidate is an assertion with a count
+    attached and no way to check it --- a reviewer looking at
+    ``router -> pheasant-flock`` can see that it was seen four times and
+    nothing at all about what was asked or what came back.
+    """
+
+    event_id: str
+    query: str
+    node_ids: list[str] = field(default_factory=list)
+    paths: list[str] = field(default_factory=list)
+    started_at: str = ""
+
+
+@dataclass
 class SessionObservations:
     """One principal's interactions within one session.
 
@@ -105,14 +123,14 @@ class SessionObservations:
     queries: list[str] = field(default_factory=list)
     paths: Counter[str] = field(default_factory=Counter)
     gaps: list[str] = field(default_factory=list)
-    #: ``(query, node ids, paths)`` per observed call, in dialog order.
+    #: One entry per observed call, in dialog order.
     #:
     #: Per *interaction*, not per session, because the mining rules ask
     #: questions of the form "what did **this** query retrieve" --- an alias is
     #: a claim about one word and the documents that word found, and rolling a
     #: session's hits together would attribute every document to every word
     #: anyone typed in that session.
-    interactions: list[tuple[str, list[str], list[str]]] = field(default_factory=list)
+    interactions: list[Interaction] = field(default_factory=list)
     observations: int = 0
     first_seen: str = ""
     last_seen: str = ""
@@ -153,7 +171,7 @@ def _rows(state: Any, session_ids: list[str]) -> list[Any]:
         return []
     placeholders = ",".join("?" for _ in session_ids)
     return state.rows(
-        "SELECT session_id, principal, modality, query_text, result_ids_json, "
+        "SELECT id, session_id, principal, modality, query_text, result_ids_json, "
         "result_paths_json, result_count, top_score, started_at "
         f"FROM interaction_events WHERE session_id IN ({placeholders}) "
         "ORDER BY started_at, id",
@@ -201,7 +219,15 @@ def collect_sessions(
             pass
         entry.paths.update(paths)
         if query:
-            entry.interactions.append((query, node_ids, paths))
+            entry.interactions.append(
+                Interaction(
+                    event_id=str(row["id"]),
+                    query=query,
+                    node_ids=node_ids,
+                    paths=paths,
+                    started_at=started,
+                )
+            )
         # A question that returned nothing is the most useful thing a session
         # can record: it is what the region could not answer.
         if query and not _answered(row["result_count"]) and query not in entry.gaps:
@@ -388,6 +414,13 @@ GAP_RULE = "retrieval-gap-v1"
 #: directly because its scope confines it. Ordered so a pass is reproducible.
 CANDIDATE_RULES = (ALIAS_RULE, PATH_RULE, GAP_RULE)
 
+#: How many contributing interactions a proposal names.
+#:
+#: A cap, because the id list rides in the candidate row and a token asked
+#: four hundred times would otherwise carry four hundred ids. The head of the
+#: list is what a reviewer reads; the counts beside it remain the true totals.
+MAX_EVIDENCE_EVENTS = 20
+
 #: A path prefix shorter than this is not an affinity, it is the corpus.
 #: `preference` rules matching `/` would re-rank every query in the region.
 MIN_PREFIX_SEGMENTS = 1
@@ -538,13 +571,15 @@ def mine_aliases(sessions: list[SessionObservations], state: Any, settings: Any)
     # token -> the hits *its own queries* retrieved, and who asked.
     hits: dict[str, list[str]] = {}
     seen_in: dict[str, set[str]] = {}
+    events: dict[str, list[str]] = {}
     asked: Counter[str] = Counter()
     for session in sessions:
-        for query, node_ids, _paths in session.interactions:
-            for token in _tokens(query):
+        for call in session.interactions:
+            for token in _tokens(call.query):
                 asked[token] += 1
                 seen_in.setdefault(token, set()).add(session.session_id)
-                hits.setdefault(token, []).extend(node_ids)
+                hits.setdefault(token, []).extend(call.node_ids)
+                events.setdefault(token, []).append(call.event_id)
     if not asked:
         return []
 
@@ -579,6 +614,7 @@ def mine_aliases(sessions: list[SessionObservations], state: Any, settings: Any)
                     "target": target,
                     "asked": asked[token],
                     "sessions": sorted(seen_in[token]),
+                    "event_ids": events[token][:MAX_EVIDENCE_EVENTS],
                 },
                 observations=asked[token],
                 sessions=len(seen_in[token]),
@@ -703,15 +739,17 @@ def mine_path_affinity(sessions: list[SessionObservations], settings: Any) -> li
 
     landed: dict[str, list[str]] = {}
     seen_in: dict[str, set[str]] = {}
+    events: dict[str, list[str]] = {}
     asked: Counter[str] = Counter()
     for session in sessions:
-        for query, _node_ids, paths in session.interactions:
-            if not paths:
+        for call in session.interactions:
+            if not call.paths:
                 continue
-            for token in _tokens(query):
+            for token in _tokens(call.query):
                 asked[token] += 1
                 seen_in.setdefault(token, set()).add(session.session_id)
-                landed.setdefault(token, []).extend(paths)
+                landed.setdefault(token, []).extend(call.paths)
+                events.setdefault(token, []).append(call.event_id)
 
     out: list[Candidate] = []
     for token in sorted(asked):
@@ -731,6 +769,7 @@ def mine_path_affinity(sessions: list[SessionObservations], settings: Any) -> li
                     "prefix": prefix,
                     "paths": sorted(set(landed[token]))[:MAX_PATHS],
                     "sessions": sorted(seen_in[token]),
+                    "event_ids": events[token][:MAX_EVIDENCE_EVENTS],
                 },
                 observations=asked[token],
                 sessions=len(seen_in[token]),
@@ -758,15 +797,19 @@ def mine_gaps(sessions: list[SessionObservations], settings: Any) -> list[Candid
 
     asked: Counter[str] = Counter()
     seen_in: dict[str, set[str]] = {}
+    events: dict[str, list[str]] = {}
     first: dict[str, str] = {}
     last: dict[str, str] = {}
     for session in sessions:
+        by_query = {call.query: call.event_id for call in session.interactions}
         for gap in session.gaps:
             key = gap.strip()
             if not key:
                 continue
             asked[key] += 1
             seen_in.setdefault(key, set()).add(session.session_id)
+            if key in by_query:
+                events.setdefault(key, []).append(by_query[key])
             first[key] = min(first.get(key, session.first_seen), session.first_seen)
             last[key] = max(last.get(key, ""), session.last_seen)
 
@@ -790,6 +833,7 @@ def mine_gaps(sessions: list[SessionObservations], settings: Any) -> list[Candid
                     "query": quoted,
                     "asked": asked[query],
                     "sessions": sorted(seen_in[query]),
+                    "event_ids": events.get(query, [])[:MAX_EVIDENCE_EVENTS],
                 },
                 observations=asked[query],
                 sessions=len(seen_in[query]),

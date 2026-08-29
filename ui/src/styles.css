@@ -2743,3 +2743,233 @@ select.text-input {
   border-color: var(--accent-border);
   color: var(--accent-text);
 }
+
+/* ── Candidate review ──────────────────────────────────────────────────────
+   Three layers, and the density is the point: a reviewer with two hundred
+   proposals is triaging, not reading. One line per proposal, evidence on
+   demand, and bulk actions so a whole rule can be cleared in one gesture. */
+.candidates__count {
+  display: inline-block;
+  min-width: 1.5rem;
+  padding: 0 0.4rem;
+  margin-left: 0.4rem;
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-align: center;
+  vertical-align: middle;
+}
+.candidates__toolbar {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 0.75rem 0;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+.candidates__toolbar .input {
+  flex: 1 1 14rem;
+  min-width: 10rem;
+}
+.candidates__all {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  font-size: 0.8rem;
+  color: var(--text-soft);
+  white-space: nowrap;
+}
+/* Reserves its space so the row does not reflow the moment something is
+   ticked — a toolbar that jumps under the cursor loses the next click. */
+.candidates__selection {
+  min-width: 6rem;
+  font-size: 0.8rem;
+  color: var(--accent-text);
+  font-variant-numeric: tabular-nums;
+}
+.candidates__group {
+  margin-bottom: 1rem;
+}
+.candidates__group-head {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  padding: 0.35rem 0;
+}
+.candidates__link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-size: 0.78rem;
+  color: var(--muted);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.candidates__link:hover {
+  color: var(--text);
+}
+.candidate {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  margin-bottom: 0.35rem;
+  background: var(--bg-raised);
+}
+.candidate__row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.45rem 0.6rem;
+  flex-wrap: wrap;
+}
+.candidate__text {
+  flex: 1 1 16rem;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.85rem;
+  word-break: break-word;
+}
+.candidate__strength {
+  font-size: 0.75rem;
+  color: var(--accent-text);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.candidate__hint {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+/* Per-row actions stay hidden until the row is hovered or something inside it
+   has focus: with two hundred rows, four hundred always-visible buttons is
+   noise, and the bulk toolbar is the primary path anyway. Focus-within keeps
+   them reachable by keyboard, where hover does not exist. */
+.candidate__row-actions {
+  display: flex;
+  gap: 0.35rem;
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.candidate:hover .candidate__row-actions,
+.candidate:focus-within .candidate__row-actions {
+  opacity: 1;
+}
+.candidate__row-actions .button {
+  padding: 0.15rem 0.5rem;
+  font-size: 0.75rem;
+}
+.candidate__disclose {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--text-soft);
+  cursor: pointer;
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: baseline;
+}
+.candidate__disclose:hover {
+  color: var(--text);
+}
+.candidate__evidence {
+  border-top: 1px solid var(--border);
+  padding: 0.6rem 0.75rem 0.75rem;
+  background: var(--bg-sunken);
+  border-radius: 0 0 var(--radius-md) var(--radius-md);
+}
+.candidate__evidence-head {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
+}
+.candidate__calls {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+.candidate__calls th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 0.5rem 0.25rem 0;
+  border-bottom: 1px solid var(--border);
+}
+.candidate__calls td {
+  padding: 0.3rem 0.5rem 0.3rem 0;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.candidate__q {
+  font-style: italic;
+}
+.candidate__path {
+  display: inline-block;
+  margin-right: 0.3rem;
+  padding: 0 0.3rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-active);
+  font-size: 0.75rem;
+}
+/* The most useful row in the table: the region was asked and had nothing. */
+.candidate__nothing {
+  color: var(--warn);
+}
+.candidate__trace {
+  margin: 0.5rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.78rem;
+  color: var(--text-soft);
+}
+.candidate__trace li {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+  padding: 0.15rem 0;
+}
+.candidate__trace-end {
+  border-top: 1px dashed var(--border-strong);
+  margin-top: 0.3rem;
+  padding-top: 0.35rem;
+}
+.candidate__span {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+.candidate__status {
+  display: inline-block;
+  min-width: 5.5rem;
+  padding: 0 0.35rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.7rem;
+  text-align: center;
+  background: var(--bg-active);
+  color: var(--text-soft);
+}
+.candidate__status--ok {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+.candidate__status--error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.candidate__status--shed {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.candidate__status--formed {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}

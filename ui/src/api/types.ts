@@ -329,6 +329,39 @@ export interface MemoryCandidate {
   decided_at?: string | null;
 }
 
+/** One ledger row behind a proposal: what was asked, what came back, and the
+ *  span that carried it. */
+export interface CandidateInteraction {
+  id: string;
+  trace_id: string;
+  span_id: string;
+  parent_span_id?: string | null;
+  modality: string;
+  operation: string;
+  principal?: string | null;
+  session_id?: string | null;
+  started_at: string;
+  duration_ms: number | null;
+  status: string;
+  query_text?: string | null;
+  answer_text?: string | null;
+  criteria_json?: string | null;
+  result_ids_json?: string | null;
+  result_paths_json?: string | null;
+  result_count?: number | null;
+  top_score?: number | null;
+}
+
+export interface MemoryCandidateEvidence {
+  candidate: MemoryCandidate;
+  evidence: Record<string, unknown>;
+  interactions: CandidateInteraction[];
+  /** How many calls the rule recorded, against how many are still retained —
+   *  the hot window ages out from under a pending proposal. */
+  named: number;
+  found: number;
+}
+
 export interface MemoryCandidateListResponse {
   candidates: MemoryCandidate[];
   counts: Record<string, number>;

@@ -37,6 +37,15 @@ VIEWPORT = {"width": 1440, "height": 900}
 #: searches below say `router`, and that is exactly the pattern
 #: `alias-cooccurrence-v1` is built to notice — so the Memory tab's proposals
 #: are genuinely mined rather than staged.
+#: Enough vocabulary mismatch to produce a review queue worth showing. The
+#: Memory tab's job at scale is triage, and a screenshot of three proposals
+#: does not show whether the page can do it.
+TEAM_WORDS = {
+    "router": "pheasant-flock",
+    "watcher": "filewatch",
+    "runbook": "kestrel",
+}
+
 CORPUS = {
     "deploy/rollout.md": (
         "# Rollout\n\n"
@@ -59,10 +68,20 @@ CORPUS = {
 SEARCHES = [
     ("router rollout coordination", "sess-ada"),
     ("router canary promotion", "sess-ada"),
-    ("filewatch daemon restart", "sess-ada"),
+    ("runbook escalation rota", "sess-ada"),
+    ("watcher restart schedule", "sess-ada"),
     ("router rollout", "sess-bo"),
-    ("router canary", "sess-bo"),
+    ("router canary steps", "sess-bo"),
+    ("runbook oncall", "sess-bo"),
+    ("watcher nightly", "sess-bo"),
+    ("promotion health gate", "sess-bo"),
+    ("promotion health gate", "sess-ada"),
+    # Questions the corpus cannot answer. The most useful proposals in the
+    # queue: what the region keeps being asked and keeps failing.
+    ("vault seal rotation", "sess-ada"),
     ("vault seal rotation", "sess-bo"),
+    ("quarterly capacity forecast", "sess-ada"),
+    ("quarterly capacity forecast", "sess-bo"),
 ]
 
 MEMORIES = [
@@ -199,6 +218,16 @@ def _shoot(port: int, shots: dict[str, str]) -> None:
             # the same as a settled layout.
             page.wait_for_load_state("networkidle")
             page.wait_for_timeout(1200)
+            if name == "memory":
+                # Open the layers. A screenshot of collapsed rows shows the
+                # triage view and hides the thing that makes a proposal
+                # reviewable at all: what was asked, what came back, and the
+                # spans behind it.
+                page.get_by_role("button", name="Show evidence").first.click()
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(600)
+                page.get_by_role("button", name="Trace").first.click()
+                page.wait_for_timeout(500)
             out = TARGET / f"{name}.png"
             page.screenshot(path=str(out))
             print(f"  {out.relative_to(REPO)}  ({out.stat().st_size // 1024} KiB)")
