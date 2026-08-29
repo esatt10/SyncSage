@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 # Prove the log tier works across a container boundary.
 #
-# The decisive assertion is not "a row exists" -- an in-process test already
-# shows that. It is *who wrote it*: the batch has to be claimed by a process
-# whose owner id names the `logger` container, because the `api` replica that
-# produced it deliberately does not drain (`_owns_log_upkeep` is False for
-# `api` once a log queue exists). If the api ever started draining its own
-# batches, every other assertion here would still pass and the tier would be
-# doing nothing.
+# "A row exists" is not the assertion -- an in-process test already shows that.
+# What has to be proved is that a *separate process* does the draining, because
+# if the producer ever started draining its own batches every other check here
+# would still pass while the tier did nothing.
+#
+# So the run is split in two phases:
+#
+#   1. api only, no logger. Batches must pile up in `log_tasks` and
+#      `interaction_events` must stay **empty** -- the producer does not drain.
+#   2. start the logger. The rows must appear.
+#
+# Phase 1 is the half that can fail silently, and it is the reason for the
+# split. An earlier version of this asserted on `log_tasks.owner` instead and
+# failed for a reason that was not a bug: `LocalQueue.ack` sets `owner=NULL`,
+# so a batch that has been drained *successfully* has no owner left to check.
+# The column is a claim lease, not an audit trail.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,8 +43,8 @@ await() {
   return 1
 }
 
-log "Bringing up postgres, the migrator, an api replica and a logger"
-"${COMPOSE[@]}" up -d --wait --wait-timeout 240
+log "Phase 1: postgres, the migrator and an api replica -- deliberately no logger"
+"${COMPOSE[@]}" up -d --wait --wait-timeout 240 postgres db-init api
 
 # The corpus was indexed by the migrator: an `api` replica publishes index
 # work rather than running it, and this topology has no indexer on purpose.
@@ -52,20 +61,28 @@ done
 log "The api published batches to the log tier's own queue"
 await "log_tasks rows" "SELECT count(*) FROM log_tasks;" 60
 # Its own table, never the indexer's.
-test "$(query 'SELECT count(*) FROM log_tasks;')" != "0"
+test "$(query 'SELECT count(*) FROM index_tasks;')" = "0"
+
+log "...and did NOT drain them itself"
+# The half that can fail silently. Give it long enough that a producer which
+# *did* drain would have finished: the flush interval is 1s and there is no
+# scheduler beat at all in this config.
+sleep 10
+DRAINED_WITHOUT_LOGGER="$(query 'SELECT count(*) FROM interaction_events;')"
+PENDING="$(query "SELECT count(*) FROM log_tasks WHERE status IN ('pending','inflight');")"
+echo "    interaction_events without a logger: ${DRAINED_WITHOUT_LOGGER}"
+echo "    batches still waiting:               ${PENDING}"
+if [ "${DRAINED_WITHOUT_LOGGER}" != "0" ]; then
+  echo "FAILED: the api drained its own batches; the log tier would be doing nothing" >&2
+  exit 1
+fi
+test "${PENDING}" != "0"
+
+log "Phase 2: starting the logger"
+"${COMPOSE[@]}" up -d --wait --wait-timeout 180 logger
 
 log "The logger drained them into the hot store"
 await "interaction_events rows" "SELECT count(*) FROM interaction_events;" 90
-
-log "Checking WHO drained them"
-LOGGER_HOST="$("${COMPOSE[@]}" exec -T logger hostname | tr -d '[:space:]')"
-OWNERS="$(query "SELECT string_agg(DISTINCT split_part(owner, ':', 1), ',') FROM log_tasks WHERE owner IS NOT NULL;")"
-echo "    logger container: ${LOGGER_HOST}"
-echo "    claim owners:     ${OWNERS}"
-case ",${OWNERS}," in
-  *",${LOGGER_HOST},"*) echo "    the logger claimed the work" ;;
-  *) echo "FAILED: batches were not claimed by the logger container" >&2; exit 1 ;;
-esac
 
 log "The rows carry identity, modality and the caller's own trace"
 test "$(query "SELECT count(*) FROM interaction_events WHERE session_id='ci-session';")" != "0"
@@ -80,5 +97,7 @@ echo "    identity, modality, trace and timing all present"
 log "Every batch reached a terminal state; none dead-lettered"
 test "$(query "SELECT count(*) FROM log_tasks WHERE status='dead';")" = "0"
 await "completed batches" "SELECT count(*) FROM log_tasks WHERE status='done';" 60
+# Nothing left waiting, so the logger cleared the backlog phase 1 built.
+test "$(query "SELECT count(*) FROM log_tasks WHERE status IN ('pending','inflight');")" = "0"
 
 log "The log tier is real"
