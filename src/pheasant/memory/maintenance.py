@@ -99,6 +99,25 @@ def _run(engine: Any, config: Any, settings: Any, source: Any, *, now: datetime 
                 "pheasant_memory_compactions_total", len(compaction["subsumed"]), op="subsume"
             )
 
+    # Formation rides the same beat, after consolidation and capacity: a
+    # digest written now should not be pruned by a pass that already ran, and
+    # the record list above is the one it needs. Off by default; no-ops fast.
+    if getattr(getattr(settings, "formation", None), "enabled", False):
+        from pheasant.memory.formation import run_session_digests
+
+        formation = run_session_digests(engine, now=now, records=store.list_records())
+        if formation:
+            result["formation"] = formation
+            for outcome, key in (("created", "created"), ("refined", "refined")):
+                count = len(formation.get(key) or [])
+                if count:
+                    metrics.REGISTRY.inc(
+                        "pheasant_memory_formations_total",
+                        count,
+                        rule_id=formation["rule_id"],
+                        outcome=outcome,
+                    )
+
     _record_scope_gauge(engine)
     return result
 

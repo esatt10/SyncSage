@@ -536,7 +536,14 @@ def test_the_process_buffer_is_a_single_shared_slot() -> None:
     """So a mounted MCP app observes through the API's buffer instead of
     opening a second one that would double-count every /mcp call."""
 
-    assert process_buffer() is None
+    # A strict entry assertion on purpose: it is the canary for a test that
+    # built an app without a lifespan (no TestClient), so the teardown that
+    # clears this slot never ran. If this fails, the leak is in whatever ran
+    # before it, not here.
+    assert process_buffer() is None, (
+        "another test left a process buffer behind: build the app inside a "
+        "TestClient, or leave observability.interactions disabled"
+    )
     buffer = InteractionBuffer(NullSink())
     try:
         set_process_buffer(buffer)

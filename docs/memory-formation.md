@@ -399,9 +399,58 @@ refinement naming the previous one in `supersedes`. Then:
 - consolidation archives the chain on the ordinary beat;
 - `session_ttl_days` decays it like any other session-scope memory.
 
-The digest's text is a fixed deterministic template over the session's observed
-subjects, paths and queries. It is not a summary in the model sense, and it
-does not claim to be.
+The text is a fixed template over sorted inputs — not a summary in the model
+sense, and it does not claim to be:
+
+```
+Session sess-alpha (ui): 4 interactions from 2026-08-29T…Z to 2026-08-29T…Z.
+
+Asked about:
+- filewatch daemon nightly
+- invoices finance service
+- where does staging run
+
+Most-consulted:
+- runbook.md (3)
+- billing.md (1)
+
+Found nothing for:
+- who owns the kestrel rota
+```
+
+Questions stay in the order the session asked them (dialog order, and already
+deterministic — the rows are read `ORDER BY started_at`). Paths sort by count
+then by path, because `most_common` alone leaves ties in insertion order, and
+the record's id is a digest of this string: two passes over an unchanged
+session must produce the same bytes or every beat would supersede the last.
+Every list is capped — a digest is a paragraph someone reads in the Memory tab,
+and an unbounded one is a transcript, which is the thing this deliberately is
+not.
+
+**"Found nothing for" is the honest form of "usage expands the knowledge".**
+Usage cannot conjure facts the corpus lacks; what it can do is say which
+questions keep going unanswered.
+
+#### Why this one is written automatically
+
+Everything else formation produces is a *candidate* a person promotes. A
+session digest is written directly, and the reason is scope: it is
+`scope: session`, subject that session, written by that principal — so under
+`security.acl_enforced` only its own writer can read it, and it decays with
+`session_ttl_days` like any other session memory. It never becomes shared
+knowledge. Reaching `user` or `org` scope takes an explicit promotion, which is
+exactly the "nothing persists into the knowledge base unless a person adds it"
+this design is built around. What is automatic here is a session's memory of
+itself.
+
+A digest is written only for a session with at least `min_observations`
+recorded interactions. One question is not a dialog, and a record per drive-by
+query is the unbounded growth the capacity rules exist to prevent.
+
+**Two principals claiming one session id get separate digests.** A session id
+is caller-asserted, so that can happen; a digest that mixed them would be
+readable by whichever writer owned the record — an ACL leak reached through a
+field nobody authenticates.
 
 ### Admission
 

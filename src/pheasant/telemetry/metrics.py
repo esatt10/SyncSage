@@ -494,6 +494,16 @@ def register_default_metrics(version: str) -> None:
         ("op",),
     )
     REGISTRY.histogram("pheasant_memory_compaction_seconds", "One L1/L2 clustering pass.")
+    # Formation: records written from the observation plane rather than by a
+    # caller. `rule_id` is versioned, so a rule whose logic changes shows up
+    # here as a new series rather than silently continuing the old one's count.
+    REGISTRY.counter(
+        "pheasant_memory_formations_total",
+        "Records formed from observed interactions, by rule and outcome "
+        "('created' for a session's first digest, 'refined' for one that "
+        "superseded its own previous version).",
+        ("rule_id", "outcome"),
+    )
     REGISTRY.counter(
         "pheasant_memory_synthesis_calls_total",
         "L3 synthesis cluster attempts, by outcome "

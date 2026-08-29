@@ -283,6 +283,17 @@ record, indexed by the ordinary pipeline. Recall *is* search. On top of that:
   `index_tasks.payload` (attached *after* the id digest, or the content-
   addressed dedup that makes two replicas enqueue one task would break).
   `docs/memory-formation.md`.
+- **Formation** (`memory.formation`, off) — deterministic rules read the
+  observation plane and produce memory. `session-digest-v1` is the first:
+  one record per `(session, principal)`, refined by **superseding itself**,
+  so `current_only` returns exactly one and `as_of` reads the session's
+  history. Written automatically rather than proposed, and only because of
+  scope: `session` scope + `written_by` means only its own writer can read
+  it and it decays with `session_ttl_days` — it never becomes shared
+  knowledge, which still takes an explicit promotion. Two guards keep a
+  repeat pass free: a text short-circuit (cheap) and the store's own id
+  dedup (sound, because `supersedes` is deliberately absent from the id
+  digest).
 
 ### Scale
 
