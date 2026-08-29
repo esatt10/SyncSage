@@ -1,0 +1,227 @@
+name: Memory
+
+# The memory subsystem gets its own workflow for one reason: its correctness
+# lives in the *seams*, and the seams cross a database, a queue, a container
+# boundary and a file format. The unit suites in `CI` cover each hop; nothing
+# there proves the hops connect.
+#
+# Two jobs, and both are about connection rather than coverage:
+#
+#   round-trip  — the full exchange, in order, on both storage backends:
+#                 a search becomes a span and a ledger row, the row is
+#                 published to the log tier's own queue, drained into the hot
+#                 store, rolled to cold Parquet, read back out by DuckDB,
+#                 mined into a candidate, promoted through the ordinary write
+#                 path, indexed, and found again by search.
+#
+#   log-tier    — the same tier as real containers. `--role logger` in its own
+#                 image, draining a queue an `--role all` container published
+#                 to, against a real PostgreSQL. This is the one thing an
+#                 in-process test cannot show, and this repo has been bitten by
+#                 container-only behaviour four separate times.
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+    paths:
+      - "src/pheasant/memory/**"
+      - "src/pheasant/telemetry/**"
+      - "src/pheasant/sync/log_queue.py"
+      - "src/pheasant/sync/queue.py"
+      - "src/pheasant/evalset.py"
+      - "src/pheasant/persistence/**"
+      - "tests/test_memory_*.py"
+      - "tests/test_interactions.py"
+      - "tests/test_log_queue.py"
+      - "tests/test_evalset.py"
+      - "deploy/compose/**"
+      - ".github/workflows/memory.yml"
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  round-trip:
+    name: Memory round trip (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          - sqlite
+          - postgres
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pheasant
+          POSTGRES_PASSWORD: pheasant
+          POSTGRES_DB: pheasant_memory
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pheasant"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # `analytics` for the DuckDB reader the cold-storage hop needs, `otel`
+      # so the span/ledger correlation is exercised against the real SDK
+      # rather than the no-op shim, `postgres` for the parity leg.
+      - name: Install pheasant and the extras the loop crosses
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp,analytics,otel,postgres]"
+
+      - name: Run the memory suites
+        env:
+          # Only the postgres leg points at the service; the sqlite leg must
+          # stay on SQLite, which is the default every user gets.
+          PHEASANT_TEST_POSTGRES_DSN: ${{ matrix.backend == 'postgres' && 'postgresql://pheasant:pheasant@127.0.0.1:5432/pheasant_memory' || '' }}
+          PHEASANT_ROUNDTRIP_REPORT: memory-roundtrip-${{ matrix.backend }}.json
+          # Defence in depth: no formation rule and no observation path may
+          # ever reach a model. If one tries, it fails here rather than
+          # quietly becoming a metered test.
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GEMINI_API_KEY: ""
+        run: |
+          python -m pytest -q --durations=15 \
+            tests/test_memory_roundtrip.py \
+            tests/test_memory_*.py \
+            tests/test_interactions.py \
+            tests/test_log_queue.py \
+            tests/test_evalset.py \
+            tests/test_sync_idempotency.py \
+            tests/test_backend_parity.py \
+            2>&1 | tee memory-suite-${{ matrix.backend }}.log
+
+      - name: Summarise the loop's cost
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, pathlib
+          backend = "${{ matrix.backend }}"
+          report = pathlib.Path(f"memory-roundtrip-{backend}.json")
+          print(f"### Memory round trip — {backend}\n")
+          if not report.exists():
+              print("_No timing report was produced._")
+              raise SystemExit(0)
+          data = json.loads(report.read_text())
+          print("| Phase | ms |")
+          print("|---|---:|")
+          for phase, value in data["phases_ms"].items():
+              print(f"| `{phase}` | {value} |")
+          print(f"| **total** | **{data['total_ms']}** |")
+          PY
+
+      # The round trip's cost is the number worth watching: it is the only
+      # measurement that covers the whole loop rather than one hop, so a
+      # regression anywhere in it shows up here as a number instead of as a
+      # feeling. Not a hard budget yet -- one is worth setting once there are
+      # a few runs of history to set it from.
+      - name: Warn if the loop got materially slower
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys
+          report = pathlib.Path("memory-roundtrip-${{ matrix.backend }}.json")
+          if not report.exists():
+              sys.exit(0)
+          total = json.loads(report.read_text())["total_ms"]
+          # Generous on purpose: a shared runner is noisy, and a threshold that
+          # cries wolf is a threshold people disable.
+          budget = 3000
+          print(f"round trip total: {total} ms (advisory budget {budget} ms)")
+          if total > budget:
+              print(f"::warning::the memory round trip took {total} ms, over the {budget} ms advisory budget")
+          PY
+
+      - name: Upload the timing report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-roundtrip-${{ matrix.backend }}
+          path: |
+            memory-roundtrip-${{ matrix.backend }}.json
+            memory-suite-${{ matrix.backend }}.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  log-tier:
+    name: Log tier in real containers
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pheasant
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[postgres]"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The observability profile is a published artifact. Nothing else in CI
+      # parses it with the profile on, so a malformed `logger` service would
+      # otherwise reach a user's host before it reached us.
+      - name: Validate the observability profile parses
+        env:
+          PHEASANT_INDEX_WORKER_TOKEN: ci-config-check
+          OPENAI_API_KEY: ci-config-check
+        run: |
+          docker compose -f deploy/compose/docker-compose.scale.yml \
+            --profile observability config --quiet
+          # And that it is genuinely opt-in: the default `up` must be the
+          # fleet it has always been.
+          test "$(docker compose -f deploy/compose/docker-compose.scale.yml \
+            config --services | grep -c '^logger$')" = "0"
+          test "$(docker compose -f deploy/compose/docker-compose.scale.yml \
+            --profile observability config --services | grep -c '^logger$')" = "1"
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: pheasant:ci
+
+      - name: Run the log tier for real
+        run: bash deploy/compose/ci/log-tier-smoke.sh
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose -f deploy/compose/ci/docker-compose.log-tier.yml logs --no-color --tail 200
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose -f deploy/compose/ci/docker-compose.log-tier.yml down -v --remove-orphans || true

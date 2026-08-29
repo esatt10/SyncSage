@@ -742,3 +742,57 @@ def test_the_base_install_still_needs_no_infrastructure() -> None:
     # And no workload in the base install passes --role: the default is `all`.
     for workload in _workloads(docs):
         assert "--role" not in (_container(workload).get("args") or [])
+
+
+# --------------------------------------------------------------------------
+# The log tier's CI topology
+# --------------------------------------------------------------------------
+
+CI_COMPOSE = REPO_ROOT / "deploy" / "compose" / "ci" / "docker-compose.log-tier.yml"
+CI_CONFIG = REPO_ROOT / "deploy" / "compose" / "ci" / "pheasant.log-tier.yaml"
+
+
+def test_the_log_tier_topology_splits_producing_from_draining() -> None:
+    """The whole point of that compose file.
+
+    `all` would drain what it publishes -- correct for one container, and it
+    would make the CI smoke test prove nothing, because the producer would
+    consume its own batches. The roles have to be split or the tier is
+    untested.
+    """
+
+    compose = yaml.safe_load(CI_COMPOSE.read_text(encoding="utf-8"))
+    services = compose["services"]
+    assert set(services) == {"postgres", "db-init", "api", "logger"}
+    assert services["api"]["command"] == ["serve", "--role", "api"]
+    assert services["logger"]["command"] == ["serve", "--role", "logger"]
+
+    config = PheasantConfig.model_validate(yaml.safe_load(CI_CONFIG.read_text(encoding="utf-8")))
+    # Both roles must actually be startable against this config: `validate_role`
+    # is the same function the process runs, and it refuses an api without an
+    # index queue and a logger without an observation queue.
+    for role in ("api", "logger"):
+        validate_role(resolve_role(config, role), config)
+
+    # And the producer must genuinely not drain, which is what
+    # `_owns_log_upkeep` decides.
+    from pheasant.cli import _owns_log_upkeep
+
+    assert _owns_log_upkeep(config, resolve_role(config, "api")) is False
+    assert _owns_log_upkeep(config, resolve_role(config, "logger")) is False
+
+
+def test_the_ci_topology_exercises_the_whole_ledger_path() -> None:
+    """A smoke test with cold storage off, or formation off, would pass while
+    testing half of what it claims to."""
+
+    config = PheasantConfig.model_validate(yaml.safe_load(CI_CONFIG.read_text(encoding="utf-8")))
+    interactions = config.observability.interactions
+
+    assert interactions.enabled
+    assert interactions.queue.enabled
+    assert interactions.cold_enabled
+    assert config.memory.formation.enabled
+    # PostgreSQL, because that is the backend the fleet actually runs and the
+    # one whose migration path differs.
+    assert config.storage.backend == "postgres"

@@ -641,6 +641,52 @@ def test_a_different_inflection_is_not_proposed_as_an_alias(tmp_path: Path) -> N
     assert not any(text.startswith("coordination ->") for text in proposals)
 
 
+def test_the_alias_target_is_the_corpus_s_own_word_not_a_common_one(
+    tmp_path: Path,
+) -> None:
+    """Being shared by every retrieved document is not enough.
+
+    The first version of this rule picked the alphabetically-first universal
+    term and proposed `router -> before`, because "before traffic shifts" and
+    "before promotion" both contain it. Alphabetical order is not a signal.
+    The pick is by corpus document frequency now -- the same IDF the ranking
+    arm scores with, so "distinctive" means the same thing to formation as it
+    does to search.
+    """
+
+    engine = _corpus_engine(tmp_path, min_observations=2, min_sessions=2)
+    for index, session in enumerate(("s1", "s2")):
+        _ask(engine, session, "router rollout", start=index * 10, hits=["deploy/rollout.md"])
+        _ask(engine, session, "router canary", start=index * 10 + 1, hits=["deploy/canary.md"])
+
+    run_candidate_rules(engine)
+
+    aliases = engine.state.list_memory_candidates(rule_id="alias-cooccurrence-v1")
+    assert [c["text"] for c in aliases] == ["router -> pheasant-flock"]
+
+
+def test_a_corpus_with_no_vocabulary_still_proposes_rather_than_crashing(
+    tmp_path: Path,
+) -> None:
+    """An empty corpus, or an FTS build without `fts5vocab`, degrades to
+    lexical order -- the behaviour before frequencies were consulted."""
+
+    from pheasant.memory.formation import _dominant_term
+
+    bodies = ["alpha zulu content here", "alpha zulu other content"]
+    assert _dominant_term(bodies, exclude=set(), state=None) == "alpha"
+
+
+def test_documents_that_are_simply_similar_yield_no_alias() -> None:
+    """More than a handful of shared terms means the documents resemble each
+    other, not that any one term is the alias."""
+
+    from pheasant.memory.formation import MAX_UNIVERSAL_TERMS, _dominant_term
+
+    shared = " ".join(f"term{index}" for index in range(MAX_UNIVERSAL_TERMS + 2))
+    assert _dominant_term([shared, shared], exclude=set(), state=None) is None
+
+
 def test_a_query_family_that_lands_in_one_directory_becomes_a_preference(
     tmp_path: Path,
 ) -> None:

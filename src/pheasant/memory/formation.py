@@ -565,7 +565,7 @@ def mine_aliases(sessions: list[SessionObservations], state: Any, settings: Any)
         # Absent *and* not merely a different form of a word they do use.
         if _is_inflection(token, bodies):
             continue
-        target = _dominant_term(bodies, exclude={token})
+        target = _dominant_term(bodies, exclude={token}, state=state)
         if target is None:
             continue
         out.append(
@@ -589,14 +589,29 @@ def mine_aliases(sessions: list[SessionObservations], state: Any, settings: Any)
     return out
 
 
-def _dominant_term(bodies: list[str], *, exclude: set[str]) -> str | None:
-    """The term every retrieved document shares, if there is exactly one worth
-    naming.
+def _dominant_term(bodies: list[str], *, exclude: set[str], state: Any = None) -> str | None:
+    """The most *distinctive* term every retrieved document shares.
 
-    Requires presence in **all** of them, not most: an alias is a claim that
-    two words mean the same thing, and a term two documents out of three
-    happen to share is a coincidence. Ties break lexicographically so the
-    proposal is reproducible.
+    Presence in **all** of them, not most: an alias is a claim that two words
+    mean the same thing, and a term two documents out of three happen to share
+    is a coincidence.
+
+    Being universal is not enough on its own, though, and the first version of
+    this proved it: on a two-document fixture it proposed ``router -> before``,
+    because "before traffic shifts" and "before promotion" both contain the
+    word and it sorted first alphabetically. Alphabetical order is not a
+    signal.
+
+    So the pick is by **corpus document frequency**, rarest first --- the same
+    IDF the ranking arm scores with, read from the same term/document-frequency
+    table (`corpus_vocabulary`), so "distinctive" means the same thing to
+    formation as it does to search. A term the whole corpus uses is a function
+    word; a term a handful of documents use is the corpus's own name for
+    something, which is exactly what an alias should point at.
+
+    Falls back to lexical order when no vocabulary is available (an empty
+    corpus, or an FTS build without `fts5vocab`), which is the pre-existing
+    behaviour rather than a crash.
     """
 
     from pheasant.search.sqlite_store import _STOPWORDS
@@ -612,7 +627,35 @@ def _dominant_term(bodies: list[str], *, exclude: set[str]) -> str | None:
     universal = sorted(term for term, count in counts.items() if count == len(bodies))
     # More than a handful shared by everything means the documents are simply
     # similar, not that any one term is the alias.
-    return universal[0] if 1 <= len(universal) <= 8 else None
+    if not 1 <= len(universal) <= MAX_UNIVERSAL_TERMS:
+        return None
+
+    frequencies = _corpus_frequencies(state)
+    if not frequencies:
+        return universal[0]
+    # Rarest in the corpus wins; an unlisted term is rarer than any listed one,
+    # since `corpus_vocabulary` returns only the most widely used. Lexical
+    # order breaks ties so the proposal is reproducible.
+    return min(universal, key=lambda term: (frequencies.get(term, -1), term))
+
+
+#: More universal terms than this and the documents are simply similar --- no
+#: one of them is the alias.
+MAX_UNIVERSAL_TERMS = 8
+
+
+def _corpus_frequencies(state: Any) -> dict[str, int]:
+    """``term -> document count`` for the corpus's most widely used terms."""
+
+    if state is None:
+        return {}
+    try:
+        from pheasant.search.sqlite_store import corpus_vocabulary
+
+        return {term: doc for term, doc in corpus_vocabulary(state, limit=512)}
+    except Exception:  # noqa: BLE001 - a missing vocabulary is not a failure
+        logger.debug("Corpus vocabulary unavailable for alias ranking", exc_info=True)
+        return {}
 
 
 #: How much of a word two forms must share before they count as the same word.

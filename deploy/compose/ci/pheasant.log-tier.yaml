@@ -1,0 +1,73 @@
+# The smallest configuration that is still the real fleet shape for the log
+# tier: PostgreSQL holds the tables, an `api` replica observes without
+# draining, and a `logger` replica drains.
+#
+# `api` is used rather than `all` on purpose. `all` runs the maintenance beat
+# and, with a log queue configured, drains what it publishes -- which is
+# correct behaviour for one container and would make this test prove nothing,
+# because the producer would consume its own batches. Splitting the roles is
+# the whole point.
+pheasant:
+  name: log-tier-ci
+  state_path: /state
+  workspace_root: /workspace
+  exports_path: /exports
+
+server:
+  host: 0.0.0.0
+  port: 8765
+  api:
+    cors_origins:
+      - "*"
+
+storage:
+  backend: postgres
+  dsn_env: PHEASANT_DATABASE_URL
+  graph_snapshots: false
+
+search:
+  embeddings:
+    provider: stub
+
+assistant:
+  enabled: false
+
+sync:
+  scheduler:
+    enabled: false
+  watcher:
+    enabled: false
+  queue:
+    # `validate_role` refuses `role: api` without this: an api replica
+    # publishes index work instead of running it, so without a queue every
+    # sync request would be accepted and go nowhere.
+    enabled: true
+    backend: local
+
+observability:
+  interactions:
+    enabled: true
+    # Flush every observation immediately: a smoke test should not wait out a
+    # five-second timer to find out whether the tier works.
+    flush_batch_size: 1
+    flush_interval_seconds: 1.0
+    hot_retention_days: 7
+    cold_enabled: true
+    queue:
+      enabled: true
+      backend: local
+
+memory:
+  formation:
+    enabled: true
+    min_observations: 1
+    min_sessions: 1
+
+sources:
+  - name: docs
+    type: markdown_folder
+    path: /workspace/corpus
+    include:
+      - "**/*.md"
+    sync:
+      on_startup: false

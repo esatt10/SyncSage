@@ -1,0 +1,94 @@
+# The log tier, in containers, against a real database.
+#
+# This is the piece an in-process test cannot show: that `serve --role logger`
+# in its own image claims batches another container published, and that the
+# rows land where the next process can read them. Container-only behaviour has
+# bitten this repository four separate times -- read-only mounts, cross-process
+# visibility, a crash on real-world input -- so the tier gets a real run.
+#
+# Deliberately smaller than `docker-compose.scale.yml`: no NATS, no worker, no
+# graph service. Those are covered elsewhere and each one added here is another
+# way for this to fail for a reason that is not the log tier.
+name: pheasant-log-tier-ci
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pheasant
+      POSTGRES_PASSWORD: pheasant
+      POSTGRES_DB: pheasant
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pheasant"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # One migrator, before anything serves. Replaying the schema from several
+  # processes at once deadlocks PostgreSQL catalog locks against ordinary
+  # writes -- the reason `_migrate_postgres` elects a single migrator at all.
+  db-init:
+    image: ${PHEASANT_IMAGE:-pheasant:ci}
+    restart: "no"
+    # The same shape `docker-compose.scale.yml` uses: building the engine once
+    # runs the schema migration and nothing else. `pheasant migrate` is a
+    # different tool -- it copies an existing SQLite state into PostgreSQL,
+    # which is not what a fresh database needs.
+    entrypoint: ["python", "-c"]
+    # It also indexes the corpus, because nothing else here can: an `api`
+    # replica publishes index work to the queue instead of running it, and
+    # this topology deliberately has no indexer. `sync_source` runs it
+    # directly rather than publishing, which is what makes the searches below
+    # return real hits.
+    command:
+      - "from pathlib import Path; from pheasant.cli import _engine; engine = _engine(Path('/config/pheasant.yaml')); engine.sync_source('docs', 'full'); engine.close()"
+    environment: &env
+      PHEASANT_CONFIG: /config/pheasant.yaml
+      PHEASANT_DATABASE_URL: postgresql://pheasant:pheasant@postgres:5432/pheasant
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes: &mounts
+      - ./pheasant.log-tier.yaml:/config/pheasant.yaml:ro
+      - ./corpus:/workspace/corpus:ro
+      - state:/state
+      - exports:/exports
+
+  # Observes, and does not drain: `_owns_log_upkeep` is False for `api` once a
+  # log queue exists, so every batch this publishes has to be claimed by the
+  # logger below or the test fails.
+  api:
+    image: ${PHEASANT_IMAGE:-pheasant:ci}
+    command: ["serve", "--role", "api"]
+    environment: *env
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes: *mounts
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  logger:
+    image: ${PHEASANT_IMAGE:-pheasant:ci}
+    command: ["serve", "--role", "logger"]
+    environment: *env
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    volumes: *mounts
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  state:
+  exports:
