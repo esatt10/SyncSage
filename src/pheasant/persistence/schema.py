@@ -342,6 +342,124 @@ CREATE TABLE IF NOT EXISTS index_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_index_tasks_claim
   ON index_tasks(status, visible_at, enqueued_at);
+-- Memory candidates: what formation proposes, before anything admits it.
+--
+-- Evidence, never memory. A row here is a *suggestion* derived from the
+-- observation plane; it becomes knowledge only when something admits it, and
+-- admission goes through MemoryStore.append like every other write. That is
+-- what keeps memory's first invariant intact while still letting the region
+-- learn from how it is used.
+--
+-- `id` is content-addressed over (rule, scope, subject, kind, normalized text,
+-- params_hash), so a rule re-deriving the same proposal on the next beat
+-- updates the counters on the row it already wrote instead of piling up
+-- duplicates -- the same property `memory_compactions` gets from hashing its
+-- own fields.
+--
+-- **A rejected candidate is never re-proposed.** The upsert below only ever
+-- refreshes a row that is still `pending`, so `rejected` stays rejected and
+-- `admitted` stays admitted, exactly as `index_tasks` keeps a dead task dead.
+-- Without that, a rule would re-suggest on every beat something a person has
+-- already said no to.
+CREATE TABLE IF NOT EXISTS memory_candidates (
+  id TEXT PRIMARY KEY,
+  rule_id TEXT NOT NULL,
+  params_hash TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  subject TEXT,
+  kind TEXT NOT NULL DEFAULT 'fact',
+  text TEXT NOT NULL,
+  written_by TEXT,
+  evidence_json TEXT,
+  observations INTEGER NOT NULL DEFAULT 1,
+  sessions INTEGER NOT NULL DEFAULT 1,
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  admitted_by TEXT,
+  record_id TEXT,
+  decided_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memory_candidates_status
+  ON memory_candidates(status, last_seen);
+-- The log tier's own queue, deliberately NOT a `kind` column on index_tasks.
+-- Observations arrive at request rate against a corpus that changes hourly at
+-- most, so sharing a table would mean request-rate churn on the very index
+-- (idx_index_tasks_claim) the indexer claims from, plus the vacuum pressure
+-- that comes with it under Postgres — exactly the burden the separate tier
+-- exists to avoid. The cost of separating is small because the abstraction was
+-- already right: `drain()` is task-agnostic and is reused verbatim, and the
+-- race-free conditional-UPDATE claim stays one implementation parameterized by
+-- table name.
+--
+-- No `source_id`/`mode`: those are indexing vocabulary. A batch is opaque JSON
+-- and the payload is the whole task.
+CREATE TABLE IF NOT EXISTS log_tasks (
+  id TEXT PRIMARY KEY,
+  payload TEXT,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 2,
+  owner TEXT,
+  visible_at TEXT NOT NULL,
+  enqueued_at TEXT NOT NULL,
+  updated_at TEXT,
+  last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_log_tasks_claim
+  ON log_tasks(status, visible_at, enqueued_at);
+-- The observation plane: one row per API/MCP call, when
+-- `observability.interactions.enabled`.
+--
+-- **These are not memory records and must never become them.** A row here is
+-- never a file, never chunked, never indexed, and never returned by a search;
+-- a UI session's chat does not become knowledge because it was observed. The
+-- only path from here into memory is a *candidate* that something admits,
+-- and admission goes through MemoryStore.append like every other write. See
+-- docs/memory-formation.md.
+--
+-- Unlike every other table in this file, this one is high-churn and
+-- retention-bounded: rows are deleted once past
+-- `interactions.hot_retention_days`, after being rolled to Parquet under
+-- /exports when `cold_enabled`. That is the one sanctioned exception to
+-- "nothing is ever deleted" (CLAUDE.md rule 2) and it is why the retention is
+-- a declared, documented policy rather than an implementation detail.
+--
+-- `id` is blake2b(trace_id|span_id), so at-least-once redelivery of a batch
+-- is a no-op rather than a duplicate — the same argument index_tasks makes
+-- from content sha256, reached a different way.
+CREATE TABLE IF NOT EXISTS interaction_events (
+  id TEXT PRIMARY KEY,
+  kb_id TEXT NOT NULL,
+  trace_id TEXT NOT NULL,
+  span_id TEXT NOT NULL,
+  parent_span_id TEXT,
+  modality TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  principal TEXT,
+  session_id TEXT,
+  client_id TEXT,
+  started_at TEXT NOT NULL,
+  duration_ms REAL,
+  status TEXT NOT NULL,
+  query_text TEXT,
+  answer_text TEXT,
+  criteria_json TEXT,
+  -- Stable node ids and source-relative paths, kept in two homogeneous lists
+  -- rather than one heterogeneous one. `result_ids` joins to graph_nodes and
+  -- chunks; `result_paths` is in the grammar steering rules already match
+  -- against, so a `preference` rule minted from these can actually fire.
+  result_ids_json TEXT,
+  result_paths_json TEXT,
+  result_count INTEGER,
+  top_score REAL,
+  attributes_json TEXT,
+  schema_version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_interaction_events_time
+  ON interaction_events(started_at);
+CREATE INDEX IF NOT EXISTS idx_interaction_events_session
+  ON interaction_events(session_id, started_at);
 """
 
 #: SQLite-only: WAL, plus the FTS5 virtual tables.

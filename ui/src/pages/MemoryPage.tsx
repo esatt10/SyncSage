@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
+import { CandidateReview } from "../memory/CandidateReview";
 import type { MemoryRecord, MemoryScope } from "../api/types";
 
 const SCOPES: MemoryScope[] = ["session", "user", "org"];
@@ -60,8 +61,12 @@ export function MemoryPage() {
 
   const consolidate = useMutation({
     mutationFn: () => api.memoryConsolidate(),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["memory"] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["memory"] });
+      queryClient.invalidateQueries({ queryKey: ["memory-candidates"] });
+    },
   });
+
 
   const records = listing.data?.records ?? [];
   const bySubject = useMemo(() => {
@@ -119,6 +124,8 @@ export function MemoryPage() {
         </div>
       ) : (
         <>
+          <CandidateReview />
+
           <section className="section">
             <h2>Write a memory</h2>
             <p className="section__hint">

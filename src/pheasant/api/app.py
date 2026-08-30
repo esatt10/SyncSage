@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import threading
 import time
 from collections import deque
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import yaml
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
@@ -391,11 +392,205 @@ RETRIEVAL_FIELD_HELP: dict[str, str] = {
     "max_facts": "graph facts surfaced alongside the answer.",
 }
 
+
 #: Config sections that can be changed on a running server, and what changing
 #: one actually costs. ``True`` means the live process picks it up; ``False``
 #: means it is written to the file and needs a restart. Being honest about the
 #: difference is the whole point — a UI that says "saved" for a setting the
 #: process is still ignoring has lied to the user.
+def _state_is_writable(config: PheasantConfig, state: object) -> bool:
+    """Can this process actually write the hot store?
+
+    Under PostgreSQL, yes, from every replica -- which is why the shipped
+    fleet needs no spool at all. Under SQLite the answer is the filesystem's:
+    `docker-compose.scale.yml` mounts `/state:ro` on API replicas so the
+    indexer is the only writer, and probing beats asking an operator to
+    configure per-role what the mount already decided.
+
+    Verified against the two forms that mount can take, because they are not
+    equivalent. A read-only **mount** -- what `:ro` actually is -- is reported
+    unwritable even to uid 0, since the kernel checks `MS_RDONLY` before it
+    checks anything else. Read-only **permission bits** are not: root bypasses
+    them, so this returns True and the first insert raises instead. That
+    failure is caught and counted as a dropped batch rather than surfacing to
+    a caller, so the worst case is a degraded ledger, not a broken request --
+    and the manifests express it as a mount, which is the case that works.
+    """
+
+    backend = str(getattr(config.storage, "backend", "sqlite") or "sqlite").lower()
+    if backend != "sqlite":
+        return True
+    path = getattr(config.storage, "sqlite_path", None)
+    if path is None:
+        return True
+    return os.access(Path(path).parent, os.W_OK)
+
+
+def _build_interaction_buffer(
+    config: PheasantConfig,
+    state: object,
+    app: FastAPI,
+    role_policy: object,
+) -> object | None:
+    """Wire the observation plane, or return ``None`` when it is off.
+
+    Never raises. Telemetry that can break startup is worse than no telemetry,
+    and this runs before anything has served a request.
+    """
+
+    settings = getattr(getattr(config, "observability", None), "interactions", None)
+    if settings is None or not getattr(settings, "enabled", False):
+        return None
+    try:
+        from pheasant.sync.log_queue import log_queue_from_config
+        from pheasant.telemetry.interactions import (
+            InteractionBuffer,
+            configure_tracing,
+            resolve_sink,
+            set_process_buffer,
+        )
+
+        configure_tracing(config.observability)
+        queue = log_queue_from_config(config, state)
+        app.state.log_queue = queue
+        sink = resolve_sink(
+            settings,
+            state=state,
+            queue=queue,
+            kb_id=config.pheasant.name,
+            state_writable=_state_is_writable(config, state),
+            owner=f"{socket.gethostname()}-{os.getpid()}",
+        )
+        buffer = InteractionBuffer(
+            sink,
+            capacity=int(getattr(settings, "buffer_size", 10_000)),
+            batch_size=int(getattr(settings, "flush_batch_size", 500)),
+            interval_seconds=float(getattr(settings, "flush_interval_seconds", 5.0)),
+        )
+        buffer.start()
+        # The mounted MCP app observes through this same buffer rather than
+        # opening a second one -- see `interactions.set_process_buffer`.
+        set_process_buffer(buffer)
+        logger.info(
+            "Observation plane on (sink=%s, role=%s). Interactions are rows with a "
+            "retention policy, never indexed content.",
+            buffer.sink_name,
+            getattr(role_policy, "name", "?"),
+        )
+        return buffer
+    except Exception:  # noqa: BLE001 - telemetry must never break startup
+        logger.warning(
+            "Could not start the observation plane; continuing without it", exc_info=True
+        )
+        return None
+
+
+def observed(request: Any) -> Any:
+    """The live interaction event for this request, or ``None``.
+
+    The seam between the middleware, which knows the timing and the status,
+    and a handler, which is the only thing that has seen the request body and
+    the results. A handler enriches through this and never has to know whether
+    observation is on -- with it off there is no event and this returns None.
+
+    Free text set here is capped and redacted by the middleware afterwards, so
+    a handler never has to remember to do either.
+    """
+
+    return getattr(getattr(request, "state", None), "interaction", None)
+
+
+def record_retrieval(
+    request: Any,
+    *,
+    query: str | None,
+    payload: Any,
+    criteria: dict[str, Any] | None = None,
+    answer: str | None = None,
+    event: Any = None,
+) -> None:
+    """Fill in what only a handler knows: the question, the hits, the answer.
+
+    A no-op when observation is off, so a route calls it unconditionally and
+    never branches on telemetry. Free text set here is capped and redacted by
+    the middleware on the way out, so a handler cannot forget to do either.
+    """
+
+    event = event if event is not None else observed(request)
+    if event is None:
+        return
+    try:
+        from pheasant.telemetry.interactions import extract_results
+
+        event.query_text = query
+        if criteria:
+            event.criteria = criteria
+        if answer is not None:
+            event.answer_text = answer
+        ids, paths, top, count = extract_results(payload)
+        event.result_ids, event.result_paths = ids, paths
+        event.top_score = top
+        event.result_count = count
+    except Exception:  # noqa: BLE001 - an observation must never fail a request
+        logger.debug("could not record retrieval detail", exc_info=True)
+
+
+def _observe_shed(
+    buffer: object | None, request: object, path: str, config: PheasantConfig
+) -> None:
+    """Record a 429 without going through `observe`.
+
+    Separate because the shed path has no handler to wrap: the response is
+    built and returned before anything else runs.
+    """
+
+    if buffer is None:
+        return
+    try:
+        from pheasant.telemetry.interactions import InteractionContext, InteractionEvent, utc_now
+
+        headers = request.headers  # type: ignore[attr-defined]
+        context = InteractionContext.create(
+            "ui",
+            principal=headers.get("x-pheasant-principal"),
+            session_id=headers.get("x-pheasant-session"),
+            client_id=headers.get("x-pheasant-client"),
+            traceparent=headers.get("traceparent"),
+        )
+        buffer.record(  # type: ignore[attr-defined]
+            InteractionEvent(
+                kb_id=config.pheasant.name,
+                operation=path,
+                modality=str(context.modality),
+                principal=context.principal,
+                session_id=context.session_id,
+                client_id=context.client_id,
+                trace_id=context.trace_id,
+                span_id=context.span_id,
+                parent_span_id=context.parent_span_id,
+                started_at=utc_now().isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                status="shed",
+            )
+        )
+    except Exception:  # noqa: BLE001 - an observation must never fail a request
+        logger.debug("could not observe a shed request", exc_info=True)
+
+
+#: Routes the observation plane ignores.
+#:
+#: Liveness and scrape endpoints are machine chatter, not interactions: no
+#: query, no session, no principal, and nothing a formation rule could ever
+#: read. Recording them is not merely useless, it is expensive --- a container
+#: health check every 3s is 28,800 rows per replica per day, about 26 MB, so a
+#: three-replica fleet holding a week of history would carry half a gigabyte
+#: of probes. Measured on the CI log-tier run, where the row count visibly
+#: climbed between assertions with no traffic but the probes.
+#:
+#: `/mcp` is here for a different reason: it is observed one level down, by
+#: the decorator that wraps every tool, which knows the tool name and its
+#: criteria. Counting it twice would double every formation threshold.
+UNOBSERVED_PATHS = frozenset({"/health", "/ready", "/metrics", "/mcp"})
+
 LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
     "search": True,
     "assistant": True,
@@ -405,6 +600,11 @@ LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
     "sync": False,  # watcher/scheduler services are started at boot
     "security": False,  # path policy is read per request, but ACL wiring is not
     "synapse": True,
+    # The tracer provider, the exporter and the buffer's flusher thread are
+    # all wired once at app construction, and the log tier's queue binding
+    # with them. Same reason `sync` is False: these are services, not
+    # values read per request.
+    "observability": False,
     "storage": False,
     "server": False,
     "pheasant": False,
@@ -946,6 +1146,19 @@ def create_app(
                 async with mcp_asgi_app.router.lifespan_context(app):
                     yield
         finally:
+            buffer = getattr(app.state, "interaction_buffer", None)
+            if buffer is not None:
+                app.state.interaction_buffer = None
+                try:
+                    from pheasant.telemetry.interactions import set_process_buffer
+
+                    set_process_buffer(None)
+                    # Drains what is buffered, with a bounded join. A shutdown
+                    # that hangs on the log tier is worse than one that loses a
+                    # handful of observations.
+                    buffer.stop()
+                except Exception:  # pragma: no cover - shutdown must not raise
+                    logger.debug("could not stop the interaction buffer", exc_info=True)
             held = getattr(app.state, "metrics_queue", None)
             if held is not None:
                 app.state.metrics_queue = None
@@ -1011,6 +1224,14 @@ def create_app(
     limiter: ConcurrencyLimiter = app.state.limiter
     drain_state: DrainState = app.state.drain
 
+    # The observation plane (off by default). Built here rather than in the
+    # lifespan so a TestClient sees the same wiring a served process does, and
+    # so `interaction_buffer` is a stable attribute a route can read without
+    # caring whether observation is on.
+    app.state.log_queue = None
+    app.state.interaction_buffer = _build_interaction_buffer(config, state, app, role_policy)
+    interaction_buffer = app.state.interaction_buffer
+
     @app.middleware("http")
     async def bound_concurrency(request, call_next):  # type: ignore[no-untyped-def]
         """Admit or refuse immediately; never block.
@@ -1023,6 +1244,10 @@ def create_app(
         path = request.url.path
         if not limiter.acquire(path):
             metrics.REGISTRY.inc("pheasant_requests_shed_total", path=_metric_path(path))
+            # A shed request is still an observation: it is exactly the signal
+            # that says a formation threshold is being reached more slowly than
+            # the traffic suggests, and losing it would hide that.
+            _observe_shed(interaction_buffer, request, _metric_path(path), config)
             return JSONResponse(
                 status_code=429,
                 content={
@@ -1034,9 +1259,100 @@ def create_app(
                 headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
             )
         try:
-            return await call_next(request)
+            if interaction_buffer is None or _metric_path(path) in UNOBSERVED_PATHS:
+                return await call_next(request)
+            # One bounded append per request and nothing else. Everything the
+            # ledger costs beyond this happens on the flusher thread or on the
+            # log tier — see `pheasant.telemetry.interactions`.
+            from pheasant.telemetry.interactions import (
+                InteractionContext,
+                cap_answer,
+                observe,
+                redact,
+            )
+
+            context = InteractionContext.create(
+                _request_modality(request),
+                principal=request.headers.get("x-pheasant-principal"),
+                session_id=request.headers.get("x-pheasant-session"),
+                client_id=request.headers.get("x-pheasant-client"),
+                traceparent=request.headers.get("traceparent"),
+            )
+            settings = config.observability.interactions
+            with observe(
+                interaction_buffer,
+                context,
+                kb_id=config.pheasant.name,
+                operation=_metric_path(path),
+            ) as event:
+                # The middleware cannot see a request body without consuming
+                # the stream, and it cannot see a response body at all. So it
+                # publishes the live event and the handlers that know what was
+                # asked and what came back fill it in -- see `observed()`.
+                # Without this, every UI search recorded a path and a status
+                # and no content, and three of the four formation rules would
+                # have worked for MCP agents only.
+                request.state.interaction = event
+                response = await call_next(request)
+                event.status = "ok" if response.status_code < 400 else "error"
+                event.attributes["http_status"] = response.status_code
+                event.attributes["method"] = request.method
+                cap_answer(event, max_chars=int(getattr(settings, "max_answer_chars", 4000)))
+                redact(event, enabled=bool(getattr(settings, "redact_text", False)))
+                return response
         finally:
             limiter.release(path)
+
+    def _record_stream_answer(parent: Any, req: Any, answer: Any, started: Any) -> None:
+        """Observe a streamed answer as a child of the request that opened it.
+
+        The request's own event was buffered the moment this route returned
+        its `StreamingResponse`, which is long before there is an answer to
+        record -- so this is a second event rather than a late mutation of a
+        first, and the trace is what joins them.
+        """
+
+        if parent is None or interaction_buffer is None:
+            return
+        try:
+            from pheasant.telemetry.interactions import cap_answer, child_event, redact
+
+            settings = config.observability.interactions
+            event = child_event(parent, "/assistant/chat/stream")
+            # Timed from the child's own start, not the request's: this span
+            # exists precisely to say how long generating the answer took,
+            # which is the slowest thing in the region and the only part the
+            # request's own span cannot see.
+            event.duration_ms = round((time.perf_counter() - started) * 1000.0, 3)
+            record_retrieval(
+                None,
+                query=req.question,
+                payload=answer,
+                criteria={"workflow": req.workflow} if req.workflow else None,
+                answer=str(answer.get("answer") or "") or None,
+                event=event,
+            )
+            cap_answer(event, max_chars=int(getattr(settings, "max_answer_chars", 4000)))
+            redact(event, enabled=bool(getattr(settings, "redact_text", False)))
+            interaction_buffer.record(event)
+        except Exception:  # noqa: BLE001 - an observation must never fail a stream
+            logger.debug("could not observe a streamed answer", exc_info=True)
+
+    def _request_modality(request) -> str:  # type: ignore[no-untyped-def]
+        """Which surface this call arrived on.
+
+        An explicit header wins; otherwise the `/mcp` mount is the only thing
+        that can be told apart from a UI or script call by its path, and
+        everything else is `ui` — which is what the existing `audit()` closure
+        has always hardcoded. Making it a guess with a header override is
+        strictly better than making it a constant, and honest about being a
+        guess: nothing here is authenticated.
+        """
+
+        declared = request.headers.get("x-pheasant-modality")
+        if declared:
+            return declared
+        return "mcp" if request.url.path.startswith("/mcp") else "ui"
 
     def _metric_path(path: str) -> str:
         """Collapse to the first segment: a label per artifact id is a leak.
@@ -1839,6 +2155,7 @@ def create_app(
         import hashlib
 
         from pheasant.sync.queue import IndexTask, queue_from_config
+        from pheasant.telemetry.interactions import traceparent_header
 
         queue = queue_from_config(config, state)
         if queue is None:  # pragma: no cover - validate_role refuses this at startup
@@ -1860,6 +2177,15 @@ def create_app(
                         + json.dumps(payload, sort_keys=True, separators=(",", ":"))
                     ).encode()
                 ).hexdigest()[:24]
+                # Attached *after* the digest, never before: the task id is
+                # content-addressed over the payload so two replicas answering
+                # one double-click enqueue one task, and a per-request value in
+                # there would defeat that entirely. A task already pending
+                # keeps the first requester's trace, which is honest -- that is
+                # the request the run belongs to.
+                traceparent = traceparent_header()
+                if traceparent:
+                    payload = {**payload, "traceparent": traceparent}
                 task = IndexTask(
                     id=f"idx-{digest}",
                     source_id=name,
@@ -2277,6 +2603,102 @@ def create_app(
         audit(source.name, "memory_enable", {"path": str(path)})
         return {"status": "enabled", "source": source.model_dump(mode="json")}
 
+    @app.get("/memory/candidates")
+    def memory_candidates(
+        status: str = "pending",
+        rule_id: str | None = None,
+        principal: str | None = None,
+        limit: int = 100,
+    ) -> dict:
+        """Proposals formation has made, awaiting a decision.
+
+        Evidence, not memory: nothing listed here is retrievable, and nothing
+        becomes retrievable until it is promoted. `principal` narrows to what
+        one caller may see -- a candidate carrying a writer is that principal's
+        business, because the record it would become is scoped to them.
+        """
+
+        return {
+            "candidates": state.list_memory_candidates(
+                status=status or None,
+                rule_id=rule_id,
+                principal=principal,
+                limit=max(1, min(int(limit), 500)),
+            ),
+            "counts": state.memory_candidate_counts(),
+        }
+
+    @app.get("/memory/candidates/{candidate_id}/evidence")
+    def memory_candidate_evidence(candidate_id: str) -> dict:
+        """Why this was proposed: the calls behind it, and their spans.
+
+        Three layers, because a reviewer asks three questions in order. *What
+        is being claimed* is the candidate itself. *On what basis* is the set
+        of interactions — what was asked, what came back. *How do I check it*
+        is the trace: each call's span, its parent, when it ran and how long
+        it took, which is what lets somebody follow one proposal back through
+        the collector to the request that produced it.
+
+        Evidence can age out from under a pending proposal — the hot window is
+        retention-bounded — so this reports what survives and says how much is
+        missing rather than failing.
+        """
+
+        candidate = state.get_memory_candidate(candidate_id)
+        if candidate is None:
+            raise HTTPException(status_code=404, detail=f"Unknown memory candidate: {candidate_id}")
+        try:
+            evidence = json.loads(candidate.get("evidence_json") or "{}")
+        except (TypeError, ValueError):
+            evidence = {}
+        event_ids = [str(item) for item in (evidence.get("event_ids") or [])]
+        interactions = state.interaction_events_by_id(event_ids)
+        return {
+            "candidate": candidate,
+            "evidence": evidence,
+            "interactions": interactions,
+            # The head of the id list is what was recorded; `named` vs
+            # `found` is how a reviewer knows the trail is partial rather
+            # than assuming the rule only ever saw this much.
+            "named": len(event_ids),
+            "found": len(interactions),
+        }
+
+    @app.post("/memory/candidates/{candidate_id}/promote")
+    def memory_candidate_promote(candidate_id: str, principal: str | None = None) -> dict:
+        """Admit one proposal. **This is the crossing** from evidence to memory.
+
+        It writes through the ordinary `MemoryStore.append`, so the result is
+        an ordinary record in an ordinary file, indexed by the ordinary
+        pipeline -- there is no second ingestion path here any more than there
+        is for a record a person typed.
+        """
+
+        from pheasant.memory.formation import admit
+
+        try:
+            return admit(engine, candidate_id, admitted_by=principal or "ui")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/memory/candidates/{candidate_id}/reject")
+    def memory_candidate_reject(candidate_id: str, principal: str | None = None) -> dict:
+        """Decline one proposal, permanently.
+
+        A rejection is a decision: the rule that proposed it will not suggest
+        it again. Re-proposing what somebody already declined is the fastest
+        way to make a review queue worth ignoring.
+        """
+
+        from pheasant.memory.formation import reject
+
+        try:
+            return reject(engine, candidate_id, rejected_by=principal or "ui")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+
     @app.post("/memory/consolidate")
     def memory_consolidate() -> dict:
         from pheasant.memory.maintenance import run_memory_maintenance
@@ -2424,7 +2846,7 @@ def create_app(
         }
 
     @app.post("/search")
-    def search_context(req: SearchRequest) -> dict:
+    def search_context(req: SearchRequest, request: Request) -> dict:
         from pheasant.search.criteria import (
             apply_retrieval_criteria,
             criteria_active,
@@ -2484,10 +2906,16 @@ def create_app(
                 req.source_types,
                 req.exclude_source_types,
             )
+        record_retrieval(
+            request,
+            query=req.query,
+            payload=payload,
+            criteria={"mode": req.mode, **(payload.get("criteria") or {})},
+        )
         return payload
 
     @app.post("/relevant-files")
-    def relevant_files(req: SearchRequest) -> dict:
+    def relevant_files(req: SearchRequest, request: Request) -> dict:
         # Same retrieval as /search, so it must run under the same ACL
         # enforcement: dropping `security`/`principal` here silently returned
         # unfiltered results for every caller whenever acl_enforced was on.
@@ -2516,7 +2944,9 @@ def create_app(
             if relative_path and relative_path not in seen:
                 seen.add(relative_path)
                 files.append(result)
-        return {"files": files}
+        answer = {"files": files}
+        record_retrieval(request, query=req.query, payload=answer, criteria={"mode": "hybrid"})
+        return answer
 
     def _acl_guard(
         artifact_id: str | None,
@@ -3677,14 +4107,14 @@ def create_app(
         return {"revoked": app.state.session_keys.revoke(session_id)}
 
     @app.post("/assistant/chat")
-    def assistant_chat(req: ChatRequest) -> dict:
+    def assistant_chat(req: ChatRequest, request: Request) -> dict:
         from pheasant.assistant.chat import answer_question
 
         if not config.assistant.enabled:
             raise HTTPException(status_code=403, detail="The assistant is disabled")
         if not req.question.strip():
             raise HTTPException(status_code=400, detail="question must not be empty")
-        return answer_question(
+        answer = answer_question(
             req.question,
             search=search,
             knowledge_base=config.knowledge_base_id,
@@ -3704,9 +4134,20 @@ def create_app(
             options=req.options,
             memory=req.memory,
         )
+        # A chat turn is the richest evidence the ledger gets: the question, the
+        # passages that answered it, and the answer itself. `citations` is what
+        # `extract_results` reads for ids and paths.
+        record_retrieval(
+            request,
+            query=req.question,
+            payload=answer,
+            criteria={"mode": req.mode, "workflow": req.workflow} if req.mode else None,
+            answer=str(answer.get("answer") or "") or None,
+        )
+        return answer
 
     @app.post("/assistant/chat/stream")
-    def assistant_chat_stream(req: ChatRequest):
+    def assistant_chat_stream(req: ChatRequest, request: Request):
         """The same answer as ``/assistant/chat``, with progress as it happens.
 
         Server-sent events: one ``step`` per workflow stage the moment it
@@ -3746,6 +4187,12 @@ def create_app(
         events: queue_module.Queue = queue_module.Queue()
         credential = app.state.session_keys.get(req.session_id)
         environ = dict(os.environ)
+        # Captured here, in the request, because `run()` executes on a worker
+        # thread after this route has already returned its response object.
+        parent_event = observed(request)
+        # Monotonic, like every other duration here: a wall-clock delta across a
+        # generation that can take a minute is exactly where an NTP step shows up.
+        answer_started = time.perf_counter()
 
         def run() -> None:
             try:
@@ -3776,6 +4223,7 @@ def create_app(
                         }
                     ),
                 )
+                _record_stream_answer(parent_event, req, answer, answer_started)
                 events.put({"type": "answer", "answer": answer})
             except Exception as exc:  # surfaced to the client, never a 500 mid-stream
                 logger.exception("streaming chat failed")

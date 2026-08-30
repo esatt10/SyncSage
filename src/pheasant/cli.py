@@ -75,7 +75,7 @@ def _print_projection(report: dict) -> None:
         print(f"  ! {warning}")
 
 
-def _sync_services(engine, cfg, config_path=None):
+def _sync_services(engine, cfg, config_path=None, policy=None):
     """Build the watcher + scheduler pair sharing one sync serialization lock.
 
     SyncEngine is not safe for concurrent syncs within a process, so both
@@ -95,9 +95,33 @@ def _sync_services(engine, cfg, config_path=None):
         engine = WorkerBackedEngine(engine, config_path)
     return (
         WatcherService(engine, cfg, sync_lock=sync_lock),
-        SchedulerService(engine, cfg, sync_lock=sync_lock),
+        SchedulerService(
+            engine, cfg, sync_lock=sync_lock, log_upkeep=_owns_log_upkeep(cfg, policy)
+        ),
         sync_lock,
     )
+
+
+def _owns_log_upkeep(cfg, policy) -> bool:
+    """Does this process persist and roll the observation ledger?
+
+    With no log queue, yes: whoever observed a call already wrote it, and the
+    roll needs some timer. With a queue under ``--role all``, also yes -- a
+    single container drains what it publishes, exactly as ``sync_all`` does
+    with the index queue. With a queue in a fleet, no: a ``--role logger``
+    tier owns it, and an indexer doing the same work would put a
+    multi-million-row Parquet roll back on the process holding ``sync_lock``,
+    which is the thing the tier exists to prevent.
+    """
+
+    from pheasant.deployment.roles import Role
+
+    queue = getattr(
+        getattr(getattr(cfg, "observability", None), "interactions", None), "queue", None
+    )
+    if not getattr(queue, "enabled", False):
+        return True
+    return policy is None or policy.role is Role.ALL
 
 
 def _report_ui(app_obj, cfg) -> None:
@@ -130,12 +154,13 @@ def _serve_app(cfg, config_path: str, *, report_ui: bool = True, role: str | Non
     if report_ui and policy.serves_ui:
         _report_ui(app_obj, cfg)
     watcher, scheduler, sync_lock = _sync_services(
-        app_obj.state.engine, cfg, config_path=config_path
+        app_obj.state.engine, cfg, config_path=config_path, policy=policy
     )
     # Standalone startup syncs and every background producer share this gate.
     # Postgres indexers additionally hand it to the leader supervisor below.
     app_obj.state.sync_lock = sync_lock
     drainer = _queue_drainer(cfg, config_path, policy, sync_lock=sync_lock)
+    log_drainer = _log_drainer(cfg, app_obj.state.engine, policy)
     refresher = _graph_refresher(cfg, app_obj.state.engine, policy)
     orchestration = _orchestration_supervisor(
         app_obj,
@@ -157,6 +182,8 @@ def _serve_app(cfg, config_path: str, *, report_ui: bool = True, role: str | Non
             scheduler.start()
         if drainer is not None:
             drainer.start()
+    if log_drainer is not None:
+        log_drainer.start()
     if refresher is not None:
         refresher.start()
     if not policy.is_default:
@@ -164,6 +191,8 @@ def _serve_app(cfg, config_path: str, *, report_ui: bool = True, role: str | Non
     try:
         uvicorn.run(app_obj, host=cfg.server.host, port=cfg.server.port)
     finally:
+        if log_drainer is not None:
+            log_drainer.stop()
         if refresher is not None:
             refresher.stop()
         if orchestration is not None:
@@ -656,6 +685,100 @@ class _GraphRefresher:
                 log.warning("graph refresh failed; will retry", exc_info=True)
 
 
+class _LogDrainer:
+    """The ``--role logger`` loop: claim batches, persist, roll to cold.
+
+    Deliberately its own thread in its own process. Everything it does --
+    a multi-row insert per batch, a Parquet write per day rolled, a bounded
+    delete after it -- is work that would otherwise land on a process that is
+    either answering requests or holding the indexer's ``sync_lock``. Neither
+    can afford it at request rates, and that is the entire argument for the
+    tier.
+
+    The roll runs on its own, longer cadence than the drain: a batch should be
+    persisted within seconds, while rolling a day out of the hot store is
+    hourly work at most.
+    """
+
+    #: How long a claim loop waits for more work before rolling.
+    DRAIN_IDLE_SECONDS = 5.0
+
+    def __init__(self, engine, queue, *, roll_interval_seconds: float = 300.0) -> None:
+        import threading
+
+        self._engine = engine
+        self._queue = queue
+        self._roll_interval = float(roll_interval_seconds)
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self) -> None:
+        import threading
+
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="pheasant-logger", daemon=True)
+        self._thread.start()
+        print("log tier draining (role: logger)")
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=10)
+        try:
+            self._queue.close()
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            pass
+
+    def _run(self) -> None:
+        import logging
+        import time
+
+        from pheasant.sync.log_queue import handle_batch, publish_depth, run_log_maintenance
+        from pheasant.sync.queue import drain
+
+        log = logging.getLogger("pheasant.cli")
+        state, config = self._engine.state, self._engine.config
+        last_roll = 0.0
+        while not self._stop.is_set():
+            try:
+                drain(
+                    self._queue,
+                    lambda task: handle_batch(state, task),
+                    idle_timeout=self.DRAIN_IDLE_SECONDS,
+                )
+                publish_depth(self._queue)
+                if time.monotonic() - last_roll >= self._roll_interval:
+                    last_roll = time.monotonic()
+                    report = run_log_maintenance(state, config)
+                    if report and report.get("rolled"):
+                        log.info(
+                            "Rolled %s interaction row(s) out of the hot store (%s)",
+                            report["rolled"],
+                            report.get("disposition"),
+                        )
+            except Exception:  # noqa: BLE001 - one bad pass must not end the tier
+                log.warning("Log tier pass failed", exc_info=True)
+                self._stop.wait(5.0)
+
+
+def _log_drainer(cfg, engine, policy):
+    """The log tier's loop, or ``None`` when this role is not it."""
+
+    if not policy.drains_log_queue:
+        return None
+    from pheasant.sync.log_queue import log_queue_from_config
+
+    queue = log_queue_from_config(cfg, engine.state)
+    if queue is None:
+        # `validate_role` already refuses this combination at startup, so
+        # reaching here means the config changed underneath us.
+        return None
+    return _LogDrainer(engine, queue)
+
+
 def _graph_refresher(cfg, engine, policy):
     """The refresh loop, or ``None`` when this role indexes its own graph."""
 
@@ -1099,7 +1222,7 @@ def main(argv: list[str] | None = None) -> int:
     serve_p.add_argument("--config", "-c", default=server_config_default)
     serve_p.add_argument(
         "--role",
-        choices=("all", "api", "indexer", "graph", "worker"),
+        choices=("all", "api", "indexer", "graph", "worker", "logger"),
         default=None,
         help="Which jobs this process takes on. Default: server.role, or 'all'.",
     )
@@ -1190,6 +1313,24 @@ def main(argv: list[str] | None = None) -> int:
     # `pheasant.analytics` pulls in stdlib and the schema module only —
     # DuckDB itself is imported lazily, inside the functions that need it.
     from pheasant.analytics import EXPORTABLE
+
+    eval_p = sub.add_parser(
+        "eval", help="Build evaluation sets from what this region was really asked."
+    )
+    eval_sub = eval_p.add_subparsers(dest="eval_command", required=True)
+    eval_boot_p = eval_sub.add_parser(
+        "bootstrap",
+        help="Turn the interaction ledger into a de-identified evaluation case set.",
+    )
+    eval_boot_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
+    eval_boot_p.add_argument(
+        "--out",
+        default=None,
+        help="Where to write it. Default: <exports_path>/eval/cases.json",
+    )
+    eval_boot_p.add_argument(
+        "--limit", type=int, default=500, help="Maximum distinct questions (default: 500)"
+    )
 
     export_p = sub.add_parser(
         "export", help="Write Parquet exports of indexed state, and query them."
@@ -1715,6 +1856,33 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             engine.close()
         print("Repair complete")
+        return 0
+    if args.command == "eval":
+        from pheasant.config.loader import load_config
+        from pheasant.evalset import bootstrap
+
+        cfg = load_config(Path(args.config))
+        # No graph: this reads the ledger and writes a JSON file. Materializing
+        # a graph for it would cost the whole corpus's memory for nothing.
+        engine = _engine(Path(args.config), load_persisted_graph=False)
+        try:
+            target = (
+                Path(args.out)
+                if args.out
+                else Path(cfg.pheasant.exports_path) / "eval" / "cases.json"
+            )
+            report = bootstrap(engine.state, target, limit=args.limit)
+        finally:
+            engine.close()
+        print(
+            f"Wrote {report['cases']} case(s) to {report['path']} "
+            f"({report['answered']} with a promoted answer, "
+            f"{report['unanswered']} that found nothing)."
+        )
+        print(
+            "Principals and sessions are per-export pseudonyms; two exports "
+            "cannot be joined to re-identify anyone."
+        )
         return 0
     if args.command == "export":
         from pheasant.analytics import (

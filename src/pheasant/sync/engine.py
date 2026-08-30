@@ -1581,6 +1581,23 @@ class SyncEngine:
         isolated single-writer child.
         """
 
+        payload = getattr(task, "payload", None) or {}
+        # Run the whole task inside the trace of the request that queued it.
+        # `POST /sync` is a traced request; the indexer that claims the task is
+        # a different process, possibly minutes later, and without this the
+        # chain breaks at the queue -- one thing a person asked for shows up as
+        # two unrelated traces. Adopting it here also means every hop the
+        # indexer makes onward (remote preparation, the graph service) carries
+        # it, because those inject from the ambient trace. A no-op when the
+        # task carries none, which is every task a scheduler enqueued.
+        from pheasant.telemetry.interactions import adopt_trace
+
+        with adopt_trace(payload.get("traceparent")):
+            return self._apply_index_task(task, on_progress=on_progress)
+
+    def _apply_index_task(
+        self, task: Any, *, on_progress: ProgressHook | None = None
+    ) -> SyncResult:
         operation = str((getattr(task, "payload", None) or {}).get("operation") or "")
         if operation == "delete_source":
             return self.remove_source(str(task.source_id), on_progress=on_progress)

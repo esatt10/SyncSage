@@ -122,6 +122,11 @@ def test_every_workload_passes_a_role_this_code_knows(scaled: list[dict[str, Any
         assert args[1] == "--role"
         assert args[2] in valid, f"unknown role {args[2]!r}"
         seen.add(args[2])
+    # No "logger": the log tier lives in scaled/observability/, which
+    # `kubectl apply -f scaled/` does not recurse into — the Kubernetes
+    # equivalent of the Compose `observability` profile. Applying it means
+    # first editing the shared ConfigMap to record queries and principals,
+    # which must be a decision rather than a default.
     assert seen == {"api", "graph", "indexer", "worker"}
 
 
@@ -392,8 +397,14 @@ def test_the_worker_autoscaler_reads_source_and_file_backlog(scaled: list[dict[s
     assert "pheasant_index_inflight" in metrics.REGISTRY.render()
     assert "pheasant_index_preparation_backlog" in metrics.REGISTRY.render()
 
-    keda = next(doc for doc in _by_kind(scaled, "ScaledObject"))
-    assert keda["spec"]["scaleTargetRef"]["name"] == "pheasant-worker"
+    # Select by name: the log tier has its own ScaledObject, on its own
+    # backlog. Taking "the first ScaledObject" would silently start asserting
+    # about whichever manifest sorted first.
+    keda = next(
+        doc
+        for doc in _by_kind(scaled, "ScaledObject")
+        if doc["spec"]["scaleTargetRef"]["name"] == "pheasant-worker"
+    )
     assert "pheasant_index_queue_depth" in keda["spec"]["triggers"][0]["metadata"]["query"]
     assert "pheasant_index_inflight" in keda["spec"]["triggers"][0]["metadata"]["query"]
     assert "pheasant_index_preparation_backlog" in keda["spec"]["triggers"][0]["metadata"]["query"]
@@ -541,8 +552,14 @@ def test_the_compose_fleet_has_the_high_throughput_topology() -> None:
         "api",
         "graph",
         "indexer",
+        "logger",
         "worker",
     }
+    # The log tier is defined but not part of the default `up`: recording
+    # queries and principals is an operator's decision, not a default, and a
+    # logger with observation off refuses to start rather than idling green.
+    assert services["logger"]["profiles"] == ["observability"]
+    assert all("profiles" not in services[name] for name in set(services) - {"logger"})
 
     roles = {}
     for name in ("api", "graph", "indexer"):
@@ -725,3 +742,57 @@ def test_the_base_install_still_needs_no_infrastructure() -> None:
     # And no workload in the base install passes --role: the default is `all`.
     for workload in _workloads(docs):
         assert "--role" not in (_container(workload).get("args") or [])
+
+
+# --------------------------------------------------------------------------
+# The log tier's CI topology
+# --------------------------------------------------------------------------
+
+CI_COMPOSE = REPO_ROOT / "deploy" / "compose" / "ci" / "docker-compose.log-tier.yml"
+CI_CONFIG = REPO_ROOT / "deploy" / "compose" / "ci" / "pheasant.log-tier.yaml"
+
+
+def test_the_log_tier_topology_splits_producing_from_draining() -> None:
+    """The whole point of that compose file.
+
+    `all` would drain what it publishes -- correct for one container, and it
+    would make the CI smoke test prove nothing, because the producer would
+    consume its own batches. The roles have to be split or the tier is
+    untested.
+    """
+
+    compose = yaml.safe_load(CI_COMPOSE.read_text(encoding="utf-8"))
+    services = compose["services"]
+    assert set(services) == {"postgres", "db-init", "api", "logger"}
+    assert services["api"]["command"] == ["serve", "--role", "api"]
+    assert services["logger"]["command"] == ["serve", "--role", "logger"]
+
+    config = PheasantConfig.model_validate(yaml.safe_load(CI_CONFIG.read_text(encoding="utf-8")))
+    # Both roles must actually be startable against this config: `validate_role`
+    # is the same function the process runs, and it refuses an api without an
+    # index queue and a logger without an observation queue.
+    for role in ("api", "logger"):
+        validate_role(resolve_role(config, role), config)
+
+    # And the producer must genuinely not drain, which is what
+    # `_owns_log_upkeep` decides.
+    from pheasant.cli import _owns_log_upkeep
+
+    assert _owns_log_upkeep(config, resolve_role(config, "api")) is False
+    assert _owns_log_upkeep(config, resolve_role(config, "logger")) is False
+
+
+def test_the_ci_topology_exercises_the_whole_ledger_path() -> None:
+    """A smoke test with cold storage off, or formation off, would pass while
+    testing half of what it claims to."""
+
+    config = PheasantConfig.model_validate(yaml.safe_load(CI_CONFIG.read_text(encoding="utf-8")))
+    interactions = config.observability.interactions
+
+    assert interactions.enabled
+    assert interactions.queue.enabled
+    assert interactions.cold_enabled
+    assert config.memory.formation.enabled
+    # PostgreSQL, because that is the backend the fleet actually runs and the
+    # one whose migration path differs.
+    assert config.storage.backend == "postgres"

@@ -32,7 +32,8 @@ incremental runs deterministic.
 | Graph-query service | Read-only graph search/traversal over an atomically refreshed snapshot. Fleet APIs use a bounded proxy and do not load the full graph. |
 | PostgreSQL/SQLite | Artifacts, chunks, lexical ranking, manifests, leases, queue state, and metadata. |
 | Vector store | Optional semantic vectors; NumPy and LanceDB are supported. |
-| NATS JetStream | Durable source-task transport between API and indexer in the fleet. |
+| Log tier | Optional. Persists the interaction ledger, rolls expired rows to Parquet, and drops expired partitions. Exists so none of that runs on a process serving requests or holding the indexer's sync lock. |
+| NATS JetStream | Durable source-task transport between API and indexer in the fleet. Carries the log tier's batches on a separate stream when observation is enabled. |
 
 ## Retrieval decision
 
@@ -92,6 +93,34 @@ API replicas for request traffic, and graph replicas for graph-query
 saturation or availability. If graph save/enrichment or the single ordered
 commit dominates, adding any of those replicas cannot help; shard whole
 repositories or document collections instead.
+
+## The observation plane
+
+Optional and off by default. When enabled, every API and MCP call becomes a
+row in an interaction ledger — never a file, never indexed, never returned by
+a search — that [memory formation](memory-formation.md) reads to propose
+memory candidates.
+
+It scales on a fourth, independent axis, because observation volume tracks
+request traffic rather than corpus churn. Two placements are load-bearing and
+both are the opposite of the obvious one:
+
+- **The request path appends to a bounded in-memory ring and nothing else.**
+  Writing one ledger row per request puts a database write on the same
+  PostgreSQL whose lexical ranking the retrieval section above names as the
+  dominant measured search bottleneck. A flusher thread batches and publishes;
+  a `--role logger` tier persists.
+- **The hot-to-cold roll runs on that tier, never on the scheduler beat.**
+  The beat holds `sync_lock` across all of its work, so a Parquet write over
+  millions of rows there stalls incremental sync for every source in the
+  region. In a single container the roll does run on the beat — bounded by
+  `max_rows_per_pass`, which is what keeps it a slice rather than a stall.
+
+The tier has its own table (`log_tasks`, never a `kind` column on
+`index_tasks`), its own dead-letter, and its own scaling signal
+(`pheasant_log_queue_depth`). Under saturation it drops observations rather
+than slowing a request or growing an unbounded queue — the same posture the
+API takes when it answers `429`.
 
 The graph-query boundary is retained in the fleet because the measured corpus
 reduced API memory and mixed-search wall time. It remains optional for local

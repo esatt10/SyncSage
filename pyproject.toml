@@ -82,6 +82,17 @@ queue = ["nats-py>=2.7"]
 # a state backend, for the reasons in src/pheasant/analytics.py. Gated because
 # a region that never exports should not carry a 20 MB wheel.
 analytics = ["duckdb>=1.0"]
+# Exporting spans to an OTLP collector. Gated for a reason worth stating,
+# because it is not the usual one: the observation plane works *without* this.
+# Trace and span ids are the interaction ledger's primary key, so they cannot
+# be optional and pheasant mints W3C-shaped ones itself. This extra only adds
+# the exporter, and the exporter is only attached when
+# observability.otlp_endpoint is set — which is why the offline suite stays
+# network-free by construction rather than by mocking a collector.
+otel = [
+  "opentelemetry-sdk>=1.25",
+  "opentelemetry-exporter-otlp-proto-http>=1.25",
+]
 # Documentation site (MkDocs Material). Build with: mkdocs build --strict
 docs = ["mkdocs-material>=9.5"]
 dev = [

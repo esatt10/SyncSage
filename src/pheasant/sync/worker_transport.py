@@ -42,6 +42,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from pheasant.sync.remote_worker import RemoteWorkerError
+from pheasant.telemetry.interactions import inject_traceparent
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +212,12 @@ class HttpTransport:
             headers[DEADLINE_HEADER] = f"{max(0.0, deadline_seconds):.3f}"
         if keys:
             headers[IDEMPOTENCY_HEADER] = keys[0] if len(keys) == 1 else _batch_key(keys)
+        # Beside the deadline and the idempotency key, for the same reason both
+        # of those are here: a hop the coordinator makes on someone's behalf
+        # should say whose behalf. A no-op today, because preparation runs on
+        # the sync path where no interaction trace is ambient -- and correct
+        # the moment one is, rather than a call site somebody has to remember.
+        inject_traceparent(headers)
 
         attempted_reuse = connection is not None
         if connection is None:

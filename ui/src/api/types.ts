@@ -307,6 +307,66 @@ export interface MemoryListResponse {
   records: MemoryRecord[];
 }
 
+/** A proposal formation has made. Deliberately not a `MemoryRecord`: nothing
+ *  here is retrievable, and nothing becomes retrievable until it is promoted. */
+export interface MemoryCandidate {
+  id: string;
+  rule_id: string;
+  scope: string;
+  subject?: string | null;
+  kind: string;
+  text: string;
+  written_by?: string | null;
+  /** Why the rule proposed this: counts, the tokens, the sessions involved. */
+  evidence_json?: string | null;
+  observations: number;
+  sessions: number;
+  first_seen: string;
+  last_seen: string;
+  status: string;
+  admitted_by?: string | null;
+  record_id?: string | null;
+  decided_at?: string | null;
+}
+
+/** One ledger row behind a proposal: what was asked, what came back, and the
+ *  span that carried it. */
+export interface CandidateInteraction {
+  id: string;
+  trace_id: string;
+  span_id: string;
+  parent_span_id?: string | null;
+  modality: string;
+  operation: string;
+  principal?: string | null;
+  session_id?: string | null;
+  started_at: string;
+  duration_ms: number | null;
+  status: string;
+  query_text?: string | null;
+  answer_text?: string | null;
+  criteria_json?: string | null;
+  result_ids_json?: string | null;
+  result_paths_json?: string | null;
+  result_count?: number | null;
+  top_score?: number | null;
+}
+
+export interface MemoryCandidateEvidence {
+  candidate: MemoryCandidate;
+  evidence: Record<string, unknown>;
+  interactions: CandidateInteraction[];
+  /** How many calls the rule recorded, against how many are still retained —
+   *  the hot window ages out from under a pending proposal. */
+  named: number;
+  found: number;
+}
+
+export interface MemoryCandidateListResponse {
+  candidates: MemoryCandidate[];
+  counts: Record<string, number>;
+}
+
 export interface MemoryWriteResponse {
   record: MemoryRecord;
   created: boolean;

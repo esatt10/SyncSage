@@ -776,6 +776,93 @@ def build_sections() -> list[Section]:
             ],
         ),
         Section(
+            id="observability",
+            title="Tracing and the observation plane",
+            blurb=(
+                "Optional, and off by default. Every API and MCP call can emit a "
+                "span — exported to your collector, recorded in the region's own "
+                "interaction ledger, or both. The ledger is what lets memory "
+                "formation learn from how the knowledge base is actually used. It "
+                "records queries and principals, so it is a deliberate choice: "
+                "observations are rows with a retention policy, never indexed "
+                "content, and nothing observed becomes a memory without an "
+                "admission."
+            ),
+            covers=("observability",),
+            questions=[
+                Question(
+                    key="observability.otlp_endpoint",
+                    prompt="OTLP collector endpoint (blank = export nothing)",
+                    help=(
+                        "Blank attaches no exporter at all. Spans are still created "
+                        "and still feed the interaction ledger below; they just do "
+                        "not leave the box. Needs the [otel] extra to export."
+                    ),
+                    default="",
+                    advanced=True,
+                ),
+                Question(
+                    key="observability.interactions.enabled",
+                    prompt="Record interactions (queries, principals, results)?",
+                    help=(
+                        "The evidence memory formation reads. Rows in /state with a "
+                        "retention policy — never files, never indexed, never "
+                        "returned by a search. Off, the region behaves exactly as it "
+                        "did before this existed."
+                    ),
+                    kind="bool",
+                    advanced=True,
+                ),
+                Question(
+                    key="observability.interactions.hot_retention_days",
+                    prompt="Days to keep interactions queryable in /state (0 = cold only)",
+                    help=(
+                        "0 means batches go straight to Parquet and /state never "
+                        "grows: you keep the audit trail and the evaluation corpus "
+                        "without a query-time ledger."
+                    ),
+                    kind="int",
+                    when=lambda a: bool(a.get("observability.interactions.enabled")),
+                    advanced=True,
+                ),
+                Question(
+                    key="observability.interactions.cold_enabled",
+                    prompt="Roll expired interactions to Parquet under /exports?",
+                    help=(
+                        "Off, they are simply deleted when they age out. On, whole "
+                        "days are written to <exports>/interactions/dt=... first, "
+                        "which is what `pheasant eval bootstrap` reads. A Parquet "
+                        "directory enforces no access control — put it on the "
+                        "directory."
+                    ),
+                    kind="bool",
+                    when=lambda a: bool(a.get("observability.interactions.enabled")),
+                    advanced=True,
+                ),
+                Question(
+                    key="observability.interactions.queue.enabled",
+                    prompt="Hand log work to a dedicated tier?",
+                    help=(
+                        "Off, whoever produced a batch writes it. On, batches are "
+                        "published to their own queue and a `serve --role logger` "
+                        "drains them — so persistence, rolling and compaction never "
+                        "touch a request or the indexer's sync lock. Worth it in a "
+                        "fleet; pure overhead in one container."
+                    ),
+                    kind="bool",
+                    when=lambda a: bool(a.get("observability.interactions.enabled")),
+                    advanced=True,
+                ),
+                Question(
+                    key="observability.interactions.queue.backend",
+                    prompt="Log queue backend (local | nats)",
+                    kind="str",
+                    when=lambda a: bool(a.get("observability.interactions.queue.enabled")),
+                    advanced=True,
+                ),
+            ],
+        ),
+        Section(
             id="synapse",
             title="Synapse federation",
             blurb=(
@@ -850,8 +937,8 @@ def build_phases(sections: list[Section] | None = None) -> list[Phase]:
         Phase(
             "operations-security",
             "Operations & security",
-            "Synchronization, the server surface, and filesystem safeguards.",
-            ("sync", "server", "security"),
+            "Synchronization, the server surface, tracing, and filesystem safeguards.",
+            ("sync", "server", "observability", "security"),
         ),
         Phase(
             "federation",

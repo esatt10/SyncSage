@@ -494,6 +494,23 @@ def register_default_metrics(version: str) -> None:
         ("op",),
     )
     REGISTRY.histogram("pheasant_memory_compaction_seconds", "One L1/L2 clustering pass.")
+    # Formation: records written from the observation plane rather than by a
+    # caller. `rule_id` is versioned, so a rule whose logic changes shows up
+    # here as a new series rather than silently continuing the old one's count.
+    REGISTRY.gauge(
+        "pheasant_memory_candidates",
+        "Open proposals awaiting a decision, by status. A queue that only ever "
+        "grows means nobody is reviewing it; one stuck at zero with traffic "
+        "means the thresholds are never met.",
+        ("status",),
+    )
+    REGISTRY.counter(
+        "pheasant_memory_formations_total",
+        "Records formed from observed interactions, by rule and outcome "
+        "('created' for a session's first digest, 'refined' for one that "
+        "superseded its own previous version).",
+        ("rule_id", "outcome"),
+    )
     REGISTRY.counter(
         "pheasant_memory_synthesis_calls_total",
         "L3 synthesis cluster attempts, by outcome "
@@ -520,6 +537,61 @@ def register_default_metrics(version: str) -> None:
         "Of the writes that either created a record or were folded as a "
         "paraphrase, the fraction folded. Byte-identical repeats are in "
         "neither half — they never would have become a record.",
+    )
+
+    # The observation plane and its log tier. Every label set here is bounded
+    # by construction — modality is a four-value enum, operation is a tool or
+    # route name, status is ok|error|shed. Query text, principals and session
+    # ids never become labels: that is the `_metric_path` cardinality lesson,
+    # and here it is also a privacy one.
+    REGISTRY.counter(
+        "pheasant_interaction_events_total",
+        "Interactions observed, by surface, operation and outcome.",
+        ("modality", "operation", "status"),
+    )
+    # The number that says whether the tier is keeping up. A log tier falling
+    # behind must degrade to data loss, never to request latency, so this
+    # counter rising is the *designed* failure mode — but an unwatched one is
+    # silent formation starvation, since every formation threshold counts a
+    # stream this thins.
+    REGISTRY.counter(
+        "pheasant_interaction_events_dropped_total",
+        "Observations discarded rather than recorded, by reason: "
+        "'buffer_full' (the request-path ring overflowed), 'queue_full' "
+        "(the log queue is past max_queue_depth), 'malformed' (no trace id "
+        "or no timestamp -- the two things every row must have), 'no_sink' "
+        "(nowhere writable and no spool configured), or 'error'.",
+        ("reason",),
+    )
+    REGISTRY.gauge(
+        "pheasant_interaction_rows",
+        "Interaction rows currently in the hot store (/state).",
+    )
+    REGISTRY.gauge(
+        "pheasant_interaction_buffer_depth",
+        "Events buffered on this process, awaiting a flush.",
+    )
+    REGISTRY.gauge(
+        "pheasant_log_queue_depth",
+        "Log-tier batches awaiting a worker, by status. The signal a "
+        "`--role logger` tier scales on — deliberately separate from "
+        "`pheasant_index_queue_depth`, since the two queues are different "
+        "tables with different failure modes.",
+        ("status",),
+    )
+    REGISTRY.gauge(
+        "pheasant_log_dead_letters",
+        "Log batches set aside after exhausting their attempts.",
+    )
+    REGISTRY.histogram(
+        "pheasant_log_roll_seconds",
+        "One hot-to-cold roll pass (Parquet write plus the delete that follows it).",
+    )
+    REGISTRY.counter(
+        "pheasant_log_rolled_rows_total",
+        "Interaction rows moved out of the hot store, by disposition: "
+        "'cold' (written to Parquet first) or 'dropped' (cold storage off).",
+        ("disposition",),
     )
 
     # Remote preparation workers (Phase 35.5 hardens these; the gauge exists

@@ -123,6 +123,9 @@ widen the validity window.
 | POST | `/memory` | Append one record. Body: `text`, `scope` (`session`/`user`/`org`), `subject`, `supersedes`, `tags`, `kind`, `principal`, `valid_until`, `sync`. Response adds `outcome` (`"created"` \| `"reinforced"` \| `"duplicate"`) and, when a reinforcement changed what is stored, `submitted_text`. |
 | GET | `/memory` | List records. Query: `scope`, `current_only`. Each record carries `tier` (`hot`/`cold`) and `subsumed_by`. |
 | POST | `/memory/consolidate` | Archive superseded/expired records, prune past `memory.max_records`, then re-index. Returns `{"skipped": …}` when consolidation is off — not an error. |
+| GET | `/memory/candidates` | Memory formation has **proposed** but nothing has admitted. Not memories: nothing here is retrievable until promoted. `status` (default `pending`), `rule_id`, `principal`, `limit`. |
+| POST | `/memory/candidates/{id}/promote` | Admit one proposal. Writes through the ordinary `MemoryStore.append`, so the result is an ordinary indexed record. `409` if already decided — a decision is final, and re-deciding would write a second record. |
+| POST | `/memory/candidates/{id}/reject` | Decline one proposal, permanently. The rule that proposed it will not suggest it again. |
 | POST | `/memory/synthesize` | LLM-merge a near-duplicate cluster deterministic compaction could not resolve into one canonical record, subsuming the inputs. Off by default (`memory.synthesis.enabled`) and never automatic — only this call runs it. `{"skipped": …}` when disabled, no memory source, or no model reachable; otherwise `{"attempted","synthesized","cached","records"}`. |
 
 See [Agent memory](../how-to/agent-memory.md).

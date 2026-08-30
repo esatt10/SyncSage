@@ -192,6 +192,15 @@ class StateStore:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_memory_records_tier ON memory_records(tier, scope)"
         )
+        # The observation plane's free-text and result-path columns. Guarded
+        # like every other additive column here: `executescript` creates the
+        # table only when it is absent, so a /state written before these
+        # existed keeps the old shape unless something adds them.
+        interaction_columns = self.backend.table_columns("interaction_events")
+        if interaction_columns and "answer_text" not in interaction_columns:
+            self.conn.execute("ALTER TABLE interaction_events ADD COLUMN answer_text TEXT")
+        if interaction_columns and "result_paths_json" not in interaction_columns:
+            self.conn.execute("ALTER TABLE interaction_events ADD COLUMN result_paths_json TEXT")
         self.conn.commit()
         self._migrate_fts_titles()
 
@@ -216,6 +225,12 @@ class StateStore:
                 "index_tasks": "id",
                 "source_leases": "source_id",
                 "sync_fingerprints": "scope",
+                "log_tasks": "id",
+                # The *newest* column, not just the table: a marker written
+                # before these existed would otherwise skip the DDL below and
+                # leave every ledger insert failing on a missing column.
+                "interaction_events": "answer_text",
+                "memory_candidates": "id",
             }
             schema_present = all(
                 column in self.backend.table_columns(table) for table, column in required.items()
@@ -225,6 +240,17 @@ class StateStore:
             self.backend.executescript(schema_for(self.backend.dialect))
             if "acl" not in self.backend.table_columns("artifacts"):
                 self.conn.execute("ALTER TABLE artifacts ADD COLUMN acl TEXT")
+            # Postgres returns early from `migrate()`, so the guarded column
+            # adds there never run here -- an additive column needs saying
+            # twice or it exists on exactly one backend. `CREATE TABLE IF NOT
+            # EXISTS` above cannot widen a table that already exists.
+            interaction_columns = self.backend.table_columns("interaction_events")
+            if interaction_columns and "answer_text" not in interaction_columns:
+                self.conn.execute("ALTER TABLE interaction_events ADD COLUMN answer_text TEXT")
+            if interaction_columns and "result_paths_json" not in interaction_columns:
+                self.conn.execute(
+                    "ALTER TABLE interaction_events ADD COLUMN result_paths_json TEXT"
+                )
             self.conn.execute(
                 "INSERT INTO pheasant_schema_meta(key, value, updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
@@ -1057,6 +1083,173 @@ class StateStore:
                     (row_id, op, member_id, canonical_id, rule_id, params_hash, now),
                 )
         return demoted
+
+    # -- memory candidates (formation) -------------------------------------
+
+    def upsert_memory_candidate(self, candidate: dict[str, Any]) -> bool:
+        """Record a proposal, or refresh the counters of one already open.
+
+        Returns True when the row is (still) ``pending`` afterwards --- that
+        is, when this proposal is live and awaiting a decision.
+
+        The ``WHERE`` on the conflict branch is the load-bearing part: it only
+        ever updates a row that is still pending, so **a rejected candidate is
+        never re-proposed** and an admitted one is never reopened. Without it a
+        rule would re-suggest on every beat the very thing a person just said
+        no to, which is the fastest way to make a review queue worthless. Same
+        shape `index_tasks` uses to keep a dead task dead.
+        """
+
+        rows = self.execute_returning(
+            "INSERT INTO memory_candidates("
+            "id, rule_id, params_hash, scope, subject, kind, text, written_by, "
+            "evidence_json, observations, sessions, first_seen, last_seen, status"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "observations=excluded.observations, sessions=excluded.sessions, "
+            "evidence_json=excluded.evidence_json, last_seen=excluded.last_seen "
+            "WHERE memory_candidates.status='pending' "
+            "RETURNING id",
+            (
+                str(candidate["id"]),
+                str(candidate["rule_id"]),
+                str(candidate["params_hash"]),
+                str(candidate["scope"]),
+                candidate.get("subject"),
+                str(candidate.get("kind") or "fact"),
+                str(candidate["text"]),
+                candidate.get("written_by"),
+                candidate.get("evidence_json"),
+                int(candidate.get("observations") or 1),
+                int(candidate.get("sessions") or 1),
+                str(candidate["first_seen"]),
+                str(candidate["last_seen"]),
+                "pending",
+            ),
+        )
+        return bool(rows)
+
+    def list_memory_candidates(
+        self,
+        *,
+        status: str | None = "pending",
+        rule_id: str | None = None,
+        principal: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Open proposals, most recently reinforced first.
+
+        ``principal`` narrows to what one caller may see: a candidate carrying
+        a writer is that principal's business alone, because the record it
+        would become is scoped to them. One with no writer is region-wide and
+        is visible to everybody --- the same rule `normalize_acl` applies to
+        the records themselves.
+        """
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if rule_id:
+            clauses.append("rule_id = ?")
+            params.append(rule_id)
+        if principal is not None:
+            clauses.append("(written_by IS NULL OR written_by = ?)")
+            params.append(principal)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(int(limit))
+        rows = self.rows(
+            "SELECT id, rule_id, params_hash, scope, subject, kind, text, written_by, "
+            "evidence_json, observations, sessions, first_seen, last_seen, status, "
+            "admitted_by, record_id, decided_at "
+            f"FROM memory_candidates{where} ORDER BY last_seen DESC, id LIMIT ?",
+            tuple(params),
+        )
+        return [dict(row) for row in rows]
+
+    def get_memory_candidate(self, candidate_id: str) -> dict[str, Any] | None:
+        rows = self.rows(
+            "SELECT id, rule_id, params_hash, scope, subject, kind, text, written_by, "
+            "evidence_json, observations, sessions, first_seen, last_seen, status, "
+            "admitted_by, record_id, decided_at "
+            "FROM memory_candidates WHERE id = ?",
+            (candidate_id,),
+        )
+        return dict(rows[0]) if rows else None
+
+    def decide_memory_candidate(
+        self,
+        candidate_id: str,
+        *,
+        status: str,
+        admitted_by: str,
+        record_id: str | None = None,
+        when: str,
+    ) -> bool:
+        """Mark a candidate admitted or rejected. Returns False if already decided.
+
+        Guarded on ``status='pending'`` so two reviewers racing on one
+        candidate cannot both admit it --- the second gets False and can say
+        so, instead of writing a second identical record.
+        """
+
+        rows = self.execute_returning(
+            "UPDATE memory_candidates SET status=?, admitted_by=?, record_id=?, "
+            "decided_at=? WHERE id=? AND status='pending' RETURNING id",
+            (str(status), str(admitted_by), record_id, str(when), str(candidate_id)),
+        )
+        return bool(rows)
+
+    def expire_memory_candidates(self, *, older_than: str) -> int:
+        """Retire proposals nobody acted on. Rejections are never touched.
+
+        A pending candidate that has gone stale is noise in a review queue; a
+        rejection is a decision, and re-proposing what someone already declined
+        is the thing the upsert guard exists to prevent.
+        """
+
+        rows = self.execute_returning(
+            "UPDATE memory_candidates SET status='expired', decided_at=? "
+            "WHERE status='pending' AND last_seen < ? RETURNING id",
+            (str(older_than), str(older_than)),
+        )
+        return len(rows)
+
+    def memory_candidate_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for row in self.rows(
+            "SELECT status, COUNT(*) AS c FROM memory_candidates GROUP BY status", ()
+        ):
+            counts[str(row["status"])] = int(row["c"])
+        return counts
+
+    def interaction_events_by_id(self, event_ids: list[str]) -> list[dict[str, Any]]:
+        """The ledger rows a proposal was derived from, oldest first.
+
+        What turns a candidate from an assertion with a count attached into
+        something a reviewer can check: the questions that produced it, what
+        came back, and the spans that carried them.
+
+        Rows may be absent --- the hot window is retention-bounded, so
+        evidence can age out from under a proposal that is still pending. The
+        caller gets what survives rather than an error, because a partial
+        trail is more useful than none.
+        """
+
+        if not event_ids:
+            return []
+        placeholders = ",".join("?" for _ in event_ids)
+        rows = self.rows(
+            "SELECT id, trace_id, span_id, parent_span_id, modality, operation, "
+            "principal, session_id, started_at, duration_ms, status, query_text, "
+            "answer_text, criteria_json, result_ids_json, result_paths_json, "
+            "result_count, top_score "
+            f"FROM interaction_events WHERE id IN ({placeholders}) "
+            "ORDER BY started_at, id",
+            tuple(event_ids),
+        )
+        return [dict(row) for row in rows]
 
     def memory_compaction_ledger(
         self,

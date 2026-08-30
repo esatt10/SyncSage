@@ -137,6 +137,13 @@ a {
   flex: 1;
   min-height: 0;
   overflow: hidden;
+  /* A docked side panel takes its width from the page rather than sitting on
+     top of it: the whole reason to dock rather than overlay is that the row
+     under review has to stay visible beside the detail. `--side-panel` is set
+     on the document only while a panel is open, so this is 0 by default and
+     the shell is byte-identical to what it was without one. */
+  padding-right: var(--side-panel, 0px);
+  transition: padding-right 140ms ease;
 }
 
 .topbar {
@@ -2742,4 +2749,472 @@ select.text-input {
   background: var(--accent-soft);
   border-color: var(--accent-border);
   color: var(--accent-text);
+}
+
+/* ── Candidate review ──────────────────────────────────────────────────────
+   Three layers, and the density is the point: a reviewer with two hundred
+   proposals is triaging, not reading. One line per proposal, evidence on
+   demand, and bulk actions so a whole rule can be cleared in one gesture. */
+.candidates__count {
+  display: inline-block;
+  min-width: 1.5rem;
+  padding: 0 0.4rem;
+  margin-left: 0.4rem;
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-align: center;
+  vertical-align: middle;
+}
+.candidates__toolbar {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 0.75rem 0;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+.candidates__toolbar .input {
+  flex: 1 1 14rem;
+  min-width: 10rem;
+}
+.candidates__all {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  font-size: 0.8rem;
+  color: var(--text-soft);
+  white-space: nowrap;
+}
+/* Reserves its space so the row does not reflow the moment something is
+   ticked — a toolbar that jumps under the cursor loses the next click. */
+.candidates__selection {
+  min-width: 6rem;
+  font-size: 0.8rem;
+  color: var(--accent-text);
+  font-variant-numeric: tabular-nums;
+}
+.candidates__group {
+  margin-bottom: 1rem;
+}
+.candidates__group-head {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  padding: 0.35rem 0;
+}
+.candidates__link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-size: 0.78rem;
+  color: var(--muted);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.candidates__link:hover {
+  color: var(--text);
+}
+.candidate {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  margin-bottom: 0.35rem;
+  background: var(--bg-raised);
+}
+.candidate__row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.45rem 0.6rem;
+  flex-wrap: wrap;
+}
+.candidate__text {
+  flex: 1 1 16rem;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  word-break: break-word;
+}
+.candidate__strength {
+  font-size: 0.75rem;
+  color: var(--accent-text);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.candidate__hint {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+/* Per-row actions stay hidden until the row is hovered or something inside it
+   has focus: with two hundred rows, four hundred always-visible buttons is
+   noise, and the bulk toolbar is the primary path anyway. Focus-within keeps
+   them reachable by keyboard, where hover does not exist. */
+.candidate__row-actions {
+  display: flex;
+  gap: 0.35rem;
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.candidate:hover .candidate__row-actions,
+.candidate:focus-within .candidate__row-actions {
+  opacity: 1;
+}
+.candidate__row-actions .button {
+  padding: 0.15rem 0.5rem;
+  font-size: 0.75rem;
+}
+.candidate__disclose {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--text-soft);
+  cursor: pointer;
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: baseline;
+}
+.candidate__disclose:hover {
+  color: var(--text);
+}
+.candidate__evidence {
+  border-top: 1px solid var(--border);
+  padding: 0.6rem 0.75rem 0.75rem;
+  background: var(--bg-sunken);
+  border-radius: 0 0 var(--radius-md) var(--radius-md);
+}
+.candidate__evidence-head {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
+}
+.candidate__calls {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+.candidate__calls th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 0.5rem 0.25rem 0;
+  border-bottom: 1px solid var(--border);
+}
+.candidate__calls td {
+  padding: 0.3rem 0.5rem 0.3rem 0;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.candidate__q {
+  font-style: italic;
+}
+.candidate__path {
+  display: inline-block;
+  margin-right: 0.3rem;
+  padding: 0 0.3rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-active);
+  font-size: 0.75rem;
+}
+/* The most useful row in the table: the region was asked and had nothing. */
+.candidate__nothing {
+  color: var(--warn);
+}
+.candidate__trace {
+  margin: 0.5rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.78rem;
+  color: var(--text-soft);
+}
+.candidate__trace li {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+  padding: 0.15rem 0;
+}
+.candidate__trace-end {
+  border-top: 1px dashed var(--border-strong);
+  margin-top: 0.3rem;
+  padding-top: 0.35rem;
+}
+.candidate__span {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+.candidate__status {
+  display: inline-block;
+  min-width: 5.5rem;
+  padding: 0 0.35rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.7rem;
+  text-align: center;
+  background: var(--bg-active);
+  color: var(--text-soft);
+}
+.candidate__status--ok {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+.candidate__status--error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.candidate__status--shed {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.candidate__status--formed {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+/* ── The evidence side panel ───────────────────────────────────────────────
+   Layer 4 of the review: what is actually behind a selected key.
+
+   Docked, not modal. A reviewer opens this to check one proposal against one
+   call, and a dialog would cover the proposal — so the panel is fixed to the
+   right edge and `.app__main` gives up the width for it (see `--side-panel`).
+   Below 1180px there is no width to give up, so it overlays instead.
+
+   The body scrolls on its own. A chunk is as long as a chunk is, and the
+   header has to stay reachable however much text is under it. */
+.sidepanel {
+  position: fixed;
+  top: 56px; /* the topbar's height */
+  right: 0;
+  bottom: 0;
+  z-index: 35;
+  width: 24rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-lg);
+}
+.sidepanel__head {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.7rem 0.9rem 0.4rem;
+  flex: none;
+}
+.sidepanel__title {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  min-width: 0;
+  flex: 1;
+}
+.sidepanel__title code {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.sidepanel__close {
+  flex: none;
+  padding: 0.15rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text-soft);
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.sidepanel__close:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.sidepanel__sub {
+  margin: 0;
+  padding: 0 0.9rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+/* The scrolling part. `min-height: 0` is what actually lets it scroll inside
+   a flex column — without it the body grows and the panel does the scrolling,
+   taking the header off screen with it. The bottom padding keeps the last
+   line clear of the jobs tray, which floats over this corner. */
+.sidepanel__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.6rem 0.9rem 3.5rem;
+  font-size: 0.8rem;
+}
+.sidepanel__h {
+  margin: 0.9rem 0 0.35rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+.sidepanel__h:first-child {
+  margin-top: 0;
+}
+.sidepanel__kv {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.12rem 0;
+}
+.sidepanel__k {
+  flex: none;
+  min-width: 4.5rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+/* Hashes wrap rather than truncate: the point of opening the panel is to get
+   the whole value, and an ellipsis here would defeat that. `anywhere` rather
+   than `break-all` so an id breaks at its own separators where it can and
+   splits mid-token only when a run of hex leaves no choice. */
+.sidepanel__v {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-soft);
+  overflow-wrap: anywhere;
+}
+.sidepanel__ask {
+  margin: 0;
+  font-style: italic;
+  color: var(--text);
+}
+.sidepanel__note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+.sidepanel__content {
+  margin: 0;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* An answer is context for the keys below it, not the subject: cap it so the
+   list of keys stays reachable without scrolling past a chat transcript. */
+.sidepanel__content--short {
+  max-height: 12rem;
+  overflow-y: auto;
+}
+.sidepanel__keys,
+.sidepanel__paths {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sidepanel__key {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  width: 100%;
+  text-align: left;
+  padding: 0.3rem 0.4rem;
+  margin-bottom: 0.2rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  font: inherit;
+  cursor: pointer;
+}
+.sidepanel__key:hover {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+.sidepanel__key-head {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.sidepanel__key-hash {
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+.sidepanel__key[aria-expanded="true"] {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+/* The resolved text sits under the key that names it, indented so the list
+   still reads as a list. It does not scroll on its own -- the panel body is
+   the one scroller, and a nested one would trap the wheel over a chunk. */
+.sidepanel__resolved {
+  margin: 0 0 0.5rem 0.6rem;
+  padding-left: 0.5rem;
+  border-left: 2px solid var(--accent-border);
+}
+.sidepanel__paths li {
+  padding: 0.1rem 0;
+}
+/* Inside a resolved key the id is the longest value in the panel, and the
+   indent has already taken width from it. Stack the label so the value gets
+   the whole column rather than wrapping inside a narrow one. */
+.sidepanel__resolved .sidepanel__kv,
+.sidepanel__resolved .sidepanel__k {
+  display: block;
+}
+
+/* A hash in the trace row is a control, not decoration — it is what opens the
+   panel — so it reads as one on hover and reports its state to a screen
+   reader through aria-pressed. */
+.candidate__key {
+  padding: 0 0.25rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: none;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+.candidate__key:hover {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+.candidate__key[aria-pressed="true"] {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+.candidate__key--criteria {
+  font-family: inherit;
+  border-color: var(--border);
+}
+.candidate__trace--on {
+  background: var(--accent-soft);
+  border-radius: var(--radius-sm);
+}
+.candidate__trace-hint {
+  margin: 0.35rem 0 0;
+}
+
+@media (max-width: 1180px) {
+  /* No width left to give up: overlay, and let the shadow carry the layering.
+     `--side-panel` is still set, so this has to win explicitly. */
+  .app__main {
+    padding-right: 0;
+  }
+  .sidepanel {
+    width: min(24rem, 100vw);
+  }
 }

@@ -214,6 +214,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         kind: str = "fact",
         principal: str | None = None,
         valid_until: str | None = None,
+        session: str | None = None,
     ) -> dict:
         """Persist one agent-memory record (session/user/org scope) and index it.
 
@@ -225,6 +226,12 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         distinct from another's. kind marks a record as retrieval policy
         (alias/preference/exclusion) instead of a fact. valid_until gives the
         record an expiry it declares itself.
+
+        session identifies the conversation this call belongs to. It is
+        recorded, never enforced -- pass a stable opaque string and the
+        region can keep one refined memory per session; omit it and nothing
+        changes. Like principal, it is asserted by you and verified by
+        nobody.
         """
 
         return tools.memory_write(
@@ -239,6 +246,51 @@ def create_mcp_server(config: PheasantConfig) -> Any:
             principal,
             valid_until,
         )
+
+    @mcp.tool()
+    @anticipated
+    def list_memory_candidates(
+        knowledge_base: str,
+        status: str = "pending",
+        rule_id: str | None = None,
+        principal: str | None = None,
+        max_results: int = 50,
+    ) -> dict:
+        """List memory this region has proposed but nothing has admitted yet.
+
+        These are NOT memories: nothing here is retrievable, and nothing
+        becomes retrievable until it is promoted. Each carries the evidence
+        behind it (which rule, how many observations, across how many
+        sessions) -- read that before promoting. A proposal is a suggestion,
+        not a finding.
+        """
+
+        return tools.list_memory_candidates(knowledge_base, status, rule_id, principal, max_results)
+
+    @mcp.tool()
+    @anticipated
+    def promote_memory_candidate(
+        knowledge_base: str, candidate_id: str, principal: str | None = None
+    ) -> dict:
+        """Admit one proposed memory, making it an ordinary record.
+
+        It is written through the same path memory_write uses and indexed
+        identically, so it competes on the same ranking as anything else.
+        """
+
+        return tools.promote_memory_candidate(knowledge_base, candidate_id, principal)
+
+    @mcp.tool()
+    @anticipated
+    def reject_memory_candidate(
+        knowledge_base: str, candidate_id: str, principal: str | None = None
+    ) -> dict:
+        """Decline one proposed memory, permanently.
+
+        The rule that proposed it will not suggest it again.
+        """
+
+        return tools.reject_memory_candidate(knowledge_base, candidate_id, principal)
 
     @mcp.tool()
     @anticipated
@@ -279,6 +331,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         include_graph_neighbors: bool = True,
         principal: str | None = None,
         principal_groups: list[str] | None = None,
+        session: str | None = None,
         section: str | None = None,
         source_name: str | None = None,
         exclude_sources: list[str] | None = None,
@@ -292,6 +345,12 @@ def create_mcp_server(config: PheasantConfig) -> Any:
 
         principal/principal_groups scope results to what that caller may see
         when security.acl_enforced is on (Step 32.2); ignored otherwise.
+
+        session identifies the conversation this call belongs to. It is
+        recorded, never enforced -- pass a stable opaque string and the
+        region can keep one refined memory per session; omit it and nothing
+        changes. Like principal, it is asserted by you and verified by
+        nobody.
 
         section restricts results to one part of a document's extracted
         taxonomy, matched against the breadcrumb — "§ 12.3", "Article IV" or a
@@ -399,6 +458,7 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         source_name: str | None = None,
         principal: str | None = None,
         principal_groups: list[str] | None = None,
+        session: str | None = None,
         options: dict | None = None,
         source_types: list[str] | None = None,
         exclude_source_types: list[str] | None = None,
@@ -408,6 +468,12 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         Runs the configured agent workflow over pheasant's own search. Use
         this for a synthesized, cited answer; use search_context when you
         want the raw passages to reason over yourself.
+
+        session identifies the conversation this call belongs to. It is
+        recorded, never enforced -- pass a stable opaque string and the
+        region can keep one refined memory per session; omit it and nothing
+        changes. Like principal, it is asserted by you and verified by
+        nobody.
         """
 
         return tools.ask_knowledge_base(
@@ -433,8 +499,16 @@ def create_mcp_server(config: PheasantConfig) -> Any:
         max_files: int = 8,
         principal: str | None = None,
         principal_groups: list[str] | None = None,
+        session: str | None = None,
     ) -> dict:
-        """Return files likely needed for a coding or research task."""
+        """Return files likely needed for a coding or research task.
+
+        session identifies the conversation this call belongs to. It is
+        recorded, never enforced -- pass a stable opaque string and the
+        region can keep one refined memory per session; omit it and nothing
+        changes. Like principal, it is asserted by you and verified by
+        nobody.
+        """
 
         return tools.get_relevant_files(
             knowledge_base,
@@ -679,6 +753,12 @@ def _anticipated_failures(surface: str) -> Any:
     ``surface`` picks which of the two the wrapper raises: the tool and
     resource paths each forward only their own exception type, so the wrong
     one is stripped exactly like a crash.
+
+    It is also where the MCP surface is **observed**, when observation is on.
+    This decorator already wraps every tool and every resource and already
+    sees each call's arguments and its return value, so instrumenting here
+    covers the whole surface in one place instead of 27 -- and it keeps
+    ``PheasantTools`` free of any of it, exactly as it is free of the SDK.
     """
 
     from mcp.server.mcpserver.exceptions import ResourceError, ToolError
@@ -686,23 +766,102 @@ def _anticipated_failures(surface: str) -> Any:
     deliberate = ToolError if surface == "tool" else ResourceError
 
     def decorate(fn):
+        operation = getattr(fn, "__name__", surface)
+
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            try:
-                return fn(*args, **kwargs)
-            except (ValueError, KeyError) as exc:
-                # `str(KeyError("x"))` is `"'x'"`; the message reads better
-                # to a model without the quoting `repr` adds.
-                message = (
-                    exc.args[0]
-                    if isinstance(exc, KeyError) and exc.args and isinstance(exc.args[0], str)
-                    else str(exc)
-                )
-                raise deliberate(message) from exc
+            def run():
+                try:
+                    return fn(*args, **kwargs)
+                except (ValueError, KeyError) as exc:
+                    # `str(KeyError("x"))` is `"'x'"`; the message reads
+                    # better to a model without the quoting `repr` adds.
+                    message = (
+                        exc.args[0]
+                        if isinstance(exc, KeyError) and exc.args and isinstance(exc.args[0], str)
+                        else str(exc)
+                    )
+                    raise deliberate(message) from exc
+
+            buffer = _interaction_buffer()
+            if buffer is None:
+                return run()
+            return _observed(buffer, operation, kwargs, run)
 
         return wrapper
 
     return decorate
+
+
+def _interaction_buffer() -> Any:
+    """The process buffer, if observation is on. Never raises, never imports
+    the module when it is off."""
+
+    try:
+        from pheasant.telemetry.interactions import process_buffer
+
+        return process_buffer()
+    except Exception:  # noqa: BLE001 - observation must never break a tool call
+        return None
+
+
+def _observed(buffer: Any, operation: str, kwargs: dict[str, Any], run: Any) -> Any:
+    """Wrap one tool call in an observation.
+
+    ``principal`` and ``session`` are ordinary tool arguments the model
+    supplies, which is the same trust level ``principal`` already has
+    everywhere else in pheasant: asserted, never verified. The MCP transport
+    is ``stateless_http=True`` by design, so there is no server-side session
+    to read them from and there deliberately is not going to be one.
+    """
+
+    from pheasant.telemetry.interactions import (
+        InteractionContext,
+        Modality,
+        extract_results,
+        observe,
+    )
+
+    context = InteractionContext.create(
+        Modality.MCP,
+        principal=kwargs.get("principal"),
+        session_id=kwargs.get("session"),
+        client_id=kwargs.get("client_id"),
+    )
+    with observe(
+        buffer,
+        context,
+        kb_id=str(kwargs.get("knowledge_base") or ""),
+        operation=operation,
+    ) as event:
+        query = kwargs.get("query")
+        event.query_text = str(query) if isinstance(query, str) else None
+        event.criteria = {
+            key: value
+            for key, value in kwargs.items()
+            if key
+            in (
+                "mode",
+                "source_name",
+                "exclude_sources",
+                "node_types",
+                "min_score",
+                "section",
+                "source_types",
+                "exclude_source_types",
+                "max_results",
+            )
+            and value is not None
+        } or None
+        result = run()
+        # The same extractor the HTTP surface uses. Two implementations would
+        # mean a rule mining different evidence depending on which surface a
+        # caller happened to be on.
+        ids, paths, top, count = extract_results(result)
+        event.result_ids, event.result_paths = ids, paths
+        event.top_score = top
+        event.result_count = count
+        return result
 
 
 def _transport_security(config: PheasantConfig) -> Any:

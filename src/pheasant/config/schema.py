@@ -851,6 +851,76 @@ class MemorySynthesisSettings(ModelMixin):
 
 
 @dataclass
+class MemoryFormationSettings(ModelMixin):
+    """Turning recorded interactions into memory candidates, deterministically.
+
+    The observation plane (``observability.interactions``) records what was
+    asked and what came back. This is the half that reads it and proposes
+    records — and, deliberately, only *proposes*: a candidate becomes a
+    record through :meth:`pheasant.memory.store.MemoryStore.append` like
+    every other write, so nothing here is a second ingestion path.
+
+    **No model runs in this path.** Rules are counting and string matching
+    over recorded inputs, so a pass is reproducible and a candidate's id is
+    a deterministic hash of what produced it. Every decision is ledgered
+    with its ``rule_id`` and ``params_hash``, exactly as compaction's
+    already is, so a repeat pass over unchanged observations under
+    unchanged parameters writes nothing.
+
+    See ``docs/memory-formation.md``.
+    """
+
+    #: Master switch. Off, nothing reads the observation plane and no
+    #: candidate is ever minted — the region behaves exactly as it did
+    #: before formation existed.
+    enabled: bool = False
+    #: Maintain one record per session, refined through dialog: scope
+    #: ``session``, subject the session id, each refinement naming the
+    #: previous one in ``supersedes``. `current_only` (on by default) then
+    #: returns exactly one record per session and `as_of` reads its
+    #: history — the validity model doing what it was built for, with no
+    #: new primitive. Only meaningful when `enabled`.
+    session_digest: bool = True
+    #: Admit a candidate above threshold without review.
+    #:
+    #: **Off by default**, the same posture `compaction_enabled` and
+    #: `supersede_retention_days` take: it changes what a *default* query
+    #: returns, which is a decision an operator should make rather than
+    #: inherit. Left off, candidates accumulate for review in the Memory
+    #: tab and nothing is written until a person promotes one. An
+    #: auto-admitted record carries the `formed` tag and its candidate row
+    #: records `admitted_by`, so a machine-formed record is always
+    #: distinguishable from a written one.
+    auto_admit: bool = False
+    #: How many times a pattern must be observed before it is a candidate.
+    #: Counts run over a stream that is *sampled under load* (the log tier
+    #: drops rather than blocks), so a busy region reaches these thresholds
+    #: later — not incorrectly.
+    min_observations: int = 3
+    #: …and across how many distinct sessions. One session repeating itself
+    #: is a habit; several sessions agreeing is a signal. Guards against a
+    #: single loop minting steering that reorders results for everyone.
+    min_sessions: int = 2
+    #: Hard cap on candidates minted in one pass, bounding a first pass over
+    #: a large ledger the way `synthesis.max_calls_per_pass` bounds its own.
+    max_candidates_per_pass: int = 50
+    #: A pending candidate nobody promoted expires after this many days.
+    #: Rejections are remembered separately and are never re-proposed.
+    candidate_ttl_days: int = 30
+    #: Rules to run, by id. Each is versioned so a rule's decisions stay
+    #: attributable after its logic changes: a new version is a new
+    #: `rule_id`, never an edit to an existing one.
+    rules: list[str] = field(
+        default_factory=lambda: [
+            "session-digest-v1",
+            "alias-cooccurrence-v1",
+            "path-affinity-v1",
+            "retrieval-gap-v1",
+        ]
+    )
+
+
+@dataclass
 class MemorySettings(ModelMixin):
     """Agent-memory consolidation policy (Step 33.2).
 
@@ -963,6 +1033,11 @@ class MemorySettings(ModelMixin):
     #: See `MemorySynthesisSettings` — off by default, never on an automatic
     #: beat.
     synthesis: MemorySynthesisSettings = field(default_factory=MemorySynthesisSettings)
+
+    # --- formation (observation -> candidate -> record) --------------------
+    #: Reading the observation plane and proposing records. Off by default;
+    #: see `MemoryFormationSettings` and ``docs/memory-formation.md``.
+    formation: MemoryFormationSettings = field(default_factory=MemoryFormationSettings)
 
 
 @dataclass
@@ -1145,6 +1220,153 @@ class SourceConfig(ModelMixin):
 
 
 @dataclass
+class LogQueueSettings(ModelMixin):
+    """The log tier's own durable queue — deliberately not the index queue.
+
+    Request-rate churn in ``index_tasks`` would mean vacuum pressure on
+    PostgreSQL and constant churn on the index claim path, which is exactly
+    the burden this tier exists to avoid. The cost of separating is small:
+    ``drain()`` is already task-agnostic and is reused verbatim, and the
+    race-free conditional-``UPDATE`` claim stays one implementation
+    parameterized by table.
+    """
+
+    #: Off, batches are written by whoever produced them, if `/state` is
+    #: writable. On, they are published and a ``--role logger`` drains them.
+    enabled: bool = False
+    backend: str = "local"  # local | nats
+    visibility_seconds: int = 120
+    #: Lower than the index queue's 3. A log batch is best-effort by
+    #: construction, and retrying a poisoned one three times costs more than
+    #: the data is worth.
+    max_attempts: int = 2
+    nats_stream: str = "PHEASANT_LOGS"
+    nats_subject: str = "pheasant.logs.batches"
+    nats_durable: str = "pheasant-loggers"
+
+
+@dataclass
+class InteractionSettings(ModelMixin):
+    """The observation plane: what was asked, on which surface, by whom, and
+    what came back.
+
+    **Off by default, because it records queries and principals.** An
+    operator turning this on is choosing to keep that; `redact_text` exists
+    for regions that want the shape of the traffic without its content.
+
+    Observations are rows, never files. They are not chunked, not indexed,
+    and never returned by ``search_context`` — a UI session's chat does not
+    become knowledge because it was observed. See ``docs/memory-formation.md``.
+    """
+
+    enabled: bool = False
+    #: Record no free text at all -- neither the question nor the answer.
+    #:
+    #: Named for what it does rather than for one of the two fields it
+    #: covers: redacting a question while keeping the answer that quotes the
+    #: corpus back at it would be incoherent, so this is deliberately not
+    #: `redact_query_text`. Identity, modality, criteria, result ids and
+    #: paths are still recorded, so `path-affinity-v1` and
+    #: `retrieval-gap-v1` still work; only the lexical rule
+    #: (`alias-cooccurrence-v1`) goes quiet.
+    redact_text: bool = False
+    #: Cap on a recorded answer, in characters. **`0` records no answers at
+    #: all** -- the same "0 means off" shape `hot_retention_days` and
+    #: `supersede_retention_days` already use.
+    #:
+    #: A cap rather than an unbounded field because an answer is model output
+    #: and runs 10-50x a question's bytes; left unbounded, chat traffic would
+    #: dominate the ledger's size on a corpus that barely changed. Truncation
+    #: is honest: a truncated answer is marked in `attributes`.
+    max_answer_chars: int = 4000
+
+    # --- the request path ---------------------------------------------------
+    #: Events held in memory before a flush. **This is a backpressure knob,
+    #: not a throughput one**: the buffer is bounded and overflow drops the
+    #: oldest event rather than blocking a request. A log tier falling
+    #: behind must degrade to data loss, never to request latency — the same
+    #: posture `bound_concurrency` takes when it answers 429 under
+    #: saturation.
+    buffer_size: int = 10_000
+    flush_interval_seconds: float = 5.0
+    #: Events per published batch. Batching is what keeps the ledger off the
+    #: request path: one publish per N events rather than one write per
+    #: request, mirroring the batched fan-out `sync.worker_pool` already
+    #: does for file preparation.
+    flush_batch_size: int = 500
+    #: Stop publishing (and start dropping, counted separately) when the log
+    #: queue is this deep. Without it a stalled log tier turns into unbounded
+    #: queue growth, which is the same failure wearing a different hat.
+    max_queue_depth: int = 50_000
+
+    # --- storage tiers ------------------------------------------------------
+    #: How long events stay queryable in `/state`.
+    #:
+    #: ``0`` is **cold-only mode**: batches go straight to Parquet and
+    #: `/state` never grows at all. Formation then reads cold on its own
+    #: pass — slower, batch-only, which is fine because formation is a beat,
+    #: not a request.
+    hot_retention_days: int = 7
+    #: Roll hot rows past their retention into Parquet under
+    #: ``<exports_path>/interactions/dt=YYYY-MM-DD/`` before deleting them.
+    #: Off, they are simply deleted.
+    #:
+    #: This does not make DuckDB a storage backend (CLAUDE.md rule 12): the
+    #: destination is `/exports`, the writer is `analytics.py`'s, the pass
+    #: runs on the log tier rather than the sync path, and nothing
+    #: operational lives there.
+    cold_enabled: bool = False
+    #: ``None`` keeps cold partitions forever. Set it and whole ``dt=``
+    #: directories are dropped once past it — never individual rows.
+    cold_retention_days: int | None = None
+    #: Upper bound on rows one roll pass moves. Load-bearing in a single
+    #: container, where the roll runs on the scheduler beat *under
+    #: ``sync_lock``*: an unbounded roll there stalls incremental sync for
+    #: every source. Same argument as `MEMORY_TARGETED_ARCHIVE_MAX`.
+    max_rows_per_pass: int = 50_000
+    #: Where an API replica spools batches when `/state` is read-only and no
+    #: queue is configured — the degraded path for a custom SQLite
+    #: multi-process deployment. ``None`` disables it, and such a replica
+    #: then drops rather than spools. The shipped fleet needs none of this:
+    #: it runs PostgreSQL, so every replica can write directly.
+    spool_path: Path | None = None
+
+    queue: LogQueueSettings = field(default_factory=LogQueueSettings)
+
+
+@dataclass
+class ObservabilitySettings(ModelMixin):
+    """Tracing and the observation plane.
+
+    Two independent things share this block because they share a source:
+    one span per API/MCP call feeds both the operator's collector (if they
+    run one) and the region's own interaction ledger (if they enable it).
+    Neither requires the other, and both are off by default.
+
+    ``pytest`` stays network-free by construction rather than by mocking:
+    the OTLP exporter is attached only when `otlp_endpoint` is set, and the
+    default is ``None``.
+    """
+
+    #: OTLP collector endpoint. ``None`` attaches no exporter at all — spans
+    #: are still created and still feed the interaction ledger, they just go
+    #: nowhere off-box.
+    otlp_endpoint: str | None = None
+    otlp_protocol: str = "http/protobuf"
+    #: Environment variable holding ``key=value,key=value`` exporter headers.
+    #: The **name**, never the value — same rule as `storage.dsn_env`.
+    otlp_headers_env: str = "PHEASANT_OTLP_HEADERS"
+    service_name: str = "pheasant"
+    #: Head sampling ratio for exported spans. Does not affect the
+    #: interaction ledger, which has its own bounded buffer: sampling out a
+    #: span the operator's collector does not need should not also cost the
+    #: region a data point it counts on.
+    sample_ratio: float = 1.0
+
+    interactions: InteractionSettings = field(default_factory=InteractionSettings)
+
+
+@dataclass
 class PheasantConfig(ModelMixin):
     pheasant: PheasantSettings = field(default_factory=PheasantSettings)
     server: ServerSettings = field(default_factory=ServerSettings)
@@ -1156,6 +1378,7 @@ class PheasantConfig(ModelMixin):
     security: SecuritySettings = field(default_factory=SecuritySettings)
     synapse: SynapseSettings = field(default_factory=SynapseSettings)
     memory: MemorySettings = field(default_factory=MemorySettings)
+    observability: ObservabilitySettings = field(default_factory=ObservabilitySettings)
     assistant: AssistantSettings = field(default_factory=AssistantSettings)
     sources: list[SourceConfig] = field(default_factory=list)
 
@@ -1200,6 +1423,16 @@ class PheasantConfig(ModelMixin):
             if dc is MemorySettings:
                 if "synthesis" in raw and isinstance(raw["synthesis"], dict):
                     raw["synthesis"] = build(MemorySynthesisSettings, raw["synthesis"])
+                if "formation" in raw and isinstance(raw["formation"], dict):
+                    raw["formation"] = build(MemoryFormationSettings, raw["formation"])
+            if dc is ObservabilitySettings:
+                if "interactions" in raw and isinstance(raw["interactions"], dict):
+                    raw["interactions"] = build(InteractionSettings, raw["interactions"])
+            if dc is InteractionSettings:
+                if raw.get("spool_path") is not None:
+                    raw["spool_path"] = Path(raw["spool_path"])
+                if "queue" in raw and isinstance(raw["queue"], dict):
+                    raw["queue"] = build(LogQueueSettings, raw["queue"])
             if dc is IngestionSettings:
                 if "captioner" in raw and isinstance(raw["captioner"], dict):
                     raw["captioner"] = build(CaptionerSettings, raw["captioner"])
@@ -1233,6 +1466,7 @@ class PheasantConfig(ModelMixin):
             security=build(SecuritySettings, data.get("security")),
             synapse=build(SynapseSettings, data.get("synapse")),
             memory=build(MemorySettings, data.get("memory")),
+            observability=build(ObservabilitySettings, data.get("observability")),
             assistant=build(AssistantSettings, data.get("assistant")),
             sources=[],
         )

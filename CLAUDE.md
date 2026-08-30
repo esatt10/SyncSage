@@ -68,11 +68,13 @@ pheasant-kb/
 │   ├── quickstart.py          ← `pheasant up` config generation
 │   ├── capacity.py            ← the one home for sizing coefficients
 │   ├── analytics.py           ← Parquet exports + the DuckDB query surface
+│   ├── evalset.py             ← de-identified eval cases from the ledger
 │   ├── sharding.py            ← `pheasant shard plan`
 │   ├── jobs.py                ← per-source progress: phase, rate, ETA, stalled
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
 │   ├── sync/                  ← engine, connectors, watcher, scheduler, locks,
-│   │                            queue, worker_pool, worker_transport, grpc
+│   │                            queue, log_queue, worker_pool,
+│   │                            worker_transport, grpc
 │   ├── connectors/            ← first-party SDK plugins: notion, gdrive,
 │   │                            slack, confluence, imap
 │   ├── ingestion/             ← pipeline, chunking, content_types, taxonomy,
@@ -82,7 +84,7 @@ pheasant-kb/
 │   ├── search/                ← sqlite_store (FTS5/tsvector + BM25),
 │   │                            graph_search, hybrid (RRF), criteria, vector
 │   ├── memory/                ← store, projection, policy, steering, salience,
-│   │                            bridge, maintenance, benchmark
+│   │                            bridge, maintenance, formation, benchmark
 │   ├── persistence/           ← state_store, backends (sqlite|postgres),
 │   │                            schema, graph_store, manifest, migrate, paths
 │   ├── mcp_server/            ← server.py (MCPServer), tools.py (PheasantTools)
@@ -92,7 +94,8 @@ pheasant-kb/
 │   ├── deployment/            ← roles, serving durability, mounts, host
 │   ├── security/              ← path_policy, acl, idp
 │   ├── synapse/               ← contract publisher, events, signing
-│   └── telemetry/metrics.py   ← Prometheus exposition
+│   └── telemetry/             ← metrics.py (Prometheus exposition),
+│                                interactions.py (the observation plane)
 ├── ui/                        ← React + Vite workspace (baked into the image)
 └── tests/                     ← 87 pytest modules, offline by design
 ```
@@ -130,6 +133,7 @@ pheasant backup|restore
 pheasant export parquet [--table NAME]      # /exports/parquet/<kb_id>/*.parquet
 pheasant export query "SELECT …"            # SQL over an export directory
 pheasant export tables [--schema]           # what is exportable; --schema for columns
+pheasant eval bootstrap                     # de-identified eval cases from real traffic
 pheasant mcp --transport stdio
 pheasant client-config claude-code|cursor|vscode
 pheasant config show                       # resolved config after profile+YAML+--set
@@ -266,20 +270,67 @@ record, indexed by the ordinary pipeline. Recall *is* search. On top of that:
 - **Graph** — records get `memory_record` nodes, `supersedes` edges, and
   `about` edges via a precedence ladder (reference → symbol → heading →
   entity), capped at three targets.
+- **Observation** (`observability.interactions`, off) — every API/MCP call
+  becomes a **row with a retention policy**: never a file, never chunked,
+  never indexed, never returned by a search. A UI session's chat does not
+  become knowledge because it was observed. The only path from here into
+  memory is a candidate that something *admits*, and admission goes through
+  `MemoryStore.append` like every other write, so invariant 1 never bends.
+  Dimensioned by identity / session / modality (`ui|mcp|a2a|cli`) / criteria.
+  Trace and timestamp are guaranteed, not best-effort: `NOT NULL` in the
+  schema, rejected-and-counted before the insert if absent, `duration_ms`
+  always set and taken from a **monotonic** clock while `started_at` is wall
+  clock. The trace is ambient for the call and injected into every hop
+  pheasant makes of its own — the graph-query call, remote preparation, and
+  `index_tasks.payload` (attached *after* the id digest, or the content-
+  addressed dedup that makes two replicas enqueue one task would break).
+  `docs/memory-formation.md`.
+- **Formation** (`memory.formation`, off) — deterministic rules read the
+  observation plane and produce memory. `session-digest-v1` is the first:
+  one record per `(session, principal)`, refined by **superseding itself**,
+  so `current_only` returns exactly one and `as_of` reads the session's
+  history. Written automatically rather than proposed, and only because of
+  scope: `session` scope + `written_by` means only its own writer can read
+  it and it decays with `session_ttl_days` — it never becomes shared
+  knowledge, which still takes an explicit promotion. Two guards keep a
+  repeat pass free: a text short-circuit (cheap) and the store's own id
+  dedup (sound, because `supersedes` is deliberately absent from the id
+  digest). Three further rules **propose** rather than write:
+  `alias-cooccurrence-v1` (a query word absent from everything it retrieved,
+  guarded against inflections — `coordination -> check` was a real false
+  positive), `path-affinity-v1` (prefix cut at a directory boundary) and
+  `retrieval-gap-v1` (a gap is *no results*, never a score threshold: fused
+  RRF scores have no absolute scale). A candidate crosses into memory only
+  through `MemoryStore.append`; a rejection is permanent, because
+  re-suggesting what someone declined makes a review queue worth ignoring.
 
 ### Scale
 
-One container until it shouldn't be. Then three independent axes:
+One container until it shouldn't be. Then four independent axes:
 
 | Axis | Mechanism | Scales on |
 |---|---|---|
 | Request traffic | `serve --role api` replicas; publish instead of index | CPU / RPS |
 | Ingest throughput | `--role indexer` claiming from a durable queue, `--role worker` preparing | `pheasant_index_queue_depth` |
 | Corpus size | `pheasant shard plan` packs **whole sources** per region | graph nodes |
+| Observation volume | `--role logger` draining its **own** queue (`log_tasks`, never `index_tasks`) | `pheasant_log_queue_depth` |
 
 Selectable backends, dependency-free side first: `storage.backend`
 sqlite|postgres, `sync.queue.backend` off|local|nats,
-`sync.concurrency.worker_transport` http|grpc.
+`sync.concurrency.worker_transport` http|grpc,
+`observability.interactions.queue.backend` off|local|nats.
+
+The fourth axis rises with **request traffic, not corpus churn**, which is why
+it is a separate queue and a separate role rather than a `kind` column: sharing
+`index_tasks` would put request-rate churn on the index claim path. Two things
+it must keep true. **The request path only appends to a bounded ring** — a
+ledger write per request puts a database write on the same Postgres the lexical
+arm already contends on (`docs/architecture.md`'s measured bottleneck). **The
+hot→cold roll never runs under `sync_lock`**, which the scheduler beat holds
+across all its work; a multi-million-row Parquet write there stalls incremental
+sync for every source. Under pressure the tier drops observations rather than
+slowing a request, so formation thresholds count a stream thinned under load: a
+busy region forms memory more slowly, not incorrectly.
 
 Service-to-service traffic is durable by construction: pooled keep-alive
 connections, batching, full-jitter retry honouring `Retry-After`, a per-endpoint
@@ -356,6 +407,23 @@ Each of these cost real time. They are listed because the shape recurs.
   fabricating a state the default config cannot produce. A derived metric
   needs its own inputs at its own granularity, and its test needs the real
   write path.
+- **A batch insert makes one bad row cost every good row beside it.** A
+  queued batch of observations is written inside one transaction, so a single
+  event carrying a null `trace_id` — a truncated spool line, a garbled
+  payload — raised `IntegrityError` and rolled back the whole batch. The batch
+  then nacked, retried, failed identically and dead-lettered: one bad line for
+  hundreds of good observations. Validation has to happen *before* the
+  statement (`InteractionEvent.is_writable`), because a rolled-back
+  transaction cannot drop the one bad row and keep the rest. Found by a test
+  written for the batch path, not by reading it.
+- **Telemetry ids that are minted twice name two different calls.** The
+  interaction ledger mints W3C trace/span ids itself, because they are a row's
+  primary key and must exist without the `[otel]` extra. With the extra
+  installed the SDK mints its own — so the row and the exported span
+  disagreed, and an operator correlating a slow span in their collector to a
+  ledger row found nothing, which is most of the reason to export spans at
+  all. The span starts first now and the row adopts *its* ids. Caught by
+  running against a real SDK, not by the offline suite, which had no opinion.
 - **`wasmtime.Trap` and `wasmtime.WasmtimeError` are siblings**, not parent and
   child. Catch `guest_failures()`.
 - **A mutation harness must `touch` the restored file and purge
@@ -453,5 +521,7 @@ Each of these cost real time. They are listed because the shape recurs.
   — `/exports` is a PVC/named volume an outside reader mounts; nothing is
   served over HTTP
 - **Memory:** `docs/memory-system.md`, `docs/how-to/agent-memory.md`
+- **Observation & formation:** `docs/memory-formation.md` — the two planes,
+  the log tier, and the two combination designs that were rejected
 - **Synapse region spec:** `docs/SYNAPSE_INTEGRATION.md`
 - **Deployment:** `docs/deployment.md`, `deploy/kubernetes/`

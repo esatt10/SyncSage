@@ -51,6 +51,7 @@ class Role(StrEnum):
     INDEXER = "indexer"
     GRAPH = "graph"
     WORKER = "worker"
+    LOGGER = "logger"
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,15 @@ class RolePolicy:
     #: was when the pod started — indefinitely, and silently, while text and
     #: vector search stayed current from the shared database.
     refreshes_graph: bool = False
+    #: Claim batches from the **log** queue -- a different table with a
+    #: different failure mode, deliberately not the index queue.
+    #:
+    #: Its own flag rather than a reuse of ``drains_queue`` because the two
+    #: must be independently settable: an ``indexer`` drains index work and
+    #: should not also be doing hot-to-cold Parquet rolls, which is exactly
+    #: the coupling that would put a multi-million-row roll inside the
+    #: scheduler's ``sync_lock``.
+    drains_log_queue: bool = False
 
     @property
     def name(self) -> str:
@@ -97,6 +107,11 @@ POLICIES: dict[Role, RolePolicy] = {
         # resumption, not to become a fleet, and `sync_all` already drains
         # what it publishes.
         drains_queue=False,
+        # False for the same reason, and it is the same reason: `all` must
+        # behave identically whether or not a queue exists. A single container
+        # rolls its own logs inline on the maintenance beat, bounded by
+        # `max_rows_per_pass`, rather than growing a second worker.
+        drains_log_queue=False,
         indexes_locally=True,
         serves_ui=True,
     ),
@@ -136,6 +151,20 @@ POLICIES: dict[Role, RolePolicy] = {
         indexes_locally=False,
         serves_ui=False,
     ),
+    # The log tier. Everything else is False on purpose: this process serves
+    # no traffic, indexes nothing, holds no sync lock and loads no graph. That
+    # is the entire point -- persistence, rolling and cold compaction for a
+    # request-rate stream, in a failure domain that shares nothing with
+    # serving or ingest.
+    Role.LOGGER: RolePolicy(
+        role=Role.LOGGER,
+        runs_watcher=False,
+        runs_scheduler=False,
+        drains_queue=False,
+        indexes_locally=False,
+        serves_ui=False,
+        drains_log_queue=True,
+    ),
 }
 
 
@@ -165,21 +194,37 @@ def resolve_role(config: object, override: str | None = None) -> RolePolicy:
 def validate_role(policy: RolePolicy, config: object) -> None:
     """Refuse a combination that cannot work, at startup.
 
-    Only one check, and it earns its place: an ``api`` replica publishes its
-    syncs instead of running them, so without a queue a sync request would be
-    accepted and then go **nowhere**. That is worse than a refusal — the
-    caller gets a job id, the UI shows a job, and nothing ever indexes.
+    Two checks, and each earns its place by turning a silent no-op into a
+    refusal. An ``api`` replica publishes its syncs instead of running them,
+    so without a queue a sync request would be accepted and then go
+    **nowhere** — the caller gets a job id, the UI shows a job, and nothing
+    ever indexes. A ``logger`` with nothing to drain is the same shape: a pod
+    that starts healthy, reports ready, and does nothing forever.
     """
 
-    if policy.role is not Role.API:
-        return
-    queue = getattr(getattr(config, "sync", None), "queue", None)
-    if not getattr(queue, "enabled", False):
-        raise RoleConfigurationError(
-            "role 'api' publishes index work instead of running it, so it needs "
-            "sync.queue.enabled: true and an indexer draining the same queue. "
-            "Without that, every sync request would be accepted and never run."
-        )
+    if policy.role is Role.API:
+        queue = getattr(getattr(config, "sync", None), "queue", None)
+        if not getattr(queue, "enabled", False):
+            raise RoleConfigurationError(
+                "role 'api' publishes index work instead of running it, so it needs "
+                "sync.queue.enabled: true and an indexer draining the same queue. "
+                "Without that, every sync request would be accepted and never run."
+            )
+    if policy.role is Role.LOGGER:
+        interactions = getattr(getattr(config, "observability", None), "interactions", None)
+        if not getattr(interactions, "enabled", False):
+            raise RoleConfigurationError(
+                "role 'logger' drains the observation log queue, so it needs "
+                "observability.interactions.enabled: true. Without that there is "
+                "nothing to drain and the process would idle forever while "
+                "reporting itself healthy."
+            )
+        if not getattr(getattr(interactions, "queue", None), "enabled", False):
+            raise RoleConfigurationError(
+                "role 'logger' needs observability.interactions.queue.enabled: true. "
+                "With the queue off, whichever process observed a call also writes "
+                "it, so a separate log tier would have no work to claim."
+            )
 
 
 def describe(policy: RolePolicy) -> dict[str, object]:
@@ -190,6 +235,7 @@ def describe(policy: RolePolicy) -> dict[str, object]:
         "watcher": policy.runs_watcher,
         "scheduler": policy.runs_scheduler,
         "drains_queue": policy.drains_queue,
+        "drains_log_queue": policy.drains_log_queue,
         "indexes_locally": policy.indexes_locally,
         "refreshes_graph": policy.refreshes_graph,
     }

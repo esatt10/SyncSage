@@ -769,11 +769,96 @@ memory source itself. See [Agent memory](how-to/agent-memory.md).
 | `synthesis.max_input_chars` | integer | `6000` | A cluster whose combined member text exceeds this is skipped rather than truncated into a partial merge. |
 | `synthesis.min_cluster_size` | integer | `3` | Below this, medoid promotion (L2) already resolves the cluster losslessly. |
 | `synthesis.max_jaccard` | float | `0.55` | Above this mean pairwise similarity (over normalized tokens, measured exactly as L1 clustering measures it) a cluster is skipped: near-identical rephrasings are what medoid promotion resolves for free, so spend goes only where deterministic compaction provably cannot help. Matters most with `compaction_enabled` off (the default), where nothing has been demoted. |
+| `formation.enabled` | bool | `false` | Read the observation plane (`observability.interactions`) and mint memory **candidates** from it, deterministically. Off, nothing is read and no candidate is ever minted. A candidate is a proposal, not a record: it becomes one only through an admission, and admission goes through the ordinary `MemoryStore.append` write path. See [Memory formation](memory-formation.md). |
+| `formation.session_digest` | bool | `true` | Maintain one record per session, refined through dialog — scope `session`, subject the session id, each refinement naming the previous in `supersedes`. `current_only` then returns exactly one record per session and `as_of` reads its history. No new primitive: this is the validity model doing what it was built for. Only meaningful when `formation.enabled`. |
+| `formation.auto_admit` | bool | `false` | Admit a candidate above threshold without review. Off by default, the same posture `compaction_enabled` takes: it changes what a *default* query returns. Left off, candidates accumulate for review in the Memory tab. An auto-admitted record carries the `formed` tag and its candidate records `admitted_by`, so a machine-formed record is always distinguishable from a written one. |
+| `formation.min_observations` | integer | `3` | How many times a pattern must be observed before it is a candidate. Counts run over a stream that is *sampled under load* — the log tier drops rather than blocks — so a busy region reaches these thresholds later, not incorrectly. |
+| `formation.min_sessions` | integer | `2` | …and across how many distinct sessions. One session repeating itself is a habit; several agreeing is a signal. Guards against a single loop minting steering that reorders results for everyone. |
+| `formation.max_candidates_per_pass` | integer | `50` | Hard cap on candidates minted in one pass, bounding a first pass over a large ledger. |
+| `formation.candidate_ttl_days` | integer | `30` | A pending candidate nobody promoted expires after this many days. Rejections are remembered separately and never re-proposed. |
+| `formation.rules` | list | all four | Which rules run: `session-digest-v1`, `alias-cooccurrence-v1`, `path-affinity-v1`, `retrieval-gap-v1`. Each is versioned so its decisions stay attributable — a new version is a new `rule_id`, never an edit to an existing one. |
 
 **Corrected records are excluded from retrieval automatically**, at query time,
 without waiting for a consolidation pass — pass `{"current_only": false}` or an
 `as_of` instant to see them. That is a property of the retrieval path, not a
 setting here.
+
+---
+
+## `observability` (tracing + the observation plane, optional)
+
+Two independent things share this block because they share a source: one span
+per API/MCP call feeds both an operator's OTLP collector and the region's own
+**interaction ledger**. Neither requires the other, and both are off by
+default.
+
+The ledger is what [memory formation](memory-formation.md) reads. It records
+queries, principals, sessions and result ids as **rows with a retention
+policy** — never files, never chunked, never indexed, never returned by a
+search. A UI session's chat does not become knowledge because it was observed;
+only an admission crosses that line.
+
+Exporting spans needs the `[otel]` extra (`pip install "pheasant[otel]"`).
+Without it, spans still feed the ledger and the exporter is simply never
+attached — `pytest` stays network-free by construction rather than by mocking.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `otlp_endpoint` | string \| null | `null` | OTLP collector endpoint. `null` attaches no exporter at all: spans are still created and still feed the ledger, they just go nowhere off-box. |
+| `otlp_protocol` | string | `http/protobuf` | OTLP wire protocol. |
+| `otlp_headers_env` | string | `PHEASANT_OTLP_HEADERS` | Environment variable holding `key=value,key=value` exporter headers. The **name**, never the value — same rule as `storage.dsn_env`. |
+| `service_name` | string | `pheasant` | `service.name` on every exported span. |
+| `sample_ratio` | float | `1.0` | Head sampling for *exported* spans only. It deliberately does not thin the ledger: sampling out a span your collector does not need should not also cost the region a data point formation counts on. |
+| `interactions.enabled` | bool | `false` | Record interactions. Off, the region behaves exactly as it did before this existed. On, it is recording queries and principals — a deliberate choice, not a default. |
+| `interactions.redact_text` | bool | `false` | Record no free text at all — neither the question nor the answer. Named for what it does rather than one of the two fields it covers: redacting a question while keeping an answer that quotes the corpus back at it would be incoherent. Identity, modality, criteria, result ids and result paths are still recorded, so `path-affinity-v1` and `retrieval-gap-v1` still work; only the lexical rule `alias-cooccurrence-v1` goes quiet. |
+| `interactions.max_answer_chars` | integer | `4000` | Cap on a recorded assistant answer, in characters. **`0` records no answers at all** — the same "0 means off" shape `hot_retention_days` and `supersede_retention_days` use. A cap rather than an unbounded field because an answer is model output at 10-50x a question's bytes; left unbounded, chat traffic would dominate a ledger sized for search. A truncated answer is marked `answer_truncated` in `attributes`. |
+| `interactions.buffer_size` | integer | `10000` | Events held in memory before a flush. **A backpressure knob, not a throughput one**: the buffer is bounded and overflow drops the oldest event rather than blocking a request. |
+| `interactions.flush_interval_seconds` | float | `5.0` | Flush at least this often, even below `flush_batch_size`. |
+| `interactions.flush_batch_size` | integer | `500` | Events per published batch. Batching is what keeps the ledger off the request path: one publish per N events rather than one write per request. |
+| `interactions.max_queue_depth` | integer | `50000` | Stop publishing (and start dropping, counted separately) when the log queue is this deep. Without it, a stalled log tier turns into unbounded queue growth. |
+| `interactions.hot_retention_days` | integer | `7` | How long events stay queryable in `/state`. **`0` is cold-only mode**: batches go straight to Parquet and `/state` never grows. Formation then reads cold on its own pass — slower, batch-only, which is fine because formation is a beat, not a request. |
+| `interactions.cold_enabled` | bool | `false` | Roll hot rows past their retention into Parquet under `<exports_path>/interactions/dt=YYYY-MM-DD/` before deleting them. Off, they are simply deleted. |
+| `interactions.cold_retention_days` | integer \| null | `null` | `null` keeps cold partitions forever. Set it and whole `dt=` directories are dropped once past it — never individual rows. |
+| `interactions.max_rows_per_pass` | integer | `50000` | Upper bound on rows one roll pass moves. Load-bearing in a single container, where the roll runs on the scheduler beat **under `sync_lock`**: an unbounded roll there stalls incremental sync for every source. |
+| `interactions.spool_path` | path \| null | `null` | Where a replica spools batches when `/state` is read-only and no queue is configured — the degraded path for a custom SQLite multi-process deployment. `null` means such a replica drops instead. The shipped fleet needs none of this: it runs PostgreSQL, so every replica writes directly. |
+| `interactions.queue.enabled` | bool | `false` | Hand log work to a dedicated tier. Off, whoever produced a batch writes it. On, batches are published to **their own queue** — not `index_tasks` — and a `serve --role logger` drains them, so persistence, rolling and compaction never touch a request or the indexer's sync lock. |
+| `interactions.queue.backend` | `local` \| `nats` | `local` | Same two backends the index queue has. `nats` takes its own stream, subject and durable so the two tiers cannot consume each other's work. |
+| `interactions.queue.visibility_seconds` | integer | `120` | How long a claimed batch stays invisible before another worker may take it. |
+| `interactions.queue.max_attempts` | integer | `2` | Lower than the index queue's `3` on purpose: a log batch is best-effort by construction, and retrying a poisoned one three times costs more than the data is worth. |
+| `interactions.queue.nats_stream` | string | `PHEASANT_LOGS` | JetStream stream name. |
+| `interactions.queue.nats_subject` | string | `pheasant.logs.batches` | JetStream subject. |
+| `interactions.queue.nats_durable` | string | `pheasant-loggers` | Durable consumer name. |
+
+### What one interaction row holds
+
+| Field | Notes |
+|---|---|
+| `id`, `trace_id`, `span_id`, `parent_span_id` | Correlation, and `NOT NULL` apart from the parent (a root span genuinely has none). `id` is `blake2b(trace_id\|span_id)`, so a redelivered batch dedups instead of double-counting. An inbound W3C `traceparent` is adopted, so an agent's trace continues into this one. A streamed answer is a **child** row: it outlives the request that opened it, so it gets its own span under the same trace rather than a racing late edit of the request's. |
+| `modality`, `operation`, `principal`, `session_id`, `client_id` | The four dimensions formation slices on. All caller-asserted, exactly like `principal` already is everywhere else in pheasant. |
+| `started_at`, `duration_ms`, `status` | `started_at` and `status` are `NOT NULL`. `duration_ms` is always set, including on a call that raised, and comes from a monotonic clock so an NTP step cannot produce a negative one. `status` is `ok` \| `error` \| `shed`; a 429 under saturation is recorded, because it is the signal that says thresholds are being reached more slowly than traffic suggests. |
+| `query_text` | The question, from MCP tool arguments or an HTTP request body. |
+| `answer_text` | The assistant's answer, when there was one. Capped by `max_answer_chars`. |
+| `criteria_json` | The filter object the caller passed — mode, source filters, `min_score`, section. |
+| `result_ids_json` | Stable node ids, which join to `graph_nodes` and through them to `chunks`. |
+| `result_paths_json` | Source-relative `relative_path` values — the same grammar [steering](how-to/agent-memory.md#steering) matches against, so a `preference` rule minted from these can actually fire. |
+| `result_count`, `top_score` | The full result count (the id/path lists are capped at 50) and the best score. Together they are what lets a rule tell "nothing matched" from "matched more than we recorded". |
+| `attributes_json` | Free-form: HTTP status and method, and the `answer_truncated` / `text_redacted` markers. |
+
+Two lists rather than one, deliberately: a rule that had to sniff whether a
+value was an id or a path would behave differently depending on which surface
+produced the row, which is the opposite of the determinism every formation rule
+downstream is built on.
+
+**A log tier falling behind degrades to data loss, never to request latency.**
+The buffer is bounded, the queue depth is bounded, and nothing on the request
+path ever blocks on either — the same posture `server.api.max_concurrency`
+takes when it answers `429` under saturation. `pheasant_interaction_events_dropped_total{reason}`
+counts what was lost and why.
+
+**Cold storage enforces nothing.** A Parquet directory has no access control,
+and these rows carry principals and query text. Put the access control on the
+directory, exactly as [the export schema](reference/export-schema.md) says of
+exports.
 
 ---
 

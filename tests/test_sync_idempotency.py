@@ -227,3 +227,72 @@ def test_a_no_op_memory_write_never_marks_the_source_dirty(tmp_path: Path) -> No
         assert tools.engine.state.get_fingerprint(dirty_scope) is None
     finally:
         tools.engine.close()
+
+
+def test_observing_a_call_never_touches_the_index(tmp_path: Path) -> None:
+    """The boundary, asserted from the sync side.
+
+    An observation is a row with a retention policy. It must not create an
+    artifact, a chunk, a memory record or an enrichment-dirty marker -- if it
+    did, a busy region would be re-indexing itself once per request, and the
+    "unchanged re-sync does no work" pillar would be false for any region with
+    observation on.
+    """
+
+    from pheasant.sync.log_queue import hot_row_count, write_events
+    from pheasant.telemetry.interactions import InteractionEvent
+
+    tools = _deferred_enrichment_tools(tmp_path)
+    try:
+        engine = tools.engine
+        dirty_scope = engine._ENRICH_DIRTY_SCOPE.format(name="agent-memory")
+        tools.sync_source("deferred-enrich", "agent-memory", "incremental")
+
+        def counts() -> tuple[int, int, int]:
+            return (
+                engine.state.rows("SELECT COUNT(*) AS c FROM artifacts", ())[0]["c"],
+                engine.state.rows("SELECT COUNT(*) AS c FROM chunks", ())[0]["c"],
+                engine.state.rows("SELECT COUNT(*) AS c FROM memory_records", ())[0]["c"],
+            )
+
+        before = counts()
+        write_events(
+            engine.state,
+            [
+                InteractionEvent(
+                    kb_id="deferred-enrich",
+                    operation="search_context",
+                    trace_id=f"{index:032x}",
+                    span_id=f"{index:016x}",
+                    started_at="2026-01-01T00:00:00.000000Z",
+                    query_text="where is the watcher",
+                )
+                for index in range(25)
+            ],
+        )
+
+        assert hot_row_count(engine.state) == 25
+        assert counts() == before
+        assert engine.state.get_fingerprint(dirty_scope) is None
+
+        # And the next incremental sync still finds nothing to do.
+        result = tools.sync_source("deferred-enrich", "agent-memory", "incremental")
+        assert result["indexed_artifacts"] == 0
+        assert counts() == before
+    finally:
+        tools.engine.close()
+
+
+def test_a_sync_is_unchanged_when_observation_is_off(sync_engine: object) -> None:
+    """Rule 7, from the other direction: the default config must reach the
+    same state a pre-observation build did, and no ledger table is touched."""
+
+    first = sync_result_counts(run_sync(sync_engine, mode="full"), sync_engine)
+    second = sync_result_counts(run_sync(sync_engine, mode="full"), sync_engine)
+
+    assert second == first
+    assert all(value > 0 for value in second.values())
+    # The tables exist (the schema is replayed on every start) and stay empty:
+    # observation is off, so nothing anywhere writes to them.
+    assert sync_engine.state.rows("SELECT COUNT(*) AS c FROM interaction_events", ())[0]["c"] == 0
+    assert sync_engine.state.rows("SELECT COUNT(*) AS c FROM log_tasks", ())[0]["c"] == 0
