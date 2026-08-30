@@ -101,6 +101,7 @@ nav:
       - Architecture: architecture.md
       - The memory system: memory-system.md
       - Memory formation: memory-formation.md
+      - Knowledge effectiveness: knowledge-effectiveness.md
       - Troubleshooting: troubleshooting.md
   - Contributor:
       - pheasant as a Synapse region (spec): SYNAPSE_INTEGRATION.md

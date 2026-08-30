@@ -84,6 +84,23 @@ Routing, fan-out, merge, and global cross-region search live on the **router**
 (pheasant-flock), not on the region. See
 [Attach to a Synapse fleet](../how-to/attach-to-synapse.md).
 
+## Knowledge effectiveness (evaluation plane)
+
+| Capability | CLI | HTTP | Web UI | MCP |
+|---|---|---|---|---|
+| Record typed interaction proof | `pheasant eval proof` | `POST /evaluation/evidence` | — | `record_evidence` |
+| List the evidence taxonomy | `pheasant eval taxonomy` | `GET /evaluation/taxonomy` | — | `pheasant://evaluation/taxonomy` |
+| Run an evaluation batch | `pheasant eval run` | `POST /evaluation/run` (background job) | — | — |
+| Read the latest report | `pheasant eval report` | `GET /evaluation/report` | — | `get_evaluation_report` |
+| List past runs | — | `GET /evaluation/runs` | — | — |
+| One metric's trend | `pheasant eval trend` | `GET /evaluation/trend` | — | — |
+| De-identified eval case set | `pheasant eval bootstrap` | — | — | — |
+
+Running a batch is deliberately absent from MCP: it is minutes of read-side work
+that takes a lease and writes a run row, which is an operator action rather than
+something an agent should start mid-conversation. Agents record evidence and
+read reports.
+
 ## Server & MCP lifecycle
 
 | Capability | CLI |

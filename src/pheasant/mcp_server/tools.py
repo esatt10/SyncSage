@@ -828,6 +828,117 @@ class PheasantTools:
             )
         return payload
 
+    def record_evidence(
+        self,
+        knowledge_base: str,
+        query: str,
+        target_id: str,
+        event_type: str,
+        target_type: str = "artifact",
+        principal: str | None = None,
+        session_id: str | None = None,
+        position: int | None = None,
+        outcome_reference: str | None = None,
+    ) -> dict:
+        """Record what actually came of a result this region returned.
+
+        The one way an agent contributes *proof* rather than traffic. Retrieval
+        already records what was served; only the caller knows whether it was
+        cited, selected, accepted, rejected, or validated by something
+        deterministic -- and those are four claims of very different strength,
+        which is why ``event_type`` is required and drawn from a fixed
+        taxonomy rather than being a "useful: true" flag.
+
+        Two defaults worth knowing before instrumenting anything: being served
+        is *not* evidence of usefulness, and *not* selecting something is not
+        evidence against it. Both stay unknown, so an agent that reports
+        nothing degrades the evaluation's coverage rather than corrupting its
+        conclusions.
+
+        ``pheasant://evaluation/taxonomy`` lists every event type.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        import pheasant.evaluation as evaluation
+
+        return evaluation.record_evidence(
+            self.state,
+            self.config,
+            query=query,
+            target_id=target_id,
+            target_type=target_type,
+            event_type=event_type,
+            principal=principal,
+            session_id=session_id,
+            position=position,
+            outcome_reference=outcome_reference,
+            reason_code="mcp",
+        )
+
+    def get_evaluation_report(self, knowledge_base: str, run_id: str | None = None) -> dict:
+        """The most recent evidence-bearing effectiveness report, or a named one.
+
+        Returns the agent projection: status, evidence sufficiency, the metric
+        deltas, the gates, the limitations, and the actions this report permits.
+        The full report -- per-query operands, formulas, proof references -- is
+        available over HTTP at ``/evaluation/report``; what comes back here is
+        the part an agent can act on without parsing a document.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        import pheasant.evaluation as evaluation
+        from pheasant.evaluation import store as evaluation_store
+
+        report = (
+            evaluation_store.load_report(self.state, run_id)
+            if run_id
+            else evaluation.latest_report(self.state, self.config.knowledge_base_id)
+        )
+        if report is None:
+            raise ValueError(
+                f"No evaluation report for {run_id}"
+                if run_id
+                else "No evaluation run has completed for this knowledge base yet"
+            )
+        return {
+            "run_identity": report.get("run_identity", {}),
+            "health_vector": report.get("health_vector", {}),
+            "gates": report.get("gates", []),
+            "generalization": report.get("generalization", {}),
+            "candidate_decisions": report.get("candidate_decisions", []),
+            "limitations": report.get("limitations", {}),
+            "agent": (report.get("explanations") or {}).get("agent", {}),
+        }
+
+    def get_evaluation_taxonomy(self, knowledge_base: str) -> dict:
+        """Every evidence event type, its polarity and strength, and what it licenses."""
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.evaluation.proof import DEFAULT_TAXONOMY
+
+        return {
+            "events": [
+                {
+                    "event_type": kind.event_type,
+                    "polarity": str(kind.polarity),
+                    "strength": str(kind.strength),
+                    "note": kind.note,
+                }
+                for kind in DEFAULT_TAXONOMY.values()
+            ],
+            "defaults": {
+                "unknown_is_negative": bool(self.config.evaluation.proof.unknown_is_negative),
+                "non_selection_is_negative": bool(
+                    self.config.evaluation.proof.non_selection_is_negative
+                ),
+            },
+            "note": (
+                "Exposure is not success and non-selection is not a negative. "
+                "Both stay unknown unless this deployment has deliberately "
+                "re-polarized them."
+            ),
+        }
+
     def describe_retrieval(self, knowledge_base: str) -> dict:
         """What this region's retrieval is configured to do, and what is tunable.
 

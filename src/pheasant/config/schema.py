@@ -1367,6 +1367,234 @@ class ObservabilitySettings(ModelMixin):
 
 
 @dataclass
+class EvaluationProofSettings(ModelMixin):
+    """How observed events become weighted evidence.
+
+    Every default here is a refusal to over-claim, and each one has a failure
+    mode attached:
+
+    ``unknown_is_negative`` off -- an artifact served and neither selected nor
+    rejected stays *unjudged*. Turned on, every metric below silently changes
+    meaning: precision improves whenever the region returns fewer results,
+    because the unshown items stop counting as failures.
+
+    ``non_selection_is_negative`` off -- the reader may have found the answer
+    at rank one and stopped. This is the single most tempting inference in the
+    whole system and the one with no evidence behind it.
+
+    ``temporal_decay_enabled`` off -- an operator who has not chosen a
+    half-life should not discover that a year-old conclusive test result
+    quietly stopped counting.
+
+    The event weights are the specification's defaults. Renaming an event type
+    orphans every proof row referencing it, so the *names* are stable API even
+    though the numbers are configuration.
+    """
+
+    event_weights: dict[str, float] = field(
+        default_factory=lambda: {
+            "considered": 0.0,
+            "served": 0.0,
+            "included_in_context": 0.0,
+            "cited": 0.25,
+            "selected": 0.5,
+            "explicit_accept": 1.0,
+            "downstream_success": 1.0,
+            "deterministic_validation_pass": 1.0,
+            "explicit_reject": -1.0,
+            "downstream_failure": -1.0,
+            "deterministic_validation_fail": -1.0,
+            "explicit_correction": -1.0,
+            "superseded": -1.0,
+            "immediate_reformulation": 0.0,
+            "not_selected": 0.0,
+        }
+    )
+    strength_multipliers: dict[str, float] = field(
+        default_factory=lambda: {
+            "weak": 0.25,
+            "moderate": 0.5,
+            "strong": 1.0,
+            "conclusive": 1.0,
+        }
+    )
+    unknown_is_negative: bool = False
+    non_selection_is_negative: bool = False
+    temporal_decay_enabled: bool = False
+    temporal_half_life_days: float = 180.0
+    #: Net weight below which a target is neither a known positive nor a known
+    #: negative. Not zero: one weak citation is not a "known positive", and a
+    #: metric named `known_positive_recall` that counted one would over-claim
+    #: in its own name.
+    positive_floor: float = 0.2
+    minimum_eligible_queries: int = 10
+    minimum_evidenced_queries: int = 5
+    minimum_independent_interactions: int = 5
+    maximum_single_query_proof_share: float = 0.5
+
+
+@dataclass
+class EvaluationCohortSettings(ModelMixin):
+    """Which query cohorts a run materializes, and how large each may be.
+
+    ``anchor_minimum_queries`` is a floor on *freezing*, not on running: an
+    anchor of four questions is not a baseline, and freezing one means being
+    stuck with it at every future snapshot.
+
+    ``holdout_minimum_separation_days`` defaults to 0 because "how long must a
+    temporal holdout remain independent" is an open policy decision the
+    specification flags explicitly. A hidden non-zero default would be this
+    package answering it on an operator's behalf.
+    """
+
+    anchor: bool = True
+    anchor_minimum_queries: int = 20
+    rolling: bool = True
+    rolling_lookback_days: int = 30
+    learned: bool = True
+    temporal_holdout: bool = True
+    holdout_minimum_separation_days: float = 0.0
+    holdout_minimum_queries: int = 5
+    control: bool = True
+    control_minimum_queries: int = 10
+    synthetic_invariants: bool = True
+    maximum_queries_per_cohort: int = 200
+
+
+@dataclass
+class EvaluationVariantSettings(ModelMixin):
+    """Which ablations run. ``B0`` (corpus baseline) is not optional.
+
+    Every attribution number in the report is a paired difference against the
+    corpus baseline. Without it the treatment numbers have nothing to subtract,
+    and an absolute retrieval score published on its own gets read as accuracy.
+    """
+
+    memory_content: bool = True
+    alias_only: bool = True
+    preference_only: bool = True
+    exclusion_only: bool = True
+    full_memory: bool = True
+    candidate_shadow: bool = True
+    leave_one_memory_out: bool = False
+    leave_one_cluster_out: bool = False
+
+
+@dataclass
+class EvaluationGateSettings(ModelMixin):
+    """Hard invariants, checked before any score is aggregated.
+
+    Zero tolerance on the first four is the point of having them: an ACL leak
+    is not offset by good recall, and any arithmetic that lets it be is the
+    arithmetic these exist to sit outside of.
+    """
+
+    acl_leak_maximum: int = 0
+    stale_current_leak_maximum: int = 0
+    temporal_invariant_failures_maximum: int = 0
+    known_positive_exclusion_maximum: int = 0
+    abstention_failures_maximum: int = 0
+    control_regression_tolerance: float = 0.0
+    negative_exposure_increase_tolerance: float = 0.0
+    incomplete_snapshot_blocks_run: bool = True
+
+
+@dataclass
+class EvaluationPromotionSettings(ModelMixin):
+    """When a validated candidate may reach production retrieval.
+
+    Off by default, the same posture ``memory.formation.auto_admit`` takes and
+    for the same reason: promotion changes what a *default* query returns.
+
+    ``allow_originating_query_only_promotion`` off is the anti-self-reward
+    rule. A candidate that improves only the query that created it has
+    demonstrated recall of its own evidence and nothing else, and promoting on
+    that basis is the feedback loop this whole plane is built to keep closed.
+    """
+
+    enabled: bool = False
+    require_shadow_replay: bool = True
+    require_all_hard_gates: bool = True
+    minimum_independent_queries: int = 3
+    minimum_temporal_holdout_queries: int = 1
+    minimum_target_metric_gain: float = 0.0
+    maximum_control_regression: float = 0.0
+    maximum_negative_exposure_increase: float = 0.0
+    allow_originating_query_only_promotion: bool = False
+    #: What happens to a candidate the evidence cannot yet decide:
+    #: ``retain_candidate`` (default) or ``reject``. Retention is right --
+    #: a rejection is permanent by design, and rejecting for *absence* of
+    #: evidence would make a review queue that forgets things nobody has
+    #: had a chance to demonstrate yet.
+    insufficient_evidence_action: str = "retain_candidate"
+
+
+@dataclass
+class EvaluationSettings(ModelMixin):
+    """The evaluation plane: measuring whether this region is getting better.
+
+    Off by default and read-only when on. A run replays cohorts through the
+    real search path, computes evidence-bearing metrics, and writes rows to the
+    ``evaluation_*`` tables -- which are never indexed, never chunked and never
+    returned by a search, because a region must not retrieve its own
+    measurements as knowledge.
+
+    **Fleet-safe by construction.** A run takes the evaluation lease
+    (``pheasant.evaluation.runner.EVALUATION_LEASE``), so several API replicas
+    pointed at one ``/state`` produce one run rather than N. It never takes
+    ``sync_lock``: the scheduler holds that across all its work, and a
+    thousand-query replay inside it would stall incremental sync for every
+    source in the region -- exactly the mistake the observation plane's
+    hot-to-cold roll was moved outside the lock to avoid.
+
+    See ``docs/knowledge-effectiveness.md``.
+    """
+
+    enabled: bool = False
+    #: Fire a run on the scheduler beat when the snapshot manifest shows a
+    #: material change. Off by default: a run costs one search per query per
+    #: variant, which is real work to start doing on a timer without asking.
+    on_material_snapshot: bool = False
+    #: …and never more often than this, whatever the trigger says. A corpus
+    #: under active indexing changes materially every beat.
+    minimum_interval_seconds: int = 3600
+    on_release_boundary: bool = True
+    #: Historical reconstruction ("what could the region have known at t")
+    #: alongside current-state replay ("how does it handle that question now").
+    #: Both are supported; a report always says which it ran.
+    historical_reconstruction: bool = True
+    #: Results requested per query per variant. The k values the metrics use
+    #: are capped by this, so raising the metric k without raising this
+    #: measures a truncated list.
+    max_results: int = 10
+    #: Retrieval mode the replay uses. ``hybrid`` is what production serves.
+    mode: str = "hybrid"
+    #: Ceiling on one run: queries × variants searches. A run that outgrows
+    #: this is truncated and says so, rather than becoming the region's
+    #: dominant workload.
+    maximum_queries_per_run: int = 500
+    maximum_runtime_seconds: int = 900
+    #: Per-query metric rows kept in the report. The audit trail an aggregate
+    #: resolves to, bounded so a large rolling cohort cannot produce a
+    #: document nothing can open.
+    maximum_stored_per_query_results: int = 200
+    #: Optional packs, each independently enabled. Every one of them is
+    #: labelled diagnostic or optional in the report; none may enter a
+    #: factual-accuracy claim.
+    retrieval_diagnostics: bool = False
+    binary_preference: bool = False
+    #: Weighted geometric mean over normalized components. Empty (the default)
+    #: means no composite is published at all, which is the specification's
+    #: "no default universal accuracy score".
+    composite_weights: dict[str, float] = field(default_factory=dict)
+    proof: EvaluationProofSettings = field(default_factory=EvaluationProofSettings)
+    cohorts: EvaluationCohortSettings = field(default_factory=EvaluationCohortSettings)
+    variants: EvaluationVariantSettings = field(default_factory=EvaluationVariantSettings)
+    gates: EvaluationGateSettings = field(default_factory=EvaluationGateSettings)
+    promotion: EvaluationPromotionSettings = field(default_factory=EvaluationPromotionSettings)
+
+
+@dataclass
 class PheasantConfig(ModelMixin):
     pheasant: PheasantSettings = field(default_factory=PheasantSettings)
     server: ServerSettings = field(default_factory=ServerSettings)
@@ -1380,6 +1608,7 @@ class PheasantConfig(ModelMixin):
     memory: MemorySettings = field(default_factory=MemorySettings)
     observability: ObservabilitySettings = field(default_factory=ObservabilitySettings)
     assistant: AssistantSettings = field(default_factory=AssistantSettings)
+    evaluation: EvaluationSettings = field(default_factory=EvaluationSettings)
     sources: list[SourceConfig] = field(default_factory=list)
 
     @classmethod
@@ -1428,6 +1657,16 @@ class PheasantConfig(ModelMixin):
             if dc is ObservabilitySettings:
                 if "interactions" in raw and isinstance(raw["interactions"], dict):
                     raw["interactions"] = build(InteractionSettings, raw["interactions"])
+            if dc is EvaluationSettings:
+                for key, nested in (
+                    ("proof", EvaluationProofSettings),
+                    ("cohorts", EvaluationCohortSettings),
+                    ("variants", EvaluationVariantSettings),
+                    ("gates", EvaluationGateSettings),
+                    ("promotion", EvaluationPromotionSettings),
+                ):
+                    if key in raw and isinstance(raw[key], dict):
+                        raw[key] = build(nested, raw[key])
             if dc is InteractionSettings:
                 if raw.get("spool_path") is not None:
                     raw["spool_path"] = Path(raw["spool_path"])
@@ -1468,6 +1707,7 @@ class PheasantConfig(ModelMixin):
             memory=build(MemorySettings, data.get("memory")),
             observability=build(ObservabilitySettings, data.get("observability")),
             assistant=build(AssistantSettings, data.get("assistant")),
+            evaluation=build(EvaluationSettings, data.get("evaluation")),
             sources=[],
         )
         cfg.sources = []

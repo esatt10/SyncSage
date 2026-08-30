@@ -78,7 +78,26 @@ class HybridSearch:
         security: Any = None,
         section: str | None = None,
         memory: Any = None,
+        steering_kinds: tuple[str, ...] | None = None,
+        extra_steering_records: list[dict[str, Any]] | None = None,
     ) -> dict:
+        """Run one query across the arms and fuse them.
+
+        ``steering_kinds`` narrows which memory rule kinds may fire. ``None``
+        -- every production caller -- means "whatever ``steering_enabled``
+        says", so this behaves exactly as it did before the argument existed.
+        The evaluation plane passes an explicit subset to build a paired
+        ablation: measuring what *alias* rules contribute needs a run in which
+        preference and exclusion rules do not fire, and one in which they do,
+        differing in nothing else.
+
+        ``extra_steering_records`` adds rule records that are **not in the
+        store** -- proposed rules under shadow validation. They go through the
+        same `parse_rule`/`admits` path as stored ones, so a shadow run
+        measures the rule retrieval would really apply rather than a
+        re-implementation of it, and nothing is written anywhere: a candidate
+        cannot reach production ranking by being evaluated.
+        """
         mode = mode if mode in VALID_MODES else "hybrid"
         # Clamped, not just floored: `max_results` arrives straight off an
         # unauthenticated HTTP body, and an over-fetching ACL pass multiplies
@@ -103,15 +122,19 @@ class HybridSearch:
         # through the same `admits` predicate as retrieval so a corrected or
         # out-of-scope record steers nothing. Empty unless steering is on.
         steering = None
-        if memory_index and self.steering_enabled:
+        steering_on = self.steering_enabled if steering_kinds is None else bool(steering_kinds)
+        if steering_on and (memory_index or extra_steering_records):
             from pheasant.memory.steering import load_steering, load_steering_records
 
+            records = load_steering_records(self.store.state)
+            records.extend(extra_steering_records or [])
             steering = (
                 load_steering(
-                    load_steering_records(self.store.state),
+                    records,
                     policy,
-                    now=memory_now,
+                    now=memory_now or utc_now_iso(),
                     enabled=True,
+                    kinds=steering_kinds,
                 )
                 or None
             )

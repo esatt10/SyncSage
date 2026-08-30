@@ -309,6 +309,42 @@ class ConfigSectionRequest(BaseModel):
     persist: bool = True
 
 
+class EvidenceRequest(BaseModel):
+    """One typed observation about one retrieved thing.
+
+    ``event_type`` is required and drawn from the taxonomy rather than being a
+    boolean "useful": *cited*, *selected*, *accepted* and *validated* are four
+    claims of very different strength, and an API that let a caller skip the
+    distinction would collapse them at the one point where the information
+    still exists.
+    """
+
+    query: str
+    target_id: str
+    event_type: str
+    target_type: str = "artifact"
+    interaction_id: str | None = None
+    principal: str | None = None
+    session_id: str | None = None
+    position: int | None = None
+    outcome_reference: str | None = None
+    reason_code: str = ""
+
+
+class EvaluationRunRequest(BaseModel):
+    """Start one evaluation batch.
+
+    ``mode`` picks between "how does the region answer that historical
+    question now" and "what could it have known at ``as_of``". A report always
+    names which ran; a longitudinal chart that mixed them would be comparing
+    two different questions.
+    """
+
+    mode: str = "current_state"
+    as_of: str | None = None
+    force: bool = False
+
+
 class KnowledgeBaseRequest(BaseModel):
     name: str | None = None
     description: str | None = None
@@ -605,6 +641,11 @@ LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
     # with them. Same reason `sync` is False: these are services, not
     # values read per request.
     "observability": False,
+    # Read per run, not wired into a service: the runner reads
+    # `config.evaluation` when a batch starts, so a change applies to the next
+    # run without a restart. The exception is nothing — even the lease is
+    # claimed per run rather than held.
+    "evaluation": True,
     "storage": False,
     "server": False,
     "pheasant": False,
@@ -2698,6 +2739,186 @@ def create_app(
             return reject(engine, candidate_id, rejected_by=principal or "ui")
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+
+    @app.post("/evaluation/evidence")
+    def evaluation_evidence(req: EvidenceRequest) -> dict:
+        """Record one typed piece of interaction evidence.
+
+        The only way proof enters the system. Everything else the evaluation
+        plane knows is *derived* -- exposure from the interaction ledger, an
+        explicit accept from an admitted memory candidate -- and derivation
+        can only ever say what the region did, never whether it helped.
+        """
+
+        import pheasant.evaluation as evaluation
+
+        try:
+            return evaluation.record_evidence(
+                state,
+                config,
+                query=req.query,
+                target_id=req.target_id,
+                target_type=req.target_type,
+                event_type=req.event_type,
+                interaction_id=req.interaction_id,
+                principal=req.principal,
+                session_id=req.session_id,
+                position=req.position,
+                outcome_reference=req.outcome_reference,
+                reason_code=req.reason_code,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/evaluation/taxonomy")
+    def evaluation_taxonomy() -> dict:
+        """Every event type, its polarity and strength, and what it licenses.
+
+        Served so a caller instrumenting a surface can pick the honest event
+        rather than guessing, and so the two defaults that matter most --
+        exposure is not success, non-selection is not a negative -- are stated
+        where an integrator will actually read them.
+        """
+
+        from pheasant.evaluation.proof import DEFAULT_TAXONOMY
+
+        return {
+            "events": [
+                {
+                    "event_type": kind.event_type,
+                    "polarity": str(kind.polarity),
+                    "strength": str(kind.strength),
+                    "note": kind.note,
+                }
+                for kind in DEFAULT_TAXONOMY.values()
+            ],
+            "defaults": {
+                "unknown_is_negative": bool(config.evaluation.proof.unknown_is_negative),
+                "non_selection_is_negative": bool(
+                    config.evaluation.proof.non_selection_is_negative
+                ),
+            },
+        }
+
+    @app.post("/evaluation/run")
+    def evaluation_run(req: EvaluationRunRequest) -> dict:
+        """Start a batch as a background job and return its id.
+
+        A run replays every cohort through the real search path once per
+        variant, which is minutes of work on a real corpus -- far past what a
+        request should hold open. It goes through the same job registry a first
+        index uses, so the UI, the CLI and an agent all watch it the same way.
+
+        The run takes the evaluation lease, so several API replicas pointed at
+        one `/state` produce one run rather than N. It never takes `sync_lock`:
+        a replay inside the scheduler's lock would stall incremental sync for
+        every source in the region.
+        """
+
+        import pheasant.evaluation as evaluation
+
+        if not config.evaluation.enabled and not req.force:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "evaluation.enabled is false. Enable it in pheasant.yaml, or pass "
+                    "force=true for a one-off run."
+                ),
+            )
+        job = app.state.jobs.create(
+            "evaluation", f"evaluation ({req.mode})", targets=["evaluation"]
+        )
+
+        def _run() -> None:
+            try:
+                outcome = evaluation.run(
+                    engine,
+                    mode=req.mode,
+                    effective_as_of=req.as_of,
+                    force=bool(req.force),
+                    on_progress=lambda phase, detail: app.state.jobs.progress(
+                        job.id, phase=phase, detail=detail or phase, source="evaluation"
+                    ),
+                )
+                app.state.jobs.finish(
+                    job.id,
+                    status="succeeded" if outcome.status != "invalid" else "failed",
+                    result={
+                        "run_id": outcome.run_id,
+                        "snapshot_id": outcome.snapshot_id,
+                        "status": outcome.status,
+                        "gates_passed": outcome.gates_passed,
+                        "skipped_reason": outcome.skipped_reason,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - a job records its own failure
+                app.state.jobs.finish(job.id, status="failed", error=str(exc))
+
+        threading.Thread(target=_run, name="pheasant-evaluation", daemon=True).start()
+        return {"job_id": job.id, "status": "running", "mode": req.mode}
+
+    @app.get("/evaluation/report")
+    def evaluation_report(run: str | None = None) -> dict:
+        """The most recent report, or a named one."""
+
+        import pheasant.evaluation as evaluation
+        from pheasant.evaluation import store as evaluation_store
+
+        report = (
+            evaluation_store.load_report(state, run)
+            if run
+            else evaluation.latest_report(state, config.knowledge_base_id)
+        )
+        if report is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No evaluation report for {run}"
+                    if run
+                    else "No evaluation run has completed yet"
+                ),
+            )
+        return report
+
+    @app.get("/evaluation/runs")
+    def evaluation_runs(limit: int = 20) -> dict:
+        from pheasant.evaluation import store as evaluation_store
+
+        return {
+            "runs": evaluation_store.list_runs(
+                state, config.knowledge_base_id, limit=max(1, min(int(limit), 200))
+            )
+        }
+
+    @app.get("/evaluation/trend")
+    def evaluation_trend(
+        metric: str = "known_positive_reciprocal_rank",
+        cohort: str = "anchor",
+        variant: str = "B5",
+        limit: int = 50,
+    ) -> dict:
+        """One metric's history across snapshots, oldest first.
+
+        Defaults to the anchor cohort because it is the only one whose
+        membership is frozen: a rolling trend moves for two reasons at once and
+        cannot separate "the region changed" from "the questions changed".
+        """
+
+        import pheasant.evaluation as evaluation
+
+        return {
+            "metric_id": metric,
+            "cohort": cohort,
+            "variant": variant,
+            "points": evaluation.trend(
+                state,
+                config.knowledge_base_id,
+                metric,
+                cohort_name=cohort,
+                variant_id=variant,
+                limit=max(1, min(int(limit), 500)),
+            ),
+        }
 
     @app.post("/memory/consolidate")
     def memory_consolidate() -> dict:

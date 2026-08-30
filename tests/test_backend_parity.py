@@ -788,3 +788,133 @@ def test_compaction_and_scope_budgets_run_against_postgres(tmp_path: Path) -> No
         assert not again.get("compaction", {}).get("subsumed")
     finally:
         tools.engine.close()
+
+
+@postgres
+def test_the_evaluation_plane_runs_a_whole_batch_against_postgres(tmp_path: Path) -> None:
+    """Every statement the evaluation plane writes, against the real server.
+
+    This backend has caught three portability bugs the offline suite had no
+    opinion about — a declared FK a maintenance path deliberately violates, a
+    discarded ``rowcount``, and one SQLite-only ``INSERT OR IGNORE``. The
+    evaluation plane adds five tables and a dozen statements to the same
+    surface, so it gets the same treatment: a complete batch, then a *second*
+    one over unchanged state to prove the ``ON CONFLICT DO NOTHING`` idempotency
+    is real rather than an accident of two runs landing in the same second.
+    """
+
+    import pheasant.evaluation as evaluation
+    from pheasant.evaluation import store as evaluation_store
+    from pheasant.sync.log_queue import write_events
+    from pheasant.telemetry.interactions import InteractionEvent
+
+    _reset(DSN)
+    workspace = _corpus(tmp_path)
+    config = _config(tmp_path, workspace, "postgres")
+    config.evaluation.enabled = True
+    config.evaluation.proof.minimum_eligible_queries = 1
+    config.evaluation.proof.minimum_evidenced_queries = 1
+    config.evaluation.proof.minimum_independent_interactions = 1
+    config.evaluation.proof.maximum_single_query_proof_share = 1.0
+    config.evaluation.cohorts.anchor_minimum_queries = 2
+
+    engine = SyncEngine(config)
+    try:
+        engine.sync_source("docs", "full")
+        state = engine.state
+        artifacts = {
+            str(row["relative_path"]): str(row["id"])
+            for row in state.rows("SELECT id, relative_path FROM artifacts")
+        }
+
+        queries = [
+            "how do I deploy the gateway",
+            "when does the gateway restart",
+            "who generates invoices",
+            "where is the rollout script",
+        ]
+        write_events(
+            state,
+            [
+                InteractionEvent(
+                    kb_id=config.knowledge_base_id,
+                    operation="/search",
+                    modality="ui",
+                    principal="user:ada",
+                    session_id=f"s{index % 2}",
+                    trace_id=f"{index:032x}",
+                    span_id=f"{index:016x}",
+                    started_at=f"2026-01-01T00:00:{index:02d}.000000Z",
+                    status="ok",
+                    duration_ms=7.0,
+                    query_text=query,
+                    result_paths=["runbook.md"],
+                    result_ids=[artifacts["runbook.md"]],
+                    result_count=1,
+                    top_score=0.7,
+                )
+                for index, query in enumerate(queries)
+            ],
+        )
+        for index, (query, path, event) in enumerate(
+            [
+                (queries[0], "deploy-gateway.md", "explicit_accept"),
+                (queries[0], "notes.md", "explicit_reject"),
+                (queries[1], "runbook.md", "selected"),
+                (queries[2], "billing.md", "downstream_success"),
+            ]
+        ):
+            evaluation.record_evidence(
+                state,
+                config,
+                query=query,
+                target_id=artifacts[path],
+                event_type=event,
+                principal="user:ada",
+                session_id=f"s{index % 2}",
+                interaction_id=f"call-{index}",
+            )
+
+        first = evaluation.run(engine)
+        assert first.status == "completed"
+        assert first.gates_passed, [g.as_dict() for g in first.gates if not g.passed]
+        assert first.report["health_vector"]["evidence_coverage"]["value"]
+
+        # Idempotency across a repeat run: one snapshot row, one run row, no
+        # duplicated proof, and the metric rows re-derive their own
+        # content-addressed ids rather than piling up a second identical set.
+        metric_rows = state.rows("SELECT COUNT(*) AS c FROM evaluation_metrics")[0]["c"]
+        second = evaluation.run(engine)
+        assert second.snapshot_id == first.snapshot_id
+        assert second.run_id == first.run_id
+        assert state.rows("SELECT COUNT(*) AS c FROM evaluation_snapshots")[0]["c"] == 1
+        assert state.rows("SELECT COUNT(*) AS c FROM evaluation_proofs")[0]["c"] == 4
+        assert state.rows("SELECT COUNT(*) AS c FROM evaluation_metrics")[0]["c"] == metric_rows
+
+        # A retry that names its interaction is a no-op, not a second judgment.
+        evaluation.record_evidence(
+            state,
+            config,
+            query=queries[0],
+            target_id=artifacts["deploy-gateway.md"],
+            event_type="explicit_accept",
+            principal="user:ada",
+            session_id="s0",
+            interaction_id="call-0",
+        )
+        assert state.rows("SELECT COUNT(*) AS c FROM evaluation_proofs")[0]["c"] == 4
+
+        # Every read surface, against the real dialect: the trend join, the
+        # report fetch, the run listing and the cohort listing.
+        assert evaluation.latest_report(state, config.knowledge_base_id) is not None
+        assert len(evaluation_store.list_runs(state, config.knowledge_base_id)) == 1
+        assert len(evaluation_store.list_cohorts(state, config.knowledge_base_id)) >= 4
+        assert evaluation.trend(
+            state,
+            config.knowledge_base_id,
+            "known_positive_reciprocal_rank",
+            cohort_name="anchor",
+            variant_id="B5",
+        )
+    finally:
+        engine.close()

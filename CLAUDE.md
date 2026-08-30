@@ -69,6 +69,9 @@ pheasant-kb/
 │   ├── capacity.py            ← the one home for sizing coefficients
 │   ├── analytics.py           ← Parquet exports + the DuckDB query surface
 │   ├── evalset.py             ← de-identified eval cases from the ledger
+│   ├── evaluation/            ← the evaluation plane: contracts, snapshots,
+│   │                            proof, cohorts, variants, replay, metrics,
+│   │                            gates, report, candidates, runner, store
 │   ├── sharding.py            ← `pheasant shard plan`
 │   ├── jobs.py                ← per-source progress: phase, rate, ETA, stalled
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
@@ -134,6 +137,11 @@ pheasant export parquet [--table NAME]      # /exports/parquet/<kb_id>/*.parquet
 pheasant export query "SELECT …"            # SQL over an export directory
 pheasant export tables [--schema]           # what is exportable; --schema for columns
 pheasant eval bootstrap                     # de-identified eval cases from real traffic
+pheasant eval taxonomy                     # the evidence taxonomy: what each event licenses
+pheasant eval proof --query … --target … --event explicit_accept
+pheasant eval run [--mode current_state|historical --as-of T]
+pheasant eval report [--run ID] [--json]
+pheasant eval trend --metric known_positive_reciprocal_rank
 pheasant mcp --transport stdio
 pheasant client-config claude-code|cursor|vscode
 pheasant config show                       # resolved config after profile+YAML+--set
@@ -304,6 +312,57 @@ record, indexed by the ordinary pipeline. Recall *is* search. On top of that:
   through `MemoryStore.append`; a rejection is permanent, because
   re-suggesting what someone declined makes a review queue worth ignoring.
 
+### Evaluation
+
+`evaluation.*`, off by default and read-only when on. A **third plane**:
+observations are evidence, records are memory, and *measurements are neither* —
+nothing the `evaluation_*` tables hold is a file, is chunked, is indexed, or is
+returned by a search. A region must not answer a question with its own report.
+
+- **Typed proof, or none.** Served/considered/included are **unknown**, weight
+  zero; only a caller can say `cited`/`selected`/`explicit_accept`/
+  `explicit_reject`/`downstream_*`/`deterministic_validation_*`. `not_selected`
+  is unknown too — the reader may have found the answer at rank one, and
+  treating silence as a negative manufactures negatives at exactly the rate the
+  region serves results. Weight is a product of four **reported** multipliers.
+  Positive and negative sums never cancel: `P`, `N`, `Net` and a conflict rate
+  are all published.
+- **Snapshot manifests** digest every input that can change retrieval (content,
+  sources, graph, lexical/vector index, encoding, chunking, fusion, arm limits,
+  memory, steering, ACL, evaluation policy). Computed identically on any
+  replica, so two pods agree on a snapshot id without coordinating. **No clock
+  in either id**: a snapshot addresses state and a run addresses
+  `(state, config, mode, described instant)`, so two runs over an unchanged
+  region are one run and one trend point. The clock-seeded version made runs a
+  second apart two rows and runs *within* a second collapse into one.
+- **Six cohorts.** anchor (frozen, the trend line), rolling, **learned**
+  (queries that created the memory — *recall of learned experience*, never
+  reported as generalization), **temporal holdout** (later, independent
+  queries), control (no steering rule can fire), synthetic invariants.
+  `generalization_gap = learned − holdout` is the memorization detector.
+- **Paired ablations** `B0`–`B6`. `B0` (corpus-only) is not removable: every
+  attribution number is a difference against it. `B2`–`B4` hold memory
+  *content* off so a retrieved record cannot be counted as a rule's doing.
+- **Every metric carries its denominator, formula, substituted calculation,
+  operands, proof ids, exclusions and one limitation** — `MetricResult.validate()`
+  withholds one that cannot. A missing input yields `insufficient_evidence`
+  with `value: None`, never `0.0`.
+- **Gates are not metrics.** ACL leak, stale-current leak, `as_of` correctness,
+  abstention, known-positive exclusion, control regression and negative-exposure
+  increase are evaluated *before* aggregation so a good score cannot offset them.
+- **Candidates are shadowed.** A proposed steering rule is passed into the
+  search call for the length of one query via `extra_steering_records` — the
+  real `parse_rule`/`admits` path, nothing written. A proposed *fact* is
+  `not_shadow_replayable` (its text is in no index; scoring it would measure
+  string similarity). Promotion needs every gate, independent queries, and a
+  holdout result: `allow_originating_query_only_promotion` is off, which is
+  what keeps the self-rewarding loop closed.
+- **Fleet-safe.** A run claims the `__evaluation__` lease in `source_leases`
+  (N replicas → one run), **never** takes `sync_lock`, and the replay searcher
+  is built with `usage_tracking=False` so evaluation cannot inflate the salience
+  of the records it measures. Auto-trigger fires only where the scheduler runs.
+  `docs/knowledge-effectiveness.md`.
+
 ### Scale
 
 One container until it shouldn't be. Then four independent axes:
@@ -424,6 +483,16 @@ Each of these cost real time. They are listed because the shape recurs.
   ledger row found nothing, which is most of the reason to export spans at
   all. The span starts first now and the row adopts *its* ids. Caught by
   running against a real SDK, not by the offline suite, which had no opinion.
+- **A measurement derived from what a system chose to show measures its own
+  confidence.** Mining "appeared at rank 1" out of the interaction ledger as a
+  positive would produce a retrieval metric that improves whenever ranking gets
+  more *confident*, regardless of whether it gets more correct — and every
+  experiment run against it confirms itself. The ledger yields `served` only:
+  polarity unknown, weight zero. Utility proof has to come from a surface where
+  somebody said so. The same shape one level up: a replay that counted as a
+  memory *use* would let the evaluation raise the salience of the records it is
+  measuring, which is why the replay searcher is built with
+  `usage_tracking=False`.
 - **`wasmtime.Trap` and `wasmtime.WasmtimeError` are siblings**, not parent and
   child. Catch `guest_failures()`.
 - **A mutation harness must `touch` the restored file and purge
@@ -523,5 +592,7 @@ Each of these cost real time. They are listed because the shape recurs.
 - **Memory:** `docs/memory-system.md`, `docs/how-to/agent-memory.md`
 - **Observation & formation:** `docs/memory-formation.md` — the two planes,
   the log tier, and the two combination designs that were rejected
+- **Evaluation:** `docs/knowledge-effectiveness.md` — the evidence taxonomy,
+  the cohort split, the ablation matrix, the gates, and what it refuses to claim
 - **Synapse region spec:** `docs/SYNAPSE_INTEGRATION.md`
 - **Deployment:** `docs/deployment.md`, `deploy/kubernetes/`

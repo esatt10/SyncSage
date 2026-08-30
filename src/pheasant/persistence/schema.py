@@ -460,6 +460,123 @@ CREATE INDEX IF NOT EXISTS idx_interaction_events_time
   ON interaction_events(started_at);
 CREATE INDEX IF NOT EXISTS idx_interaction_events_session
   ON interaction_events(session_id, started_at);
+
+-- ---------------------------------------------------------------------------
+-- The evaluation plane. Records *about* the knowledge base, never part of it:
+-- nothing here is a file, is chunked, is indexed, or is returned by a search.
+-- Same boundary `interaction_events` draws, and drawn again here because the
+-- temptation is stronger: an evaluation report reads like knowledge.
+--
+-- Ids are content digests, not sequences. Two API replicas computing a
+-- manifest for one knowledge-base state must agree on its id without
+-- coordinating, which is also what makes an INSERT idempotent under
+-- at-least-once retry -- the argument `index_tasks` makes from content
+-- sha256, reached the same way.
+CREATE TABLE IF NOT EXISTS evaluation_snapshots (
+  snapshot_id TEXT PRIMARY KEY,
+  kb_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  effective_as_of TEXT NOT NULL,
+  complete INTEGER NOT NULL DEFAULT 1,
+  manifest_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_evaluation_snapshots_time
+  ON evaluation_snapshots(kb_id, created_at);
+-- Typed interaction evidence. `polarity` is one of positive/negative/unknown
+-- and unknown is stored rather than dropped: an artifact that was served and
+-- neither selected nor rejected is *unjudged*, and a table that only held
+-- judgments could not tell that apart from one nobody ever saw.
+--
+-- `event_type` is preserved verbatim even when several types map to one
+-- polarity and weight, because re-weighting the taxonomy has to be
+-- recomputable over evidence already collected.
+CREATE TABLE IF NOT EXISTS evaluation_proofs (
+  proof_id TEXT PRIMARY KEY,
+  kb_id TEXT NOT NULL,
+  query_id TEXT NOT NULL,
+  target_type TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  polarity TEXT NOT NULL,
+  strength TEXT NOT NULL,
+  weight REAL NOT NULL DEFAULT 0.0,
+  observed_at TEXT NOT NULL,
+  interaction_id TEXT,
+  snapshot_id TEXT,
+  principal_partition TEXT,
+  position INTEGER,
+  exposed INTEGER NOT NULL DEFAULT 1,
+  outcome_reference TEXT,
+  supersedes_proof_id TEXT,
+  reason_code TEXT,
+  multipliers_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_evaluation_proofs_query
+  ON evaluation_proofs(kb_id, query_id, polarity);
+CREATE INDEX IF NOT EXISTS idx_evaluation_proofs_target
+  ON evaluation_proofs(kb_id, target_id);
+CREATE INDEX IF NOT EXISTS idx_evaluation_proofs_time
+  ON evaluation_proofs(kb_id, observed_at);
+-- A frozen anchor cohort is the whole reason longitudinal comparison works:
+-- the same questions, asked of every later snapshot. `frozen` is enforced in
+-- `pheasant.evaluation.cohorts`, not by a constraint, because re-materializing
+-- a rolling cohort is the normal case and only the anchor is immutable.
+CREATE TABLE IF NOT EXISTS evaluation_cohorts (
+  cohort_id TEXT PRIMARY KEY,
+  kb_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  frozen INTEGER NOT NULL DEFAULT 0,
+  window_start TEXT,
+  window_end TEXT,
+  eligibility_digest TEXT,
+  query_count INTEGER NOT NULL DEFAULT 0,
+  queries_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_evaluation_cohorts_purpose
+  ON evaluation_cohorts(kb_id, purpose, created_at);
+-- One row per batch. `report_json` is the whole evidence-bearing report; the
+-- per-metric rows below exist so an aggregate can be resolved to the per-query
+-- calculations that produced it without parsing a large document.
+CREATE TABLE IF NOT EXISTS evaluation_runs (
+  run_id TEXT PRIMARY KEY,
+  kb_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  status TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'current_state',
+  config_digest TEXT NOT NULL,
+  gates_passed INTEGER NOT NULL DEFAULT 1,
+  report_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_evaluation_runs_time
+  ON evaluation_runs(kb_id, started_at);
+-- Per-query rows and aggregates share this table; an aggregate has a NULL
+-- query_id. That is what makes "resolve this 0.89 to the five queries behind
+-- it" one query rather than a join across two shapes.
+CREATE TABLE IF NOT EXISTS evaluation_metrics (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  kb_id TEXT NOT NULL,
+  metric_id TEXT NOT NULL,
+  metric_version INTEGER NOT NULL DEFAULT 1,
+  classification TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  cohort_id TEXT,
+  variant_id TEXT,
+  query_id TEXT,
+  value REAL,
+  numerator REAL,
+  denominator REAL,
+  status TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_evaluation_metrics_run
+  ON evaluation_metrics(run_id, metric_id, variant_id);
+CREATE INDEX IF NOT EXISTS idx_evaluation_metrics_trend
+  ON evaluation_metrics(kb_id, metric_id, cohort_id, variant_id);
 """
 
 #: SQLite-only: WAL, plus the FTS5 virtual tables.

@@ -152,6 +152,11 @@ _TEMP_DIRNAME = ".pheasant-export-tmp"
 #:   ``sync_fingerprints`` / ``manifests`` — operational state. Transient,
 #:   opaque, and meaningless once detached from the region that wrote it.
 #: * ``knowledge_bases`` — one row, reported in the manifest instead.
+#: * ``interaction_events`` and the ``evaluation_*`` tables — the observation
+#:   and evaluation planes. Both hold raw query text keyed to a principal
+#:   partition, which is the identity category the three tables above are
+#:   excluded for. ``pheasant eval bootstrap`` is the sanctioned way out of
+#:   them, and it hashes principal and session with a per-export salt first.
 SQL_TABLES: dict[str, str] = {
     "sources": "One row per configured source: type, path, enabled, last sync status.",
     "artifacts": "One row per indexed file: path, sha256, size, mime type, git branch/commit.",

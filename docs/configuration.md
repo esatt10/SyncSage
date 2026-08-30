@@ -41,6 +41,7 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 | `synapse` | Federation into a Synapse fleet (contract publishing, signing). | Optional, standalone-safe |
 | `memory` | Agent-memory consolidation policy (TTL decay, supersede archiving). | Optional |
 | `assistant` | Grounded chat over the index (the UI's chat layer). Query-time only. | Optional |
+| `evaluation` | Knowledge-effectiveness measurement: cohorts, proof, ablations, gates. | Optional |
 | `sources` | All indexed repositories/folders/files/URLs (incl. per-source `taxonomy`). | Yes |
 
 > **Note:** this table's row order follows `PheasantConfig`'s field order in
@@ -859,6 +860,142 @@ counts what was lost and why.
 and these rows carry principals and query text. Put the access control on the
 directory, exactly as [the export schema](reference/export-schema.md) says of
 exports.
+
+---
+
+## `evaluation` (knowledge-effectiveness measurement, optional)
+
+Off by default, read-only when on, and it publishes no single "accuracy" score.
+A run replays cohorts of recorded queries through the **real** search path
+against a corpus-only baseline and the memory system, then reports what changed
+with its denominator, its evidence and its limitation attached.
+
+Full prose: [Knowledge-effectiveness evaluation](knowledge-effectiveness.md).
+
+```yaml
+evaluation:
+  enabled: false
+  on_material_snapshot: false
+  minimum_interval_seconds: 3600
+  max_results: 10
+  mode: hybrid
+  maximum_queries_per_run: 500
+  maximum_runtime_seconds: 900
+  retrieval_diagnostics: false
+  composite_weights: {}
+  proof:
+    unknown_is_negative: false
+    non_selection_is_negative: false
+    temporal_decay_enabled: false
+    positive_floor: 0.2
+    minimum_evidenced_queries: 5
+  cohorts:
+    anchor: true
+    anchor_minimum_queries: 20
+    rolling_lookback_days: 30
+    holdout_minimum_separation_days: 0.0
+  variants:
+    memory_content: true
+    alias_only: true
+    preference_only: true
+    exclusion_only: true
+    full_memory: true
+    candidate_shadow: true
+  gates:
+    acl_leak_maximum: 0
+    stale_current_leak_maximum: 0
+    control_regression_tolerance: 0.0
+    incomplete_snapshot_blocks_run: true
+  promotion:
+    enabled: false
+    minimum_independent_queries: 3
+    allow_originating_query_only_promotion: false
+```
+
+### `evaluation.enabled`
+
+Master switch. Off, nothing here runs and the region behaves exactly as it did
+before this existed. On, `pheasant eval run` and `POST /evaluation/run` produce
+reports; the `evaluation_*` tables in `/state` hold them and are **never
+indexed, chunked or returned by a search** — a region must not retrieve its own
+measurements as knowledge.
+
+Needs `observability.interactions.enabled` to have recorded queries worth
+replaying. Without it the cohorts are empty and every demonstrated metric
+reports `insufficient_evidence` rather than zero.
+
+### `evaluation.on_material_snapshot`
+
+Fire a run on the scheduler beat when the snapshot manifest shows a material
+change (content, graph, retrieval configuration, memory or ACL policy digests
+moving — not counts drifting). Off by default: a run costs one search per query
+per variant, which is real work to start doing on a timer without being asked.
+
+Fleet behaviour: the automatic trigger fires only where the scheduler runs
+(`--role all`, `--role indexer`), a run takes the evaluation lease so several
+replicas produce one run rather than N, and it **never runs inside
+`sync_lock`** — a replay there would stall incremental sync for every source.
+
+### `evaluation.proof.*`
+
+How observed events become weighted evidence. The three defaults that matter:
+
+* `unknown_is_negative: false` — an artifact served and neither selected nor
+  rejected stays *unjudged*. Turned on, every metric changes meaning:
+  precision improves whenever the region returns **fewer** results.
+* `non_selection_is_negative: false` — the reader may have found the answer at
+  rank one and stopped.
+* `temporal_decay_enabled: false` — an operator who has not chosen a half-life
+  should not discover that a year-old conclusive test result stopped counting.
+
+`positive_floor` is the net weight below which a target is neither a known
+positive nor a known negative. Deliberately not zero: one weak citation is not
+a "known positive", and `known_positive_recall` counting one would over-claim
+in its own name.
+
+`minimum_*` are sufficiency conditions. A metric computed over less is
+published with status `insufficient_evidence` and **`value: null`** — never
+`0.0`, which would put a red bar on a dashboard describing an instrumentation
+gap.
+
+### `evaluation.cohorts.*`
+
+Six cohorts, each with a different purpose:
+
+| Cohort | What it is | Why it is separate |
+|---|---|---|
+| `anchor` | Frozen once, replayed at every snapshot | Longitudinal comparability |
+| `rolling` | Recent traffic in a lookback window | Notices new questions; moves for two reasons at once |
+| `learned` | Queries whose interactions created the memory | **Recall of learned experience — never reported as generalization** |
+| `temporal_holdout` | Later queries that contributed no evidence | Forward generalization |
+| `control` | Queries no steering rule can fire on | Finds unintended re-ranking |
+| `invariants` | Deterministic ACL / validity / abstention cases | Gates, not scores |
+
+`holdout_minimum_separation_days` defaults to `0.0` because "how long must a
+holdout remain independent" is an open policy decision; a hidden non-zero
+default would be answering it on your behalf.
+
+### `evaluation.variants.*`
+
+The ablation matrix. `B0` (corpus baseline) is not removable: every attribution
+number is a paired difference against it, and a treatment score published
+without one gets read as accuracy.
+
+### `evaluation.gates.*`
+
+Hard invariants, evaluated **before** any aggregation so a failure cannot be
+averaged away. ACL leakage, stale-current leakage, temporal `as_of` correctness,
+abstention and known-positive exclusion default to zero tolerance.
+
+### `evaluation.promotion.*`
+
+Off by default. With it off the same candidate decisions are computed and
+recorded and **nothing is applied** — which is what to run first: read a month
+of decisions before letting any of them take effect.
+
+`allow_originating_query_only_promotion: false` is the anti-self-reward rule. A
+candidate that improves only the query that created it has demonstrated recall
+of its own evidence and nothing else.
 
 ---
 

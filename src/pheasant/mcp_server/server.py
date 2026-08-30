@@ -582,12 +582,59 @@ def create_mcp_server(config: PheasantConfig) -> Any:
 
         return tools.get_sync_history(knowledge_base, source_name, limit, offset)
 
+    @mcp.tool()
+    @anticipated
+    def record_evidence(
+        knowledge_base: str,
+        query: str,
+        target_id: str,
+        event_type: str,
+        target_type: str = "artifact",
+        principal: str | None = None,
+        session_id: str | None = None,
+        position: int | None = None,
+        outcome_reference: str | None = None,
+    ) -> dict:
+        """Record what came of a result: cited, selected, accepted, rejected, validated.
+
+        Being served is not evidence of usefulness and not selecting something
+        is not evidence against it, so reporting nothing lowers the
+        evaluation's coverage rather than corrupting it. See
+        `pheasant://evaluation/taxonomy` for the event types.
+        """
+
+        return tools.record_evidence(
+            knowledge_base,
+            query,
+            target_id,
+            event_type,
+            target_type,
+            principal,
+            session_id,
+            position,
+            outcome_reference,
+        )
+
+    @mcp.tool()
+    @anticipated
+    def get_evaluation_report(knowledge_base: str, run_id: str | None = None) -> dict:
+        """Return the latest knowledge-effectiveness report, with its gates and limits."""
+
+        return tools.get_evaluation_report(knowledge_base, run_id)
+
     @mcp.resource("pheasant://knowledge-bases")
     @anticipated_resource
     def knowledge_bases_resource() -> str:
         """Return registered knowledge bases as JSON."""
 
         return _json(tools.list_knowledge_bases())
+
+    @mcp.resource("pheasant://evaluation/taxonomy")
+    @anticipated_resource
+    def evaluation_taxonomy_resource() -> str:
+        """Return the evidence taxonomy as JSON: what each event type licenses."""
+
+        return _json(tools.get_evaluation_taxonomy(""))
 
     @mcp.resource("pheasant://knowledge-bases/{kb_id}/sources")
     @anticipated_resource
