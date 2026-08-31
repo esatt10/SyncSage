@@ -37,6 +37,14 @@ sync:
     enabled: false
   watcher:
     enabled: false
+  queue:
+    # `validate_role` refuses `role: api` without this, and refuses it at
+    # *startup* rather than when a sync silently goes nowhere. Nothing in this
+    # topology syncs -- db-init indexes the corpus directly -- but the role's
+    # contract does not care, and it is right not to: an api replica publishes
+    # index work, so a queue is what makes that work reachable.
+    enabled: true
+    backend: local
 
 observability:
   interactions:

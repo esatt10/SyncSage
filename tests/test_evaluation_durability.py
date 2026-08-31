@@ -587,6 +587,59 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CI_DIR = REPO_ROOT / "deploy" / "compose" / "ci"
 
 
+def test_every_ci_compose_config_is_valid_for_the_role_it_is_given() -> None:
+    """`validate_role` over every CI topology, the way `test_fleet_manifests`
+    already does for the Kubernetes manifests.
+
+    That check existed for one set of deployment artifacts and not the other,
+    and the gap cost a red build: the evaluation topology ran `--role api`
+    without `sync.queue.enabled`, and an api replica refuses to start without a
+    queue because it *publishes* index work rather than running it. The failure
+    was correct and immediate — the container exited 1 on boot — but it
+    surfaced in a container job rather than here, where it is a second to find.
+
+    Written over every compose file and every service rather than the one that
+    broke, because the next topology added will have the same shape.
+    """
+
+    import yaml
+
+    from pheasant.config.schema import PheasantConfig
+    from pheasant.deployment.roles import resolve_role, validate_role
+
+    topologies = sorted(CI_DIR.glob("docker-compose.*.yml"))
+    assert topologies, "no CI compose topologies found"
+
+    checked = 0
+    for topology in topologies:
+        compose = yaml.safe_load(topology.read_text(encoding="utf-8"))
+        for name, service in (compose.get("services") or {}).items():
+            command = service.get("command") or []
+            if not (isinstance(command, list) and "--role" in command):
+                # db-init and the runner have their own entrypoints; they take
+                # no role and there is nothing to validate.
+                continue
+            role = command[command.index("--role") + 1]
+            mounted = [
+                str(volume).split(":", 1)[0]
+                for volume in (service.get("volumes") or [])
+                if isinstance(volume, str) and ":/config/pheasant.yaml" in str(volume)
+            ]
+            assert mounted, f"{topology.name}:{name} runs --role {role} with no config mounted"
+            config_path = (CI_DIR / mounted[0]).resolve()
+            assert config_path.exists(), f"{topology.name}:{name} mounts a missing {config_path}"
+
+            config = PheasantConfig.model_validate(
+                yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            )
+            # The same call the process makes at startup, so a config that
+            # would exit 1 in a container fails here instead.
+            validate_role(resolve_role(config, role), config)
+            checked += 1
+
+    assert checked >= 2, f"expected several roled services across the topologies, saw {checked}"
+
+
 def test_the_ci_evaluation_config_is_valid_for_the_role_that_uses_it() -> None:
     """A malformed CI config fails the durability job for a reason that is not
     the feature, which is the worst kind of red build."""

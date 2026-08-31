@@ -62,7 +62,18 @@ await_status() {
 }
 
 log "Bringing up postgres, the migrator and the api replica"
-"${COMPOSE[@]}" up -d --wait --wait-timeout 240 api
+# `--wait` reports only "container ... exited (1)" when a service refuses to
+# start, and the reason is in that container's own log — which is in the *next*
+# step, after this one has already gone red. Catching it here puts the reason
+# in the failing step, where somebody reading the job will actually see it.
+# (The first thing this caught: `--role api` with no `sync.queue.enabled`,
+# which `validate_role` refuses at startup by design.)
+if ! "${COMPOSE[@]}" up -d --wait --wait-timeout 240 api; then
+  echo "FAILED: the api replica did not come up. Its log:" >&2
+  "${COMPOSE[@]}" logs --no-color --tail 50 api >&2 || true
+  "${COMPOSE[@]}" logs --no-color --tail 20 db-init >&2 || true
+  exit 1
+fi
 
 log "Nothing has run yet, and the api says so rather than guessing"
 test "$(status_field status)" = "none"
