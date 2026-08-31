@@ -28,6 +28,13 @@ import type {
 import type {
   ConfigSection,
   ConfigSectionResult,
+  EvaluationCohortSummary,
+  EvaluationMetricResult,
+  EvaluationReport,
+  EvaluationRunSummary,
+  EvaluationStatus,
+  EvaluationTaxonomyEvent,
+  EvaluationTrendPoint,
   GraphDiagnostics,
   GraphPath,
   HostPathReport,
@@ -471,6 +478,51 @@ export const api = {
     request<GraphDiagnostics>(`/graph/diagnostics${qs({ top })}`),
   graphPath: (source: string, target: string, maxDepth = 8) =>
     request<GraphPath>(`/graph/path${qs({ source, target, max_depth: maxDepth })}`),
+
+  // The evaluation plane. `evaluationStatus` reads `/state` rather than a
+  // process, which is why it keeps answering for a batch this replica did not
+  // start and for one whose container has since been restarted.
+  evaluationStatus: (runId?: string) =>
+    request<EvaluationStatus>(`/evaluation/status${qs({ run: runId })}`),
+  evaluationRun: (body: { mode?: string; as_of?: string | null; force?: boolean } = {}) =>
+    request<{ job_id: string; status: string; mode: string }>("/evaluation/run", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  evaluationReport: (runId?: string) =>
+    request<EvaluationReport>(`/evaluation/report${qs({ run: runId })}`),
+  evaluationRuns: (limit = 20) =>
+    request<{ runs: EvaluationRunSummary[] }>(`/evaluation/runs${qs({ limit })}`),
+  evaluationCohorts: (limit = 20) =>
+    request<{ cohorts: EvaluationCohortSummary[] }>(`/evaluation/cohorts${qs({ limit })}`),
+  evaluationTrend: (params: { metric?: string; cohort?: string; variant?: string } = {}) =>
+    request<{
+      metric_id: string;
+      cohort: string;
+      variant: string;
+      points: EvaluationTrendPoint[];
+    }>(`/evaluation/trend${qs(params)}`),
+  evaluationMetrics: (
+    params: { run?: string; metric?: string; cohort?: string; variant?: string } = {},
+  ) =>
+    request<{
+      run_id: string;
+      results: {
+        metric_id: string;
+        variant_id: string | null;
+        query_id: string | null;
+        value: number | null;
+        status: string;
+        cohort_name: string | null;
+        cohort_purpose: string | null;
+        result: EvaluationMetricResult | null;
+      }[];
+    }>(`/evaluation/metrics${qs(params)}`),
+  evaluationTaxonomy: () =>
+    request<{
+      events: EvaluationTaxonomyEvent[];
+      defaults: Record<string, boolean>;
+    }>("/evaluation/taxonomy"),
 };
 
 export { API_BASE };

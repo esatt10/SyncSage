@@ -296,6 +296,21 @@ def list_cohorts(state: Any, kb_id: str, *, limit: int = 100) -> list[Cohort]:
 # runs and metrics
 
 
+#: How often a running batch stamps its heartbeat, and how stale one must be
+#: before another process may declare it dead. The gap is deliberate, and it is
+#: the same shape :data:`pheasant.sync.locks.SOURCE_HEARTBEAT_SECONDS` uses: a
+#: run that missed two beats has almost certainly died with its container,
+#: while one that is merely slow gets three chances to say otherwise.
+#:
+#: Wider than the source lease's, because a single unit of evaluation work is a
+#: whole cohort/variant replay -- hundreds of searches -- rather than one file.
+RUN_HEARTBEAT_SECONDS = 15.0
+RUN_STALE_SECONDS = 90.0
+
+#: Terminal states. Nothing rewrites a run in one of these.
+TERMINAL_RUN_STATUSES = ("completed", "truncated", "invalid", "failed", "interrupted")
+
+
 def open_run(
     state: Any,
     *,
@@ -305,12 +320,106 @@ def open_run(
     started_at: str,
     mode: str,
     config_digest: str,
-) -> None:
+    owner: str = "",
+    total_units: int = 0,
+) -> dict[str, Any]:
+    """Claim a run row, or resume the one already there.
+
+    Returns ``{"resumed": bool, "attempts": int, "previous_status": str}``.
+    Resuming is the normal path after a container restart: the run id is
+    content-addressed, so the same batch re-derives the same row rather than
+    starting a second one, and ``attempts`` counts how many times it has been
+    picked up. The insert and the claim are one statement each, and neither
+    ever rewrites a *terminal* row -- a completed run is history.
+    """
+
+    # Read before writing, so "this row did not exist" and "this row is being
+    # picked up again" stay distinguishable -- an insert that reports success
+    # either way cannot tell a first attempt from a resume, and would have every
+    # fresh run claiming to be a recovery.
+    #
+    # The read-then-write race is real and harmless here: the evaluation lease
+    # already serializes batches per `/state`, the INSERT is
+    # `ON CONFLICT DO NOTHING`, and the worst a lost race costs is an attempt
+    # counter off by one. Correctness does not ride on it; the checkpoints do
+    # that, and they are keyed by (run, cohort, variant).
+    existing = state.rows("SELECT status, attempts FROM evaluation_runs WHERE run_id=?", (run_id,))
+    if not existing:
+        state.execute(
+            "INSERT INTO evaluation_runs(run_id, kb_id, snapshot_id, started_at, status, "
+            "mode, config_digest, phase, completed_units, total_units, heartbeat_at, owner, "
+            "attempts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (run_id) DO NOTHING",
+            (
+                run_id,
+                kb_id,
+                snapshot_id,
+                started_at,
+                "running",
+                mode,
+                config_digest,
+                "starting",
+                0,
+                int(total_units),
+                started_at,
+                owner,
+                1,
+            ),
+        )
+        return {"resumed": False, "attempts": 1, "previous_status": ""}
+
+    previous = str(existing[0]["status"] or "")
+    attempts = int(existing[0]["attempts"] or 1)
+    if previous in TERMINAL_RUN_STATUSES and previous not in ("interrupted", "failed"):
+        # A completed, truncated or invalid run is history: re-running it would
+        # destroy the report it published, and its numbers are reproducible by
+        # construction anyway.
+        return {"resumed": False, "attempts": attempts, "previous_status": previous}
     state.execute(
-        "INSERT INTO evaluation_runs(run_id, kb_id, snapshot_id, started_at, status, "
-        "mode, config_digest) VALUES(?,?,?,?,?,?,?) ON CONFLICT (run_id) DO NOTHING",
-        (run_id, kb_id, snapshot_id, started_at, "running", mode, config_digest),
+        "UPDATE evaluation_runs SET status=?, phase=?, heartbeat_at=?, owner=?, "
+        "attempts=attempts+1, error=NULL, finished_at=NULL, total_units=? WHERE run_id=?",
+        ("running", "starting", started_at, owner, int(total_units), run_id),
     )
+    return {"resumed": True, "attempts": attempts + 1, "previous_status": previous}
+
+
+def heartbeat_run(
+    state: Any,
+    *,
+    run_id: str,
+    now: str,
+    phase: str | None = None,
+    detail: str | None = None,
+    completed_units: int | None = None,
+    total_units: int | None = None,
+) -> None:
+    """Stamp progress. Fail-soft: a lost beat must never fail the batch.
+
+    A progress write that could raise would make observability able to break
+    the thing it observes -- the posture ``jobs.progress`` already takes for the
+    indexing loop, and for the same reason.
+    """
+
+    sets = ["heartbeat_at=?"]
+    params: list[Any] = [now]
+    if phase is not None:
+        sets.append("phase=?")
+        params.append(phase)
+    if detail is not None:
+        sets.append("phase_detail=?")
+        params.append(detail[:400])
+    if completed_units is not None:
+        sets.append("completed_units=?")
+        params.append(int(completed_units))
+    if total_units is not None:
+        sets.append("total_units=?")
+        params.append(int(total_units))
+    try:
+        state.execute(
+            f"UPDATE evaluation_runs SET {', '.join(sets)} WHERE run_id=?",
+            (*params, run_id),
+        )
+    except Exception:  # noqa: BLE001 - progress must not be able to fail a run
+        logger.debug("evaluation: progress write failed for %s", run_id, exc_info=True)
 
 
 def close_run(
@@ -321,12 +430,174 @@ def close_run(
     status: str,
     gates_passed: bool,
     report: dict[str, Any],
+    error: str | None = None,
 ) -> None:
     state.execute(
-        "UPDATE evaluation_runs SET finished_at=?, status=?, gates_passed=?, report_json=? "
-        "WHERE run_id=?",
-        (finished_at, status, 1 if gates_passed else 0, _json(report), run_id),
+        "UPDATE evaluation_runs SET finished_at=?, status=?, gates_passed=?, report_json=?, "
+        "phase=?, phase_detail=NULL, heartbeat_at=?, error=? WHERE run_id=?",
+        (
+            finished_at,
+            status,
+            1 if gates_passed else 0,
+            _json(report),
+            status,
+            finished_at,
+            error,
+            run_id,
+        ),
     )
+
+
+def reclaim_stale_runs(
+    state: Any,
+    kb_id: str,
+    *,
+    now: str,
+    stale_before: str,
+) -> list[str]:
+    """Mark runs whose heartbeat died as ``interrupted``, and say which.
+
+    This is the container-stopped case, and it is the reason progress is a row
+    rather than a process. Without it a killed batch leaves ``running`` forever:
+    the UI shows a spinner nobody will ever stop, and the next scheduled run
+    sees work apparently in flight.
+
+    ``interrupted`` rather than ``failed`` on purpose -- the run did not fail,
+    it was cut off, and the distinction decides whether resuming it is sensible
+    (it is: the checkpointed replays are still there).
+    """
+
+    stale = state.rows(
+        "SELECT run_id FROM evaluation_runs WHERE kb_id=? AND status='running' "
+        "AND (heartbeat_at IS NULL OR heartbeat_at < ?) ORDER BY started_at",
+        (kb_id, stale_before),
+    )
+    reclaimed: list[str] = []
+    for row in stale:
+        run_id = str(row["run_id"])
+        state.execute(
+            "UPDATE evaluation_runs SET status='interrupted', phase='interrupted', "
+            "phase_detail=?, finished_at=?, error=? WHERE run_id=? AND status='running'",
+            (
+                "the process running this batch stopped without finishing it",
+                now,
+                "heartbeat expired; the run was reclaimed",
+                run_id,
+            ),
+        )
+        reclaimed.append(run_id)
+    if reclaimed:
+        logger.info("evaluation: reclaimed %s stale run(s)", len(reclaimed))
+    return reclaimed
+
+
+def run_status(state: Any, run_id: str) -> dict[str, Any] | None:
+    """One run's live progress, readable from any process at any time."""
+
+    rows = state.rows(
+        "SELECT run_id, kb_id, snapshot_id, started_at, finished_at, status, mode, "
+        "gates_passed, phase, phase_detail, completed_units, total_units, heartbeat_at, "
+        "owner, attempts, error FROM evaluation_runs WHERE run_id=?",
+        (run_id,),
+    )
+    if not rows:
+        return None
+    payload = dict(rows[0])
+    payload["gates_passed"] = bool(payload.get("gates_passed"))
+    payload["completed_units"] = int(payload.get("completed_units") or 0)
+    payload["total_units"] = int(payload.get("total_units") or 0)
+    payload["attempts"] = int(payload.get("attempts") or 0)
+    total = payload["total_units"]
+    payload["fraction"] = round(min(1.0, payload["completed_units"] / total), 4) if total else None
+    payload["active"] = payload["status"] == "running"
+    return payload
+
+
+def active_run(state: Any, kb_id: str) -> dict[str, Any] | None:
+    """The batch currently in flight for this knowledge base, if any."""
+
+    rows = state.rows(
+        "SELECT run_id FROM evaluation_runs WHERE kb_id=? AND status='running' "
+        "ORDER BY started_at DESC LIMIT 1",
+        (kb_id,),
+    )
+    return run_status(state, str(rows[0]["run_id"])) if rows else None
+
+
+# --------------------------------------------------------------------------
+# replay checkpoints
+
+
+def save_replay_checkpoint(
+    state: Any,
+    *,
+    run_id: str,
+    kb_id: str,
+    cohort_id: str,
+    cohort_name: str,
+    variant_id: str,
+    completed_at: str,
+    query_count: int,
+    failure_count: int,
+    duration_ms: float,
+    payload: dict[str, Any],
+) -> None:
+    """Record one finished (cohort, variant) replay so a restart need not redo it."""
+
+    state.execute(
+        "INSERT INTO evaluation_replays(id, run_id, kb_id, cohort_id, cohort_name, "
+        "variant_id, completed_at, query_count, failure_count, duration_ms, results_json) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING",
+        (
+            digest(run_id, cohort_id, variant_id),
+            run_id,
+            kb_id,
+            cohort_id,
+            cohort_name,
+            variant_id,
+            completed_at,
+            int(query_count),
+            int(failure_count),
+            float(duration_ms),
+            _json(payload),
+        ),
+    )
+
+
+def load_replay_checkpoints(state: Any, run_id: str) -> dict[tuple[str, str], dict[str, Any]]:
+    """``{(cohort_name, variant_id): payload}`` for everything already replayed."""
+
+    try:
+        rows = state.rows(
+            "SELECT cohort_name, variant_id, results_json FROM evaluation_replays WHERE run_id=?",
+            (run_id,),
+        )
+    except Exception:  # noqa: BLE001 - a resume must not fail on a missing table
+        logger.debug("evaluation: replay checkpoints unavailable", exc_info=True)
+        return {}
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        try:
+            out[(str(row["cohort_name"]), str(row["variant_id"]))] = json.loads(row["results_json"])
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def clear_replay_checkpoints(state: Any, run_id: str) -> None:
+    """Drop a finished run's scaffolding.
+
+    The evidence a completed run leaves behind is its metric rows and its
+    report; the checkpoints exist only to make a *restart* cheap. Keeping them
+    would grow ``/state`` by a copy of every result list, forever, for no
+    reader -- which is the growth the retention policies elsewhere exist to
+    prevent.
+    """
+
+    try:
+        state.execute("DELETE FROM evaluation_replays WHERE run_id=?", (run_id,))
+    except Exception:  # noqa: BLE001 - cleanup must not fail a finished run
+        logger.debug("evaluation: could not clear checkpoints for %s", run_id, exc_info=True)
 
 
 def save_metrics(state: Any, run_id: str, kb_id: str, results: list[MetricResult]) -> int:
@@ -392,6 +663,57 @@ def list_runs(state: Any, kb_id: str, *, limit: int = 20) -> list[dict[str, Any]
         (kb_id, int(limit)),
     )
     return [dict(row) for row in rows]
+
+
+def metric_rows(
+    state: Any,
+    run_id: str,
+    *,
+    metric_id: str | None = None,
+    cohort_purpose: str | None = None,
+    variant_id: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """The stored metric results for one run, filtered, with their full payloads.
+
+    How a reader gets from an aggregate to the queries, ranks and proof events
+    behind it. Per-query rows and aggregates share the table (an aggregate has
+    a NULL ``query_id``), so this returns both and the caller decides which it
+    wanted — which is what makes "resolve this 0.89 to the five queries behind
+    it" one request rather than a download of the whole report.
+    """
+
+    clauses = ["m.run_id=?"]
+    params: list[Any] = [run_id]
+    if metric_id:
+        clauses.append("m.metric_id=?")
+        params.append(metric_id)
+    if variant_id:
+        clauses.append("m.variant_id=?")
+        params.append(variant_id)
+    if cohort_purpose:
+        clauses.append("c.purpose=?")
+        params.append(cohort_purpose)
+    rows = state.rows(
+        "SELECT m.metric_id AS metric_id, m.variant_id AS variant_id, "
+        "m.query_id AS query_id, m.value AS value, m.status AS status, "
+        "c.name AS cohort_name, c.purpose AS cohort_purpose, m.payload_json AS payload_json "
+        "FROM evaluation_metrics m "
+        "LEFT JOIN evaluation_cohorts c ON c.cohort_id = m.cohort_id "
+        f"WHERE {' AND '.join(clauses)} "
+        "ORDER BY m.metric_id, m.variant_id, m.query_id LIMIT ?",
+        (*params, int(limit)),
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        payload = dict(row)
+        raw = payload.pop("payload_json", None)
+        try:
+            payload["result"] = json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            payload["result"] = None
+        out.append(payload)
+    return out
 
 
 def metric_trend(

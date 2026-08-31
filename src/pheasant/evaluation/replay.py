@@ -79,15 +79,47 @@ class QueryReplay:
         return {
             "query_id": self.query_id,
             "variant_id": self.variant_id,
+            "text": self.text,
             "ranked_ids": list(self.ranked_ids),
+            "ranked_paths": list(self.ranked_paths),
             "memory_record_ids": list(self.memory_record_ids),
             "arms": {name: list(ids) for name, ids in self.arms.items()},
+            "scores": dict(self.scores),
             "contributing_arms": {k: list(v) for k, v in self.contributing_arms.items()},
             "result_count": self.result_count,
             "duration_ms": round(self.duration_ms, 3),
             "steering_applied": self.steering_applied,
             "failed": self.failed,
         }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> QueryReplay:
+        """Rebuild a replayed query from its checkpoint.
+
+        Lossless for everything the metrics read -- ranks, paths, memory ids,
+        per-arm attribution, scores, latency and the failure reason. A resumed
+        run must compute the *same* numbers as an uninterrupted one, so a
+        checkpoint that dropped a field would make the answer depend on whether
+        the container happened to restart.
+        """
+
+        return cls(
+            query_id=str(payload.get("query_id") or ""),
+            variant_id=str(payload.get("variant_id") or ""),
+            text=str(payload.get("text") or ""),
+            ranked_ids=[str(item) for item in payload.get("ranked_ids") or []],
+            ranked_paths=[str(item) for item in payload.get("ranked_paths") or []],
+            memory_record_ids=[str(item) for item in payload.get("memory_record_ids") or []],
+            arms={k: list(v) for k, v in (payload.get("arms") or {}).items()},
+            scores={k: float(v) for k, v in (payload.get("scores") or {}).items()},
+            contributing_arms={
+                k: list(v) for k, v in (payload.get("contributing_arms") or {}).items()
+            },
+            result_count=int(payload.get("result_count") or 0),
+            duration_ms=float(payload.get("duration_ms") or 0.0),
+            steering_applied=dict(payload.get("steering_applied") or {}),
+            failed=str(payload.get("failed") or ""),
+        )
 
 
 @dataclass
@@ -105,6 +137,26 @@ class VariantReplay:
 
     def latencies(self) -> list[float]:
         return sorted(r.duration_ms for r in self.results.values() if not r.failed)
+
+    def as_dict(self) -> dict[str, Any]:
+        """The checkpoint payload: everything a resumed run must not recompute."""
+
+        return {
+            "variant_id": self.variant.variant_id,
+            "cohort_id": self.cohort_id,
+            "results": [result.as_dict() for result in self.results.values()],
+            "failures": dict(self.failures),
+        }
+
+    @classmethod
+    def from_dict(cls, variant: Variant, payload: dict[str, Any]) -> VariantReplay:
+        run = cls(variant=variant, cohort_id=str(payload.get("cohort_id") or ""))
+        for item in payload.get("results") or []:
+            replayed = QueryReplay.from_dict(item)
+            if replayed.query_id:
+                run.results[replayed.query_id] = replayed
+        run.failures = {str(k): str(v) for k, v in (payload.get("failures") or {}).items()}
+        return run
 
 
 def shadow_records(candidates: list[dict[str, Any]], *, now: str) -> list[dict[str, Any]]:

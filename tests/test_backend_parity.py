@@ -918,3 +918,81 @@ def test_the_evaluation_plane_runs_a_whole_batch_against_postgres(tmp_path: Path
         )
     finally:
         engine.close()
+
+
+@postgres
+def test_the_evaluation_progress_columns_reach_a_pre_existing_postgres_table(
+    tmp_path: Path,
+) -> None:
+    """The additive-column case, on the backend that returns early from
+    ``migrate()``.
+
+    Two traps in one, and both have bitten this file before. A column stated in
+    only the SQLite path exists on exactly one backend. And a marker written
+    before the column existed makes Postgres skip the whole DDL block unless
+    the ``required`` map names the *newest* column rather than just the table.
+
+    The `/state` this rewinds to is the shape ``evaluation_runs`` shipped in,
+    which is what any deployment that ran the plane before progress was durable
+    actually has.
+    """
+
+    from pheasant.persistence.paths import StatePaths
+    from pheasant.persistence.state_store import SCHEMA_VERSION, StateStore
+
+    _reset(DSN)
+    config = _config(tmp_path, _corpus(tmp_path), "postgres")
+    paths = StatePaths.from_config(config)
+    paths.ensure()
+    state = StateStore.from_config(config, paths.sqlite)
+    try:
+        state.migrate()
+        # Rewind to the pre-progress shape, with a row in it, and stamp the
+        # schema marker as current so nothing but the `required` map can notice.
+        state.conn.execute("DROP TABLE IF EXISTS evaluation_runs")
+        state.conn.execute(
+            "CREATE TABLE evaluation_runs ("
+            "run_id TEXT PRIMARY KEY, kb_id TEXT NOT NULL, snapshot_id TEXT NOT NULL, "
+            "started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, "
+            "mode TEXT NOT NULL DEFAULT 'current_state', config_digest TEXT NOT NULL, "
+            "gates_passed INTEGER NOT NULL DEFAULT 1, report_json TEXT)"
+        )
+        state.conn.execute(
+            "INSERT INTO evaluation_runs(run_id, kb_id, snapshot_id, started_at, status, "
+            "config_digest) VALUES('run-legacy','parity','kb-x','2026-01-01T00:00:00Z',"
+            "'completed','c')"
+        )
+        state.conn.execute(
+            "INSERT INTO pheasant_schema_meta(key, value, updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("core", SCHEMA_VERSION, "2026-01-01T00:00:00Z"),
+        )
+        state.conn.commit()
+        before = state.backend.table_columns("evaluation_runs")
+        assert "heartbeat_at" not in before
+
+        state.migrate()
+
+        after = state.backend.table_columns("evaluation_runs")
+        assert {"phase", "heartbeat_at", "attempts", "total_units"} <= set(after)
+        # The row that was already there survives the widening.
+        row = dict(state.rows("SELECT * FROM evaluation_runs WHERE run_id='run-legacy'")[0])
+        assert row["status"] == "completed"
+
+        # And a progress write — the thing that would otherwise fail with a
+        # missing column on every heartbeat — now works.
+        from pheasant.evaluation import store as evaluation_store
+
+        evaluation_store.heartbeat_run(
+            state,
+            run_id="run-legacy",
+            now="2026-02-02T00:00:00Z",
+            phase="replay",
+            completed_units=3,
+        )
+        status = evaluation_store.run_status(state, "run-legacy")
+        assert status is not None
+        assert status["phase"] == "replay"
+        assert status["completed_units"] == 3
+    finally:
+        state.close()

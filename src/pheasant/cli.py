@@ -75,6 +75,41 @@ def _print_projection(report: dict) -> None:
         print(f"  ! {warning}")
 
 
+def _print_evaluation_projection(report: dict) -> None:
+    """What an evaluation batch would cost on a corpus this size.
+
+    Printed here because this is the moment an operator is deciding what to
+    provision, and because the evaluation plane scales on a *different axis*
+    from the corpus: it grows with cohort size times the ablation matrix, not
+    with file count. A region with a million files and forty recorded queries
+    has a large index and a trivial evaluation, and the reverse is equally
+    possible — so a single "how big should this be" number would describe
+    neither.
+
+    Only shown when evaluation is switched on: an operator who has not enabled
+    it does not need a volume estimate for it.
+    """
+
+    evaluation = report.get("evaluation_projection")
+    if not evaluation:
+        return
+    print("evaluation plane (region-wide)")
+    print(
+        f"  at full cohorts ({evaluation['queries_per_cohort']} queries x "
+        f"{evaluation['variants']} variants x {evaluation['cohorts']} cohorts): "
+        f"{evaluation['replays_per_run']:,} replays/run, "
+        f"~{evaluation['projected_run_minutes']:.1f} min"
+    )
+    print(
+        f"  storage: ~{evaluation['state_mb_per_run']:.0f} MB per run "
+        f"(~{evaluation['state_gb_per_year']:.1f} GB/yr at the configured cadence), "
+        f"{evaluation['peak_checkpoint_mb']:.1f} MB of replay checkpoints in flight"
+    )
+    print(f"  suggested container memory for a batch: {evaluation['recommended_memory']}")
+    for warning in evaluation.get("warnings") or []:
+        print(f"  ! {warning}")
+
+
 def _sync_services(engine, cfg, config_path=None, policy=None):
     """Build the watcher + scheduler pair sharing one sync serialization lock.
 
@@ -793,6 +828,43 @@ def _graph_refresher(cfg, engine, policy):
     return _GraphRefresher(engine, interval)
 
 
+def _print_evaluation_status(payload: dict) -> None:
+    """One line of live progress, read from the row rather than from a process.
+
+    This is the surface an operator uses when the batch is running somewhere
+    else -- another container, another terminal, or a process that has since
+    been restarted. It says `interrupted` for a run whose heartbeat expired
+    rather than printing a bar that will never move.
+    """
+
+    status = str(payload.get("status") or "unknown")
+    if status == "none":
+        print(payload.get("detail") or "No evaluation batch has run for this knowledge base.")
+        return
+    phase = payload.get("phase") or status
+    detail = payload.get("phase_detail")
+    done = payload.get("completed_units") or 0
+    total = payload.get("total_units") or 0
+    fraction = payload.get("fraction")
+    bar = ""
+    if fraction is not None:
+        filled = int(round(fraction * 24))
+        bar = f"[{'#' * filled}{'.' * (24 - filled)}] {fraction:.0%} "
+    line = f"{status:<12} {bar}{phase}"
+    if detail:
+        line += f" — {detail}"
+    if total:
+        line += f"  ({done}/{total} replays)"
+    print(line)
+    attempts = int(payload.get("attempts") or 1)
+    if attempts > 1:
+        print(f"  attempt {attempts}: a previous attempt was interrupted and this one resumed it")
+    if payload.get("error"):
+        print(f"  error: {payload['error']}")
+    if payload.get("owner"):
+        print(f"  run {payload.get('run_id')} on {payload['owner']}")
+
+
 def _print_evaluation_summary(report: dict, *, kb: str) -> None:
     """The terminal view of a run: the vector, the gates, and the caveat.
 
@@ -1455,6 +1527,19 @@ def main(argv: list[str] | None = None) -> int:
     eval_sub.add_parser(
         "taxonomy", help="Print the evidence taxonomy: every event type and what it licenses."
     )
+    eval_status_p = eval_sub.add_parser(
+        "status", help="What an evaluation batch is doing right now."
+    )
+    eval_status_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
+    eval_status_p.add_argument("--run", default=None, help="A specific run id.")
+    eval_status_p.add_argument(
+        "--watch",
+        action="store_true",
+        help="Poll until the batch reaches a terminal state.",
+    )
+    eval_status_p.add_argument(
+        "--interval", type=float, default=2.0, help="Seconds between polls with --watch."
+    )
     eval_trend_p = eval_sub.add_parser("trend", help="One metric's history across snapshots.")
     eval_trend_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
     eval_trend_p.add_argument(
@@ -1817,6 +1902,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         for report in reports:
             _print_scan(report)
+        # Once, after the sources. The evaluation plane is a property of the
+        # *region*, not of any one source, and printing it per source would
+        # repeat one number as though it were several.
+        _print_evaluation_projection(
+            next((r for r in reports if r.get("evaluation_projection")), {})
+        )
         return 0
     if args.command == "queue":
         from pheasant.sync.queue import (
@@ -2079,6 +2170,28 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, indent=2, sort_keys=True, default=str))
             return 0
         _print_evaluation_summary(report, kb=cfg.knowledge_base_id)
+        return 0
+    if args.command == "eval" and args.eval_command == "status":
+        import time as _time
+
+        import pheasant.evaluation as evaluation
+        from pheasant.config.loader import load_config
+        from pheasant.evaluation.store import TERMINAL_RUN_STATUSES
+
+        cfg = load_config(Path(args.config))
+        # No graph: this reads one row. Materializing a graph to print a
+        # progress line would cost the whole corpus's memory for nothing.
+        engine = _engine(Path(args.config), load_persisted_graph=False)
+        terminal = (*TERMINAL_RUN_STATUSES, "none", "unknown")
+        try:
+            while True:
+                payload = evaluation.progress(engine.state, cfg.knowledge_base_id, args.run)
+                _print_evaluation_status(payload)
+                if not args.watch or payload.get("status") in terminal:
+                    break
+                _time.sleep(max(0.5, float(args.interval)))
+        finally:
+            engine.close()
         return 0
     if args.command == "eval" and args.eval_command == "trend":
         import pheasant.evaluation as evaluation

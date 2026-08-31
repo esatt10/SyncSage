@@ -617,6 +617,30 @@ def create_mcp_server(config: PheasantConfig) -> Any:
 
     @mcp.tool()
     @anticipated
+    def start_evaluation(
+        knowledge_base: str,
+        mode: str = "current_state",
+        as_of: str | None = None,
+        force: bool = False,
+    ) -> dict:
+        """Start a knowledge-effectiveness batch; returns a job id, not a report.
+
+        Minutes of work, so it runs in the background. Poll
+        `get_evaluation_status` — progress lives in `/state`, so it survives a
+        restart and is readable from any process.
+        """
+
+        return tools.start_evaluation(knowledge_base, mode, as_of, force)
+
+    @mcp.tool()
+    @anticipated
+    def get_evaluation_status(knowledge_base: str, run_id: str | None = None) -> dict:
+        """How far an evaluation batch has got: phase, units done, attempts, status."""
+
+        return tools.get_evaluation_status(knowledge_base, run_id)
+
+    @mcp.tool()
+    @anticipated
     def get_evaluation_report(knowledge_base: str, run_id: str | None = None) -> dict:
         """Return the latest knowledge-effectiveness report, with its gates and limits."""
 

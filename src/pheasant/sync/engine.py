@@ -2457,7 +2457,67 @@ class SyncEngine:
                 ),
                 max_nodes_per_shard=self.config.graph.max_nodes or 1_500_000,
             ).as_dict(),
+            # The evaluation plane scales on a *different axis* from the
+            # corpus -- cohort size times the ablation matrix, not file count
+            # -- so it gets its own projection rather than a share of the one
+            # above. Present only when evaluation is on: an operator who has
+            # not enabled it does not need a volume estimate for it.
+            "evaluation_projection": (
+                self._evaluation_projection() if self.config.evaluation.enabled else None
+            ),
         }
+
+    def _evaluation_projection(self) -> dict[str, Any]:
+        """Size an evaluation batch from the region's own configuration.
+
+        Reads the cohort cap, the enabled variants and the storage cap off the
+        live config rather than taking the model's defaults, so the answer
+        describes *this* region: a deployment that trimmed the ablation matrix
+        or lowered `maximum_stored_per_query_results` should see the smaller
+        number it actually earned.
+        """
+
+        from pheasant.capacity import project_evaluation
+
+        settings = self.config.evaluation
+        variant_flags = (
+            settings.variants.memory_content,
+            settings.variants.alias_only,
+            settings.variants.preference_only,
+            settings.variants.exclusion_only,
+            settings.variants.full_memory,
+        )
+        # +1 for B0, which is not optional: every attribution number is a
+        # paired difference against it.
+        variants = 1 + sum(1 for enabled in variant_flags if enabled)
+        cohort_flags = (
+            settings.cohorts.anchor,
+            settings.cohorts.rolling,
+            settings.cohorts.learned,
+            settings.cohorts.temporal_holdout,
+            settings.cohorts.control,
+            settings.cohorts.synthetic_invariants,
+        )
+        cohorts = max(1, sum(1 for enabled in cohort_flags if enabled))
+        # A material-change trigger on an hourly-indexing region runs hourly,
+        # bounded by `minimum_interval_seconds`. Off, an operator runs it by
+        # hand, and once a day is the honest default for that.
+        runs_per_day = (
+            86400.0 / max(1.0, float(settings.minimum_interval_seconds))
+            if settings.on_material_snapshot
+            else 1.0
+        )
+        return project_evaluation(
+            min(
+                int(settings.cohorts.maximum_queries_per_cohort),
+                int(settings.maximum_queries_per_run),
+            ),
+            variants=variants,
+            cohorts=cohorts,
+            runs_per_day=runs_per_day,
+            embeddings_enabled=bool(self.config.search.embeddings.enabled),
+            max_stored_per_query_results=int(settings.maximum_stored_per_query_results),
+        ).as_dict()
 
     def _source(self, name: str) -> SourceConfig:
         for source in self.config.sources:

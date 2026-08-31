@@ -910,6 +910,87 @@ class PheasantTools:
             "agent": (report.get("explanations") or {}).get("agent", {}),
         }
 
+    def start_evaluation(
+        self,
+        knowledge_base: str,
+        mode: str = "current_state",
+        as_of: str | None = None,
+        force: bool = False,
+    ) -> dict:
+        """Start an effectiveness batch and return immediately with its run id.
+
+        A batch replays every cohort under every variant through the real search
+        path — minutes of work on a real corpus, far past what a tool call
+        should hold open. So this starts it and hands back a ``run_id``; poll
+        :meth:`get_evaluation_status` to watch it.
+
+        Progress and completion live in ``/state``, not in this process, which
+        is what makes the answer survive the container being restarted and what
+        lets a different process (the UI, a CLI, another agent) watch the same
+        run. A batch also takes the region's evaluation lease, so asking twice
+        gets you the run already in flight rather than a second one.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        import threading
+
+        import pheasant.evaluation as evaluation
+
+        if not self.config.evaluation.enabled and not force:
+            raise ValueError(
+                "Evaluation is disabled for this knowledge base. Enable "
+                "`evaluation.enabled` in pheasant.yaml, or pass force=true for a "
+                "one-off run."
+            )
+        in_flight = evaluation.progress(self.state, self.config.knowledge_base_id)
+        if in_flight.get("status") == "running":
+            return {"status": "already-running", **in_flight}
+
+        job = self.jobs.create("evaluation", f"evaluation ({mode})", targets=["evaluation"])
+
+        def _run() -> None:
+            try:
+                outcome = evaluation.run(
+                    self.engine,
+                    mode=mode,
+                    effective_as_of=as_of,
+                    force=bool(force),
+                    on_progress=lambda phase, detail: self.jobs.progress(
+                        job.id, phase=phase, detail=detail or phase, source="evaluation"
+                    ),
+                )
+                self.jobs.finish(
+                    job.id,
+                    status="succeeded" if outcome.status != "invalid" else "failed",
+                    result={"run_id": outcome.run_id, "status": outcome.status},
+                )
+            except Exception as exc:  # noqa: BLE001 - a job records its own failure
+                self.jobs.finish(job.id, status="failed", error=str(exc))
+
+        threading.Thread(target=_run, name="pheasant-mcp-evaluation", daemon=True).start()
+        return {"status": "started", "job_id": job.id, "mode": mode}
+
+    def get_evaluation_status(self, knowledge_base: str, run_id: str | None = None) -> dict:
+        """How far a batch has got, and whether anything is running at all.
+
+        Read from ``/state``, so it answers for a run this process did not start
+        and for one whose process has since stopped. ``phase`` names the step
+        (`snapshot`, `cohorts`, `proof`, `variants`, `replay`, `metrics`,
+        `gates`, `report`, `persisting`), ``completed_units``/``total_units``
+        count (cohort, variant) replays, and ``attempts`` above 1 means a
+        previous attempt was interrupted and this one resumed it.
+
+        A run whose heartbeat expired reports ``interrupted`` rather than
+        pretending to still be working.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        import pheasant.evaluation as evaluation
+
+        payload = evaluation.progress(self.state, self.config.knowledge_base_id, run_id)
+        payload["enabled"] = bool(self.config.evaluation.enabled)
+        return payload
+
     def get_evaluation_taxonomy(self, knowledge_base: str) -> dict:
         """Every evidence event type, its polarity and strength, and what it licenses."""
 

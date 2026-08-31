@@ -126,7 +126,24 @@ class SchedulerService:
 
         config = self.engine.config
         settings = getattr(config, "evaluation", None)
-        if settings is None or not settings.enabled or not settings.on_material_snapshot:
+        if settings is None or not settings.enabled:
+            return
+        # Reclamation runs whenever evaluation is on at all, even when the
+        # automatic trigger is off: a batch someone started by hand from the UI
+        # or the CLI is exactly as capable of being killed with its container,
+        # and leaving that row saying `running` forever would show a spinner
+        # nobody will ever stop.
+        try:
+            from pheasant.evaluation.runner import reclaim_interrupted_runs
+
+            reclaim_interrupted_runs(
+                self.engine.state,
+                config.knowledge_base_id,
+                stale_after_seconds=settings.run_stale_seconds,
+            )
+        except Exception:  # noqa: BLE001 - recovery must never break the beat
+            logger.debug("Evaluation reclamation failed", exc_info=True)
+        if not settings.on_material_snapshot:
             return
         now = time.monotonic()
         if self._last_evaluation and (now - self._last_evaluation) < float(

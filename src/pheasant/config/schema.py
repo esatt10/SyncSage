@@ -1578,6 +1578,17 @@ class EvaluationSettings(ModelMixin):
     #: resolves to, bounded so a large rolling cohort cannot produce a
     #: document nothing can open.
     maximum_stored_per_query_results: int = 200
+    #: How long a running batch may go without stamping its heartbeat before
+    #: another process may declare it dead and mark it ``interrupted``.
+    #:
+    #: A knob rather than a constant because the right value depends on how
+    #: long a single (cohort, variant) replay takes here, and that is a
+    #: property of the corpus. Too low and a slow-but-healthy batch is
+    #: reclaimed out from under itself; too high and a stopped container shows
+    #: a spinner for minutes longer than it needs to. The default is six
+    #: heartbeats -- a run that missed that many has almost certainly died
+    #: with its process.
+    run_stale_seconds: float = 90.0
     #: Optional packs, each independently enabled. Every one of them is
     #: labelled diagnostic or optional in the report; none may enter a
     #: factual-accuracy claim.

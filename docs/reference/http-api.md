@@ -144,6 +144,9 @@ a region must not retrieve its own measurements as knowledge.
 | GET | `/evaluation/report` | The latest report, or `?run=<run_id>`. The whole document: health vector, gates, attribution, generalization, candidate decisions, limitations, and all three explanations. |
 | GET | `/evaluation/runs` | Recent runs with status, mode and whether the gates passed. |
 | GET | `/evaluation/trend` | One metric across snapshots. `metric`, `cohort` (default `anchor` — the only cohort whose membership is frozen), `variant` (default `B5`), `limit`. |
+| GET | `/evaluation/status` | What a batch is doing **right now**, read from `/state` rather than from the process running it — so it answers for a run this replica did not start, and for one whose container has since stopped. Returns `status`, `phase`, `phase_detail`, `completed_units`/`total_units` (cohort/variant replays), `fraction`, `attempts` and `error`. A run whose heartbeat expired reports `interrupted`, never a spinner nobody will stop. `?run=` for a specific one. |
+| GET | `/evaluation/cohorts` | The query sets recent runs used, with purpose, size and whether frozen. An empty cohort explains an `insufficient_evidence` better than the metric can. |
+| GET | `/evaluation/metrics` | Per-query rows behind an aggregate: the audit trail, on demand. `run`, `metric`, `cohort` (by purpose), `variant`, `limit`. Each row carries the full result payload — formula, substituted calculation, operands, proof references, limitation. |
 
 Running a batch is a background job because it replays every cohort under every
 variant through the real search path — minutes of work on a real corpus. It

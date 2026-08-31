@@ -920,6 +920,20 @@ def build_sections() -> list[Section]:
                     advanced=True,
                 ),
                 Question(
+                    key="evaluation.run_stale_seconds",
+                    prompt="Seconds a batch may go silent before it is called interrupted",
+                    help=(
+                        "A batch heartbeats while it works. Past this, another "
+                        "process marks it interrupted and the next run resumes "
+                        "from its checkpoints. Raise it if one replay here takes "
+                        "a long time; lower it to notice a stopped container "
+                        "sooner."
+                    ),
+                    kind="float",
+                    when=lambda a: bool(a.get("evaluation.enabled")),
+                    advanced=True,
+                ),
+                Question(
                     key="evaluation.promotion.enabled",
                     prompt="Let validated memory candidates be promoted automatically?",
                     help=(

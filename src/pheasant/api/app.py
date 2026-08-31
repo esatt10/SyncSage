@@ -1133,6 +1133,29 @@ def create_app(
             except ValueError:  # pragma: no cover - not the main thread (TestClient)
                 logger.debug("drain handler not installed: not running in the main thread")
 
+        # Close out any evaluation batch this process (or a previous one, in a
+        # container that was stopped) left in flight. Done at boot rather than
+        # only on the scheduler beat because `--role api` never runs the beat,
+        # and the API is exactly where somebody is watching a progress bar that
+        # would otherwise spin forever for work nobody is doing.
+        if config.evaluation.enabled:
+            try:
+                from pheasant.evaluation.runner import reclaim_interrupted_runs
+
+                reclaimed = reclaim_interrupted_runs(
+                    state,
+                    config.knowledge_base_id,
+                    stale_after_seconds=config.evaluation.run_stale_seconds,
+                )
+                if reclaimed:
+                    logger.info(
+                        "Reclaimed %s interrupted evaluation run(s): %s",
+                        len(reclaimed),
+                        ", ".join(reclaimed),
+                    )
+            except Exception:  # noqa: BLE001 - recovery must never block a boot
+                logger.debug("Evaluation reclamation failed at startup", exc_info=True)
+
         startup_sources = [
             source.name for source in engine.enabled_sources() if source.sync.on_startup
         ]
@@ -2888,6 +2911,95 @@ def create_app(
             "runs": evaluation_store.list_runs(
                 state, config.knowledge_base_id, limit=max(1, min(int(limit), 200))
             )
+        }
+
+    @app.get("/evaluation/status")
+    def evaluation_status(run: str | None = None) -> dict:
+        """What a batch is doing right now — read from `/state`, not a process.
+
+        This is the endpoint a progress bar polls, and the reason it reads the
+        database rather than the in-process job registry is the two cases that
+        actually happen: a browser talking to an API replica that did not start
+        the run, and a watcher reconnecting after the container that *was*
+        running it stopped. An in-memory registry answers neither.
+
+        A batch whose heartbeat expired reports `interrupted`, with what it had
+        finished and how far it got — never a spinner nobody will ever stop.
+        """
+
+        import pheasant.evaluation as evaluation
+
+        payload = evaluation.progress(state, config.knowledge_base_id, run)
+        payload["enabled"] = bool(config.evaluation.enabled)
+        payload["promotion_enabled"] = bool(config.evaluation.promotion.enabled)
+        payload["auto_trigger"] = bool(config.evaluation.on_material_snapshot)
+        return payload
+
+    @app.get("/evaluation/cohorts")
+    def evaluation_cohorts(limit: int = 20) -> dict:
+        """The query sets the last runs used, and what each one is for.
+
+        Served because a reader looking at a number needs to know which
+        questions produced it — and because a cohort that is empty (no anchor
+        yet, no holdout yet) explains an `insufficient_evidence` far better
+        than the metric can.
+        """
+
+        from pheasant.evaluation import store as evaluation_store
+
+        cohorts = evaluation_store.list_cohorts(
+            state, config.knowledge_base_id, limit=max(1, min(int(limit), 100))
+        )
+        return {
+            "cohorts": [
+                {
+                    "cohort_id": cohort.cohort_id,
+                    "name": cohort.name,
+                    "purpose": cohort.purpose,
+                    "query_count": cohort.query_count,
+                    "frozen": cohort.frozen,
+                    "created_at": cohort.created_at,
+                    "window_start": cohort.window_start,
+                    "window_end": cohort.window_end,
+                }
+                for cohort in cohorts
+            ]
+        }
+
+    @app.get("/evaluation/metrics")
+    def evaluation_metrics(
+        run: str | None = None,
+        metric: str | None = None,
+        cohort: str | None = None,
+        variant: str | None = None,
+        limit: int = 200,
+    ) -> dict:
+        """Per-query rows behind an aggregate: the audit trail, on demand.
+
+        The report carries the aggregates; this is how a reader gets from one of
+        them to the queries, ranks and proof events that produced it without
+        downloading every per-query row in the document.
+        """
+
+        import pheasant.evaluation as evaluation
+        from pheasant.evaluation import store as evaluation_store
+
+        resolved = run
+        if not resolved:
+            latest = evaluation.latest_run(state, config.knowledge_base_id)
+            resolved = str(latest["run_id"]) if latest else None
+        if not resolved:
+            raise HTTPException(status_code=404, detail="No evaluation run has completed yet")
+        return {
+            "run_id": resolved,
+            "results": evaluation_store.metric_rows(
+                state,
+                resolved,
+                metric_id=metric,
+                cohort_purpose=cohort,
+                variant_id=variant,
+                limit=max(1, min(int(limit), 1000)),
+            ),
         }
 
     @app.get("/evaluation/trend")

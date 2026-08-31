@@ -90,16 +90,23 @@ Routing, fan-out, merge, and global cross-region search live on the **router**
 |---|---|---|---|---|
 | Record typed interaction proof | `pheasant eval proof` | `POST /evaluation/evidence` | — | `record_evidence` |
 | List the evidence taxonomy | `pheasant eval taxonomy` | `GET /evaluation/taxonomy` | — | `pheasant://evaluation/taxonomy` |
-| Run an evaluation batch | `pheasant eval run` | `POST /evaluation/run` (background job) | — | — |
-| Read the latest report | `pheasant eval report` | `GET /evaluation/report` | — | `get_evaluation_report` |
+| Run an evaluation batch | `pheasant eval run` | `POST /evaluation/run` (background job) | Effectiveness → **Run evaluation** | `start_evaluation` |
+| Watch a batch in flight | `pheasant eval status [--watch]` | `GET /evaluation/status` | Effectiveness (live progress) | `get_evaluation_status` |
+| Read the latest report | `pheasant eval report` | `GET /evaluation/report` | Effectiveness | `get_evaluation_report` |
 | List past runs | — | `GET /evaluation/runs` | — | — |
-| One metric's trend | `pheasant eval trend` | `GET /evaluation/trend` | — | — |
+| Inspect the cohorts a run used | — | `GET /evaluation/cohorts` | Effectiveness → Cohorts | — |
+| Resolve an aggregate to its per-query rows | — | `GET /evaluation/metrics` | Effectiveness → click a tile | — |
+| One metric's trend | `pheasant eval trend` | `GET /evaluation/trend` | Effectiveness → Trend | — |
 | De-identified eval case set | `pheasant eval bootstrap` | — | — | — |
 
-Running a batch is deliberately absent from MCP: it is minutes of read-side work
-that takes a lease and writes a run row, which is an operator action rather than
-something an agent should start mid-conversation. Agents record evidence and
-read reports.
+Starting a batch is available everywhere, and it is safe to ask twice: a run
+takes the region's evaluation lease and is content-addressed, so a second
+request joins the batch already in flight rather than starting a competing one.
+
+Progress is the same row on every surface. It lives in `/state`, not in the
+process running the batch, which is what makes a browser talking to a replica
+that did not start the run — or a reader coming back after a restart — see the
+same thing.
 
 ## Server & MCP lifecycle
 

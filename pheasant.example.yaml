@@ -557,6 +557,13 @@ evaluation:
   maximum_queries_per_run: 500
   maximum_runtime_seconds: 900
   maximum_stored_per_query_results: 200
+  # How long a running batch may go without a heartbeat before another process
+  # marks it `interrupted`. A knob because the right value depends on how long
+  # one (cohort, variant) replay takes here. Too low reclaims a slow-but-healthy
+  # batch out from under itself; too high shows a spinner for a stopped
+  # container longer than it needs to. Reclamation runs at API boot and on the
+  # scheduler beat, and a reclaimed run *resumes* from its checkpoints.
+  run_stale_seconds: 90.0
   retrieval_diagnostics: false
   binary_preference: false
   # Empty means no composite is published at all — the specification's

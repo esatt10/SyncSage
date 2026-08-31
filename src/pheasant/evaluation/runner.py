@@ -53,8 +53,10 @@ region past that is one ``pheasant shard plan`` should be splitting.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
+from datetime import UTC
 from typing import Any
 
 from pheasant.evaluation import candidates as candidate_validation
@@ -103,10 +105,133 @@ class RunOutcome:
     report: dict[str, Any] = field(default_factory=dict)
     gates: list[GateResult] = field(default_factory=list)
     skipped_reason: str = ""
+    #: How many times this batch has been picked up. Above 1 means a previous
+    #: attempt was interrupted -- a restarted container, a killed process --
+    #: and this one resumed it.
+    attempts: int = 1
+    #: (cohort, variant) replays this attempt reused from checkpoints rather
+    #: than re-running. The measure of what the restart cost, and of what the
+    #: checkpointing saved.
+    resumed_replays: int = 0
 
     @property
     def gates_passed(self) -> bool:
         return all(gate.passed for gate in self.gates)
+
+
+def _owner() -> str:
+    """Which process is running this batch. Read by an operator, not by code."""
+
+    import os
+    import socket
+
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
+class _RunProgress:
+    """Durable progress for one batch, plus a heartbeat that outlives a phase.
+
+    Two jobs, and the second is the subtle one.
+
+    **Publishing.** Every phase transition writes ``phase``, ``phase_detail``
+    and the unit counters to the run row, so any process -- the UI polling
+    HTTP, an agent over MCP, a CLI in another terminal -- can watch a batch it
+    did not start. Fail-soft throughout: a progress write must never be able to
+    fail the run it is describing.
+
+    **Beating between transitions.** A single cohort/variant replay can run for
+    minutes, and during it nothing else writes. Without a beat, a healthy run
+    looks exactly like a dead one to
+    :func:`~pheasant.evaluation.store.reclaim_stale_runs`, and would be
+    reclaimed out from under itself. A daemon thread stamps the clock on an
+    interval well inside the stale window -- the same arrangement
+    :class:`~pheasant.sync.locks.SourceLease` uses, and for exactly the same
+    reason.
+    """
+
+    def __init__(self, state: Any):
+        self.state = state
+        self.run_id: str | None = None
+        self.completed_units = 0
+        self.total_units = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def bind(self, run_id: str) -> None:
+        self.run_id = run_id
+        self._start_heartbeat()
+
+    def plan(self, total_units: int) -> None:
+        self.total_units = max(0, int(total_units))
+
+    def advance(self, units: int = 1) -> None:
+        self.completed_units += int(units)
+
+    def publish(self, phase: str, detail: str = "", units: int | None = None) -> None:
+        if units is not None:
+            self.completed_units = int(units)
+        if self.run_id is None:
+            return
+        evaluation_store.heartbeat_run(
+            self.state,
+            run_id=self.run_id,
+            now=utc_now(),
+            phase=phase,
+            detail=detail or None,
+            completed_units=self.completed_units,
+            total_units=self.total_units or None,
+        )
+
+    def _start_heartbeat(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._beat, name="pheasant-evaluation-heartbeat", daemon=True
+        )
+        self._thread.start()
+
+    def _beat(self) -> None:
+        while not self._stop.wait(evaluation_store.RUN_HEARTBEAT_SECONDS):
+            if self.run_id is None:
+                continue
+            evaluation_store.heartbeat_run(
+                self.state,
+                run_id=self.run_id,
+                now=utc_now(),
+                completed_units=self.completed_units,
+            )
+
+    def fail(self, error: BaseException) -> None:
+        """Mark the run failed, durably, with the reason.
+
+        The alternative is a row that says ``running`` forever after a crash --
+        and a watcher in another process cannot tell that apart from work still
+        in flight. The checkpoints are deliberately *not* cleared: a failed run
+        is resumable, and re-running it is how an operator retries.
+        """
+
+        if self.run_id is None:
+            return
+        try:
+            evaluation_store.close_run(
+                self.state,
+                run_id=self.run_id,
+                finished_at=utc_now(),
+                status="failed",
+                gates_passed=False,
+                report={"run_id": self.run_id, "error": f"{type(error).__name__}: {error}"},
+                error=f"{type(error).__name__}: {error}"[:2000],
+            )
+        except Exception:  # noqa: BLE001 - we are already failing
+            logger.debug("evaluation: could not record failure", exc_info=True)
+
+    def close(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+            self._thread = None
 
 
 class EvaluationLease:
@@ -121,6 +246,7 @@ class EvaluationLease:
 
     def __init__(self, state: Any, *, owner: str | None = None):
         self._lease: Any = None
+        self._progress: _RunProgress | None = None
         try:
             from pheasant.sync.locks import SourceLease
 
@@ -148,13 +274,68 @@ class EvaluationLease:
             )
             return True
 
-    def __exit__(self, *_exc: Any) -> None:
+    def watch(self, progress: _RunProgress) -> None:
+        """Hand the lease the run's progress, so leaving marks the attempt over.
+
+        The lease's exit *is* "this attempt has ended", which is the one moment
+        the run row must stop saying ``running`` -- whether the batch returned,
+        raised, or the process is unwinding. Putting it here rather than in a
+        ``try`` around the body keeps one place responsible for the end of an
+        attempt, and there is no second place to forget.
+        """
+
+        self._progress = progress
+
+    def __exit__(self, exc_type: Any, exc: BaseException | None, _tb: Any) -> None:
+        progress = getattr(self, "_progress", None)
+        if progress is not None:
+            if exc is not None:
+                progress.fail(exc)
+            progress.close()
         if self._lease is None:
             return
         try:
             self._lease.release()
         except Exception:  # noqa: BLE001
             logger.debug("evaluation: lease release failed", exc_info=True)
+
+
+def reclaim_interrupted_runs(
+    state: Any, kb_id: str, *, stale_after_seconds: float | None = None
+) -> list[str]:
+    """Close out batches whose process stopped without finishing them.
+
+    Called at startup and on the scheduler beat. This is the whole answer to
+    "the container was turned off": a run row that says ``running`` with a dead
+    heartbeat becomes ``interrupted``, with a reason, so a watcher in any
+    process stops showing a spinner for work nobody is doing -- and so the next
+    attempt can *resume* it, since its replay checkpoints are still there.
+
+    Deliberately not destructive. The checkpoints survive, the metric rows
+    survive, and re-running the same batch re-derives the same content-addressed
+    run id and picks up where it left off.
+    """
+
+    from datetime import datetime, timedelta
+
+    now = datetime.now(UTC)
+    window = (
+        float(stale_after_seconds)
+        if stale_after_seconds is not None
+        else evaluation_store.RUN_STALE_SECONDS
+    )
+    stale_before = (
+        (now - timedelta(seconds=max(1.0, window)))
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+    try:
+        return evaluation_store.reclaim_stale_runs(
+            state, kb_id, now=utc_now(), stale_before=stale_before
+        )
+    except Exception:  # noqa: BLE001 - recovery must not break a boot
+        logger.debug("evaluation: could not reclaim stale runs", exc_info=True)
+        return []
 
 
 def _evaluation_digests(settings: Any, policy: proof_projection.ProofPolicy) -> dict[str, Any]:
@@ -361,7 +542,22 @@ def run_evaluation(
     started_at = utc_now()
     started_clock = time.monotonic()
 
-    def report(phase: str, detail: str = "") -> None:
+    # Set once the run row exists; before that there is nothing durable to
+    # write progress to, and the in-process callback is all a caller has.
+    progress = _RunProgress(state)
+
+    def report(phase: str, detail: str = "", *, units: int | None = None) -> None:
+        """Publish one phase transition to every watcher there is.
+
+        Two destinations, and both matter. The callback is the in-process one
+        (the CLI's printed line, the HTTP job registry). The row in
+        ``evaluation_runs`` is the durable one -- it is what a *different*
+        process reads, and what survives this one being killed. A batch is
+        minutes of work; a progress signal that lives only in the process
+        running it is a progress signal the UI cannot show after a restart.
+        """
+
+        progress.publish(phase, detail, units)
         if on_progress is not None:
             try:
                 on_progress(phase, detail)
@@ -376,7 +572,8 @@ def run_evaluation(
             skipped_reason="evaluation.enabled is false; pass force=True to run anyway",
         )
 
-    with EvaluationLease(state) as acquired:
+    lease = EvaluationLease(state)
+    with lease as acquired:
         if not acquired:
             return RunOutcome(
                 run_id="",
@@ -430,7 +627,7 @@ def run_evaluation(
             mode,
             manifest.effective_as_of if mode == "historical" else None,
         )
-        evaluation_store.open_run(
+        claim = evaluation_store.open_run(
             state,
             run_id=run_id,
             kb_id=kb_id,
@@ -438,7 +635,25 @@ def run_evaluation(
             started_at=started_at,
             mode=mode,
             config_digest=config_digest,
+            owner=_owner(),
         )
+        progress.bind(run_id)
+        lease.watch(progress)
+        checkpoints = (
+            evaluation_store.load_replay_checkpoints(state, run_id) if claim["resumed"] else {}
+        )
+        if claim["resumed"]:
+            logger.info(
+                "evaluation: resuming %s (attempt %s, was %s) with %s replay checkpoint(s)",
+                run_id,
+                claim["attempts"],
+                claim["previous_status"],
+                len(checkpoints),
+            )
+            report(
+                "resuming",
+                f"attempt {claim['attempts']}; {len(checkpoints)} replay(s) already done",
+            )
         if not snapshot_gate.passed:
             outcome = RunOutcome(
                 run_id=run_id,
@@ -495,16 +710,62 @@ def run_evaluation(
         replays: dict[str, dict[str, VariantReplay]] = {}
         truncated: dict[str, int] = {}
         spent = 0
-        for cohort_name, cohort in cohorts.items():
-            per_cohort: dict[str, VariantReplay] = {}
-            for variant in matrix:
-                if spent >= budget or (time.monotonic() - started_clock) > deadline:
-                    truncated[f"{cohort_name}:{variant.variant_id}"] = cohort.query_count
-                    continue
-                report("replay", f"{cohort_name}/{variant.variant_id}")
-                per_cohort[variant.variant_id] = replay_engine.replay_variant(cohort, variant)
-                spent += cohort.query_count
-            replays[cohort_name] = per_cohort
+        resumed_pairs = 0
+        # One unit is one (cohort, variant) replay. Counting *pairs* rather than
+        # queries is what makes the progress bar honest across cohorts of very
+        # different sizes: a bar that jumped 40% for the invariant cohort and
+        # crawled through the anchor would be measuring the wrong thing.
+        planned = [
+            (cohort_name, cohort, variant)
+            for cohort_name, cohort in cohorts.items()
+            for variant in matrix
+        ]
+        progress.plan(len(planned))
+        by_cohort: dict[str, dict[str, VariantReplay]] = {name: {} for name in cohorts}
+        for cohort_name, cohort, variant in planned:
+            key = (cohort_name, variant.variant_id)
+            checkpoint = checkpoints.get(key)
+            if checkpoint is not None:
+                # Already replayed, by this run, before it was interrupted.
+                # Reusing it is what makes a restart cheap instead of a
+                # restart-from-zero -- and it is *sound* because the run id is
+                # content-addressed: the same run id means the same snapshot,
+                # the same configuration and the same cohorts.
+                by_cohort[cohort_name][variant.variant_id] = VariantReplay.from_dict(
+                    variant, checkpoint
+                )
+                resumed_pairs += 1
+                progress.advance()
+                report("replay", f"{cohort_name}/{variant.variant_id} (checkpointed)")
+                continue
+            if spent >= budget or (time.monotonic() - started_clock) > deadline:
+                truncated[f"{cohort_name}:{variant.variant_id}"] = cohort.query_count
+                progress.advance()
+                continue
+            report("replay", f"{cohort_name}/{variant.variant_id}")
+            pair_started = time.monotonic()
+            replayed = replay_engine.replay_variant(cohort, variant)
+            by_cohort[cohort_name][variant.variant_id] = replayed
+            spent += cohort.query_count
+            progress.advance()
+            # Checkpointed the moment it finishes, not at the end of the phase:
+            # a container stopped between two replays must keep the one that
+            # completed. Writing a batch of them at the end would lose exactly
+            # the work a restart is trying to avoid redoing.
+            evaluation_store.save_replay_checkpoint(
+                state,
+                run_id=run_id,
+                kb_id=kb_id,
+                cohort_id=cohort.cohort_id,
+                cohort_name=cohort_name,
+                variant_id=variant.variant_id,
+                completed_at=utc_now(),
+                query_count=cohort.query_count,
+                failure_count=len(replayed.failures),
+                duration_ms=(time.monotonic() - pair_started) * 1000.0,
+                payload=replayed.as_dict(),
+            )
+        replays = by_cohort
 
         # 7-9. Metrics, then paired deltas.
         report("metrics")
@@ -663,9 +924,12 @@ def run_evaluation(
                 "variants": [variant.variant_id for variant in matrix],
             },
         )
+        report("persisting")
         evaluation_store.save_metrics(state, run_id, kb_id, [*published, *per_query])
         finished = utc_now()
         status = "completed" if not truncated else "truncated"
+        payload["run_identity"]["attempts"] = claim["attempts"]
+        payload["run_identity"]["resumed_replays"] = resumed_pairs
         evaluation_store.close_run(
             state,
             run_id=run_id,
@@ -674,13 +938,27 @@ def run_evaluation(
             gates_passed=gate_checks.all_passed(run_gates),
             report=payload,
         )
-        report("done")
+        # Only once the report is committed. The checkpoints are the recovery
+        # path for a run that did not get this far; dropping them earlier would
+        # mean a crash during persistence had to replay everything again.
+        evaluation_store.clear_replay_checkpoints(state, run_id)
+        # Notified, not published: `close_run` has already written the terminal
+        # phase (which is the *status*, and is the truthful one), and a
+        # "done" phase written after it would overwrite "completed" with a word
+        # that says less. The lease's exit stops the heartbeat.
+        if on_progress is not None:
+            try:
+                on_progress("done", status)
+            except Exception:  # noqa: BLE001 - progress must never fail a run
+                logger.debug("evaluation: progress hook failed", exc_info=True)
         return RunOutcome(
             run_id=run_id,
             snapshot_id=manifest.snapshot_id,
             status=status,
             report=payload,
             gates=run_gates,
+            attempts=int(claim["attempts"]),
+            resumed_replays=resumed_pairs,
         )
 
 

@@ -755,3 +755,227 @@ export interface GraphPath {
   hops: number | null;
   path: (GraphNode & { node_id: string })[];
 }
+
+// ---------------------------------------------------------------------------
+// The evaluation plane.
+//
+// Every number here arrives with its denominator, its status and its stated
+// limitation, and the UI's job is to keep them together: a value rendered
+// without its `denominator` and `status` is exactly the bare score the whole
+// plane exists to avoid producing. `value: null` with an
+// `insufficient_evidence` status is a real answer — "we could not measure" —
+// and must render as a gap rather than as a zero.
+// ---------------------------------------------------------------------------
+
+export type EvaluationMetricStatus =
+  | "pass"
+  | "warn"
+  | "fail"
+  | "informational"
+  | "insufficient_evidence"
+  | "not_applicable";
+
+export type EvaluationClassification =
+  | "demonstrated"
+  | "structural"
+  | "diagnostic"
+  | "operational";
+
+/** A batch's live position, read from `/state` rather than from a process. */
+export interface EvaluationStatus {
+  status:
+    | "running"
+    | "completed"
+    | "truncated"
+    | "invalid"
+    | "failed"
+    | "interrupted"
+    | "none"
+    | "unknown";
+  run_id?: string;
+  snapshot_id?: string;
+  mode?: string;
+  phase?: string | null;
+  phase_detail?: string | null;
+  completed_units?: number;
+  total_units?: number;
+  /** 0–1, or null when the run has not planned its units yet. */
+  fraction?: number | null;
+  started_at?: string;
+  finished_at?: string | null;
+  heartbeat_at?: string | null;
+  owner?: string | null;
+  /** Above 1 means an earlier attempt was interrupted and this one resumed it. */
+  attempts?: number;
+  error?: string | null;
+  gates_passed?: boolean;
+  active?: boolean;
+  detail?: string;
+  enabled?: boolean;
+  promotion_enabled?: boolean;
+  auto_trigger?: boolean;
+}
+
+export interface EvaluationHealthEntry {
+  value: number | null;
+  status: EvaluationMetricStatus;
+  numerator?: number | null;
+  denominator?: number | null;
+  classification?: EvaluationClassification;
+}
+
+export interface EvaluationGate {
+  gate_id: string;
+  passed: boolean;
+  observed: number;
+  maximum: number;
+  detail: string;
+  evidence: Record<string, unknown>;
+}
+
+export interface EvaluationMetricResult {
+  metric_id: string;
+  metric_version: number;
+  classification: EvaluationClassification;
+  optional: boolean;
+  scope: {
+    snapshot_id: string;
+    cohort_id: string | null;
+    variant_id: string | null;
+    query_id: string | null;
+  };
+  result: {
+    value: number | null;
+    numerator: number | null;
+    denominator: number | null;
+    unit: string;
+    status: EvaluationMetricStatus;
+    threshold: number | null;
+  };
+  calculation: {
+    formula: string;
+    substituted: string;
+    operands: Record<string, unknown>;
+  };
+  evidence: {
+    proof_ids: string[];
+    interaction_ids: string[];
+    artifact_ids: string[];
+    excluded_count: number;
+    exclusion_reasons: Record<string, number>;
+  };
+  interpretation: {
+    summary: string;
+    supports_claim: string;
+    does_not_support: string;
+  };
+}
+
+export interface EvaluationCandidateDecision {
+  candidate_id: string;
+  rule_id: string;
+  kind: string;
+  decision: string;
+  reasons: string[];
+  evidence: Record<string, unknown>;
+  applied?: boolean;
+  note?: string;
+  error?: string;
+}
+
+export interface EvaluationReport {
+  schema_version: number;
+  run_identity: Record<string, unknown> & {
+    run_id: string;
+    snapshot_id: string;
+    mode: string;
+    primary_variant: string;
+    baseline_variant: string;
+    attempts?: number;
+    resumed_replays?: number;
+  };
+  snapshot_integrity: {
+    complete: boolean;
+    incomplete_sections: string[];
+    manifest: Record<string, unknown>;
+  };
+  evidence_coverage: {
+    sufficient: boolean;
+    eligible_queries: number;
+    evidenced_queries: number;
+    independent_interactions: number;
+    max_single_query_share: number;
+    reasons: string[];
+  };
+  health_vector: Record<string, EvaluationHealthEntry>;
+  classification_breakdown: Record<string, string[]>;
+  baseline_comparison: EvaluationMetricResult[];
+  memory_attribution: EvaluationMetricResult[];
+  generalization: {
+    learned: EvaluationMetricResult | null;
+    temporal_holdout: EvaluationMetricResult | null;
+    gap: EvaluationMetricResult | null;
+    note: string;
+  };
+  controls_and_regressions: EvaluationMetricResult | null;
+  gates: EvaluationGate[];
+  optional_diagnostics: Record<string, unknown>;
+  candidate_decisions: EvaluationCandidateDecision[];
+  composite: Record<string, unknown>;
+  limitations: {
+    unjudged_share: number | null;
+    failed_queries: Record<string, Record<string, string>>;
+    truncated_replays: Record<string, number>;
+    metrics_withheld: { metric_id: string; problems: string[] }[];
+  };
+  longitudinal: {
+    previous_snapshot_id: string | null;
+    snapshot_diff: string[];
+    material_change: string[];
+  };
+  explanations: {
+    end_user: string;
+    agent: Record<string, unknown>;
+    developer: Record<string, unknown>;
+  };
+}
+
+export interface EvaluationRunSummary {
+  run_id: string;
+  snapshot_id: string;
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  mode: string;
+  gates_passed: number | boolean;
+}
+
+export interface EvaluationCohortSummary {
+  cohort_id: string;
+  name: string;
+  purpose: string;
+  query_count: number;
+  frozen: boolean;
+  created_at: string;
+  window_start: string | null;
+  window_end: string | null;
+}
+
+export interface EvaluationTrendPoint {
+  started_at: string;
+  snapshot_id: string;
+  run_id: string;
+  value: number | null;
+  numerator: number | null;
+  denominator: number | null;
+  status: EvaluationMetricStatus;
+  variant_id: string | null;
+  cohort_id: string | null;
+}
+
+export interface EvaluationTaxonomyEvent {
+  event_type: string;
+  polarity: "positive" | "negative" | "unknown";
+  strength: "weak" | "moderate" | "strong" | "conclusive";
+  note: string;
+}

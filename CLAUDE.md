@@ -71,7 +71,8 @@ pheasant-kb/
 │   ├── evalset.py             ← de-identified eval cases from the ledger
 │   ├── evaluation/            ← the evaluation plane: contracts, snapshots,
 │   │                            proof, cohorts, variants, replay, metrics,
-│   │                            gates, report, candidates, runner, store
+│   │                            gates, report, candidates, runner, store,
+│   │                            benchmark (the capacity measurement)
 │   ├── sharding.py            ← `pheasant shard plan`
 │   ├── jobs.py                ← per-source progress: phase, rate, ETA, stalled
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
@@ -142,6 +143,8 @@ pheasant eval proof --query … --target … --event explicit_accept
 pheasant eval run [--mode current_state|historical --as-of T]
 pheasant eval report [--run ID] [--json]
 pheasant eval trend --metric known_positive_reciprocal_rank
+pheasant eval status [--watch]             # a batch's live phase/progress, from /state
+python -m pheasant.evaluation.benchmark    # measure a batch against the capacity model
 pheasant mcp --transport stdio
 pheasant client-config claude-code|cursor|vscode
 pheasant config show                       # resolved config after profile+YAML+--set
@@ -361,7 +364,25 @@ returned by a search. A region must not answer a question with its own report.
   (N replicas → one run), **never** takes `sync_lock`, and the replay searcher
   is built with `usage_tracking=False` so evaluation cannot inflate the salience
   of the records it measures. Auto-trigger fires only where the scheduler runs.
-  `docs/knowledge-effectiveness.md`.
+- **Progress is a row, not a process.** `phase`, unit counters and a heartbeat
+  live on `evaluation_runs`, so the UI, the CLI (`pheasant eval status
+  [--watch]`), HTTP (`/evaluation/status`) and MCP (`get_evaluation_status`)
+  all watch a batch none of them started — across a restart. A run whose
+  heartbeat expires is reclaimed as **`interrupted`** (at API boot and on the
+  beat), never left spinning.
+- **A batch resumes rather than restarting.** Each (cohort, variant) replay is
+  checkpointed to `evaluation_replays` as it finishes; the content-addressed
+  run id makes a re-run load them and replay only what is missing. Checkpoints
+  clear only *after* the report commits, and a resumed run computes numbers
+  identical to an uninterrupted one — asserted by killing one of two identical
+  regions mid-batch and diffing health vectors.
+- **Sized, not guessed.** `capacity.project_evaluation` is the one home for
+  evaluation coefficients; `pheasant scan` prints run time, steady-state and
+  *peak* volume separately (the peak is checkpoints in flight, the number that
+  decides whether a PVC fills mid-run). `python -m pheasant.evaluation.benchmark`
+  measures a real batch against the model and CI publishes the comparison —
+  the first two coefficients shipped were out by 2x and 3x, found exactly that
+  way. `docs/knowledge-effectiveness.md`.
 
 ### Scale
 
@@ -483,6 +504,32 @@ Each of these cost real time. They are listed because the shape recurs.
   ledger row found nothing, which is most of the reason to export spans at
   all. The span starts first now and the row adopts *its* ids. Caught by
   running against a real SDK, not by the offline suite, which had no opinion.
+- **Progress that lives in a process disappears with the process.** An
+  evaluation batch is minutes of work, and the first version put its progress
+  in the in-memory job registry. That answers neither case that actually
+  happens: a browser talking to an API replica that did not start the run, and
+  a reader coming back after the container was restarted — where the row also
+  said `running` forever, because nothing rewrites a row when a process is
+  killed. Phase, counters and a heartbeat are columns now, reclamation runs at
+  API boot and on the beat, and each (cohort, variant) replay is checkpointed
+  as it finishes so a restart resumes. The same shape as `source_leases`, and
+  for the same reason.
+- **An index in `CORE_SCHEMA` that names a column a guarded ALTER adds runs
+  first, and fails the whole migration.** `CREATE TABLE IF NOT EXISTS` no-ops
+  against an existing table, so `idx_evaluation_runs_live` on
+  `heartbeat_at` broke every `migrate()` over a `/state` written before that
+  column existed — "no such column: heartbeat_at", on boot. It is created in
+  `migrate()` after the ALTER now, exactly where `idx_memory_records_canon_key`
+  already was for exactly this reason. Found by pointing the CLI at an older
+  state directory, not by reading the code.
+- **A capacity coefficient nobody measures is a coefficient that rots.** The
+  first two evaluation constants were guesses: seconds-per-replay was 2x over,
+  and bytes-per-checkpoint 3x *under* — the dangerous direction, since that is
+  the number deciding whether a volume fills mid-run.
+  `python -m pheasant.evaluation.benchmark` runs a real batch and prints
+  measured beside projected; CI publishes the diff. Same posture as
+  `SECONDS_PER_1K_FILES`, which was a curve being quoted as a line until
+  someone measured it at two scales.
 - **A measurement derived from what a system chose to show measures its own
   confidence.** Mining "appeared at rank 1" out of the interaction ledger as a
   positive would produce a retrieval metric that improves whenever ranking gets

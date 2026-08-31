@@ -201,8 +201,52 @@ class StateStore:
             self.conn.execute("ALTER TABLE interaction_events ADD COLUMN answer_text TEXT")
         if interaction_columns and "result_paths_json" not in interaction_columns:
             self.conn.execute("ALTER TABLE interaction_events ADD COLUMN result_paths_json TEXT")
+        self._migrate_evaluation_progress()
         self.conn.commit()
         self._migrate_fts_titles()
+
+    #: The evaluation run's durable progress columns, added after the table
+    #: shipped. Guarded like every other additive column: `CREATE TABLE IF NOT
+    #: EXISTS` cannot widen a table that already exists, so a `/state` written
+    #: before these would otherwise fail every progress write with a missing
+    #: column -- and progress is the one thing a watcher outside the process
+    #: has to be able to read.
+    _EVALUATION_RUN_COLUMNS: tuple[tuple[str, str], ...] = (
+        ("phase", "TEXT"),
+        ("phase_detail", "TEXT"),
+        ("completed_units", "INTEGER NOT NULL DEFAULT 0"),
+        ("total_units", "INTEGER NOT NULL DEFAULT 0"),
+        ("heartbeat_at", "TEXT"),
+        ("owner", "TEXT"),
+        ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("error", "TEXT"),
+    )
+
+    def _migrate_evaluation_progress(self) -> None:
+        """Add the run-progress columns to a pre-existing ``evaluation_runs``.
+
+        Said once here and called from both migration paths, because Postgres
+        returns early from :meth:`migrate` and an additive column stated in only
+        one place exists on exactly one backend -- a mistake this file has
+        already made once, and the reason the comment below the Postgres
+        ``required`` map exists.
+        """
+
+        existing = self.backend.table_columns("evaluation_runs")
+        if not existing:
+            return
+        for column, declaration in self._EVALUATION_RUN_COLUMNS:
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE evaluation_runs ADD COLUMN {column} {declaration}")
+        # Only safe once `heartbeat_at` is guaranteed present — either it was in
+        # this database's original CREATE TABLE, or the ALTER above just added
+        # it. Declaring it in the schema script instead fails the whole
+        # migration with "no such column" on any /state written before the
+        # progress columns existed, which is how this was found.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_evaluation_runs_live "
+            "ON evaluation_runs(kb_id, status, heartbeat_at)"
+        )
 
     def _migrate_postgres(self) -> None:
         """Run DDL once across a concurrently starting fleet.
@@ -231,6 +275,11 @@ class StateStore:
                 # leave every ledger insert failing on a missing column.
                 "interaction_events": "answer_text",
                 "memory_candidates": "id",
+                # Same rule, newest column: a marker written before the
+                # evaluation plane's progress columns existed must not let this
+                # skip the DDL and leave every progress write failing.
+                "evaluation_runs": "heartbeat_at",
+                "evaluation_replays": "id",
             }
             schema_present = all(
                 column in self.backend.table_columns(table) for table, column in required.items()
@@ -251,6 +300,7 @@ class StateStore:
                 self.conn.execute(
                     "ALTER TABLE interaction_events ADD COLUMN result_paths_json TEXT"
                 )
+            self._migrate_evaluation_progress()
             self.conn.execute(
                 "INSERT INTO pheasant_schema_meta(key, value, updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "

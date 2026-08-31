@@ -1,0 +1,304 @@
+name: Evaluation
+
+# The evaluation plane gets its own workflow for the same reason the memory
+# subsystem does: its correctness lives in the seams, and the seams cross a
+# database, a container boundary and a process being killed. The unit suites in
+# `CI` cover each piece; nothing there proves the pieces hold together when the
+# container stops.
+#
+# Three jobs, and each answers a question the others cannot:
+#
+#   suites       — the plane on both storage backends. A declared FK, a
+#                  discarded rowcount and one SQLite-only INSERT have each
+#                  passed the offline suite and failed on a real PostgreSQL.
+#
+#   durability   — a real container, stopped mid-replay. "The process went
+#                  away" is not a state a mock reproduces honestly, and the
+#                  properties that matter (an api replica can watch a batch it
+#                  did not start; a killed batch is reclaimed and resumed) only
+#                  exist across a real process boundary.
+#
+#   capacity     — the sizing model against the machine, published as a job
+#                  summary. This is what informs how big an evaluation node and
+#                  its volume have to be, and it is a number rather than a
+#                  feeling because a projection nobody checks is a projection
+#                  that rots.
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+    paths:
+      - "src/pheasant/evaluation/**"
+      - "src/pheasant/capacity.py"
+      - "src/pheasant/persistence/**"
+      - "src/pheasant/search/hybrid.py"
+      - "src/pheasant/memory/steering.py"
+      - "src/pheasant/sync/scheduler.py"
+      - "src/pheasant/api/app.py"
+      - "src/pheasant/mcp_server/**"
+      - "tests/test_evaluation_*.py"
+      - "tests/test_capacity_model.py"
+      - "tests/test_backend_parity.py"
+      - "ui/src/evaluation/**"
+      - "ui/src/pages/EvaluationPage.tsx"
+      - "deploy/compose/ci/**"
+      - ".github/workflows/evaluation.yml"
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  suites:
+    name: Evaluation suites (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          - sqlite
+          - postgres
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pheasant
+          POSTGRES_PASSWORD: pheasant
+          POSTGRES_DB: pheasant_evaluation
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pheasant"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pheasant and the extras the plane crosses
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp,postgres]"
+
+      - name: Run the evaluation suites
+        env:
+          # Only the postgres leg points at the service; the sqlite leg must
+          # stay on SQLite, which is the default every user gets.
+          PHEASANT_TEST_POSTGRES_DSN: ${{ matrix.backend == 'postgres' && 'postgresql://pheasant:pheasant@127.0.0.1:5432/pheasant_evaluation' || '' }}
+          # Defence in depth: no replay, no metric and no formation rule may
+          # ever reach a model. If one tries, it fails here rather than quietly
+          # becoming a metered test.
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GEMINI_API_KEY: ""
+        run: |
+          python -m pytest -q --durations=15 \
+            tests/test_evaluation_plane.py \
+            tests/test_evaluation_batch.py \
+            tests/test_evaluation_durability.py \
+            tests/test_evaluation_capacity.py \
+            tests/test_capacity_model.py \
+            tests/test_backend_parity.py \
+            tests/test_memory_steering.py \
+            tests/test_ranking.py \
+            2>&1 | tee evaluation-suite-${{ matrix.backend }}.log
+
+      - name: Upload the suite log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-suite-${{ matrix.backend }}
+          path: evaluation-suite-${{ matrix.backend }}.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  ui:
+    name: Evaluation UI builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci --no-audit --no-fund
+
+      # The page is typed against `api/types.ts`, which is hand-written against
+      # the HTTP surface. A response shape that changed without the types
+      # following it fails here rather than rendering `undefined` in a browser.
+      - name: Typecheck
+        working-directory: ui
+        run: npm run typecheck
+
+      - name: Build the bundle that ships in the image
+        working-directory: ui
+        run: npm run build
+
+  durability:
+    name: A stopped container, in real containers
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The evaluation topology is a published artifact. Nothing else in CI
+      # parses it, so a malformed service would otherwise reach a user's host
+      # before it reached us.
+      - name: Validate the evaluation topology parses
+        run: |
+          docker compose -f deploy/compose/ci/docker-compose.evaluation.yml config --quiet
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: pheasant:ci
+
+      - name: Kill a batch mid-replay and prove it resumes
+        run: bash deploy/compose/ci/evaluation-smoke.sh
+
+      - name: Container logs on failure
+        if: failure()
+        run: |
+          docker compose -f deploy/compose/ci/docker-compose.evaluation.yml \
+            logs --no-color --tail 200
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker rm -f pheasant-eval-runner 2>/dev/null || true
+          docker compose -f deploy/compose/ci/docker-compose.evaluation.yml \
+            down -v --remove-orphans || true
+
+  capacity:
+    name: Sizing model versus the machine
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pheasant
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp]"
+
+      - name: Measure a batch and compare it with the projection
+        env:
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GEMINI_API_KEY: ""
+          PHEASANT_EVAL_CAPACITY_REPORT: evaluation-capacity.json
+        run: python -m pheasant.evaluation.benchmark --output evaluation-capacity.json
+
+      - name: Publish the sizing table
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, pathlib
+          report = pathlib.Path("evaluation-capacity.json")
+          print("### Evaluation capacity\n")
+          if not report.exists():
+              print("_No capacity report was produced._")
+              raise SystemExit(0)
+          data = json.loads(report.read_text())
+          measured = data["measured"]
+          print(f"Measured on {measured['replays']} replays "
+                f"({measured['queries']} queries x {measured['variants']} variants "
+                f"x {measured['cohorts']} cohorts).\n")
+          print("| | measured | projected |")
+          print("|---|---:|---:|")
+          print(f"| run seconds | {measured['run_seconds']} | {data['projected']['run_seconds']} |")
+          print(f"| ms per replay | {measured['ms_per_replay']} | "
+                f"{round(data['coefficients']['SECONDS_PER_QUERY_VARIANT'] * 1000, 2)} |")
+          print(f"| /state bytes | {measured['state_bytes']} | "
+                f"{data['projected']['state_bytes_per_run']} |")
+          print(f"| peak checkpoint bytes | {measured['peak_checkpoint_bytes']} | "
+                f"{data['projected']['peak_checkpoint_bytes']} |")
+          print("\n**Sizing at production cohort sizes**\n")
+          print("| queries/cohort | replays | minutes | MB/run | GB/year | peak MB | memory |")
+          print("|---:|---:|---:|---:|---:|---:|---|")
+          for row in data["ladder"]:
+              print(f"| {row['queries_per_cohort']} | {row['replays_per_run']} | "
+                    f"{row['projected_run_minutes']} | {row['state_mb_per_run']} | "
+                    f"{row['state_gb_per_year']} | {row['peak_checkpoint_mb']} | "
+                    f"{row['recommended_memory']} |")
+          for warning in data.get("warnings", []):
+              print(f"\n> [!WARNING]\n> {warning}")
+          PY
+
+      # Advisory rather than a hard budget: a shared runner is noisy, and a
+      # threshold that cries wolf is a threshold people disable. What this is
+      # for is the *shape* changing — a replay loop that went quadratic would
+      # blow past this at any cohort size worth running.
+      - name: Warn if a replay got materially more expensive
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys
+          report = pathlib.Path("evaluation-capacity.json")
+          if not report.exists():
+              sys.exit(0)
+          data = json.loads(report.read_text())
+          measured = data["measured"]["ms_per_replay"]
+          modelled = data["coefficients"]["SECONDS_PER_QUERY_VARIANT"] * 1000
+          budget = modelled * 40
+          print(f"per replay: {measured} ms (model {modelled:.1f} ms, advisory budget {budget:.0f} ms)")
+          if measured > budget:
+              print(f"::warning::a replay took {measured} ms against a modelled {modelled:.1f} ms; "
+                    "the capacity coefficients may need re-measuring, or the replay loop has "
+                    "changed shape")
+          PY
+
+      - name: Upload the capacity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-capacity
+          path: evaluation-capacity.json
+          if-no-files-found: warn
+          retention-days: 90

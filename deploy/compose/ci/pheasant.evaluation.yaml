@@ -1,0 +1,86 @@
+# The evaluation plane in a real fleet, on a real database.
+#
+# `api` and `all` are split for the same reason the log tier's config splits
+# them: what has to be proved is that a batch's progress and recovery live in
+# `/state` rather than in whichever process happened to start it. An `api`
+# replica that never runs an evaluation itself must still be able to *watch*
+# one, and must close out a run whose container stopped.
+pheasant:
+  name: evaluation-ci
+  state_path: /state
+  workspace_root: /workspace
+  exports_path: /exports
+
+server:
+  host: 0.0.0.0
+  port: 8765
+  api:
+    cors_origins:
+      - "*"
+
+storage:
+  backend: postgres
+  dsn_env: PHEASANT_DATABASE_URL
+  graph_snapshots: false
+
+search:
+  embeddings:
+    provider: stub
+
+assistant:
+  enabled: false
+
+sync:
+  # No beat: this test drives every run explicitly, so a scheduled one firing
+  # underneath it would make a failure ambiguous.
+  scheduler:
+    enabled: false
+  watcher:
+    enabled: false
+
+observability:
+  interactions:
+    enabled: true
+    flush_batch_size: 1
+    flush_interval_seconds: 1.0
+    hot_retention_days: 7
+
+memory:
+  steering_enabled: true
+
+evaluation:
+  enabled: true
+  # Driven explicitly, never on a timer, for the reason above.
+  on_material_snapshot: false
+  max_results: 5
+  # 20s instead of the 90s default. A CI replay is fast, so a batch killed here
+  # is provably dead long before a production one would be -- and waiting out
+  # the production window would add a minute and a half to the job for nothing.
+  run_stale_seconds: 20
+  proof:
+    # A CI corpus has a handful of queries. The sufficiency floors exist to
+    # stop a *production* region publishing a number from four data points;
+    # here they would only stop the test measuring anything at all.
+    minimum_eligible_queries: 1
+    minimum_evidenced_queries: 1
+    minimum_independent_interactions: 1
+    maximum_single_query_proof_share: 1.0
+  cohorts:
+    anchor_minimum_queries: 2
+    maximum_queries_per_cohort: 25
+  promotion:
+    enabled: false
+
+sources:
+  - name: docs
+    type: markdown_folder
+    path: /workspace/corpus
+    include:
+      - "**/*.md"
+    sync:
+      on_startup: false
+  - name: agent-memory
+    type: memory
+    path: /state/memory
+    sync:
+      on_startup: false

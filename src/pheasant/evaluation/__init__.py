@@ -34,8 +34,19 @@ from pheasant.evaluation.proof import (
     make_proof,
     partition_token,
 )
-from pheasant.evaluation.runner import RunOutcome, run_evaluation
-from pheasant.evaluation.store import latest_run, list_runs, load_report, metric_trend
+from pheasant.evaluation.runner import (
+    RunOutcome,
+    reclaim_interrupted_runs,
+    run_evaluation,
+)
+from pheasant.evaluation.store import (
+    active_run,
+    latest_run,
+    list_runs,
+    load_report,
+    metric_trend,
+    run_status,
+)
 
 __all__ = [
     "DEFAULT_TAXONOMY",
@@ -47,10 +58,14 @@ __all__ = [
     "RunOutcome",
     "Strength",
     "latest_report",
+    "latest_run",
     "list_runs",
+    "progress",
     "query_id",
+    "reclaim_interrupted_runs",
     "record_evidence",
     "run",
+    "run_status",
     "trend",
 ]
 
@@ -138,3 +153,29 @@ def trend(state: Any, kb_id: str, metric_id: str, **kwargs: Any) -> list[dict[st
     """One metric's history across snapshots, oldest first."""
 
     return metric_trend(state, kb_id, metric_id, **kwargs)
+
+
+def progress(state: Any, kb_id: str, run_id: str | None = None) -> dict[str, Any]:
+    """What a batch is doing right now, readable from any process.
+
+    The answer comes from ``/state``, not from the process running the batch,
+    which is what makes it work at all for the two cases that matter: a UI in a
+    browser talking to an API replica that did not start the run, and a watcher
+    reconnecting after the container that *was* running it stopped.
+
+    Without ``run_id`` this reports the batch in flight, or the last one that
+    finished. A run whose heartbeat has expired reads as ``interrupted`` once
+    :func:`reclaim_interrupted_runs` has been round -- never as a spinner
+    nobody will ever stop.
+    """
+
+    if run_id:
+        found = run_status(state, run_id)
+        return found or {"run_id": run_id, "status": "unknown"}
+    live = active_run(state, kb_id)
+    if live is not None:
+        return live
+    latest = latest_run(state, kb_id)
+    if latest is None:
+        return {"status": "none", "detail": "no evaluation batch has run for this knowledge base"}
+    return run_status(state, str(latest["run_id"])) or {"status": "none"}

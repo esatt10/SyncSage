@@ -314,6 +314,140 @@ query would measure string similarity and report it as retrieval.
 
 ---
 
+## Watching a batch, and what happens when the container stops
+
+A batch is minutes of work. Two things follow from that, and both are why the
+run's progress is a **row in `/state`** rather than an object in the process
+running it.
+
+### Progress is readable from anywhere
+
+```bash
+pheasant eval status            # once
+pheasant eval status --watch    # until it reaches a terminal state
+```
+
+```
+running      [##########..............] 42%  replay — anchor/B3  (15/36 replays)
+  run run-0664e4863d7b482c on indexer-0:31
+```
+
+Over HTTP, `GET /evaluation/status`; over MCP, `get_evaluation_status`; in the
+UI, the **Effectiveness** page polls it while a run is in flight. All four read
+the same row, which is what makes them work in the two cases that actually
+happen: a browser talking to an API replica that did not start the run, and a
+reader coming back after the container that *was* running it was restarted.
+
+`phase` names the step the batch is on — `snapshot`, `cohorts`, `proof`,
+`variants`, `replay`, `metrics`, `gates`, `report`, `persisting` — and
+`completed_units`/`total_units` count **(cohort, variant) replays**. Counting
+pairs rather than queries is what keeps the bar honest across cohorts of very
+different sizes: one that jumped 40% for the six-case invariant cohort and
+crawled through the anchor would be measuring the wrong thing.
+
+### A stopped container is reclaimed, not left spinning
+
+Nothing rewrites a row when a process is killed, so something else has to. A
+run whose heartbeat has expired is marked **`interrupted`** — with how far it
+got and why — by `reclaim_interrupted_runs`, which runs at API startup and on
+the scheduler beat.
+
+`interrupted` rather than `failed` is a real distinction: the batch did not
+fail, it was cut off, and that decides whether resuming it makes sense. It
+does.
+
+### Restarting resumes rather than starting over
+
+Each **(cohort, variant)** replay is checkpointed to `evaluation_replays` the
+moment it finishes — not batched at the end, because a container stopped
+between two replays must keep the one that completed. Re-running the same batch
+re-derives the same content-addressed `run_id`, loads the checkpoints, and
+replays only what is missing:
+
+```
+$ pheasant eval run
+  resuming: attempt 2; 3 replay(s) already done
+  replay: anchor/B0 (checkpointed)
+  ...
+completed    [########################] 100% completed  (36/36 replays)
+```
+
+The checkpoints are cleared **only once the report is committed** — they are
+the recovery path for a run that did not get that far, and dropping them
+earlier would mean a crash during persistence had to replay everything again.
+
+A resumed run computes the *same numbers* as an uninterrupted one; the test
+suite asserts it by running two identical regions, killing one mid-batch, and
+comparing health vectors. Reproducibility cannot depend on whether the
+container happened to restart.
+
+| Terminal state | Means | Re-running it |
+|---|---|---|
+| `completed` | Everything replayed, report published | No-op — it is history, and re-running would destroy the report |
+| `truncated` | Ran out of `maximum_queries_per_run` or `maximum_runtime_seconds` | Same; raise the budget first |
+| `interrupted` | The process stopped without finishing | **Resumes** from checkpoints |
+| `failed` | The batch raised | **Resumes** from checkpoints |
+| `invalid` | The snapshot manifest was incomplete | Fix the manifest gap first |
+
+---
+
+## Sizing an evaluation node and its volume
+
+`pheasant scan` reports it, because that is the moment somebody is provisioning:
+
+```
+evaluation plane (region-wide)
+  at full cohorts (200 queries x 6 variants x 6 cohorts): 7,200 replays/run, ~1.0 min
+  storage: ~47 MB per run (~17.1 GB/yr at the configured cadence), 5.8 MB of replay
+           checkpoints in flight
+  suggested container memory for a batch: 0.5Gi
+```
+
+Three numbers, and they answer different questions:
+
+* **Run time** is `queries × variants × cohorts` replays, each a real search
+  through the real hybrid path. Linear, and the only term worth tuning.
+* **Steady state** is metric rows and reports, which accumulate. It is an
+  *upper bound*: per-query rows exist only for queries carrying positive proof,
+  so a region where a quarter of queries are evidenced uses roughly a quarter
+  of it. The bound points that way on purpose — over-provisioning a volume is
+  cheap, running out mid-run is not.
+* **Peak** is the replay checkpoints held *during* a run and deleted when it
+  completes. This is free space a volume must have, which is a different
+  question from what it fills with.
+
+The coefficients live in `src/pheasant/capacity.py` — the one place sizing
+numbers live, so `pheasant scan`, `pheasant shard plan` and these docs cannot
+disagree — and they are measurements rather than guesses. Reproduce them on
+your own hardware:
+
+```bash
+python -m pheasant.evaluation.benchmark --output evaluation-capacity.json
+```
+
+It runs a real batch through the real search path and prints what it measured
+beside what the model projected. The shape holds across machines; the constants
+move. CI runs it on every change to the plane and publishes the comparison as a
+job summary, because a model nobody checks against a machine is a model that
+quietly stops describing anything — and the first two coefficients shipped here
+were out by 2x and 3x, found exactly this way.
+
+### Scaling
+
+Evaluation does not scale by adding workers, and
+[the section below](#why-replay-is-not-fanned-out-over-the-worker-transport)
+says why. It scales by:
+
+* **fewer queries** — `evaluation.cohorts.maximum_queries_per_cohort`;
+* **a longer interval** — `evaluation.minimum_interval_seconds`, or leaving
+  `on_material_snapshot` off and running it by hand;
+* **fewer variants** — trimming `evaluation.variants` (`B0` is not removable);
+* **sharding the region** — past the point where a batch will not fit a budget
+  worth having, `pheasant shard plan` splits the corpus and each shard
+  evaluates itself.
+
+---
+
 ## Running it in a fleet
 
 The evaluation plane is read-side work and is shaped for the

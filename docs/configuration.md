@@ -936,6 +936,22 @@ Fleet behaviour: the automatic trigger fires only where the scheduler runs
 replicas produce one run rather than N, and it **never runs inside
 `sync_lock`** — a replay there would stall incremental sync for every source.
 
+### `evaluation.run_stale_seconds`
+
+How long a running batch may go without stamping its heartbeat before another
+process may declare it dead and mark it `interrupted`.
+
+A knob rather than a constant because the right value depends on how long a
+single (cohort, variant) replay takes here, and that is a property of the
+corpus. Too low and a slow-but-healthy batch is reclaimed out from under
+itself; too high and a stopped container shows a spinner for minutes longer
+than it needs to. The default is 90s — six heartbeats.
+
+Reclamation runs at API startup and on the scheduler beat, so `--role api`
+replicas (which never run the beat) still close out a batch whose container
+stopped. See
+[Watching a batch](knowledge-effectiveness.md#watching-a-batch-and-what-happens-when-the-container-stops).
+
 ### `evaluation.proof.*`
 
 How observed events become weighted evidence. The three defaults that matter:

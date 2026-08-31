@@ -539,6 +539,15 @@ CREATE INDEX IF NOT EXISTS idx_evaluation_cohorts_purpose
 -- One row per batch. `report_json` is the whole evidence-bearing report; the
 -- per-metric rows below exist so an aggregate can be resolved to the per-query
 -- calculations that produced it without parsing a large document.
+--
+-- **Progress lives here, not in a process.** A batch is minutes of work, and
+-- the UI, the CLI and an agent all need to watch it -- from other processes,
+-- and across a restart. An in-memory job registry answers none of those: a
+-- container that stops mid-run leaves a watcher with no record at all, and
+-- `status='running'` forever. So the phase, the unit counters and a heartbeat
+-- are columns, written as the run moves. A row whose heartbeat has gone stale
+-- is reclaimable (see `reclaim_stale_runs`), which is the same recovery an
+-- indexer already gets from `source_leases`.
 CREATE TABLE IF NOT EXISTS evaluation_runs (
   run_id TEXT PRIMARY KEY,
   kb_id TEXT NOT NULL,
@@ -549,10 +558,53 @@ CREATE TABLE IF NOT EXISTS evaluation_runs (
   mode TEXT NOT NULL DEFAULT 'current_state',
   config_digest TEXT NOT NULL,
   gates_passed INTEGER NOT NULL DEFAULT 1,
-  report_json TEXT
+  report_json TEXT,
+  phase TEXT,
+  phase_detail TEXT,
+  completed_units INTEGER NOT NULL DEFAULT 0,
+  total_units INTEGER NOT NULL DEFAULT 0,
+  heartbeat_at TEXT,
+  owner TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_evaluation_runs_time
   ON evaluation_runs(kb_id, started_at);
+-- NOTE: the companion index on (kb_id, status, heartbeat_at) is deliberately
+-- NOT here. `CREATE TABLE IF NOT EXISTS` no-ops against a /state written
+-- before `heartbeat_at` existed, so an index naming that column in this same
+-- script runs *before* the guarded ALTER that adds it and fails the whole
+-- migration with "no such column". It is created in `StateStore.migrate`,
+-- after the ALTER — exactly where `idx_memory_records_canon_key` is, and for
+-- exactly the same reason.
+-- One replayed (cohort, variant) pair, checkpointed as it completes.
+--
+-- This is what makes a batch **resumable** rather than merely idempotent. A
+-- run is content-addressed, so a restart re-derives the same `run_id` and the
+-- metric rows dedup -- but without this, every query would be replayed again
+-- from the top, and on a large cohort that is the whole cost of the run. With
+-- it, a resumed batch loads the pairs it already finished and replays only
+-- what is missing. The same argument `source_checkpoints` makes for a
+-- connector: the expensive part is the fetch, so remember what was fetched.
+--
+-- Rows are keyed by (run, cohort, variant) and are written once. They are
+-- pruned with their run rather than kept forever: a completed run's evidence
+-- is its metric rows and its report, and this is scaffolding.
+CREATE TABLE IF NOT EXISTS evaluation_replays (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  kb_id TEXT NOT NULL,
+  cohort_id TEXT NOT NULL,
+  cohort_name TEXT NOT NULL,
+  variant_id TEXT NOT NULL,
+  completed_at TEXT NOT NULL,
+  query_count INTEGER NOT NULL DEFAULT 0,
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  duration_ms REAL,
+  results_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_evaluation_replays_run
+  ON evaluation_replays(run_id, cohort_name, variant_id);
 -- Per-query rows and aggregates share this table; an aggregate has a NULL
 -- query_id. That is what makes "resolve this 0.89 to the five queries behind
 -- it" one query rather than a join across two shapes.
