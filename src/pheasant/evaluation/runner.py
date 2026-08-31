@@ -116,7 +116,18 @@ class RunOutcome:
 
     @property
     def gates_passed(self) -> bool:
-        return all(gate.passed for gate in self.gates)
+        """Whether every gate passed -- and never vacuously.
+
+        ``all([])`` is ``True``, so the obvious spelling reports a run that
+        evaluated *no* gates as one that passed them all. That is the wrong
+        answer for the two outcomes that carry no gates at all: a batch skipped
+        because the lease was held, and one skipped because evaluation is off.
+        ``pheasant eval run`` turns this straight into its exit status, so the
+        vacuous reading is a green CI gate for a run that never happened -- the
+        `insufficient_evidence`-rather-than-`0.0` rule, one level up.
+        """
+
+        return bool(self.gates) and all(gate.passed for gate in self.gates)
 
 
 def _owner() -> str:
@@ -330,12 +341,30 @@ def reclaim_interrupted_runs(
         .replace("+00:00", "Z")
     )
     try:
-        return evaluation_store.reclaim_stale_runs(
+        reclaimed = evaluation_store.reclaim_stale_runs(
             state, kb_id, now=utc_now(), stale_before=stale_before
         )
     except Exception:  # noqa: BLE001 - recovery must not break a boot
         logger.debug("evaluation: could not reclaim stale runs", exc_info=True)
         return []
+    if reclaimed:
+        # The run row and the lease are two records of one dead process, and
+        # until this they aged out on two different clocks: the run on
+        # `evaluation.run_stale_seconds`, the lease on `SOURCE_STALE_SECONDS`.
+        # In the gap between them a region reported a batch `interrupted` --
+        # which invites a resume, and the UI says so -- and then skipped the
+        # resume, because a lease nobody was holding said someone was. A
+        # skipped run is not a loud failure either: it has no gates, so it
+        # reported none failing. Freeing the lease *here* is what makes the
+        # invitation true, and it uses this function's own evidence: a
+        # heartbeat-expired run is a process that is gone.
+        try:
+            from pheasant.sync.locks import release_stale_lease
+
+            release_stale_lease(state, EVALUATION_LEASE, stale_before=stale_before)
+        except Exception:  # noqa: BLE001 - leases are optional infrastructure
+            logger.debug("evaluation: could not free the evaluation lease", exc_info=True)
+    return reclaimed
 
 
 def _evaluation_digests(settings: Any, policy: proof_projection.ProofPolicy) -> dict[str, Any]:

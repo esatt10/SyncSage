@@ -465,6 +465,16 @@ The evaluation plane is read-side work and is shaped for the
   the same conditional-`UPDATE` mechanism source leases use, so several API
   replicas produce one run rather than N. A replica that dies mid-run stops
   heartbeating and the lease goes stale.
+* **Reclaiming a run frees its lease.** A killed container releases nothing, so
+  it leaves the lease row behind, and the run row and the lease row age out on
+  two different clocks — `evaluation.run_stale_seconds` and the source lease's
+  own 45s window. Where the first is set *below* the second, the region reported
+  a batch `interrupted` — which invites a resume, and the UI says so — and then
+  declined the resume, because a lease nobody held said someone was running it.
+  Reclamation now frees the lease on the same evidence and in the same window
+  that declared the run dead, so "interrupted" always means the next attempt
+  runs. A lease that is still beating is never touched: the staleness test is
+  in the `DELETE`, so a successor that legitimately took it survives.
 * **Never under `sync_lock`.** The scheduler holds that across all its work; a
   thousand-query replay inside it would stall incremental sync for every source
   — the same mistake the observation plane's hot-to-cold Parquet roll was moved

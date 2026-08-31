@@ -32,7 +32,7 @@ import pytest
 import pheasant.evaluation as evaluation
 from pheasant.evaluation import store as evaluation_store
 from pheasant.evaluation.replay import QueryReplay, ReplayEngine, VariantReplay
-from pheasant.evaluation.runner import reclaim_interrupted_runs
+from pheasant.evaluation.runner import EVALUATION_LEASE, reclaim_interrupted_runs
 from pheasant.evaluation.variants import default_matrix
 from tests.test_evaluation_batch import _artifact, _engine, _seed
 
@@ -697,3 +697,185 @@ def test_the_container_runner_asserts_what_the_smoke_script_parses() -> None:
         assert f'"{field}"' in runner, f"the runner no longer prints {field}"
     for field in ("status", "attempts", "resumed_replays"):
         assert f'outcome["{field}"]' in script, f"the script no longer asserts on {field}"
+
+
+# --------------------------------------------------------------------------
+# The lease a killed process never released
+# --------------------------------------------------------------------------
+#
+# Every in-process test above kills a batch by *raising*, which unwinds
+# `EvaluationLease.__exit__` and releases the lease on the way out. A stopped
+# container does not unwind anything, so it leaves the lease row behind — and
+# the run row and that row then age out on two different clocks:
+# `evaluation.run_stale_seconds` against `locks.SOURCE_STALE_SECONDS` (45s).
+#
+# The window only opens when the first is set *below* the second, because then
+# the run is declared dead while its lease still claims a live holder. The
+# shipped default (90s) is above it and never sees this; the CI region sets 20s
+# so its smoke test does not have to wait out 90 seconds, and hit it on the
+# first real container run. So these tests pin `run_stale_seconds` rather than
+# taking the default, and time their rows relative to now — an ancient
+# timestamp is stale by every window at once and would prove nothing.
+
+
+#: Lower than `SOURCE_STALE_SECONDS`, as the CI region sets it. This is the
+#: configuration in which the two clocks disagree.
+RUN_STALE = 20.0
+
+
+def _seconds_ago(seconds: float) -> str:
+    from datetime import timedelta
+
+    from pheasant.evaluation.contracts import UTC, datetime
+
+    return (
+        (datetime.now(UTC) - timedelta(seconds=seconds))
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _abandoned_lease(state: Any, *, heartbeat_at: str, owner: str = "dead-host:1") -> None:
+    """The row a killed container leaves: held, never released, not beating."""
+
+    state.conn.execute(
+        "INSERT INTO source_leases(source_id, owner, acquired_at, heartbeat_at) "
+        "VALUES(?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET "
+        "owner=excluded.owner, acquired_at=excluded.acquired_at, "
+        "heartbeat_at=excluded.heartbeat_at",
+        (EVALUATION_LEASE, owner, heartbeat_at, heartbeat_at),
+    )
+    state.conn.commit()
+
+
+def _lease_owner(state: Any) -> str | None:
+    rows = state.rows("SELECT owner FROM source_leases WHERE source_id=?", (EVALUATION_LEASE,))
+    return str(rows[0]["owner"]) if rows else None
+
+
+def _kill_a_batch(state: Any, *, ago: float, run_id: str = "run-killed") -> None:
+    """A run and its lease, both last beating `ago` seconds back.
+
+    One process wrote both and then stopped, so they stop together — which is
+    the whole reason the two staleness windows have to agree about it.
+    """
+
+    stopped = _seconds_ago(ago)
+    evaluation_store.open_run(
+        state,
+        run_id=run_id,
+        kb_id="kb",
+        snapshot_id="kb-x",
+        started_at=_seconds_ago(ago + 30),
+        mode="current_state",
+        config_digest="c",
+        owner="dead-host:1",
+        total_units=36,
+    )
+    evaluation_store.heartbeat_run(
+        state,
+        run_id=run_id,
+        now=stopped,
+        phase="replay",
+        detail="anchor/B3",
+        completed_units=7,
+    )
+    _abandoned_lease(state, heartbeat_at=stopped)
+
+
+def test_reclaiming_a_run_frees_the_lease_its_killed_process_never_released(
+    seeded: Any,
+) -> None:
+    """The container-stopped case, which the raising kills above cannot reach.
+
+    Reclaiming the run row and freeing the lease are one conclusion — the
+    process is gone — and leaving them on separate clocks is what let the
+    region advertise a resume it would then decline.
+    """
+
+    # 25s dead: past `run_stale_seconds` (20s), still inside the lease's own
+    # 45s window. This is the gap, and it is where CI stopped.
+    _kill_a_batch(seeded.state, ago=25.0)
+
+    reclaimed = reclaim_interrupted_runs(seeded.state, "kb", stale_after_seconds=RUN_STALE)
+    assert reclaimed == ["run-killed"]
+    assert evaluation_store.run_status(seeded.state, "run-killed")["status"] == "interrupted"
+    assert _lease_owner(seeded.state) is None, (
+        "the run was advertised as resumable while its lease still said someone was running it"
+    )
+
+
+def test_the_resume_a_reclaim_advertises_actually_runs(seeded: Any) -> None:
+    """The defect end to end: `interrupted` has to mean the next attempt runs.
+
+    Asserted through `evaluation.run` rather than the lease row, because the
+    symptom was not a stuck row — it was a batch reporting `skipped` with no
+    gates, which reads as success to everything downstream of it.
+    """
+
+    _kill_a_batch(seeded.state, ago=25.0)
+    reclaim_interrupted_runs(seeded.state, "kb", stale_after_seconds=RUN_STALE)
+
+    outcome = evaluation.run(seeded)
+    assert outcome.status == "completed", outcome.skipped_reason
+    assert outcome.skipped_reason == ""
+
+
+def test_a_lease_that_is_still_beating_survives_a_reclaim(seeded: Any) -> None:
+    """The other half: a successor that took the lease legitimately keeps it.
+
+    The staleness test lives in the DELETE rather than in a read before it, so
+    a live holder survives whatever the reclaiming process believed about the
+    holder it knew about.
+    """
+
+    from pheasant.evaluation.contracts import utc_now
+
+    _kill_a_batch(seeded.state, ago=25.0)
+    # A successor claimed the lease between the kill and this reclaim.
+    _abandoned_lease(seeded.state, heartbeat_at=utc_now(), owner="successor:2")
+
+    reclaimed = reclaim_interrupted_runs(seeded.state, "kb", stale_after_seconds=RUN_STALE)
+    assert reclaimed == ["run-killed"]
+    assert _lease_owner(seeded.state) == "successor:2"
+
+
+def test_a_held_lease_still_makes_a_second_run_decline(seeded: Any) -> None:
+    """The exclusion itself is unchanged: N replicas still produce one run."""
+
+    from pheasant.evaluation.contracts import utc_now
+
+    _abandoned_lease(seeded.state, heartbeat_at=utc_now(), owner="other-replica:9")
+    outcome = evaluation.run(seeded)
+    assert outcome.status == "skipped"
+    assert "lease" in outcome.skipped_reason
+    assert _lease_owner(seeded.state) == "other-replica:9"
+
+
+def test_a_skipped_run_never_reports_that_its_gates_passed(seeded: Any) -> None:
+    """`all([])` is True, and a run that evaluated no gates is not a run that
+    passed them. The API publishes this field beside `status`, and it is the
+    same rule as `insufficient_evidence` rather than `0.0`, one level up."""
+
+    from pheasant.evaluation.contracts import utc_now
+
+    _abandoned_lease(seeded.state, heartbeat_at=utc_now(), owner="other-replica:9")
+    held = evaluation.run(seeded)
+    assert held.status == "skipped"
+    assert held.gates == []
+    assert held.gates_passed is False
+
+    seeded.config.evaluation.enabled = False
+    disabled = evaluation.run(seeded)
+    assert disabled.status == "skipped"
+    assert disabled.gates_passed is False
+
+
+def test_a_completed_run_still_reports_its_gates(seeded: Any) -> None:
+    """Guards the fix: requiring a non-empty gate list must not make a real
+    run look failed."""
+
+    outcome = evaluation.run(seeded)
+    assert outcome.status == "completed"
+    assert outcome.gates, "a completed run published no gates at all"
+    assert outcome.gates_passed is all(gate.passed for gate in outcome.gates)

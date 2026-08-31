@@ -522,6 +522,22 @@ Each of these cost real time. They are listed because the shape recurs.
   `migrate()` after the ALTER now, exactly where `idx_memory_records_canon_key`
   already was for exactly this reason. Found by pointing the CLI at an older
   state directory, not by reading the code.
+- **Two staleness clocks over one dead process will disagree, and the gap is
+  a feature that lies.** A killed evaluation container releases nothing, so its
+  run row *and* its `__evaluation__` lease row are both left behind — and they
+  aged out on different windows: `evaluation.run_stale_seconds` for the run,
+  `locks.SOURCE_STALE_SECONDS` (45s) for the lease. Set the first below the
+  second — the CI region uses 20s so its smoke test need not wait out 90 — and
+  the region reports a batch `interrupted`, which invites a resume and says so
+  in the UI, then *skips* the resume because a lease nobody was holding claimed
+  a live writer. The skip was not loud either: a skipped run carries no gates,
+  and `all([])` is `True`, so it reported its gates passed — which
+  `pheasant eval run` turns straight into an exit status. Reclamation frees the
+  lease on its own evidence and in its own window now (the staleness test lives
+  in the `DELETE`, so a legitimate successor survives), and `gates_passed`
+  requires a non-empty gate list. Every in-process test killed a batch by
+  *raising*, which unwinds the lease's `__exit__` and releases it, so the
+  offline suite could not see this: it took a real `docker compose stop`.
 - **A capacity coefficient nobody measures is a coefficient that rots.** The
   first two evaluation constants were guesses: seconds-per-replay was 2x over,
   and bytes-per-checkpoint 3x *under* — the dangerous direction, since that is

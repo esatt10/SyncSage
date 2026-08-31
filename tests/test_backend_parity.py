@@ -996,3 +996,78 @@ def test_the_evaluation_progress_columns_reach_a_pre_existing_postgres_table(
         assert status["completed_units"] == 3
     finally:
         state.close()
+
+
+@postgres
+def test_a_killed_batch_frees_its_lease_on_postgres(tmp_path: Path) -> None:
+    """The recovery CI found, on the dialect that has broken three others.
+
+    ``DELETE ... RETURNING`` is the fourth statement shape this plane asks of
+    both backends, and the previous three portability bugs here were each a
+    statement that ran on SQLite and did something else — or nothing — on the
+    real server. So the whole sequence runs against Postgres: a batch that was
+    killed without releasing its lease, the reclaim that frees it, and the
+    resume that then actually happens instead of reporting ``skipped``.
+    """
+
+    from datetime import UTC, datetime, timedelta
+
+    from pheasant.evaluation import store as evaluation_store
+    from pheasant.evaluation.runner import EVALUATION_LEASE, reclaim_interrupted_runs
+
+    def ago(seconds: float) -> str:
+        return (
+            (datetime.now(UTC) - timedelta(seconds=seconds))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+
+    _reset(DSN)
+    config = _config(tmp_path, _corpus(tmp_path), "postgres")
+    config.evaluation.enabled = True
+    engine = SyncEngine(config)
+    try:
+        engine.sync_source("docs", "full")
+        state = engine.state
+        kb_id = config.knowledge_base_id
+
+        # 25s dead: past the CI region's `run_stale_seconds` (20s), still
+        # inside the lease's own 45s window. That disagreement is the bug.
+        stopped = ago(25.0)
+        evaluation_store.open_run(
+            state,
+            run_id="run-killed",
+            kb_id=kb_id,
+            snapshot_id="kb-x",
+            started_at=ago(55.0),
+            mode="current_state",
+            config_digest="c",
+            owner="dead-host:1",
+            total_units=36,
+        )
+        evaluation_store.heartbeat_run(
+            state,
+            run_id="run-killed",
+            now=stopped,
+            phase="replay",
+            detail="anchor/B3",
+            completed_units=7,
+        )
+        state.conn.execute(
+            "INSERT INTO source_leases(source_id, owner, acquired_at, heartbeat_at) "
+            "VALUES(%s,%s,%s,%s) ON CONFLICT(source_id) DO UPDATE SET "
+            "owner=excluded.owner, acquired_at=excluded.acquired_at, "
+            "heartbeat_at=excluded.heartbeat_at",
+            (EVALUATION_LEASE, "dead-host:1", stopped, stopped),
+        )
+        state.conn.commit()
+
+        assert reclaim_interrupted_runs(state, kb_id, stale_after_seconds=20.0) == ["run-killed"]
+        assert evaluation_store.run_status(state, "run-killed")["status"] == "interrupted"
+        # The statement under test: on SQLite this row is gone. It has to be
+        # gone here too, or the resume the reclaim just advertised is a lie.
+        assert not state.rows(
+            "SELECT owner FROM source_leases WHERE source_id=%s", (EVALUATION_LEASE,)
+        )
+    finally:
+        engine.close()
