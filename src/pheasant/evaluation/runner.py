@@ -843,8 +843,13 @@ def run_evaluation(
                 report("replay", f"{cohort_name}/{variant.variant_id} (checkpointed)")
                 continue
             if spent >= budget or (time.monotonic() - started_clock) > deadline:
+                # Recorded, and deliberately *not* counted as a completed unit.
+                # Advancing here made a truncated run finish at 42/42 -- a
+                # progress bar reporting every replay done for a batch that
+                # skipped most of them, which is the mirror of the
+                # smaller-denominator sin this module refuses elsewhere. A
+                # truncated run stops short and the counter says where.
                 truncated[f"{cohort_name}:{variant.variant_id}"] = cohort.query_count
-                progress.advance()
                 continue
             report("replay", f"{cohort_name}/{variant.variant_id}")
             pair_started = time.monotonic()

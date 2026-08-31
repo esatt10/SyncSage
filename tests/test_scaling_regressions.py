@@ -1,16 +1,18 @@
-"""Four defects found by stressing the evaluation and memory planes, pinned.
+"""Defects found by stressing the evaluation and memory planes, pinned.
 
-Each of these was invisible to the offline suite and surfaced only by running
-the real thing -- a real Postgres server, a real SIGKILL, a real ``/exports``
-volume -- which is CLAUDE.md rule 10 doing its job. Each is pinned here at the
-level the offline suite *can* reach, with the backend-specific half marked and
-skipped when there is no server.
+Each was invisible to the offline suite and surfaced only by running the real
+thing -- a real Postgres server, a real SIGKILL, a real ``/exports`` volume,
+two writes a second apart -- which is CLAUDE.md rule 10 doing its job. Each is
+pinned here at the level the offline suite *can* reach, with the
+backend-specific half marked and skipped when there is no server.
 
-They share a shape worth naming: all four are failures of a **scaling** path
-(a connection pool, a fleet's run identity, a retention tier, a liveness
-clock) that a single-container SQLite region never exercises, and three of the
-four are silent -- a timeout, a lying progress row, a report claiming rows were
-archived that were not.
+They share a shape worth naming. Four are failures of a **scaling** path (a
+connection pool, a fleet's run identity, a retention tier, a liveness clock)
+that a single-container SQLite region never exercises. And all but one are
+*silent*: a timeout, a lying progress row, a report claiming rows were archived
+that were not, a correction that stopped applying. Two are the same underlying
+mistake in different modules -- a wall-clock second treated as a semantic
+boundary -- which is why they are filed together.
 """
 
 from __future__ import annotations
@@ -402,3 +404,95 @@ def _utc_now() -> str:
     from datetime import UTC, datetime
 
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+# --------------------------------------------------------------------------
+# 5. Re-asserting an archived claim is decided by content, not by the clock
+# --------------------------------------------------------------------------
+
+
+def test_reviving_an_archived_record_keeps_its_identity(tmp_path: Path) -> None:
+    """A correction must not be defeated by a second boundary.
+
+    Consolidation archives a superseded record on the very next pass under the
+    default `supersede_retention_days: 0`. Re-asserting that same text later --
+    a person, an agent, a re-import; `memory_write` is an open API and the old
+    wording is still what people say -- minted a *new* id, because the id
+    carries a wall-clock prefix and only the digest part is content-addressed.
+    The live correction names the *old* id, so it no longer applied: the
+    corrected claim came back **current, beside its own correction**, and
+    `current_only` returned both.
+
+    Re-asserted inside the same second it reused the id by luck and stayed
+    corrected. That is the tell -- identical operations, different memory,
+    decided by a boundary nobody means as a semantic one.
+    """
+
+    from pheasant.memory.store import MemoryStore
+
+    fact = "The gateway restarts nightly at 0300 UTC."
+    fix = "Correction: the gateway restarts nightly at 0400 UTC."
+
+    def sequence(gap_seconds: float) -> dict[str, Any]:
+        root = tmp_path / f"mem-{gap_seconds}"
+        root.mkdir(parents=True, exist_ok=True)
+        store = MemoryStore(root)
+        original, _ = store.append(fact, scope="org")
+        store.append(fix, scope="org", supersedes=original.record_id)
+        archived = store.consolidate(supersede_retention_days=0).archived_superseded
+        assert archived == (original.record_id,)
+        if gap_seconds:
+            import time
+
+            time.sleep(gap_seconds)
+        # A fresh reader, as another process or a later beat would be.
+        revived, _ = MemoryStore(root).append(fact, scope="org")
+        current = MemoryStore(root).list_records(current_only=True)
+        return {
+            "original_id": original.record_id,
+            "revived_id": revived.record_id,
+            "current": sorted(record.text for record in current),
+        }
+
+    same_second = sequence(0.0)
+    next_second = sequence(1.2)
+
+    # The revived record is the same assertion, so it keeps the same id --
+    # which is also what keeps it one `memory_record` node and one
+    # `supersedes` edge rather than two.
+    for outcome in (same_second, next_second):
+        assert outcome["revived_id"] == outcome["original_id"]
+        assert outcome["current"] == [fix], outcome["current"]
+
+    # And the whole point: the clock does not decide.
+    assert same_second["current"] == next_second["current"]
+
+
+def test_reviving_an_archived_record_nothing_corrected_still_makes_it_current(
+    tmp_path: Path,
+) -> None:
+    """The other half, so the fix does not quietly bury a legitimate revival.
+
+    A TTL-expired record is archived without being superseded. Re-asserting it
+    brings it back *and* it is current, because nothing corrected it -- which
+    is the behaviour `append` documents.
+    """
+
+    from pheasant.memory.store import MemoryStore
+
+    root = tmp_path / "ttl"
+    root.mkdir(parents=True, exist_ok=True)
+    store = MemoryStore(root)
+    text = "The planner packs whole sources per region."
+    original, _ = store.append(text, scope="org")
+    MemoryStore.archive(original)
+    assert original.path.with_suffix(".md.archived").exists()
+    assert MemoryStore(root).list_records() == []
+
+    import time
+
+    time.sleep(1.2)
+    revived, created = MemoryStore(root).append(text, scope="org")
+    assert created is True
+    assert revived.record_id == original.record_id
+    assert [record.text for record in MemoryStore(root).list_records(current_only=True)] == [text]
