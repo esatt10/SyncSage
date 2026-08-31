@@ -1,0 +1,94 @@
+# The evaluation plane across a container boundary, against a real database.
+#
+# Two things an in-process test cannot show, and both are the whole reason the
+# run's progress is a row rather than an object:
+#
+#   1. An `api` replica that did **not** start a batch can still watch it, and
+#      can close out one whose container has stopped.
+#   2. A batch killed mid-replay resumes from its checkpoints when the
+#      container comes back — rather than starting over, or worse, leaving
+#      `status='running'` forever with nobody to reclaim it.
+#
+# Container-only behaviour has bitten this repository four separate times, and
+# "the process was killed" is not a state a mock reproduces honestly.
+name: pheasant-evaluation-ci
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pheasant
+      POSTGRES_PASSWORD: pheasant
+      POSTGRES_DB: pheasant
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pheasant"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # One migrator, before anything serves — replaying the schema from several
+  # processes at once deadlocks PostgreSQL catalog locks against ordinary
+  # writes. It indexes the corpus too, because no other service here does.
+  db-init:
+    image: ${PHEASANT_IMAGE:-pheasant:ci}
+    restart: "no"
+    entrypoint: ["python", "-c"]
+    command:
+      - "from pathlib import Path; from pheasant.cli import _engine; engine = _engine(Path('/config/pheasant.yaml')); engine.sync_source('docs', 'full'); engine.close()"
+    environment: &env
+      PHEASANT_CONFIG: /config/pheasant.yaml
+      PHEASANT_DATABASE_URL: postgresql://pheasant:pheasant@postgres:5432/pheasant
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes: &mounts
+      - ./pheasant.evaluation.yaml:/config/pheasant.yaml:ro
+      # Shared with the log-tier topology. That one asserts on ledger rows
+      # rather than on retrieval results, so adding documents here for the
+      # evaluation scenario does not affect it — but the sharing is worth
+      # knowing before anyone removes a file.
+      - ./corpus:/workspace/corpus:ro
+      - state:/state
+      - exports:/exports
+
+  # The watcher. Never starts a batch in this test; it only reads
+  # `/evaluation/status`, which is exactly the browser's position.
+  api:
+    image: ${PHEASANT_IMAGE:-pheasant:ci}
+    command: ["serve", "--role", "api"]
+    environment: *env
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8770:8765"
+    volumes: *mounts
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  # The runner, started and killed by the smoke script. `restart: "no"` because
+  # the script controls its lifecycle: an automatic restart would resume the
+  # batch before the test could observe the interrupted state.
+  runner:
+    image: ${PHEASANT_IMAGE:-pheasant:ci}
+    restart: "no"
+    entrypoint: ["python", "/scripts/run_evaluation.py"]
+    environment: *env
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./pheasant.evaluation.yaml:/config/pheasant.yaml:ro
+      - ./corpus:/workspace/corpus:ro
+      - ./scripts:/scripts:ro
+      - state:/state
+      - exports:/exports
+
+volumes:
+  state:
+  exports:

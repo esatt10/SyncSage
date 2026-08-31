@@ -525,6 +525,122 @@ assistant:
   #    expand_graph: true
   #    max_context_passages: 10
 
+# Knowledge-effectiveness evaluation (optional, off by default, read-only).
+#
+# Replays cohorts of recorded queries through the *real* search path against a
+# corpus-only baseline and the memory system, then reports what changed with
+# the evidence and the denominator attached. It publishes no single "accuracy"
+# score — what comes out is a health vector plus hard gates for ACL leakage,
+# stale-fact leakage and temporal correctness.
+#
+# Everything it writes lands in the `evaluation_*` tables and is never indexed,
+# never chunked and never returned by a search: a region must not retrieve its
+# own measurements as knowledge.
+#
+# Needs `observability.interactions.enabled` above to have queries worth
+# replaying. Without it the cohorts are empty and every demonstrated metric
+# reports `insufficient_evidence` rather than zero.
+#
+# Fleet-safe: a run claims the `__evaluation__` lease (so N API replicas
+# produce one run, not N) and never runs inside the scheduler's sync lock.
+#
+# See docs/knowledge-effectiveness.md.
+evaluation:
+  enabled: false
+  # Fire on the scheduler beat when the snapshot manifest shows a material
+  # change. Off: a run costs one search per query per variant, which is real
+  # work to start doing on a timer without being asked.
+  on_material_snapshot: false
+  minimum_interval_seconds: 3600
+  max_results: 10
+  mode: hybrid
+  maximum_queries_per_run: 500
+  maximum_runtime_seconds: 900
+  maximum_stored_per_query_results: 200
+  # How long a running batch may go without a heartbeat before another process
+  # marks it `interrupted`. A knob because the right value depends on how long
+  # one (cohort, variant) replay takes here. Too low reclaims a slow-but-healthy
+  # batch out from under itself; too high shows a spinner for a stopped
+  # container longer than it needs to. Reclamation runs at API boot and on the
+  # scheduler beat, and a reclaimed run *resumes* from its checkpoints.
+  run_stale_seconds: 90.0
+  retrieval_diagnostics: false
+  binary_preference: false
+  # Empty means no composite is published at all — the specification's
+  # "no default universal accuracy score". Configured, it is a weighted
+  # geometric mean that excludes (never zero-fills) missing components.
+  composite_weights: {}
+  proof:
+    # The three defaults that decide what every metric below *means*.
+    #   unknown_is_negative: on, precision improves whenever the region
+    #     returns FEWER results — it counts what was never shown as a failure.
+    #   non_selection_is_negative: the reader may have found the answer at
+    #     rank one and stopped. Silence is not evidence.
+    #   temporal_decay_enabled: nobody should discover that a year-old
+    #     conclusive test result quietly stopped counting.
+    unknown_is_negative: false
+    non_selection_is_negative: false
+    temporal_decay_enabled: false
+    temporal_half_life_days: 180.0
+    # Net weight below which a target is neither a known positive nor a known
+    # negative. Not zero: one weak citation is not a "known positive".
+    positive_floor: 0.2
+    minimum_eligible_queries: 10
+    minimum_evidenced_queries: 5
+    minimum_independent_interactions: 5
+    maximum_single_query_proof_share: 0.5
+  cohorts:
+    anchor: true
+    anchor_minimum_queries: 20
+    rolling: true
+    rolling_lookback_days: 30
+    learned: true
+    temporal_holdout: true
+    # How long a holdout must stay independent is an open policy decision;
+    # a hidden non-zero default would be answering it on your behalf.
+    holdout_minimum_separation_days: 0.0
+    holdout_minimum_queries: 5
+    control: true
+    control_minimum_queries: 10
+    synthetic_invariants: true
+    maximum_queries_per_cohort: 200
+  # The ablation matrix. B0 (corpus baseline) is not listed because it is not
+  # optional: every attribution number is a paired difference against it.
+  variants:
+    memory_content: true       # B1
+    alias_only: true           # B2
+    preference_only: true      # B3
+    exclusion_only: true       # B4
+    full_memory: true          # B5
+    candidate_shadow: true     # B6
+    leave_one_memory_out: false
+    leave_one_cluster_out: false
+  # Evaluated BEFORE any aggregation, so a failure cannot be averaged away.
+  gates:
+    acl_leak_maximum: 0
+    stale_current_leak_maximum: 0
+    temporal_invariant_failures_maximum: 0
+    known_positive_exclusion_maximum: 0
+    abstention_failures_maximum: 0
+    control_regression_tolerance: 0.0
+    negative_exposure_increase_tolerance: 0.0
+    incomplete_snapshot_blocks_run: true
+  promotion:
+    # Off: the same decisions are computed and recorded and nothing is
+    # applied. Read a month of them before letting any take effect.
+    enabled: false
+    require_shadow_replay: true
+    require_all_hard_gates: true
+    minimum_independent_queries: 3
+    minimum_temporal_holdout_queries: 1
+    minimum_target_metric_gain: 0.0
+    maximum_control_regression: 0.0
+    maximum_negative_exposure_increase: 0.0
+    # The anti-self-reward rule. A candidate that improves only the query that
+    # created it has demonstrated recall of its own evidence and nothing else.
+    allow_originating_query_only_promotion: false
+    insufficient_evidence_action: retain_candidate
+
 sources:
   - name: pheasant-repo
     type: repository

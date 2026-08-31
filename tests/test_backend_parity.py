@@ -788,3 +788,286 @@ def test_compaction_and_scope_budgets_run_against_postgres(tmp_path: Path) -> No
         assert not again.get("compaction", {}).get("subsumed")
     finally:
         tools.engine.close()
+
+
+@postgres
+def test_the_evaluation_plane_runs_a_whole_batch_against_postgres(tmp_path: Path) -> None:
+    """Every statement the evaluation plane writes, against the real server.
+
+    This backend has caught three portability bugs the offline suite had no
+    opinion about — a declared FK a maintenance path deliberately violates, a
+    discarded ``rowcount``, and one SQLite-only ``INSERT OR IGNORE``. The
+    evaluation plane adds five tables and a dozen statements to the same
+    surface, so it gets the same treatment: a complete batch, then a *second*
+    one over unchanged state to prove the ``ON CONFLICT DO NOTHING`` idempotency
+    is real rather than an accident of two runs landing in the same second.
+    """
+
+    import pheasant.evaluation as evaluation
+    from pheasant.evaluation import store as evaluation_store
+    from pheasant.sync.log_queue import write_events
+    from pheasant.telemetry.interactions import InteractionEvent
+
+    _reset(DSN)
+    workspace = _corpus(tmp_path)
+    config = _config(tmp_path, workspace, "postgres")
+    config.evaluation.enabled = True
+    config.evaluation.proof.minimum_eligible_queries = 1
+    config.evaluation.proof.minimum_evidenced_queries = 1
+    config.evaluation.proof.minimum_independent_interactions = 1
+    config.evaluation.proof.maximum_single_query_proof_share = 1.0
+    config.evaluation.cohorts.anchor_minimum_queries = 2
+
+    engine = SyncEngine(config)
+    try:
+        engine.sync_source("docs", "full")
+        state = engine.state
+        artifacts = {
+            str(row["relative_path"]): str(row["id"])
+            for row in state.rows("SELECT id, relative_path FROM artifacts")
+        }
+
+        queries = [
+            "how do I deploy the gateway",
+            "when does the gateway restart",
+            "who generates invoices",
+            "where is the rollout script",
+        ]
+        write_events(
+            state,
+            [
+                InteractionEvent(
+                    kb_id=config.knowledge_base_id,
+                    operation="/search",
+                    modality="ui",
+                    principal="user:ada",
+                    session_id=f"s{index % 2}",
+                    trace_id=f"{index:032x}",
+                    span_id=f"{index:016x}",
+                    started_at=f"2026-01-01T00:00:{index:02d}.000000Z",
+                    status="ok",
+                    duration_ms=7.0,
+                    query_text=query,
+                    result_paths=["runbook.md"],
+                    result_ids=[artifacts["runbook.md"]],
+                    result_count=1,
+                    top_score=0.7,
+                )
+                for index, query in enumerate(queries)
+            ],
+        )
+        for index, (query, path, event) in enumerate(
+            [
+                (queries[0], "deploy-gateway.md", "explicit_accept"),
+                (queries[0], "notes.md", "explicit_reject"),
+                (queries[1], "runbook.md", "selected"),
+                (queries[2], "billing.md", "downstream_success"),
+            ]
+        ):
+            evaluation.record_evidence(
+                state,
+                config,
+                query=query,
+                target_id=artifacts[path],
+                event_type=event,
+                principal="user:ada",
+                session_id=f"s{index % 2}",
+                interaction_id=f"call-{index}",
+            )
+
+        first = evaluation.run(engine)
+        assert first.status == "completed"
+        assert first.gates_passed, [g.as_dict() for g in first.gates if not g.passed]
+        assert first.report["health_vector"]["evidence_coverage"]["value"]
+
+        # Idempotency across a repeat run: one snapshot row, one run row, no
+        # duplicated proof, and the metric rows re-derive their own
+        # content-addressed ids rather than piling up a second identical set.
+        metric_rows = state.rows("SELECT COUNT(*) AS c FROM evaluation_metrics")[0]["c"]
+        second = evaluation.run(engine)
+        assert second.snapshot_id == first.snapshot_id
+        assert second.run_id == first.run_id
+        assert state.rows("SELECT COUNT(*) AS c FROM evaluation_snapshots")[0]["c"] == 1
+        assert state.rows("SELECT COUNT(*) AS c FROM evaluation_proofs")[0]["c"] == 4
+        assert state.rows("SELECT COUNT(*) AS c FROM evaluation_metrics")[0]["c"] == metric_rows
+
+        # A retry that names its interaction is a no-op, not a second judgment.
+        evaluation.record_evidence(
+            state,
+            config,
+            query=queries[0],
+            target_id=artifacts["deploy-gateway.md"],
+            event_type="explicit_accept",
+            principal="user:ada",
+            session_id="s0",
+            interaction_id="call-0",
+        )
+        assert state.rows("SELECT COUNT(*) AS c FROM evaluation_proofs")[0]["c"] == 4
+
+        # Every read surface, against the real dialect: the trend join, the
+        # report fetch, the run listing and the cohort listing.
+        assert evaluation.latest_report(state, config.knowledge_base_id) is not None
+        assert len(evaluation_store.list_runs(state, config.knowledge_base_id)) == 1
+        assert len(evaluation_store.list_cohorts(state, config.knowledge_base_id)) >= 4
+        assert evaluation.trend(
+            state,
+            config.knowledge_base_id,
+            "known_positive_reciprocal_rank",
+            cohort_name="anchor",
+            variant_id="B5",
+        )
+    finally:
+        engine.close()
+
+
+@postgres
+def test_the_evaluation_progress_columns_reach_a_pre_existing_postgres_table(
+    tmp_path: Path,
+) -> None:
+    """The additive-column case, on the backend that returns early from
+    ``migrate()``.
+
+    Two traps in one, and both have bitten this file before. A column stated in
+    only the SQLite path exists on exactly one backend. And a marker written
+    before the column existed makes Postgres skip the whole DDL block unless
+    the ``required`` map names the *newest* column rather than just the table.
+
+    The `/state` this rewinds to is the shape ``evaluation_runs`` shipped in,
+    which is what any deployment that ran the plane before progress was durable
+    actually has.
+    """
+
+    from pheasant.persistence.paths import StatePaths
+    from pheasant.persistence.state_store import SCHEMA_VERSION, StateStore
+
+    _reset(DSN)
+    config = _config(tmp_path, _corpus(tmp_path), "postgres")
+    paths = StatePaths.from_config(config)
+    paths.ensure()
+    state = StateStore.from_config(config, paths.sqlite)
+    try:
+        state.migrate()
+        # Rewind to the pre-progress shape, with a row in it, and stamp the
+        # schema marker as current so nothing but the `required` map can notice.
+        state.conn.execute("DROP TABLE IF EXISTS evaluation_runs")
+        state.conn.execute(
+            "CREATE TABLE evaluation_runs ("
+            "run_id TEXT PRIMARY KEY, kb_id TEXT NOT NULL, snapshot_id TEXT NOT NULL, "
+            "started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, "
+            "mode TEXT NOT NULL DEFAULT 'current_state', config_digest TEXT NOT NULL, "
+            "gates_passed INTEGER NOT NULL DEFAULT 1, report_json TEXT)"
+        )
+        state.conn.execute(
+            "INSERT INTO evaluation_runs(run_id, kb_id, snapshot_id, started_at, status, "
+            "config_digest) VALUES('run-legacy','parity','kb-x','2026-01-01T00:00:00Z',"
+            "'completed','c')"
+        )
+        state.conn.execute(
+            "INSERT INTO pheasant_schema_meta(key, value, updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("core", SCHEMA_VERSION, "2026-01-01T00:00:00Z"),
+        )
+        state.conn.commit()
+        before = state.backend.table_columns("evaluation_runs")
+        assert "heartbeat_at" not in before
+
+        state.migrate()
+
+        after = state.backend.table_columns("evaluation_runs")
+        assert {"phase", "heartbeat_at", "attempts", "total_units"} <= set(after)
+        # The row that was already there survives the widening.
+        row = dict(state.rows("SELECT * FROM evaluation_runs WHERE run_id='run-legacy'")[0])
+        assert row["status"] == "completed"
+
+        # And a progress write — the thing that would otherwise fail with a
+        # missing column on every heartbeat — now works.
+        from pheasant.evaluation import store as evaluation_store
+
+        evaluation_store.heartbeat_run(
+            state,
+            run_id="run-legacy",
+            now="2026-02-02T00:00:00Z",
+            phase="replay",
+            completed_units=3,
+        )
+        status = evaluation_store.run_status(state, "run-legacy")
+        assert status is not None
+        assert status["phase"] == "replay"
+        assert status["completed_units"] == 3
+    finally:
+        state.close()
+
+
+@postgres
+def test_a_killed_batch_frees_its_lease_on_postgres(tmp_path: Path) -> None:
+    """The recovery CI found, on the dialect that has broken three others.
+
+    ``DELETE ... RETURNING`` is the fourth statement shape this plane asks of
+    both backends, and the previous three portability bugs here were each a
+    statement that ran on SQLite and did something else — or nothing — on the
+    real server. So the whole sequence runs against Postgres: a batch that was
+    killed without releasing its lease, the reclaim that frees it, and the
+    resume that then actually happens instead of reporting ``skipped``.
+    """
+
+    from datetime import UTC, datetime, timedelta
+
+    from pheasant.evaluation import store as evaluation_store
+    from pheasant.evaluation.runner import EVALUATION_LEASE, reclaim_interrupted_runs
+
+    def ago(seconds: float) -> str:
+        return (
+            (datetime.now(UTC) - timedelta(seconds=seconds))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+
+    _reset(DSN)
+    config = _config(tmp_path, _corpus(tmp_path), "postgres")
+    config.evaluation.enabled = True
+    engine = SyncEngine(config)
+    try:
+        engine.sync_source("docs", "full")
+        state = engine.state
+        kb_id = config.knowledge_base_id
+
+        # 25s dead: past the CI region's `run_stale_seconds` (20s), still
+        # inside the lease's own 45s window. That disagreement is the bug.
+        stopped = ago(25.0)
+        evaluation_store.open_run(
+            state,
+            run_id="run-killed",
+            kb_id=kb_id,
+            snapshot_id="kb-x",
+            started_at=ago(55.0),
+            mode="current_state",
+            config_digest="c",
+            owner="dead-host:1",
+            total_units=36,
+        )
+        evaluation_store.heartbeat_run(
+            state,
+            run_id="run-killed",
+            now=stopped,
+            phase="replay",
+            detail="anchor/B3",
+            completed_units=7,
+        )
+        state.conn.execute(
+            "INSERT INTO source_leases(source_id, owner, acquired_at, heartbeat_at) "
+            "VALUES(%s,%s,%s,%s) ON CONFLICT(source_id) DO UPDATE SET "
+            "owner=excluded.owner, acquired_at=excluded.acquired_at, "
+            "heartbeat_at=excluded.heartbeat_at",
+            (EVALUATION_LEASE, "dead-host:1", stopped, stopped),
+        )
+        state.conn.commit()
+
+        assert reclaim_interrupted_runs(state, kb_id, stale_after_seconds=20.0) == ["run-killed"]
+        assert evaluation_store.run_status(state, "run-killed")["status"] == "interrupted"
+        # The statement under test: on SQLite this row is gone. It has to be
+        # gone here too, or the resume the reclaim just advertised is a lie.
+        assert not state.rows(
+            "SELECT owner FROM source_leases WHERE source_id=%s", (EVALUATION_LEASE,)
+        )
+    finally:
+        engine.close()

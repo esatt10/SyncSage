@@ -4,6 +4,7 @@ import { JobsTray } from "./components/JobsTray";
 import { Notebook } from "./pages/Notebook";
 import { GraphPage } from "./pages/GraphPage";
 import { MemoryPage } from "./pages/MemoryPage";
+import { EvaluationPage } from "./pages/EvaluationPage";
 import { SourcesPage } from "./pages/SourcesPage";
 import { ConfigPage } from "./pages/ConfigPage";
 import { SessionProvider } from "./state/session";
@@ -27,6 +28,7 @@ export function App() {
             <Route path="/" element={<Notebook />} />
             <Route path="/graph" element={<GraphPage />} />
             <Route path="/memory" element={<MemoryPage />} />
+            <Route path="/evaluation" element={<EvaluationPage />} />
             <Route path="/sources" element={<SourcesPage />} />
             <Route path="/config" element={<ConfigPage />} />
           </Routes>

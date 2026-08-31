@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING
 
 from pheasant.config.schema import PheasantConfig
@@ -53,6 +54,11 @@ class SchedulerService:
         self.log_upkeep = bool(log_upkeep)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        #: Monotonic clock of the last evaluation run this process started, so
+        #: ``evaluation.minimum_interval_seconds`` is enforced here rather than
+        #: leaving a corpus under active indexing -- which changes materially
+        #: on every beat -- to fire a run every beat.
+        self._last_evaluation: float = 0.0
 
     def _log_upkeep(self) -> None:
         """Drain and roll the observation ledger, when nobody else will.
@@ -95,6 +101,97 @@ class SchedulerService:
             run_log_maintenance(state, config)
         except Exception:  # noqa: BLE001 - telemetry must never break the beat
             logger.debug("Observation-ledger upkeep failed", exc_info=True)
+
+    def _evaluation_upkeep(self) -> None:
+        """Run an effectiveness batch when the region has materially changed.
+
+        **Deliberately outside ``sync_lock``**, like :meth:`_log_upkeep` and for
+        the same reason: the beat holds that lock across all its work, and a
+        replay of several hundred queries inside it would stall incremental
+        sync for every source in the region. A batch is read-only search
+        traffic and has no business blocking writes.
+
+        Cheap when there is nothing to do. The manifest is built from digests
+        over already-indexed rows, and :func:`material_change` compares it to
+        the previous snapshot: counts drifting is not material, only content,
+        graph, retrieval-configuration, memory or ACL-policy digests moving.
+        A corpus under active indexing does change materially every beat, which
+        is what ``minimum_interval_seconds`` is for.
+
+        The run itself claims the evaluation lease, so in a fleet the fact that
+        several processes reach this line produces one run rather than several.
+
+        Never raises: this is measurement, and the beat's next line is a sync.
+        """
+
+        config = self.engine.config
+        settings = getattr(config, "evaluation", None)
+        if settings is None or not settings.enabled:
+            return
+        # Reclamation runs whenever evaluation is on at all, even when the
+        # automatic trigger is off: a batch someone started by hand from the UI
+        # or the CLI is exactly as capable of being killed with its container,
+        # and leaving that row saying `running` forever would show a spinner
+        # nobody will ever stop.
+        try:
+            from pheasant.evaluation.runner import reclaim_interrupted_runs
+
+            reclaim_interrupted_runs(
+                self.engine.state,
+                config.knowledge_base_id,
+                stale_after_seconds=settings.run_stale_seconds,
+            )
+        except Exception:  # noqa: BLE001 - recovery must never break the beat
+            logger.debug("Evaluation reclamation failed", exc_info=True)
+        if not settings.on_material_snapshot:
+            return
+        now = time.monotonic()
+        if self._last_evaluation and (now - self._last_evaluation) < float(
+            settings.minimum_interval_seconds
+        ):
+            return
+        try:
+            from pheasant.evaluation import runner as evaluation_runner
+            from pheasant.evaluation import snapshots as evaluation_snapshots
+            from pheasant.evaluation import store as evaluation_store
+
+            state = self.engine.state
+            manifest = evaluation_snapshots.build_snapshot(
+                state,
+                config,
+                graph=getattr(self.engine.graph_builder, "graph", None),
+            )
+            # A snapshot id is a digest of the state, so its mere *presence*
+            # answers the question: this exact region has already been
+            # evaluated and there is nothing new to say. Asking
+            # `previous_snapshot` here instead would exclude the current id and
+            # compare against the state before it -- reporting a change on every
+            # beat after a run, and firing a batch as often as the interval
+            # allowed.
+            if evaluation_store.load_snapshot(state, manifest.snapshot_id) is not None:
+                return
+            previous = evaluation_store.previous_snapshot(
+                state,
+                config.knowledge_base_id,
+                before=manifest.created_at,
+                exclude=manifest.snapshot_id,
+            )
+            changed = evaluation_snapshots.material_change(previous, manifest)
+            if not changed:
+                return
+            self._last_evaluation = now
+            outcome = evaluation_runner.run_evaluation(self.engine)
+            if outcome.status == "skipped":
+                logger.debug("Evaluation skipped: %s", outcome.skipped_reason)
+            else:
+                logger.info(
+                    "Evaluation run %s finished (%s); gates %s",
+                    outcome.run_id,
+                    outcome.status,
+                    "passed" if outcome.gates_passed else "FAILED",
+                )
+        except Exception:  # noqa: BLE001 - measurement must never break the beat
+            logger.debug("Evaluation upkeep failed", exc_info=True)
 
     @property
     def running(self) -> bool:
@@ -156,3 +253,7 @@ class SchedulerService:
             # `max_rows_per_pass` on top, so a backlog costs several beats
             # rather than one long one. No-ops fast when observation is off.
             self._log_upkeep()
+            # Same posture, same reason: outside `sync_lock`, bounded by its
+            # own interval, and a no-op unless the region has materially
+            # changed. See `_evaluation_upkeep`.
+            self._evaluation_upkeep()

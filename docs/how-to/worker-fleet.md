@@ -289,3 +289,8 @@ during an atomic refresh.
 - [Speed up indexing](indexing-performance.md) — worker counts and executors.
 - [Monitor indexing](monitor-indexing.md) — throughput, ETA, stall detection.
 - [Capacity planning](capacity-planning.md) — when one region should become several.
+- [Knowledge effectiveness](../knowledge-effectiveness.md) — the read-side
+  evaluation plane. It claims the `__evaluation__` lease so N replicas produce
+  one run, never takes `sync_lock`, and only auto-triggers where the scheduler
+  runs (`all`, `indexer`) — an `api` replica must not spend its budget replaying
+  cohorts.

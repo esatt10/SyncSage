@@ -1,6 +1,18 @@
 # /state: SQLite (unused here — this fleet is on Postgres), the knowledge
 # graph, manifests, snapshots and vectors.
 #
+# With `evaluation.enabled` this also holds the evaluation plane, which grows
+# on a different axis from the corpus: cohort size times the ablation matrix,
+# not file count. Size it with `pheasant scan`, which reports the steady state
+# and the *peak* separately — the peak is replay checkpoints held while a batch
+# is in flight and deleted when it completes, so it is free space the volume
+# must have rather than space it fills. See
+# docs/how-to/capacity-planning.md#sizing-the-evaluation-plane.
+#
+# RWX matters for the same reason it does for the graph: an api replica serves
+# `/evaluation/status` for a batch an indexer is running, and it reads that
+# progress out of this volume.
+#
 # ReadWriteMany is a HARD requirement, not a preference. The graph is a file
 # the indexer writes and every api replica reads; with ReadWriteOnce the
 # volume attaches to one node, so api replicas scheduled elsewhere cannot

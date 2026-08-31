@@ -210,6 +210,214 @@ BYTES_PER_INTERACTION_EVENT = 950
 BYTES_PER_CHAT_INTERACTION = 2200
 
 
+#: ``/state`` bytes per stored proof row. A proof is short and fixed-shape --
+#: two ids, an event name, a weight, a partition token and a multiplier bag --
+#: so this is dominated by SQLite's per-row overhead and its three indexes
+#: rather than by the payload. Rounded up from the measured row size on the
+#: parity corpus, because being 30% over on a row this small costs nothing and
+#: being under is what makes a volume fill.
+BYTES_PER_EVALUATION_PROOF = 420
+
+#: ``/state`` bytes per stored metric row. Much larger than a proof row,
+#: because the payload is the whole explanation contract: the formula, the
+#: substituted calculation, the operands, the proof references and the
+#: limitation. That is the *point* -- a metric without them is not publishable
+#: -- so the cost is a design decision rather than an overhead to trim.
+#:
+#: Per-query rows dominate the count; an aggregate is roughly the same size.
+BYTES_PER_EVALUATION_METRIC = 2200
+
+#: ``/state`` bytes per run's stored report. The thirteen required sections,
+#: including all three explanation projections. Grows with the *cohort* count
+#: rather than with the corpus, so it is flat for a region of any size.
+BYTES_PER_EVALUATION_REPORT = 120_000
+
+#: ``/state`` bytes per checkpointed (cohort, variant) replay, per query in
+#: that cohort. Transient: the checkpoints exist so a restarted batch does not
+#: replay from zero, and they are deleted when the run completes. They are
+#: sized here anyway because the peak matters -- a volume has to hold them
+#: while the run is in flight.
+#:
+#: **Measured 761** by ``python -m pheasant.evaluation.benchmark`` (432 replays
+#: peaking at 328,956 bytes of `results_json`); rounded up. The first value
+#: here was 260, a guess that understated the peak by 3x -- which is the
+#: dangerous direction, because it is the number that decides whether a volume
+#: fills mid-run.
+BYTES_PER_REPLAY_CHECKPOINT_QUERY = 800
+
+#: Seconds per (query, variant) replay, single process, embeddings off. One
+#: replay is one `search_context` through the real hybrid path plus the metric
+#: bookkeeping.
+#:
+#: **Measured 0.0056** by ``python -m pheasant.evaluation.benchmark`` on a
+#: 30-file synthetic corpus; the value below is rounded up to cover a larger
+#: index, where the lexical arm's own cost grows. Treat it as a floor: a
+#: corpus with a real vector arm pays an embedding call per replay on top, and
+#: that cost is the provider's rather than pheasant's.
+#:
+#: **The dominant term in a run's cost, and the only one worth tuning.** A
+#: batch is `queries x variants x cohorts` of these, which is why
+#: `maximum_queries_per_run` exists and why the honest way to scale evaluation
+#: is fewer queries or a longer interval rather than more workers -- see
+#: `docs/knowledge-effectiveness.md` on why replay is not distributed.
+SECONDS_PER_QUERY_VARIANT = 0.008
+
+#: Multiplier when the vector arm is enabled with a real embedding provider.
+#: **Deliberately not measured**, for the same reason
+#: :data:`EMBEDDING_SLOWDOWN` is not: a network embedder's throughput is the
+#: provider's rate limit, not pheasant's, and every replayed query pays one
+#: embedding call. Recorded as a documented unknown.
+EVALUATION_EMBEDDING_SLOWDOWN: float | None = None
+
+
+@dataclass(frozen=True)
+class EvaluationProjection:
+    """What one evaluation batch costs, and what it leaves behind.
+
+    Separated from :class:`Projection` because it scales on a different axis:
+    a corpus projection grows with *files*, and this grows with *cohort size
+    times the ablation matrix*. A region with a million files and forty
+    recorded queries has a large index and a trivial evaluation; the reverse
+    is equally possible, and one number covering both would describe neither.
+    """
+
+    queries: int
+    variants: int
+    cohorts: int
+    replays: int
+    run_seconds: float
+    peak_checkpoint_bytes: int
+    state_bytes_per_run: int
+    state_bytes_per_year: int
+    recommended_memory: str
+    warnings: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "queries_per_cohort": self.queries,
+            "variants": self.variants,
+            "cohorts": self.cohorts,
+            "replays_per_run": self.replays,
+            "projected_run_seconds": round(self.run_seconds, 1),
+            "projected_run_minutes": round(self.run_seconds / 60, 1),
+            "peak_checkpoint_bytes": self.peak_checkpoint_bytes,
+            "peak_checkpoint_mb": round(self.peak_checkpoint_bytes / (1024 * 1024), 1),
+            "state_bytes_per_run": self.state_bytes_per_run,
+            "state_mb_per_run": round(self.state_bytes_per_run / (1024 * 1024), 1),
+            "state_bytes_per_year": self.state_bytes_per_year,
+            "state_gb_per_year": round(self.state_bytes_per_year / 1e9, 2),
+            "recommended_memory": self.recommended_memory,
+            "warnings": list(self.warnings),
+        }
+
+
+def project_evaluation(
+    queries_per_cohort: int,
+    *,
+    variants: int = 6,
+    cohorts: int = 6,
+    runs_per_day: float = 1.0,
+    proofs_per_query: float = 2.0,
+    embeddings_enabled: bool = False,
+    per_query_metric_rows: int = 3,
+    max_stored_per_query_results: int = 200,
+) -> EvaluationProjection:
+    """Size an evaluation batch: how long it runs and what it stores.
+
+    The defaults describe the shipped configuration -- the six-variant matrix
+    over six cohorts -- so a caller who knows only their cohort size gets a
+    useful answer. ``runs_per_day`` is what turns a per-run cost into a volume
+    requirement, and it is the number most operators get wrong: evaluation is
+    triggered by *material change*, so a region indexing hourly can run one
+    per hour if it is left on that trigger.
+
+    Storage is split deliberately. ``peak_checkpoint_bytes`` is transient and
+    is what a volume must have *free* during a run; ``state_bytes_per_year``
+    is what accumulates. Reporting one number for both would either overstate
+    the steady state or understate the peak.
+
+    The storage figures are an **upper bound**, and knowingly so: per-query
+    metric rows exist only for queries that carry positive proof, and this
+    assumes every query does. A region where a quarter of queries are
+    evidenced -- which is the ordinary case -- will use roughly a quarter of
+    the projected steady state. Over-provisioning a volume is cheap; running
+    out of one mid-run is not, so the bound points that way on purpose.
+
+    ``per_query_metric_rows`` is 3 because three metrics emit per-query rows:
+    known-positive recall at 5 and at 10, and the reciprocal rank.
+    """
+
+    queries = max(0, int(queries_per_cohort))
+    variants = max(1, int(variants))
+    cohorts = max(1, int(cohorts))
+    replays = queries * variants * cohorts
+
+    run_seconds = replays * SECONDS_PER_QUERY_VARIANT
+    warnings: list[str] = []
+    if embeddings_enabled:
+        warnings.append(
+            "Embeddings are on: every replayed query makes an embedding call, so the run "
+            "time above is a floor bounded by your provider's rate limit, not by pheasant. "
+            "No multiplier is applied because a measured one would describe the stub."
+        )
+
+    # Metric rows: per-query rows for the demonstrated metrics on every
+    # (cohort, variant), plus a much smaller number of aggregates.
+    #
+    # Capped by `evaluation.maximum_stored_per_query_results`, because the
+    # runner is: a model that ignored its own configuration knob would
+    # overstate a large cohort by the ratio between its size and that cap,
+    # which is exactly the case where the number matters.
+    stored_per_metric = min(queries, max(0, int(max_stored_per_query_results)))
+    metric_rows = stored_per_metric * per_query_metric_rows * variants * cohorts
+    metric_rows += variants * cohorts * 24
+    state_per_run = (
+        metric_rows * BYTES_PER_EVALUATION_METRIC
+        + BYTES_PER_EVALUATION_REPORT
+        + queries * cohorts * 400  # the frozen cohort membership
+    )
+    # Proof is written by *traffic*, not by runs, so it is counted once per
+    # year rather than once per run -- the same distinction the observation
+    # plane makes, and the reason the two are sized apart.
+    proof_bytes = int(queries * proofs_per_query * BYTES_PER_EVALUATION_PROOF)
+    per_year = int(state_per_run * max(0.0, runs_per_day) * 365) + proof_bytes
+
+    # Every pair holds one result list per query in its cohort, and they all
+    # coexist until the run completes and clears them. This is the free space a
+    # volume must have *during* a run, which is a different question from what
+    # it accumulates.
+    peak_checkpoints = replays * BYTES_PER_REPLAY_CHECKPOINT_QUERY
+
+    if per_year > 20 * 1024**3:
+        warnings.append(
+            "Over 20 GiB of evaluation state a year at this rate. Lower "
+            "`evaluation.maximum_stored_per_query_results`, run less often, or prune old "
+            "runs -- the per-query rows are the audit trail, and they are most of this."
+        )
+    if run_seconds > 900:
+        warnings.append(
+            "A run projects past the default `maximum_runtime_seconds` (900s) and would be "
+            "truncated. Lower `maximum_queries_per_run`, or raise the budget deliberately."
+        )
+
+    # Replay holds one cohort's result lists at a time, plus the report. Small
+    # next to the graph, which is why an evaluation-capable process is sized by
+    # the corpus rather than by this -- but not zero, and worth stating.
+    rss = 256 * 1024**2 + replays * 4096
+    return EvaluationProjection(
+        queries=queries,
+        variants=variants,
+        cohorts=cohorts,
+        replays=replays,
+        run_seconds=run_seconds,
+        peak_checkpoint_bytes=peak_checkpoints,
+        state_bytes_per_run=state_per_run,
+        state_bytes_per_year=per_year,
+        recommended_memory=recommend_memory(rss),
+        warnings=tuple(warnings),
+    )
+
+
 def observation_state_bytes(
     events_per_day: int,
     retention_days: int,

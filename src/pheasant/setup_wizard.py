@@ -863,6 +863,93 @@ def build_sections() -> list[Section]:
             ],
         ),
         Section(
+            id="evaluation",
+            title="Knowledge-effectiveness evaluation",
+            blurb=(
+                "Optional, off by default, and read-only when on. A run replays "
+                "recorded queries against a corpus-only baseline and the memory "
+                "system, and reports what changed with the evidence and the "
+                "denominator attached. It never publishes a single 'accuracy' "
+                "score: what it produces is a health vector plus hard gates for "
+                "ACL leakage, stale-fact leakage and temporal correctness. "
+                "Needs the interaction ledger above to have something to replay."
+            ),
+            covers=("evaluation",),
+            questions=[
+                Question(
+                    key="evaluation.enabled",
+                    prompt="Measure knowledge effectiveness over time?",
+                    help=(
+                        "Replays cohorts of real queries through the real search "
+                        "path and writes evidence-bearing reports to /state. "
+                        "Nothing it writes is ever indexed or retrievable as "
+                        "knowledge."
+                    ),
+                    kind="bool",
+                    advanced=True,
+                ),
+                Question(
+                    key="evaluation.on_material_snapshot",
+                    prompt="Run automatically when the knowledge base changes materially?",
+                    help=(
+                        "Off by default: a run costs one search per query per "
+                        "variant, which is real work to start doing on a timer "
+                        "without being asked. It never runs inside the sync lock."
+                    ),
+                    kind="bool",
+                    when=lambda a: bool(a.get("evaluation.enabled")),
+                    advanced=True,
+                ),
+                Question(
+                    key="evaluation.max_results",
+                    prompt="Results fetched per query per variant",
+                    kind="int",
+                    when=lambda a: bool(a.get("evaluation.enabled")),
+                    advanced=True,
+                ),
+                Question(
+                    key="evaluation.maximum_queries_per_run",
+                    prompt="Ceiling on queries replayed in one run",
+                    help=(
+                        "A run past this is truncated and says which cohorts it "
+                        "dropped, rather than quietly reporting a smaller "
+                        "denominator as if it were the whole thing."
+                    ),
+                    kind="int",
+                    when=lambda a: bool(a.get("evaluation.enabled")),
+                    advanced=True,
+                ),
+                Question(
+                    key="evaluation.run_stale_seconds",
+                    prompt="Seconds a batch may go silent before it is called interrupted",
+                    help=(
+                        "A batch heartbeats while it works. Past this, another "
+                        "process marks it interrupted and the next run resumes "
+                        "from its checkpoints. Raise it if one replay here takes "
+                        "a long time; lower it to notice a stopped container "
+                        "sooner."
+                    ),
+                    kind="float",
+                    when=lambda a: bool(a.get("evaluation.enabled")),
+                    advanced=True,
+                ),
+                Question(
+                    key="evaluation.promotion.enabled",
+                    prompt="Let validated memory candidates be promoted automatically?",
+                    help=(
+                        "Off by default. On, a candidate is promoted only when "
+                        "every hard gate passes AND it improves later queries it "
+                        "was not derived from. Off, the same decisions are "
+                        "computed and recorded and nothing is applied — which is "
+                        "what to run first."
+                    ),
+                    kind="bool",
+                    when=lambda a: bool(a.get("evaluation.enabled")),
+                    advanced=True,
+                ),
+            ],
+        ),
+        Section(
             id="synapse",
             title="Synapse federation",
             blurb=(
@@ -937,8 +1024,11 @@ def build_phases(sections: list[Section] | None = None) -> list[Phase]:
         Phase(
             "operations-security",
             "Operations & security",
-            "Synchronization, the server surface, tracing, and filesystem safeguards.",
-            ("sync", "server", "observability", "security"),
+            (
+                "Synchronization, the server surface, tracing, effectiveness "
+                "measurement, and filesystem safeguards."
+            ),
+            ("sync", "server", "observability", "evaluation", "security"),
         ),
         Phase(
             "federation",

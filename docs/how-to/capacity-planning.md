@@ -272,6 +272,64 @@ The projection reflects *your* config — enabling embeddings adds the vector
 store to the disk figure — and warns when a corpus needs sharding rather than
 a bigger container. `--json` includes it as a `projection` object.
 
+## Sizing the evaluation plane
+
+`evaluation` scales on a **different axis** from the corpus: cohort size times
+the ablation matrix, not file count. A region with a million files and forty
+recorded queries has a large index and a trivial evaluation, and the reverse is
+equally possible — so one "how big should this be" number would describe
+neither, and `scan` reports it separately when evaluation is enabled:
+
+```console
+evaluation plane (region-wide)
+  at full cohorts (200 queries x 6 variants x 6 cohorts): 7,200 replays/run, ~1.0 min
+  storage: ~47 MB per run (~17.1 GB/yr at the configured cadence), 5.8 MB of replay
+           checkpoints in flight
+  suggested container memory for a batch: 0.5Gi
+```
+
+Three numbers, three different questions:
+
+| Number | What it is | What it decides |
+|---|---|---|
+| **replays/run, minutes** | `queries × variants × cohorts` real searches | Whether a batch fits `maximum_runtime_seconds` |
+| **MB per run / GB per year** | Metric rows and reports, which accumulate | How big the `/state` volume must be |
+| **checkpoint MB in flight** | Replay checkpoints, deleted when the run completes | How much the volume must have **free** during a run |
+
+The steady-state figure is an **upper bound**: per-query metric rows exist only
+for queries carrying positive proof, so a region where a quarter of queries are
+evidenced — the ordinary case — uses roughly a quarter of it. The bound points
+that way deliberately; over-provisioning a volume is cheap and running out
+mid-run is not.
+
+### Levers, in order of effect
+
+1. `evaluation.cohorts.maximum_queries_per_cohort` — linear in everything.
+2. `evaluation.maximum_stored_per_query_results` — the per-query audit rows are
+   most of the steady state.
+3. `evaluation.minimum_interval_seconds`, or leaving `on_material_snapshot`
+   off — a region indexing hourly will otherwise evaluate hourly.
+4. Trimming `evaluation.variants` — `B0` is not removable, because every
+   attribution number is a paired difference against it.
+
+Adding workers is **not** a lever:
+[replay is deliberately not distributed](../knowledge-effectiveness.md#why-replay-is-not-fanned-out-over-the-worker-transport).
+Past the point where a batch will not fit a budget worth having, the answer is
+`pheasant shard plan` — each shard then evaluates itself.
+
+### Measure it here
+
+```bash
+python -m pheasant.evaluation.benchmark --output evaluation-capacity.json
+```
+
+Runs a real batch through the real search path and prints what it measured
+beside what the model projected. CI runs it on every change to the plane and
+publishes the comparison as a job summary — because a model nobody checks
+against a machine is a model that quietly stops describing anything. The first
+two coefficients shipped here were out by 2x (time) and 3x (peak volume), and
+this is how that was found.
+
 ## Sizing a fleet
 
 Past one container, the shape is
@@ -355,3 +413,5 @@ symbols, so adopting its figure would have halved every memory projection.
 - [Separate graph queries](graph-query-service.md) — setup, failure semantics,
   and the measured 2026-08-26 fleet decision.
 - [Attach to a Synapse fleet](attach-to-synapse.md) — running several regions.
+- [Knowledge effectiveness](../knowledge-effectiveness.md) — the evaluation
+  plane's own sizing, restart semantics and progress surfaces.

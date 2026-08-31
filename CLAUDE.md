@@ -69,6 +69,10 @@ pheasant-kb/
 │   ├── capacity.py            ← the one home for sizing coefficients
 │   ├── analytics.py           ← Parquet exports + the DuckDB query surface
 │   ├── evalset.py             ← de-identified eval cases from the ledger
+│   ├── evaluation/            ← the evaluation plane: contracts, snapshots,
+│   │                            proof, cohorts, variants, replay, metrics,
+│   │                            gates, report, candidates, runner, store,
+│   │                            benchmark (the capacity measurement)
 │   ├── sharding.py            ← `pheasant shard plan`
 │   ├── jobs.py                ← per-source progress: phase, rate, ETA, stalled
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
@@ -134,6 +138,13 @@ pheasant export parquet [--table NAME]      # /exports/parquet/<kb_id>/*.parquet
 pheasant export query "SELECT …"            # SQL over an export directory
 pheasant export tables [--schema]           # what is exportable; --schema for columns
 pheasant eval bootstrap                     # de-identified eval cases from real traffic
+pheasant eval taxonomy                     # the evidence taxonomy: what each event licenses
+pheasant eval proof --query … --target … --event explicit_accept
+pheasant eval run [--mode current_state|historical --as-of T]
+pheasant eval report [--run ID] [--json]
+pheasant eval trend --metric known_positive_reciprocal_rank
+pheasant eval status [--watch]             # a batch's live phase/progress, from /state
+python -m pheasant.evaluation.benchmark    # measure a batch against the capacity model
 pheasant mcp --transport stdio
 pheasant client-config claude-code|cursor|vscode
 pheasant config show                       # resolved config after profile+YAML+--set
@@ -304,6 +315,75 @@ record, indexed by the ordinary pipeline. Recall *is* search. On top of that:
   through `MemoryStore.append`; a rejection is permanent, because
   re-suggesting what someone declined makes a review queue worth ignoring.
 
+### Evaluation
+
+`evaluation.*`, off by default and read-only when on. A **third plane**:
+observations are evidence, records are memory, and *measurements are neither* —
+nothing the `evaluation_*` tables hold is a file, is chunked, is indexed, or is
+returned by a search. A region must not answer a question with its own report.
+
+- **Typed proof, or none.** Served/considered/included are **unknown**, weight
+  zero; only a caller can say `cited`/`selected`/`explicit_accept`/
+  `explicit_reject`/`downstream_*`/`deterministic_validation_*`. `not_selected`
+  is unknown too — the reader may have found the answer at rank one, and
+  treating silence as a negative manufactures negatives at exactly the rate the
+  region serves results. Weight is a product of four **reported** multipliers.
+  Positive and negative sums never cancel: `P`, `N`, `Net` and a conflict rate
+  are all published.
+- **Snapshot manifests** digest every input that can change retrieval (content,
+  sources, graph, lexical/vector index, encoding, chunking, fusion, arm limits,
+  memory, steering, ACL, evaluation policy). Computed identically on any
+  replica, so two pods agree on a snapshot id without coordinating. **No clock
+  in either id**: a snapshot addresses state and a run addresses
+  `(state, config, mode, described instant)`, so two runs over an unchanged
+  region are one run and one trend point. The clock-seeded version made runs a
+  second apart two rows and runs *within* a second collapse into one.
+- **Six cohorts.** anchor (frozen, the trend line), rolling, **learned**
+  (queries that created the memory — *recall of learned experience*, never
+  reported as generalization), **temporal holdout** (later, independent
+  queries), control (no steering rule can fire), synthetic invariants.
+  `generalization_gap = learned − holdout` is the memorization detector.
+- **Paired ablations** `B0`–`B6`. `B0` (corpus-only) is not removable: every
+  attribution number is a difference against it. `B2`–`B4` hold memory
+  *content* off so a retrieved record cannot be counted as a rule's doing.
+- **Every metric carries its denominator, formula, substituted calculation,
+  operands, proof ids, exclusions and one limitation** — `MetricResult.validate()`
+  withholds one that cannot. A missing input yields `insufficient_evidence`
+  with `value: None`, never `0.0`.
+- **Gates are not metrics.** ACL leak, stale-current leak, `as_of` correctness,
+  abstention, known-positive exclusion, control regression and negative-exposure
+  increase are evaluated *before* aggregation so a good score cannot offset them.
+- **Candidates are shadowed.** A proposed steering rule is passed into the
+  search call for the length of one query via `extra_steering_records` — the
+  real `parse_rule`/`admits` path, nothing written. A proposed *fact* is
+  `not_shadow_replayable` (its text is in no index; scoring it would measure
+  string similarity). Promotion needs every gate, independent queries, and a
+  holdout result: `allow_originating_query_only_promotion` is off, which is
+  what keeps the self-rewarding loop closed.
+- **Fleet-safe.** A run claims the `__evaluation__` lease in `source_leases`
+  (N replicas → one run), **never** takes `sync_lock`, and the replay searcher
+  is built with `usage_tracking=False` so evaluation cannot inflate the salience
+  of the records it measures. Auto-trigger fires only where the scheduler runs.
+- **Progress is a row, not a process.** `phase`, unit counters and a heartbeat
+  live on `evaluation_runs`, so the UI, the CLI (`pheasant eval status
+  [--watch]`), HTTP (`/evaluation/status`) and MCP (`get_evaluation_status`)
+  all watch a batch none of them started — across a restart. A run whose
+  heartbeat expires is reclaimed as **`interrupted`** (at API boot and on the
+  beat), never left spinning.
+- **A batch resumes rather than restarting.** Each (cohort, variant) replay is
+  checkpointed to `evaluation_replays` as it finishes; the content-addressed
+  run id makes a re-run load them and replay only what is missing. Checkpoints
+  clear only *after* the report commits, and a resumed run computes numbers
+  identical to an uninterrupted one — asserted by killing one of two identical
+  regions mid-batch and diffing health vectors.
+- **Sized, not guessed.** `capacity.project_evaluation` is the one home for
+  evaluation coefficients; `pheasant scan` prints run time, steady-state and
+  *peak* volume separately (the peak is checkpoints in flight, the number that
+  decides whether a PVC fills mid-run). `python -m pheasant.evaluation.benchmark`
+  measures a real batch against the model and CI publishes the comparison —
+  the first two coefficients shipped were out by 2x and 3x, found exactly that
+  way. `docs/knowledge-effectiveness.md`.
+
 ### Scale
 
 One container until it shouldn't be. Then four independent axes:
@@ -424,6 +504,58 @@ Each of these cost real time. They are listed because the shape recurs.
   ledger row found nothing, which is most of the reason to export spans at
   all. The span starts first now and the row adopts *its* ids. Caught by
   running against a real SDK, not by the offline suite, which had no opinion.
+- **Progress that lives in a process disappears with the process.** An
+  evaluation batch is minutes of work, and the first version put its progress
+  in the in-memory job registry. That answers neither case that actually
+  happens: a browser talking to an API replica that did not start the run, and
+  a reader coming back after the container was restarted — where the row also
+  said `running` forever, because nothing rewrites a row when a process is
+  killed. Phase, counters and a heartbeat are columns now, reclamation runs at
+  API boot and on the beat, and each (cohort, variant) replay is checkpointed
+  as it finishes so a restart resumes. The same shape as `source_leases`, and
+  for the same reason.
+- **An index in `CORE_SCHEMA` that names a column a guarded ALTER adds runs
+  first, and fails the whole migration.** `CREATE TABLE IF NOT EXISTS` no-ops
+  against an existing table, so `idx_evaluation_runs_live` on
+  `heartbeat_at` broke every `migrate()` over a `/state` written before that
+  column existed — "no such column: heartbeat_at", on boot. It is created in
+  `migrate()` after the ALTER now, exactly where `idx_memory_records_canon_key`
+  already was for exactly this reason. Found by pointing the CLI at an older
+  state directory, not by reading the code.
+- **Two staleness clocks over one dead process will disagree, and the gap is
+  a feature that lies.** A killed evaluation container releases nothing, so its
+  run row *and* its `__evaluation__` lease row are both left behind — and they
+  aged out on different windows: `evaluation.run_stale_seconds` for the run,
+  `locks.SOURCE_STALE_SECONDS` (45s) for the lease. Set the first below the
+  second — the CI region uses 20s so its smoke test need not wait out 90 — and
+  the region reports a batch `interrupted`, which invites a resume and says so
+  in the UI, then *skips* the resume because a lease nobody was holding claimed
+  a live writer. The skip was not loud either: a skipped run carries no gates,
+  and `all([])` is `True`, so it reported its gates passed — which
+  `pheasant eval run` turns straight into an exit status. Reclamation frees the
+  lease on its own evidence and in its own window now (the staleness test lives
+  in the `DELETE`, so a legitimate successor survives), and `gates_passed`
+  requires a non-empty gate list. Every in-process test killed a batch by
+  *raising*, which unwinds the lease's `__exit__` and releases it, so the
+  offline suite could not see this: it took a real `docker compose stop`.
+- **A capacity coefficient nobody measures is a coefficient that rots.** The
+  first two evaluation constants were guesses: seconds-per-replay was 2x over,
+  and bytes-per-checkpoint 3x *under* — the dangerous direction, since that is
+  the number deciding whether a volume fills mid-run.
+  `python -m pheasant.evaluation.benchmark` runs a real batch and prints
+  measured beside projected; CI publishes the diff. Same posture as
+  `SECONDS_PER_1K_FILES`, which was a curve being quoted as a line until
+  someone measured it at two scales.
+- **A measurement derived from what a system chose to show measures its own
+  confidence.** Mining "appeared at rank 1" out of the interaction ledger as a
+  positive would produce a retrieval metric that improves whenever ranking gets
+  more *confident*, regardless of whether it gets more correct — and every
+  experiment run against it confirms itself. The ledger yields `served` only:
+  polarity unknown, weight zero. Utility proof has to come from a surface where
+  somebody said so. The same shape one level up: a replay that counted as a
+  memory *use* would let the evaluation raise the salience of the records it is
+  measuring, which is why the replay searcher is built with
+  `usage_tracking=False`.
 - **`wasmtime.Trap` and `wasmtime.WasmtimeError` are siblings**, not parent and
   child. Catch `guest_failures()`.
 - **A mutation harness must `touch` the restored file and purge
@@ -523,5 +655,7 @@ Each of these cost real time. They are listed because the shape recurs.
 - **Memory:** `docs/memory-system.md`, `docs/how-to/agent-memory.md`
 - **Observation & formation:** `docs/memory-formation.md` — the two planes,
   the log tier, and the two combination designs that were rejected
+- **Evaluation:** `docs/knowledge-effectiveness.md` — the evidence taxonomy,
+  the cohort split, the ablation matrix, the gates, and what it refuses to claim
 - **Synapse region spec:** `docs/SYNAPSE_INTEGRATION.md`
 - **Deployment:** `docs/deployment.md`, `deploy/kubernetes/`

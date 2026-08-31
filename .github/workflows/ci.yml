@@ -178,6 +178,12 @@ jobs:
           OPENAI_API_KEY=ci-config-check \
             docker compose -f deploy/compose/docker-compose.advanced.yml config --quiet
           docker compose -f deploy/compose/docker-compose.fresh.yml config --quiet
+          # The CI-only topologies are published artifacts too, and each is
+          # parsed by exactly one workflow. Checking them here as well means a
+          # malformed service fails on every PR rather than only on the ones
+          # that touch its own paths.
+          docker compose -f deploy/compose/ci/docker-compose.log-tier.yml config --quiet
+          docker compose -f deploy/compose/ci/docker-compose.evaluation.yml config --quiet
 
       - name: Build image for validation
         uses: docker/build-push-action@v6

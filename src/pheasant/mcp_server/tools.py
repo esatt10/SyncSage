@@ -828,6 +828,198 @@ class PheasantTools:
             )
         return payload
 
+    def record_evidence(
+        self,
+        knowledge_base: str,
+        query: str,
+        target_id: str,
+        event_type: str,
+        target_type: str = "artifact",
+        principal: str | None = None,
+        session_id: str | None = None,
+        position: int | None = None,
+        outcome_reference: str | None = None,
+    ) -> dict:
+        """Record what actually came of a result this region returned.
+
+        The one way an agent contributes *proof* rather than traffic. Retrieval
+        already records what was served; only the caller knows whether it was
+        cited, selected, accepted, rejected, or validated by something
+        deterministic -- and those are four claims of very different strength,
+        which is why ``event_type`` is required and drawn from a fixed
+        taxonomy rather than being a "useful: true" flag.
+
+        Two defaults worth knowing before instrumenting anything: being served
+        is *not* evidence of usefulness, and *not* selecting something is not
+        evidence against it. Both stay unknown, so an agent that reports
+        nothing degrades the evaluation's coverage rather than corrupting its
+        conclusions.
+
+        ``pheasant://evaluation/taxonomy`` lists every event type.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        import pheasant.evaluation as evaluation
+
+        return evaluation.record_evidence(
+            self.state,
+            self.config,
+            query=query,
+            target_id=target_id,
+            target_type=target_type,
+            event_type=event_type,
+            principal=principal,
+            session_id=session_id,
+            position=position,
+            outcome_reference=outcome_reference,
+            reason_code="mcp",
+        )
+
+    def get_evaluation_report(self, knowledge_base: str, run_id: str | None = None) -> dict:
+        """The most recent evidence-bearing effectiveness report, or a named one.
+
+        Returns the agent projection: status, evidence sufficiency, the metric
+        deltas, the gates, the limitations, and the actions this report permits.
+        The full report -- per-query operands, formulas, proof references -- is
+        available over HTTP at ``/evaluation/report``; what comes back here is
+        the part an agent can act on without parsing a document.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        import pheasant.evaluation as evaluation
+        from pheasant.evaluation import store as evaluation_store
+
+        report = (
+            evaluation_store.load_report(self.state, run_id)
+            if run_id
+            else evaluation.latest_report(self.state, self.config.knowledge_base_id)
+        )
+        if report is None:
+            raise ValueError(
+                f"No evaluation report for {run_id}"
+                if run_id
+                else "No evaluation run has completed for this knowledge base yet"
+            )
+        return {
+            "run_identity": report.get("run_identity", {}),
+            "health_vector": report.get("health_vector", {}),
+            "gates": report.get("gates", []),
+            "generalization": report.get("generalization", {}),
+            "candidate_decisions": report.get("candidate_decisions", []),
+            "limitations": report.get("limitations", {}),
+            "agent": (report.get("explanations") or {}).get("agent", {}),
+        }
+
+    def start_evaluation(
+        self,
+        knowledge_base: str,
+        mode: str = "current_state",
+        as_of: str | None = None,
+        force: bool = False,
+    ) -> dict:
+        """Start an effectiveness batch and return immediately with its run id.
+
+        A batch replays every cohort under every variant through the real search
+        path — minutes of work on a real corpus, far past what a tool call
+        should hold open. So this starts it and hands back a ``run_id``; poll
+        :meth:`get_evaluation_status` to watch it.
+
+        Progress and completion live in ``/state``, not in this process, which
+        is what makes the answer survive the container being restarted and what
+        lets a different process (the UI, a CLI, another agent) watch the same
+        run. A batch also takes the region's evaluation lease, so asking twice
+        gets you the run already in flight rather than a second one.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        import threading
+
+        import pheasant.evaluation as evaluation
+
+        if not self.config.evaluation.enabled and not force:
+            raise ValueError(
+                "Evaluation is disabled for this knowledge base. Enable "
+                "`evaluation.enabled` in pheasant.yaml, or pass force=true for a "
+                "one-off run."
+            )
+        in_flight = evaluation.progress(self.state, self.config.knowledge_base_id)
+        if in_flight.get("status") == "running":
+            return {"status": "already-running", **in_flight}
+
+        job = self.jobs.create("evaluation", f"evaluation ({mode})", targets=["evaluation"])
+
+        def _run() -> None:
+            try:
+                outcome = evaluation.run(
+                    self.engine,
+                    mode=mode,
+                    effective_as_of=as_of,
+                    force=bool(force),
+                    on_progress=lambda phase, detail: self.jobs.progress(
+                        job.id, phase=phase, detail=detail or phase, source="evaluation"
+                    ),
+                )
+                self.jobs.finish(
+                    job.id,
+                    status="succeeded" if outcome.status != "invalid" else "failed",
+                    result={"run_id": outcome.run_id, "status": outcome.status},
+                )
+            except Exception as exc:  # noqa: BLE001 - a job records its own failure
+                self.jobs.finish(job.id, status="failed", error=str(exc))
+
+        threading.Thread(target=_run, name="pheasant-mcp-evaluation", daemon=True).start()
+        return {"status": "started", "job_id": job.id, "mode": mode}
+
+    def get_evaluation_status(self, knowledge_base: str, run_id: str | None = None) -> dict:
+        """How far a batch has got, and whether anything is running at all.
+
+        Read from ``/state``, so it answers for a run this process did not start
+        and for one whose process has since stopped. ``phase`` names the step
+        (`snapshot`, `cohorts`, `proof`, `variants`, `replay`, `metrics`,
+        `gates`, `report`, `persisting`), ``completed_units``/``total_units``
+        count (cohort, variant) replays, and ``attempts`` above 1 means a
+        previous attempt was interrupted and this one resumed it.
+
+        A run whose heartbeat expired reports ``interrupted`` rather than
+        pretending to still be working.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        import pheasant.evaluation as evaluation
+
+        payload = evaluation.progress(self.state, self.config.knowledge_base_id, run_id)
+        payload["enabled"] = bool(self.config.evaluation.enabled)
+        return payload
+
+    def get_evaluation_taxonomy(self, knowledge_base: str) -> dict:
+        """Every evidence event type, its polarity and strength, and what it licenses."""
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.evaluation.proof import DEFAULT_TAXONOMY
+
+        return {
+            "events": [
+                {
+                    "event_type": kind.event_type,
+                    "polarity": str(kind.polarity),
+                    "strength": str(kind.strength),
+                    "note": kind.note,
+                }
+                for kind in DEFAULT_TAXONOMY.values()
+            ],
+            "defaults": {
+                "unknown_is_negative": bool(self.config.evaluation.proof.unknown_is_negative),
+                "non_selection_is_negative": bool(
+                    self.config.evaluation.proof.non_selection_is_negative
+                ),
+            },
+            "note": (
+                "Exposure is not success and non-selection is not a negative. "
+                "Both stay unknown unless this deployment has deliberately "
+                "re-polarized them."
+            ),
+        }
+
     def describe_retrieval(self, knowledge_base: str) -> dict:
         """What this region's retrieval is configured to do, and what is tunable.
 

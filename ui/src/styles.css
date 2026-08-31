@@ -3218,3 +3218,320 @@ select.text-input {
     width: min(24rem, 100vw);
   }
 }
+
+/* ---------------------------------------------------------------------------
+   The evaluation plane.
+
+   Three rules the visual language enforces, because each replaces a lie a
+   reader would otherwise not be able to see:
+
+   * A measurement that could not be made renders in the `muted` tone with an
+     em dash and an explicit note — never as a zero, which would look like a
+     bad score rather than an instrumentation gap.
+   * A value never appears without its denominator; the denominator is set at
+     the same weight as the number, not as a footnote.
+   * Gates are visually separate from scores. They are not tiles, they are not
+     coloured on a gradient, and they never sit in the same grid — because an
+     ACL leak is not a low number, it is a stop.
+   --------------------------------------------------------------------------- */
+
+.eval-page .eval-section {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  padding: 18px 20px;
+  margin-bottom: 20px;
+}
+
+.eval-page .eval-section > .section__title {
+  margin-top: 0;
+}
+
+.eval-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 12px;
+  margin: 12px 0 4px;
+}
+
+.eval-tiles__item {
+  all: unset;
+  cursor: pointer;
+  display: block;
+}
+
+.eval-tiles__item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius);
+}
+
+.eval-tile {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  background: var(--bg-sunken);
+  height: 100%;
+}
+
+.eval-tile--good { border-left-color: var(--ok); }
+.eval-tile--bad { border-left-color: var(--danger); }
+.eval-tile--neutral { border-left-color: var(--border-strong); }
+.eval-tile--muted { border-left-color: var(--border); opacity: 0.85; }
+
+.eval-tile__name {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.eval-tile__value {
+  font-family: var(--font-mono);
+  font-size: 22px;
+  font-weight: 600;
+  margin: 4px 0 6px;
+  color: var(--text);
+}
+
+.eval-tile__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Same weight as the value on purpose: "0.89" and "0.89 over 5 of 103" are
+   different claims, and only the second one is true. */
+.eval-tile__denominator {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-soft);
+}
+
+.eval-tile__note {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.eval-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: var(--radius-pill);
+  padding: 2px 8px;
+  font-size: 11px;
+  background: var(--bg-active);
+  color: var(--text-soft);
+  white-space: nowrap;
+}
+
+.eval-chip--pass,
+.eval-chip--completed { background: var(--accent-soft); color: var(--accent-text); }
+.eval-chip--fail,
+.eval-chip--failed { background: var(--danger-soft); color: var(--danger); }
+.eval-chip--warn,
+.eval-chip--truncated,
+.eval-chip--interrupted { background: var(--warn-soft); color: var(--warn); }
+.eval-chip--insufficient_evidence,
+.eval-chip--not_applicable { background: var(--bg-active); color: var(--muted); }
+.eval-chip--running { background: var(--accent-soft); color: var(--accent-text); }
+
+.eval-gates {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.eval-gate {
+  display: grid;
+  grid-template-columns: 18px 200px 1fr;
+  gap: 10px;
+  align-items: baseline;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+
+.eval-gate--pass { color: var(--text-soft); }
+.eval-gate--fail { background: var(--danger-soft); color: var(--danger); font-weight: 500; }
+.eval-gate__mark { font-weight: 700; }
+.eval-gate__id { font-family: var(--font-mono); font-size: 12px; }
+.eval-gate__detail { color: inherit; opacity: 0.85; }
+
+.eval-progress__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.eval-progress__run { font-size: 12px; color: var(--muted); }
+
+.eval-progress__bar {
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-active);
+  overflow: hidden;
+}
+
+.eval-progress__fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 240ms ease;
+}
+
+.eval-phases {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 6px;
+  padding: 0;
+  font-size: 11px;
+}
+
+.eval-phase {
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-sunken);
+  color: var(--muted);
+}
+
+.eval-phase--done { color: var(--text-soft); }
+.eval-phase--current { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; }
+
+.eval-progress__note {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.eval-progress--failed .eval-progress__note {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.eval-detail {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-sunken);
+}
+
+.eval-detail__grid {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 6px 14px;
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+
+.eval-detail__grid dt { color: var(--muted); }
+.eval-detail__grid dd { margin: 0; }
+.eval-detail__grid code { font-size: 12px; word-break: break-word; }
+.eval-detail__summary { margin: 0 0 6px; font-size: 13px; }
+
+/* The limitation is not fine print. It is the sentence that stops the number
+   above it being read as a bigger claim than it is. */
+.eval-detail__limit {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-soft);
+  border-left: 2px solid var(--border-strong);
+  padding-left: 10px;
+  line-height: 1.5;
+}
+
+.eval-split {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.eval-split__cell {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-sunken);
+}
+
+.eval-split__label { font-size: 11px; text-transform: uppercase; color: var(--muted); }
+.eval-split__value {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 600;
+  margin: 4px 0;
+}
+
+.eval-spark {
+  width: 100%;
+  height: 56px;
+  margin-top: 8px;
+}
+
+.eval-spark polyline { stroke: var(--accent); }
+.eval-spark circle { fill: var(--accent); }
+
+.eval-trend__controls {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.eval-reasons {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 13px;
+  color: var(--text-soft);
+  line-height: 1.6;
+}
+
+.eval-coverage p { margin: 0 0 6px; }
+
+.eval-explanation {
+  margin: 12px 0 0;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  background: var(--bg-sunken);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.eval-candidates { list-style: none; margin: 10px 0 0; padding: 0; }
+
+.eval-candidate {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin-bottom: 8px;
+}
+
+.eval-candidate--promote { border-left: 3px solid var(--ok); }
+.eval-candidate--retain_candidate { border-left: 3px solid var(--border-strong); }
+.eval-candidate--insufficient_evidence { border-left: 3px solid var(--warn); }
+.eval-candidate--not_shadow_replayable { border-left: 3px solid var(--border); }
+
+.eval-candidate__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.eval-page .data-table .num { text-align: right; font-family: var(--font-mono); }

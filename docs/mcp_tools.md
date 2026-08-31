@@ -84,6 +84,10 @@ The committed template contains no host-specific paths. `.vscode/mcp.json` is ig
 | `explain_node` | Explain a graph node and why it matters. |
 | `get_sync_status` | Return queue, lock, error, freshness, and connector checkpoint status. |
 | `get_sync_history` | Return runtime registration, sync, promotion, disable, and removal audit events. |
+| `record_evidence` | Record what came of a result this region returned: `cited`, `selected`, `explicit_accept`, `explicit_reject`, `downstream_success`/`failure`, or a `deterministic_validation_pass`/`fail`. The only way *proof* enters the region — retrieval already records what was served, and only the caller knows whether it helped. Being served is not evidence of usefulness and **not** selecting something is not evidence against it, so an agent that reports nothing lowers the evaluation's coverage rather than corrupting its conclusions. See `pheasant://evaluation/taxonomy`. |
+| `start_evaluation` | Start an effectiveness batch and return a job id, not a report — a batch is minutes of work. Poll `get_evaluation_status`. Safe to call twice: the run takes the region's lease and is content-addressed, so a second call joins the batch in flight rather than starting a competing one. |
+| `get_evaluation_status` | How far a batch has got: `phase`, cohort/variant replays done against planned, `attempts` (above 1 means an earlier attempt was interrupted and this one resumed it), and the terminal status. Read from `/state`, so it answers for a run this process did not start and for one whose container has stopped — a run whose heartbeat expired reports `interrupted` rather than pretending to still be working. |
+| `get_evaluation_report` | Return the latest knowledge-effectiveness report: the health vector, the hard gates, learned-versus-holdout generalization, candidate decisions, the stated limitations, and the actions the report permits. Every number carries its denominator; one that could not be computed reports `insufficient_evidence`, never `0.0`. |
 
 ### Agent memory in retrieval
 
@@ -135,6 +139,7 @@ pheasant://knowledge-bases/{kb_id}/sources/{source_id}/history
 pheasant://knowledge-bases/{kb_id}/sync-history
 pheasant://knowledge-bases/{kb_id}/graph-slices/{node_id}
 pheasant://knowledge-bases/{kb_id}/nodes/{node_id}
+pheasant://evaluation/taxonomy
 ```
 
 ## Prompts

@@ -252,6 +252,7 @@ def load_steering(
     *,
     now: str,
     enabled: bool = False,
+    kinds: tuple[str, ...] | None = None,
 ) -> Steering:
     """The rules a given query may use, or an empty `Steering`.
 
@@ -267,8 +268,19 @@ def load_steering(
     still wants the region's remembered *vocabulary*, and in fact steering's
     whole value is that it improves queries returning no memory at all. Scope,
     subject and validity all still apply.
+
+    `kinds` narrows which rule kinds are in force. `None` -- the default and
+    every production call site -- means all of them, so retrieval behaves
+    exactly as it did before this argument existed. The evaluation plane passes
+    an explicit subset (or `()`) to build its ablation matrix: measuring what
+    *alias* rules alone contribute requires a run in which preference and
+    exclusion rules do not fire, and a paired ablation whose two sides differ
+    in more than the intervention measures neither of them.
     """
     if not enabled or not records:
+        return Steering()
+    allowed = STEERING_KINDS if kinds is None else tuple(kinds)
+    if not allowed:
         return Steering()
     # `include_rules` is a statement about what is *returned as content* —
     # steering records are machinery, so they stay out of result lists by
@@ -283,7 +295,7 @@ def load_steering(
 
     for record in sorted(records, key=lambda r: str(r.get("record_id") or ""))[:MAX_RULES]:
         kind = str(record.get("kind") or "")
-        if kind not in STEERING_KINDS:
+        if kind not in STEERING_KINDS or kind not in allowed:
             continue
         if not admits(rule_policy, record, now=now):
             continue

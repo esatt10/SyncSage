@@ -90,6 +90,25 @@ MEMORIES = [
     ("Ada owns the kestrel on-call rota.", "org", "people"),
 ]
 
+#: Typed proof, recorded through `POST /evaluation/evidence` the way an agent
+#: or a UI would. Deliberately a *mixture*: accepts, a selection, a rejection
+#: and a downstream success, over some queries and not others.
+#:
+#: The gaps are the point. A screenshot where every query is evidenced would
+#: show a coverage figure of 100% and hide the number that actually matters --
+#: the plane's central claim is that a score means nothing without the share of
+#: queries it was computed over, and a demo that quietly evidences everything
+#: is a demo of a system that never has to say so.
+EVIDENCE = [
+    ("router rollout coordination", "deploy/rollout.md", "explicit_accept"),
+    ("router rollout coordination", "guides/onboarding.md", "explicit_reject"),
+    ("router canary promotion", "deploy/canary.md", "explicit_accept"),
+    ("runbook escalation rota", "runbooks/kestrel.md", "downstream_success"),
+    ("watcher restart schedule", "runbooks/kestrel.md", "selected"),
+    ("router rollout", "deploy/rollout.md", "selected"),
+    ("promotion health gate", "deploy/rollout.md", "cited"),
+]
+
 
 def _free_port() -> int:
     with closing(socket.socket()) as probe:
@@ -127,6 +146,25 @@ def _seed(root: Path) -> Path:
             "steering_enabled": True,
             "formation": {"enabled": True, "min_observations": 2, "min_sessions": 2},
         },
+        # The evaluation plane, sized for a demo corpus. The sufficiency floors
+        # exist to stop a *production* region publishing a number from four
+        # data points; at this scale they would only stop the page measuring
+        # anything at all, and a screenshot of "not enough evidence" in every
+        # tile shows nothing about the page.
+        #
+        # `promotion.enabled` stays False, which is the shipped default and the
+        # honest one to photograph: the run computes candidate decisions and
+        # applies none of them.
+        "evaluation": {
+            "enabled": True,
+            "proof": {
+                "minimum_eligible_queries": 3,
+                "minimum_evidenced_queries": 2,
+                "minimum_independent_interactions": 2,
+                "maximum_single_query_proof_share": 1.0,
+            },
+            "cohorts": {"anchor_minimum_queries": 5},
+        },
         "sources": [
             {
                 "name": "handbook",
@@ -158,6 +196,15 @@ def _drive(app) -> None:
     engine = app.state.engine
     engine.sync_source("handbook", "full")
 
+    artifacts = {
+        str(row["relative_path"]): str(row["id"])
+        for row in engine.state.rows("SELECT id, relative_path FROM artifacts")
+    }
+
+    # One client for the whole drive. The MCP SDK's session manager runs its
+    # lifespan exactly once per app instance, so a second `TestClient(app)`
+    # here raises -- which is also why `main` serves a *fresh* app rather than
+    # this one.
     with TestClient(app) as client:
         for text, scope, subject in MEMORIES:
             client.post("/memory", json={"text": text, "scope": scope, "subject": subject})
@@ -167,11 +214,45 @@ def _drive(app) -> None:
                 json={"query": query, "mode": "hybrid", "max_results": 8},
                 headers={"X-Pheasant-Session": session, "X-Pheasant-Principal": "user:ada"},
             )
+        # Typed proof, over the same endpoint an agent posts to.
+        for query, path, event in EVIDENCE:
+            target = artifacts.get(path)
+            if not target:
+                continue
+            client.post(
+                "/evaluation/evidence",
+                json={
+                    "query": query,
+                    "target_id": target,
+                    "event_type": event,
+                    "principal": "user:ada",
+                    "session_id": "sess-ada",
+                    "interaction_id": f"shot-{path}-{event}",
+                },
+            )
         app.state.interaction_buffer.flush()
 
     run_session_digests(engine)
     run_candidate_rules(engine)
     engine.sync_source("agent-memory", "full")
+    _evaluate(engine)
+
+
+def _evaluate(engine) -> None:
+    """Run a real batch through the same call the endpoint and the CLI make.
+
+    Nothing is written into the metric tables directly, so what the page
+    renders is what a run actually produced -- including the tiles it had to
+    report as unmeasured.
+    """
+
+    import pheasant.evaluation as evaluation
+
+    outcome = evaluation.run(engine)
+    passed = sum(1 for gate in outcome.gates if gate.passed)
+    print(f"  evaluation: {outcome.status}, {passed}/{len(outcome.gates)} gates passed")
+    if outcome.status not in ("completed", "truncated"):
+        raise SystemExit(f"the seeded evaluation run ended as {outcome.status}")
 
 
 def _shoot(port: int, shots: dict[str, str]) -> None:
@@ -252,10 +333,148 @@ def _shoot(port: int, shots: dict[str, str]) -> None:
                             )
                 else:
                     raise SystemExit("no content keys on the trace -- nothing to select")
+            if name == "evaluation":
+                # Open one metric. A page of tiles shows the health vector and
+                # hides the thing that makes a number arguable: the formula,
+                # the numbers substituted into it, what was excluded and why,
+                # and the sentence saying what it does *not* support.
+                tile = page.locator(".eval-tiles__item").first
+                tile.click()
+                # The calculation is fetched, not read out of the report, so a
+                # settled network is what to wait for rather than a timer.
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(800)
+                if not page.locator(".eval-detail").count():
+                    raise SystemExit(
+                        "clicking a health tile opened no calculation -- the page cannot "
+                        "resolve an aggregate to the formula behind it"
+                    )
+                pass
             out = TARGET / f"{name}.png"
             page.screenshot(path=str(out))
             print(f"  {out.relative_to(REPO)}  ({out.stat().st_size // 1024} KiB)")
+            if name == "evaluation":
+                # After the page shot, never before: scrolling to the gates
+                # moves the viewport, and scrolling back is unreliable because
+                # the scroll container is the layout's main pane rather than
+                # the window. Shooting the page first leaves it framed on the
+                # header, which is where the title and the Run button are.
+                #
+                # The gates get their own frame because they are the part of
+                # the page that is deliberately *not* a score: a crop of the
+                # tiles alone shows the vector and hides the thing that sits
+                # outside its arithmetic.
+                gates = page.locator("section.eval-section").filter(has_text="Hard gates").first
+                if not gates.count():
+                    raise SystemExit("no gates section on the page")
+                gates.scroll_into_view_if_needed()
+                page.wait_for_timeout(400)
+                shot = TARGET / "evaluation-gates.png"
+                gates.screenshot(path=str(shot))
+                print(f"  {shot.relative_to(REPO)}  ({shot.stat().st_size // 1024} KiB)")
         browser.close()
+
+
+def _shoot_run_states(port: int, config) -> None:
+    """Photograph the two states a batch reaches when a process goes away.
+
+    These are the states the durable run row exists for, and neither can be
+    staged by driving the UI: one is a batch mid-flight and the other is a
+    container that stopped. Both are produced here by writing the *same rows*
+    the runner writes -- `open_run` and `heartbeat_run` for the first,
+    `reclaim_interrupted_runs` for the second -- rather than by mocking an API
+    response, so what is photographed is what the page renders for real state.
+
+    Deliberately last: it leaves the region with an interrupted run, which is
+    not the state the other screenshots want behind them.
+    """
+
+    from playwright.sync_api import sync_playwright
+
+    from pheasant.evaluation import store as evaluation_store
+    from pheasant.evaluation.runner import reclaim_interrupted_runs
+    from pheasant.persistence.paths import StatePaths
+    from pheasant.persistence.state_store import StateStore
+
+    paths = StatePaths.from_config(config)
+    state = StateStore.from_config(config, paths.sqlite)
+    provisioned = Path("/opt/pw-browsers/chromium-1194/chrome-linux/chrome")
+    launch: dict[str, object] = {}
+    if provisioned.exists():
+        launch["executable_path"] = str(provisioned)
+
+    try:
+        snapshot = evaluation_store.latest_run(state, config.knowledge_base_id)
+        snapshot_id = str(snapshot["snapshot_id"]) if snapshot else "kb-demo"
+        with sync_playwright() as play:
+            browser = play.chromium.launch(**launch)
+            page = browser.new_page(viewport=VIEWPORT, device_scale_factor=2)
+
+            # --- a batch in flight -----------------------------------------
+            # Real timestamps, not decorative ones. A cosmetic future clock
+            # made the heartbeat un-staleable, so the reclaim below found
+            # nothing -- which is the product behaving correctly on data that
+            # could not happen.
+            from pheasant.evaluation.contracts import utc_now
+
+            now = utc_now()
+            evaluation_store.open_run(
+                state,
+                run_id="run-inflight",
+                kb_id=config.knowledge_base_id,
+                snapshot_id=snapshot_id,
+                started_at=now,
+                mode="current_state",
+                config_digest="demo",
+                owner="indexer-0:31",
+                total_units=36,
+            )
+            evaluation_store.heartbeat_run(
+                state,
+                run_id="run-inflight",
+                now=now,
+                phase="replay",
+                detail="anchor/B3",
+                completed_units=15,
+            )
+            page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
+            page.wait_for_timeout(1200)
+            page.get_by_role("link", name="Effectiveness", exact=True).click()
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(1200)
+            if not page.locator(".eval-progress__bar").count():
+                raise SystemExit("no progress bar for a running batch")
+            out = TARGET / "evaluation-running.png"
+            page.locator(".eval-progress").first.screenshot(path=str(out))
+            print(f"  {out.relative_to(REPO)}  ({out.stat().st_size // 1024} KiB)")
+
+            # --- the container stopped -------------------------------------
+            # Reclaimed by the product, not by an UPDATE written here: the
+            # point of the picture is what `reclaim_interrupted_runs` leaves
+            # behind, including how far the batch got.
+            time.sleep(2)
+            reclaimed = reclaim_interrupted_runs(
+                state, config.knowledge_base_id, stale_after_seconds=1
+            )
+            if "run-inflight" not in reclaimed:
+                raise SystemExit("the stalled run was not reclaimed; nothing to photograph")
+            # Back to `/` and click, never `reload()`. The page is sitting on
+            # `/evaluation`, and a hard load of an SPA path does not reach the
+            # UI -- the React router owns those paths only once the app is
+            # running. The same trap `_shoot` documents for `/memory`.
+            page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
+            page.wait_for_timeout(1200)
+            page.get_by_role("link", name="Effectiveness", exact=True).click()
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(1200)
+            if not page.locator(".eval-progress__note").count():
+                raise SystemExit("no explanation rendered for an interrupted run")
+            out = TARGET / "evaluation-interrupted.png"
+            page.locator(".eval-progress").first.screenshot(path=str(out))
+            print(f"  {out.relative_to(REPO)}  ({out.stat().st_size // 1024} KiB)")
+            browser.close()
+    finally:
+        state.close()
 
 
 def main() -> int:
@@ -309,10 +528,12 @@ def main() -> int:
             {
                 "notebook": "Notebook",
                 "memory": "Memory",
+                "evaluation": "Effectiveness",
                 "sources": "Sources",
                 "graph": "Graph",
             },
         )
+        _shoot_run_states(port, config)
         server.should_exit = True
         thread.join(timeout=10)
         print(json.dumps({"screenshots": sorted(p.name for p in TARGET.glob("*.png"))}))

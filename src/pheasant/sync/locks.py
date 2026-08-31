@@ -447,3 +447,38 @@ class SourceLease:
 
     def __exit__(self, *_exc: Any) -> None:
         self.release()
+
+
+def release_stale_lease(state: Any, source_id: str, *, stale_before: str) -> bool:
+    """Drop a lease whose holder is provably gone. Returns whether one went.
+
+    A lease is normally released by the process that took it. A process that
+    was *killed* releases nothing, and the row it left behind keeps saying a
+    writer is at work until the staleness window runs out.
+
+    That window is the right answer when nobody knows whether the holder is
+    alive. It is the wrong answer once something else has independently
+    established that it is dead -- reclaiming its heartbeat-expired run row,
+    for instance -- because then the region is refusing work it has already
+    concluded nobody is doing.
+
+    The staleness predicate stays in the ``DELETE`` rather than in a read
+    before it: the caller's evidence concerns the holder it knew about, and
+    between that conclusion and this statement a successor may legitimately
+    have taken the lease. Only a row nobody is beating is removable, so a live
+    successor survives this call whatever the caller believed.
+    """
+
+    try:
+        result = state.conn.execute(
+            "DELETE FROM source_leases WHERE source_id=? AND heartbeat_at < ? RETURNING owner",
+            (source_id, stale_before),
+        )
+        rows = list(result)
+        state.conn.commit()
+    except Exception as exc:  # noqa: BLE001 - recovery must not raise
+        logger.debug("Could not release the stale lease for %s: %s", source_id, exc)
+        return False
+    if rows:
+        logger.info("Released the stale %s lease held by %s", source_id, str(rows[0]["owner"]))
+    return bool(rows)

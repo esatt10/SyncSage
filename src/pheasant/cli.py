@@ -75,6 +75,41 @@ def _print_projection(report: dict) -> None:
         print(f"  ! {warning}")
 
 
+def _print_evaluation_projection(report: dict) -> None:
+    """What an evaluation batch would cost on a corpus this size.
+
+    Printed here because this is the moment an operator is deciding what to
+    provision, and because the evaluation plane scales on a *different axis*
+    from the corpus: it grows with cohort size times the ablation matrix, not
+    with file count. A region with a million files and forty recorded queries
+    has a large index and a trivial evaluation, and the reverse is equally
+    possible — so a single "how big should this be" number would describe
+    neither.
+
+    Only shown when evaluation is switched on: an operator who has not enabled
+    it does not need a volume estimate for it.
+    """
+
+    evaluation = report.get("evaluation_projection")
+    if not evaluation:
+        return
+    print("evaluation plane (region-wide)")
+    print(
+        f"  at full cohorts ({evaluation['queries_per_cohort']} queries x "
+        f"{evaluation['variants']} variants x {evaluation['cohorts']} cohorts): "
+        f"{evaluation['replays_per_run']:,} replays/run, "
+        f"~{evaluation['projected_run_minutes']:.1f} min"
+    )
+    print(
+        f"  storage: ~{evaluation['state_mb_per_run']:.0f} MB per run "
+        f"(~{evaluation['state_gb_per_year']:.1f} GB/yr at the configured cadence), "
+        f"{evaluation['peak_checkpoint_mb']:.1f} MB of replay checkpoints in flight"
+    )
+    print(f"  suggested container memory for a batch: {evaluation['recommended_memory']}")
+    for warning in evaluation.get("warnings") or []:
+        print(f"  ! {warning}")
+
+
 def _sync_services(engine, cfg, config_path=None, policy=None):
     """Build the watcher + scheduler pair sharing one sync serialization lock.
 
@@ -793,6 +828,112 @@ def _graph_refresher(cfg, engine, policy):
     return _GraphRefresher(engine, interval)
 
 
+def _print_evaluation_status(payload: dict) -> None:
+    """One line of live progress, read from the row rather than from a process.
+
+    This is the surface an operator uses when the batch is running somewhere
+    else -- another container, another terminal, or a process that has since
+    been restarted. It says `interrupted` for a run whose heartbeat expired
+    rather than printing a bar that will never move.
+    """
+
+    status = str(payload.get("status") or "unknown")
+    if status == "none":
+        print(payload.get("detail") or "No evaluation batch has run for this knowledge base.")
+        return
+    phase = payload.get("phase") or status
+    detail = payload.get("phase_detail")
+    done = payload.get("completed_units") or 0
+    total = payload.get("total_units") or 0
+    fraction = payload.get("fraction")
+    bar = ""
+    if fraction is not None:
+        filled = int(round(fraction * 24))
+        bar = f"[{'#' * filled}{'.' * (24 - filled)}] {fraction:.0%} "
+    line = f"{status:<12} {bar}{phase}"
+    if detail:
+        line += f" — {detail}"
+    if total:
+        line += f"  ({done}/{total} replays)"
+    print(line)
+    attempts = int(payload.get("attempts") or 1)
+    if attempts > 1:
+        print(f"  attempt {attempts}: a previous attempt was interrupted and this one resumed it")
+    if payload.get("error"):
+        print(f"  error: {payload['error']}")
+    if payload.get("owner"):
+        print(f"  run {payload.get('run_id')} on {payload['owner']}")
+
+
+def _print_evaluation_summary(report: dict, *, kb: str) -> None:
+    """The terminal view of a run: the vector, the gates, and the caveat.
+
+    The end-user paragraph is printed verbatim rather than re-summarized here.
+    It is generated from the same numbers this prints, and writing a second
+    prose summary in the CLI is how the two start disagreeing -- with the
+    terminal one, which is what people actually read, being the one nobody
+    checks against the metrics.
+    """
+
+    from pheasant.evaluation.report import HEALTH_VECTOR
+
+    identity = report.get("run_identity", {})
+    print(f"\nEvaluation report for {kb}")
+    print(f"  run       {identity.get('run_id')}")
+    print(f"  snapshot  {identity.get('snapshot_id')}  ({identity.get('mode')})")
+    print(
+        f"  compared  {identity.get('treatment_variant', identity.get('primary_variant'))} "
+        f"against {identity.get('baseline_variant')}"
+    )
+
+    print("\nHealth vector (a vector, deliberately — there is no single accuracy score):")
+    # Rendered in the registry's own order, not the payload's. A stored report
+    # is JSON with sorted keys, so iterating the mapping would put
+    # `control_regression` first here and `evidence_coverage` first after a
+    # fresh run — two orders for one vector that is meant to be read top to
+    # bottom, with its coverage caveat before its scores.
+    vector = report.get("health_vector") or {}
+    ordered = [label for _metric, label in HEALTH_VECTOR if label in vector]
+    ordered += [label for label in vector if label not in set(ordered)]
+    for name in ordered:
+        entry = vector[name]
+        value = entry.get("value")
+        rendered = (
+            "—"
+            if value is None
+            else f"{value:+.4f}"
+            if "gain" in name or "gap" in name
+            else f"{value:.4f}"
+        )
+        denominator = entry.get("denominator")
+        suffix = f" (n={denominator})" if denominator else ""
+        print(f"  {name:<34} {rendered:>9}  [{entry.get('status')}]{suffix}")
+
+    gates = report.get("gates") or []
+    failed = [gate for gate in gates if not gate.get("passed")]
+    print(f"\nHard gates: {len(gates) - len(failed)}/{len(gates)} passed")
+    for gate in gates:
+        mark = "ok  " if gate.get("passed") else "FAIL"
+        print(f"  [{mark}] {gate.get('gate_id'):<28} {gate.get('detail')}")
+
+    decisions = report.get("candidate_decisions") or []
+    if decisions:
+        print("\nCandidate decisions:")
+        for decision in decisions:
+            applied = " (applied)" if decision.get("applied") else ""
+            print(f"  {decision.get('candidate_id')}: {decision.get('decision')}{applied}")
+            for reason in decision.get("reasons", [])[:3]:
+                print(f"      · {reason}")
+
+    print("\n" + (report.get("explanations", {}).get("end_user") or ""))
+    limitations = report.get("limitations") or {}
+    if limitations.get("truncated_replays"):
+        print(
+            f"\nTruncated: {len(limitations['truncated_replays'])} cohort/variant pairs were not "
+            "replayed within the run budget."
+        )
+
+
 def _engine(
     config_path: Path,
     *,
@@ -1331,6 +1472,81 @@ def main(argv: list[str] | None = None) -> int:
     eval_boot_p.add_argument(
         "--limit", type=int, default=500, help="Maximum distinct questions (default: 500)"
     )
+    eval_run_p = eval_sub.add_parser(
+        "run",
+        help="Replay cohorts against baselines and write an evidence-bearing report.",
+    )
+    eval_run_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
+    eval_run_p.add_argument(
+        "--mode",
+        choices=("current_state", "historical"),
+        default="current_state",
+        help=(
+            "current_state: how the region answers those questions now. "
+            "historical: what it could have known at --as-of."
+        ),
+    )
+    eval_run_p.add_argument(
+        "--as-of",
+        default=None,
+        help="Instant a historical reconstruction describes (ISO-8601).",
+    )
+    eval_run_p.add_argument(
+        "--force",
+        action="store_true",
+        help="Run even when evaluation.enabled is false.",
+    )
+    eval_run_p.add_argument(
+        "--json", action="store_true", help="Print the whole report instead of a summary."
+    )
+    eval_report_p = eval_sub.add_parser("report", help="Print the most recent evaluation report.")
+    eval_report_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
+    eval_report_p.add_argument("--run", default=None, help="A specific run id.")
+    eval_report_p.add_argument(
+        "--json", action="store_true", help="Print the whole report instead of a summary."
+    )
+    eval_proof_p = eval_sub.add_parser(
+        "proof", help="Record one typed piece of interaction evidence."
+    )
+    eval_proof_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
+    eval_proof_p.add_argument("--query", required=True, help="The question that was asked.")
+    eval_proof_p.add_argument("--target", required=True, help="Artifact or memory record id.")
+    eval_proof_p.add_argument(
+        "--event",
+        required=True,
+        help="Event type from the taxonomy (see `pheasant eval taxonomy`).",
+    )
+    eval_proof_p.add_argument(
+        "--target-type",
+        default="artifact",
+        choices=("artifact", "memory", "fact", "response", "action", "query"),
+    )
+    eval_proof_p.add_argument("--principal", default=None)
+    eval_proof_p.add_argument("--session", default=None)
+    eval_proof_p.add_argument("--position", type=int, default=None)
+    eval_sub.add_parser(
+        "taxonomy", help="Print the evidence taxonomy: every event type and what it licenses."
+    )
+    eval_status_p = eval_sub.add_parser(
+        "status", help="What an evaluation batch is doing right now."
+    )
+    eval_status_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
+    eval_status_p.add_argument("--run", default=None, help="A specific run id.")
+    eval_status_p.add_argument(
+        "--watch",
+        action="store_true",
+        help="Poll until the batch reaches a terminal state.",
+    )
+    eval_status_p.add_argument(
+        "--interval", type=float, default=2.0, help="Seconds between polls with --watch."
+    )
+    eval_trend_p = eval_sub.add_parser("trend", help="One metric's history across snapshots.")
+    eval_trend_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
+    eval_trend_p.add_argument(
+        "--metric", default="known_positive_reciprocal_rank", help="Metric id."
+    )
+    eval_trend_p.add_argument("--cohort", default="anchor", help="Cohort name (default: anchor).")
+    eval_trend_p.add_argument("--variant", default="B5", help="Variant id (default: B5).")
 
     export_p = sub.add_parser(
         "export", help="Write Parquet exports of indexed state, and query them."
@@ -1686,6 +1902,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         for report in reports:
             _print_scan(report)
+        # Once, after the sources. The evaluation plane is a property of the
+        # *region*, not of any one source, and printing it per source would
+        # repeat one number as though it were several.
+        _print_evaluation_projection(
+            next((r for r in reports if r.get("evaluation_projection")), {})
+        )
         return 0
     if args.command == "queue":
         from pheasant.sync.queue import (
@@ -1856,6 +2078,147 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             engine.close()
         print("Repair complete")
+        return 0
+    if args.command == "eval" and args.eval_command == "taxonomy":
+        from pheasant.evaluation.proof import DEFAULT_TAXONOMY
+
+        print(f"{'event type':<32} {'polarity':<9} {'strength':<11} what it licenses")
+        for kind in DEFAULT_TAXONOMY.values():
+            print(f"{kind.event_type:<32} {kind.polarity:<9} {kind.strength:<11} {kind.note}")
+        print()
+        print(
+            "Exposure is not success and non-selection is not a negative: both stay unknown "
+            "unless a deployment deliberately re-polarizes them."
+        )
+        return 0
+    if args.command == "eval" and args.eval_command == "proof":
+        import pheasant.evaluation as evaluation
+        from pheasant.config.loader import load_config
+
+        cfg = load_config(Path(args.config))
+        engine = _engine(Path(args.config), load_persisted_graph=False)
+        try:
+            recorded = evaluation.record_evidence(
+                engine.state,
+                cfg,
+                query=args.query,
+                target_id=args.target,
+                target_type=args.target_type,
+                event_type=args.event,
+                principal=args.principal,
+                session_id=args.session,
+                position=args.position,
+            )
+        except ValueError as exc:
+            print(str(exc))
+            return 2
+        finally:
+            engine.close()
+        print(
+            f"Recorded {args.event} ({recorded['polarity']}, {recorded['strength']}) "
+            f"weight {recorded['weight']} as {recorded['proof_id']} for {recorded['query_id']}."
+        )
+        print(f"Multipliers: {recorded['multipliers']}")
+        return 0
+    if args.command == "eval" and args.eval_command == "run":
+        import pheasant.evaluation as evaluation
+        from pheasant.config.loader import load_config
+
+        cfg = load_config(Path(args.config))
+        # The graph *is* loaded here: replay goes through the real hybrid path,
+        # and a graph-less run silently measures a two-arm region.
+        engine = _engine(Path(args.config))
+        try:
+            outcome = evaluation.run(
+                engine,
+                mode=args.mode,
+                effective_as_of=args.as_of,
+                force=bool(args.force),
+                on_progress=lambda phase, detail: print(
+                    f"  {phase}{(': ' + detail) if detail else ''}"
+                ),
+            )
+        finally:
+            engine.close()
+        if outcome.status == "skipped":
+            print(f"Skipped: {outcome.skipped_reason}")
+            return 0
+        if args.json:
+            print(json.dumps(outcome.report, indent=2, sort_keys=True, default=str))
+            return 0 if outcome.gates_passed else 1
+        _print_evaluation_summary(outcome.report, kb=cfg.knowledge_base_id)
+        return 0 if outcome.gates_passed else 1
+    if args.command == "eval" and args.eval_command == "report":
+        import pheasant.evaluation as evaluation
+        from pheasant.config.loader import load_config
+        from pheasant.evaluation import store as evaluation_store
+
+        cfg = load_config(Path(args.config))
+        engine = _engine(Path(args.config), load_persisted_graph=False)
+        try:
+            report = (
+                evaluation_store.load_report(engine.state, args.run)
+                if args.run
+                else evaluation.latest_report(engine.state, cfg.knowledge_base_id)
+            )
+        finally:
+            engine.close()
+        if report is None:
+            print("No evaluation run has completed yet. Run `pheasant eval run`.")
+            return 1
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True, default=str))
+            return 0
+        _print_evaluation_summary(report, kb=cfg.knowledge_base_id)
+        return 0
+    if args.command == "eval" and args.eval_command == "status":
+        import time as _time
+
+        import pheasant.evaluation as evaluation
+        from pheasant.config.loader import load_config
+        from pheasant.evaluation.store import TERMINAL_RUN_STATUSES
+
+        cfg = load_config(Path(args.config))
+        # No graph: this reads one row. Materializing a graph to print a
+        # progress line would cost the whole corpus's memory for nothing.
+        engine = _engine(Path(args.config), load_persisted_graph=False)
+        terminal = (*TERMINAL_RUN_STATUSES, "none", "unknown")
+        try:
+            while True:
+                payload = evaluation.progress(engine.state, cfg.knowledge_base_id, args.run)
+                _print_evaluation_status(payload)
+                if not args.watch or payload.get("status") in terminal:
+                    break
+                _time.sleep(max(0.5, float(args.interval)))
+        finally:
+            engine.close()
+        return 0
+    if args.command == "eval" and args.eval_command == "trend":
+        import pheasant.evaluation as evaluation
+        from pheasant.config.loader import load_config
+
+        cfg = load_config(Path(args.config))
+        engine = _engine(Path(args.config), load_persisted_graph=False)
+        try:
+            points = evaluation.trend(
+                engine.state,
+                cfg.knowledge_base_id,
+                args.metric,
+                cohort_name=args.cohort,
+                variant_id=args.variant,
+            )
+        finally:
+            engine.close()
+        if not points:
+            print(f"No trend points for {args.metric} on cohort {args.cohort}.")
+            return 1
+        print(f"{args.metric} — cohort {args.cohort}, variant {args.variant}")
+        for point in points:
+            value = "—" if point["value"] is None else f"{point['value']:.4f}"
+            print(
+                f"  {point['started_at']}  {value:>8}  "
+                f"({point['numerator']}/{point['denominator']}, {point['status']})"
+            )
         return 0
     if args.command == "eval":
         from pheasant.config.loader import load_config
