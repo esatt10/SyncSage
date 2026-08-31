@@ -211,7 +211,12 @@ def test_the_heartbeat_keeps_a_long_phase_alive(
     transitions.
     """
 
+    # The beat is derived from the configured stale window and clamped at both
+    # ends, so making it fast means moving the *cap* and the *floor*. Patching
+    # only the cap leaves `MINIMUM_RUN_HEARTBEAT_SECONDS` (1.0s) governing, and
+    # this test would be asserting on a clock slower than its own sleep.
     monkeypatch.setattr(evaluation_store, "RUN_HEARTBEAT_SECONDS", 0.05)
+    monkeypatch.setattr(evaluation_store, "MINIMUM_RUN_HEARTBEAT_SECONDS", 0.01)
     beats: list[str] = []
     real = ReplayEngine.replay_variant
 
@@ -383,6 +388,7 @@ def test_a_completed_run_is_never_rewritten(seeded: Any) -> None:
         mode="current_state",
         config_digest="c",
     )
+    assert claim["claimed"] is False
     assert claim["resumed"] is False
     assert claim["previous_status"] == "completed"
     assert evaluation_store.run_status(seeded.state, first.run_id)["status"] == "completed"
@@ -400,7 +406,7 @@ def test_a_first_attempt_does_not_claim_to_be_a_recovery(seeded: Any) -> None:
         mode="current_state",
         config_digest="c",
     )
-    assert claim == {"resumed": False, "attempts": 1, "previous_status": ""}
+    assert claim == {"claimed": True, "resumed": False, "attempts": 1, "previous_status": ""}
 
 
 # --------------------------------------------------------------------------

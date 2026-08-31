@@ -285,6 +285,19 @@ row counts, and only then renames the SQLite file to `*.migrated` — it is neve
 deleted. Re-running is safe: a table that already holds rows is left alone.
 Stable IDs carry over byte-identically, so no re-index is needed.
 
+The knowledge, memory, observation and **evaluation** planes all come across —
+including recorded proof, which is the one thing in the region that cannot be
+re-derived, and the frozen anchor cohort, without which every trend point after
+the migration would be measured against different questions than every point
+before. Four kinds of row are deliberately left behind, and
+`pheasant.persistence.migrate.NOT_MIGRATED` names each with its reason: derived
+indexes (rebuilt for the target dialect), in-flight queue and lease claims
+(meaningless once detached from the process that claimed them), and evaluation
+*replay checkpoints* — a checkpoint is a cached retrieval result, and since the
+two backends rank differently (see below), reusing one across the migration
+would make a single run's numbers half FTS5 and half `ts_rank_cd`. An
+interrupted batch simply replays from scratch on the new backend.
+
 #### One difference worth knowing about
 
 Ranking is not identical between the two. SQLite ranks with FTS5's `bm25()`;
@@ -943,9 +956,17 @@ process may declare it dead and mark it `interrupted`.
 
 A knob rather than a constant because the right value depends on how long a
 single (cohort, variant) replay takes here, and that is a property of the
-corpus. Too low and a slow-but-healthy batch is reclaimed out from under
-itself; too high and a stopped container shows a spinner for minutes longer
+corpus. Too high and a stopped container shows a spinner for minutes longer
 than it needs to. The default is 90s — six heartbeats.
+
+Lowering it is safe: the heartbeat interval is **derived from this value**, so
+narrowing the window speeds the beat up with it and a batch always gets at
+least three beats to say it is alive. It did not always work that way — the
+beat was fixed at 15s, so any window at or below that inverted the meaning of
+"the heartbeat expired" and a slow-but-healthy batch was reclaimed out from
+under itself, freeing the `__evaluation__` lease under a run that never
+stopped. Windows below 3s are raised to 3s, which is the narrowest one a beat
+can still satisfy.
 
 Reclamation runs at API startup and on the scheduler beat, so `--role api`
 replicas (which never run the beat) still close out a batch whose container

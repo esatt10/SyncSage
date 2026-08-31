@@ -65,7 +65,56 @@ TABLE_ORDER = (
     # The FK is not declared (same reason as memory_compactions), but the copy
     # order follows it anyway.
     "memory_candidates",
+    # The evaluation plane, in dependency order. Migrating to Postgres is what
+    # a region does *before* it runs a fleet, so this is precisely the moment
+    # its measurement history is most worth keeping -- and dropping it is
+    # silent, because a table in neither `copied` nor `skipped` appears in the
+    # report not at all.
+    #
+    # Two of these are unreproducible, which is why they matter more than the
+    # row counts suggest. `evaluation_proofs` is the only data in the region
+    # that cannot be re-derived from anything: proof comes from a surface where
+    # somebody said so, and nothing can say it again on their behalf. And
+    # `evaluation_cohorts` carries the **frozen anchor** -- lose it and the
+    # next run silently builds a new one, so every trend point after the
+    # migration is measured against different questions than every point
+    # before, which is the exact confound the anchor exists to remove.
+    "evaluation_snapshots",
+    "evaluation_cohorts",
+    "evaluation_proofs",
+    # After snapshots: a run names the snapshot it measured.
+    "evaluation_runs",
+    # After runs, snapshots and cohorts: a metric row names all three.
+    "evaluation_metrics",
 )
+
+#: Core tables deliberately left behind, and why.
+#:
+#: Every table in ``CORE_SCHEMA`` must be in exactly one of this and
+#: :data:`TABLE_ORDER`, which ``tests/test_scaling_regressions.py`` asserts
+#: mechanically. That check exists because the alternative already happened: the
+#: evaluation plane added six tables and none reached ``TABLE_ORDER``, so
+#: ``pheasant migrate --to postgres`` -- the step a region takes on its way to a
+#: fleet -- silently dropped every snapshot, cohort, run, metric and proof it
+#: had, and reported success. A table in neither list appears in neither
+#: ``copied`` nor ``skipped``, so there was nothing in the output to notice.
+NOT_MIGRATED: dict[str, str] = {
+    # Bookkeeping for the schema itself; `migrate()` writes the target's own.
+    "pheasant_schema_meta": "the target writes its own schema bookkeeping",
+    # In-flight claim state, meaningless once detached from the process that
+    # claimed it.
+    "index_tasks": "in-flight claim state, tied to the process that claimed it",
+    "log_tasks": "in-flight claim state, tied to the process that claimed it",
+    "source_leases": "in-flight claim state, tied to the process that claimed it",
+    # A replay checkpoint is a cached *retrieval result*, and the two backends
+    # rank differently on purpose -- FTS5's bm25() and Postgres's ts_rank_cd
+    # are different functions (`tests/test_backend_parity.py` says so, and
+    # declines to assert score equality). Carrying checkpoints across would let
+    # one run's numbers be half SQLite ranking and half Postgres ranking, which
+    # is the one thing a measurement must not be. An interrupted run replays
+    # from scratch on the new backend instead, which is correct.
+    "evaluation_replays": "cached retrieval results; the two backends rank differently",
+}
 
 #: Rows per INSERT batch. Large enough that a million-row table is not a
 #: million round trips, small enough not to build a multi-GB parameter list.

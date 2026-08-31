@@ -1463,7 +1463,9 @@ def main(argv: list[str] | None = None) -> int:
         "bootstrap",
         help="Turn the interaction ledger into a de-identified evaluation case set.",
     )
-    eval_boot_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
+    eval_boot_p.add_argument(
+        "--config", "-c", default="pheasant.yaml", help="Path to pheasant.yaml"
+    )
     eval_boot_p.add_argument(
         "--out",
         default=None,
@@ -1476,7 +1478,7 @@ def main(argv: list[str] | None = None) -> int:
         "run",
         help="Replay cohorts against baselines and write an evidence-bearing report.",
     )
-    eval_run_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
+    eval_run_p.add_argument("--config", "-c", default="pheasant.yaml", help="Path to pheasant.yaml")
     eval_run_p.add_argument(
         "--mode",
         choices=("current_state", "historical"),
@@ -1500,7 +1502,9 @@ def main(argv: list[str] | None = None) -> int:
         "--json", action="store_true", help="Print the whole report instead of a summary."
     )
     eval_report_p = eval_sub.add_parser("report", help="Print the most recent evaluation report.")
-    eval_report_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
+    eval_report_p.add_argument(
+        "--config", "-c", default="pheasant.yaml", help="Path to pheasant.yaml"
+    )
     eval_report_p.add_argument("--run", default=None, help="A specific run id.")
     eval_report_p.add_argument(
         "--json", action="store_true", help="Print the whole report instead of a summary."
@@ -1508,7 +1512,9 @@ def main(argv: list[str] | None = None) -> int:
     eval_proof_p = eval_sub.add_parser(
         "proof", help="Record one typed piece of interaction evidence."
     )
-    eval_proof_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
+    eval_proof_p.add_argument(
+        "--config", "-c", default="pheasant.yaml", help="Path to pheasant.yaml"
+    )
     eval_proof_p.add_argument("--query", required=True, help="The question that was asked.")
     eval_proof_p.add_argument("--target", required=True, help="Artifact or memory record id.")
     eval_proof_p.add_argument(
@@ -1524,13 +1530,21 @@ def main(argv: list[str] | None = None) -> int:
     eval_proof_p.add_argument("--principal", default=None)
     eval_proof_p.add_argument("--session", default=None)
     eval_proof_p.add_argument("--position", type=int, default=None)
-    eval_sub.add_parser(
+    eval_tax_p = eval_sub.add_parser(
         "taxonomy", help="Print the evidence taxonomy: every event type and what it licenses."
     )
+    # Takes a config like every sibling, and for a reason beyond uniformity:
+    # the closing line about exposure and non-selection is a claim about
+    # `evaluation.proof`, which a deployment can re-polarize. Printed without
+    # reading it, that claim can be false for the very region the command was
+    # pointed at -- while `GET /evaluation/taxonomy` reports the real values.
+    eval_tax_p.add_argument("--config", "-c", default="pheasant.yaml", help="Path to pheasant.yaml")
     eval_status_p = eval_sub.add_parser(
         "status", help="What an evaluation batch is doing right now."
     )
-    eval_status_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
+    eval_status_p.add_argument(
+        "--config", "-c", default="pheasant.yaml", help="Path to pheasant.yaml"
+    )
     eval_status_p.add_argument("--run", default=None, help="A specific run id.")
     eval_status_p.add_argument(
         "--watch",
@@ -1541,7 +1555,9 @@ def main(argv: list[str] | None = None) -> int:
         "--interval", type=float, default=2.0, help="Seconds between polls with --watch."
     )
     eval_trend_p = eval_sub.add_parser("trend", help="One metric's history across snapshots.")
-    eval_trend_p.add_argument("--config", "-c", default=None, help="Path to pheasant.yaml")
+    eval_trend_p.add_argument(
+        "--config", "-c", default="pheasant.yaml", help="Path to pheasant.yaml"
+    )
     eval_trend_p.add_argument(
         "--metric", default="known_positive_reciprocal_rank", help="Metric id."
     )
@@ -2086,10 +2102,38 @@ def main(argv: list[str] | None = None) -> int:
         for kind in DEFAULT_TAXONOMY.values():
             print(f"{kind.event_type:<32} {kind.polarity:<9} {kind.strength:<11} {kind.note}")
         print()
-        print(
-            "Exposure is not success and non-selection is not a negative: both stay unknown "
-            "unless a deployment deliberately re-polarizes them."
-        )
+        # The taxonomy above is the shipped one; these two are the knobs a
+        # deployment can turn, so they are read from the region rather than
+        # asserted about it. An unreadable config is not an error here -- the
+        # table is still worth printing -- but the line about it says so
+        # instead of stating a default the region may not be running.
+        proof_settings = None
+        try:
+            from pheasant.config.loader import load_config
+
+            proof_settings = load_config(Path(args.config)).evaluation.proof
+        except Exception:  # noqa: BLE001 - printing a table must not need a region
+            pass
+        if proof_settings is None:
+            print(
+                f"Could not read {args.config}, so this is the shipped taxonomy rather than "
+                "this region's: pass --config to see whether it re-polarizes anything."
+            )
+        elif (
+            not proof_settings.unknown_is_negative and not proof_settings.non_selection_is_negative
+        ):
+            print(
+                "Exposure is not success and non-selection is not a negative: both stay unknown "
+                "unless a deployment deliberately re-polarizes them. This one does not."
+            )
+        else:
+            print("This deployment has re-polarized the two defaults that are normally unknown:")
+            print(f"  unknown_is_negative:       {proof_settings.unknown_is_negative}")
+            print(f"  non_selection_is_negative: {proof_settings.non_selection_is_negative}")
+            print(
+                "Treating silence as a negative manufactures negatives at the rate the region "
+                "serves results; every metric below inherits that."
+            )
         return 0
     if args.command == "eval" and args.eval_command == "proof":
         import pheasant.evaluation as evaluation

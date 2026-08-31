@@ -443,7 +443,6 @@ class MemoryStore:
             digest_size=8,
         ).hexdigest()
         record_id = f"mem-{instant.strftime('%Y%m%dT%H%M%SZ')}-{digest}"
-        path = self.root / scope / f"{record_id}.md"
         # `_digest_input` is record *identity* and stays untouched by Phase
         # 1 — this is a separate key, over the *normalized* text, used only
         # to decide whether this write reinforces an existing record. Cheap
@@ -470,8 +469,39 @@ class MemoryStore:
         # widened that set: a correction, a different writer, a different kind
         # or a different validity window all change the digest. An *archived*
         # record no longer matches, so re-asserting something that was
-        # consolidated away correctly brings it back.
+        # consolidated away correctly brings it back -- under its own id, see
+        # below.
         existing = next(iter(sorted((self.root / scope).glob(f"mem-*-{digest}.md"))), None)
+        if existing is None:
+            # Bringing an archived record back reuses *its* id rather than
+            # minting a second one for the same content, because the same
+            # argument applies one level up: content identity is the digest,
+            # and the archived file's digest is this one.
+            #
+            # Without it the outcome depended on the wall clock, and in the
+            # dangerous direction. Consolidation archives a superseded record
+            # (`supersede_retention_days: 0`, the default), so a later
+            # re-assertion of that same text landed on a *new* id -- and the
+            # correction, which names the old id, no longer applied. The
+            # corrected claim came back **current, beside its own correction**,
+            # and `current_only` returned both. Re-asserted inside the same
+            # second it reused the id by luck and stayed corrected. Identical
+            # operations, different memory, decided by a second boundary nobody
+            # means as a semantic one: the same race the paragraph above
+            # records fixing for the live-record path, still live on this one.
+            #
+            # Reusing the id also keeps the revived record *one* assertion:
+            # `memory_record` graph nodes and `supersedes` edges are keyed by
+            # it, so a second id is a second node for a claim the region
+            # already knows.
+            revived = next(
+                iter(sorted((self.root / scope).glob(f"mem-*-{digest}.md.archived"))), None
+            )
+            if revived is not None:
+                record_id = revived.name[: -len(".md.archived")]
+        # After the revival check, so a brought-back record is written to its
+        # own file rather than to a second one holding the same content.
+        path = self.root / scope / f"{record_id}.md"
         if existing is not None:
             folded = self._fold_target(reinforcement, self.load(existing), asserted_at)
             if folded is not None:

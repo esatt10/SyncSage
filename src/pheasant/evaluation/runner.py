@@ -160,11 +160,19 @@ class _RunProgress:
     reason.
     """
 
-    def __init__(self, state: Any):
+    def __init__(self, state: Any, *, heartbeat_seconds: float | None = None):
         self.state = state
         self.run_id: str | None = None
         self.completed_units = 0
         self.total_units = 0
+        # Derived from the *configured* stale window, not fixed: see
+        # `evaluation_store.heartbeat_interval_for` for what a beat slower than
+        # the window does to a run that is merely slow.
+        self.heartbeat_seconds = float(
+            heartbeat_seconds
+            if heartbeat_seconds is not None
+            else evaluation_store.RUN_HEARTBEAT_SECONDS
+        )
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -203,7 +211,7 @@ class _RunProgress:
         self._thread.start()
 
     def _beat(self) -> None:
-        while not self._stop.wait(evaluation_store.RUN_HEARTBEAT_SECONDS):
+        while not self._stop.wait(self.heartbeat_seconds):
             if self.run_id is None:
                 continue
             evaluation_store.heartbeat_run(
@@ -255,13 +263,32 @@ class EvaluationLease:
     lease is real.
     """
 
-    def __init__(self, state: Any, *, owner: str | None = None):
+    def __init__(
+        self,
+        state: Any,
+        *,
+        owner: str | None = None,
+        stale_after_seconds: float | None = None,
+    ):
         self._lease: Any = None
         self._progress: _RunProgress | None = None
         try:
             from pheasant.sync.locks import SourceLease
 
-            self._lease = SourceLease(state, EVALUATION_LEASE, owner=owner)
+            # The lease is aged out on the *evaluation* window, by
+            # `reclaim_interrupted_runs`, so it has to beat on the evaluation
+            # window too. Left on `SOURCE_HEARTBEAT_SECONDS` (10s) it was the
+            # slower of the two clocks under any configured window below 30s,
+            # which made a live batch's own lease look abandoned -- the second
+            # half of the same defect `heartbeat_interval_for` documents.
+            kwargs: dict[str, Any] = {"owner": owner}
+            if stale_after_seconds is not None:
+                beat = evaluation_store.heartbeat_interval_for(stale_after_seconds)
+                kwargs["heartbeat_interval_s"] = beat
+                kwargs["stale_after_s"] = max(
+                    float(stale_after_seconds), evaluation_store.MINIMUM_RUN_STALE_SECONDS
+                )
+            self._lease = SourceLease(state, EVALUATION_LEASE, **kwargs)
         except Exception:  # noqa: BLE001 - leases are optional infrastructure
             logger.debug("evaluation: lease unavailable; running unguarded", exc_info=True)
 
@@ -325,6 +352,12 @@ def reclaim_interrupted_runs(
     Deliberately not destructive. The checkpoints survive, the metric rows
     survive, and re-running the same batch re-derives the same content-addressed
     run id and picks up where it left off.
+
+    The window is floored at :data:`~pheasant.evaluation.store.MINIMUM_RUN_STALE_SECONDS`.
+    Below that no beat can keep the three-beat margin, so reclamation would be
+    declaring *live* batches dead -- which is not recovery, it is the opposite:
+    it frees the ``__evaluation__`` lease under a running batch and admits a
+    concurrent duplicate.
     """
 
     from datetime import datetime, timedelta
@@ -335,10 +368,9 @@ def reclaim_interrupted_runs(
         if stale_after_seconds is not None
         else evaluation_store.RUN_STALE_SECONDS
     )
+    window = max(window, evaluation_store.MINIMUM_RUN_STALE_SECONDS)
     stale_before = (
-        (now - timedelta(seconds=max(1.0, window)))
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
+        (now - timedelta(seconds=window)).isoformat(timespec="seconds").replace("+00:00", "Z")
     )
     try:
         reclaimed = evaluation_store.reclaim_stale_runs(
@@ -573,7 +605,10 @@ def run_evaluation(
 
     # Set once the run row exists; before that there is nothing durable to
     # write progress to, and the in-process callback is all a caller has.
-    progress = _RunProgress(state)
+    stale_window = getattr(settings, "run_stale_seconds", None)
+    progress = _RunProgress(
+        state, heartbeat_seconds=evaluation_store.heartbeat_interval_for(stale_window)
+    )
 
     def report(phase: str, detail: str = "", *, units: int | None = None) -> None:
         """Publish one phase transition to every watcher there is.
@@ -601,7 +636,7 @@ def run_evaluation(
             skipped_reason="evaluation.enabled is false; pass force=True to run anyway",
         )
 
-    lease = EvaluationLease(state)
+    lease = EvaluationLease(state, stale_after_seconds=stale_window)
     with lease as acquired:
         if not acquired:
             return RunOutcome(
@@ -666,6 +701,40 @@ def run_evaluation(
             config_digest=config_digest,
             owner=_owner(),
         )
+        if not claim["claimed"]:
+            # This exact batch -- same state, same configuration, same mode and
+            # instant -- already reached an answer and published it. Replaying
+            # it can only re-derive the report it already holds, so the honest
+            # thing is to say so and hand back the run that has it, rather than
+            # spend a full cohort-by-variant matrix overwriting a document with
+            # itself. In a fleet on an hourly beat over a region that has not
+            # changed, that is the difference between doing the work every hour
+            # and doing it when something moved.
+            #
+            # It is also the only way the run row stays truthful: this batch
+            # has no row of its own to write progress to, and writing progress
+            # to the *finished* run's row is what made a live batch read as
+            # `completed` to every watcher. See `open_run`.
+            #
+            # The stored report comes back with it rather than an empty dict.
+            # A caller asking for this batch wants its numbers, and they exist
+            # -- re-deriving them is what is redundant, not having them. So
+            # `pheasant eval run` still prints a summary, the HTTP job still
+            # reports gates, and "two runs over one state agree" stays a
+            # property a caller can actually check.
+            settled = evaluation_store.load_report(state, run_id) or {}
+            return RunOutcome(
+                run_id=run_id,
+                snapshot_id=manifest.snapshot_id,
+                status="skipped",
+                report=settled,
+                gates=_stored_gates(settled),
+                skipped_reason=(
+                    f"this batch already {claim['previous_status']}; its report is unchanged "
+                    "because nothing the run id covers has moved"
+                ),
+                attempts=int(claim["attempts"]),
+            )
         progress.bind(run_id)
         lease.watch(progress)
         checkpoints = (
@@ -699,6 +768,12 @@ def run_evaluation(
                 gates_passed=False,
                 report={"run_id": run_id, "gates": [snapshot_gate.as_dict()]},
             )
+            # `invalid` is settled, so no later attempt will pick this run id up
+            # again -- which means any checkpoints an *earlier* attempt left are
+            # now unreachable. Dropping them here is the same argument the
+            # completed path makes: the scaffolding outlives its reader
+            # otherwise, and it is a copy of every result list.
+            evaluation_store.clear_replay_checkpoints(state, run_id)
             return outcome
 
         # 3. Resolve cohorts.
@@ -768,8 +843,13 @@ def run_evaluation(
                 report("replay", f"{cohort_name}/{variant.variant_id} (checkpointed)")
                 continue
             if spent >= budget or (time.monotonic() - started_clock) > deadline:
+                # Recorded, and deliberately *not* counted as a completed unit.
+                # Advancing here made a truncated run finish at 42/42 -- a
+                # progress bar reporting every replay done for a batch that
+                # skipped most of them, which is the mirror of the
+                # smaller-denominator sin this module refuses elsewhere. A
+                # truncated run stops short and the counter says where.
                 truncated[f"{cohort_name}:{variant.variant_id}"] = cohort.query_count
-                progress.advance()
                 continue
             report("replay", f"{cohort_name}/{variant.variant_id}")
             pair_started = time.monotonic()
@@ -1003,6 +1083,37 @@ def run_evaluation(
             attempts=int(claim["attempts"]),
             resumed_replays=resumed_pairs,
         )
+
+
+def _stored_gates(report: dict[str, Any]) -> list[GateResult]:
+    """The gates a settled run published, for a batch that declined to redo it.
+
+    ``RunOutcome.gates_passed`` is what ``pheasant eval run`` turns into an exit
+    status, and a run skipped because it had *already* answered should report
+    the answer it gave rather than an empty list -- which
+    :attr:`RunOutcome.gates_passed`, correctly, reads as "no gates, so no pass".
+    A caller that scripts on this gets the region's real gate outcome instead of
+    a false negative every time nothing has changed.
+    """
+
+    out: list[GateResult] = []
+    for gate in report.get("gates") or []:
+        if not isinstance(gate, dict):
+            continue
+        try:
+            out.append(
+                GateResult(
+                    gate_id=str(gate.get("gate_id") or ""),
+                    passed=bool(gate.get("passed")),
+                    observed=float(gate.get("observed") or 0.0),
+                    maximum=float(gate.get("maximum") or 0.0),
+                    detail=str(gate.get("detail") or ""),
+                    evidence=dict(gate.get("evidence") or {}),
+                )
+            )
+        except (TypeError, ValueError):  # a stored report must not fail a skip
+            logger.debug("evaluation: unreadable stored gate %r", gate, exc_info=True)
+    return out
 
 
 def _replay_searcher(engine: Any) -> Any:

@@ -307,8 +307,57 @@ def list_cohorts(state: Any, kb_id: str, *, limit: int = 100) -> list[Cohort]:
 RUN_HEARTBEAT_SECONDS = 15.0
 RUN_STALE_SECONDS = 90.0
 
+#: The margin between the two above, and the whole reason the pair means
+#: anything: three missed beats is death, and a merely slow run gets three
+#: chances to say otherwise.
+RUN_HEARTBEAT_MARGIN = 3
+
+#: Floors, so the margin survives an operator narrowing the window. A batch
+#: never beats faster than once a second (the beat is a write, and one per
+#: replay-second is telemetry becoming load), which is what makes
+#: :data:`MINIMUM_RUN_STALE_SECONDS` the narrowest window that can still keep
+#: the margin.
+MINIMUM_RUN_HEARTBEAT_SECONDS = 1.0
+MINIMUM_RUN_STALE_SECONDS = MINIMUM_RUN_HEARTBEAT_SECONDS * RUN_HEARTBEAT_MARGIN
+
+
+def heartbeat_interval_for(stale_seconds: float | None) -> float:
+    """How often a batch must beat for ``stale_seconds`` to mean what it says.
+
+    ``evaluation.run_stale_seconds`` is operator-configurable and the beat was
+    not, so the margin above held only at the default. Narrow the window and a
+    *live* batch becomes reclaimable: a single cohort/variant replay is
+    hundreds of searches and routinely outlasts a short window, so its row
+    flips to ``interrupted`` while it is still working -- and
+    :func:`~pheasant.evaluation.runner.reclaim_interrupted_runs` frees the
+    ``__evaluation__`` lease on the strength of that, which is the one thing
+    keeping N replicas to one run. Reproduced at a 20s window, which
+    CLAUDE.md records a CI region using so its smoke test need not wait out 90.
+
+    So the beat is derived from the window rather than fixed against it, and
+    both scale together. The default (90s) yields exactly the 15s beat it
+    always had -- six beats of margin, unchanged -- and every narrower window
+    keeps at least three.
+    """
+
+    window = max(float(stale_seconds or RUN_STALE_SECONDS), MINIMUM_RUN_STALE_SECONDS)
+    return max(
+        MINIMUM_RUN_HEARTBEAT_SECONDS,
+        min(RUN_HEARTBEAT_SECONDS, window / RUN_HEARTBEAT_MARGIN),
+    )
+
+
 #: Terminal states. Nothing rewrites a run in one of these.
 TERMINAL_RUN_STATUSES = ("completed", "truncated", "invalid", "failed", "interrupted")
+
+#: Terminal *and* settled: the batch reached an answer and published it.
+#: :func:`open_run` refuses to re-open one of these, because the report is the
+#: run's whole output and re-deriving it can only overwrite it with itself.
+#:
+#: ``failed`` and ``interrupted`` are terminal but deliberately absent: both
+#: say "this batch did not finish", and re-running one is the resume path the
+#: replay checkpoints exist for.
+SETTLED_RUN_STATUSES = ("completed", "truncated", "invalid")
 
 
 def open_run(
@@ -323,14 +372,22 @@ def open_run(
     owner: str = "",
     total_units: int = 0,
 ) -> dict[str, Any]:
-    """Claim a run row, or resume the one already there.
+    """Claim a run row, resume the one already there, or decline it.
 
-    Returns ``{"resumed": bool, "attempts": int, "previous_status": str}``.
+    Returns ``{"claimed": bool, "resumed": bool, "attempts": int,
+    "previous_status": str}``.
+
     Resuming is the normal path after a container restart: the run id is
     content-addressed, so the same batch re-derives the same row rather than
     starting a second one, and ``attempts`` counts how many times it has been
     picked up. The insert and the claim are one statement each, and neither
     ever rewrites a *terminal* row -- a completed run is history.
+
+    ``claimed`` is the caller's instruction, and it is separate from ``resumed``
+    because there are three outcomes, not two: a fresh claim, a resumed claim,
+    and a *refusal*. A run that already reached a settled terminal status is
+    refused, and the caller must not proceed -- see the comment on that branch
+    for what proceeding did.
     """
 
     # Read before writing, so "this row did not exist" and "this row is being
@@ -365,21 +422,50 @@ def open_run(
                 1,
             ),
         )
-        return {"resumed": False, "attempts": 1, "previous_status": ""}
+        return {"claimed": True, "resumed": False, "attempts": 1, "previous_status": ""}
 
     previous = str(existing[0]["status"] or "")
     attempts = int(existing[0]["attempts"] or 1)
-    if previous in TERMINAL_RUN_STATUSES and previous not in ("interrupted", "failed"):
+    if previous in SETTLED_RUN_STATUSES:
         # A completed, truncated or invalid run is history: re-running it would
         # destroy the report it published, and its numbers are reproducible by
         # construction anyway.
-        return {"resumed": False, "attempts": attempts, "previous_status": previous}
+        #
+        # This branch used to only *decline to write the row* and let the caller
+        # replay the whole matrix on top of it, which is not the same thing and
+        # broke three ways at once. The row kept saying `completed` while a
+        # batch was genuinely in flight, so every watcher -- the UI, `eval
+        # status --watch`, `get_evaluation_status` -- read a live run as
+        # finished, with a `fraction` that fell from 1.0 back to 0.02 and
+        # climbed again; `active_run` (which filters `status='running'`) could
+        # not see it at all; and if that process died the row stayed
+        # `completed` forever with `phase='replay'` and a stale
+        # `completed_units`, because `reclaim_stale_runs` filters on
+        # `status='running'` too -- so nothing could ever reclaim it, and the
+        # replay checkpoints it left behind were never loaded and never
+        # cleared. On top of which it re-replayed every cohort and variant, on
+        # every scheduled beat, to overwrite an identical report.
+        #
+        # `failed` and `interrupted` are terminal but not settled: both mean
+        # "this batch did not finish", and picking one up again is exactly the
+        # recovery the checkpoints exist for.
+        return {
+            "claimed": False,
+            "resumed": False,
+            "attempts": attempts,
+            "previous_status": previous,
+        }
     state.execute(
         "UPDATE evaluation_runs SET status=?, phase=?, heartbeat_at=?, owner=?, "
         "attempts=attempts+1, error=NULL, finished_at=NULL, total_units=? WHERE run_id=?",
         ("running", "starting", started_at, owner, int(total_units), run_id),
     )
-    return {"resumed": True, "attempts": attempts + 1, "previous_status": previous}
+    return {
+        "claimed": True,
+        "resumed": True,
+        "attempts": attempts + 1,
+        "previous_status": previous,
+    }
 
 
 def heartbeat_run(
