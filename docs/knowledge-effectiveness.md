@@ -218,6 +218,8 @@ retrieved memory record take a slot and be counted as the rule's doing.
 
 ## What comes out
 
+![The Effectiveness page: a health vector where every tile carries its denominator, with one metric opened to its formula, substituted numbers and stated limitation](assets/ui/evaluation.png)
+
 A **health vector**, not a scalar:
 
 ```yaml
@@ -259,13 +261,15 @@ part people read.
 
 ## Hard gates
 
+![The hard gates, each pass or fail with its evidence, rendered as a list apart from the scores](assets/ui/evaluation-gates.png)
+
 Gates are not metrics with a strict threshold. Metrics are combined, and anything
 combined can be offset: an ACL leak paired with excellent recall produces a
 healthy-looking composite, and that composite is a lie about a security failure.
 
 | Gate | Asserts |
 |---|---|
-| `acl_leak` | A scoped record does not reach a principal who did not write it |
+| `acl_leak` | A scoped record does not reach a principal who did not write it. Reports *not evaluated* when `security.acl_enforced` is off — scope isolation is not in force there, and failing every default region would train people to ignore the gate |
 | `stale_current_leak` | A superseded record is not returned under `current_only` |
 | `temporal_invariant` | The same query under `as_of` **does** bring the old record back |
 | `abstention` | A query about content the corpus never held returns nothing |
@@ -332,6 +336,8 @@ running      [##########..............] 42%  replay — anchor/B3  (15/36 replay
   run run-0664e4863d7b482c on indexer-0:31
 ```
 
+![A batch in flight: a progress bar, the phase it is on, and 15 of 36 cohort/variant replays done](assets/ui/evaluation-running.png)
+
 Over HTTP, `GET /evaluation/status`; over MCP, `get_evaluation_status`; in the
 UI, the **Effectiveness** page polls it while a run is in flight. All four read
 the same row, which is what makes them work in the two cases that actually
@@ -351,6 +357,8 @@ Nothing rewrites a row when a process is killed, so something else has to. A
 run whose heartbeat has expired is marked **`interrupted`** — with how far it
 got and why — by `reclaim_interrupted_runs`, which runs at API startup and on
 the scheduler beat.
+
+![An interrupted batch: the process stopped after 15 of 36 replays, and running it again resumes from there](assets/ui/evaluation-interrupted.png)
 
 `interrupted` rather than `failed` is a real distinction: the batch did not
 fail, it was cut off, and that decides whether resuming it makes sense. It
@@ -549,6 +557,19 @@ so the freed slots are refilled from real ranked candidates. Fusion scores are
 unchanged and a hit from beyond the widened window still does not enter, so it
 approximates "the record was never written" rather than reproducing it. The
 report says so instead of implying the exclusion was exact.
+
+**Control regression is paired against `B1`, not the corpus baseline.** The
+cohort is defined by "no steering rule fires here", so the treatment it
+controls has to be steering alone — and `B1` (memory content, no steering)
+against `B5` (content plus every steering kind) differ in exactly that. Pairing
+it against `B0` compares steering *and* memory content, so a record
+legitimately answering a control query read as an unintended regression: the
+treatment doing its job, counted as harm.
+
+Widening the cohort to exclude anything memory could answer was the other wrong
+fix, and it emptied the cohort outright — a formed session digest quotes the
+very queries the cohort is drawn from, so retrieval returns it for all of them.
+Both were found by running a real region and reading its gates.
 
 **Control regression counts only evidenced control queries.** An earlier version
 counted any movement in an unjudged control query's top-k, and it fired

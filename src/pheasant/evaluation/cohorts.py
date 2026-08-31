@@ -367,16 +367,31 @@ def build_control(
     name: str = "control",
     maximum_queries: int = 200,
 ) -> Cohort:
-    """Queries no steering rule can fire on, and no memory answers.
+    """Queries no steering rule can fire on.
 
     "Should have no effect" is made deterministic rather than intuitive: a
     query is a control when none of its tokens triggers any alias or preference
-    rule in the store, and no exclusion path fragment appears in its text. If a
-    treatment moves these, it moved something it was never asked to.
+    rule, and no exclusion path fragment appears in it. Derived from the live
+    steering records rather than a hand-written list, so a rule added tomorrow
+    shrinks the control set tomorrow instead of quietly invalidating it.
 
-    Derived from the live steering records rather than from a hand-written
-    list, so a rule added tomorrow shrinks the control set tomorrow instead of
-    quietly invalidating it.
+    **The cohort is about steering, so what it controls must be steering too.**
+    Two earlier attempts got this wrong from the other end. Comparing the
+    full-memory variant against the corpus baseline here counted a memory
+    record legitimately answering a control query as an unintended regression
+    -- it was the treatment doing its job on a query this cohort had wrongly
+    called untouched. Widening the cohort to exclude anything memory could
+    answer then emptied it outright, because a formed *session digest* quotes
+    the very queries the cohort is drawn from and is retrievable for all of
+    them.
+
+    Both failures came from pairing a steering-defined cohort with a treatment
+    that also changes memory *content*. The fix is on the metric's side, not
+    here: :func:`pheasant.evaluation.runner` measures control regression
+    between ``B1`` (memory content, no steering) and ``B5`` (memory content
+    plus every steering kind), which differ in steering alone. On a query no
+    rule can fire on, those two must be identical -- and any difference is
+    unintended by construction.
     """
 
     triggers: set[str] = set()

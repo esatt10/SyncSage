@@ -1141,6 +1141,8 @@ def control_regression(
             ),
         )
         result.operands = {
+            "baseline_variant": baseline.variant.variant_id,
+            "treatment_variant": treatment.variant.variant_id,
             "unjudged_changed": unjudged_changed,
             "unjudged_total": unjudged_total,
         }
@@ -1158,6 +1160,13 @@ def control_regression(
         status=MetricStatus.PASS.value if regressed == 0 else MetricStatus.FAIL.value,
         threshold=tolerance,
         operands={
+            # A paired metric names its pair. Without this the report shows a
+            # regression rate with no way to tell *what* it was measured
+            # against -- and for this metric that is the whole question, since
+            # the cohort controls for steering and only a steering-only pairing
+            # measures it.
+            "baseline_variant": baseline.variant.variant_id,
+            "treatment_variant": treatment.variant.variant_id,
             "tolerance": tolerance,
             "worst": [
                 {"query_id": qid, "delta": delta}

@@ -576,6 +576,43 @@ def test_the_holdout_excludes_every_query_that_made_the_intervention(tmp_path: P
         engine.close()
 
 
+def test_control_regression_is_paired_against_the_steering_baseline(tmp_path: Path) -> None:
+    """The cohort is defined by "no steering rule fires here", so the treatment
+    it controls must be steering alone.
+
+    Pairing it against the corpus baseline compares steering *and* memory
+    content, and a memory record legitimately answering a control query then
+    reads as an unintended regression — the treatment doing its job, counted as
+    harm. B1 (memory content, no steering) against B5 (content plus every
+    steering kind) differ in exactly the thing the cohort controls for.
+    """
+
+    engine = _engine(tmp_path)
+    _observe(engine)
+    from pheasant.memory.store import MemoryStore, memory_source
+
+    source = memory_source(engine.config, engine.state)
+    assert source is not None
+    # A record that answers a control query. Under a B0 pairing this is what
+    # produced the false regression.
+    MemoryStore(source.path).append(
+        "The filewatch daemon restarts nightly at 0300 UTC.", scope="org"
+    )
+    engine.sync_source("agent-memory", "full")
+    try:
+        outcome = evaluation.run(engine)
+        control = outcome.report["controls_and_regressions"]
+        assert control is not None, "no control-regression metric was published"
+        # Paired against the steering baseline, not the corpus one.
+        assert control["calculation"]["operands"]["baseline_variant"] == "B1"
+        # And the gate passes: no steering rule exists, so B1 and B5 are the
+        # same run on these queries.
+        gates = {g["gate_id"]: g for g in outcome.report["gates"]}
+        assert gates["control_regression"]["passed"] is True
+    finally:
+        engine.close()
+
+
 def test_the_control_cohort_excludes_anything_a_rule_could_fire_on(tmp_path: Path) -> None:
     """ "Should have no effect" has to be deterministic, not intuitive."""
 

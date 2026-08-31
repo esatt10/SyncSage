@@ -32,6 +32,32 @@ const PHASES = [
 const TERMINAL = new Set(["completed", "truncated", "invalid", "failed", "interrupted"]);
 
 /**
+ * The order the health vector is meant to be read in.
+ *
+ * A stored report is JSON with sorted keys, so iterating the object renders it
+ * alphabetically — which puts `control_regression` first and the coverage
+ * caveat fifth. The vector is meant to be read top to bottom with its
+ * denominator context before its scores, so the order is stated here rather
+ * than inherited from a serializer. Anything not listed still renders, after.
+ */
+const VECTOR_ORDER = [
+  "evidence_coverage",
+  "known_positive_retrieval_at_5",
+  "known_positive_reciprocal_rank",
+  "known_negative_exposure_at_5",
+  "memory_attributable_gain",
+  "future_query_generalization",
+  "generalization_gap",
+  "control_regression",
+];
+
+function orderedVector(vector: Record<string, unknown>): string[] {
+  const known = VECTOR_ORDER.filter((name) => name in vector);
+  const rest = Object.keys(vector).filter((name) => !VECTOR_ORDER.includes(name));
+  return [...known, ...rest];
+}
+
+/**
  * Is this knowledge base getting better, and how would we know?
  *
  * The page is organised around the answer being a *vector* rather than a
@@ -93,20 +119,34 @@ export function EvaluationPage() {
   const finished = live && TERMINAL.has(live.status);
   const data = report.data;
 
-  const metricsById = useMemo(() => {
-    const out = new Map<string, EvaluationMetricResult>();
-    for (const metric of data?.baseline_comparison ?? []) out.set(metric.metric_id, metric);
-    for (const metric of data?.memory_attribution ?? []) out.set(metric.metric_id, metric);
-    for (const metric of [
-      data?.generalization?.learned,
-      data?.generalization?.temporal_holdout,
-      data?.generalization?.gap,
-      data?.controls_and_regressions,
-    ]) {
-      if (metric) out.set(metric.metric_id, metric);
-    }
-    return out;
-  }, [data]);
+  // The metric id behind the open tile, which is not its display label.
+  const openMetricId = openMetric ? data?.health_vector?.[openMetric]?.metric_id : undefined;
+
+  // Fetched rather than dug out of the report. The report's sections carry the
+  // attribution metrics only, and most of the health vector is not among them
+  // — so reading the calculation out of the document worked for two tiles and
+  // silently showed nothing for the rest. `/evaluation/metrics` exists for
+  // exactly this: resolve an aggregate to the row that produced it.
+  const detail = useQuery({
+    queryKey: ["evaluation", "metric", openMetricId],
+    // Deliberately not pinned to the anchor cohort. Three of the vector's
+    // metrics are *about* another cohort by definition — control regression
+    // lives on the control set, and the two generalization figures on the
+    // learned and holdout sets — so filtering to the anchor returned nothing
+    // for them and the tile silently showed no calculation.
+    queryFn: () => api.evaluationMetrics({ metric: openMetricId }),
+    enabled: Boolean(openMetricId),
+    retry: false,
+  });
+
+  const openCalculation = useMemo<EvaluationMetricResult | null>(() => {
+    // Aggregates have no query id; the per-query rows behind them share the
+    // metric id and would otherwise be picked arbitrarily. Where several
+    // cohorts computed the same metric, the anchor is the headline one.
+    const rows = (detail.data?.results ?? []).filter((row) => row.query_id === null && row.result);
+    const preferred = rows.find((row) => row.cohort_purpose === "anchor") ?? rows[0];
+    return (preferred?.result as EvaluationMetricResult | undefined) ?? null;
+  }, [detail.data]);
 
   if (status.isLoading) {
     return <div className="page"><p className="muted">Loading…</p></div>;
@@ -166,24 +206,25 @@ export function EvaluationPage() {
               than as a zero.
             </p>
             <div className="eval-tiles">
-              {Object.entries(data.health_vector).map(([name, entry]) => (
+              {orderedVector(data.health_vector).map((name) => (
                 <button
                   key={name}
                   type="button"
                   className="eval-tiles__item"
                   onClick={() => setOpenMetric(openMetric === name ? null : name)}
                 >
-                  <HealthTile name={name} entry={entry} />
+                  <HealthTile name={name} entry={data.health_vector[name]} />
                 </button>
               ))}
             </div>
-            {openMetric && metricsById.has(openMetric) ? (
-              <MetricDetail metric={metricsById.get(openMetric)!} />
+            {openMetric && openCalculation ? (
+              <MetricDetail metric={openCalculation} />
+            ) : openMetric && detail.isFetching ? (
+              <p className="muted small">Loading the calculation…</p>
             ) : openMetric ? (
               <p className="muted small">
-                No stored calculation for <code>{openMetric}</code> in this run — it is
-                reported in the health vector but was computed on a cohort this run did not
-                keep per-metric detail for.
+                No stored calculation for <code>{openMetricId ?? openMetric}</code> on the
+                anchor cohort in this run.
               </p>
             ) : null}
           </section>

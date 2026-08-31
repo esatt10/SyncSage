@@ -111,3 +111,61 @@ def test_the_page_explains_an_interrupted_run_rather_than_spinning() -> None:
     assert 'status.status === "interrupted"' in source
     assert "resumes from there" in source
     assert "attempts" in source
+
+
+# ---------------------------------------------------------------------------
+# The screenshots the README and the docs show.
+#
+# A screenshot checked in once and never regenerated is a picture of a UI that
+# no longer exists. `scripts/screenshot_ui.py` is what keeps them honest; these
+# check the two things that rot silently between regenerations — an image
+# referenced by a page that nobody produces, and a page produced by nobody that
+# references it.
+# ---------------------------------------------------------------------------
+
+SHOT_DIR = REPO_ROOT / "docs" / "assets" / "ui"
+SCREENSHOT_SCRIPT = REPO_ROOT / "scripts" / "screenshot_ui.py"
+
+
+def test_every_referenced_screenshot_exists() -> None:
+    """A broken image is worse than no image: it reads as a broken product."""
+
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    doc = (REPO_ROOT / "docs" / "knowledge-effectiveness.md").read_text(encoding="utf-8")
+
+    referenced = set(re.findall(r"docs/assets/ui/([\w.-]+\.png)", readme))
+    referenced |= set(re.findall(r"\(assets/ui/([\w.-]+\.png)\)", doc))
+    assert referenced, "nothing references a UI screenshot any more"
+
+    missing = sorted(name for name in referenced if not (SHOT_DIR / name).exists())
+    assert not missing, f"referenced but not checked in: {', '.join(missing)}"
+
+
+def test_every_evaluation_screenshot_is_produced_by_the_script() -> None:
+    """An image nothing regenerates is one that quietly goes stale.
+
+    The script writes each shot by name, so a picture in the docs that the
+    script does not know how to produce will still be the first version anyone
+    took of it — months after the page changed.
+    """
+
+    script = SCREENSHOT_SCRIPT.read_text(encoding="utf-8")
+    for name in sorted(SHOT_DIR.glob("evaluation*.png")):
+        stem = name.stem
+        assert stem in script, (
+            f"{name.name} is checked in but scripts/screenshot_ui.py does not produce it — "
+            "it will never be regenerated"
+        )
+
+
+def test_the_screenshot_script_drives_the_evaluation_page() -> None:
+    """The seeded region has to actually run a batch, or the page photographs
+    an empty state and the picture proves nothing."""
+
+    script = SCREENSHOT_SCRIPT.read_text(encoding="utf-8")
+    assert '"evaluation": "Effectiveness"' in script
+    assert "/evaluation/evidence" in script, "no proof is recorded, so every tile would be empty"
+    assert "evaluation.run(" in script, "no batch is run, so there would be no report to show"
+    # And it asserts the drill-down works rather than photographing whatever
+    # happens to be on screen.
+    assert "resolve an aggregate to the formula behind it" in script

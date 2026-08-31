@@ -69,6 +69,14 @@ export function denominatorLabel(entry: EvaluationHealthEntry): string | null {
   if (entry.numerator === null || entry.numerator === undefined) {
     return `n=${entry.denominator}`;
   }
+  // A fraction only when the numerator is a genuine count. For a macro-average
+  // the numerator is `mean x n` — a sum of reciprocal ranks, say — and
+  // rendering "2.333335 / 5" states a count of things that were never counted.
+  // The denominator is still the number that matters there, so it is shown on
+  // its own rather than dressed up as a ratio.
+  if (!Number.isInteger(entry.numerator)) {
+    return `n=${entry.denominator}`;
+  }
   return `${entry.numerator} / ${entry.denominator}`;
 }
 

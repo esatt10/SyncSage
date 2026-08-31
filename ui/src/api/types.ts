@@ -817,6 +817,13 @@ export interface EvaluationStatus {
 }
 
 export interface EvaluationHealthEntry {
+  /**
+   * The metric's own id, which is deliberately not the display label — the
+   * vector says `known_positive_retrieval_at_5` where the metric is
+   * `known_positive_recall_at_5`. Carried so a client can fetch the
+   * calculation behind a tile without duplicating the mapping.
+   */
+  metric_id?: string;
   value: number | null;
   status: EvaluationMetricStatus;
   numerator?: number | null;

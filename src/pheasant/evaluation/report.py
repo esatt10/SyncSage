@@ -95,9 +95,21 @@ def health_vector(
             or _find(results, metric_id)
         )
         if result is None:
-            out[label] = {"value": None, "status": MetricStatus.NOT_APPLICABLE.value}
+            out[label] = {
+                "metric_id": metric_id,
+                "value": None,
+                "status": MetricStatus.NOT_APPLICABLE.value,
+            }
             continue
         out[label] = {
+            # The metric's own id travels with the entry, because the label is
+            # a *display* name and the two deliberately differ (the vector says
+            # `known_positive_retrieval_at_5`, the metric is
+            # `known_positive_recall_at_5`). Without it a reader wanting the
+            # formula behind a tile has to re-derive the mapping, which means
+            # duplicating it in every client -- and a duplicated mapping is one
+            # that goes stale in exactly one place.
+            "metric_id": result.metric_id,
             "value": result.value,
             "status": result.status,
             "numerator": result.numerator,

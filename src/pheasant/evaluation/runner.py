@@ -809,9 +809,21 @@ def run_evaluation(
             results.append(metric_functions.generalization_gap(learned_gain, holdout_gain))
 
         # Control regression, on the control cohort only.
+        #
+        # Paired against **B1**, not the corpus baseline. The cohort is defined
+        # by "no steering rule can fire here", so the treatment it controls has
+        # to be steering alone -- and B1 (memory content, no steering) against
+        # B5 (memory content plus every steering kind) differ in exactly that.
+        # Pairing it against B0 instead compares steering *and* memory content,
+        # so a record legitimately answering a control query read as an
+        # unintended regression: the treatment doing its job, counted as harm.
+        #
+        # Falls back to the corpus baseline only when B1 was not run, and that
+        # is a weaker comparison rather than an equivalent one.
         control_metric = None
         control_replays = replays.get("control") or {}
-        if variant_matrix.CORPUS_BASELINE in control_replays and PRIMARY_VARIANT in control_replays:
+        steering_baseline = "B1" if "B1" in control_replays else variant_matrix.CORPUS_BASELINE
+        if steering_baseline in control_replays and PRIMARY_VARIANT in control_replays:
             control_ctx = MetricContext(
                 snapshot_id=manifest.snapshot_id,
                 cohort=cohorts["control"],
@@ -821,7 +833,7 @@ def run_evaluation(
             )
             control_metric = metric_functions.control_regression(
                 control_ctx,
-                control_replays[variant_matrix.CORPUS_BASELINE],
+                control_replays[steering_baseline],
                 control_replays[PRIMARY_VARIANT],
                 tolerance=float(settings.gates.control_regression_tolerance),
             )
@@ -834,7 +846,9 @@ def run_evaluation(
         if PRIMARY_VARIANT in invariant_replays:
             run_gates.extend(
                 gate_checks.evaluate_invariants(
-                    cohorts["invariants"], invariant_replays[PRIMARY_VARIANT]
+                    cohorts["invariants"],
+                    invariant_replays[PRIMARY_VARIANT],
+                    acl_enforced=bool(getattr(config.security, "acl_enforced", False)),
                 )
             )
         anchor_replays = replays.get("anchor") or {}

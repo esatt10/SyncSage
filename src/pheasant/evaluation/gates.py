@@ -52,8 +52,19 @@ def _returned_record_ids(replay: VariantReplay, query_id: str) -> set[str]:
     return set(result.memory_record_ids)
 
 
-def evaluate_invariants(cohort: Any, replay: VariantReplay) -> list[GateResult]:
-    """The four cohort-derived gates. Order is the report's order."""
+def evaluate_invariants(
+    cohort: Any, replay: VariantReplay, *, acl_enforced: bool = True
+) -> list[GateResult]:
+    """The four cohort-derived gates. Order is the report's order.
+
+    ``acl_enforced`` mirrors ``security.acl_enforced``. With it off, a
+    scope-restricted memory record is returned to any caller *by design* --
+    that is the documented default, and the isolation the ACL gate asserts
+    simply is not switched on. Failing the gate there would report a security
+    breach on every region that never opted in, and a gate that cries wolf on
+    a default configuration is a gate people learn to ignore. So it reports
+    "not evaluated" instead, and says why.
+    """
 
     gates: list[GateResult] = []
 
@@ -103,25 +114,41 @@ def evaluate_invariants(cohort: Any, replay: VariantReplay) -> list[GateResult]:
 
     # --- ACL isolation ------------------------------------------------------
     cases = _cases(cohort, "acl_isolation")
-    leaked = [
-        case.query_id
-        for case in cases
-        if str(case.expectation["forbidden_record_id"])
-        in _returned_record_ids(replay, case.query_id)
-    ]
-    gates.append(
-        GateResult(
-            gate_id="acl_leak",
-            passed=not leaked,
-            observed=float(len(leaked)),
-            maximum=0.0,
-            detail=(
-                f"{len(leaked)} of {len(cases)} scoped records reached a principal that did not "
-                "write them"
-            ),
-            evidence={"cases": len(cases), "failed_query_ids": leaked[:20]},
+    if not acl_enforced:
+        gates.append(
+            GateResult(
+                gate_id="acl_leak",
+                passed=True,
+                observed=0.0,
+                maximum=0.0,
+                detail=(
+                    "not evaluated: security.acl_enforced is off, so scope isolation is not "
+                    "in force and a scoped record reaching another principal is the "
+                    "documented default rather than a leak"
+                ),
+                evidence={"cases": len(cases), "acl_enforced": False, "status": "not_applicable"},
+            )
         )
-    )
+    else:
+        leaked = [
+            case.query_id
+            for case in cases
+            if str(case.expectation["forbidden_record_id"])
+            in _returned_record_ids(replay, case.query_id)
+        ]
+        gates.append(
+            GateResult(
+                gate_id="acl_leak",
+                passed=not leaked,
+                observed=float(len(leaked)),
+                maximum=0.0,
+                detail=(
+                    f"{len(leaked)} of {len(cases)} scoped records reached a principal that "
+                    "did not write them"
+                ),
+                evidence={"cases": len(cases), "failed_query_ids": leaked[:20]},
+            )
+        )
 
     # --- abstention ---------------------------------------------------------
     cases = _cases(cohort, "abstention")

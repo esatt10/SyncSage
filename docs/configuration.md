@@ -984,7 +984,7 @@ Six cohorts, each with a different purpose:
 | `rolling` | Recent traffic in a lookback window | Notices new questions; moves for two reasons at once |
 | `learned` | Queries whose interactions created the memory | **Recall of learned experience — never reported as generalization** |
 | `temporal_holdout` | Later queries that contributed no evidence | Forward generalization |
-| `control` | Queries no steering rule can fire on | Finds unintended re-ranking |
+| `control` | Queries no steering rule can fire on | Finds unintended re-ranking. Paired **B1 vs B5** so content is held constant and steering varied — the cohort controls for steering, so only a steering-only pairing measures it |
 | `invariants` | Deterministic ACL / validity / abstention cases | Gates, not scores |
 
 `holdout_minimum_separation_days` defaults to `0.0` because "how long must a
