@@ -337,21 +337,22 @@ def roll(
             archived_days.append(day)
         if deferred:
             report["deferred_partitions"] = deferred
-        if report["partitions"]:
-            ids = [str(row["id"]) for day in archived_days for row in by_day[day]]
-            if deferred:
-                report["disposition"] = "cold_partial"
-        else:
-            # Cold was asked for and none of it happened. Everything not
-            # deferred is being dropped, and the report must not call that cold.
-            report["disposition"] = "dropped"
+        # A day that neither archived nor deferred is one nothing could write
+        # it with -- `_write_partition` returned None because the analytics
+        # extra is absent. Those rows are dropped, because a hot store that can
+        # never drain is the unbounded growth the retention policy exists to
+        # prevent; a deferred day is not dropped, because it will be retried.
+        droppable = [day for day in by_day if day not in archived_days and day not in deferred]
+        ids = [str(row["id"]) for day in (*archived_days, *droppable) for row in by_day[day]]
+        if droppable:
+            # The report must not call these cold: no partition holds them.
             report["cold_unavailable"] = True
-            ids = [
-                str(row["id"])
-                for day, day_rows in by_day.items()
-                if day not in deferred
-                for row in day_rows
-            ]
+            report["disposition"] = "cold_partial" if archived_days else "dropped"
+        elif deferred and archived_days:
+            report["disposition"] = "cold_partial"
+        # Everything deferred and nothing else: `disposition` stays "cold" and
+        # `rolled` stays 0, which is the truth -- nothing was archived *and*
+        # nothing was dropped, and the next pass tries again.
 
     if not ids:
         return report

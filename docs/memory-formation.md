@@ -173,6 +173,21 @@ batch-only, which is fine because formation is a beat, not a request. This is
 the configuration for an operator who wants the audit trail and the eval corpus
 without a query-time ledger.
 
+**A day is deleted only once its partition exists.** The roll groups expired
+rows by day, writes each day's Parquet file, and deletes exactly the days that
+were written. So a `/exports` volume that fills or goes read-only mid-pass costs
+one day's *delay*, not one day's data: the failed day stays hot and is retried
+next pass (`disposition: cold_partial`, with `deferred_partitions` naming it),
+while the days that succeeded are gone from `/state` and will not be written a
+second time. Deleting the whole batch on a partial write lost the failed day;
+refusing to delete any of it re-wrote the days that had already succeeded, and
+duplicate rows in cold storage are duplicate rows in the one place an outside
+reader reads. And when `cold_enabled` is on but nothing can write Parquet (the
+`analytics` extra is absent), the rows are still dropped — an un-drainable hot
+store is the unbounded growth the retention policy exists to prevent — but the
+report says `disposition: dropped` with `cold_unavailable: true`, rather than
+calling them archived when no partition holds them.
+
 **This does not make DuckDB a storage backend.** Cold storage is `/exports`,
 written by `analytics.py`'s already-tuned Parquet writer, on a worker that is
 not the indexer, off the sync path. No artifact, chunk, manifest or lease lives

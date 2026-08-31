@@ -123,6 +123,17 @@ region knows a fact was corrected and serves it anyway between consolidation
 beats. `current_only` (on by default) closes it. `as_of` deliberately brings the
 old record back — that is the whole point of invalidating rather than deleting.
 
+**And re-asserting a corrected claim does not undo the correction.** A record id
+is `mem-<instant>-<digest>` where only the digest half is content-addressed, so
+writing the same text again after consolidation had archived it minted a *new*
+id — and the correction, which names the old one, stopped applying. The
+corrected claim came back current, beside its own correction, and `current_only`
+returned both. Written inside the same second it reused the id by luck and
+stayed corrected: identical operations, different memory, decided by a second
+boundary nobody means as a semantic one. Reviving an archived record now reuses
+that record's own id, which also keeps it *one* assertion rather than a second
+`memory_record` node for a claim the region already knows.
+
 **But `as_of` can only find a row that is still indexed, and consolidation
 archives an invalidated record's file the moment it is no longer current** —
 a `.md.archived` file drops out of the source's `**/*.md` include glob, so

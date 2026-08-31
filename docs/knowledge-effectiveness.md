@@ -552,6 +552,20 @@ cutoff differs. The clock-seeded version made two runs a second apart into two
 rows and two runs *within* a second silently collapse into one — the worst of
 both, caught by running the batch twice against a real Postgres.
 
+**And a batch that already answered is skipped, not replayed over.** The second
+invocation reports `skipped`, hands back the stored report and its gates, and
+does no work — so an hourly beat over a region that has not changed costs one
+row read rather than a full cohort-by-variant matrix. This used to only decline
+to *rewrite* the row while replaying anyway, which broke three things at once:
+the row said `completed` while a batch was genuinely in flight (so every
+watcher read a live run as finished, with a `fraction` that fell from 1.0 back
+toward zero), `active_run` could not see it because it filters
+`status='running'`, and a process that died there left the row `completed` with
+`phase='replay'` forever — unreclaimable for the same reason, with orphaned
+replay checkpoints nothing would load or clear. `failed` and `interrupted` are
+excluded from this: both mean the batch did not finish, and picking one up
+again is exactly what the checkpoints are for.
+
 **Only steering candidates are shadow-replayed.** A proposed alias, preference
 or exclusion rule is exercised exactly, through the real `parse_rule`/`admits`
 path. A proposed *fact* is reported `not_shadow_replayable`, because its text is

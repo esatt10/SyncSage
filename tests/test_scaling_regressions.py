@@ -572,3 +572,32 @@ def test_the_evaluation_plane_is_carried_across_a_migration() -> None:
     assert order.index("evaluation_snapshots") < order.index("evaluation_runs")
     assert order.index("evaluation_runs") < order.index("evaluation_metrics")
     assert order.index("evaluation_cohorts") < order.index("evaluation_metrics")
+
+
+def test_a_roll_where_every_day_deferred_reports_neither_cold_nor_dropped(
+    seeded: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `/exports` volume that is entirely unavailable for one pass.
+
+    Nothing was archived *and* nothing was dropped, so the report must say
+    neither. Claiming `dropped` here would be the same lie in the other
+    direction: an operator reading it would go looking for rows that are still
+    sitting in the hot store waiting to be retried.
+    """
+
+    seeded.state.execute("DELETE FROM interaction_events")
+    _seed_ledger(seeded.state, "kb", days=("2026-02-01", "2026-02-02"))
+    before = hot_row_count(seeded.state)
+
+    def always_fails(exports_path: Any, day: str, rows: Any) -> Any:
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(log_queue, "_write_partition", always_fails)
+    report = roll(seeded.state, _ColdSettings(), exports_path=tmp_path)
+
+    assert report["rolled"] == 0
+    assert report["partitions"] == []
+    assert sorted(report["deferred_partitions"]) == ["2026-02-01", "2026-02-02"]
+    assert report["disposition"] == "cold"
+    assert "cold_unavailable" not in report
+    assert hot_row_count(seeded.state) == before, "a deferred day must not be deleted"
