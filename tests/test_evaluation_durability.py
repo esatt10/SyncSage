@@ -211,7 +211,12 @@ def test_the_heartbeat_keeps_a_long_phase_alive(
     transitions.
     """
 
+    # The beat is derived from the configured stale window and clamped at both
+    # ends, so making it fast means moving the *cap* and the *floor*. Patching
+    # only the cap leaves `MINIMUM_RUN_HEARTBEAT_SECONDS` (1.0s) governing, and
+    # this test would be asserting on a clock slower than its own sleep.
     monkeypatch.setattr(evaluation_store, "RUN_HEARTBEAT_SECONDS", 0.05)
+    monkeypatch.setattr(evaluation_store, "MINIMUM_RUN_HEARTBEAT_SECONDS", 0.01)
     beats: list[str] = []
     real = ReplayEngine.replay_variant
 

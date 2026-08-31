@@ -160,11 +160,19 @@ class _RunProgress:
     reason.
     """
 
-    def __init__(self, state: Any):
+    def __init__(self, state: Any, *, heartbeat_seconds: float | None = None):
         self.state = state
         self.run_id: str | None = None
         self.completed_units = 0
         self.total_units = 0
+        # Derived from the *configured* stale window, not fixed: see
+        # `evaluation_store.heartbeat_interval_for` for what a beat slower than
+        # the window does to a run that is merely slow.
+        self.heartbeat_seconds = float(
+            heartbeat_seconds
+            if heartbeat_seconds is not None
+            else evaluation_store.RUN_HEARTBEAT_SECONDS
+        )
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -203,7 +211,7 @@ class _RunProgress:
         self._thread.start()
 
     def _beat(self) -> None:
-        while not self._stop.wait(evaluation_store.RUN_HEARTBEAT_SECONDS):
+        while not self._stop.wait(self.heartbeat_seconds):
             if self.run_id is None:
                 continue
             evaluation_store.heartbeat_run(
@@ -255,13 +263,32 @@ class EvaluationLease:
     lease is real.
     """
 
-    def __init__(self, state: Any, *, owner: str | None = None):
+    def __init__(
+        self,
+        state: Any,
+        *,
+        owner: str | None = None,
+        stale_after_seconds: float | None = None,
+    ):
         self._lease: Any = None
         self._progress: _RunProgress | None = None
         try:
             from pheasant.sync.locks import SourceLease
 
-            self._lease = SourceLease(state, EVALUATION_LEASE, owner=owner)
+            # The lease is aged out on the *evaluation* window, by
+            # `reclaim_interrupted_runs`, so it has to beat on the evaluation
+            # window too. Left on `SOURCE_HEARTBEAT_SECONDS` (10s) it was the
+            # slower of the two clocks under any configured window below 30s,
+            # which made a live batch's own lease look abandoned -- the second
+            # half of the same defect `heartbeat_interval_for` documents.
+            kwargs: dict[str, Any] = {"owner": owner}
+            if stale_after_seconds is not None:
+                beat = evaluation_store.heartbeat_interval_for(stale_after_seconds)
+                kwargs["heartbeat_interval_s"] = beat
+                kwargs["stale_after_s"] = max(
+                    float(stale_after_seconds), evaluation_store.MINIMUM_RUN_STALE_SECONDS
+                )
+            self._lease = SourceLease(state, EVALUATION_LEASE, **kwargs)
         except Exception:  # noqa: BLE001 - leases are optional infrastructure
             logger.debug("evaluation: lease unavailable; running unguarded", exc_info=True)
 
@@ -325,6 +352,12 @@ def reclaim_interrupted_runs(
     Deliberately not destructive. The checkpoints survive, the metric rows
     survive, and re-running the same batch re-derives the same content-addressed
     run id and picks up where it left off.
+
+    The window is floored at :data:`~pheasant.evaluation.store.MINIMUM_RUN_STALE_SECONDS`.
+    Below that no beat can keep the three-beat margin, so reclamation would be
+    declaring *live* batches dead -- which is not recovery, it is the opposite:
+    it frees the ``__evaluation__`` lease under a running batch and admits a
+    concurrent duplicate.
     """
 
     from datetime import datetime, timedelta
@@ -335,10 +368,9 @@ def reclaim_interrupted_runs(
         if stale_after_seconds is not None
         else evaluation_store.RUN_STALE_SECONDS
     )
+    window = max(window, evaluation_store.MINIMUM_RUN_STALE_SECONDS)
     stale_before = (
-        (now - timedelta(seconds=max(1.0, window)))
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
+        (now - timedelta(seconds=window)).isoformat(timespec="seconds").replace("+00:00", "Z")
     )
     try:
         reclaimed = evaluation_store.reclaim_stale_runs(
@@ -573,7 +605,10 @@ def run_evaluation(
 
     # Set once the run row exists; before that there is nothing durable to
     # write progress to, and the in-process callback is all a caller has.
-    progress = _RunProgress(state)
+    stale_window = getattr(settings, "run_stale_seconds", None)
+    progress = _RunProgress(
+        state, heartbeat_seconds=evaluation_store.heartbeat_interval_for(stale_window)
+    )
 
     def report(phase: str, detail: str = "", *, units: int | None = None) -> None:
         """Publish one phase transition to every watcher there is.
@@ -601,7 +636,7 @@ def run_evaluation(
             skipped_reason="evaluation.enabled is false; pass force=True to run anyway",
         )
 
-    lease = EvaluationLease(state)
+    lease = EvaluationLease(state, stale_after_seconds=stale_window)
     with lease as acquired:
         if not acquired:
             return RunOutcome(

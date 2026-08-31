@@ -307,6 +307,46 @@ def list_cohorts(state: Any, kb_id: str, *, limit: int = 100) -> list[Cohort]:
 RUN_HEARTBEAT_SECONDS = 15.0
 RUN_STALE_SECONDS = 90.0
 
+#: The margin between the two above, and the whole reason the pair means
+#: anything: three missed beats is death, and a merely slow run gets three
+#: chances to say otherwise.
+RUN_HEARTBEAT_MARGIN = 3
+
+#: Floors, so the margin survives an operator narrowing the window. A batch
+#: never beats faster than once a second (the beat is a write, and one per
+#: replay-second is telemetry becoming load), which is what makes
+#: :data:`MINIMUM_RUN_STALE_SECONDS` the narrowest window that can still keep
+#: the margin.
+MINIMUM_RUN_HEARTBEAT_SECONDS = 1.0
+MINIMUM_RUN_STALE_SECONDS = MINIMUM_RUN_HEARTBEAT_SECONDS * RUN_HEARTBEAT_MARGIN
+
+
+def heartbeat_interval_for(stale_seconds: float | None) -> float:
+    """How often a batch must beat for ``stale_seconds`` to mean what it says.
+
+    ``evaluation.run_stale_seconds`` is operator-configurable and the beat was
+    not, so the margin above held only at the default. Narrow the window and a
+    *live* batch becomes reclaimable: a single cohort/variant replay is
+    hundreds of searches and routinely outlasts a short window, so its row
+    flips to ``interrupted`` while it is still working -- and
+    :func:`~pheasant.evaluation.runner.reclaim_interrupted_runs` frees the
+    ``__evaluation__`` lease on the strength of that, which is the one thing
+    keeping N replicas to one run. Reproduced at a 20s window, which
+    CLAUDE.md records a CI region using so its smoke test need not wait out 90.
+
+    So the beat is derived from the window rather than fixed against it, and
+    both scale together. The default (90s) yields exactly the 15s beat it
+    always had -- six beats of margin, unchanged -- and every narrower window
+    keeps at least three.
+    """
+
+    window = max(float(stale_seconds or RUN_STALE_SECONDS), MINIMUM_RUN_STALE_SECONDS)
+    return max(
+        MINIMUM_RUN_HEARTBEAT_SECONDS,
+        min(RUN_HEARTBEAT_SECONDS, window / RUN_HEARTBEAT_MARGIN),
+    )
+
+
 #: Terminal states. Nothing rewrites a run in one of these.
 TERMINAL_RUN_STATUSES = ("completed", "truncated", "invalid", "failed", "interrupted")
 
