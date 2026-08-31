@@ -666,6 +666,40 @@ def run_evaluation(
             config_digest=config_digest,
             owner=_owner(),
         )
+        if not claim["claimed"]:
+            # This exact batch -- same state, same configuration, same mode and
+            # instant -- already reached an answer and published it. Replaying
+            # it can only re-derive the report it already holds, so the honest
+            # thing is to say so and hand back the run that has it, rather than
+            # spend a full cohort-by-variant matrix overwriting a document with
+            # itself. In a fleet on an hourly beat over a region that has not
+            # changed, that is the difference between doing the work every hour
+            # and doing it when something moved.
+            #
+            # It is also the only way the run row stays truthful: this batch
+            # has no row of its own to write progress to, and writing progress
+            # to the *finished* run's row is what made a live batch read as
+            # `completed` to every watcher. See `open_run`.
+            #
+            # The stored report comes back with it rather than an empty dict.
+            # A caller asking for this batch wants its numbers, and they exist
+            # -- re-deriving them is what is redundant, not having them. So
+            # `pheasant eval run` still prints a summary, the HTTP job still
+            # reports gates, and "two runs over one state agree" stays a
+            # property a caller can actually check.
+            settled = evaluation_store.load_report(state, run_id) or {}
+            return RunOutcome(
+                run_id=run_id,
+                snapshot_id=manifest.snapshot_id,
+                status="skipped",
+                report=settled,
+                gates=_stored_gates(settled),
+                skipped_reason=(
+                    f"this batch already {claim['previous_status']}; its report is unchanged "
+                    "because nothing the run id covers has moved"
+                ),
+                attempts=int(claim["attempts"]),
+            )
         progress.bind(run_id)
         lease.watch(progress)
         checkpoints = (
@@ -699,6 +733,12 @@ def run_evaluation(
                 gates_passed=False,
                 report={"run_id": run_id, "gates": [snapshot_gate.as_dict()]},
             )
+            # `invalid` is settled, so no later attempt will pick this run id up
+            # again -- which means any checkpoints an *earlier* attempt left are
+            # now unreachable. Dropping them here is the same argument the
+            # completed path makes: the scaffolding outlives its reader
+            # otherwise, and it is a copy of every result list.
+            evaluation_store.clear_replay_checkpoints(state, run_id)
             return outcome
 
         # 3. Resolve cohorts.
@@ -1003,6 +1043,37 @@ def run_evaluation(
             attempts=int(claim["attempts"]),
             resumed_replays=resumed_pairs,
         )
+
+
+def _stored_gates(report: dict[str, Any]) -> list[GateResult]:
+    """The gates a settled run published, for a batch that declined to redo it.
+
+    ``RunOutcome.gates_passed`` is what ``pheasant eval run`` turns into an exit
+    status, and a run skipped because it had *already* answered should report
+    the answer it gave rather than an empty list -- which
+    :attr:`RunOutcome.gates_passed`, correctly, reads as "no gates, so no pass".
+    A caller that scripts on this gets the region's real gate outcome instead of
+    a false negative every time nothing has changed.
+    """
+
+    out: list[GateResult] = []
+    for gate in report.get("gates") or []:
+        if not isinstance(gate, dict):
+            continue
+        try:
+            out.append(
+                GateResult(
+                    gate_id=str(gate.get("gate_id") or ""),
+                    passed=bool(gate.get("passed")),
+                    observed=float(gate.get("observed") or 0.0),
+                    maximum=float(gate.get("maximum") or 0.0),
+                    detail=str(gate.get("detail") or ""),
+                    evidence=dict(gate.get("evidence") or {}),
+                )
+            )
+        except (TypeError, ValueError):  # a stored report must not fail a skip
+            logger.debug("evaluation: unreadable stored gate %r", gate, exc_info=True)
+    return out
 
 
 def _replay_searcher(engine: Any) -> Any:

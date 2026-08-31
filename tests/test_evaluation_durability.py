@@ -383,6 +383,7 @@ def test_a_completed_run_is_never_rewritten(seeded: Any) -> None:
         mode="current_state",
         config_digest="c",
     )
+    assert claim["claimed"] is False
     assert claim["resumed"] is False
     assert claim["previous_status"] == "completed"
     assert evaluation_store.run_status(seeded.state, first.run_id)["status"] == "completed"
@@ -400,7 +401,7 @@ def test_a_first_attempt_does_not_claim_to_be_a_recovery(seeded: Any) -> None:
         mode="current_state",
         config_digest="c",
     )
-    assert claim == {"resumed": False, "attempts": 1, "previous_status": ""}
+    assert claim == {"claimed": True, "resumed": False, "attempts": 1, "previous_status": ""}
 
 
 # --------------------------------------------------------------------------

@@ -385,8 +385,7 @@ class StateStore:
         """
         desired = {(principal, group) for principal, groups in mapping.items() for group in groups}
         current = {
-            (row[0], row[1])
-            for row in self.conn.execute("SELECT principal, group_name FROM idp_groups")
+            (row[0], row[1]) for row in self.rows("SELECT principal, group_name FROM idp_groups")
         }
         changed = desired != current
         with self.conn:
@@ -404,12 +403,17 @@ class StateStore:
         return changed
 
     def idp_groups_for(self, principals: set[str]) -> set[str]:
-        """Group names the IdP mapping grants any of these principal spellings."""
+        """Group names the IdP mapping grants any of these principal spellings.
+
+        ``rows``, not ``conn.execute``: this runs on the request path, and see
+        :meth:`artifact_acls` for what routing a read through the write path
+        costs on Postgres.
+        """
         if not principals:
             return set()
         ordered = sorted(principals)
         placeholders = ",".join("?" for _ in ordered)
-        rows = self.conn.execute(
+        rows = self.rows(
             f"SELECT group_name FROM idp_groups WHERE principal IN ({placeholders})",
             tuple(ordered),
         )
@@ -424,11 +428,28 @@ class StateStore:
         return int(rows[0]["c"]) if rows else 0
 
     def artifact_acls(self, artifact_ids: list[str]) -> dict[str, str | None]:
-        """The stored ACL JSON (or None) for each artifact id (Step 32.2)."""
+        """The stored ACL JSON (or None) for each artifact id (Step 32.2).
+
+        ``rows``, not ``conn.execute``. Under Postgres those are two different
+        paths: ``rows`` returns the pooled connection when the statement leaves
+        nothing pending, while ``conn.execute`` goes through
+        :meth:`~pheasant.persistence.backends.PostgresBackend.statement`, which
+        deliberately holds the connection because it is the *write* path.
+
+        This method is a read, and it runs on every search under
+        ``security.acl_enforced``. Routing it through the write path marked the
+        calling thread dirty with nothing to commit, so its connection was
+        pinned for the life of that thread -- and Starlette serves sync
+        endpoints from a 40-slot threadpool against a pool of ``pool_size``
+        (10). The eleventh thread to serve a search blocked for 30s and got
+        ``PoolTimeout``; every one after it did too. Exactly the failure
+        ``PostgresBackend._conn`` records having fixed once, reached again
+        through a read on the sqlite-shaped connection.
+        """
         if not artifact_ids:
             return {}
         placeholders = ",".join("?" for _ in artifact_ids)
-        rows = self.conn.execute(
+        rows = self.rows(
             f"SELECT id, acl FROM artifacts WHERE id IN ({placeholders})",
             tuple(artifact_ids),
         )

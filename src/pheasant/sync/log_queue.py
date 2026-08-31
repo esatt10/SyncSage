@@ -266,6 +266,25 @@ def roll(
 
     Returns a report rather than logging one, so a caller can put it on an
     endpoint or a metric without re-deriving it.
+
+    **A day is deleted only once its partition exists.** The pass groups rows
+    by day, writes each day's partition, and deletes exactly the days that were
+    written -- so the two failures a real ``/exports`` volume produces stay
+    survivable:
+
+    * *the write fails for one day.* The other days still roll; that day's rows
+      stay hot and are retried next pass. Deleting the whole batch on a partial
+      write would lose the failed day, and refusing to delete any of it would
+      re-write every day that had already succeeded -- which is what produced
+      duplicate rows in cold storage, in the one place an outside reader reads
+      (``docs/reference/export-schema.md``). Same shape as the interaction
+      batch insert: one bad row must not cost the rest.
+    * *no partition can be written at all* (``cold_enabled`` with the
+      ``analytics`` extra absent). The rows are still dropped -- an
+      un-drainable hot store is the unbounded growth the retention policy
+      exists to prevent -- but the report says ``dropped``, not ``cold``, and
+      names why. Reporting ``cold`` for rows that reached no partition told an
+      operator their observations were in ``/exports`` when they were gone.
     """
 
     now = now or datetime.now(UTC)
@@ -292,13 +311,50 @@ def roll(
         day = str(row["started_at"])[:10] or "unknown"
         by_day.setdefault(day, []).append(row)
 
-    if cold:
+    ids: list[str] = []
+    if not cold:
+        ids = [str(row["id"]) for row in rows]
+    else:
+        archived_days: list[str] = []
+        deferred: dict[str, str] = {}
         for day, day_rows in sorted(by_day.items()):
-            written = _write_partition(exports_path, day, day_rows)
-            if written:
-                report["partitions"].append(str(written))
+            try:
+                written = _write_partition(exports_path, day, day_rows)
+            except Exception as exc:  # noqa: BLE001 - one bad day must not cost the rest
+                logger.warning(
+                    "Could not archive interaction partition dt=%s; its rows stay in "
+                    "the hot store and will be retried",
+                    day,
+                    exc_info=True,
+                )
+                deferred[day] = f"{type(exc).__name__}: {exc}"
+                continue
+            if written is None:
+                # Nothing to write it with. `_write_partition` has already said
+                # so; the rows are dropped, and the disposition below says that.
+                continue
+            report["partitions"].append(str(written))
+            archived_days.append(day)
+        if deferred:
+            report["deferred_partitions"] = deferred
+        if report["partitions"]:
+            ids = [str(row["id"]) for day in archived_days for row in by_day[day]]
+            if deferred:
+                report["disposition"] = "cold_partial"
+        else:
+            # Cold was asked for and none of it happened. Everything not
+            # deferred is being dropped, and the report must not call that cold.
+            report["disposition"] = "dropped"
+            report["cold_unavailable"] = True
+            ids = [
+                str(row["id"])
+                for day, day_rows in by_day.items()
+                if day not in deferred
+                for row in day_rows
+            ]
 
-    ids = [str(row["id"]) for row in rows]
+    if not ids:
+        return report
     _delete_ids(state, ids)
     report["rolled"] = len(ids)
     REGISTRY.inc(

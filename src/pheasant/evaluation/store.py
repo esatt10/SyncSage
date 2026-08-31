@@ -310,6 +310,15 @@ RUN_STALE_SECONDS = 90.0
 #: Terminal states. Nothing rewrites a run in one of these.
 TERMINAL_RUN_STATUSES = ("completed", "truncated", "invalid", "failed", "interrupted")
 
+#: Terminal *and* settled: the batch reached an answer and published it.
+#: :func:`open_run` refuses to re-open one of these, because the report is the
+#: run's whole output and re-deriving it can only overwrite it with itself.
+#:
+#: ``failed`` and ``interrupted`` are terminal but deliberately absent: both
+#: say "this batch did not finish", and re-running one is the resume path the
+#: replay checkpoints exist for.
+SETTLED_RUN_STATUSES = ("completed", "truncated", "invalid")
+
 
 def open_run(
     state: Any,
@@ -323,14 +332,22 @@ def open_run(
     owner: str = "",
     total_units: int = 0,
 ) -> dict[str, Any]:
-    """Claim a run row, or resume the one already there.
+    """Claim a run row, resume the one already there, or decline it.
 
-    Returns ``{"resumed": bool, "attempts": int, "previous_status": str}``.
+    Returns ``{"claimed": bool, "resumed": bool, "attempts": int,
+    "previous_status": str}``.
+
     Resuming is the normal path after a container restart: the run id is
     content-addressed, so the same batch re-derives the same row rather than
     starting a second one, and ``attempts`` counts how many times it has been
     picked up. The insert and the claim are one statement each, and neither
     ever rewrites a *terminal* row -- a completed run is history.
+
+    ``claimed`` is the caller's instruction, and it is separate from ``resumed``
+    because there are three outcomes, not two: a fresh claim, a resumed claim,
+    and a *refusal*. A run that already reached a settled terminal status is
+    refused, and the caller must not proceed -- see the comment on that branch
+    for what proceeding did.
     """
 
     # Read before writing, so "this row did not exist" and "this row is being
@@ -365,21 +382,50 @@ def open_run(
                 1,
             ),
         )
-        return {"resumed": False, "attempts": 1, "previous_status": ""}
+        return {"claimed": True, "resumed": False, "attempts": 1, "previous_status": ""}
 
     previous = str(existing[0]["status"] or "")
     attempts = int(existing[0]["attempts"] or 1)
-    if previous in TERMINAL_RUN_STATUSES and previous not in ("interrupted", "failed"):
+    if previous in SETTLED_RUN_STATUSES:
         # A completed, truncated or invalid run is history: re-running it would
         # destroy the report it published, and its numbers are reproducible by
         # construction anyway.
-        return {"resumed": False, "attempts": attempts, "previous_status": previous}
+        #
+        # This branch used to only *decline to write the row* and let the caller
+        # replay the whole matrix on top of it, which is not the same thing and
+        # broke three ways at once. The row kept saying `completed` while a
+        # batch was genuinely in flight, so every watcher -- the UI, `eval
+        # status --watch`, `get_evaluation_status` -- read a live run as
+        # finished, with a `fraction` that fell from 1.0 back to 0.02 and
+        # climbed again; `active_run` (which filters `status='running'`) could
+        # not see it at all; and if that process died the row stayed
+        # `completed` forever with `phase='replay'` and a stale
+        # `completed_units`, because `reclaim_stale_runs` filters on
+        # `status='running'` too -- so nothing could ever reclaim it, and the
+        # replay checkpoints it left behind were never loaded and never
+        # cleared. On top of which it re-replayed every cohort and variant, on
+        # every scheduled beat, to overwrite an identical report.
+        #
+        # `failed` and `interrupted` are terminal but not settled: both mean
+        # "this batch did not finish", and picking one up again is exactly the
+        # recovery the checkpoints exist for.
+        return {
+            "claimed": False,
+            "resumed": False,
+            "attempts": attempts,
+            "previous_status": previous,
+        }
     state.execute(
         "UPDATE evaluation_runs SET status=?, phase=?, heartbeat_at=?, owner=?, "
         "attempts=attempts+1, error=NULL, finished_at=NULL, total_units=? WHERE run_id=?",
         ("running", "starting", started_at, owner, int(total_units), run_id),
     )
-    return {"resumed": True, "attempts": attempts + 1, "previous_status": previous}
+    return {
+        "claimed": True,
+        "resumed": True,
+        "attempts": attempts + 1,
+        "previous_status": previous,
+    }
 
 
 def heartbeat_run(
