@@ -69,6 +69,8 @@ See ``docs/retrieval-tuning.md``.
 
 from __future__ import annotations
 
+from typing import Any
+
 from pheasant.tuning.contracts import (
     Decision,
     Diagnosis,
@@ -80,6 +82,83 @@ from pheasant.tuning.contracts import (
 )
 from pheasant.tuning.stages import STAGES, attribute, stage_histogram
 
+
+def run(engine: Any, **kwargs: Any) -> Any:
+    """Run one tuning batch. The entry point every surface calls.
+
+    Imported lazily inside the function so that ``import pheasant.tuning`` --
+    which the CLI, the API and MCP all do just to read a status row -- does not
+    drag in the replay engine, the evaluation plane and the search stack.
+    """
+
+    from pheasant.tuning.runner import run_tuning
+
+    return run_tuning(engine, **kwargs)
+
+
+def progress(state: Any, kb_id: str, experiment_id: str | None = None) -> dict[str, Any]:
+    """What a batch is doing right now, read from ``/state``.
+
+    Deliberately a row read and nothing else, so a UI, a CLI and an MCP client
+    can all watch a batch **none of them started** -- including across the
+    container that started it being restarted. Progress that lives in a
+    process disappears with the process; this is the same lesson, and the same
+    shape of answer, as the evaluation plane's run row.
+    """
+
+    from pheasant.tuning import store
+
+    row = (
+        store.experiment_status(state, experiment_id)
+        if experiment_id
+        else (store.active_experiment(state, kb_id) or store.latest_experiment(state, kb_id))
+    )
+    if row is None:
+        return {"status": "none", "experiment_id": "", "phase": "", "progress": None}
+    return row
+
+
+def latest_report(state: Any, kb_id: str) -> dict[str, Any] | None:
+    from pheasant.tuning import store
+
+    row = store.latest_experiment(state, kb_id)
+    return (row or {}).get("report")
+
+
+def active_parameters(state: Any, kb_id: str) -> dict[str, Any]:
+    """What the region is ranking with, and where it came from.
+
+    The question every surface asks first, and the one that has to be
+    answerable without running anything: an operator looking at a ranking they
+    did not expect needs to know whether a bundle is in force before they need
+    anything else.
+    """
+
+    from pheasant.search.ranking import RankingParameters
+    from pheasant.tuning import store
+
+    overlay = store.active_overlay(state, kb_id)
+    base = RankingParameters()
+    if not overlay:
+        return {
+            "provenance": "config",
+            "bundle_id": "",
+            "values": base.values(),
+            "bundle": None,
+        }
+    resolved = base.with_overlay(
+        overlay.get("parameters") or {},
+        provenance="bundle",
+        bundle_id=str(overlay.get("bundle_id") or ""),
+    )
+    return {
+        "provenance": "bundle",
+        "bundle_id": resolved.bundle_id,
+        "values": resolved.values(),
+        "bundle": overlay,
+    }
+
+
 __all__ = [
     "STAGES",
     "Decision",
@@ -89,6 +168,10 @@ __all__ = [
     "StageAttribution",
     "Trial",
     "TuningBundle",
+    "active_parameters",
     "attribute",
+    "latest_report",
+    "progress",
+    "run",
     "stage_histogram",
 ]

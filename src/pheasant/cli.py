@@ -865,6 +865,263 @@ def _print_evaluation_status(payload: dict) -> None:
         print(f"  run {payload.get('run_id')} on {payload['owner']}")
 
 
+def _print_stage_histogram(histogram: dict, *, summary: str = "") -> None:
+    """The diagnosis, as a person reads it.
+
+    Ordered by count and labelled with whether a parameter can reach the stage,
+    because that is the only thing a reader has to decide: tune, or go fix
+    indexing. A bare histogram invites the first answer regardless.
+    """
+
+    from pheasant.tuning.stages import ACTIONABLE_STAGES
+
+    evaluated = int(histogram.get("evaluated") or 0)
+    misses = int(histogram.get("misses") or 0)
+    print(f"  {evaluated} evidenced query/target pairs, {histogram.get('served', 0)} served")
+    if not misses:
+        print("  no misses to attribute")
+    for entry in histogram.get("ranked") or []:
+        stage = str(entry["stage"])
+        count = int(entry["count"])
+        reach = "tunable" if stage in ACTIONABLE_STAGES else "NOT reachable by any parameter"
+        bar = "#" * min(30, count)
+        print(f"    {stage:<22} {count:>4}  {bar:<30} ({reach})")
+    if summary:
+        print(f"\n  {summary}")
+
+
+def _print_tuning_summary(report: dict) -> None:
+    decision = report.get("decision") or {}
+    diagnosis = report.get("diagnosis") or {}
+    experiment = report.get("experiment") or {}
+    print(f"Experiment {experiment.get('experiment_id', '?')}")
+    print(
+        f"  snapshot {experiment.get('snapshot_id', '?')}  "
+        f"cohort {experiment.get('cohort_id', '?')}"
+    )
+    print("\nDiagnosis")
+    _print_stage_histogram(diagnosis.get("histogram") or {}, summary=diagnosis.get("summary", ""))
+    trials = report.get("trials") or []
+    if trials:
+        print(
+            f"\nTop trials ({report.get('trial_count', len(trials))} run, "
+            f"{report.get('searches', 0)} searches)"
+        )
+        metric = report.get("primary_metric", "")
+        for trial in trials[:5]:
+            value = (trial.get("metrics") or {}).get(metric)
+            shown = "—" if value is None else f"{value:.4f}"
+            proposal = trial.get("proposal") or {}
+            point = proposal.get("point") or {}
+            print(
+                f"    {shown:>8}  {point.get('delta_description', ''):<44}"
+                f"  [{proposal.get('motivating_stage', '')}, {proposal.get('cost_class', '')}]"
+            )
+    print(f"\nDecision: {decision.get('outcome', '?')}")
+    print(f"  {decision.get('reason', '')}")
+    for gate in decision.get("gates") or []:
+        mark = "PASS" if gate.get("passed") else ("FAIL" if gate.get("blocking") else "warn")
+        print(f"    [{mark}] {gate['gate_id']}: {gate['summary']}")
+    bundle = report.get("bundle")
+    if bundle:
+        print(f"\nBundle {bundle['bundle_id']}  (proposed, not applied)")
+        for name, value in sorted((bundle.get("parameters") or {}).items()):
+            print(f"    {name} = {value:g}")
+        print("\n  Apply it with: pheasant tune apply " + bundle["bundle_id"])
+
+
+def _print_tuning_status(payload: dict) -> None:
+    status = payload.get("status", "none")
+    if status == "none":
+        print("No tuning batch has run for this knowledge base.")
+        return
+    fraction = payload.get("progress")
+    shown = "—" if fraction is None else f"{fraction:.0%}"
+    print(
+        f"{payload.get('experiment_id', '?')}  {status}  "
+        f"{payload.get('phase', '')}  {shown}  "
+        f"({payload.get('completed_units', 0)}/{payload.get('total_units', 0)} units, "
+        f"{payload.get('searches', 0)} searches)"
+    )
+    if payload.get("phase_detail"):
+        print(f"  {payload['phase_detail']}")
+    if payload.get("error"):
+        print(f"  error: {payload['error']}")
+
+
+def _tune_command(args) -> int:
+    """Every `pheasant tune` subcommand.
+
+    Only `run` and `diagnose` load the persisted graph. The rest read rows,
+    and materializing a whole corpus's graph to print a table would cost the
+    region's memory for nothing -- the same call `pheasant eval status` makes.
+    """
+
+    import json as _json
+    import time as _time
+    from pathlib import Path as _Path
+
+    import pheasant.tuning as tuning
+    from pheasant.config.loader import load_config
+    from pheasant.tuning import store as tuning_store
+
+    command = args.tune_command
+    cfg = load_config(_Path(args.config))
+    kb = cfg.knowledge_base_id
+    needs_graph = command in {"run", "diagnose"}
+    engine = _engine(_Path(args.config), load_persisted_graph=needs_graph)
+    try:
+        if command in {"run", "diagnose"}:
+            if command == "diagnose":
+                # A diagnosis is a run with no trial budget: it replays the
+                # cohort, attributes the misses and stops. Spelled as a budget
+                # rather than a flag so there is one code path, and so what
+                # `diagnose` does is exactly the first movement of `run`.
+                from pheasant.tuning.strategy import Budget
+
+                outcome = tuning.run(
+                    engine,
+                    force=True,
+                    budget=Budget(refusion_trials=0, requery_trials=0, max_searches=10_000),
+                    on_progress=lambda phase, detail: print(
+                        f"  {phase}{(': ' + detail) if detail else ''}"
+                    ),
+                )
+            else:
+                if args.apply:
+                    cfg.tuning.auto.apply = True
+                    engine.config.tuning.auto.apply = True
+                outcome = tuning.run(
+                    engine,
+                    force=bool(args.force),
+                    on_progress=lambda phase, detail: print(
+                        f"  {phase}{(': ' + detail) if detail else ''}"
+                    ),
+                )
+            if outcome.status == "skipped":
+                print(f"Skipped: {outcome.skipped_reason}")
+                return 0
+            if outcome.status not in {"completed", "interrupted"}:
+                print(f"{outcome.status}: {outcome.skipped_reason}")
+                return 1
+            if command == "diagnose":
+                if args.json:
+                    print(
+                        _json.dumps(
+                            outcome.diagnosis.as_dict() if outcome.diagnosis else {},
+                            indent=2,
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                    return 0
+                print(f"Retrieval diagnosis for {kb}\n")
+                _print_stage_histogram(
+                    outcome.diagnosis.histogram if outcome.diagnosis else {},
+                    summary=outcome.diagnosis.summary if outcome.diagnosis else "",
+                )
+                return 0
+            if args.json:
+                print(_json.dumps(outcome.report, indent=2, sort_keys=True, default=str))
+            else:
+                _print_tuning_summary(outcome.report)
+                if outcome.applied:
+                    print(f"\nApplied bundle {outcome.bundle_id} — every replica picks it up.")
+            # A batch that proposed nothing, or whose winner failed a gate, is
+            # a *result*, not an error: exiting non-zero would make a CI job
+            # fail for correctly declining to change anything.
+            return 0
+
+        if command == "status":
+            terminal = {"completed", "failed", "interrupted", "none"}
+            while True:
+                payload = tuning.progress(engine.state, kb, args.experiment)
+                _print_tuning_status(payload)
+                if not args.watch or payload.get("status") in terminal:
+                    break
+                _time.sleep(max(0.5, float(args.interval)))
+            return 0
+
+        if command == "report":
+            row = (
+                tuning_store.experiment_status(engine.state, args.experiment)
+                if args.experiment
+                else tuning_store.latest_experiment(engine.state, kb)
+            )
+            report = (row or {}).get("report")
+            if not report:
+                print("No tuning batch has completed yet. Run `pheasant tune run`.")
+                return 1
+            if args.json:
+                print(_json.dumps(report, indent=2, sort_keys=True, default=str))
+            else:
+                _print_tuning_summary(report)
+            return 0
+
+        if command == "bundles":
+            bundles = tuning_store.list_bundles(engine.state, kb)
+            if not bundles:
+                print("No configuration bundles. Run `pheasant tune run`.")
+                return 0
+            for item in bundles:
+                mark = "* LIVE" if item.get("active") else "      "
+                params = ", ".join(
+                    f"{k}={v:g}" for k, v in sorted((item.get("parameters") or {}).items())
+                )
+                print(f"{mark} {item['bundle_id']}  {item.get('created_at', '')}")
+                print(f"         {params}")
+                if item.get("rationale"):
+                    print(f"         {item['rationale'][:150]}")
+            return 0
+
+        if command == "show":
+            active = tuning.active_parameters(engine.state, kb)
+            if args.yaml:
+                import yaml as _yaml
+
+                print(
+                    _yaml.safe_dump(
+                        {"search": {"ranking": active["values"]}}, sort_keys=True
+                    ).rstrip()
+                )
+                return 0
+            print(f"{kb} is ranking with parameters from: {active['provenance']}")
+            if active["bundle_id"]:
+                bundle = active.get("bundle") or {}
+                print(f"  bundle {active['bundle_id']}")
+                print(f"  applied {bundle.get('applied_at', '')} by {bundle.get('applied_by', '')}")
+                print(f"  from experiment {bundle.get('experiment_id', '')}")
+            from pheasant.search.ranking import PARAMETER_STAGES
+
+            for name, value in sorted(active["values"].items()):
+                print(f"    {name:<20} {value:<10g} ({PARAMETER_STAGES.get(name, '?')})")
+            return 0
+
+        if command == "apply":
+            try:
+                payload = tuning_store.apply_bundle(engine.state, kb, args.bundle, applied_by="cli")
+            except KeyError as exc:
+                print(str(exc))
+                return 1
+            print(f"Applied {payload['bundle_id']} to {kb}.")
+            print("Every replica reading this /state picks it up within its refresh window.")
+            for name, value in sorted((payload.get("parameters") or {}).items()):
+                print(f"    {name} = {value:g}")
+            print("\n  Undo with: pheasant tune rollback")
+            return 0
+
+        if command == "rollback":
+            reverted = tuning_store.revert_bundle(engine.state, kb, applied_by="cli")
+            if reverted is None:
+                print(f"{kb} has no bundle applied; it is already on its configured parameters.")
+                return 0
+            print(f"Stood down {reverted['bundle_id']}. {kb} is back on its configured values.")
+            return 0
+    finally:
+        engine.close()
+    return 1
+
+
 def _print_evaluation_summary(report: dict, *, kb: str) -> None:
     """The terminal view of a run: the vector, the gates, and the caveat.
 
@@ -1564,6 +1821,65 @@ def main(argv: list[str] | None = None) -> int:
     eval_trend_p.add_argument("--cohort", default="anchor", help="Cohort name (default: anchor).")
     eval_trend_p.add_argument("--variant", default="B5", help="Variant id (default: B5).")
 
+    tune_p = sub.add_parser(
+        "tune",
+        help="Find which retrieval stage is failing, and tune the parameters that reach it.",
+    )
+    tune_sub = tune_p.add_subparsers(dest="tune_command", required=True)
+
+    def _tune_parser(name: str, help_text: str):
+        parser = tune_sub.add_parser(name, help=help_text)
+        parser.add_argument("--config", "-c", default="pheasant.yaml", help="Path to pheasant.yaml")
+        return parser
+
+    tune_diag_p = _tune_parser(
+        "diagnose",
+        "Attribute every retrieval miss to the stage that lost it. Changes nothing.",
+    )
+    tune_diag_p.add_argument(
+        "--json", action="store_true", help="Print the whole diagnosis instead of a summary."
+    )
+    tune_run_p = _tune_parser(
+        "run", "Diagnose, search the parameters that reach the blamed stages, and gate a winner."
+    )
+    tune_run_p.add_argument(
+        "--force", action="store_true", help="Run even when tuning.enabled is false."
+    )
+    tune_run_p.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Apply the winning bundle if every gate passes. Off by default: producing a "
+            "bundle changes nothing, applying one re-ranks the whole fleet."
+        ),
+    )
+    tune_run_p.add_argument("--json", action="store_true", help="Print the whole report.")
+    tune_status_p = _tune_parser("status", "What a tuning batch is doing right now.")
+    tune_status_p.add_argument("--experiment", default=None, help="A specific experiment id.")
+    tune_status_p.add_argument(
+        "--watch", action="store_true", help="Poll until the batch reaches a terminal state."
+    )
+    tune_status_p.add_argument(
+        "--interval", type=float, default=2.0, help="Seconds between polls with --watch."
+    )
+    tune_report_p = _tune_parser("report", "The most recent tuning report.")
+    tune_report_p.add_argument("--experiment", default=None, help="A specific experiment id.")
+    tune_report_p.add_argument("--json", action="store_true", help="Print the whole report.")
+    _tune_parser("bundles", "Configuration bundles this region has produced, and which is live.")
+    tune_show_p = _tune_parser(
+        "show", "The parameters this region is ranking with, and where they came from."
+    )
+    tune_show_p.add_argument(
+        "--yaml",
+        action="store_true",
+        help="Print the equivalent `search.ranking` block, to paste into pheasant.yaml.",
+    )
+    tune_apply_p = _tune_parser("apply", "Make a bundle the region's live retrieval overlay.")
+    tune_apply_p.add_argument("bundle", help="Bundle id (see `pheasant tune bundles`).")
+    _tune_parser(
+        "rollback", "Stand the active overlay down; the region returns to its configured values."
+    )
+
     export_p = sub.add_parser(
         "export", help="Write Parquet exports of indexed state, and query them."
     )
@@ -2164,6 +2480,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"Multipliers: {recorded['multipliers']}")
         return 0
+    if args.command == "tune":
+        return _tune_command(args)
     if args.command == "eval" and args.eval_command == "run":
         import pheasant.evaluation as evaluation
         from pheasant.config.loader import load_config

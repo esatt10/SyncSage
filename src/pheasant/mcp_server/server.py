@@ -646,6 +646,66 @@ def create_mcp_server(config: PheasantConfig) -> Any:
 
         return tools.get_evaluation_report(knowledge_base, run_id)
 
+    @mcp.tool()
+    @anticipated
+    def start_retrieval_tuning(
+        knowledge_base: str,
+        diagnose_only: bool = False,
+        apply: bool = False,
+        force: bool = False,
+    ) -> dict:
+        """Find which step of retrieval is failing; returns a job id, not a report.
+
+        `diagnose_only=true` attributes every miss to the stage that lost it
+        and proposes nothing — the right first call, because it can tell you
+        the failures are somewhere no retrieval parameter reaches. `apply` lets
+        a gated winner change the fleet's ranking; off by default.
+        """
+
+        return tools.start_retrieval_tuning(knowledge_base, diagnose_only, apply, force)
+
+    @mcp.tool()
+    @anticipated
+    def get_retrieval_tuning_status(knowledge_base: str, experiment_id: str | None = None) -> dict:
+        """How far a tuning batch has got: phase, units done, attempts, status."""
+
+        return tools.get_retrieval_tuning_status(knowledge_base, experiment_id)
+
+    @mcp.tool()
+    @anticipated
+    def get_retrieval_diagnosis(knowledge_base: str, experiment_id: str | None = None) -> dict:
+        """Where retrieval loses documents, by pipeline stage, and what a parameter can reach."""
+
+        return tools.get_retrieval_diagnosis(knowledge_base, experiment_id)
+
+    @mcp.tool()
+    @anticipated
+    def get_retrieval_parameters(knowledge_base: str) -> dict:
+        """What this region ranks with, whether a tuning bundle is in force, and what is tunable."""
+
+        return tools.get_retrieval_parameters(knowledge_base)
+
+    @mcp.tool()
+    @anticipated
+    def list_tuning_bundles(knowledge_base: str, limit: int = 20) -> dict:
+        """Configuration bundles this region has produced, and which one is live."""
+
+        return tools.list_tuning_bundles(knowledge_base, limit)
+
+    @mcp.tool()
+    @anticipated
+    def apply_tuning_bundle(knowledge_base: str, bundle_id: str, applied_by: str = "mcp") -> dict:
+        """Make a bundle this region's live retrieval overlay, for every replica."""
+
+        return tools.apply_tuning_bundle(knowledge_base, bundle_id, applied_by)
+
+    @mcp.tool()
+    @anticipated
+    def rollback_tuning_bundle(knowledge_base: str) -> dict:
+        """Stand the active tuning overlay down; the region returns to its configured values."""
+
+        return tools.rollback_tuning_bundle(knowledge_base)
+
     @mcp.resource("pheasant://knowledge-bases")
     @anticipated_resource
     def knowledge_bases_resource() -> str:

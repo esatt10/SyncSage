@@ -346,6 +346,27 @@ class EvaluationRunRequest(BaseModel):
     force: bool = False
 
 
+class TuningRunRequest(BaseModel):
+    """Start one tuning batch.
+
+    ``apply`` is separate from ``force`` on purpose. ``force`` runs a batch a
+    region has not enabled -- read-only, and safe. ``apply`` lets the winner
+    change what every replica serves, and no amount of "I meant to run it"
+    should imply that.
+    """
+
+    force: bool = False
+    apply: bool = False
+    diagnose_only: bool = False
+
+
+class TuningApplyRequest(BaseModel):
+    """Make one bundle the region's live retrieval overlay."""
+
+    bundle_id: str
+    applied_by: str = "api"
+
+
 class KnowledgeBaseRequest(BaseModel):
     name: str | None = None
     description: str | None = None
@@ -2923,6 +2944,197 @@ def create_app(
                 state, config.knowledge_base_id, limit=max(1, min(int(limit), 200))
             )
         }
+
+    # ---- the tuning plane ------------------------------------------------
+    #
+    # Shaped after the evaluation routes above, and for the same reasons: a
+    # batch is minutes of work so starting one returns a job id, and every
+    # read comes off `/state` rather than an in-process registry so a browser
+    # talking to a replica that did not start the batch still sees it.
+
+    @app.post("/tuning/run")
+    def tuning_run(req: TuningRunRequest) -> dict:
+        """Start a tuning batch as a background job.
+
+        Read-only unless ``apply`` is set. The batch takes the ``__tuning__``
+        lease, so several replicas pointed at one `/state` produce one batch;
+        it never takes ``sync_lock``; and it stands down while the index queue
+        has work in it, because indexing is somebody waiting and this is a
+        measurement.
+        """
+
+        import pheasant.tuning as tuning
+
+        if not config.tuning.enabled and not req.force:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "tuning.enabled is false. Enable it in pheasant.yaml, or pass "
+                    "force=true for a one-off batch."
+                ),
+            )
+        label = "tuning (diagnose)" if req.diagnose_only else "tuning"
+        job = app.state.jobs.create("tuning", label, targets=["tuning"])
+
+        def _run() -> None:
+            try:
+                kwargs: dict = {"force": True}
+                if req.diagnose_only:
+                    from pheasant.tuning.strategy import Budget
+
+                    # A diagnosis is a batch with no trial budget: the same
+                    # code path, stopped after the first movement.
+                    kwargs["budget"] = Budget(
+                        refusion_trials=0, requery_trials=0, max_searches=10_000
+                    )
+                if req.apply:
+                    engine.config.tuning.auto.apply = True
+                try:
+                    outcome = tuning.run(
+                        engine,
+                        on_progress=lambda phase, detail: app.state.jobs.progress(
+                            job.id, phase=phase, detail=detail or phase, source="tuning"
+                        ),
+                        **kwargs,
+                    )
+                finally:
+                    if req.apply:
+                        # Restored whatever the outcome: a request-scoped
+                        # override must not silently become the region's
+                        # standing policy for every later batch.
+                        engine.config.tuning.auto.apply = bool(config.tuning.auto.apply)
+                if outcome.applied:
+                    ranking_resolver.invalidate()
+                app.state.jobs.finish(
+                    job.id,
+                    status="succeeded" if outcome.status != "failed" else "failed",
+                    result={
+                        "experiment_id": outcome.experiment_id,
+                        "status": outcome.status,
+                        "outcome": outcome.decision.outcome if outcome.decision else "",
+                        "bundle_id": outcome.bundle_id,
+                        "applied": outcome.applied,
+                        "gates_passed": outcome.gates_passed,
+                        "skipped_reason": outcome.skipped_reason,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - a job records its own failure
+                app.state.jobs.finish(job.id, status="failed", error=str(exc))
+
+        threading.Thread(target=_run, name="pheasant-tuning", daemon=True).start()
+        return {"job_id": job.id, "status": "running"}
+
+    @app.get("/tuning/status")
+    def tuning_status(experiment: str | None = None) -> dict:
+        """What a tuning batch is doing right now, read from `/state`."""
+
+        import pheasant.tuning as tuning
+
+        payload = tuning.progress(state, config.knowledge_base_id, experiment)
+        payload["enabled"] = bool(config.tuning.enabled)
+        payload["auto_enabled"] = bool(config.tuning.auto.enabled)
+        payload["auto_apply"] = bool(config.tuning.auto.apply)
+        payload["tracking_backend"] = str(config.tuning.tracking.backend)
+        return payload
+
+    @app.get("/tuning/report")
+    def tuning_report(experiment: str | None = None) -> dict:
+        """The most recent tuning report, or a named one."""
+
+        from pheasant.tuning import store as tuning_store
+
+        row = (
+            tuning_store.experiment_status(state, experiment)
+            if experiment
+            else tuning_store.latest_experiment(state, config.knowledge_base_id)
+        )
+        report = (row or {}).get("report")
+        if not report:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No tuning report for {experiment}"
+                    if experiment
+                    else "No tuning batch has completed yet"
+                ),
+            )
+        return report
+
+    @app.get("/tuning/experiments")
+    def tuning_experiments(limit: int = 20) -> dict:
+        from pheasant.tuning import store as tuning_store
+
+        return {
+            "experiments": tuning_store.list_experiments(
+                state, config.knowledge_base_id, limit=max(1, min(int(limit), 200))
+            )
+        }
+
+    @app.get("/tuning/parameters")
+    def tuning_parameters() -> dict:
+        """What this region is ranking with, where it came from, and what is tunable.
+
+        The first question an operator looking at an unexpected ranking has to
+        answer, and it must be answerable without running anything.
+        """
+
+        import pheasant.tuning as tuning
+        from pheasant.tuning.space import ParameterSpace
+
+        active = tuning.active_parameters(state, config.knowledge_base_id)
+        space = ParameterSpace(pinned=frozenset(config.tuning.pinned_parameters or ()))
+        return {
+            "active": active,
+            "space": space.as_dict(),
+            "config_fragment": {"search": {"ranking": active["values"]}},
+        }
+
+    @app.get("/tuning/bundles")
+    def tuning_bundles(limit: int = 20) -> dict:
+        from pheasant.tuning import store as tuning_store
+
+        return {
+            "bundles": tuning_store.list_bundles(
+                state, config.knowledge_base_id, limit=max(1, min(int(limit), 200))
+            )
+        }
+
+    @app.post("/tuning/bundles/apply")
+    def tuning_apply(req: TuningApplyRequest) -> dict:
+        """Make a bundle the fleet's live retrieval overlay.
+
+        Fleet-scoped: one row, and every replica reading this `/state` resolves
+        it within its refresh window. There is deliberately no per-principal or
+        per-request variant of this endpoint — retrieval parameters that varied
+        by caller would make two agents disagree about what the region holds.
+        """
+
+        from pheasant.tuning import store as tuning_store
+
+        try:
+            payload = tuning_store.apply_bundle(
+                state,
+                config.knowledge_base_id,
+                req.bundle_id,
+                applied_by=req.applied_by or "api",
+            )
+        except KeyError as exc:
+            # 404 rather than a silent success: an unknown id must reach the
+            # caller as a refusal they can read, not a no-op that leaves
+            # ranking unchanged and reports that it changed.
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        ranking_resolver.invalidate()
+        return {"applied": True, "bundle": payload}
+
+    @app.post("/tuning/bundles/rollback")
+    def tuning_rollback() -> dict:
+        """Stand the active overlay down; the region returns to its config."""
+
+        from pheasant.tuning import store as tuning_store
+
+        reverted = tuning_store.revert_bundle(state, config.knowledge_base_id, applied_by="api")
+        ranking_resolver.invalidate()
+        return {"reverted": reverted is not None, "bundle": reverted}
 
     @app.get("/evaluation/status")
     def evaluation_status(run: str | None = None) -> dict:

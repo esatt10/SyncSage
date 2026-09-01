@@ -444,7 +444,33 @@ def _run(
             executor.checkpoint()
             key = f"{proposal.point.point_id}::{search_cohort.cohort_id}"
             if key in stored:
-                continue
+                # Resumed. A stored trial has to come back as a *comparable*
+                # result, not merely be skipped: the decision pairs per query,
+                # and a run that skipped its way to an empty comparison set
+                # would report `insufficient_evidence` for a batch that had in
+                # fact evaluated everything.
+                restored = _restore_trial(proposal, stored[key], experiment, search_cohort)
+                if restored is not None:
+                    results[proposal.point.point_id] = restored[0]
+                    trial_scores[proposal.point.point_id] = restored[1]
+                    # Counted as progress: a watcher must not see a resumed
+                    # batch sit at 0% while it works through everything it
+                    # already has, and then jump.
+                    phase("trial", f"{index}/{total}: reused", completed=index, total=total)
+                    continue
+                if proposal.cost_class == "requery":
+                    # The per-query rows are gone (cold storage absent or
+                    # pruned) and re-running is the expensive path. Skip it:
+                    # the aggregate is still on the row for the report, and a
+                    # point missing from the comparison is better than one that
+                    # spends the budget a second time.
+                    logger.info(
+                        "tuning: cannot restore %s for comparison; its per-query rows are gone",
+                        proposal.point.point_id,
+                    )
+                    continue
+                # A re-fusion trial costs nothing to redo, so redo it rather
+                # than dropping it.
             if searches >= budget.max_searches:
                 logger.info("tuning: search budget exhausted after %s searches", searches)
                 break
@@ -470,8 +496,11 @@ def _run(
                 kb_id,
                 experiment.experiment_id,
                 f"trial-{trial.trial_id}",
-                [{"trial": trial.as_dict()}],
+                [{"trial": trial.as_dict(), "score": trial_score.as_dict()}],
             )
+            # The ref goes on the row, so a resumed batch can find the
+            # per-query rows again without scanning the export directory.
+            tuning_store.save_trial(state, trial, kb_id, cold_ref=cold_ref)
             sink.log_trial(experiment, trial, cold_ref)
             phase(
                 "trial",
@@ -482,7 +511,12 @@ def _run(
             )
 
         # --- 4. decide ---------------------------------------------------
-        phase("decide", "gating the best point against the holdout and control cohorts")
+        phase(
+            "decide",
+            "gating the best point against the holdout and control cohorts",
+            completed=total,
+            total=total,
+        )
         decision, winner, comparisons = _decide(
             experiment=experiment,
             baseline_trial=baseline_trial,
@@ -843,6 +877,45 @@ def _decide(
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+
+
+def _restore_trial(
+    proposal: Proposal,
+    row: dict[str, Any],
+    experiment: Experiment,
+    cohort: Cohort,
+) -> tuple[Trial, scoring.CohortScore] | None:
+    """Rebuild a stored trial and its per-query score, or ``None``.
+
+    ``None`` rather than a partially-restored trial: a comparison built from an
+    aggregate with no per-query rows is not a paired comparison, and reporting
+    it as one would be the exact confound the pairing exists to remove.
+    """
+
+    payload = tuning_store.read_cold(str(row.get("cold_ref") or ""))
+    score_payload = next(
+        (item.get("score") for item in payload if isinstance(item, dict) and item.get("score")),
+        None,
+    )
+    if not score_payload:
+        return None
+    score = scoring.CohortScore.from_dict(score_payload)
+    if not score.per_query:
+        return None
+    trial = Trial(
+        trial_id=str(row.get("trial_id") or ""),
+        experiment_id=experiment.experiment_id,
+        proposal=proposal,
+        cohort_id=cohort.cohort_id,
+        cohort_name=cohort.name,
+        metrics=dict(row.get("metrics") or {}),
+        histogram=dict(row.get("histogram") or {}),
+        evaluated_queries=int(row.get("evaluated_queries") or 0),
+        excluded_queries=int(row.get("excluded_queries") or 0),
+        duration_ms=float(row.get("duration_ms") or 0.0),
+        searches=int(row.get("searches") or 0),
+    )
+    return trial, score
 
 
 def _replay_for(

@@ -3535,3 +3535,145 @@ select.text-input {
 }
 
 .eval-page .data-table .num { text-align: right; font-family: var(--font-mono); }
+
+/* --------------------------------------------------------------------------
+   Retrieval tuning
+   --------------------------------------------------------------------------
+   The stage histogram is the page, and the one thing its styling has to carry
+   is the distinction between a stage a parameter can reach and one it cannot.
+   A bar chart where "the fusion demoted it" and "it was never indexed" render
+   identically invites the same response to two problems that have nothing in
+   common, so an unreachable stage is drawn muted and struck through with a
+   different accent rather than just labelled. */
+
+.tune-page .tune-section {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin-bottom: 16px;
+  background: var(--surface);
+}
+
+.tune-page .tune-section > h2 {
+  margin: 0 0 10px;
+  font-size: 15px;
+}
+
+.tune-page .tuning__status {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.tune-page .stages {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.tune-page .stage__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.tune-page .stage__bar {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--border);
+  overflow: hidden;
+  margin: 4px 0;
+}
+
+.tune-page .stage__fill {
+  height: 100%;
+  background: var(--accent);
+}
+
+/* Not reachable by any parameter: a different colour, not a smaller bar. The
+   count is still true, and dimming the number would hide the finding. */
+.tune-page .stage--unreachable .stage__fill {
+  background: var(--border-strong);
+}
+
+.tune-page .stage--unreachable .stage__head strong {
+  color: var(--text-muted);
+}
+
+.tune-page .stage p {
+  margin: 2px 0 0;
+  font-size: 12px;
+}
+
+.tune-page .tune-warning {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--warn, var(--border-strong));
+  background: var(--surface-alt, transparent);
+  font-size: 13px;
+}
+
+.tune-page .tune-error {
+  color: var(--danger);
+}
+
+.tune-page .bundles {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.tune-page .bundle {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.tune-page .bundle--live {
+  border-color: var(--ok);
+}
+
+.tune-page .bundle__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.tune-page .bundle__params {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.tune-page .badge--live {
+  background: var(--ok);
+  color: var(--surface);
+}
+
+.tune-page .badge--promote { background: var(--ok); color: var(--surface); }
+.tune-page .badge--reject,
+.tune-page .badge--failed { background: var(--danger); color: var(--surface); }
+.tune-page .badge--running { background: var(--accent); color: var(--surface); }
+
+.tune-page .gate {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.tune-page .gate--fail .badge { background: var(--danger); color: var(--surface); }
+.tune-page .gate--pass .badge { background: var(--ok); color: var(--surface); }

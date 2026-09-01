@@ -986,3 +986,191 @@ export interface EvaluationTaxonomyEvent {
   strength: "weak" | "moderate" | "strong" | "conclusive";
   note: string;
 }
+
+// --------------------------------------------------------------------------
+// The tuning plane
+//
+// Where the evaluation types describe *how well* retrieval is doing, these
+// describe **which step** of it is failing. The shapes below are the API's,
+// verbatim, rather than a UI-convenient flattening of them: a diagnosis is
+// evidence for a decision somebody may have to argue with later, and a view
+// model that dropped the denominator or the rationale would make that
+// impossible on exactly the screen where it matters.
+
+/** One pipeline stage's share of the misses. */
+export interface TuningStageEntry {
+  stage: string;
+  count: number;
+}
+
+/**
+ * The diagnosis: how misses distribute over the retrieval pipeline.
+ *
+ * `actionable_share` is the fraction a ranking parameter could plausibly move.
+ * It is nullable, and the null means "there were no misses to attribute" —
+ * which is not the same as zero, and must not render as a 0% bar.
+ */
+export interface TuningHistogram {
+  counts: Record<string, number>;
+  evaluated: number;
+  served: number;
+  misses: number;
+  actionable_misses: number;
+  actionable_share: number | null;
+  dominant_stage: string | null;
+  ranked: TuningStageEntry[];
+}
+
+export interface TuningDiagnosis {
+  diagnosis_id: string;
+  cohort_name: string;
+  histogram: TuningHistogram;
+  unevidenced_queries: number;
+  summary: string;
+}
+
+export interface TuningPoint {
+  point_id: string;
+  values: Record<string, number>;
+  delta: Record<string, [number, number]>;
+  delta_description: string;
+}
+
+export interface TuningProposal {
+  point: TuningPoint;
+  motivating_stage: string;
+  rationale: string;
+  cost_class: string;
+  strategy: string;
+  generation: number;
+}
+
+export interface TuningTrial {
+  trial_id: string;
+  proposal: TuningProposal;
+  cohort_name: string;
+  metrics: Record<string, number>;
+  histogram: TuningHistogram;
+  evaluated_queries: number;
+  excluded_queries: number;
+  searches: number;
+  duration_ms: number;
+  failed: string;
+}
+
+export interface TuningComparison {
+  metric: string;
+  baseline_value: number;
+  treatment_value: number;
+  delta: number;
+  paired_queries: number;
+  improved_queries: number;
+  regressed_queries: number;
+  excluded_queries: number;
+  formula: string;
+  substituted: string;
+}
+
+/** A gate is not a metric: it is evaluated before aggregation and blocks. */
+export interface TuningGate {
+  gate_id: string;
+  passed: boolean;
+  blocking: boolean;
+  summary: string;
+  observed: unknown;
+  threshold: unknown;
+}
+
+export interface TuningDecision {
+  decision_id: string;
+  outcome: "promote" | "reject" | "no_change" | "insufficient_evidence";
+  reason: string;
+  winning_point_id: string;
+  comparisons: TuningComparison[];
+  gates: TuningGate[];
+  gates_passed: boolean;
+  holdout_confirmed: boolean;
+  control_regressed: boolean;
+}
+
+export interface TuningBundle {
+  bundle_id: string;
+  kb_id: string;
+  experiment_id: string;
+  decision_id: string;
+  parameters: Record<string, number>;
+  replaces: Record<string, number>;
+  metrics: Record<string, number>;
+  gates: TuningGate[];
+  motivating_stage: string;
+  rationale: string;
+  created_at: string;
+  applied_at?: string;
+  applied_by?: string;
+  superseded_at?: string;
+  active?: boolean;
+}
+
+export interface TuningReport {
+  experiment: { experiment_id: string; snapshot_id: string; cohort_id: string };
+  diagnosis: TuningDiagnosis;
+  decision: TuningDecision;
+  bundle: TuningBundle | null;
+  baseline: TuningTrial;
+  trials: TuningTrial[];
+  trial_count: number;
+  searches: number;
+  primary_metric: string;
+}
+
+export interface TuningStatus {
+  experiment_id: string;
+  status: string;
+  phase: string;
+  phase_detail: string;
+  completed_units: number;
+  total_units: number;
+  progress: number | null;
+  searches: number;
+  attempts: number;
+  error: string;
+  enabled?: boolean;
+  auto_enabled?: boolean;
+  auto_apply?: boolean;
+  tracking_backend?: string;
+}
+
+export interface TuningExperimentSummary {
+  experiment_id: string;
+  status: string;
+  phase: string;
+  started_at: string;
+  finished_at: string;
+  searches: number;
+  progress: number | null;
+}
+
+export interface TuningParameterSpec {
+  name: string;
+  stage: string;
+  cost_class: string;
+  candidates: number[];
+  bounds: number[];
+  rationale: string;
+}
+
+export interface TuningParameters {
+  active: {
+    provenance: string;
+    bundle_id: string;
+    values: Record<string, number>;
+    bundle: TuningBundle | null;
+  };
+  space: {
+    digest: string;
+    pinned: string[];
+    parameters: TuningParameterSpec[];
+    cost_classes: Record<string, string[]>;
+  };
+  config_fragment: { search: { ranking: Record<string, number> } };
+}

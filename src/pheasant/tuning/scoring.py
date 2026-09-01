@@ -77,6 +77,28 @@ def score_query(ranked_ids: list[str], positives: list[str]) -> QueryScore | Non
     return score
 
 
+def score_as_dict(score: QueryScore) -> dict[str, Any]:
+    return {
+        "query_id": score.query_id,
+        "reciprocal_rank": score.reciprocal_rank,
+        "first_rank": score.first_rank,
+        "recall": {str(k): v for k, v in score.recall.items()},
+        "positives": score.positives,
+        "returned": score.returned,
+    }
+
+
+def score_from_dict(payload: dict[str, Any]) -> QueryScore:
+    return QueryScore(
+        query_id=str(payload.get("query_id") or ""),
+        reciprocal_rank=float(payload.get("reciprocal_rank") or 0.0),
+        first_rank=payload.get("first_rank"),
+        recall={int(k): float(v) for k, v in (payload.get("recall") or {}).items()},
+        positives=int(payload.get("positives") or 0),
+        returned=int(payload.get("returned") or 0),
+    )
+
+
 @dataclass
 class CohortScore:
     """A whole cohort under one point: the aggregates and the rows behind them."""
@@ -88,6 +110,35 @@ class CohortScore:
     @property
     def evaluated(self) -> int:
         return len(self.per_query)
+
+    def as_dict(self) -> dict[str, Any]:
+        """The per-query rows, for the cold payload.
+
+        Stored in cold storage rather than in ``/state`` because it is one row
+        per (trial, query) -- the thing the hot/cold split exists to keep out
+        of an operational database. It is read back on resume, which is what
+        lets a resumed batch compute the *same* paired comparison an
+        uninterrupted one would: an aggregate cannot be paired after the fact,
+        because it has already lost which queries it covered.
+        """
+
+        return {
+            "per_query": [score_as_dict(score) for score in self.per_query.values()],
+            "unevidenced": self.unevidenced,
+            "failed": dict(self.failed),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> CohortScore:
+        restored = cls(
+            unevidenced=int(payload.get("unevidenced") or 0),
+            failed={str(k): str(v) for k, v in (payload.get("failed") or {}).items()},
+        )
+        for item in payload.get("per_query") or []:
+            score = score_from_dict(item)
+            if score.query_id:
+                restored.per_query[score.query_id] = score
+        return restored
 
     def aggregate(self) -> dict[str, float]:
         """Means over the evaluated queries. Empty when there are none.
