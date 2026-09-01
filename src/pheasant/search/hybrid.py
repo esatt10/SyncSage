@@ -17,9 +17,11 @@ from pheasant.memory.policy import (
 )
 from pheasant.search.criteria import source_type_map, stamp_source_types
 from pheasant.search.graph_search import search_graph
+from pheasant.search.observability import observe_search, should_sample, stage_digest
 from pheasant.search.ranking import DEFAULT_RANKING, RankingParameters
 from pheasant.search.sqlite_store import SearchStore, section_matches, section_needle
 from pheasant.search.vector_store import VectorSearcher
+from pheasant.telemetry.interactions import annotate_current
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,7 @@ class HybridSearch:
         steering_enabled: bool = False,
         default_memory_policy: str = "auto",
         usage_tracking: bool = False,
+        stage_sample_rate: float = 0.0,
     ):
         self.store = store
         # Optional semantic candidates (Synapse 21.4). None when
@@ -65,6 +68,14 @@ class HybridSearch:
         # salience can reflect use. Off by default: it is a write on the read
         # path and recording what someone looks up is an operator's choice.
         self.usage_tracking = usage_tracking
+        # observability.interactions.stage_sample_rate — the fraction of
+        # searches that capture a per-stage digest onto their ledger row. The
+        # always-on Prometheus counters do not depend on this; what this buys
+        # is a *query you can look at* when one of those counters moves, and a
+        # live diagnosis source for the tuning plane that does not wait for a
+        # batch. Zero by default: it is a write on somebody's ledger, and how
+        # much of one is an operator's call.
+        self.stage_sample_rate = float(stage_sample_rate or 0.0)
 
     def ranking_parameters(self) -> RankingParameters:
         """The parameter point this search fuses under.
@@ -177,10 +188,12 @@ class HybridSearch:
             if (enforced or sectioned or memory_filtered)
             else max_results
         )
-        # Nothing is collected unless a caller asked, so the ordinary path
-        # allocates one `None` and does no extra work at all.
+        # Nothing is collected unless a caller asked or this search was
+        # sampled, so the ordinary path allocates one `None` and does no extra
+        # work at all.
         stages: dict[str, Any] | None = None
-        if explain:
+        sampled = not explain and self._sampled()
+        if explain or sampled:
             stages = {
                 "parameters": ranking.describe(),
                 "query": {
@@ -427,8 +440,38 @@ class HybridSearch:
             _record_paths(stages, text_results, vector_results, graph_results, results)
             if steering:
                 stages["query"]["steering"] = steering.describe()
-            payload["stages"] = stages
+            if not sampled:
+                payload["stages"] = stages
+        # Emitted here rather than at each call site, so HTTP, MCP, the CLI and
+        # the assistant are all covered by construction — and so a new caller
+        # cannot be added without it. Counters only: never a database write on
+        # the request path.
+        observe_search(payload, stages)
+        if sampled and stages is not None:
+            # A sampled search annotates the row the *handler* is already
+            # going to write. It does not write one of its own, which would be
+            # a database write per sampled request — the thing the observation
+            # plane's hot tier exists to avoid.
+            annotate_current("retrieval_stages", stage_digest(payload, stages))
         return payload
+
+    def _sampled(self) -> bool:
+        """Is this search one of the sampled ones?
+
+        Decided from the ambient trace, so every hop of one call agrees. A
+        search running outside an observed handler has no trace and is never
+        sampled — there would be no row to annotate.
+        """
+
+        if self.stage_sample_rate <= 0.0:
+            return False
+        try:
+            from pheasant.telemetry.interactions import current_trace
+
+            trace = current_trace()
+        except Exception:  # noqa: BLE001 - observation is optional
+            return False
+        return bool(trace) and should_sample(self.stage_sample_rate, trace[0])
 
 
 #: How many ids per arm a ``stages`` block carries. The arms are already

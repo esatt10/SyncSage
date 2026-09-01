@@ -141,11 +141,25 @@ def _seed(root: Path) -> Path:
         # network, which is what makes it reproducible.
         "assistant": {"enabled": True, "provider": "none"},
         "sync": {"watcher": {"enabled": False}, "scheduler": {"enabled": False}},
-        "observability": {"interactions": {"enabled": True, "flush_batch_size": 1}},
+        "observability": {
+            "interactions": {
+                "enabled": True,
+                "flush_batch_size": 1,
+                # Every search, because a demo region has no traffic to spare:
+                # sampling down would leave the live-health panel below its
+                # own minimum and photograph an empty state.
+                "stage_sample_rate": 1.0,
+            }
+        },
         "memory": {
             "steering_enabled": True,
             "formation": {"enabled": True, "min_observations": 2, "min_sessions": 2},
         },
+        # `max_results: 2` against a corpus this size is what makes *rank*
+        # matter: a top-10 over nine documents returns everything, so every
+        # query is `served` whatever the ranking does and the stage histogram
+        # is a flat bar with nothing to say.
+        "tuning": {"enabled": True, "max_results": 2, "minimum_paired_queries": 2},
         # The evaluation plane, sized for a demo corpus. The sufficiency floors
         # exist to stop a *production* region publishing a number from four
         # data points; at this scale they would only stop the page measuring
@@ -208,12 +222,22 @@ def _drive(app) -> None:
     with TestClient(app) as client:
         for text, scope, subject in MEMORIES:
             client.post("/memory", json={"text": text, "scope": scope, "subject": subject})
-        for query, session in SEARCHES:
-            client.post(
-                "/search",
-                json={"query": query, "mode": "hybrid", "max_results": 8},
-                headers={"X-Pheasant-Session": session, "X-Pheasant-Principal": "user:ada"},
-            )
+        # Three passes over the same questions, in different sessions. Not
+        # padding: a region gets asked the same things repeatedly, that
+        # repetition is what memory formation keys on, and it is what takes
+        # the live-health panel past its own minimum-sample floor. Below that
+        # floor the panel correctly refuses to publish a rate, which is right
+        # in production and photographs as an empty state.
+        for pass_index in range(3):
+            for query, session in SEARCHES:
+                client.post(
+                    "/search",
+                    json={"query": query, "mode": "hybrid", "max_results": 8},
+                    headers={
+                        "X-Pheasant-Session": f"{session}-{pass_index}" if pass_index else session,
+                        "X-Pheasant-Principal": "user:ada",
+                    },
+                )
         # Typed proof, over the same endpoint an agent posts to.
         for query, path, event in EVIDENCE:
             target = artifacts.get(path)
@@ -236,6 +260,7 @@ def _drive(app) -> None:
     run_candidate_rules(engine)
     engine.sync_source("agent-memory", "full")
     _evaluate(engine)
+    _tune(engine)
 
 
 def _evaluate(engine) -> None:
@@ -255,14 +280,34 @@ def _evaluate(engine) -> None:
         raise SystemExit(f"the seeded evaluation run ended as {outcome.status}")
 
 
+def _tune(engine) -> None:
+    """One real tuning batch over the seeded region.
+
+    Real in the same sense the evaluation run is: it replays the searches the
+    script performed, attributes each miss to the stage that lost it, and
+    reaches whatever decision the evidence supports. The gate panel in the
+    README is often a *refusal* for that reason — a demo corpus has no holdout
+    cohort, so a genuine improvement cannot be confirmed and is not promoted.
+    """
+
+    import pheasant.tuning as tuning
+
+    outcome = tuning.run(engine, force=True)
+    decision = outcome.decision.outcome if outcome.decision else "none"
+    print(f"  tuning: {outcome.status}, {outcome.trials_run} trials, decision {decision}")
+    if outcome.status != "completed":
+        raise SystemExit(f"the seeded tuning batch ended as {outcome.status}")
+
+
 def _shoot(port: int, shots: dict[str, str]) -> None:
     """Navigate the way a person does: load once, then click.
 
-    A hard load of `/memory` does **not** reach the UI. That path is also an
-    API route, and FastAPI resolves it before the SPA's static mount -- so
-    `goto("/memory")` photographs a JSON body. The React router owns those
-    paths only after the app is running, which is exactly what clicking the
-    nav does.
+    Deep links now work -- a 404 falls back to the UI shell -- so `goto` would
+    reach most pages. Two reasons this still clicks. `/memory`, `/sources` and
+    `/graph` are *also* API routes, and FastAPI resolves those before the
+    static mount, so a hard load of one photographs a JSON body regardless of
+    the fallback. And clicking is what a person does, so it exercises the
+    router the way the app is actually used.
     """
     from playwright.sync_api import sync_playwright
 
@@ -375,6 +420,54 @@ def _shoot(port: int, shots: dict[str, str]) -> None:
         browser.close()
 
 
+def _shoot_tuning(port: int) -> None:
+    """The tuning plane's three panels, each cropped to what it is showing.
+
+    Separate from the full-page shot because these are the pieces a reader
+    needs to see close up: the stage histogram is the finding, the sweeps are
+    the evidence, and the gates are why a real improvement was refused.
+    """
+
+    from playwright.sync_api import sync_playwright
+
+    provisioned = Path("/opt/pw-browsers/chromium-1194/chrome-linux/chrome")
+    launch: dict[str, object] = {}
+    if provisioned.exists():
+        launch["executable_path"] = str(provisioned)
+
+    panels = {
+        "tuning-health": 'section:has(h2:text("Live pipeline health"))',
+        "tuning-diagnosis": 'section:has(h2:text("Where retrieval loses documents"))',
+        "tuning-sweeps": 'section:has(h2:text("Parameter sweeps"))',
+        "tuning-decision": 'section:has(h2:text("Decision"))',
+    }
+    with sync_playwright() as play:
+        browser = play.chromium.launch(**launch)
+        page = browser.new_page(viewport=VIEWPORT, device_scale_factor=2)
+        errors: list[str] = []
+        page.on("pageerror", lambda exc: errors.append(str(exc)))
+        page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
+        page.wait_for_timeout(1200)
+        page.get_by_role("link", name="Tuning", exact=True).click()
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(2500)
+        for name, selector in panels.items():
+            panel = page.locator(selector)
+            if not panel.count():
+                # Loud rather than quiet: a panel that vanished because its
+                # endpoint changed shape should fail the run, not silently
+                # leave a stale image in the README.
+                raise SystemExit(f"the tuning page has no {name!r} panel to photograph")
+            panel.first.scroll_into_view_if_needed()
+            page.wait_for_timeout(400)
+            out = TARGET / f"{name}.png"
+            panel.first.screenshot(path=str(out))
+            print(f"  {out.relative_to(REPO)}  ({out.stat().st_size // 1024} KiB)")
+        if errors:
+            raise SystemExit(f"the tuning page raised: {errors}")
+        browser.close()
+
+
 def _shoot_run_states(port: int, config) -> None:
     """Photograph the two states a batch reaches when a process goes away.
 
@@ -458,10 +551,9 @@ def _shoot_run_states(port: int, config) -> None:
             )
             if "run-inflight" not in reclaimed:
                 raise SystemExit("the stalled run was not reclaimed; nothing to photograph")
-            # Back to `/` and click, never `reload()`. The page is sitting on
-            # `/evaluation`, and a hard load of an SPA path does not reach the
-            # UI -- the React router owns those paths only once the app is
-            # running. The same trap `_shoot` documents for `/memory`.
+            # Back to `/` and click, never `reload()`. A reload would work now
+            # that deep links fall back to the shell, but clicking is what a
+            # person does and it keeps this identical to `_shoot`.
             page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
             page.wait_for_timeout(1200)
             page.get_by_role("link", name="Effectiveness", exact=True).click()
@@ -529,10 +621,12 @@ def main() -> int:
                 "notebook": "Notebook",
                 "memory": "Memory",
                 "evaluation": "Effectiveness",
+                "tuning": "Tuning",
                 "sources": "Sources",
                 "graph": "Graph",
             },
         )
+        _shoot_tuning(port)
         _shoot_run_states(port, config)
         server.should_exit = True
         thread.join(timeout=10)

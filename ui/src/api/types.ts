@@ -1174,3 +1174,72 @@ export interface TuningParameters {
   };
   config_fragment: { search: { ranking: Record<string, number> } };
 }
+
+/** One point on a parameter's sweep: what it was set to, and what that scored. */
+export interface TuningSweepPoint {
+  trial_id: string;
+  value: number | null;
+  baseline_value: number | null;
+  metric: number | null;
+  stage: string;
+  cost_class: string;
+}
+
+export interface TuningTrialRow {
+  trial_id: string;
+  point_id: string;
+  cohort_name: string;
+  cost_class: string;
+  motivating_stage: string;
+  generation: number;
+  metrics: Record<string, number>;
+  point: { delta_description?: string; values?: Record<string, number> };
+  proposal: { rationale?: string };
+  evaluated_queries: number;
+  searches: number;
+}
+
+export interface TuningTrials {
+  experiment_id: string;
+  primary_metric: string;
+  trials: TuningTrialRow[];
+  sweeps: Record<string, TuningSweepPoint[]>;
+}
+
+/**
+ * Pipeline behaviour on live traffic.
+ *
+ * `status` is `insufficient_evidence` until enough searches have been sampled.
+ * That is a distinct state from "healthy", and the UI must render it as an
+ * absence rather than as zeroes — a 0% empty rate over four searches is not
+ * good news, it is no news.
+ */
+export interface TuningHealth {
+  status: "measured" | "insufficient_evidence";
+  classification?: string;
+  samples: number;
+  minimum_samples?: number;
+  reason?: string;
+  sample_rate?: number;
+  observation_enabled?: boolean;
+  empty?: {
+    count: number;
+    rate: number;
+    by_stage: Record<string, { count: number; share: number | null }>;
+  };
+  arms?: Record<
+    string,
+    {
+      observed: number;
+      contributed: number;
+      contribution_rate: number | null;
+      failed: number;
+    }
+  >;
+  filters?: Record<string, { dropped: number; per_search: number }>;
+  truncation?: { count: number; rate: number };
+  results_per_search?: number;
+  bundles?: Record<string, number>;
+  mixed_configurations?: boolean;
+  does_not_support?: string;
+}

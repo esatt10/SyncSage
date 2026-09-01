@@ -706,6 +706,40 @@ def create_mcp_server(config: PheasantConfig) -> Any:
 
         return tools.rollback_tuning_bundle(knowledge_base)
 
+    @mcp.tool()
+    @anticipated
+    def get_retrieval_health(knowledge_base: str, since: str | None = None) -> dict:
+        """How retrieval is behaving on live traffic: empty rate by stage, arm contribution.
+
+        Needs no cohort and no proof, so it works between tuning batches — but
+        it says what the pipeline did, never whether an answer was correct.
+        """
+
+        return tools.get_retrieval_health(knowledge_base, since)
+
+    @mcp.tool()
+    @anticipated
+    def cancel_retrieval_tuning(knowledge_base: str, experiment_id: str | None = None) -> dict:
+        """Ask the running tuning batch to stop. Resumable: its trials are already stored."""
+
+        return tools.cancel_retrieval_tuning(knowledge_base, experiment_id)
+
+    @mcp.tool()
+    @anticipated
+    def pin_retrieval_parameters(knowledge_base: str, pinned: list[str]) -> dict:
+        """Settle ranking parameters so no tuning batch proposes them again."""
+
+        return tools.pin_retrieval_parameters(knowledge_base, pinned)
+
+    @mcp.tool()
+    @anticipated
+    def list_tuning_trials(
+        knowledge_base: str, experiment_id: str | None = None, limit: int = 50
+    ) -> dict:
+        """Every trial in an experiment: the point, its score, its stage, and its rationale."""
+
+        return tools.list_tuning_trials(knowledge_base, experiment_id, limit)
+
     @mcp.resource("pheasant://knowledge-bases")
     @anticipated_resource
     def knowledge_bases_resource() -> str:

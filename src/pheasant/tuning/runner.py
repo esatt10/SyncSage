@@ -35,7 +35,9 @@ drifted.
 from __future__ import annotations
 
 import logging
+import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC
 from typing import Any
@@ -62,7 +64,13 @@ from pheasant.tuning.contracts import (
     Proposal,
     Trial,
 )
-from pheasant.tuning.executor import BackpressureGate, StoodDown, TuningExecutor, TuningLease
+from pheasant.tuning.executor import (
+    BackpressureGate,
+    Cancelled,
+    StoodDown,
+    TuningExecutor,
+    TuningLease,
+)
 from pheasant.tuning.space import ParameterSpace, apply_point, baseline_values, validate_space
 from pheasant.tuning.stages import attribute, stage_histogram
 from pheasant.tuning.store import PRIMARY_METRIC
@@ -290,13 +298,27 @@ def _run(
 
     stale_before = _stale_before(float(settings.stale_seconds))
     tuning_store.reclaim_stale_experiments(state, kb_id, stale_before)
-    owner = f"{kb_id}:{id(engine)}"
+    # Unique per *attempt*, not per process. `open_experiment` inserts with
+    # `ON CONFLICT DO NOTHING` and then reads the owner back to find out
+    # whether it won — so an owner two claimants share makes both of them read
+    # their own name and both conclude they won.
+    #
+    # A host:pid owner looks unique and is not: two threads in one API replica
+    # (a scheduled trigger and somebody pressing Run) share it, and the
+    # `__tuning__` lease does not separate them either, because `SourceLease`
+    # grants a lease its current holder already owns. Found by running three
+    # batches from three threads and getting two completed experiments.
+    owner = f"{kb_id}:{os.uname().nodename}:{os.getpid()}:{uuid.uuid4().hex}"
     if not tuning_store.open_experiment(state, experiment, owner=owner, stale_before=stale_before):
         return TuningOutcome(
             experiment_id=experiment.experiment_id,
             status="skipped",
             skipped_reason="this experiment is already running in another process",
         )
+
+    # Now that the row exists, a cancel from *any* replica can reach this
+    # batch: the executor reads the column between units.
+    executor.cancel_check = lambda: tuning_store.cancel_requested(state, experiment.experiment_id)
 
     def phase(name: str, detail: str = "", **kwargs: Any) -> None:
         tuning_store.publish_phase(
@@ -574,6 +596,22 @@ def _run(
         sink.finish(experiment, "completed")
         return outcome
 
+    except Cancelled as cancelled:
+        # A distinct terminal state from `interrupted`. Both leave the trials
+        # on disk and both are resumable, but only one of them should be
+        # resumed *automatically*: an interrupted batch yielded to the region
+        # and should come back on its own, and a cancelled one was stopped by
+        # a person who would not thank us for restarting it.
+        tuning_store.close_experiment(
+            state,
+            experiment.experiment_id,
+            status=tuning_store.CANCELLED,
+            error=str(cancelled),
+        )
+        sink.finish(experiment, "cancelled")
+        outcome.status = "cancelled"
+        outcome.skipped_reason = str(cancelled)
+        return outcome
     except StoodDown as stood:
         # Not a failure: the region needed the machine. The experiment row goes
         # back to `interrupted` and its trials are on disk, so the next attempt

@@ -88,6 +88,7 @@ class PheasantTools:
             steering_enabled=config.memory.steering_enabled,
             default_memory_policy=config.memory.default_policy,
             usage_tracking=config.memory.usage_tracking,
+            stage_sample_rate=config.observability.interactions.stage_sample_rate,
         )
 
     def _publish_sync(
@@ -1209,6 +1210,101 @@ class PheasantTools:
         )
         self._invalidate_ranking()
         return {"reverted": reverted is not None, "bundle": reverted}
+
+    def get_retrieval_health(self, knowledge_base: str, since: str | None = None) -> dict:
+        """How the pipeline is behaving on live traffic, between batches.
+
+        Needs no cohort, no replay and no proof: it reads the sampled stage
+        digests off the interaction ledger. Consequently it says what the
+        pipeline *did* — empty rate and the stage that lost it, per-arm
+        contribution, filter drops, truncation — and never whether an answer
+        was correct.
+
+        Use it as a change detector. An empty rate that moves after a bundle
+        is applied is a fact about the bundle, and it is visible without
+        waiting for the next batch.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.tuning.health import stage_health
+
+        payload = stage_health(self.state, self.config.knowledge_base_id, since=since)
+        payload["sample_rate"] = self.config.observability.interactions.stage_sample_rate
+        return payload
+
+    def cancel_retrieval_tuning(
+        self, knowledge_base: str, experiment_id: str | None = None
+    ) -> dict:
+        """Ask the running tuning batch to stand down at its next checkpoint.
+
+        The batch stops with its trials already stored, so cancelling is
+        resumable rather than destructive. It lands as a row, so it reaches a
+        batch running in a different process or on a different replica.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        import pheasant.tuning as tuning
+        from pheasant.tuning import store as tuning_store
+
+        target = experiment_id or (
+            tuning.progress(self.state, self.config.knowledge_base_id) or {}
+        ).get("experiment_id")
+        if not target:
+            raise ValueError("No tuning batch is running for this knowledge base.")
+        if not tuning_store.request_cancel(
+            self.state, self.config.knowledge_base_id, target, requested_by="mcp"
+        ):
+            raise ValueError(f"{target} is not running, so there is nothing to cancel.")
+        return {"cancelled": True, "experiment_id": target}
+
+    def pin_retrieval_parameters(self, knowledge_base: str, pinned: list[str]) -> dict:
+        """Settle parameters so no tuning batch proposes them again.
+
+        Replaces the whole list rather than adding to it, so a caller states
+        the set they want rather than a delta against one they may not have
+        read.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.search.ranking import PARAMETER_STAGES
+
+        unknown = sorted(set(pinned or []) - set(PARAMETER_STAGES))
+        if unknown:
+            raise ValueError(
+                f"Not ranking parameters: {', '.join(unknown)}. "
+                f"Known: {', '.join(sorted(PARAMETER_STAGES))}"
+            )
+        self.config.tuning.pinned_parameters = sorted(set(pinned or []))
+        return {"pinned": self.config.tuning.pinned_parameters}
+
+    def list_tuning_trials(
+        self, knowledge_base: str, experiment_id: str | None = None, limit: int = 50
+    ) -> dict:
+        """Every trial in an experiment: point, score, stage, and why it was tried.
+
+        The audit trail behind a decision, at the granularity an agent can
+        reason about — each row names the parameter it moved, from what to
+        what, the stage that motivated it, and whether it cost a real search.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.tuning import store as tuning_store
+
+        target = experiment_id or (
+            tuning_store.latest_experiment(self.state, self.config.knowledge_base_id) or {}
+        ).get("experiment_id")
+        if not target:
+            raise ValueError("No tuning batch has run for this knowledge base yet.")
+        trials = tuning_store.load_trials(self.state, target)
+        rows = sorted(
+            (t for t in trials.values() if not t["failed"]),
+            key=lambda t: -(t["metrics"].get(tuning_store.PRIMARY_METRIC) or 0.0),
+        )
+        return {
+            "experiment_id": target,
+            "primary_metric": tuning_store.PRIMARY_METRIC,
+            "trials": rows[: max(1, min(int(limit), 500))],
+        }
 
     def _invalidate_ranking(self) -> None:
         """Make this process pick up an overlay change at once.

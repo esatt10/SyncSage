@@ -179,6 +179,45 @@ _CURRENT_TRACE: contextvars.ContextVar[tuple[str, str] | None] = contextvars.Con
 )
 
 
+#: The event being filled in for the call running on this context, when one
+#: is. Ambient for the same reason the trace is: retrieval sits several frames
+#: below the handler that owns the row, and threading an event object through
+#: `search_context` would put a telemetry parameter on the signature every
+#: caller — HTTP, MCP, CLI, the assistant, the tuning replay — has to pass.
+#:
+#: Follows the same rule as the trace and inherits the same limitation: it does
+#: not cross a bare `threading.Thread`, so a handler that hands retrieval to a
+#: raw thread annotates nothing rather than annotating the wrong row.
+_CURRENT_EVENT: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "pheasant_current_interaction_event", default=None
+)
+
+
+def current_event() -> Any:
+    """The interaction event this call is filling in, or ``None``."""
+
+    return _CURRENT_EVENT.get()
+
+
+def annotate_current(key: str, value: Any) -> bool:
+    """Add one attribute to the ambient event. ``True`` if there was one.
+
+    Best-effort and deliberately quiet: observation being off, or a caller
+    running outside an observed handler, is the ordinary case rather than an
+    anomaly — and a retrieval path that raised because nothing was listening
+    would be a diagnostic that costs queries.
+    """
+
+    event = _CURRENT_EVENT.get()
+    if event is None:
+        return False
+    try:
+        event.attributes[key] = value
+    except Exception:  # noqa: BLE001 - annotation must never fail a call
+        return False
+    return True
+
+
 def current_trace() -> tuple[str, str] | None:
     """``(trace_id, span_id)`` for the call in progress, or ``None``."""
 
@@ -981,6 +1020,7 @@ def observe(
         started_at=_iso(started),
     )
     token = _CURRENT_TRACE.set((event.trace_id, event.span_id))
+    event_token = _CURRENT_EVENT.set(event)
     span_cm = None
     if TRACING.enabled and TRACING.tracer is not None:
         span_cm = TRACING.tracer.start_as_current_span(
@@ -1014,6 +1054,7 @@ def observe(
             except Exception:  # noqa: BLE001 - a span must not break a request
                 logger.debug("Span exit failed", exc_info=True)
         _CURRENT_TRACE.reset(token)
+        _CURRENT_EVENT.reset(event_token)
         if buffer is not None:
             buffer.record(event)
 

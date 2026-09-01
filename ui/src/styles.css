@@ -3677,3 +3677,74 @@ select.text-input {
 
 .tune-page .gate--fail .badge { background: var(--danger); color: var(--surface); }
 .tune-page .gate--pass .badge { background: var(--ok); color: var(--surface); }
+
+/* Tuning: sweeps, rate tiles, and the experiment observability surface.
+   Charts use the app's own tokens rather than a chart palette — the only
+   colour distinctions here are status-like (tunable vs not, good vs bad) and
+   each one is labelled in text, so nothing depends on telling two hues apart. */
+
+.tune-page .sweeps {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.tune-page .sweep {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px 8px;
+  background: var(--bg-raised);
+}
+
+.tune-page .sweep figcaption {
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.tune-page .sweep svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+/* Reserved so the readout swapping between its hover and resting text does
+   not reflow the grid — a chart that twitches as the pointer crosses it is
+   harder to read than one that does not. */
+.tune-page .sweep__readout {
+  min-height: 18px;
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.tune-page .rate-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.tune-page .rate-tile {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  background: var(--bg-raised);
+}
+
+.tune-page .rate-tile--good { border-left-color: var(--ok); }
+.tune-page .rate-tile--bad { border-left-color: var(--danger); }
+
+.tune-page .rate-tile__label {
+  font-size: 12px;
+  color: var(--text-soft);
+}
+
+.tune-page .rate-tile__value {
+  font-size: 22px;
+  font-variant-numeric: tabular-nums;
+  margin: 2px 0;
+}
+
+.tune-page .rate-tile__hint { font-style: italic; }

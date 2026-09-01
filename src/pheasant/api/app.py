@@ -14,7 +14,7 @@ from typing import Annotated, Any
 import yaml
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
 from pheasant.assistant.credentials import SessionKeyStore
@@ -367,6 +367,24 @@ class TuningApplyRequest(BaseModel):
     applied_by: str = "api"
 
 
+class TuningCancelRequest(BaseModel):
+    """Ask the running batch to stand down."""
+
+    experiment_id: str | None = None
+    requested_by: str = "ui"
+
+
+class TuningPinRequest(BaseModel):
+    """Parameters an operator has settled and does not want re-litigated.
+
+    Replaces the whole list rather than adding to it, so the request describes
+    the state the caller wants rather than a delta against one they may not
+    have read.
+    """
+
+    pinned: list[str]
+
+
 class KnowledgeBaseRequest(BaseModel):
     name: str | None = None
     description: str | None = None
@@ -677,6 +695,40 @@ LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
     "server": False,
     "pheasant": False,
 }
+
+
+def _tuning_sweeps(trials: list[dict], metric: str) -> dict[str, list[dict]]:
+    """Trials grouped by the parameter each one moved, for plotting.
+
+    Grouped here rather than in the browser because the answer is already in
+    the trial: a proposal moves exactly one coordinate, and its delta names
+    which. Re-deriving that per render would put the strategy's invariant
+    (one coordinate at a time) into the UI, where a later change to the
+    strategy could not reach it.
+
+    Each series carries the baseline value too, so a sweep renders as "what
+    happens as this parameter moves away from what we serve" rather than as an
+    unanchored scatter.
+    """
+
+    sweeps: dict[str, list[dict]] = {}
+    for trial in trials:
+        delta = (trial.get("point") or {}).get("delta") or {}
+        for name, pair in delta.items():
+            before, after = (list(pair) + [None, None])[:2]
+            sweeps.setdefault(name, []).append(
+                {
+                    "trial_id": trial.get("trial_id", ""),
+                    "value": after,
+                    "baseline_value": before,
+                    "metric": (trial.get("metrics") or {}).get(metric),
+                    "stage": trial.get("motivating_stage", ""),
+                    "cost_class": trial.get("cost_class", ""),
+                }
+            )
+    for series in sweeps.values():
+        series.sort(key=lambda point: (point["value"] is None, point["value"]))
+    return sweeps
 
 
 def _allowed_roots(config: PheasantConfig) -> list[Path]:
@@ -1122,6 +1174,7 @@ def create_app(
         steering_enabled=config.memory.steering_enabled,
         default_memory_policy=config.memory.default_policy,
         usage_tracking=config.memory.usage_tracking,
+        stage_sample_rate=config.observability.interactions.stage_sample_rate,
     )
 
     # Built before the lifespan so the lifespan closure can start its session
@@ -3137,6 +3190,144 @@ def create_app(
         ranking_resolver.invalidate()
         return {"reverted": reverted is not None, "bundle": reverted}
 
+    @app.get("/tuning/health")
+    def tuning_health(since: str | None = None, limit: int = 5000) -> dict:
+        """Pipeline behaviour on live traffic, between batches.
+
+        Read from the sampled stage digests on the interaction ledger, so it
+        needs no cohort, no replay and no proof — and consequently says what
+        the pipeline *did*, never whether an answer was correct. Its value is
+        as a change detector: an empty-rate that moves after a bundle is
+        applied is a fact about the bundle, visible without waiting for the
+        next batch.
+        """
+
+        from pheasant.tuning.health import stage_health
+
+        payload = stage_health(
+            state,
+            config.knowledge_base_id,
+            since=since,
+            limit=max(1, min(int(limit), 50_000)),
+        )
+        payload["sample_rate"] = config.observability.interactions.stage_sample_rate
+        payload["observation_enabled"] = bool(config.observability.interactions.enabled)
+        return payload
+
+    @app.get("/tuning/trials")
+    def tuning_trials(experiment: str | None = None, limit: int = 500) -> dict:
+        """Every trial in an experiment, for charting.
+
+        This is what makes experiment observability native rather than a link
+        to another system: `/state` already holds the parameter point, the
+        score, the motivating stage and the rationale for every trial, so the
+        sweep an operator wants to look at is a query, not an export.
+        """
+
+        from pheasant.tuning import store as tuning_store
+
+        experiment_id = experiment or (
+            (tuning_store.latest_experiment(state, config.knowledge_base_id) or {}).get(
+                "experiment_id"
+            )
+        )
+        if not experiment_id:
+            return {"experiment_id": "", "trials": [], "sweeps": {}, "primary_metric": ""}
+        trials = tuning_store.load_trials(state, experiment_id)
+        rows = sorted(
+            (t for t in trials.values() if not t["failed"]),
+            key=lambda t: -(t["metrics"].get(tuning_store.PRIMARY_METRIC) or 0.0),
+        )
+        return {
+            "experiment_id": experiment_id,
+            "primary_metric": tuning_store.PRIMARY_METRIC,
+            "trials": rows[: max(1, min(int(limit), 2000))],
+            # Pre-grouped per parameter so the UI plots a sweep without having
+            # to know which parameter each trial moved — that is in the delta,
+            # and re-deriving it per render is work the server does once.
+            "sweeps": _tuning_sweeps(rows, tuning_store.PRIMARY_METRIC),
+        }
+
+    @app.post("/tuning/cancel")
+    def tuning_cancel(req: TuningCancelRequest) -> dict:
+        """Ask the running batch to stand down at its next checkpoint.
+
+        Lands as a column, not a signal to a thread: the replica serving this
+        request is usually not the one running the batch. The batch stops with
+        its trials already stored, so a cancel is resumable rather than
+        destructive.
+        """
+
+        import pheasant.tuning as tuning
+        from pheasant.tuning import store as tuning_store
+
+        experiment_id = req.experiment_id or (
+            tuning.progress(state, config.knowledge_base_id) or {}
+        ).get("experiment_id")
+        if not experiment_id:
+            raise HTTPException(status_code=404, detail="No tuning batch is running")
+        cancelled = tuning_store.request_cancel(
+            state,
+            config.knowledge_base_id,
+            experiment_id,
+            requested_by=req.requested_by or "api",
+        )
+        if not cancelled:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{experiment_id} is not running, so there is nothing to cancel",
+            )
+        return {"cancelled": True, "experiment_id": experiment_id}
+
+    @app.patch("/tuning/pinned")
+    def tuning_pin(req: TuningPinRequest) -> dict:
+        """Pin parameters so no batch proposes them.
+
+        Applies to the running process and is persisted with the rest of the
+        config, so it survives a restart — a pin that evaporated on redeploy
+        would be re-litigated by the next scheduled batch, which is the thing
+        pinning exists to prevent.
+        """
+
+        from pheasant.search.ranking import PARAMETER_STAGES
+
+        unknown = sorted(set(req.pinned) - set(PARAMETER_STAGES))
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not ranking parameters: {', '.join(unknown)}",
+            )
+        config.tuning.pinned_parameters = sorted(set(req.pinned))
+        # Persisted as well as applied. A pin that evaporated on the next
+        # redeploy would be silently re-litigated by the following scheduled
+        # batch, which is precisely what pinning exists to prevent.
+        wrote = _merge_into_config_file(
+            {"tuning": {"pinned_parameters": config.tuning.pinned_parameters}}
+        )
+        return {"pinned": config.tuning.pinned_parameters, "persisted": wrote}
+
+    @app.delete("/tuning/experiments/{experiment_id}")
+    def tuning_prune(experiment_id: str) -> dict:
+        """Delete a finished experiment and its trials.
+
+        Bundles survive on purpose: one of them may be the live overlay, and
+        erasing the provenance of the configuration a fleet is serving is a
+        worse outcome than keeping a row that points at a pruned experiment.
+        """
+
+        from pheasant.tuning import store as tuning_store
+
+        removed = tuning_store.prune_experiment(state, config.knowledge_base_id, experiment_id)
+        if not removed["experiments"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{experiment_id} is unknown or still running; a running batch must be "
+                    "cancelled before it can be pruned"
+                ),
+            )
+        return {"pruned": experiment_id, "removed": removed}
+
     @app.get("/evaluation/status")
     def evaluation_status(run: str | None = None) -> dict:
         """What a batch is doing right now — read from `/state`, not a process.
@@ -5116,4 +5307,39 @@ def _mount_ui(app: FastAPI, config: PheasantConfig) -> None:
 
     app.mount("/", StaticFiles(directory=str(target), html=True), name="ui")
     app.state.ui_dist = str(target)
+
+    index = target / "index.html"
+
+    @app.exception_handler(404)
+    async def _spa_fallback(request: Request, exc: Any) -> Response:
+        """Serve the UI shell for client-side routes.
+
+        ``StaticFiles(html=True)`` serves ``index.html`` at ``/`` and 404s
+        everything else, so every deep link into the single-page app —
+        ``/evaluation``, ``/memory``, ``/tuning`` — returned raw JSON to a
+        browser. That is not only a bookmark being broken: it is what a *hard
+        refresh* does, so anyone who reloaded the page they were looking at got
+        an error and had to navigate back in from the root.
+
+        Handled at 404 rather than as a catch-all route, which matters: this
+        runs only after real routing has failed, so it cannot shadow an API
+        endpoint, the ``/mcp`` mount, or a static asset that exists.
+
+        Three conditions, each excluding a case where HTML would be the wrong
+        answer:
+
+        * ``GET`` only — a mistyped ``POST`` deserves its 404, not a page.
+        * the client must actually accept HTML, so an API client or a ``curl``
+          still gets JSON and a missing endpoint still reads as missing.
+        * the path must not look like a file. A missing ``.js`` served as HTML
+          becomes a MIME-type error in the console, which is a much harder
+          thing to diagnose than a 404.
+        """
+
+        accepts_html = "text/html" in request.headers.get("accept", "")
+        looks_like_a_file = "." in request.url.path.rsplit("/", 1)[-1]
+        if request.method == "GET" and accepts_html and not looks_like_a_file:
+            return FileResponse(index)
+        return JSONResponse({"detail": getattr(exc, "detail", "Not Found")}, status_code=404)
+
     logger.info("Serving pheasant UI bundle from %s", target)

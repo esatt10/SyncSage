@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import type { TuningGate, TuningHistogram, TuningTrial } from "../api/types";
+import { RateTile, StageBars, SweepChart } from "../tuning/charts";
+import type { TuningGate, TuningHealth, TuningTrial } from "../api/types";
 
 /** Stages a ranking parameter can actually move. Mirrors `tuning.stages`. */
 const ACTIONABLE = new Set([
@@ -73,6 +74,24 @@ export function TuningPage() {
     queryKey: ["tuning", "bundles"],
     queryFn: () => api.tuningBundles(),
   });
+  // Experiment observability, served from /state. There is deliberately no
+  // link out to a tracking server here: the parameter point, the score, the
+  // motivating stage and the rationale are all rows this API already
+  // publishes, so the sweep belongs on this page rather than behind a second
+  // system somebody has to be running.
+  const trials = useQuery({
+    queryKey: ["tuning", "trials", status.data?.experiment_id],
+    queryFn: () => api.tuningTrials(),
+    enabled: !running,
+  });
+  // Live pipeline behaviour, which needs no batch at all. This is what makes
+  // the page useful *between* runs and is the only thing here that can notice
+  // a regression the moment a bundle starts serving.
+  const health = useQuery({
+    queryKey: ["tuning", "health"],
+    queryFn: () => api.tuningHealth(),
+    refetchInterval: 15000,
+  });
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ["tuning"] });
@@ -90,10 +109,23 @@ export function TuningPage() {
     mutationFn: () => api.tuningRollback(),
     onSuccess: invalidate,
   });
+  const cancel = useMutation({
+    mutationFn: () => api.tuningCancel(),
+    onSuccess: invalidate,
+  });
+  const pin = useMutation({
+    mutationFn: (names: string[]) => api.tuningPin(names),
+    onSuccess: invalidate,
+  });
+  const prune = useMutation({
+    mutationFn: (id: string) => api.tuningPrune(id),
+    onSuccess: invalidate,
+  });
 
   const active = parameters.data?.active;
   const decision = report.data?.decision;
   const histogram = report.data?.diagnosis?.histogram;
+  const pinned = parameters.data?.space.pinned ?? [];
 
   return (
     <div className="page tune-page">
@@ -152,9 +184,27 @@ export function TuningPage() {
               batch resumed from its stored trials.
             </p>
           ) : null}
+          {running ? (
+            <button
+              type="button"
+              className="btn"
+              onClick={() => cancel.mutate()}
+              disabled={cancel.isPending}
+            >
+              Cancel this batch
+            </button>
+          ) : null}
+          {status.data.status === "cancelled" ? (
+            <p className="muted small">
+              Cancelled. Its trials are stored, so running again resumes rather than
+              starting over.
+            </p>
+          ) : null}
           {status.data.error ? <p className="muted small tune-error">{status.data.error}</p> : null}
         </section>
       ) : null}
+
+      <LiveHealth health={health.data} />
 
       <section className="tune-section">
         <h2>What this region ranks with</h2>
@@ -189,23 +239,44 @@ export function TuningPage() {
                   <th>Parameter</th>
                   <th>Value</th>
                   <th>Stage it acts on</th>
+                  <th>Pinned</th>
                 </tr>
               </thead>
               <tbody>
-                {parameters.data?.space.parameters.map((spec) => (
-                  <tr key={spec.name}>
-                    <td>
-                      <code>{spec.name}</code>
-                    </td>
-                    <td>{active.values[spec.name]}</td>
-                    <td>
-                      {spec.stage}{" "}
-                      <span className="muted">
-                        ({spec.cost_class === "refusion" ? "free to trial" : "needs a search"})
-                      </span>
-                    </td>
-                  </tr>
-                ))}
+                {parameters.data?.space.parameters.map((spec) => {
+                  const isPinned = pinned.includes(spec.name);
+                  return (
+                    <tr key={spec.name}>
+                      <td>
+                        <code>{spec.name}</code>
+                      </td>
+                      <td>{active.values[spec.name]}</td>
+                      <td>
+                        {spec.stage}{" "}
+                        <span className="muted">
+                          ({spec.cost_class === "refusion" ? "free to trial" : "needs a search"})
+                        </span>
+                      </td>
+                      <td>
+                        {/* Pinning is how an operator says "I have measured
+                            this one, stop re-litigating it". Persisted, so the
+                            next scheduled batch honours it too. */}
+                        <input
+                          type="checkbox"
+                          checked={isPinned}
+                          aria-label={`Pin ${spec.name}`}
+                          onChange={() =>
+                            pin.mutate(
+                              isPinned
+                                ? pinned.filter((n) => n !== spec.name)
+                                : [...pinned, spec.name],
+                            )
+                          }
+                        />
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </>
@@ -218,7 +289,7 @@ export function TuningPage() {
         <section className="tune-section">
           <h2>Where retrieval loses documents</h2>
           <p className="page__lede">{report.data?.diagnosis.summary}</p>
-          <StageHistogram histogram={histogram} />
+          <StageBars histogram={histogram} actionable={ACTIONABLE} help={STAGE_HELP} />
           {histogram.actionable_share !== null && histogram.actionable_share < 0.34 ? (
             <p className="tune-warning">
               Most misses are in stages no retrieval parameter reaches. Tuning is the
@@ -304,6 +375,32 @@ export function TuningPage() {
         </section>
       ) : null}
 
+      {trials.data && Object.keys(trials.data.sweeps ?? {}).length ? (
+        <section className="tune-section">
+          <h2>Parameter sweeps</h2>
+          <p className="muted">
+            What each parameter did to <code>{trials.data.primary_metric}</code>. One chart
+            per parameter, because two of them on one plot would need two x-scales and the
+            crossing point would be an artifact of the scales rather than a finding. The
+            dashed line is what the region serves now.
+          </p>
+          <div className="sweeps">
+            {Object.entries(trials.data.sweeps).map(([parameter, points]) => (
+              <SweepChart
+                key={parameter}
+                parameter={parameter}
+                stage={points[0]?.stage ?? ""}
+                metric={trials.data!.primary_metric}
+                points={points}
+                baseline={
+                  report.data?.baseline?.metrics?.[trials.data!.primary_metric] ?? null
+                }
+              />
+            ))}
+          </div>
+        </section>
+      ) : null}
+
       <section className="tune-section">
         <h2>Configuration bundles</h2>
         {bundles.data?.bundles?.length ? (
@@ -348,47 +445,78 @@ export function TuningPage() {
 }
 
 /**
- * The histogram, with each stage labelled by whether tuning can reach it.
+ * Pipeline behaviour on live traffic, between batches.
  *
- * The label is the point of the component. Without it, "43% of misses are in
- * fusion" and "43% of misses are documents that were never indexed" render
- * identically and read as the same instruction.
+ * Placed above the diagnosis on purpose. The diagnosis is a batch result and
+ * can be days old; this is what the region is doing right now, and it is the
+ * only thing on the page that can catch a regression the moment an applied
+ * bundle starts serving.
+ *
+ * Every rate carries its denominator, and `insufficient_evidence` renders as
+ * an absence rather than as zeroes: a 0% empty rate over four searches is not
+ * good news, it is no news.
  */
-function StageHistogram({ histogram }: { histogram: TuningHistogram }) {
-  const worst = Math.max(1, ...histogram.ranked.map((entry) => entry.count));
+function LiveHealth({ health }: { health?: TuningHealth }) {
+  if (!health) return null;
+  if (health.status !== "measured") {
+    return (
+      <section className="tune-section">
+        <h2>Live pipeline health</h2>
+        <p className="muted">{health.reason}</p>
+        {!health.observation_enabled ? (
+          <p className="muted small">
+            Set <code>observability.interactions.enabled</code> and{" "}
+            <code>observability.interactions.stage_sample_rate</code> to collect it.
+          </p>
+        ) : null}
+      </section>
+    );
+  }
+  const empty = health.empty!;
+  const arms = health.arms ?? {};
   return (
-    <>
+    <section className="tune-section">
+      <h2>Live pipeline health</h2>
       <p className="muted">
-        {histogram.evaluated} evidenced query/target pairs · {histogram.served} served ·{" "}
-        {histogram.misses} missed
+        {health.samples} sampled searches. Says what the pipeline did — never whether an
+        answer was correct. Its use is as a change detector.
       </p>
-      {histogram.ranked.length === 0 ? (
-        <p>Every evidenced query returned its known positive. There is nothing to attribute.</p>
-      ) : (
-        <ul className="stages">
-          {histogram.ranked.map((entry) => {
-            const reachable = ACTIONABLE.has(entry.stage);
-            return (
-              <li key={entry.stage} className={reachable ? "stage" : "stage stage--unreachable"}>
-                <div className="stage__head">
-                  <strong>{entry.stage}</strong>
-                  <span className="muted">
-                    {entry.count} {reachable ? "· tunable" : "· not reachable by any parameter"}
-                  </span>
-                </div>
-                <div className="stage__bar">
-                  <div
-                    className="stage__fill"
-                    style={{ width: `${Math.round((entry.count / worst) * 100)}%` }}
-                  />
-                </div>
-                <p className="muted">{STAGE_HELP[entry.stage] ?? ""}</p>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-    </>
+      {health.mixed_configurations ? (
+        <p className="tune-warning">
+          These samples span more than one configuration, so the rates below average
+          across a change. Narrow the window to read either side.
+        </p>
+      ) : null}
+      <div className="rate-tiles">
+        <RateTile
+          label="Returned nothing"
+          value={empty.rate}
+          denominator={`${empty.count} of ${health.samples} searches`}
+          hint={
+            Object.keys(empty.by_stage).length
+              ? `mostly ${Object.keys(empty.by_stage)[0]}`
+              : undefined
+          }
+          tone={empty.rate > 0.15 ? "bad" : "neutral"}
+        />
+        {Object.entries(arms).map(([arm, stats]) => (
+          <RateTile
+            key={arm}
+            label={`${arm} arm contributed`}
+            value={stats.contribution_rate}
+            denominator={`${stats.contributed} of ${stats.observed} searches`}
+            hint={stats.failed ? `${stats.failed} failed` : undefined}
+            tone={stats.failed ? "bad" : "neutral"}
+          />
+        ))}
+        <RateTile
+          label="Truncated"
+          value={health.truncation?.rate ?? null}
+          denominator={`${health.truncation?.count ?? 0} of ${health.samples} searches`}
+          hint="fused list was longer than what was returned"
+        />
+      </div>
+    </section>
   );
 }
 

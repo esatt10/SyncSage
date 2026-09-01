@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,7 @@ RUNNING = "running"
 COMPLETED = "completed"
 FAILED = "failed"
 INTERRUPTED = "interrupted"
+CANCELLED = "cancelled"
 
 
 def _json(payload: Any) -> str:
@@ -119,18 +121,24 @@ def write_cold(
 
     if not exports_path or not records:
         return ""
+    tmp: Path | None = None
     try:
         import zstandard
 
         target = cold_dir(exports_path, kb_id, experiment_id)
         target.mkdir(parents=True, exist_ok=True)
         path = target / f"{name}.jsonl.zst"
+        tmp = path.with_suffix(f".{uuid.uuid4().hex}.partial")
         body = "\n".join(_json(record) for record in records).encode("utf-8")
         compressor = zstandard.ZstdCompressor(level=10)
         # Written to a temporary name and renamed, so a reader never sees a
         # half-written file: `pheasant export query` and an operator with
         # `zstdcat` both point at this directory while a batch is running.
-        tmp = path.with_suffix(".partial")
+        #
+        # The temp name is unique per writer. A fixed `.partial` collided when
+        # two batches raced: both wrote the same path, the first rename took
+        # it, and the second `os.replace` raised FileNotFoundError on a file
+        # that had just been renamed out from under it.
         tmp.write_bytes(compressor.compress(body))
         os.replace(tmp, path)
         return str(path)
@@ -138,6 +146,14 @@ def write_cold(
         logger.warning(
             "tuning: could not write cold payload %r for %s", name, experiment_id, exc_info=True
         )
+        # A rename that failed leaves the temp file behind, and these are
+        # unique per writer now — so without this a failing volume would
+        # accumulate one orphan per attempt rather than one in total.
+        try:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
         return ""
 
 
@@ -272,6 +288,71 @@ def publish_phase(
         f"UPDATE tuning_experiments SET {', '.join(sets)} WHERE experiment_id = ?",
         tuple(params),
     )
+
+
+def request_cancel(state: Any, kb_id: str, experiment_id: str, *, requested_by: str) -> bool:
+    """Ask a running batch to stand down. ``False`` if there was none.
+
+    Sets a column rather than signalling a thread, because the replica serving
+    the cancel is usually not the replica running the batch. The runner reads
+    this between units, so the batch stops at its next checkpoint with its
+    trials already stored — which makes a cancel resumable rather than
+    destructive, the same property standing down under index-queue pressure
+    has.
+    """
+
+    changed = _write(
+        state,
+        """UPDATE tuning_experiments SET cancel_requested = 1, cancel_requested_by = ?
+            WHERE experiment_id = ? AND kb_id = ? AND status = ?""",
+        (requested_by, experiment_id, kb_id, RUNNING),
+    )
+    return bool(changed)
+
+
+def cancel_requested(state: Any, experiment_id: str) -> str:
+    """Who asked this batch to stop, or "" if nobody has.
+
+    Read between units, so it is one indexed single-row select on the primary
+    key — cheap enough to check often, which is what makes a cancel feel
+    immediate rather than arriving whenever the batch happens to finish.
+    """
+
+    try:
+        rows = state.rows(
+            "SELECT cancel_requested, cancel_requested_by FROM tuning_experiments "
+            "WHERE experiment_id = ?",
+            (experiment_id,),
+        )
+    except Exception:  # noqa: BLE001 - a /state predating the column
+        return ""
+    if not rows or not int(rows[0]["cancel_requested"] or 0):
+        return ""
+    return str(rows[0]["cancel_requested_by"] or "a caller")
+
+
+def prune_experiment(state: Any, kb_id: str, experiment_id: str) -> dict[str, int]:
+    """Delete one experiment and its trials. Returns what it removed.
+
+    Bundles are deliberately **not** removed: a bundle may be the region's live
+    overlay, and deleting the experiment that produced it must not leave the
+    fleet serving a configuration whose provenance has been erased. The bundle
+    keeps its `experiment_id`, which then names a row that is gone — which is
+    honest ("this came from a pruned experiment") rather than misleading.
+    """
+
+    trials = _write(state, "DELETE FROM tuning_trials WHERE experiment_id = ?", (experiment_id,))
+    decisions = _write(
+        state,
+        "DELETE FROM tuning_decisions WHERE experiment_id = ? AND kb_id = ?",
+        (experiment_id, kb_id),
+    )
+    experiments = _write(
+        state,
+        "DELETE FROM tuning_experiments WHERE experiment_id = ? AND kb_id = ? AND status <> ?",
+        (experiment_id, kb_id, RUNNING),
+    )
+    return {"experiments": experiments, "trials": trials, "decisions": decisions}
 
 
 def heartbeat(state: Any, experiment_id: str) -> None:

@@ -463,6 +463,72 @@ def register_default_metrics(version: str) -> None:
         ("outcome",),
     )
 
+    # Retrieval, per pipeline stage.
+    #
+    # `pheasant_search_duration_seconds` says a search was slow. It cannot say
+    # *which step* was slow, and `pheasant_search_total{outcome}` cannot say
+    # which step returned nothing — after the merge a lexical miss, a
+    # filtered-out document, a fusion demotion and a truncation all look
+    # identical, because they all produce the same absent result.
+    #
+    # These are the live counterpart of the tuning plane's stage attribution.
+    # That attribution is only computed inside a *replay*, so without these a
+    # region's diagnosis is only as fresh as its last batch and a regression
+    # introduced by an applied bundle is invisible until somebody runs another
+    # one. They cost an in-memory counter increment per search: no database
+    # write reaches the request path, which is the rule the observation plane's
+    # hot tier already exists to keep.
+    REGISTRY.counter(
+        "pheasant_retrieval_arm_total",
+        "Arm executions, by arm and outcome ('ok', 'empty', 'failed'). "
+        "'empty' and 'failed' are separate because 'the vector index is down' "
+        "and 'the vector index has nothing for this query' call for opposite "
+        "responses and are indistinguishable downstream.",
+        ("arm", "outcome"),
+    )
+    REGISTRY.histogram(
+        "pheasant_retrieval_arm_candidates",
+        "Candidates an arm returned before any filter ran.",
+        ("arm",),
+        buckets=(0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0),
+    )
+    REGISTRY.counter(
+        "pheasant_retrieval_filtered_total",
+        "Candidates removed after retrieval, by filter and arm. A filter that "
+        "drops most of what the arms found is either an over-narrow policy or "
+        "an under-sized over-fetch window, and both are invisible in the "
+        "result count alone.",
+        ("filter", "arm"),
+    )
+    REGISTRY.counter(
+        "pheasant_retrieval_fusion_contributions_total",
+        "Returned results credited to each arm combination "
+        "(e.g. 'text', 'text+vector'). Agreement between arms is what RRF "
+        "promotes, so a corpus where nothing is ever multi-arm is one where "
+        "hybrid search is costing latency for a single arm's ordering.",
+        ("arms",),
+    )
+    REGISTRY.histogram(
+        "pheasant_retrieval_fusion_depth",
+        "Fused candidates considered before truncation. Much larger than "
+        "max_results means the merge is discarding a lot; roughly equal means "
+        "the arms are not over-fetching enough to rank anything.",
+        buckets=(0.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0),
+    )
+    REGISTRY.counter(
+        "pheasant_retrieval_truncated_total",
+        "Searches where the fused list was longer than the results returned.",
+    )
+    REGISTRY.counter(
+        "pheasant_retrieval_empty_total",
+        "Searches that returned nothing, by the last stage that still had "
+        "candidates. This is the live version of the tuning plane's stage "
+        "histogram: a region whose empties are mostly 'no_candidates' has an "
+        "indexing problem, and one whose empties are mostly 'filters' has a "
+        "policy problem.",
+        ("stage",),
+    )
+
     # Graph.
     REGISTRY.gauge("pheasant_graph_nodes", "Nodes in the loaded graph.")
     REGISTRY.gauge("pheasant_graph_edges", "Edges in the loaded graph.")

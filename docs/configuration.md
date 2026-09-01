@@ -1122,6 +1122,22 @@ The executor holds **one slot**, takes the `__tuning__` lease, and never takes
 Names you have settled and do not want re-litigated. A pinned parameter is
 never proposed.
 
+### `observability.interactions.stage_sample_rate`
+
+Default `0.0`. The fraction of searches that attach a **per-stage digest** to
+their ledger row: arm counts, what each filter removed, the fused depth, and
+the bundle the search ranked under.
+
+The always-on Prometheus stage counters (`pheasant_retrieval_*`) do not depend
+on this. What sampling buys is a *query you can look at* when one of those
+counters moves, and a live diagnosis source for the tuning plane that does not
+wait for a batch — which is what `GET /tuning/health` reads.
+
+Sampled rather than universal because the digest is a few hundred bytes on a
+row that is already a couple of kilobytes. Sampling is deterministic on the
+trace id, so every hop of one call agrees and the sampled set can be joined; a
+per-hop random draw produces traces that cannot be.
+
 ### `tuning.tracking.*`
 
 `backend` is `off` (default), `state`, or `mlflow`. `/state` is always the

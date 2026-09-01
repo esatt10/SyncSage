@@ -45,6 +45,8 @@ import type {
   RetrievalSettings,
   TuningBundle,
   TuningExperimentSummary,
+  TuningHealth,
+  TuningTrials,
   TuningParameters,
   TuningReport,
   TuningStatus,
@@ -555,6 +557,27 @@ export const api = {
     request<{ reverted: boolean; bundle: TuningBundle | null }>("/tuning/bundles/rollback", {
       method: "POST",
     }),
+  // Experiment observability, served from /state rather than from a tracking
+  // server: the parameter point, the score, the stage and the rationale are
+  // already rows, so the sweep a reader wants is a query and not an export.
+  tuningTrials: (experiment?: string) =>
+    request<TuningTrials>(`/tuning/trials${qs({ experiment })}`),
+  tuningHealth: (since?: string) => request<TuningHealth>(`/tuning/health${qs({ since })}`),
+  tuningCancel: (experimentId?: string) =>
+    request<{ cancelled: boolean; experiment_id: string }>("/tuning/cancel", {
+      method: "POST",
+      body: JSON.stringify({ experiment_id: experimentId, requested_by: "ui" }),
+    }),
+  tuningPin: (pinned: string[]) =>
+    request<{ pinned: string[]; persisted: boolean }>("/tuning/pinned", {
+      method: "PATCH",
+      body: JSON.stringify({ pinned }),
+    }),
+  tuningPrune: (experimentId: string) =>
+    request<{ pruned: string; removed: Record<string, number> }>(
+      `/tuning/experiments/${encodeURIComponent(experimentId)}`,
+      { method: "DELETE" },
+    ),
 };
 
 export { API_BASE };

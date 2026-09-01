@@ -54,10 +54,14 @@ on:
       - "src/pheasant/mcp_server/**"
       - "tests/test_tuning_*.py"
       - "tests/test_ranking*.py"
+      - "tests/test_api_ui_routes.py"
+      - "tests/test_interactions.py"
       - "tests/test_search_context.py"
       - "tests/test_backend_parity.py"
       - "ui/src/pages/TuningPage.tsx"
+      - "ui/src/tuning/**"
       - "ui/src/api/types.ts"
+      - "ui/src/api/client.ts"
       - ".github/workflows/tuning.yml"
   push:
     branches:
@@ -128,6 +132,8 @@ jobs:
             tests/test_tuning_batch.py \
             tests/test_tuning_refusion.py \
             tests/test_tuning_durability.py \
+            tests/test_tuning_stress.py \
+            tests/test_api_ui_routes.py \
             tests/test_ranking_parameters.py \
             tests/test_ranking.py \
             tests/test_search_context.py \
@@ -297,6 +303,44 @@ jobs:
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
 
+  stress:
+    name: Contention, not the happy path
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pheasant
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp]"
+
+      # Its own job because every correctness claim this plane makes is about
+      # *contention* — one batch across N replicas, an overlay changing while
+      # searches read it, a cancel from a process that is not running the
+      # batch. A single-threaded test cannot make any of them, and the last
+      # sampler defect found here (all-or-nothing sampling on counter-derived
+      # trace ids) looked exactly like a working sampler.
+      #
+      # Repeated, because a concurrency test that passes once has shown very
+      # little: an interleaving that only fails one run in five is the kind
+      # this is for.
+      - name: Drive the plane concurrently, several times
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::stress attempt ${attempt}"
+            python -m pytest -q -p no:randomly tests/test_tuning_stress.py
+            echo "::endgroup::"
+          done
+
   ui:
     name: The tuning page builds
     runs-on: ubuntu-latest
@@ -327,3 +371,13 @@ jobs:
       - name: Build the bundle that ships in the image
         working-directory: ui
         run: npm run build
+
+      # Typechecking proves the page compiles against the API's shapes; it
+      # does not prove the page *renders*. A chart that divides by zero on an
+      # empty sweep, or a null a type says cannot happen because the type was
+      # written by hand, only shows up when something draws it.
+      - name: Render the tuning page and fail on any console error
+        working-directory: ui
+        run: |
+          npm install --no-save playwright
+          node ci-render.mjs

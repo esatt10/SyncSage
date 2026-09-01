@@ -672,7 +672,13 @@ CREATE TABLE IF NOT EXISTS tuning_experiments (
   searches INTEGER NOT NULL DEFAULT 0,
   diagnosis_json TEXT,
   report_json TEXT,
-  error TEXT
+  error TEXT,
+  -- Cancellation is a column, not a process flag. A batch runs in a thread
+  -- inside whichever replica started it, and the person cancelling is talking
+  -- to whichever replica their browser reached — usually a different one. The
+  -- runner reads this between units, so a cancel from any replica lands.
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  cancel_requested_by TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tuning_experiments_time
   ON tuning_experiments(kb_id, started_at);

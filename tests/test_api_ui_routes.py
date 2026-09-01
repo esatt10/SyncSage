@@ -846,3 +846,68 @@ sources: []
             )
     finally:
         app.state.engine.close()
+
+
+# --------------------------------------------------------------------------
+# Deep links into the single-page app
+# --------------------------------------------------------------------------
+
+
+def _app_with_ui(tmp_path: Path, loaded_config, monkeypatch):
+    """An app serving a stub UI bundle, so the fallback has a shell to return."""
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>ui</title>", encoding="utf-8")
+    monkeypatch.setenv("PHEASANT_UI_DIST", str(dist))
+    return create_app(config=loaded_config)
+
+
+def test_a_client_side_route_serves_the_ui_shell(tmp_path, loaded_config, monkeypatch) -> None:
+    """Refreshing any UI page must not return JSON.
+
+    `StaticFiles(html=True)` serves index.html at `/` and 404s everything
+    else, so every deep link into the SPA — /evaluation, /memory, /tuning —
+    returned an error to a browser. That is not only a broken bookmark: it is
+    what a *hard refresh* does, so anyone who reloaded the page they were
+    looking at had to navigate back in from the root.
+    """
+
+    app = _app_with_ui(tmp_path, loaded_config, monkeypatch)
+    client = TestClient(app)
+    for route in ("/evaluation", "/tuning", "/some/deep/client/route"):
+        response = client.get(route, headers={"accept": "text/html"})
+        assert response.status_code == 200, route
+        assert "text/html" in response.headers["content-type"], route
+
+
+def test_the_fallback_does_not_swallow_api_or_asset_404s(
+    tmp_path, loaded_config, monkeypatch
+) -> None:
+    """Three cases where HTML would be the wrong answer.
+
+    A missing asset served as HTML is the worst of them: it becomes a MIME
+    error in the console, which is far harder to diagnose than a 404.
+    """
+
+    app = _app_with_ui(tmp_path, loaded_config, monkeypatch)
+    client = TestClient(app)
+
+    # An API client gets JSON, so a missing endpoint still reads as missing.
+    assert client.get("/nope", headers={"accept": "application/json"}).status_code == 404
+    # A missing file stays a missing file.
+    assert client.get("/assets/gone.js", headers={"accept": "text/html"}).status_code == 404
+    # A mistyped method deserves its 404, not a page.
+    assert client.post("/tuning", headers={"accept": "text/html"}).status_code in (404, 405)
+
+
+def test_a_real_api_route_still_wins_over_the_fallback(
+    tmp_path, loaded_config, monkeypatch
+) -> None:
+    """The fallback runs at 404, so routing is untouched."""
+
+    app = _app_with_ui(tmp_path, loaded_config, monkeypatch)
+    client = TestClient(app)
+    response = client.get("/tuning/parameters", headers={"accept": "text/html"})
+    assert response.status_code == 200
+    assert "application/json" in response.headers["content-type"]

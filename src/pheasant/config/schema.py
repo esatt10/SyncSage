@@ -1305,6 +1305,23 @@ class InteractionSettings(ModelMixin):
     """
 
     enabled: bool = False
+    #: Fraction of observed searches that carry a per-stage digest.
+    #:
+    #: The digest names what each retrieval stage did — arm candidate counts,
+    #: what each filter removed, the fused depth, and the bundle the search
+    #: ranked under. It is what lets a stage regression be traced to the
+    #: configuration change that caused it, and it gives the tuning plane a
+    #: *live* diagnosis source rather than one that is only as fresh as the
+    #: last batch.
+    #:
+    #: Sampled rather than universal because the digest is a few hundred bytes
+    #: on a row that is already a couple of kilobytes, and a ledger sized for
+    #: search traffic should not be resized by a diagnostic. Sampling is
+    #: deterministic on the trace id, so every hop of one call agrees about
+    #: whether it is sampled — a per-hop random draw produces traces that
+    #: cannot be joined. 0.0 disables it; the always-on Prometheus stage
+    #: counters are unaffected either way.
+    stage_sample_rate: float = 0.0
     #: Record no free text at all -- neither the question nor the answer.
     #:
     #: Named for what it does rather than for one of the two fields it

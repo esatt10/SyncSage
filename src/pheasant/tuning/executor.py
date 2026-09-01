@@ -43,6 +43,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -65,7 +66,16 @@ DEFAULT_MAX_QUEUE_DEPTH = 1
 
 
 def _owner() -> str:
-    return f"{os.uname().nodename}:{os.getpid()}"
+    """A lease owner that is unique per *holder*, not per process.
+
+    ``host:pid`` is not enough. Two threads in one replica share it, and
+    ``SourceLease`` grants a lease its current holder already owns — so a
+    process-scoped owner makes an in-process race look like a re-entrant
+    acquire and lets both threads through. The tuning executor is exactly that
+    shape: a scheduled batch and a hand-started one live in the same process.
+    """
+
+    return f"{os.uname().nodename}:{os.getpid()}:{uuid.uuid4().hex}"
 
 
 @dataclass
@@ -171,6 +181,17 @@ class TuningLease:
             logger.debug("tuning: lease release failed", exc_info=True)
 
 
+class Cancelled(RuntimeError):
+    """Somebody asked this batch to stop.
+
+    Distinct from :class:`StoodDown` because the two mean opposite things
+    about intent. Standing down is the region protecting itself and should
+    resume unprompted; a cancel is a person saying "not now", and resuming it
+    automatically would be ignoring them. The runner records them as different
+    terminal states for that reason.
+    """
+
+
 class StoodDown(RuntimeError):
     """The batch yielded to more important work. Resumable, not failed.
 
@@ -192,6 +213,10 @@ class TuningExecutor:
 
     state: Any
     gate: BackpressureGate | None = None
+    #: Returns who asked to cancel, or "" — read between units. A callable
+    #: rather than an id so the executor stays ignorant of the tuning schema,
+    #: and so a test can cancel without a database.
+    cancel_check: Callable[[], str] | None = None
     nice_increment: int = 10
     _thread: threading.Thread | None = field(default=None, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -220,6 +245,8 @@ class TuningExecutor:
         self._lower_priority()
         try:
             work()
+        except Cancelled as cancelled:
+            logger.info("tuning: %s %s", name, cancelled)
         except StoodDown as stood:
             logger.info("tuning: %s stood down (%s); it will resume", name, stood)
         except Exception:  # noqa: BLE001 - a batch must not take the process down
@@ -249,6 +276,14 @@ class TuningExecutor:
         what makes raising here safe.
         """
 
+        if self.cancel_check is not None:
+            try:
+                requested_by = self.cancel_check()
+            except Exception:  # noqa: BLE001 - a failed check must not stop work
+                logger.debug("tuning: cancel check failed", exc_info=True)
+                requested_by = ""
+            if requested_by:
+                raise Cancelled(f"cancelled by {requested_by}")
         if self._stop.is_set():
             raise StoodDown("stop was requested")
         if self.gate is not None:

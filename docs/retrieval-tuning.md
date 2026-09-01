@@ -153,6 +153,124 @@ reported that its gates passed, straight into a CLI exit status.
 
 ---
 
+## Telemetry: what each stage reports
+
+The diagnosis above comes from a batch. Between batches, retrieval reports on
+itself two ways, split by cost.
+
+**Always on — counters, no configuration.** Every search increments in-memory
+counters exposed on `/metrics`:
+
+| Metric | What it separates |
+|---|---|
+| `pheasant_retrieval_arm_total{arm,outcome}` | `ok` / `empty` / **`failed`** — "the vector index is down" and "it has nothing for this query" call for opposite responses |
+| `pheasant_retrieval_arm_candidates{arm}` | how much each arm actually found, before any filter |
+| `pheasant_retrieval_filtered_total{filter,arm}` | a filter dropping most of what the arms found is either an over-narrow policy or an under-sized over-fetch window |
+| `pheasant_retrieval_fusion_contributions_total{arms}` | agreement between arms is what RRF promotes; a corpus where nothing is ever multi-arm is paying latency for one arm's ordering |
+| `pheasant_retrieval_fusion_depth` | much larger than `max_results` means the merge is discarding a lot; roughly equal means the arms are not over-fetching enough to rank anything |
+| `pheasant_retrieval_truncated_total` | how often the fused list was longer than what was returned |
+| `pheasant_retrieval_empty_total{stage}` | the live stage histogram: empties attributed to the last stage that still had candidates |
+
+These cost an integer add per search. **No database write reaches the request
+path** — that is the same rule the observation plane's hot tier exists to keep,
+because a ledger write per request puts a write on the same Postgres the
+lexical arm already contends on.
+
+**Sampled — the stage digest.** `observability.interactions.stage_sample_rate`
+attaches a compact per-stage summary to a fraction of interaction-ledger rows:
+arm counts, what each filter removed, the fused depth, and **the bundle the
+search ranked under**. That last field is the point: it is what lets a stage
+regression be traced to the configuration change that caused it.
+
+It *annotates the row the handler is already writing* rather than writing one
+of its own, so a sampled search costs no extra insert. Sampling is
+deterministic on the trace id — hashed over the whole id, because an upstream
+`traceparent` may carry a counter-derived id whose low bits are nearly
+constant, and a sampler that sliced them collapsed to all-or-nothing while
+looking like it worked.
+
+### Stage health, and what it may not claim
+
+`GET /tuning/health`, `get_retrieval_health` (MCP), and the **Live pipeline
+health** panel read those digests into rates:
+
+- empty rate, and which stage still had candidates when it happened
+- per-arm contribution rate, and failures counted separately
+- filter drops per search, truncation rate, results per search
+
+Every one carries its denominator, and below `MINIMUM_SAMPLES` (25) it
+publishes **nothing** rather than a rate over four searches — the same
+`insufficient_evidence`-rather-than-`0.0` rule the evaluation plane's metrics
+follow.
+
+All of it is classified `structural`: it says what the pipeline **did**, never
+whether an answer was correct. Nobody judged these queries. Mining "this was
+served at rank 1" out of live traffic as a positive would produce a metric that
+improves whenever ranking gets more *confident* regardless of whether it gets
+more correct — the one shape this repository has repeatedly decided not to
+build.
+
+The honest use is a **change detector**. An empty rate that moves from 3% to
+14% after a bundle is applied is a fact about the bundle, actionable without
+anyone having judged a single result. The payload reports when its window spans
+more than one configuration, rather than averaging across exactly the change
+you were looking for.
+
+## Managing a run
+
+Every surface can drive the whole lifecycle, not just watch it.
+
+| Action | CLI | HTTP | MCP |
+|---|---|---|---|
+| Diagnose only | `tune diagnose` | `POST /tuning/run {diagnose_only}` | `start_retrieval_tuning(diagnose_only=true)` |
+| Run a batch | `tune run` | `POST /tuning/run` | `start_retrieval_tuning` |
+| Watch it | `tune status --watch` | `GET /tuning/status` | `get_retrieval_tuning_status` |
+| **Cancel it** | — | `POST /tuning/cancel` | `cancel_retrieval_tuning` |
+| Read the trials | `tune report` | `GET /tuning/trials` | `list_tuning_trials` |
+| Live health | — | `GET /tuning/health` | `get_retrieval_health` |
+| **Pin parameters** | `tuning.pinned_parameters` | `PATCH /tuning/pinned` | `pin_retrieval_parameters` |
+| Apply / roll back | `tune apply` / `rollback` | `POST /tuning/bundles/{apply,rollback}` | `apply_tuning_bundle` / `rollback_tuning_bundle` |
+| **Prune an experiment** | — | `DELETE /tuning/experiments/{id}` | — |
+
+**Cancelling lands as a row, not a signal to a thread.** The replica serving
+the cancel is usually not the one running the batch. The batch stops at its
+next checkpoint with its trials already stored, so a cancel is *resumable*
+rather than destructive — and it is recorded as `cancelled` rather than
+`interrupted`, because an interrupted batch should resume on its own and a
+cancelled one should not.
+
+**Pruning keeps bundles.** One of them may be the live overlay, and erasing the
+provenance of the configuration a fleet is serving is worse than keeping a row
+that points at a pruned experiment.
+
+## Experiment observability
+
+`/state` already holds every trial's parameter point, score, motivating stage
+and rationale. So the sweep an operator wants is a **query**, and the charts
+live in the pheasant UI rather than behind a second system somebody has to be
+running.
+
+`GET /tuning/trials` returns the trials plus `sweeps` — pre-grouped by the
+parameter each trial moved. That grouping happens server-side because the
+answer is already in the trial's delta, and re-deriving it per render would put
+the strategy's invariant (one coordinate at a time) into the browser, where a
+later change to the strategy could not reach it.
+
+The UI draws one small-multiple chart per parameter. Never two on one plot:
+that would need two x-scales, and the crossing point would be an artifact of
+the scales rather than a finding.
+
+### Where MLflow fits
+
+It is a **mirror of `/state`**, never a dependency, and the UI never requires
+it. Turn it on and every experiment, trial, decision and bundle is also written
+to an MLflow run tree — a local file store under `<exports>/tuning/mlruns` by
+default, so `mlflow ui --backend-store-uri <path>` opens it later with nothing
+running in between. Point `tracking_uri` at a server if you already operate one.
+
+Losing the mirror loses a dashboard, not a result, and you can turn it on later
+and still have every row.
+
 ## Bundles, and the two acts
 
 A **bundle** is the deliverable: a `search.ranking` parameter set plus its whole

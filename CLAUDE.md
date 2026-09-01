@@ -445,6 +445,36 @@ causes, one symptom.
   load-bearing, defaulting to a local file store.
   `docs/retrieval-tuning.md`.
 
+### Retrieval telemetry
+
+Two signals, split by cost, because the tuning plane's stage attribution only
+exists inside a *replay* — which left production retrieval with a duration
+histogram and a counter, neither able to name a stage.
+
+- **Always on: counters.** `pheasant_retrieval_arm_total{arm,outcome}`,
+  `_arm_candidates`, `_filtered_total{filter,arm}`,
+  `_fusion_contributions_total{arms}`, `_fusion_depth`, `_truncated_total`,
+  and `_empty_total{stage}` — the live version of the stage histogram. An
+  in-memory increment per search; **no database write reaches the request
+  path**, which is the rule the observation plane's hot tier exists to keep.
+  `empty` and `failed` are separate arm outcomes because "the vector index is
+  down" and "it has nothing for this query" call for opposite responses.
+- **Sampled: the stage digest.** `observability.interactions.stage_sample_rate`
+  attaches a compact per-stage summary to a fraction of ledger rows —
+  including the bundle the search ranked under, which is what lets a stage
+  regression be traced to the configuration change that caused it. It
+  annotates the row the handler is *already* writing rather than writing one
+  of its own. Sampling is deterministic on the trace id (hashed whole, see the
+  traps), so every hop of a call agrees and the sampled set can be joined.
+- **`tuning.health` reads those digests** into per-stage rates with
+  denominators, classified `structural`: it says what the pipeline did, never
+  whether an answer was correct, because nobody judged those queries. Its
+  honest use is a change detector — an empty rate that moves after an apply is
+  a fact about the bundle, without waiting for a batch. Below
+  `MINIMUM_SAMPLES` it publishes nothing rather than a rate over four
+  searches, and it reports when its window spans two configurations rather
+  than averaging across the change somebody is looking for.
+
 ### Scale
 
 One container until it shouldn't be. Then four independent axes:
@@ -628,6 +658,39 @@ Each of these cost real time. They are listed because the shape recurs.
   bugs above, and the worse direction, because the offline suite runs on
   SQLite. Found by a second `run_tuning` being refused as "already running"
   against a row that said `completed`.
+- **An owner that identifies a *process* cannot arbitrate a race inside one.**
+  `open_experiment` inserts `ON CONFLICT DO NOTHING` and reads the owner back
+  to learn whether it won — sound only if the owner is unique per *attempt*.
+  It was `host:pid`, which looks unique and is not: two threads in one replica
+  share it, so both read their own name back and both concluded they had
+  claimed the batch. The `__tuning__` lease did not separate them either,
+  because `SourceLease` grants a lease its current holder already owns, which
+  makes an in-process race indistinguishable from a re-entrant acquire. The
+  shape is ordinary — a scheduled batch and a hand-started one live in the
+  same process — and it produced two completed experiments where the design
+  promises one. Owners carry a uuid now. Found by running three batches from
+  three threads; every sequential test passed throughout.
+- **A fixed temp filename is a collision waiting for a second writer.** Cold
+  payloads were written to `<name>.partial` and renamed. Two batches racing
+  wrote the same path, the first rename took it, and the second `os.replace`
+  raised `FileNotFoundError` on a file that had just moved out from under it.
+  Unique per writer now, and a failed write unlinks its own temp file —
+  otherwise unique names would turn one orphan into one per attempt.
+- **A sampler that slices a trace id measures the id's shape, not the traffic.**
+  Stage sampling read the low four hex characters, reasoning that a W3C trace
+  id is random so any slice is uniform. True of ids pheasant mints, false of
+  ids arriving in an upstream `traceparent`: an SDK deriving them from a
+  counter or a clock leaves the low bits nearly constant, and sampling
+  collapsed to all-or-nothing — 100% at a requested 25%, looking exactly like
+  a working sampler. Hashed over the whole id now.
+- **`StaticFiles(html=True)` is not a single-page-app fallback.** It serves
+  `index.html` at `/` and 404s everything else, so every deep link into the UI
+  — `/evaluation`, `/memory`, `/tuning` — returned JSON to a browser. Not just
+  a broken bookmark: it is what a *hard refresh* does, so anyone who reloaded
+  the page they were on had to navigate back in from the root. The screenshot
+  script had grown a documented workaround for it. Fixed at the 404 handler,
+  which runs after routing has already failed and therefore cannot shadow an
+  API route, the `/mcp` mount, or a real asset.
 - **A resumed batch that *skips* is not a resumed batch.** Reusing stored
   trials by `continue`-ing past them left the decision with an empty comparison
   set, so a batch that had in fact evaluated everything reported
