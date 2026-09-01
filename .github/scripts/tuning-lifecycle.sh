@@ -31,19 +31,11 @@ cleanup() { rm -rf "${WORK}"; }
 trap cleanup EXIT
 
 log "Building a region with real queries, real proof, and a real deficiency"
-python - "${WORK}" <<'PY'
-import sys
-from pathlib import Path
-
-sys.path.insert(0, ".")
-from tests.test_tuning_batch import _engine, _seed  # noqa: E402
-
-work = Path(sys.argv[1])
-engine = _engine(work)
-_seed(engine)
-engine.close()
-print(f"region at {work / 'pheasant.yaml'}")
-PY
+# The same seeding the render check uses. Shared rather than duplicated, and
+# deliberately not an import from `tests/`: a CI script coupled to test
+# internals breaks whenever a fixture is renamed, for a check that has nothing
+# to do with the tests.
+run python scripts/seed_render_region.py --work "${WORK}"
 
 CONFIG="${WORK}/pheasant.yaml"
 

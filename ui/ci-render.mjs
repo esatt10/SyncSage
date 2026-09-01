@@ -29,35 +29,17 @@ function run(cmd, args, opts = {}) {
 
 // A region with indexed content, recorded proof, sampled traffic and one
 // completed batch — everything the page has a panel for.
-await run('python', ['-c', `
-import sys; sys.path.insert(0, "${ROOT}")
-from pathlib import Path
-import yaml, logging
-logging.disable(logging.INFO)
-from tests.test_tuning_batch import _write_config, _seed, QUERIES
-from pheasant.config.schema import PheasantConfig
-work = Path("${work}")
-cfg, path = _write_config(work)
-raw = yaml.safe_load(path.read_text())
-raw["observability"] = {"interactions": {"enabled": True, "stage_sample_rate": 1.0}}
-raw.setdefault("server", {})["port"] = 8799
-path.write_text(yaml.safe_dump(raw))
-from pheasant.api.app import create_app
-app = create_app(PheasantConfig.model_validate(raw), config_path=str(path))
-e = app.state.engine
-e.sync_source("docs", "full")
-_seed(e)
-from pheasant.tuning.runner import run_tuning
-print("batch:", run_tuning(e, force=True).status)
-from fastapi.testclient import TestClient
-c = TestClient(app)
-for _ in range(4):
-    for q in QUERIES:
-        c.post("/search", json={"query": q, "max_results": 2})
-buf = getattr(app.state, "interaction_buffer", None)
-if buf is not None and hasattr(buf, "flush"): buf.flush()
-e.close()
-`]);
+//
+// The seeding lives in `scripts/seed_render_region.py`, not in a template
+// literal here. Escaping a Python program through JavaScript is a minefield
+// (the first attempt died on an unterminated string that was invisible in
+// either file alone), and a Python program inside a `.mjs` is one nothing
+// lints or formats.
+await run('python', [
+  join(ROOT, 'scripts', 'seed_render_region.py'),
+  '--work', work,
+  '--port', '8799',
+]);
 
 const server = spawn('python', ['-m', 'pheasant', 'serve', '--config', join(work, 'pheasant.yaml')], {
   cwd: ROOT,
