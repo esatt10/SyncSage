@@ -93,6 +93,14 @@ otel = [
   "opentelemetry-sdk>=1.25",
   "opentelemetry-exporter-otlp-proto-http>=1.25",
 ]
+# Experiment tracking for the retrieval tuning plane. Gated, and the gating is
+# the point rather than a size concern: `/state` is the source of truth and
+# MLflow is a *mirror* of it, so a region without this extra runs every batch,
+# stores every result, and loses only a dashboard. With no tracking_uri the
+# sink writes a local file store under <exports>/tuning/mlruns — no server, no
+# network — which is what keeps the offline suite network-free by construction
+# rather than by mocking a tracking server.
+tuning = ["mlflow>=2.14"]
 # Documentation site (MkDocs Material). Build with: mkdocs build --strict
 docs = ["mkdocs-material>=9.5"]
 dev = [

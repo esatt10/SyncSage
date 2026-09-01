@@ -51,7 +51,7 @@ pheasant-kb/
 ├── CLAUDE.md · AGENTS.md      ← agent hand-off (this file is canonical)
 ├── README.md                  ← product front door
 ├── pyproject.toml             ← extras: mcp, vector, agent, a2a, wasm,
-│                                postgres, grpc, queue, docs, dev
+│                                postgres, grpc, queue, tuning, docs, dev
 ├── pheasant.example.yaml      ← reference config, every section
 ├── Dockerfile                 ← one universal image: API + MCP + UI, port 8765
 ├── docker-compose*.yml        ← default / override / fresh reset / scaled
@@ -73,6 +73,10 @@ pheasant-kb/
 │   │                            proof, cohorts, variants, replay, metrics,
 │   │                            gates, report, candidates, runner, store,
 │   │                            benchmark (the capacity measurement)
+│   ├── tuning/                ← the tuning plane: stages (which retrieval
+│   │                            step lost the document), space, refusion,
+│   │                            strategy, executor, gates, bundle, tracking,
+│   │                            store, runner
 │   ├── sharding.py            ← `pheasant shard plan`
 │   ├── jobs.py                ← per-source progress: phase, rate, ETA, stalled
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
@@ -86,7 +90,8 @@ pheasant-kb/
 │   │                            transcriber, office, msdoc
 │   ├── graph/                 ← model, simple, builder, enrichment, capacity
 │   ├── search/                ← sqlite_store (FTS5/tsvector + BM25),
-│   │                            graph_search, hybrid (RRF), criteria, vector
+│   │                            graph_search, hybrid (RRF), criteria, vector,
+│   │                            ranking (the tunable parameters, fleet-scoped)
 │   ├── memory/                ← store, projection, policy, steering, salience,
 │   │                            bridge, maintenance, formation, benchmark
 │   ├── persistence/           ← state_store, backends (sqlite|postgres),
@@ -144,6 +149,11 @@ pheasant eval run [--mode current_state|historical --as-of T]
 pheasant eval report [--run ID] [--json]
 pheasant eval trend --metric known_positive_reciprocal_rank
 pheasant eval status [--watch]             # a batch's live phase/progress, from /state
+pheasant tune diagnose                     # which retrieval stage is losing documents
+pheasant tune run [--apply]                # diagnose, search the blamed stages, gate a winner
+pheasant tune show [--yaml]                # the parameters in force, and where they came from
+pheasant tune bundles|apply <id>|rollback  # the fleet's retrieval overlay
+pheasant tune status [--watch] | report
 python -m pheasant.evaluation.benchmark    # measure a batch against the capacity model
 pheasant mcp --transport stdio
 pheasant client-config claude-code|cursor|vscode
@@ -384,6 +394,57 @@ returned by a search. A region must not answer a question with its own report.
   the first two coefficients shipped were out by 2x and 3x, found exactly that
   way. `docs/knowledge-effectiveness.md`.
 
+### Tuning
+
+`tuning.*`, off by default and read-only when on. Where evaluation says *how
+well* retrieval is doing, this says **which step is failing** — and after the
+merge a lexical miss, a filtered-out document, a fusion demotion and a
+truncation all look identical, because they all produce an absent result. Six
+causes, one symptom.
+
+- **A stage model, attributed to the first stage that lost the document.**
+  `search_context(explain=True)` reports each arm's candidates, what each
+  filter removed, and the fused order before truncation; `tuning.stages`
+  attributes every miss. Not to *every* stage that could be blamed — a
+  document the lexical arm never saw is not also a fusion failure, and counting
+  it as both makes the totals exceed the misses and every stage look guilty.
+  Arms are reconciled first: a target the vector arm missed and the text arm
+  returned is not a failure at all.
+- **Three refusals.** Absence from the corpus is never *inferred* from "no arm
+  returned it" — that needs a lookup, and without one it reports
+  `candidates_missing`. A query with no known positive is excluded from the
+  denominator rather than counted as served. And no stage is ever blamed on a
+  score threshold: fused RRF scores have no absolute scale.
+- **It declines.** When the misses are in stages no parameter reaches, the
+  batch proposes nothing and says why. That is the most valuable thing it
+  produces; searching anyway and shipping the highest number is the failure
+  mode the design exists to prevent.
+- **Most trials cost no retrieval.** The fusion family acts *after* the arms
+  produce candidates, so it is recomputed from cached candidate lists — a
+  thousand points for one replay. That is a re-implementation of the merge, so
+  `verify_equivalence` re-fuses at the parameters that actually ran and
+  compares id for id before any cheap trial is trusted, and a degraded capture
+  falls back to a real search rather than approximating.
+- **Nothing is promoted by its own evidence.** A winner selected on one cohort
+  must confirm on a holdout it never saw, with a control that must not regress.
+  Gates sit outside the score, and an empty gate list is a failure — `all([])`
+  is `True`, which the evaluation plane learned the expensive way.
+- **Fleet-scoped, and applying is a separate act.** A bundle is one row in
+  `/state` and every replica resolves it on a 30s TTL. There is no per-request
+  and no per-principal override, and nowhere in the schema for one. Producing a
+  bundle changes nothing; `pheasant tune apply` changes what the fleet serves,
+  and rollback restores what the bundle recorded that it replaced.
+- **It yields.** One executor slot, the `__tuning__` lease, never `sync_lock`,
+  and it stands down *between units* while the index queue has work — indexing
+  is somebody waiting, and this is a measurement. Standing down is resumable,
+  not a failure.
+- **Hot/cold.** `/state` holds experiments, trial scores, decisions and
+  bundles; per-query per-trial rankings go to `/exports/tuning` as zstd JSONL,
+  because they are derivable and an operational database is not where 80,000
+  ranked lists belong. MLflow is an optional mirror of `/state`, never
+  load-bearing, defaulting to a local file store.
+  `docs/retrieval-tuning.md`.
+
 ### Scale
 
 One container until it shouldn't be. Then four independent axes:
@@ -556,6 +617,31 @@ Each of these cost real time. They are listed because the shape recurs.
   memory *use* would let the evaluation raise the salience of the records it is
   measuring, which is why the replay searcher is built with
   `usage_tracking=False`.
+- **An inherited default that returns a constant is a defect waiting for its
+  first caller.** `SqliteBackend` inherited `Backend.statement()`, whose own
+  docstring said "nothing calls this default in practice" and which returned
+  `rowcount=0` unconditionally. True while only `PostgresBackend` implemented
+  it; a live defect the moment anything read that count on SQLite. Every lease
+  and batch claim here turns on it (`UPDATE … WHERE status <> 'running'`), so
+  the tuning plane's claim reported "I did not get it" on the default backend
+  and worked correctly on Postgres — the mirror image of the three portability
+  bugs above, and the worse direction, because the offline suite runs on
+  SQLite. Found by a second `run_tuning` being refused as "already running"
+  against a row that said `completed`.
+- **A resumed batch that *skips* is not a resumed batch.** Reusing stored
+  trials by `continue`-ing past them left the decision with an empty comparison
+  set, so a batch that had in fact evaluated everything reported
+  `insufficient_evidence`. A checkpoint has to come back as a *comparable*
+  result, which means the per-query rows have to come back too: an aggregate
+  cannot be paired after the fact, because it has already lost which queries it
+  covered. Expensive trials restore from cold storage; cheap ones are redone,
+  because redoing them costs nothing.
+- **A test corpus where every query succeeds proves nothing about ranking.**
+  The first tuning fixture had three documents and `max_results: 10`, so every
+  query returned its known positive and the stage histogram was pure `served`.
+  The plane correctly proposed nothing — and the batch tests passed while
+  exercising none of the search. Decoys plus a narrow cut is what makes *rank*
+  matter, which is the thing being tuned.
 - **`wasmtime.Trap` and `wasmtime.WasmtimeError` are siblings**, not parent and
   child. Catch `guest_failures()`.
 - **A mutation harness must `touch` the restored file and purge
@@ -657,5 +743,8 @@ Each of these cost real time. They are listed because the shape recurs.
   the log tier, and the two combination designs that were rejected
 - **Evaluation:** `docs/knowledge-effectiveness.md` — the evidence taxonomy,
   the cohort split, the ablation matrix, the gates, and what it refuses to claim
+- **Tuning:** `docs/retrieval-tuning.md` — the stage model, why re-fusion makes
+  a parameter search affordable, and the gates that keep a winner from being
+  promoted by its own evidence
 - **Synapse region spec:** `docs/SYNAPSE_INTEGRATION.md`
 - **Deployment:** `docs/deployment.md`, `deploy/kubernetes/`
