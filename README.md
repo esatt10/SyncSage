@@ -99,11 +99,15 @@ shows the same snippet and the full tool list.
 ### See how it fits together
 
 <p align="center">
-  <img src="docs/assets/ui/graph.png" alt="The knowledge graph around one file, with node-type counts and the most-connected hubs beside it" width="900">
+  <img src="docs/assets/ui/graph.png" alt="The whole knowledge graph: 422 nodes in three connected clusters — a documentation tree, a memory cluster and a document corpus — with node-type counts and the most-connected hubs beside it" width="900">
 </p>
 
-Files, symbols, headings, entities and memory records become nodes; the edges
-between them are what the graph arm searches and what "explain this" traverses.
+Files, directories, symbols, headings, entities and memory records become
+nodes; the edges between them are what the graph arm searches and what "explain
+this" traverses. The shape is legible at a glance—here, one knowledge base
+joining a documentation tree, a cluster of memory records and an indexed corpus.
+The panel beside it ranks the hubs a traversal will pass through.
+
 See [the graph model](docs/graph_model.md) for the full grammar.
 
 ### Let it remember
@@ -114,9 +118,14 @@ See [the graph model](docs/graph_model.md) for the full grammar.
 
 Memory records are ordinary Markdown files, indexed like everything else—so
 recall is just search, and a correction supersedes an old record rather than
-overwriting it. Pheasant can also **propose** memories from how it is actually
-being used (here: everyone searches for `router` while the documents say
-`pheasant-flock`). Nothing proposed is retrievable until you promote it.
+overwriting it.
+
+Pheasant can also **propose** memories from how it is actually being used: here
+it noticed six sessions searching for `forecast` and reading documents that say
+`capacity`, and proposes the alias. Open a proposal and it shows the calls it
+was mined from, so "why was this suggested" ends at real content rather than at
+a hash. Nothing proposed is retrievable until you promote it, and a rejection is
+permanent.
 
 → [The memory system](docs/memory-system.md) ·
 [How memories are formed](docs/memory-formation.md)
