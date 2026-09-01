@@ -45,7 +45,10 @@ import type {
   RetrievalSettings,
   TuningBundle,
   TuningExperimentSummary,
+  TuningGlossary,
   TuningHealth,
+  TuningLineage,
+  TuningObjectives,
   TuningTrials,
   TuningParameters,
   TuningReport,
@@ -553,10 +556,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ bundle_id: bundleId, applied_by: "ui" }),
     }),
-  tuningRollback: () =>
-    request<{ reverted: boolean; bundle: TuningBundle | null }>("/tuning/bundles/rollback", {
-      method: "POST",
-    }),
+  tuningRollback: (to = "base") =>
+    request<{ reverted: boolean; bundle: TuningBundle | null; to: string }>(
+      "/tuning/bundles/rollback",
+      { method: "POST", body: JSON.stringify({ to }) },
+    ),
   // Experiment observability, served from /state rather than from a tracking
   // server: the parameter point, the score, the stage and the rationale are
   // already rows, so the sweep a reader wants is a query and not an export.
@@ -573,6 +577,9 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ pinned }),
     }),
+  tuningGlossary: () => request<TuningGlossary>("/tuning/glossary"),
+  tuningObjectives: () => request<TuningObjectives>("/tuning/objectives"),
+  tuningLineage: () => request<TuningLineage>("/tuning/lineage"),
   tuningPrune: (experimentId: string) =>
     request<{ pruned: string; removed: Record<string, number> }>(
       `/tuning/experiments/${encodeURIComponent(experimentId)}`,

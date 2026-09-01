@@ -162,6 +162,35 @@ optional *mirror* of `/state` — losing it costs a dashboard, never a result.
   <img src="docs/assets/ui/tuning-decision.png" alt="The decision panel: gates listed pass or fail, with the reason a winning parameter set was or was not promoted" width="900">
 </p>
 
+<p align="center">
+  <img src="docs/assets/ui/tuning-config.png" alt="Base configuration and promoted overlay shown as separate layers, with per-parameter explanations" width="900">
+</p>
+
+There is always a **base configuration** — `search.ranking` in the
+`pheasant.yaml` the container mounts, so a deployment's starting point is
+version-controlled and settable at compose time. A promoted bundle layers over
+it. Both are shown separately rather than collapsed, because "what is it
+ranking with" and "what would it rank with if I rolled back" are different
+questions and the second gets asked at exactly the moment nobody can go and
+look it up.
+
+`pheasant tune lineage` lists every configuration the region has served and
+what each one replaced; `pheasant tune rollback [--to <bundle>]` steps back to
+the base or to any earlier promotion. All of it lives in `/state`, so it
+survives the container stopping.
+
+**Every measure explains itself where it is shown** — what it means, what to do
+if it moves, and the misreading it invites. That last field is the point: a 42%
+truncation rate looks alarming and is normal, a 0% empty rate looks fine and
+proves nothing about quality. `pheasant tune explain <term>`,
+`GET /tuning/glossary`, and inline on the page.
+
+You choose what "better" means. `tuning.objective` picks between reciprocal
+rank, recall at 5 or 10, hit rate, a balanced composite, or your own weights —
+and each one publishes what it **trades away**, because a region whose agents
+read one result and one whose agents read a page want opposite things and an
+objective without a stated trade is a preference presented as an optimum.
+
 Nothing is promoted by its own evidence. A parameter set that improved the
 queries it was *selected on* has demonstrated selection, not improvement, so
 promotion needs a held-out cohort it never saw and a control that must not
@@ -181,7 +210,9 @@ pheasant tune diagnose        # which step is losing documents. Changes nothing.
 pheasant tune run             # search the blamed stages, gate a winner
 pheasant tune show            # what the region ranks with, and where it came from
 pheasant tune apply <id>      # make a bundle the fleet's overlay
-pheasant tune rollback        # back to the configured values
+pheasant tune lineage         # every configuration this region has served
+pheasant tune rollback        # back to the base, or --to an earlier bundle
+pheasant tune explain <term>  # what a measure means, and what it does not
 ```
 
 See [Retrieval performance tuning](docs/retrieval-tuning.md).

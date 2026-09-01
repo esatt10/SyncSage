@@ -1075,7 +1075,7 @@ def _tune_command(args) -> int:
             return 0
 
         if command == "show":
-            active = tuning.active_parameters(engine.state, kb)
+            active = tuning.active_parameters(engine.state, kb, cfg)
             if args.yaml:
                 import yaml as _yaml
 
@@ -1083,6 +1083,11 @@ def _tune_command(args) -> int:
 
                 print(_yaml.safe_dump(as_config_fragment(active), sort_keys=True).rstrip())
                 return 0
+            from pheasant.tuning import objective as objective_module
+
+            objective = objective_module.resolve(cfg.tuning.objective)
+            print(f"Tuning for: {objective.label} ({objective.objective_id})")
+            print(f"  trades away: {objective.trades_away}\n")
             print(f"{kb} is ranking with parameters from: {active['provenance']}")
             if active["bundle_id"]:
                 bundle = active.get("bundle") or {}
@@ -1091,8 +1096,16 @@ def _tune_command(args) -> int:
                 print(f"  from experiment {bundle.get('experiment_id', '')}")
             from pheasant.search.ranking import PARAMETER_STAGES
 
+            changes = {change["parameter"]: change for change in active.get("changes") or []}
             for name, value in sorted(active["values"].items()):
-                print(f"    {name:<20} {value:<10g} ({PARAMETER_STAGES.get(name, '?')})")
+                stage = PARAMETER_STAGES.get(name, "?")
+                change = changes.get(name)
+                # Base shown beside anything the overlay moved, so "what would
+                # a rollback give me" is answerable without a second command.
+                suffix = f"  (was {change['base']:g} in the base)" if change else ""
+                print(f"    {name:<20} {value:<10g} ({stage}){suffix}")
+            if changes:
+                print("\n  Roll back with: pheasant tune rollback")
             return 0
 
         if command == "apply":
@@ -1109,11 +1122,63 @@ def _tune_command(args) -> int:
             return 0
 
         if command == "rollback":
-            reverted = tuning_store.revert_bundle(engine.state, kb, applied_by="cli")
+            target = getattr(args, "to", "base") or "base"
+            if target != "base" and not tuning_store.load_bundle_row(engine.state, kb, target):
+                print(f"Unknown bundle: {target}")
+                return 1
+            reverted = tuning_store.revert_bundle(engine.state, kb, applied_by="cli", to=target)
             if reverted is None:
                 print(f"{kb} has no bundle applied; it is already on its configured parameters.")
                 return 0
-            print(f"Stood down {reverted['bundle_id']}. {kb} is back on its configured values.")
+            if target == "base":
+                print(f"Stood down {reverted['bundle_id']}. {kb} is back on its configured values.")
+            else:
+                print(f"Stood down {reverted['bundle_id']}; {kb} is now serving {target}.")
+            return 0
+
+        if command == "explain":
+            from pheasant.tuning import glossary
+
+            if args.term:
+                entry = glossary.lookup(args.term)
+                if entry is None:
+                    print(f"No explanation for {args.term!r}. Run `pheasant tune explain`.")
+                    return 1
+                print(f"{entry['label']}  ({entry['kind']}, better = {entry['direction']})\n")
+                print(f"  {entry['means']}\n")
+                print(f"  If it moves: {entry['impact']}\n")
+                print(f"  It does NOT mean: {entry['does_not_mean']}")
+                return 0
+            catalog = glossary.catalog()
+            for group in ("metrics", "health", "stages", "gates", "parameters"):
+                print(f"\n{group.upper()}")
+                for entry in catalog[group]:
+                    print(f"  {entry['term']:<32} {entry['means'][:70]}")
+            print("\nReading notes")
+            for note in catalog["reading_notes"]:
+                print(f"  - {note}")
+            print("\n  `pheasant tune explain <term>` for the full entry.")
+            return 0
+
+        if command == "lineage":
+            history = tuning_store.lineage(engine.state, kb)
+            if not history:
+                print(f"{kb} has only ever served its configured base parameters.")
+                return 0
+            for entry in history:
+                mark = "* SERVING" if entry["active"] else "         "
+                params = ", ".join(f"{k}={v:g}" for k, v in sorted(entry["parameters"].items()))
+                print(
+                    f"{mark} {entry['bundle_id']}  applied {entry['applied_at']} "
+                    f"by {entry['applied_by']}"
+                )
+                print(f"           {params}")
+                if entry["replaced"]:
+                    replaced = ", ".join(f"{k}={v:g}" for k, v in sorted(entry["replaced"].items()))
+                    print(f"           replaced: {replaced}")
+                else:
+                    print("           replaced: the configured base")
+            print("\n  Roll back with: pheasant tune rollback --to <bundle-id|base>")
             return 0
     finally:
         engine.close()
@@ -1874,9 +1939,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     tune_apply_p = _tune_parser("apply", "Make a bundle the region's live retrieval overlay.")
     tune_apply_p.add_argument("bundle", help="Bundle id (see `pheasant tune bundles`).")
-    _tune_parser(
+    tune_rollback_p = _tune_parser(
         "rollback", "Stand the active overlay down; the region returns to its configured values."
     )
+    tune_rollback_p.add_argument(
+        "--to",
+        default="base",
+        help=(
+            "'base' (default: the values in pheasant.yaml) or an earlier bundle id, "
+            "which is recorded as a rollback rather than a fresh apply."
+        ),
+    )
+    tune_explain_p = _tune_parser(
+        "explain", "What a tuning measure means, and the misreading it invites."
+    )
+    tune_explain_p.add_argument(
+        "term", nargs="?", default=None, help="A metric, stage, gate or parameter name."
+    )
+    _tune_parser("lineage", "Every retrieval configuration this region has served.")
 
     export_p = sub.add_parser(
         "export", help="Write Parquet exports of indexed state, and query them."

@@ -1138,6 +1138,19 @@ row that is already a couple of kilobytes. Sampling is deterministic on the
 trace id, so every hop of one call agrees and the sampled set can be joined; a
 per-hop random draw produces traces that cannot be.
 
+### `tuning.objective.*`
+
+What "better" means for this region. `metric` is `reciprocal_rank` (default),
+`recall_at_5`, `recall_at_10`, `hit_rate` or `balanced`; `weights` overrides it
+with a custom combination over collected metrics, normalized to sum to one.
+
+Not a detail. A region whose agents read one result wants `reciprocal_rank`;
+one whose agents fetch a page and synthesize wants `recall_at_10`, and would be
+actively harmed by a parameter set that sharpens rank one at the cost of
+dropping a document out of the list. Each objective publishes what it **trades
+away** as well as what it optimizes, and every report names the one that
+produced it.
+
 ### `tuning.tracking.*`
 
 `backend` is `off` (default), `state`, or `mlflow`. `/state` is always the

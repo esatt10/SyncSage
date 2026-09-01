@@ -306,10 +306,35 @@ caller would make two agents disagree about what the region contains, and would
 make every number the evaluation plane publishes a measurement of whoever
 happened to ask.
 
-Rollback restores the *configured* parameters rather than re-applying an older
-bundle. That is the conservative direction: the config file is the thing a team
-can read, and a rollback that quietly activated a previous experiment's output
-would leave the region serving a configuration nobody chose, twice over.
+### Base, overlay, and stepping back
+
+Three layers, reported separately rather than collapsed:
+
+- **base** — `search.ranking` in the `pheasant.yaml` the container mounts. The
+  version-controlled starting point, settable at compose time, and the floor a
+  rollback returns to.
+- **overlay** — the promoted bundle, if any. One row in `/state`.
+- **active** — base with the overlay on top. What retrieval actually uses.
+
+Collapsing these would answer "what is it ranking with" and lose "what would it
+rank with if I rolled back" — the question asked at exactly the moment somebody
+is least able to go and look it up.
+
+```bash
+pheasant tune lineage                     # every configuration ever served
+pheasant tune rollback                    # back to the configured base
+pheasant tune rollback --to <bundle-id>   # back to an earlier promotion
+```
+
+Rollback defaults to the *base* rather than the previous bundle. That is the
+conservative direction: the config file is the thing a team can read, and a
+rollback that quietly activated an older experiment's output would leave the
+region serving a configuration nobody chose, twice over. Naming an earlier
+bundle steps back to it explicitly, and is recorded as a rollback rather than
+as a fresh apply that happens to use old numbers.
+
+`lineage` records what each promotion *replaced*, so "what were we serving
+before" survives the active row moving on.
 
 ---
 

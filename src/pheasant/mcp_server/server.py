@@ -701,10 +701,35 @@ def create_mcp_server(config: PheasantConfig) -> Any:
 
     @mcp.tool()
     @anticipated
-    def rollback_tuning_bundle(knowledge_base: str) -> dict:
-        """Stand the active tuning overlay down; the region returns to its configured values."""
+    def rollback_tuning_bundle(knowledge_base: str, to: str = "base") -> dict:
+        """Roll the retrieval overlay back to the configured base, or to an earlier bundle."""
 
-        return tools.rollback_tuning_bundle(knowledge_base)
+        return tools.rollback_tuning_bundle(knowledge_base, to)
+
+    @mcp.tool()
+    @anticipated
+    def explain_retrieval_measures(knowledge_base: str, term: str | None = None) -> dict:
+        """What every tuning measure means, and the misreading each one invites.
+
+        Call this before acting on a number from a tuning report or health
+        payload — several of them look alarming and are normal.
+        """
+
+        return tools.explain_retrieval_measures(knowledge_base, term)
+
+    @mcp.tool()
+    @anticipated
+    def get_tuning_objective(knowledge_base: str) -> dict:
+        """What "better" means here, and what optimizing it accepts getting worse."""
+
+        return tools.get_tuning_objective(knowledge_base)
+
+    @mcp.tool()
+    @anticipated
+    def get_retrieval_lineage(knowledge_base: str, limit: int = 50) -> dict:
+        """Every retrieval configuration this region has served: what changed, when, and why."""
+
+        return tools.get_retrieval_lineage(knowledge_base, limit)
 
     @mcp.tool()
     @anticipated

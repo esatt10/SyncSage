@@ -682,26 +682,89 @@ def apply_bundle(state: Any, kb_id: str, bundle_id: str, *, applied_by: str) -> 
     return payload
 
 
-def revert_bundle(state: Any, kb_id: str, *, applied_by: str) -> dict[str, Any] | None:
+def revert_bundle(
+    state: Any, kb_id: str, *, applied_by: str, to: str = "base"
+) -> dict[str, Any] | None:
     """Stand the active overlay down. Returns what was reverted, or ``None``.
 
-    Reverting restores the *configured* parameters rather than re-applying a
-    previous bundle. That is the conservative direction: the config file is
-    the thing an operator can read, and a rollback that silently activated an
-    older experiment's output would leave the region serving a configuration
-    nobody chose twice over.
+    ``to`` is ``"base"`` (the default) or an earlier bundle id.
+
+    **Base is the default, deliberately.** The configured parameters are the
+    thing an operator can read in a file and reason about; an earlier bundle
+    is a decision somebody made once and may not remember. A rollback that
+    silently activated an older experiment's output would leave the region
+    serving a configuration nobody chose twice over.
+
+    But stepping back to a *named* earlier bundle is a real need — the last
+    apply made things worse and the one before it was fine — and forcing that
+    through "revert to base, then re-apply" loses the fact that it was a
+    rollback. Naming a target records it as one.
     """
 
     active = active_overlay(state, kb_id)
     if not active:
         return None
+    now = utc_now()
     _write(
         state,
         """UPDATE tuning_bundles SET superseded_at = ?, applied_by = ?
             WHERE kb_id = ? AND bundle_id = ? AND superseded_at IS NULL""",
-        (utc_now(), applied_by, kb_id, active["bundle_id"]),
+        (now, applied_by, kb_id, active["bundle_id"]),
     )
+    if to and to != "base":
+        # Re-apply the named bundle. `apply_bundle` records what it replaced,
+        # so the lineage reads as a step back rather than as a fresh apply
+        # that happens to use old numbers.
+        apply_bundle(state, kb_id, to, applied_by=f"{applied_by} (rollback)")
     return active
+
+
+def lineage(state: Any, kb_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+    """Every configuration this region has served, newest first.
+
+    The answer to "what changed, when, and what were we serving before". Kept
+    as history rather than derived from the active row, because the question
+    people actually ask after a regression is about a *previous* state, and
+    that is exactly the state the active row no longer holds.
+
+    ``applied_at`` is second-resolution, so two applies inside one second tie
+    — which is not exotic: it is what a rollback immediately after a bad apply
+    looks like, and what a test does. Ties break on the active row first, then
+    on the *later* supersession, which reconstructs the real order: the row
+    still serving is newest, and among retired rows the one retired last was
+    serving most recently.
+    """
+
+    rows = state.rows(
+        """SELECT bundle_id, experiment_id, decision_id, created_at, applied_at,
+                  applied_by, superseded_at, parameters_json, replaces_json
+             FROM tuning_bundles
+            WHERE kb_id = ? AND applied_at IS NOT NULL
+            ORDER BY applied_at DESC,
+                     CASE WHEN superseded_at IS NULL THEN 0 ELSE 1 END,
+                     superseded_at DESC
+            LIMIT ?""",
+        (kb_id, int(limit)),
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "bundle_id": str(row["bundle_id"]),
+                "experiment_id": str(row["experiment_id"] or ""),
+                "decision_id": str(row["decision_id"] or ""),
+                "created_at": str(row["created_at"] or ""),
+                "applied_at": str(row["applied_at"] or ""),
+                "applied_by": str(row["applied_by"] or ""),
+                "superseded_at": str(row["superseded_at"] or ""),
+                "active": not row["superseded_at"],
+                "parameters": json.loads(row["parameters_json"] or "{}"),
+                # What this bundle displaced. An empty map means it replaced
+                # the base configuration rather than another bundle.
+                "replaced": json.loads(row["replaces_json"] or "{}"),
+            }
+        )
+    return out
 
 
 def active_overlay(state: Any, kb_id: str) -> dict[str, Any] | None:
@@ -731,6 +794,16 @@ def active_overlay(state: Any, kb_id: str) -> dict[str, Any] | None:
         "experiment_id": str(row["experiment_id"] or ""),
         "decision_id": str(row["decision_id"] or ""),
     }
+
+
+def load_bundle_row(state: Any, kb_id: str, bundle_id: str) -> dict[str, Any] | None:
+    """One bundle by id, or ``None``. Used to refuse an unknown rollback target."""
+
+    rows = state.rows(
+        "SELECT payload_json FROM tuning_bundles WHERE kb_id = ? AND bundle_id = ?",
+        (kb_id, bundle_id),
+    )
+    return json.loads(rows[0]["payload_json"]) if rows else None
 
 
 def list_bundles(state: Any, kb_id: str, *, limit: int = 20) -> list[dict[str, Any]]:

@@ -440,6 +440,7 @@ def _shoot_tuning(port: int) -> None:
         "tuning-diagnosis": 'section:has(h2:text("Where retrieval loses documents"))',
         "tuning-sweeps": 'section:has(h2:text("Parameter sweeps"))',
         "tuning-decision": 'section:has(h2:text("Decision"))',
+        "tuning-config": 'section:has(h2:text("What this region ranks with"))',
     }
     with sync_playwright() as play:
         browser = play.chromium.launch(**launch)
@@ -451,6 +452,17 @@ def _shoot_tuning(port: int) -> None:
         page.get_by_role("link", name="Tuning", exact=True).click()
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(2500)
+        # One explanation opened before the diagnosis is photographed. The
+        # whole point of the catalog is that a measure and its meaning are a
+        # click apart, and a screenshot of the collapsed state shows a "?"
+        # rather than the thing the "?" is for.
+        opener = page.locator(
+            'section:has(h2:text("Where retrieval loses documents")) .explain > summary'
+        )
+        if opener.count():
+            opener.first.click()
+            page.wait_for_timeout(400)
+
         for name, selector in panels.items():
             panel = page.locator(selector)
             if not panel.count():

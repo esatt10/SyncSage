@@ -125,36 +125,83 @@ def latest_report(state: Any, kb_id: str) -> dict[str, Any] | None:
     return (row or {}).get("report")
 
 
-def active_parameters(state: Any, kb_id: str) -> dict[str, Any]:
-    """What the region is ranking with, and where it came from.
+def active_parameters(state: Any, kb_id: str, config: Any = None) -> dict[str, Any]:
+    """What the region ranks with, what its base is, and the difference.
 
     The question every surface asks first, and the one that has to be
     answerable without running anything: an operator looking at a ranking they
     did not expect needs to know whether a bundle is in force before they need
     anything else.
+
+    Three layers, reported separately rather than collapsed into one number
+    per parameter:
+
+    ``base``
+        The configured values — `search.ranking` in the config file the
+        container was started with, or the shipped defaults where it says
+        nothing. This is the floor a rollback returns to and the thing an
+        operator can read in a file.
+    ``overlay``
+        The applied bundle's parameters, if any. Empty is the common case.
+    ``active``
+        What retrieval actually uses: base with the overlay on top.
+
+    Collapsing these would answer "what is it ranking with" and lose "what
+    would it rank with if I rolled back", which is the question somebody asks
+    at exactly the moment they are least able to go and look it up.
     """
 
-    from pheasant.search.ranking import RankingParameters
+    from pheasant.search.ranking import PARAMETER_STAGES, RankingParameters
     from pheasant.tuning import store
 
+    base = RankingParameters.from_config(config) if config is not None else RankingParameters()
+    base_values = base.values()
     overlay = store.active_overlay(state, kb_id)
-    base = RankingParameters()
-    if not overlay:
-        return {
-            "provenance": "config",
-            "bundle_id": "",
-            "values": base.values(),
-            "bundle": None,
-        }
-    resolved = base.with_overlay(
-        overlay.get("parameters") or {},
-        provenance="bundle",
-        bundle_id=str(overlay.get("bundle_id") or ""),
+    overlay_values = dict((overlay or {}).get("parameters") or {})
+
+    resolved = (
+        base.with_overlay(
+            overlay_values, provenance="bundle", bundle_id=str(overlay.get("bundle_id") or "")
+        )
+        if overlay
+        else base
     )
+    changes = [
+        {
+            "parameter": name,
+            "stage": PARAMETER_STAGES.get(name, "unknown"),
+            "base": base_values.get(name),
+            "active": value,
+        }
+        for name, value in resolved.values().items()
+        if base_values.get(name) != value
+    ]
     return {
-        "provenance": "bundle",
+        "provenance": "bundle" if overlay else "config",
         "bundle_id": resolved.bundle_id,
         "values": resolved.values(),
+        "base": {
+            "values": base_values,
+            "source": "config" if config is not None else "defaults",
+            "explanation": (
+                "The configured floor. Set it in `search.ranking` in the "
+                "pheasant.yaml the container mounts, so a deployment's "
+                "starting point is version-controlled. A rollback returns "
+                "here."
+            ),
+        },
+        "overlay": {
+            "values": overlay_values,
+            "bundle_id": str((overlay or {}).get("bundle_id") or ""),
+            "applied_at": str((overlay or {}).get("applied_at") or ""),
+            "applied_by": str((overlay or {}).get("applied_by") or ""),
+            "explanation": (
+                "A promoted bundle, layered over the base for every replica "
+                "reading this /state. Reversible, and durable across restarts "
+                "because it is a row rather than process state."
+            ),
+        },
+        "changes": changes,
         "bundle": overlay,
     }
 

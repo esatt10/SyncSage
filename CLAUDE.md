@@ -76,7 +76,9 @@ pheasant-kb/
 │   ├── tuning/                ← the tuning plane: stages (which retrieval
 │   │                            step lost the document), space, refusion,
 │   │                            strategy, executor, gates, bundle, tracking,
-│   │                            store, runner
+│   │                            store, runner, objective (what "better"
+│   │                            means), glossary (what every measure means),
+│   │                            health (live stage rates)
 │   ├── sharding.py            ← `pheasant shard plan`
 │   ├── jobs.py                ← per-source progress: phase, rate, ETA, stalled
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
@@ -152,7 +154,9 @@ pheasant eval status [--watch]             # a batch's live phase/progress, from
 pheasant tune diagnose                     # which retrieval stage is losing documents
 pheasant tune run [--apply]                # diagnose, search the blamed stages, gate a winner
 pheasant tune show [--yaml]                # the parameters in force, and where they came from
-pheasant tune bundles|apply <id>|rollback  # the fleet's retrieval overlay
+pheasant tune bundles|apply <id>|rollback [--to] # the fleet's retrieval overlay
+pheasant tune lineage                      # every configuration ever served
+pheasant tune explain [term]               # what a measure means, and does not
 pheasant tune status [--watch] | report
 python -m pheasant.evaluation.benchmark    # measure a batch against the capacity model
 pheasant mcp --transport stdio
@@ -429,6 +433,32 @@ causes, one symptom.
   must confirm on a holdout it never saw, with a control that must not regress.
   Gates sit outside the score, and an empty gate list is a failure — `all([])`
   is `True`, which the evaluation plane learned the expensive way.
+- **The objective is configured, not assumed.** `tuning.objective` picks
+  between reciprocal rank, recall@5/10, hit rate, a balanced composite, or
+  custom weights, and every one publishes what it *trades away*: a region
+  whose agents read one result and one whose agents read a page want opposite
+  things, and a plane that silently assumed the first would make the second
+  worse while reporting an improvement. A composite scores `None` rather than
+  zero when a component is missing — a point that could not be measured is not
+  one that measured badly.
+- **Every measure carries its own explanation** (`tuning.glossary`): what it
+  means with its denominator, what to do if it moves, and — the field that
+  prevents the wrong action — the misreading it invites. Served over HTTP and
+  MCP and rendered inline in the UI, because documentation a reader has to go
+  and find arrives after the mistake. `tests/test_tuning_objective.py` fails
+  when a stage, gate or parameter the plane emits has no entry.
+- **Each mechanism is measured on its own.** The diagnosis ablates the arms —
+  text, vector, graph alone against the merge — by re-fusing captured
+  candidates with the others weighted to zero, so it costs no retrieval.
+  "Hybrid is better" is an assumption most regions never test and is
+  frequently false; when an arm alone beats the merge the report says so in
+  words. Reported, never acted on.
+- **Base, overlay, lineage.** The base is `search.ranking` in the mounted
+  config (compose-settable, version-controlled); the overlay is one row; the
+  active point is base + overlay, and all three are reported separately
+  because "what would a rollback give me" is asked when nobody can go and look
+  it up. `lineage` records what each promotion replaced, and rollback targets
+  the base (default) or a named earlier bundle.
 - **Fleet-scoped, and applying is a separate act.** A bundle is one row in
   `/state` and every replica resolves it on a 30s TTL. There is no per-request
   and no per-principal override, and nowhere in the schema for one. Producing a

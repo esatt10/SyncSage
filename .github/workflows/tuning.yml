@@ -133,6 +133,7 @@ jobs:
             tests/test_tuning_refusion.py \
             tests/test_tuning_durability.py \
             tests/test_tuning_stress.py \
+            tests/test_tuning_objective.py \
             tests/test_api_ui_routes.py \
             tests/test_ranking_parameters.py \
             tests/test_ranking.py \

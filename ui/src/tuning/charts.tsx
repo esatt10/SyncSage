@@ -1,5 +1,6 @@
 import { useId, useState } from "react";
-import type { TuningHistogram, TuningSweepPoint } from "../api/types";
+import { Explain } from "./explain";
+import type { GlossaryEntry, TuningHistogram, TuningSweepPoint } from "../api/types";
 
 /**
  * Charts for the tuning plane, as inline SVG against the app's own tokens.
@@ -236,10 +237,12 @@ export function StageBars({
   histogram,
   actionable,
   help,
+  explain,
 }: {
   histogram: TuningHistogram;
   actionable: Set<string>;
   help: Record<string, string>;
+  explain?: (term: string) => GlossaryEntry | undefined;
 }) {
   const ranked = histogram.ranked ?? [];
   const worst = Math.max(1, ...ranked.map((e) => e.count));
@@ -270,6 +273,7 @@ export function StageBars({
               />
             </div>
             <p className="muted small">{help[entry.stage] ?? ""}</p>
+            <Explain entry={explain?.(entry.stage)} />
           </li>
         );
       })}
@@ -291,16 +295,21 @@ export function RateTile({
   denominator,
   hint,
   tone = "neutral",
+  entry,
 }: {
   label: string;
   value: number | null;
   denominator: string;
   hint?: string;
   tone?: "neutral" | "good" | "bad";
+  entry?: GlossaryEntry;
 }) {
   return (
     <div className={`rate-tile rate-tile--${tone}`}>
-      <div className="rate-tile__label">{label}</div>
+      <div className="rate-tile__label">
+        {label}
+        <Explain entry={entry} compact />
+      </div>
       <div className="rate-tile__value">
         {value === null ? <span className="muted">—</span> : `${(value * 100).toFixed(1)}%`}
       </div>

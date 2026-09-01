@@ -71,6 +71,8 @@ from pheasant.tuning.executor import (
     TuningExecutor,
     TuningLease,
 )
+from pheasant.tuning.objective import Objective
+from pheasant.tuning.objective import resolve as resolve_objective
 from pheasant.tuning.space import ParameterSpace, apply_point, baseline_values, validate_space
 from pheasant.tuning.stages import attribute, stage_histogram
 from pheasant.tuning.store import PRIMARY_METRIC
@@ -114,6 +116,8 @@ class TuningOutcome:
     applied: bool = False
     trials_run: int = 0
     trials_reused: int = 0
+    #: Each retrieval mechanism scored alone, plus what the merge adds.
+    mechanisms: dict[str, Any] = field(default_factory=dict)
     searches: int = 0
     duration_ms: float = 0.0
     report: dict[str, Any] = field(default_factory=dict)
@@ -196,6 +200,7 @@ def run_tuning(
         # numbers, which is the worst kind.
         return TuningOutcome(status="failed", skipped_reason=f"invalid parameter space: {problems}")
 
+    objective = resolve_objective(settings.objective)
     budget = budget or Budget(
         refusion_trials=int(settings.refusion_trials),
         requery_trials=int(settings.requery_trials),
@@ -216,6 +221,7 @@ def run_tuning(
             kb_id=kb_id,
             space=space,
             budget=budget,
+            objective=objective,
             executor=executor
             or TuningExecutor(
                 state,
@@ -239,6 +245,7 @@ def _run(
     kb_id: str,
     space: ParameterSpace,
     budget: Budget,
+    objective: Objective,
     executor: TuningExecutor,
     on_progress: Any,
     started: float,
@@ -393,6 +400,9 @@ def _run(
             unevidenced_queries=unevidenced,
             summary=_summarize(histogram, unevidenced),
         )
+        # Each mechanism on its own, from the captures already in hand.
+        mechanisms = _measure_mechanisms(captures, positives, base_ranking, objective)
+        outcome.mechanisms = mechanisms
         outcome.diagnosis = diagnosis
         sink.log_diagnosis(experiment, diagnosis)
         tuning_store.write_cold(
@@ -447,6 +457,7 @@ def _run(
                 searches=searches,
                 exports=exports,
                 histogram=histogram,
+                objective=objective,
             )
 
         # --- 3. trial ----------------------------------------------------
@@ -554,6 +565,7 @@ def _run(
             executor=executor,
             settings=settings,
             histogram=histogram,
+            objective=objective,
         )
         outcome.decision = decision
         sink.log_decision(experiment, decision)
@@ -580,7 +592,15 @@ def _run(
                 _invalidate(engine)
 
         report = _report(
-            experiment, diagnosis, decision, packaged, baseline_trial, results, searches
+            experiment,
+            diagnosis,
+            decision,
+            packaged,
+            baseline_trial,
+            results,
+            searches,
+            objective,
+            mechanisms,
         )
         outcome.report = report
         outcome.status = "completed"
@@ -775,6 +795,7 @@ def _decide(
     executor: TuningExecutor,
     settings: Any,
     histogram: dict[str, Any],
+    objective: Objective,
 ) -> tuple[Decision, Trial | None, tuple[Comparison, ...]]:
     """Pick a winner, confirm it on unseen queries, and gate it.
 
@@ -785,11 +806,20 @@ def _decide(
     confirmation must not share a substrate with the selection.
     """
 
-    ranked = [
-        (trial.proposal.point.point_id, float(trial.metrics.get(PRIMARY_METRIC) or 0.0))
-        for trial in trials.values()
-        if not trial.failed and trial.metrics and trial.proposal.point.point_id in trial_scores
-    ]
+    # Ranked by the region's objective, not by a constant. `score` returns
+    # None when a component metric is missing, and such a trial is excluded
+    # rather than scored as zero: a point that could not be measured is not
+    # the same as one that measured badly, and ranking them together would
+    # put the unmeasurable ones last and call it a result.
+    ranked = []
+    for trial in trials.values():
+        if trial.failed or not trial.metrics:
+            continue
+        if trial.proposal.point.point_id not in trial_scores:
+            continue
+        value = objective.score(trial.metrics)
+        if value is not None:
+            ranked.append((trial.proposal.point.point_id, value))
     best_ids = select_survivors(ranked, 1)
     winner = trials.get(best_ids[0]) if best_ids else None
 
@@ -818,11 +848,19 @@ def _decide(
     # aggregates: the point of pairing is that a query only one side could
     # score is excluded with a reason rather than silently changing the
     # denominator on one side of a difference.
+    # Compared on the objective's own metric where it has one. A composite is
+    # compared on its dominant component, and the report publishes the full
+    # substituted arithmetic beside it — pairing per query needs a single
+    # metric, and inventing a per-query composite would be a second scoring
+    # path that nothing else exercises.
+    comparison_metric = objective.primary_metric or max(
+        objective.normalized(), key=lambda name: objective.normalized()[name]
+    )
     search_comparison = Comparison(
         baseline_trial_id=baseline_trial.trial_id,
         treatment_trial_id=winner.trial_id,
         **scoring.compare(
-            PRIMARY_METRIC,
+            comparison_metric,
             baseline_score,
             trial_scores[winner.proposal.point.point_id],
         ),
@@ -843,7 +881,7 @@ def _decide(
         )
         base_score = scoring.score_cohort(base_rank, positives)
         point_score = scoring.score_cohort(point_rank, positives)
-        raw = scoring.compare(PRIMARY_METRIC, base_score, point_score)
+        raw = scoring.compare(comparison_metric, base_score, point_score)
         comparison = Comparison(
             baseline_trial_id=baseline_trial.trial_id,
             treatment_trial_id=winner.trial_id,
@@ -913,6 +951,72 @@ def _decide(
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+
+
+def _measure_mechanisms(
+    captures: dict[str, dict[str, Any]],
+    positives: dict[str, list[str]],
+    base_ranking: RankingParameters,
+    objective: Objective,
+) -> dict[str, Any]:
+    """Each retrieval mechanism, scored on its own and in the merge.
+
+    An ablation, and it costs **no retrieval**: the arms already ran during
+    the baseline replay, so isolating one is a re-fusion with the other two
+    weighted to zero. That is the same equivalence the cheap trial path rests
+    on, so it is sound for exactly the reasons `verify_equivalence` checks.
+
+    Worth having because "hybrid is better" is an assumption most regions
+    never test, and it is frequently false. A vector arm that was never built
+    contributes nothing and costs latency on every search; a graph arm can be
+    actively harmful on a prose corpus. This is the number that says so, and
+    it says it per mechanism rather than as one hybrid score that hides which
+    part is carrying it.
+
+    Reported, never acted on automatically. Dropping an arm is a decision with
+    consequences beyond this cohort — and the gates already refuse a parameter
+    set that empties one without saying so.
+    """
+
+    from pheasant.search.observability import ARMS
+
+    out: dict[str, Any] = {}
+    for arm in (*ARMS, "hybrid"):
+        if arm == "hybrid":
+            point = base_ranking
+        else:
+            # One arm at full weight, the others silenced. A zero weight is a
+            # zero score, not a filter — the arm's candidates are still in the
+            # merge, they just cannot outrank a weighted arm.
+            point = base_ranking.with_overlay(
+                {f"{other}_arm_weight": (1.0 if other == arm else 0.0) for other in ARMS},
+                provenance="ablation",
+            )
+        rankings = {
+            query_id: refusion.refuse(
+                stages["fusion_input"], int(stages.get("max_results") or 10), point
+            )
+            for query_id, stages in captures.items()
+            if refusion.refusable(stages)
+        }
+        if not rankings:
+            continue
+        score = scoring.score_cohort(rankings, positives)
+        metrics = score.aggregate()
+        out[arm] = {
+            "metrics": metrics,
+            "objective_score": objective.score(metrics),
+            "evaluated_queries": score.evaluated,
+        }
+    hybrid = (out.get("hybrid") or {}).get("objective_score")
+    for arm, entry in out.items():
+        if arm == "hybrid" or hybrid is None or entry["objective_score"] is None:
+            continue
+        # What the merge is worth over this arm alone. Negative means hybrid
+        # is *losing* to a single mechanism on this cohort, which is a finding
+        # worth surfacing loudly rather than a rounding error.
+        entry["hybrid_gain"] = hybrid - entry["objective_score"]
+    return out
 
 
 def _restore_trial(
@@ -1078,6 +1182,7 @@ def _finish_without_change(
     searches: int,
     exports: Any,
     histogram: dict[str, Any],
+    objective: Objective | None = None,
 ) -> TuningOutcome:
     """A completed batch that proposed nothing. A result, not a failure."""
 
@@ -1108,6 +1213,7 @@ def _finish_without_change(
         "decision": decision.as_dict(),
         "trials": [],
         "searches": searches,
+        "objective": objective.as_dict() if objective is not None else None,
     }
     outcome.report = report
     tuning_store.close_experiment(
@@ -1129,10 +1235,12 @@ def _report(
     baseline_trial: Trial,
     trials: dict[str, Trial],
     searches: int,
+    objective: Objective,
+    mechanisms: dict[str, Any],
 ) -> dict[str, Any]:
     ordered = sorted(
         trials.values(),
-        key=lambda t: (-(t.metrics.get(PRIMARY_METRIC) or 0.0), t.trial_id),
+        key=lambda t: (-(objective.score(t.metrics) or 0.0), t.trial_id),
     )
     return {
         "experiment": experiment.as_dict(),
@@ -1143,7 +1251,17 @@ def _report(
         "trials": [t.as_dict() for t in ordered[:25]],
         "trial_count": len(trials),
         "searches": searches,
-        "primary_metric": PRIMARY_METRIC,
+        # Which definition of "better" produced this result, and what it
+        # accepted getting worse. A report that named a winner without naming
+        # its objective would be unreadable a month later.
+        "mechanisms": mechanisms,
+        "objective": {
+            **objective.as_dict(),
+            "baseline_score": objective.score(baseline_trial.metrics),
+            "baseline_substituted": objective.substituted(baseline_trial.metrics),
+        },
+        # Kept for readers (and the UI's sweep charts) that plot one metric.
+        "primary_metric": objective.primary_metric or PRIMARY_METRIC,
     }
 
 

@@ -2,7 +2,8 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { RateTile, StageBars, SweepChart } from "../tuning/charts";
-import type { TuningGate, TuningHealth, TuningTrial } from "../api/types";
+import { Explain, MechanismTable, ObjectiveBanner } from "../tuning/explain";
+import type { GlossaryEntry, TuningGate, TuningHealth, TuningTrial } from "../api/types";
 
 /** Stages a ranking parameter can actually move. Mirrors `tuning.stages`. */
 const ACTIONABLE = new Set([
@@ -92,6 +93,17 @@ export function TuningPage() {
     queryFn: () => api.tuningHealth(),
     refetchInterval: 15000,
   });
+  // The explanation catalog. Fetched once and threaded into every panel, so a
+  // number and its meaning are never more than a click apart.
+  const glossary = useQuery({
+    queryKey: ["tuning", "glossary"],
+    queryFn: () => api.tuningGlossary(),
+    staleTime: Infinity,
+  });
+  const lineage = useQuery({
+    queryKey: ["tuning", "lineage"],
+    queryFn: () => api.tuningLineage(),
+  });
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ["tuning"] });
@@ -106,7 +118,7 @@ export function TuningPage() {
     onSuccess: invalidate,
   });
   const rollback = useMutation({
-    mutationFn: () => api.tuningRollback(),
+    mutationFn: (to: string) => api.tuningRollback(to),
     onSuccess: invalidate,
   });
   const cancel = useMutation({
@@ -126,6 +138,21 @@ export function TuningPage() {
   const decision = report.data?.decision;
   const histogram = report.data?.diagnosis?.histogram;
   const pinned = parameters.data?.space.pinned ?? [];
+  const explain = (term: string): GlossaryEntry | undefined => {
+    const catalog = glossary.data;
+    if (!catalog) return undefined;
+    for (const group of [
+      catalog.health,
+      catalog.stages,
+      catalog.gates,
+      catalog.metrics,
+      catalog.parameters,
+    ]) {
+      const found = group.find((entry) => entry.term === term);
+      if (found) return found;
+    }
+    return undefined;
+  };
 
   return (
     <div className="page tune-page">
@@ -204,12 +231,68 @@ export function TuningPage() {
         </section>
       ) : null}
 
-      <LiveHealth health={health.data} />
+      <ObjectiveBanner
+        objective={parameters.data?.objective ?? report.data?.objective}
+        baselineSubstituted={report.data?.objective?.baseline_substituted}
+      />
+
+      <LiveHealth health={health.data} explain={explain} />
 
       <section className="tune-section">
         <h2>What this region ranks with</h2>
         {active ? (
           <>
+            {/* Base and overlay reported separately, never collapsed. "What is
+                it ranking with" and "what would it rank with if I rolled back"
+                are different questions, and the second is asked at exactly the
+                moment somebody is least able to go and look it up. */}
+            <div className="layers">
+              <div className="layer">
+                <div className="layer__name">Base configuration</div>
+                <p className="muted small">{active.base.explanation}</p>
+                <p className="muted small">
+                  Source: <code>{active.base.source}</code>
+                </p>
+              </div>
+              <div className={active.overlay.bundle_id ? "layer layer--live" : "layer layer--off"}>
+                <div className="layer__name">
+                  Promoted overlay{active.overlay.bundle_id ? "" : " — none"}
+                </div>
+                <p className="muted small">{active.overlay.explanation}</p>
+                {active.overlay.bundle_id ? (
+                  <p className="muted small">
+                    <code>{active.overlay.bundle_id}</code> applied{" "}
+                    {active.overlay.applied_at} by {active.overlay.applied_by}
+                  </p>
+                ) : null}
+              </div>
+            </div>
+            {active.changes.length ? (
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Changed by the overlay</th>
+                    <th>Base</th>
+                    <th>Serving</th>
+                    <th>Stage</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {active.changes.map((change) => (
+                    <tr key={change.parameter}>
+                      <td>
+                        <code>{change.parameter}</code>
+                      </td>
+                      <td className="muted">{change.base}</td>
+                      <td>
+                        <strong>{change.active}</strong>
+                      </td>
+                      <td className="muted">{change.stage}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : null}
             <p>
               Parameters come from <strong>{active.provenance}</strong>
               {active.bundle_id ? (
@@ -227,7 +310,7 @@ export function TuningPage() {
               <button
                 type="button"
                 className="btn"
-                onClick={() => rollback.mutate()}
+                onClick={() => rollback.mutate("base")}
                 disabled={rollback.isPending}
               >
                 Roll back to configured values
@@ -249,6 +332,7 @@ export function TuningPage() {
                     <tr key={spec.name}>
                       <td>
                         <code>{spec.name}</code>
+                        <Explain entry={explain(spec.name)} compact />
                       </td>
                       <td>{active.values[spec.name]}</td>
                       <td>
@@ -289,7 +373,16 @@ export function TuningPage() {
         <section className="tune-section">
           <h2>Where retrieval loses documents</h2>
           <p className="page__lede">{report.data?.diagnosis.summary}</p>
-          <StageBars histogram={histogram} actionable={ACTIONABLE} help={STAGE_HELP} />
+          <StageBars
+            histogram={histogram}
+            actionable={ACTIONABLE}
+            help={STAGE_HELP}
+            explain={explain}
+          />
+          <MechanismTable
+            mechanisms={report.data?.mechanisms}
+            objectiveLabel={report.data?.objective?.label ?? "score"}
+          />
           {histogram.actionable_share !== null && histogram.actionable_share < 0.34 ? (
             <p className="tune-warning">
               Most misses are in stages no retrieval parameter reaches. Tuning is the
@@ -309,7 +402,7 @@ export function TuningPage() {
           </p>
           <ul className="eval-gates">
             {decision.gates.map((gate) => (
-              <GateRow key={gate.gate_id} gate={gate} />
+              <GateRow key={gate.gate_id} gate={gate} entry={explain(gate.gate_id)} />
             ))}
           </ul>
           {decision.comparisons.length ? (
@@ -401,6 +494,44 @@ export function TuningPage() {
         </section>
       ) : null}
 
+      {lineage.data?.lineage?.length ? (
+        <section className="tune-section">
+          <h2>What this region has served</h2>
+          <p className="muted">{lineage.data.base_explanation}</p>
+          <ol className="lineage">
+            {lineage.data.lineage.map((entry) => (
+              <li key={`${entry.bundle_id}-${entry.applied_at}`}>
+                <div className="lineage__head">
+                  <code>{entry.bundle_id}</code>
+                  {entry.active ? <span className="badge badge--live">serving</span> : null}
+                  <span className="muted small">
+                    applied {entry.applied_at} by {entry.applied_by}
+                    {entry.superseded_at ? ` · replaced ${entry.superseded_at}` : ""}
+                  </span>
+                  {!entry.active ? (
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => rollback.mutate(entry.bundle_id)}
+                      disabled={rollback.isPending}
+                    >
+                      Roll back to this
+                    </button>
+                  ) : null}
+                </div>
+                <div className="bundle__params">
+                  {Object.entries(entry.parameters).map(([name, value]) => (
+                    <span key={name}>
+                      <code>{name}</code> = {value}
+                    </span>
+                  ))}
+                </div>
+              </li>
+            ))}
+          </ol>
+        </section>
+      ) : null}
+
       <section className="tune-section">
         <h2>Configuration bundles</h2>
         {bundles.data?.bundles?.length ? (
@@ -456,7 +587,13 @@ export function TuningPage() {
  * an absence rather than as zeroes: a 0% empty rate over four searches is not
  * good news, it is no news.
  */
-function LiveHealth({ health }: { health?: TuningHealth }) {
+function LiveHealth({
+  health,
+  explain,
+}: {
+  health?: TuningHealth;
+  explain?: (term: string) => GlossaryEntry | undefined;
+}) {
   if (!health) return null;
   if (health.status !== "measured") {
     return (
@@ -498,6 +635,7 @@ function LiveHealth({ health }: { health?: TuningHealth }) {
               : undefined
           }
           tone={empty.rate > 0.15 ? "bad" : "neutral"}
+          entry={explain?.("empty_rate")}
         />
         {Object.entries(arms).map(([arm, stats]) => (
           <RateTile
@@ -507,6 +645,7 @@ function LiveHealth({ health }: { health?: TuningHealth }) {
             denominator={`${stats.contributed} of ${stats.observed} searches`}
             hint={stats.failed ? `${stats.failed} failed` : undefined}
             tone={stats.failed ? "bad" : "neutral"}
+            entry={explain?.(stats.failed ? "arm_failed" : "arm_contribution_rate")}
           />
         ))}
         <RateTile
@@ -514,6 +653,7 @@ function LiveHealth({ health }: { health?: TuningHealth }) {
           value={health.truncation?.rate ?? null}
           denominator={`${health.truncation?.count ?? 0} of ${health.samples} searches`}
           hint="fused list was longer than what was returned"
+          entry={explain?.("truncation_rate")}
         />
       </div>
     </section>
@@ -521,13 +661,14 @@ function LiveHealth({ health }: { health?: TuningHealth }) {
 }
 
 /** A gate that failed but does not block is a warning, not a failure. */
-function GateRow({ gate }: { gate: TuningGate }) {
+function GateRow({ gate, entry }: { gate: TuningGate; entry?: GlossaryEntry }) {
   const state = gate.passed ? "pass" : gate.blocking ? "fail" : "warn";
   return (
     <li className={`gate gate--${state}`}>
       <span className={`badge badge--${state}`}>{state}</span>
       <strong>{gate.gate_id}</strong>
       <span className="muted">{gate.summary}</span>
+      <Explain entry={entry} compact />
     </li>
   );
 }

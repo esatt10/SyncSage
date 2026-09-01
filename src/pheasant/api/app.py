@@ -374,6 +374,18 @@ class TuningCancelRequest(BaseModel):
     requested_by: str = "ui"
 
 
+class TuningRollbackRequest(BaseModel):
+    """Stand the overlay down, to the base or to an earlier bundle.
+
+    ``to`` defaults to ``"base"`` — the configured values, which are the thing
+    an operator can read in a file. An earlier bundle id steps back to a
+    decision somebody made before, and is recorded as a rollback rather than
+    as a fresh apply that happens to use old numbers.
+    """
+
+    to: str = "base"
+
+
 class TuningPinRequest(BaseModel):
     """Parameters an operator has settled and does not want re-litigated.
 
@@ -3132,15 +3144,21 @@ def create_app(
         """
 
         import pheasant.tuning as tuning
+        from pheasant.tuning import glossary
+        from pheasant.tuning import objective as objective_module
         from pheasant.tuning.bundle import as_config_fragment
         from pheasant.tuning.space import ParameterSpace
 
-        active = tuning.active_parameters(state, config.knowledge_base_id)
+        active = tuning.active_parameters(state, config.knowledge_base_id, config)
         space = ParameterSpace(pinned=frozenset(config.tuning.pinned_parameters or ()))
         return {
             "active": active,
             "space": space.as_dict(),
             "config_fragment": as_config_fragment(active),
+            "objective": objective_module.resolve(config.tuning.objective).as_dict(),
+            # Shipped with the values rather than behind a second request, so a
+            # surface rendering a parameter always has its meaning in hand.
+            "explanations": {entry["term"]: entry for entry in glossary.catalog()["parameters"]},
         }
 
     @app.get("/tuning/bundles")
@@ -3181,14 +3199,81 @@ def create_app(
         return {"applied": True, "bundle": payload}
 
     @app.post("/tuning/bundles/rollback")
-    def tuning_rollback() -> dict:
-        """Stand the active overlay down; the region returns to its config."""
+    def tuning_rollback(req: TuningRollbackRequest | None = None) -> dict:
+        """Stand the active overlay down, to the base or an earlier bundle."""
 
         from pheasant.tuning import store as tuning_store
 
-        reverted = tuning_store.revert_bundle(state, config.knowledge_base_id, applied_by="api")
+        target = (req.to if req else "base") or "base"
+        if target != "base" and not tuning_store.load_bundle_row(
+            state, config.knowledge_base_id, target
+        ):
+            raise HTTPException(status_code=404, detail=f"Unknown bundle: {target}")
+        reverted = tuning_store.revert_bundle(
+            state, config.knowledge_base_id, applied_by="api", to=target
+        )
         ranking_resolver.invalidate()
-        return {"reverted": reverted is not None, "bundle": reverted}
+        return {"reverted": reverted is not None, "bundle": reverted, "to": target}
+
+    @app.get("/tuning/lineage")
+    def tuning_lineage(limit: int = 50) -> dict:
+        """Every configuration this region has served, newest first.
+
+        The answer to "what changed, when, and what were we serving before" —
+        which is the question people ask after a regression, at exactly the
+        moment the active row no longer holds it.
+        """
+
+        from pheasant.tuning import store as tuning_store
+
+        return {
+            "lineage": tuning_store.lineage(
+                state, config.knowledge_base_id, limit=max(1, min(int(limit), 200))
+            ),
+            "base_explanation": (
+                "The oldest state is the configured base — `search.ranking` in "
+                "the mounted pheasant.yaml. Every entry below it is a bundle "
+                "that was promoted over it, and rolling back returns to the "
+                "base or to any earlier entry."
+            ),
+        }
+
+    @app.get("/tuning/glossary")
+    def tuning_glossary(term: str | None = None) -> dict:
+        """What every measure on this surface means, and what it does not.
+
+        Served rather than documented because documentation a reader has to go
+        and find arrives after the mistake. Each entry says what the number
+        is, what to do if it moves, and — the field that is usually missing —
+        the misreading it invites.
+        """
+
+        from pheasant.tuning import glossary
+
+        if term:
+            entry = glossary.lookup(term)
+            if entry is None:
+                raise HTTPException(status_code=404, detail=f"No explanation for {term!r}")
+            return entry
+        return glossary.catalog()
+
+    @app.get("/tuning/objectives")
+    def tuning_objectives() -> dict:
+        """The definitions of "better" this region can tune for.
+
+        Every entry states what it *trades away* as well as what it
+        optimizes: an objective without a stated trade is a preference
+        presented as an optimum, and picking one by its name alone is how a
+        region ends up optimizing for a caller it does not have.
+        """
+
+        from pheasant.tuning import objective as objective_module
+
+        return {
+            "active": objective_module.resolve(config.tuning.objective).as_dict(),
+            "available": objective_module.catalog(),
+            "configured_by": "tuning.objective.metric, or tuning.objective.weights",
+        }
 
     @app.get("/tuning/health")
     def tuning_health(since: str | None = None, limit: int = 5000) -> dict:
@@ -3210,8 +3295,16 @@ def create_app(
             since=since,
             limit=max(1, min(int(limit), 50_000)),
         )
+        from pheasant.tuning import glossary
+
         payload["sample_rate"] = config.observability.interactions.stage_sample_rate
         payload["observation_enabled"] = bool(config.observability.interactions.enabled)
+        # Every rate arrives with what it means and, more usefully, the
+        # misreading it invites — a truncation rate of 42% looks alarming and
+        # is normal, and that is the single most common misreading here.
+        payload["explanations"] = {
+            entry["term"]: entry for entry in (*glossary.HEALTH, *glossary.STAGES)
+        }
         return payload
 
     @app.get("/tuning/trials")

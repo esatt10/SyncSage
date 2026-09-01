@@ -1153,15 +1153,19 @@ class PheasantTools:
 
         self._require_knowledge_base(knowledge_base)
         import pheasant.tuning as tuning
+        from pheasant.tuning import glossary
+        from pheasant.tuning import objective as objective_module
         from pheasant.tuning.bundle import as_config_fragment
         from pheasant.tuning.space import ParameterSpace
 
-        active = tuning.active_parameters(self.state, self.config.knowledge_base_id)
+        active = tuning.active_parameters(self.state, self.config.knowledge_base_id, self.config)
         space = ParameterSpace(pinned=frozenset(self.config.tuning.pinned_parameters or ()))
         return {
             "active": active,
             "space": space.as_dict(),
             "config_fragment": as_config_fragment(active),
+            "objective": objective_module.resolve(self.config.tuning.objective).as_dict(),
+            "explanations": {entry["term"]: entry for entry in glossary.catalog()["parameters"]},
         }
 
     def list_tuning_bundles(self, knowledge_base: str, limit: int = 20) -> dict:
@@ -1199,17 +1203,28 @@ class PheasantTools:
         self._invalidate_ranking()
         return {"applied": True, "bundle": payload}
 
-    def rollback_tuning_bundle(self, knowledge_base: str) -> dict:
-        """Stand the active overlay down; the region returns to its config."""
+    def rollback_tuning_bundle(self, knowledge_base: str, to: str = "base") -> dict:
+        """Stand the active overlay down, to the base or an earlier bundle.
+
+        ``to`` defaults to ``"base"`` — the configured values, which are the
+        thing an operator can read in a file. An earlier bundle id steps back
+        to a decision somebody made before, and is recorded as a rollback
+        rather than a fresh apply that happens to use old numbers.
+        """
 
         self._require_knowledge_base(knowledge_base)
         from pheasant.tuning import store as tuning_store
 
+        target = to or "base"
+        if target != "base" and not tuning_store.load_bundle_row(
+            self.state, self.config.knowledge_base_id, target
+        ):
+            raise ValueError(f"Unknown bundle: {target}")
         reverted = tuning_store.revert_bundle(
-            self.state, self.config.knowledge_base_id, applied_by="mcp"
+            self.state, self.config.knowledge_base_id, applied_by="mcp", to=target
         )
         self._invalidate_ranking()
-        return {"reverted": reverted is not None, "bundle": reverted}
+        return {"reverted": reverted is not None, "bundle": reverted, "to": target}
 
     def get_retrieval_health(self, knowledge_base: str, since: str | None = None) -> dict:
         """How the pipeline is behaving on live traffic, between batches.
@@ -1304,6 +1319,74 @@ class PheasantTools:
             "experiment_id": target,
             "primary_metric": tuning_store.PRIMARY_METRIC,
             "trials": rows[: max(1, min(int(limit), 500))],
+        }
+
+    def explain_retrieval_measures(self, knowledge_base: str, term: str | None = None) -> dict:
+        """What every tuning measure means, and — more usefully — what it does not.
+
+        Call this before acting on a number from `get_retrieval_health` or a
+        tuning report. Each entry says what the measure is (with its
+        denominator), what to do differently if it moves, and the misreading
+        it invites: a truncation rate of 42% looks alarming and is normal, an
+        empty rate of 0% is not evidence that results are good, and a metric
+        reporting `insufficient_evidence` is not reporting zero.
+
+        Pass ``term`` for one entry, or omit it for the whole catalog grouped
+        into metrics, live-health rates, pipeline stages, gates and parameters.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.tuning import glossary
+
+        if term:
+            entry = glossary.lookup(term)
+            if entry is None:
+                raise ValueError(
+                    f"No explanation for {term!r}. Call this without a term for the full catalog."
+                )
+            return entry
+        return glossary.catalog()
+
+    def get_tuning_objective(self, knowledge_base: str) -> dict:
+        """What "better" means here, and what optimizing it accepts getting worse.
+
+        A region whose callers read one result should tune for reciprocal
+        rank; one whose callers read a page and synthesize should tune for
+        recall, and would be harmed by a parameter set that sharpens rank one
+        at the cost of dropping a document out of the list. Both are
+        legitimate and they are different objectives, so this reports which
+        one is in force rather than assuming.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.tuning import objective as objective_module
+
+        return {
+            "active": objective_module.resolve(self.config.tuning.objective).as_dict(),
+            "available": objective_module.catalog(),
+            "configured_by": "tuning.objective.metric, or tuning.objective.weights",
+        }
+
+    def get_retrieval_lineage(self, knowledge_base: str, limit: int = 50) -> dict:
+        """Every configuration this region has served, newest first.
+
+        What changed, when, who applied it, and what it replaced. This is the
+        question asked after a regression, at exactly the moment the active
+        configuration no longer holds the answer.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.tuning import store as tuning_store
+
+        return {
+            "lineage": tuning_store.lineage(
+                self.state, self.config.knowledge_base_id, limit=max(1, min(int(limit), 200))
+            ),
+            "base_explanation": (
+                "Below the oldest entry is the configured base — "
+                "`search.ranking` in the mounted pheasant.yaml. Rolling back "
+                "returns there, or to any earlier entry."
+            ),
         }
 
     def _invalidate_ranking(self) -> None:

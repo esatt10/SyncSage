@@ -3748,3 +3748,125 @@ select.text-input {
 }
 
 .tune-page .rate-tile__hint { font-style: italic; }
+
+/* Explanation, base/overlay layers, lineage and mechanism comparison.
+
+   `.explain` is a <details> rather than a tooltip: tooltips are unreachable by
+   keyboard on most implementations, vanish while you are reading them, and
+   cannot hold three paragraphs. This stays open while the reader looks
+   between it and the number it explains. */
+
+.tune-page .explain {
+  display: inline-block;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.tune-page .explain > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 0 7px;
+  display: inline-block;
+  list-style: none;
+  user-select: none;
+}
+
+.tune-page .explain > summary::-webkit-details-marker { display: none; }
+.tune-page .explain > summary:hover { color: var(--text); border-color: var(--border-strong); }
+.tune-page .explain > summary:focus-visible { outline: 2px solid var(--accent); }
+
+.tune-page .explain__body {
+  display: block;
+  margin-top: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  font-size: 12px;
+  line-height: 1.5;
+  max-width: 60ch;
+  white-space: normal;
+}
+
+.tune-page .explain__body p { margin: 0 0 8px; }
+.tune-page .explain__body p:last-child { margin-bottom: 0; }
+
+/* Set apart because it is the part people skip, and the part that prevents
+   the wrong action. */
+.tune-page .explain__caveat {
+  border-left: 2px solid var(--warn);
+  padding-left: 8px;
+}
+
+.tune-page .objective {
+  border: 1px solid var(--accent-border);
+  background: var(--accent-soft);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  margin-bottom: 16px;
+}
+
+.tune-page .objective__head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.tune-page .objective__label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.tune-page .objective p { margin: 6px 0 0; }
+.tune-page .objective__trade { color: var(--text-soft); }
+
+.tune-page .layers {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.tune-page .layer {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+
+.tune-page .layer--live { border-left-color: var(--accent); }
+.tune-page .layer--off { opacity: 0.75; }
+.tune-page .layer__name { font-weight: 600; font-size: 13px; }
+.tune-page .layer p { margin: 4px 0 0; }
+
+.tune-page .lineage {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.tune-page .lineage li {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+
+.tune-page .lineage__head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.tune-page .mechanisms { margin-top: 12px; }
+.tune-page .mechanisms__hybrid td { border-top: 2px solid var(--border-strong); }
+.tune-page .mechanisms__loss { color: var(--danger); font-weight: 600; }

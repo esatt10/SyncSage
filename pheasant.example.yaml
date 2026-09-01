@@ -714,6 +714,23 @@ tuning:
   max_index_queue_depth: 1
   yield_to_sync: true
   stale_seconds: 90.0
+  # What "better" means here. Each objective states what it TRADES AWAY as
+  # well as what it optimizes, because an objective without a stated trade is
+  # a preference presented as an optimum:
+  #
+  #   reciprocal_rank  how high the first good result lands (default). Accepts
+  #                    a document dropping out of the list for a sharper top.
+  #   recall_at_5/10   how many good documents appear in the window. Blind to
+  #                    order inside it, so the best answer can slide down.
+  #   hit_rate         did anything good appear at all. Position-blind.
+  #   balanced         half rank, half coverage. Refuses both trades, and is
+  #                    harder to reason about than either component.
+  #
+  # `weights` overrides the name with a custom combination over collected
+  # metrics, normalized to sum to one.
+  objective:
+    metric: reciprocal_rank
+    weights: {}
   # /state is always the source of truth; this is a MIRROR of it, so losing it
   # loses a dashboard rather than a result. `mlflow` needs the [tuning] extra;
   # with no tracking_uri it writes a local file store under

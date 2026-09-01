@@ -1711,6 +1711,32 @@ class TuningAutoSettings(ModelMixin):
 
 
 @dataclass
+class TuningObjectiveSettings(ModelMixin):
+    """What "better" means for this region. See ``pheasant.tuning.objective``.
+
+    ``metric`` names a built-in objective: ``reciprocal_rank`` (default),
+    ``recall_at_5``, ``recall_at_10``, ``hit_rate`` or ``balanced``. Each one
+    is a different product decision, and each publishes what it *trades away*
+    as well as what it optimizes — an objective without a stated trade is a
+    preference presented as an optimum.
+
+    ``weights`` overrides the name entirely with a custom combination over
+    collected metrics, normalized to sum to one. A caller who wrote weights has
+    been more specific than one who picked a label, so weights win.
+
+    Getting this wrong is not a small thing. A region whose agents read one
+    result wants ``reciprocal_rank``; one whose agents read a page and
+    synthesize wants ``recall_at_10``, and would be actively harmed by a
+    parameter set that sharpens rank one at the cost of dropping a document
+    out of the list. Both are legitimate and they are not the same objective.
+    """
+
+    metric: str = "reciprocal_rank"
+    weights: dict[str, float] = field(default_factory=dict)
+    higher_is_better: bool = True
+
+
+@dataclass
 class TuningSettings(ModelMixin):
     """The tuning plane: finding which retrieval stage is failing, and fixing it.
 
@@ -1759,6 +1785,7 @@ class TuningSettings(ModelMixin):
     #: How long a batch may go without a heartbeat before another process may
     #: declare it dead and mark it ``interrupted``.
     stale_seconds: float = 90.0
+    objective: TuningObjectiveSettings = field(default_factory=TuningObjectiveSettings)
     tracking: TuningTrackingSettings = field(default_factory=TuningTrackingSettings)
     auto: TuningAutoSettings = field(default_factory=TuningAutoSettings)
 
@@ -1840,6 +1867,8 @@ class PheasantConfig(ModelMixin):
                     if key in raw and isinstance(raw[key], dict):
                         raw[key] = build(nested, raw[key])
             if dc is TuningSettings:
+                if "objective" in raw and isinstance(raw["objective"], dict):
+                    raw["objective"] = build(TuningObjectiveSettings, raw["objective"])
                 if "tracking" in raw and isinstance(raw["tracking"], dict):
                     raw["tracking"] = build(TuningTrackingSettings, raw["tracking"])
                 if "auto" in raw and isinstance(raw["auto"], dict):

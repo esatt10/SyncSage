@@ -1001,6 +1001,25 @@ def build_sections() -> list[Section]:
                     advanced=True,
                 ),
                 Question(
+                    key="tuning.objective.metric",
+                    prompt=(
+                        "What should tuning optimize? "
+                        "(reciprocal_rank | recall_at_5 | recall_at_10 | hit_rate | balanced)"
+                    ),
+                    help=(
+                        "Not a detail. A region whose agents read one result "
+                        "wants reciprocal_rank; one whose agents read a page "
+                        "and synthesize wants recall_at_10, and would be "
+                        "actively harmed by a parameter set that sharpens "
+                        "rank one at the cost of dropping a document out of "
+                        "the list. Each objective publishes what it trades "
+                        "away; `pheasant tune show` reports which is in force."
+                    ),
+                    kind="str",
+                    when=lambda a: bool(a.get("tuning.enabled")),
+                    advanced=True,
+                ),
+                Question(
                     key="tuning.requery_trials",
                     prompt="Points that may be tried with real searches",
                     help=(

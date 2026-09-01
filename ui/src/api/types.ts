@@ -1113,6 +1113,11 @@ export interface TuningBundle {
 
 export interface TuningReport {
   experiment: { experiment_id: string; snapshot_id: string; cohort_id: string };
+  objective?: TuningObjective & {
+    baseline_score?: number | null;
+    baseline_substituted?: string;
+  };
+  mechanisms?: Record<string, TuningMechanism>;
   diagnosis: TuningDiagnosis;
   decision: TuningDecision;
   bundle: TuningBundle | null;
@@ -1165,7 +1170,21 @@ export interface TuningParameters {
     bundle_id: string;
     values: Record<string, number>;
     bundle: TuningBundle | null;
+    /** The configured floor a rollback returns to. */
+    base: { values: Record<string, number>; source: string; explanation: string };
+    /** The promoted bundle layered over it, if any. */
+    overlay: {
+      values: Record<string, number>;
+      bundle_id: string;
+      applied_at: string;
+      applied_by: string;
+      explanation: string;
+    };
+    /** Only the parameters where active differs from base. */
+    changes: { parameter: string; stage: string; base: number; active: number }[];
   };
+  objective?: TuningObjective;
+  explanations?: Record<string, GlossaryEntry>;
   space: {
     digest: string;
     pinned: string[];
@@ -1242,4 +1261,81 @@ export interface TuningHealth {
   bundles?: Record<string, number>;
   mixed_configurations?: boolean;
   does_not_support?: string;
+  explanations?: Record<string, GlossaryEntry>;
+}
+
+/**
+ * One measure explained.
+ *
+ * `does_not_mean` is the load-bearing field. A dashboard of rates gets read
+ * confidently and wrongly — a 42% truncation rate looks alarming and is
+ * normal, a 0% empty rate looks fine and proves nothing — so the misreading
+ * each number invites travels with it rather than living in docs a reader
+ * reaches after the mistake.
+ */
+export interface GlossaryEntry {
+  term: string;
+  label: string;
+  kind: string;
+  means: string;
+  impact: string;
+  does_not_mean: string;
+  direction: "higher" | "lower" | "neutral";
+  stage?: string;
+  cost_class?: string;
+  bounds?: number[];
+}
+
+export interface TuningGlossary {
+  metrics: GlossaryEntry[];
+  health: GlossaryEntry[];
+  stages: GlossaryEntry[];
+  gates: GlossaryEntry[];
+  parameters: GlossaryEntry[];
+  parameters_without_explanation: string[];
+  reading_notes: string[];
+}
+
+/** A definition of "better", with what it accepts getting worse. */
+export interface TuningObjective {
+  objective_id: string;
+  label: string;
+  weights: Record<string, number>;
+  primary_metric: string;
+  summary: string;
+  trades_away: string;
+  higher_is_better: boolean;
+}
+
+export interface TuningObjectives {
+  active: TuningObjective;
+  available: TuningObjective[];
+  configured_by: string;
+}
+
+/** One configuration this region served, and what it displaced. */
+export interface TuningLineageEntry {
+  bundle_id: string;
+  experiment_id: string;
+  decision_id: string;
+  created_at: string;
+  applied_at: string;
+  applied_by: string;
+  superseded_at: string;
+  active: boolean;
+  parameters: Record<string, number>;
+  replaced: Record<string, number>;
+}
+
+export interface TuningLineage {
+  lineage: TuningLineageEntry[];
+  base_explanation: string;
+}
+
+/** One retrieval mechanism scored alone, and what the merge adds over it. */
+export interface TuningMechanism {
+  metrics: Record<string, number>;
+  objective_score: number | null;
+  evaluated_queries: number;
+  hybrid_gain?: number;
 }
