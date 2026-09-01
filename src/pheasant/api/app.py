@@ -40,6 +40,7 @@ from pheasant.persistence.state_store import StateStore
 from pheasant.registry.knowledge_base_registry import KnowledgeBaseRegistry
 from pheasant.registry.source_registry import SourceRegistry
 from pheasant.search.hybrid import HybridSearch
+from pheasant.search.ranking import resolver_for
 from pheasant.search.sqlite_store import SearchStore
 from pheasant.security.path_policy import (
     PathPolicyError,
@@ -646,6 +647,11 @@ LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
     # run without a restart. The exception is nothing — even the lease is
     # claimed per run rather than held.
     "evaluation": True,
+    # Read per batch, not wired into a service: the runner reads `config.tuning`
+    # when a batch starts, so a change applies to the next one. The applied
+    # *bundle* is a different thing entirely — it lives in /state, not in this
+    # config, and every replica picks it up on its own TTL without a restart.
+    "tuning": True,
     "storage": False,
     "server": False,
     "pheasant": False,
@@ -1082,8 +1088,13 @@ def create_app(
         lambda: engine.graph_builder.graph,
         force_local=role_policy.role is not Role.API,
     )
+    # One resolver for the whole process: the searcher ranks with it, and
+    # applying a bundle invalidates it here so this replica converges at once
+    # rather than on its own TTL. Every *other* replica converges on theirs,
+    # which is the point of a polled overlay.
+    ranking_resolver = resolver_for(config, state)
     search = HybridSearch(
-        SearchStore(state),
+        SearchStore(state, ranking=ranking_resolver),
         vector=engine.vector_searcher(),
         node_index=engine.node_index,
         wasm_relationship_search=config.search.wasm_relationship_search,

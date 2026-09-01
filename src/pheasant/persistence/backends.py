@@ -165,6 +165,27 @@ class SqliteBackend(StateBackend):
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         self.conn.execute(sql, params)
 
+    def statement(self, sql: str, params: tuple[Any, ...] = ()) -> tuple[list[Row], int]:
+        """``(rows, rowcount)`` with a *real* rowcount.
+
+        Overridden rather than inherited, and the base's default is why. That
+        default returns ``rowcount=0`` unconditionally — harmless while only
+        :class:`PostgresBackend` implemented this, and a live defect the moment
+        anything reads the count on SQLite. A conditional claim
+        (``UPDATE ... WHERE status <> 'running'``, the pattern every lease and
+        every batch claim in this codebase uses) decides on that number, so
+        inheriting the default would make the claim always report "I did not
+        get it" on the default backend and work correctly on Postgres.
+
+        That is the mirror image of the failure mode this file has already
+        produced twice — SQLite tolerant, Postgres fatal — and it is the worse
+        direction, because the offline suite runs on SQLite.
+        """
+
+        cursor = self.conn.execute(sql, params)
+        rows = cursor.fetchall() if cursor.description else []
+        return rows, int(cursor.rowcount or 0)  # type: ignore[return-value]
+
     def executemany(self, sql: str, seq: list[tuple[Any, ...]]) -> None:
         self.conn.executemany(sql, seq)
 

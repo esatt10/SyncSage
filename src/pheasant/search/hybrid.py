@@ -17,6 +17,7 @@ from pheasant.memory.policy import (
 )
 from pheasant.search.criteria import source_type_map, stamp_source_types
 from pheasant.search.graph_search import search_graph
+from pheasant.search.ranking import DEFAULT_RANKING, RankingParameters
 from pheasant.search.sqlite_store import SearchStore, section_matches, section_needle
 from pheasant.search.vector_store import VectorSearcher
 
@@ -65,6 +66,18 @@ class HybridSearch:
         # path and recording what someone looks up is an operator's choice.
         self.usage_tracking = usage_tracking
 
+    def ranking_parameters(self) -> RankingParameters:
+        """The parameter point this search fuses under.
+
+        Taken from the store so the lexical arm and the fusion cannot end up
+        on different points: the SQL weights and the RRF constant are one
+        configuration, and a tuning trial that moved only one of them would be
+        measuring a state the region can never actually serve.
+        """
+
+        resolve = getattr(self.store, "ranking_parameters", None)
+        return resolve() if callable(resolve) else DEFAULT_RANKING
+
     def search_context(
         self,
         knowledge_base: str,
@@ -80,6 +93,7 @@ class HybridSearch:
         memory: Any = None,
         steering_kinds: tuple[str, ...] | None = None,
         extra_steering_records: list[dict[str, Any]] | None = None,
+        explain: bool = False,
     ) -> dict:
         """Run one query across the arms and fuse them.
 
@@ -90,6 +104,19 @@ class HybridSearch:
         ablation: measuring what *alias* rules contribute needs a run in which
         preference and exclusion rules do not fire, and one in which they do,
         differing in nothing else.
+
+        ``explain`` adds a ``stages`` block: what each arm returned before the
+        filters ran, what each filter removed, the fused order before
+        truncation, and the ranking parameters all of it ran under. It is off
+        for every production caller and the payload is **byte-identical**
+        without it -- the same rule ``heading_path`` and ``memory_policy``
+        follow. It exists because "retrieval is bad for this query" is not an
+        actionable statement: the answer is different, and the fix is
+        different, depending on whether the lexical arm never had the document,
+        a filter removed it, fusion ranked it below three worse ones, or it
+        fell off the end of ``max_results``. Nothing else in the region can
+        tell those four apart, because after the merge they all look identical
+        -- an absent result.
 
         ``extra_steering_records`` adds rule records that are **not in the
         store** -- proposed rules under shadow validation. They go through the
@@ -144,7 +171,30 @@ class HybridSearch:
         # the same again for a memory policy, where `only` narrows to a handful
         # of records and `off` can drop a lot.
         sectioned = bool(section_needle(section))
-        fetch_n = max_results * 3 if (enforced or sectioned or memory_filtered) else max_results
+        ranking = self.ranking_parameters()
+        fetch_n = (
+            max(max_results, int(max_results * ranking.filter_overfetch))
+            if (enforced or sectioned or memory_filtered)
+            else max_results
+        )
+        # Nothing is collected unless a caller asked, so the ordinary path
+        # allocates one `None` and does no extra work at all.
+        stages: dict[str, Any] | None = None
+        if explain:
+            stages = {
+                "parameters": ranking.describe(),
+                "query": {
+                    "text": query,
+                    "mode": mode,
+                    "max_results": max_results,
+                    "fetch_n": fetch_n,
+                    "over_fetching": fetch_n > max_results,
+                },
+                "candidates": {},
+                "surviving": {},
+                "filters": {},
+                "paths": {},
+            }
 
         text_results: list[dict[str, Any]] = []
         graph_results: list[dict[str, Any]] = []
@@ -184,6 +234,7 @@ class HybridSearch:
                 query, source_name=source_name, max_results=fetch_n
             )
 
+        failed_arms: list[str] = []
         if len(jobs) == 1:
             # A single explicitly-requested arm (mode="text"/"graph"/"vector")
             # has nothing to fall back to, so a failure here still raises —
@@ -212,9 +263,38 @@ class HybridSearch:
                             "hybrid search: %r arm failed, degrading", name, exc_info=True
                         )
                         collected[name] = []
+                        # An arm that *failed* and an arm that legitimately
+                        # found nothing both leave an empty list, and a
+                        # diagnosis must never confuse them: "the vector arm
+                        # is down" and "the vector arm has nothing for this
+                        # query" call for opposite responses.
+                        failed_arms.append(name)
         text_results = collected.get("text", [])
         graph_results = collected.get("graph", [])
         vector_results = collected.get("vector", [])
+
+        if stages is not None:
+            # Before any filter runs: this is what each arm could actually
+            # find. A target absent here was never a candidate, which is a
+            # different problem (indexing, chunking, the query itself) from
+            # every other stage's.
+            _record_arms(stages, "candidates", text_results, vector_results, graph_results)
+            stages["arms_run"] = sorted(jobs)
+            stages["arms_failed"] = sorted(failed_arms)
+
+        def _filter_stage(name: str) -> None:
+            """Attribute what this filter just removed, per arm."""
+
+            if stages is None:
+                return
+            before = stages["surviving"] or stages["candidates"]
+            after = _arm_ids(text_results, vector_results, graph_results)
+            stages["filters"][name] = {
+                arm: sorted(set(before.get(arm, [])) - set(after.get(arm, [])))
+                for arm in ("text", "vector", "graph")
+                if set(before.get(arm, [])) - set(after.get(arm, []))
+            }
+            stages["surviving"] = after
 
         if sectioned:
             # The text arm was already narrowed in SQL; the vector arm carries a
@@ -228,6 +308,7 @@ class HybridSearch:
             graph_results = [
                 r for r in graph_results if section_matches(r.get("heading_path"), section)
             ]
+            _filter_stage("section")
 
         if memory_index:
             # The text arm was already narrowed in SQL. These two carry no
@@ -239,6 +320,7 @@ class HybridSearch:
 
             vector_results = [r for r in vector_results if memory_admits(r)]
             graph_results = [r for r in graph_results if memory_admits(r)]
+            _filter_stage("memory_policy")
 
         if enforced:
             from pheasant.security.acl import expand_principal, is_allowed
@@ -274,6 +356,7 @@ class HybridSearch:
             text_results = [r for r in text_results if visible(r)]
             vector_results = [r for r in vector_results if visible(r)]
             graph_results = [r for r in graph_results if visible(r)]
+            _filter_stage("acl")
 
         if memory_index and policy.mode == "prefer":
             text_results, vector_results, graph_results = _prefer_memory(
@@ -287,7 +370,19 @@ class HybridSearch:
         for group in (text_results, vector_results, graph_results):
             stamp_source_types(group, source_types)
 
-        results = _merge_rrf(text_results, vector_results, graph_results, max_results)
+        if stages is not None and not stages["surviving"]:
+            # No filter ran, so nothing narrowed the candidates. Say so
+            # explicitly rather than leaving the reader to infer it from an
+            # empty dict, which also reads as "everything was removed".
+            stages["surviving"] = dict(stages["candidates"])
+        results = _merge_rrf(
+            text_results,
+            vector_results,
+            graph_results,
+            max_results,
+            ranking,
+            collect=stages,
+        )
         if memory_index:
             _annotate_memory(results, memory_index, policy)
             if self.usage_tracking:
@@ -327,12 +422,87 @@ class HybridSearch:
             # Reported so an agent can see *why* it got what it got — a rule
             # that silently re-orders results is the thing to avoid.
             payload["memory_steering"] = steering.describe()
+        if stages is not None:
+            stages["returned"] = [_identity(item) for item in results]
+            _record_paths(stages, text_results, vector_results, graph_results, results)
+            if steering:
+                stages["query"]["steering"] = steering.describe()
+            payload["stages"] = stages
         return payload
+
+
+#: How many ids per arm a ``stages`` block carries. The arms are already
+#: bounded by ``fetch_n``, so this is a second bound rather than the only one
+#: -- but a diagnostic that can be asked for over HTTP should not be able to
+#: return a list proportional to the index, and the attribution only ever
+#: reads the top of each arm anyway.
+EXPLAIN_MAX_IDS = 200
+
+
+def _identity(item: dict[str, Any]) -> str:
+    """The id a stage records a hit under.
+
+    ``node_id`` first, deliberately: for a chunk hit that is the *artifact*
+    id, which is what the evaluation plane's replay records and what a proof
+    names as its target. Keying stages on ``chunk_id`` would produce a
+    diagnostic that could never be joined to the evidence explaining why the
+    query mattered.
+    """
+
+    return str(item.get("node_id") or item.get("chunk_id") or "")
+
+
+def _arm_ids(
+    text_results: list[dict[str, Any]],
+    vector_results: list[dict[str, Any]],
+    graph_results: list[dict[str, Any]],
+) -> dict[str, list[str]]:
+    return {
+        arm: [_identity(item) for item in results[:EXPLAIN_MAX_IDS] if _identity(item)]
+        for arm, results in (
+            ("text", text_results),
+            ("vector", vector_results),
+            ("graph", graph_results),
+        )
+    }
+
+
+def _record_arms(
+    stages: dict[str, Any],
+    key: str,
+    text_results: list[dict[str, Any]],
+    vector_results: list[dict[str, Any]],
+    graph_results: list[dict[str, Any]],
+) -> None:
+    stages[key] = _arm_ids(text_results, vector_results, graph_results)
+
+
+def _record_paths(
+    stages: dict[str, Any],
+    *groups: list[dict[str, Any]],
+) -> None:
+    """``{id: relative_path}`` for everything any stage mentioned.
+
+    Carried once rather than per arm entry: an id appearing in three arms and
+    the fused list would otherwise repeat its path four times, and the paths
+    are what make a diagnosis readable by a person.
+    """
+
+    paths: dict[str, str] = stages.setdefault("paths", {})
+    for group in groups:
+        for item in group:
+            node_id = _identity(item)
+            if node_id and node_id not in paths:
+                path = str(item.get("relative_path") or item.get("path") or item.get("title") or "")
+                if path:
+                    paths[node_id] = path
 
 
 #: Reciprocal-rank-fusion constant. 60 is the value from the original RRF
 #: paper and the usual default; it damps the top ranks just enough that one
-#: arm's confident first place cannot alone decide the merge.
+#: arm's confident first place cannot alone decide the merge. It is
+#: ``RankingParameters.rrf_k``'s default, and stays named here because the
+#: fusion is the one place a reader looks for it.
 RRF_K = 60
 
 
@@ -341,6 +511,8 @@ def _merge_rrf(
     vector_results: list[dict[str, Any]],
     graph_results: list[dict[str, Any]],
     max_results: int,
+    ranking: RankingParameters = DEFAULT_RANKING,
+    collect: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Fuse the arms on **rank**, not on their scores.
 
@@ -375,11 +547,17 @@ def _merge_rrf(
         ("vector", vector_results),
         ("graph", graph_results),
     ):
+        # An arm weight of 1.0 -- every arm's default -- makes this the
+        # unweighted `1 / (k + rank)` the fusion always computed. The weights
+        # exist because the diagnosis can tell "the arm never had it" from
+        # "the arm had it and fusion buried it", and only the second is
+        # something a fusion parameter can fix.
+        arm_weight = ranking.arm_weight(arm)
         for rank, item in enumerate(results, start=1):
             key = key_of(item)
             if not key:
                 continue
-            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+            scores[key] = scores.get(key, 0.0) + arm_weight / (ranking.rrf_k + rank)
             best_rank[key] = min(best_rank.get(key, rank), rank)
             contributors.setdefault(key, set()).add(arm)
             # Keep the richest record: chunk hits carry previews and line
@@ -396,6 +574,58 @@ def _merge_rrf(
             key_of(item),
         ),
     )
+
+    if collect is not None:
+        # The fusion's own inputs, in the arms' own order: `(fusion key,
+        # reporting identity, kind)` per candidate. This is what lets a tuning
+        # trial re-fuse a query under different parameters **without running
+        # retrieval again** — and it is three fields rather than one because
+        # the merge keys on `chunk_id`, reports on `node_id`, and breaks ties
+        # on `kind`. Recording only the identity would produce a re-fusion
+        # that merged every chunk of a file into one entry, which is not what
+        # the merge does and would make the cheap path measure something the
+        # region never serves.
+        #
+        # Truncation is recorded rather than hidden: a re-fusion over a
+        # truncated arm is an approximation, and the consumer refuses to run
+        # on one instead of quietly reporting a number.
+        collect["fusion_input"] = {
+            arm: [
+                [key_of(item), _identity(item), str(item.get("kind") or "")]
+                for item in results[:EXPLAIN_MAX_IDS]
+                if key_of(item)
+            ]
+            for arm, results in (
+                ("text", text_results),
+                ("vector", vector_results),
+                ("graph", graph_results),
+            )
+        }
+        collect["fusion_input_truncated"] = any(
+            len(results) > EXPLAIN_MAX_IDS
+            for results in (text_results, vector_results, graph_results)
+        )
+        collect["max_results"] = max_results
+        # The fused order *before* truncation. This is the one list that
+        # separates "fusion ranked it 47th" from "fusion ranked it 11th and
+        # max_results was 10" — two failures that look identical downstream
+        # and have nothing in common: the first is a fusion or arm-weight
+        # problem, the second is a caller asking for too few results.
+        collect["fusion"] = {
+            "ranked": [_identity(item) for item in ordered[:EXPLAIN_MAX_IDS] if _identity(item)],
+            "scores": {
+                _identity(item): round(scores[key_of(item)], 6)
+                for item in ordered[:EXPLAIN_MAX_IDS]
+                if _identity(item)
+            },
+            "contributors": {
+                _identity(item): sorted(contributors[key_of(item)])
+                for item in ordered[:EXPLAIN_MAX_IDS]
+                if _identity(item)
+            },
+            "rrf_k": ranking.rrf_k,
+            "arm_weights": {arm: ranking.arm_weight(arm) for arm in ("text", "vector", "graph")},
+        }
 
     results: list[dict[str, Any]] = []
     seen_nodes: set[str] = set()

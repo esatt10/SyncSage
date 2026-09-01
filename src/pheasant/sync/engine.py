@@ -2227,10 +2227,11 @@ class SyncEngine:
 
     def search_context(self, query: str, max_results: int = 10) -> dict:
         from pheasant.search.hybrid import HybridSearch
+        from pheasant.search.ranking import resolver_for
         from pheasant.search.sqlite_store import SearchStore
 
         return HybridSearch(
-            SearchStore(self.state),
+            SearchStore(self.state, ranking=resolver_for(self.config, self.state)),
             vector=self.vector_searcher(),
             wasm_relationship_search=self.config.search.wasm_relationship_search,
         ).search_context(

@@ -950,6 +950,93 @@ def build_sections() -> list[Section]:
             ],
         ),
         Section(
+            id="tuning",
+            title="Retrieval performance tuning",
+            blurb=(
+                "Optional, off by default, and read-only when on. A batch replays "
+                "recorded queries with per-stage capture, works out which step of "
+                "retrieval actually lost each document — the lexical arm, a filter, "
+                "the fusion, the cut — and proposes parameters only for the stages "
+                "to blame. Any winner has to improve a held-out cohort it was not "
+                "selected on before it may change what the region serves. Needs "
+                "evaluation above, because it tunes against the same cohorts and "
+                "the same proof."
+            ),
+            covers=("tuning",),
+            questions=[
+                Question(
+                    key="tuning.enabled",
+                    prompt="Diagnose and tune retrieval parameters?",
+                    help=(
+                        "Produces a stage diagnosis and, where it helps, a proposed "
+                        "configuration bundle. Producing one changes nothing: "
+                        "applying it is a separate step."
+                    ),
+                    kind="bool",
+                    advanced=True,
+                ),
+                Question(
+                    key="tuning.auto.enabled",
+                    prompt="Run a tuning batch automatically when the corpus changes materially?",
+                    help=(
+                        "Only where the scheduler runs, so API replicas never start "
+                        "one. It stands down while the index queue has work in it."
+                    ),
+                    kind="bool",
+                    when=lambda a: bool(a.get("tuning.enabled")),
+                    advanced=True,
+                ),
+                Question(
+                    key="tuning.auto.apply",
+                    prompt="Let a passing bundle change the fleet's ranking without asking?",
+                    help=(
+                        "Off by default, and worth leaving off until you have read a "
+                        "few reports. On, a bundle that passes every gate — including "
+                        "confirmation on a cohort the search never saw — becomes the "
+                        "region's live overlay for every replica. Off, the same work "
+                        "happens and the bundle waits for `pheasant tune apply`."
+                    ),
+                    kind="bool",
+                    when=lambda a: bool(a.get("tuning.enabled")),
+                    advanced=True,
+                ),
+                Question(
+                    key="tuning.requery_trials",
+                    prompt="Points that may be tried with real searches",
+                    help=(
+                        "The number that decides how long a batch runs. Fusion "
+                        "parameters are free — they are re-computed from cached "
+                        "candidates — so this only bounds the family that changes "
+                        "what the arms retrieve."
+                    ),
+                    kind="int",
+                    when=lambda a: bool(a.get("tuning.enabled")),
+                    advanced=True,
+                ),
+                Question(
+                    key="tuning.max_searches",
+                    prompt="Ceiling on searches in one batch",
+                    kind="int",
+                    when=lambda a: bool(a.get("tuning.enabled")),
+                    advanced=True,
+                ),
+                Question(
+                    key="tuning.tracking.backend",
+                    prompt="Mirror experiments to a tracking backend? (off | mlflow)",
+                    help=(
+                        "/state is always the source of truth. `mlflow` adds a "
+                        "mirror — needs the [tuning] extra, and with no tracking_uri "
+                        "it writes a local file store under <exports>/tuning/mlruns "
+                        "that `mlflow ui` opens later with nothing running in "
+                        "between. A tracking backend being down never fails a batch."
+                    ),
+                    kind="str",
+                    when=lambda a: bool(a.get("tuning.enabled")),
+                    advanced=True,
+                ),
+            ],
+        ),
+        Section(
             id="synapse",
             title="Synapse federation",
             blurb=(

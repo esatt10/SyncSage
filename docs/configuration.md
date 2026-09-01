@@ -1036,6 +1036,115 @@ of its own evidence and nothing else.
 
 ---
 
+## `tuning` (retrieval performance tuning, optional)
+
+Off by default, and read-only when on unless you turn `auto.apply` on or apply
+a bundle yourself.
+
+The evaluation plane tells you *how well* retrieval is doing. This one tells
+you **which step is failing** and, where a parameter can fix it, proposes the
+parameter. Retrieval is a pipeline — query analysis, three candidate arms, three
+filters, a fusion, a truncation — and after the merge every one of those
+failures looks identical, because they all produce an absent result. Six causes,
+one symptom.
+
+A batch works in four movements:
+
+1. **Diagnose.** Replay a cohort with per-stage capture and attribute every miss
+   to the *first* stage that lost the document. The output is a histogram over
+   stages, not a score. If it says 71% of your misses are documents that were
+   never indexed, you have got the most valuable thing this plane produces and
+   should stop — no ranking parameter will move that, and the batch says so
+   rather than searching a space that cannot contain the answer.
+2. **Propose.** Only parameters whose stage the diagnosis actually blames.
+3. **Trial.** Most trials cost **no retrieval at all**: the fusion family
+   (`rrf_k`, the arm weights) acts after the arms have produced candidates, so
+   it is re-computed from cached candidate lists. Only parameters that change
+   what the arms retrieve need a real search, and those are budgeted separately.
+4. **Decide.** Gate the winner against a held-out cohort it was never selected
+   on and a control cohort that must not regress, then package it as a bundle.
+
+### What a bundle is, and why applying it is a separate step
+
+A bundle is a `search.ranking` parameter set plus its whole provenance: the
+snapshot it was measured against, the decision that produced it, the
+comparisons and gates behind that decision, and the parameters it replaces.
+Producing one changes nothing — it is a file describing a configuration.
+**Applying** one changes what every replica in the fleet serves, which is why
+it is `pheasant tune apply` (or `auto.apply: true`) rather than a side effect
+of the batch.
+
+Applying is **fleet-scoped by construction**. The active bundle is one row in
+`/state`, every replica resolves it on a short TTL, and there is nowhere for a
+per-request or per-principal override to live. Retrieval parameters that varied
+by caller would make two agents disagree about what the region contains.
+
+`pheasant tune rollback` stands the overlay down and returns the region to its
+configured parameters. What the bundle replaced is stored on the bundle, so
+reverting does not depend on anyone remembering what the config used to say.
+
+### `tuning.enabled`
+
+Default `false`. Turns the plane on. It needs `evaluation` to be producing
+cohorts and proof, because it tunes against the same queries and the same
+evidence the evaluation plane reports on — deliberately, so the two cannot
+optimize for and measure different things.
+
+### `tuning.auto.enabled` / `tuning.auto.apply`
+
+Two switches, and the gap between them is the safety property. The first runs
+batches automatically (only where the scheduler runs, so API replicas never
+start one). The second lets a passing bundle change ranking unattended. Leave
+`apply` off until you have read a few reports; the work still happens and the
+bundle waits.
+
+### `tuning.refusion_trials` / `tuning.requery_trials` / `tuning.max_searches`
+
+The two trial budgets are separate because the two cost classes differ by
+roughly three orders of magnitude, and a single "trials" number would be spent
+entirely on whichever class the enumeration reached first. `max_searches` is
+the backstop that keeps a large cohort from turning a modest trial budget into
+the region's dominant workload.
+
+### `tuning.max_index_queue_depth` / `tuning.yield_to_sync`
+
+Backpressure. A running batch stands down while the index queue has work in it
+or a sync holds a source lease, and it checks *between* units rather than once
+at the start — a batch that began on an idle region and is still going when a
+large re-index starts has to yield, not finish what it started. Standing down
+is not a failure: trials are checkpointed, so the next attempt resumes.
+
+The executor holds **one slot**, takes the `__tuning__` lease, and never takes
+`sync_lock`.
+
+### `tuning.pinned_parameters`
+
+Names you have settled and do not want re-litigated. A pinned parameter is
+never proposed.
+
+### `tuning.tracking.*`
+
+`backend` is `off` (default), `state`, or `mlflow`. `/state` is always the
+source of truth; MLflow is a **mirror** of it, so losing the mirror loses a
+dashboard rather than a result — and you can turn tracking on later and still
+have every row.
+
+With no `tracking_uri`, the MLflow sink writes a **local file store** under
+`<exports>/tuning/mlruns`: no server, no network, no credentials. Open it later
+with `mlflow ui --backend-store-uri <that path>`. Needs the `[tuning]` extra; a
+region without it logs a warning and the batch runs exactly as before.
+
+### `search.ranking.*` — the parameters this tunes
+
+The knobs themselves live under `search.ranking` (BM25 column weights, the
+structural priors, the RRF constant, the per-arm fusion weights, the filter
+over-fetch multiplier). Every default is the value the 2026-08-03 retrieval
+overhaul measured, so a region that never opens the block ranks exactly as it
+always has. You can set them by hand and pin them; the tuning plane is a way of
+choosing them with evidence, not the only way to change them.
+
+---
+
 ## `assistant` (grounded chat)
 
 Powers the UI's chat panel and `POST /assistant/chat`: retrieve from your own

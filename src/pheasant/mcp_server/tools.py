@@ -27,6 +27,7 @@ from pheasant.search.criteria import (
     source_of,
 )
 from pheasant.search.hybrid import HybridSearch
+from pheasant.search.ranking import resolver_for
 from pheasant.search.sqlite_store import SearchStore
 from pheasant.security.path_policy import resolve_config_write_target, resolve_under
 from pheasant.sync.engine import SyncEngine
@@ -80,7 +81,7 @@ class PheasantTools:
         self.jobs = JobRegistry()
         self._job_lock = threading.Lock()
         self.searcher = HybridSearch(
-            SearchStore(self.state),
+            SearchStore(self.state, ranking=resolver_for(config, self.state)),
             vector=self.engine.vector_searcher(),
             node_index=self.engine.node_index,
             wasm_relationship_search=config.search.wasm_relationship_search,

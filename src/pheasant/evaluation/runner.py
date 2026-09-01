@@ -1116,7 +1116,7 @@ def _stored_gates(report: dict[str, Any]) -> list[GateResult]:
     return out
 
 
-def _replay_searcher(engine: Any) -> Any:
+def _replay_searcher(engine: Any, ranking: Any = None) -> Any:
     """A searcher configured for measurement rather than for serving.
 
     ``usage_tracking=False`` is the important argument. It is a write on the
@@ -1131,11 +1131,12 @@ def _replay_searcher(engine: Any) -> Any:
     """
 
     from pheasant.search.hybrid import HybridSearch
+    from pheasant.search.ranking import resolver_for
     from pheasant.search.sqlite_store import SearchStore
 
     config = engine.config
     return HybridSearch(
-        SearchStore(engine.state),
+        SearchStore(engine.state, ranking=ranking or resolver_for(config, engine.state)),
         vector=engine.vector_searcher(),
         node_index=getattr(engine, "node_index", None),
         wasm_relationship_search=config.search.wasm_relationship_search,

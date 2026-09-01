@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from pheasant.persistence.state_store import StateStore
+from pheasant.search.ranking import DEFAULT_RANKING, RankingParameters
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,11 @@ logger = logging.getLogger(__name__)
 # the file *named* README rather than the file that happens to say "readme"
 # most often in a short body — untuned, a filename match was worth exactly one
 # body word, and BM25's length normalization then ranked by body brevity.
-_BM25_WEIGHTS = "0.0, 0.0, 0.0, 8.0, 3.0, 2.0, 1.0"
+# The values now live on `RankingParameters`, whose defaults are these exact
+# numbers; `bm25_weights` renders this same string. They stayed constants for
+# as long as they were the output of a one-off tuning pass and stopped being
+# constants when a plane appeared whose job is to propose better ones.
+_BM25_WEIGHTS = DEFAULT_RANKING.bm25_weights
 
 # The same four weights for Postgres. `ts_rank_cd` takes exactly four weight
 # classes and its array is ordered {D, C, B, A} — the reverse of how the
@@ -28,7 +33,7 @@ _BM25_WEIGHTS = "0.0, 0.0, 0.0, 8.0, 3.0, 2.0, 1.0"
 # mapping onto exactly four tsvector weight classes is luck, not design; it is
 # what makes the port preserve the *ordering* of field importance rather than
 # having to collapse two fields together.
-_TS_RANK_WEIGHTS = "0.125, 0.25, 0.375, 1.0"
+_TS_RANK_WEIGHTS = DEFAULT_RANKING.ts_rank_weights
 
 # ts_rank_cd's normalization flag. **32 = rank / (rank + 1)** — term-frequency
 # *saturation*, applied per term.
@@ -78,40 +83,62 @@ _POSTGRES_MAX_RANK_TERMS = 12
 #            Both the lexical and the vector arm ranked tests/ above the
 #            implementation for every code query measured.
 #   samples— same, one notch softer: sample code is often a legitimate answer.
-_DEPTH_PRIOR = 0.05
-_TEST_PRIOR = 0.60
-_SAMPLE_PRIOR = 0.30
-_STRUCTURAL_PRIOR = f"""(
+#
+# The three coefficients are `RankingParameters.depth_prior` / `test_prior` /
+# `sample_prior`, whose defaults are 0.05 / 0.60 / 0.30 — the measured values
+# this comment describes. `_structural_prior_sql` renders the expression;
+# `tests/test_ranking_parameters.py` pins the default rendering against the
+# literal string this used to be.
+
+
+def _structural_prior_sql(ranking: RankingParameters) -> str:
+    """The divisor expression, rendered from one parameter point.
+
+    Interpolated into SQL rather than parameterized, and safely: every value
+    is a `float` that has already been through `clamp`, so the rendering is
+    `%g` of a bounded number and no caller-controlled text reaches the
+    statement. A placeholder would be portable but would also add three
+    positional parameters to an already order-sensitive assembly, in the one
+    expression that appears before every `WHERE` clause.
+    """
+
+    return f"""(
     1.0
-    + {_DEPTH_PRIOR} * (length(artifacts.relative_path)
+    + {ranking.depth_prior} * (length(artifacts.relative_path)
                         - length(replace(artifacts.relative_path, '/', '')))
     + CASE WHEN artifacts.relative_path LIKE '%/tests/%'
              OR artifacts.relative_path LIKE 'tests/%'
              OR artifacts.relative_path LIKE '%/test_%'
              OR artifacts.relative_path LIKE 'test_%'
              OR artifacts.relative_path LIKE '%_test.%'
-           THEN {_TEST_PRIOR} ELSE 0.0 END
+           THEN {ranking.test_prior} ELSE 0.0 END
     + CASE WHEN artifacts.relative_path LIKE '%/samples/%'
              OR artifacts.relative_path LIKE 'samples/%'
              OR artifacts.relative_path LIKE '%/examples/%'
              OR artifacts.relative_path LIKE 'examples/%'
-           THEN {_SAMPLE_PRIOR} ELSE 0.0 END
+           THEN {ranking.sample_prior} ELSE 0.0 END
 )"""
 
 
-#: How much a `preference` rule is worth. The prior is a *divisor* on a
-#: negative BM25 cost, so subtracting from it makes a match rank better. Sized
-#: to outweigh roughly six levels of path depth (`_DEPTH_PRIOR` 0.05) — enough
-#: that "prefer docs/" actually moves a deep document above a shallow one,
-#: small enough that it cannot promote an irrelevant match over a strong one.
-_PREFER_BONUS = 0.35
-#: Floor on the divisor. It must stay positive or the ranking inverts, and a
-#: caller with several preference rules could otherwise drive it to zero.
-_PRIOR_FLOOR = 0.25
+# How much a `preference` rule is worth is `RankingParameters.prefer_bonus`
+# (0.35). The prior is a *divisor* on a negative BM25 cost, so subtracting
+# from it makes a match rank better. Sized to outweigh roughly six levels of
+# path depth (`depth_prior` 0.05) — enough that "prefer docs/" actually moves
+# a deep document above a shallow one, small enough that it cannot promote an
+# irrelevant match over a strong one.
+#
+# `prior_floor` (0.25) is the floor on the divisor. It must stay positive or
+# the ranking inverts, and a caller with several preference rules could
+# otherwise drive it to zero — which is why `ranking.BOUNDS` refuses to clamp
+# it below 0.01 however a config file or a proposed bundle spells it.
 
 
 def _structural_prior(
-    steering: Any, tokens: list[str], *, postgres: bool = False
+    steering: Any,
+    tokens: list[str],
+    *,
+    postgres: bool = False,
+    ranking: RankingParameters = DEFAULT_RANKING,
 ) -> tuple[str, list[object]]:
     """The ranking divisor, plus any `preference` bonus in force.
 
@@ -124,17 +151,18 @@ def _structural_prior(
     callers who have a `preference` rule in force — which is a narrow enough
     path that it could sit broken for a long time unnoticed.
     """
+    prior = _structural_prior_sql(ranking)
     if not steering:
-        return _STRUCTURAL_PRIOR, []
+        return prior, []
     prefixes = steering.prefers(tokens)
     if not prefixes:
-        return _STRUCTURAL_PRIOR, []
+        return prior, []
     cases = " ".join("WHEN artifacts.relative_path LIKE ? THEN 1 " for _ in prefixes)
     params: list[object] = [f"{prefix.rstrip('/*')}%" for prefix in prefixes]
     greatest = "GREATEST" if postgres else "MAX"
     return (
-        f"{greatest}({_PRIOR_FLOOR}, "
-        f"{_STRUCTURAL_PRIOR} - {_PREFER_BONUS} * (CASE {cases} ELSE 0 END))",
+        f"{greatest}({ranking.prior_floor}, "
+        f"{prior} - {ranking.prefer_bonus} * (CASE {cases} ELSE 0 END))",
         params,
     )
 
@@ -232,7 +260,11 @@ def _idf(total_docs: int, document_frequency: int) -> float:
 
 
 def _postgres_rank_expression(
-    state: Any, tokens: list[str], source_name: str | None = None
+    state: Any,
+    tokens: list[str],
+    source_name: str | None = None,
+    *,
+    ranking: RankingParameters = DEFAULT_RANKING,
 ) -> tuple[str, list[object], list[str]]:
     """A BM25-shaped ranking expression for Postgres.
 
@@ -254,10 +286,11 @@ def _postgres_rank_expression(
     """
 
     unique = list(dict.fromkeys(tokens))
+    weights = ranking.ts_rank_weights
     total, frequencies = _postgres_document_frequencies(state, unique, source_name)
     if not tokens or not total:
         return (
-            f"ts_rank_cd('{{{_TS_RANK_WEIGHTS}}}', chunks_fts.search_vector, "
+            f"ts_rank_cd('{{{weights}}}', chunks_fts.search_vector, "
             f"query_ts, {_TS_RANK_NORMALIZATION})",
             [],
             unique,
@@ -279,7 +312,7 @@ def _postgres_rank_expression(
     for token in score_tokens:
         weight = _idf(total, frequencies.get(token, 0))
         terms.append(
-            f"{weight:.6f} * ts_rank_cd('{{{_TS_RANK_WEIGHTS}}}', chunks_fts.search_vector, "
+            f"{weight:.6f} * ts_rank_cd('{{{weights}}}', chunks_fts.search_vector, "
             f"to_tsquery('simple', ?), {_TS_RANK_NORMALIZATION})"
         )
         params.append(token)
@@ -287,8 +320,21 @@ def _postgres_rank_expression(
 
 
 class SearchStore:
-    def __init__(self, state: StateStore):
+    def __init__(self, state: StateStore, ranking: Any = None):
         self.state = state
+        # A `RankingResolver` (fleet parameters, refreshed on a TTL), a plain
+        # `RankingParameters` (a tuning trial pinning one point), or None —
+        # which is every existing caller, and gets the shipped defaults.
+        self.ranking = ranking
+
+    def ranking_parameters(self) -> RankingParameters:
+        """The point this search ranks under."""
+
+        resolver = self.ranking
+        if resolver is None:
+            return DEFAULT_RANKING
+        current = getattr(resolver, "current", None)
+        return current() if callable(current) else resolver
 
     def _memory_sql(self, policy: Any, now: str | None) -> tuple[str, str, list[object]]:
         """`(join, where_suffix, params)` enforcing an agent-memory policy.
@@ -333,11 +379,14 @@ class SearchStore:
         # placeholders appear in the final SQL: the ranking expression sits in
         # the SELECT, ahead of every WHERE clause.
         postgres = bool(getattr(self.state, "dialect", None) and self.state.dialect.is_postgres)
-        prior_sql, prior_params = _structural_prior(steering, tokens, postgres=postgres)
+        ranking = self.ranking_parameters()
+        prior_sql, prior_params = _structural_prior(
+            steering, tokens, postgres=postgres, ranking=ranking
+        )
         rank_sql, rank_params = "", []
         if postgres:
             rank_sql, rank_params, match_tokens = _postgres_rank_expression(
-                self.state, tokens, source_name
+                self.state, tokens, source_name, ranking=ranking
             )
             match_expr = " | ".join(match_tokens) if match_tokens else query
         # Params are positional, so they must be assembled in the order the
@@ -407,7 +456,7 @@ class SearchStore:
                    chunks_fts.path, chunks_fts.heading_path, chunks.text,
                    chunks.start_line, chunks.end_line, artifacts.path AS absolute_path,
                    artifacts.relative_path,
-                   bm25(chunks_fts, {_BM25_WEIGHTS}) / {prior_sql} AS rank_score
+                   bm25(chunks_fts, {ranking.bm25_weights}) / {prior_sql} AS rank_score
             FROM chunks_fts
             JOIN chunks ON chunks.id = chunks_fts.chunk_id
             JOIN artifacts ON artifacts.id = chunks_fts.artifact_id
