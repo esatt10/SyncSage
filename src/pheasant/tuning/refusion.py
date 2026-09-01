@@ -143,30 +143,6 @@ def verify_equivalence(stages: dict[str, Any], ranking: RankingParameters) -> tu
     return False, (f"re-fusion returned {len(computed)} ids, the region served {len(served)}")
 
 
-def refuse_cohort(
-    captures: dict[str, dict[str, Any]],
-    ranking: RankingParameters,
-) -> dict[str, list[str]]:
-    """Re-fuse every captured query under one parameter point.
-
-    ``captures`` is ``{query_id: stages}``. Queries whose capture is not
-    re-fusable are **omitted rather than passed through**: including a query
-    at its baseline ordering would make every trial look identical on it and
-    quietly shrink the effect the trial is supposed to measure.
-    """
-
-    out: dict[str, list[str]] = {}
-    for query_id, stages in captures.items():
-        if not refusable(stages):
-            continue
-        out[query_id] = refuse(
-            stages["fusion_input"],
-            int(stages.get("max_results") or 10),
-            ranking,
-        )
-    return out
-
-
 def restage(
     stages: dict[str, Any], fused_ids: list[str], ranking: RankingParameters
 ) -> dict[str, Any]:

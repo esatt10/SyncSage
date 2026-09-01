@@ -502,33 +502,6 @@ def load_trials(state: Any, experiment_id: str) -> dict[str, dict[str, Any]]:
     return out
 
 
-def top_trials(
-    state: Any, experiment_id: str, *, cohort_id: str = "", limit: int = 10
-) -> list[dict[str, Any]]:
-    sql = "SELECT * FROM tuning_trials WHERE experiment_id = ? AND failed = ''"
-    params: list[Any] = [experiment_id]
-    if cohort_id:
-        sql += " AND cohort_id = ?"
-        params.append(cohort_id)
-    sql += " ORDER BY primary_metric DESC, trial_id ASC LIMIT ?"
-    params.append(int(limit))
-    rows = state.rows(sql, tuple(params))
-    return [
-        {
-            "trial_id": str(row["trial_id"]),
-            "point_id": str(row["point_id"]),
-            "cohort_name": str(row["cohort_name"]),
-            "motivating_stage": str(row["motivating_stage"]),
-            "cost_class": str(row["cost_class"]),
-            "primary_metric": row["primary_metric"],
-            "metrics": json.loads(row["metrics_json"] or "{}"),
-            "point": json.loads(row["point_json"] or "{}"),
-            "proposal": json.loads(row["proposal_json"] or "{}"),
-        }
-        for row in rows
-    ]
-
-
 # --------------------------------------------------------------------------
 # decisions and bundles
 # --------------------------------------------------------------------------
@@ -556,13 +529,6 @@ def save_decision(state: Any, decision: Decision, kb_id: str) -> None:
             _json(decision.as_dict()),
         ),
     )
-
-
-def load_decision(state: Any, decision_id: str) -> dict[str, Any] | None:
-    rows = state.rows(
-        "SELECT payload_json FROM tuning_decisions WHERE decision_id = ?", (decision_id,)
-    )
-    return json.loads(rows[0]["payload_json"]) if rows else None
 
 
 def save_bundle(state: Any, bundle: TuningBundle) -> None:
@@ -700,11 +666,3 @@ def list_bundles(state: Any, kb_id: str, *, limit: int = 20) -> list[dict[str, A
         payload["active"] = bool(row["applied_at"] and not row["superseded_at"])
         out.append(payload)
     return out
-
-
-def load_bundle(state: Any, kb_id: str, bundle_id: str) -> dict[str, Any] | None:
-    rows = state.rows(
-        "SELECT payload_json FROM tuning_bundles WHERE kb_id = ? AND bundle_id = ?",
-        (kb_id, bundle_id),
-    )
-    return json.loads(rows[0]["payload_json"]) if rows else None

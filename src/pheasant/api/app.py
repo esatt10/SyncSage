@@ -3079,6 +3079,7 @@ def create_app(
         """
 
         import pheasant.tuning as tuning
+        from pheasant.tuning.bundle import as_config_fragment
         from pheasant.tuning.space import ParameterSpace
 
         active = tuning.active_parameters(state, config.knowledge_base_id)
@@ -3086,7 +3087,7 @@ def create_app(
         return {
             "active": active,
             "space": space.as_dict(),
-            "config_fragment": {"search": {"ranking": active["values"]}},
+            "config_fragment": as_config_fragment(active),
         }
 
     @app.get("/tuning/bundles")

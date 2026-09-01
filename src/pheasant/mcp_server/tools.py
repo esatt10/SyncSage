@@ -1152,6 +1152,7 @@ class PheasantTools:
 
         self._require_knowledge_base(knowledge_base)
         import pheasant.tuning as tuning
+        from pheasant.tuning.bundle import as_config_fragment
         from pheasant.tuning.space import ParameterSpace
 
         active = tuning.active_parameters(self.state, self.config.knowledge_base_id)
@@ -1159,7 +1160,7 @@ class PheasantTools:
         return {
             "active": active,
             "space": space.as_dict(),
-            "config_fragment": {"search": {"ranking": active["values"]}},
+            "config_fragment": as_config_fragment(active),
         }
 
     def list_tuning_bundles(self, knowledge_base: str, limit: int = 20) -> dict:

@@ -1079,11 +1079,9 @@ def _tune_command(args) -> int:
             if args.yaml:
                 import yaml as _yaml
 
-                print(
-                    _yaml.safe_dump(
-                        {"search": {"ranking": active["values"]}}, sort_keys=True
-                    ).rstrip()
-                )
+                from pheasant.tuning.bundle import as_config_fragment
+
+                print(_yaml.safe_dump(as_config_fragment(active), sort_keys=True).rstrip())
                 return 0
             print(f"{kb} is ranking with parameters from: {active['provenance']}")
             if active["bundle_id"]:

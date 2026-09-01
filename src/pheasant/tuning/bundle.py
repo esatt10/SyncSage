@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from pheasant.search.ranking import PARAMETER_STAGES, RankingParameters, clamp
+from pheasant.search.ranking import PARAMETER_STAGES, clamp
 from pheasant.tuning.contracts import Comparison, Decision, Diagnosis, Experiment, TuningBundle
 
 logger = logging.getLogger(__name__)
@@ -90,22 +90,17 @@ def as_config_fragment(bundle: TuningBundle | dict[str, Any]) -> dict[str, Any]:
     that will be lost the next time somebody resets a volume.
     """
 
-    parameters = (
-        bundle.parameters if isinstance(bundle, TuningBundle) else bundle.get("parameters") or {}
-    )
-    return {"search": {"ranking": {name: value for name, value in sorted(parameters.items())}}}
-
-
-def as_ranking(bundle: TuningBundle | dict[str, Any], base: RankingParameters) -> RankingParameters:
-    """The parameters a region would serve under this bundle."""
-
-    parameters = (
-        bundle.parameters if isinstance(bundle, TuningBundle) else bundle.get("parameters") or {}
-    )
-    bundle_id = (
-        bundle.bundle_id if isinstance(bundle, TuningBundle) else str(bundle.get("bundle_id") or "")
-    )
-    return base.with_overlay(parameters, provenance="bundle", bundle_id=bundle_id)
+    if isinstance(bundle, TuningBundle):
+        parameters = bundle.parameters
+    else:
+        # Accepts either a bundle payload (`parameters`) or the
+        # `active_parameters` shape (`values`), because both are "the set of
+        # numbers this region would rank with" and a caller holding one should
+        # not have to reshape it into the other to render it.
+        parameters = bundle.get("parameters") or bundle.get("values") or {}
+    return {
+        "search": {"ranking": {name: float(value) for name, value in sorted(parameters.items())}}
+    }
 
 
 def diff(bundle: TuningBundle | dict[str, Any], current: dict[str, float]) -> list[dict[str, Any]]:
