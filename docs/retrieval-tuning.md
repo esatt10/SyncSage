@@ -31,6 +31,8 @@ not a tuned parameter — it is the histogram.
 
 ## The four movements
 
+![The Tuning page: a completed batch, the objective it optimized with what it trades away, and the live pipeline health tiles beneath it](assets/ui/tuning.png)
+
 A batch is four phases, each a durable artifact rather than a step inside a
 function, because each one is independently useful and each is somewhere you
 might reasonably stop.
@@ -39,6 +41,8 @@ might reasonably stop.
 
 Replay a cohort through the **real** search path with `explain=True`, and
 attribute every miss to the **first** stage that lost the document.
+
+![The stage histogram: misses attributed to the retrieval step that lost them, each labelled tunable or not reachable](assets/ui/tuning-diagnosis.png)
 
 ```
 pheasant tune diagnose
@@ -131,6 +135,8 @@ CI runs that equivalence check as [its own job](#ci).
 
 ### 4. Decide
 
+![The decision panel: each gate listed pass or fail, with the reason a winning parameter set was or was not promoted](assets/ui/tuning-decision.png)
+
 **Nothing is promoted by its own evidence.**
 
 A parameter point that improved the queries it was *selected on* has
@@ -190,6 +196,8 @@ constant, and a sampler that sliced them collapsed to all-or-nothing while
 looking like it worked.
 
 ### Stage health, and what it may not claim
+
+![Live pipeline health: empty rate by stage, per-arm contribution and truncation, each with its denominator](assets/ui/tuning-health.png)
 
 `GET /tuning/health`, `get_retrieval_health` (MCP), and the **Live pipeline
 health** panel read those digests into rates:
@@ -378,6 +386,8 @@ The UI draws one small-multiple chart per parameter. Never two on one plot:
 that would need two x-scales, and the crossing point would be an artifact of
 the scales rather than a finding.
 
+![Parameter sweeps: one small-multiple chart per parameter against the primary metric, with the current configuration as a dashed reference line](assets/ui/tuning-sweeps.png)
+
 ### Where MLflow fits
 
 It is a **mirror of `/state`**, never a dependency, and the UI never requires
@@ -425,6 +435,8 @@ make every number the evaluation plane publishes a measurement of whoever
 happened to ask.
 
 ### Base, overlay, and stepping back
+
+![Base configuration and promoted overlay shown as separate layers, with per-parameter explanations](assets/ui/tuning-config.png)
 
 Three layers, reported separately rather than collapsed:
 
