@@ -35,10 +35,16 @@ function run(cmd, args, opts = {}) {
 // (the first attempt died on an unterminated string that was invisible in
 // either file alone), and a Python program inside a `.mjs` is one nothing
 // lints or formats.
+// One port, stated once and passed to both sides. It used to be written into
+// the config as `server.api.port` — which is not a field, so it was dropped
+// and the region served on the default while this polled that default by
+// accident.
+const PORT = 8799;
+
 await run('python', [
   join(ROOT, 'scripts', 'seed_render_region.py'),
   '--work', work,
-  '--port', '8799',
+  '--port', String(PORT),
 ]);
 
 const server = spawn('python', ['-m', 'pheasant', 'serve', '--config', join(work, 'pheasant.yaml')], {
@@ -47,7 +53,7 @@ const server = spawn('python', ['-m', 'pheasant', 'serve', '--config', join(work
 });
 process.on('exit', () => server.kill());
 
-const base = 'http://127.0.0.1:8765';
+const base = `http://127.0.0.1:${PORT}`;
 for (let i = 0; i < 60; i += 1) {
   try {
     const r = await fetch(`${base}/health`);

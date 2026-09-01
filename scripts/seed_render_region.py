@@ -71,7 +71,12 @@ def config_for(work: Path, docs: Path, port: int) -> dict:
             "exports_path": str(work / "exports"),
         },
         "storage": {"graph_snapshots": False},
-        "server": {"api": {"port": port}},
+        # `server.port`, not `server.api.port` — the latter is not a field, so
+        # `model_validate` drops it and the region quietly serves on the
+        # default. The render check then polled the right port by accident,
+        # which would have become a mystifying failure the moment anybody
+        # changed either side.
+        "server": {"port": port},
         "observability": {
             "interactions": {
                 "enabled": True,
