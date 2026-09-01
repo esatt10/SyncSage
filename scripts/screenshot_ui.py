@@ -20,6 +20,7 @@ import argparse
 import json
 import shutil
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -116,7 +117,54 @@ def _free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def _seed(root: Path) -> Path:
+def _fetch_benchmark(root: Path) -> dict | None:
+    """Materialize SciFact beside the narrative corpus. ``None`` if unavailable.
+
+    Two corpora in one region, because they demonstrate different things and
+    neither substitutes for the other.
+
+    The handbook is a *narrative*: a handful of runbooks whose repeated,
+    related questions are what memory formation keys on. It is the right
+    corpus for the notebook and memory screenshots and a useless one for
+    retrieval measurement — with nine documents and a top-10, every query is
+    served whatever the ranking does.
+
+    SciFact is a *benchmark*: 395 scientific abstracts, a quarter of them real
+    PDFs, and 60 claims whose supporting documents a domain expert annotated.
+    Those annotations are the known-positives, so the evaluation and tuning
+    numbers measure retrieval rather than measuring this script's opinion of
+    what a good answer looks like — which is what they did while the fixture
+    was hand-written.
+
+    Skipped, loudly, when the fetch is not possible: the screenshots that do
+    not depend on it should still regenerate on a machine with no network.
+    """
+
+    import subprocess
+
+    corpus = root / "workspace" / "scifact"
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                str(REPO / "scripts" / "fetch_benchmark_corpus.py"),
+                "--cache",
+                str(REPO / ".benchmark-cache"),
+                "--out",
+                str(corpus),
+            ],
+            check=True,
+            cwd=REPO,
+        )
+    except Exception as exc:  # noqa: BLE001 - a missing benchmark is not fatal
+        print(f"  benchmark corpus unavailable ({exc}); tuning panels will be thin")
+        return None
+    index = json.loads((corpus.parent / "benchmark.json").read_text(encoding="utf-8"))
+    index["path"] = str(corpus)
+    return index
+
+
+def _seed(root: Path, benchmark: dict | None = None) -> Path:
     workspace = root / "workspace" / "handbook"
     for name, body in CORPUS.items():
         path = workspace / name
@@ -141,11 +189,25 @@ def _seed(root: Path) -> Path:
         # network, which is what makes it reproducible.
         "assistant": {"enabled": True, "provider": "none"},
         "sync": {"watcher": {"enabled": False}, "scheduler": {"enabled": False}},
-        "observability": {"interactions": {"enabled": True, "flush_batch_size": 1}},
+        "observability": {
+            "interactions": {
+                "enabled": True,
+                "flush_batch_size": 1,
+                # Every search, because a demo region has no traffic to spare:
+                # sampling down would leave the live-health panel below its
+                # own minimum and photograph an empty state.
+                "stage_sample_rate": 1.0,
+            }
+        },
         "memory": {
             "steering_enabled": True,
             "formation": {"enabled": True, "min_observations": 2, "min_sessions": 2},
         },
+        # `max_results: 2` against a corpus this size is what makes *rank*
+        # matter: a top-10 over nine documents returns everything, so every
+        # query is `served` whatever the ranking does and the stage histogram
+        # is a flat bar with nothing to say.
+        "tuning": {"enabled": True, "max_results": 2, "minimum_paired_queries": 2},
         # The evaluation plane, sized for a demo corpus. The sufficiency floors
         # exist to stop a *production* region publishing a number from four
         # data points; at this scale they would only stop the page measuring
@@ -181,12 +243,89 @@ def _seed(root: Path) -> Path:
             },
         ],
     }
+    if benchmark:
+        # A second source, not a replacement. The two corpora answer different
+        # questions and a real region has several sources anyway.
+        config["sources"].insert(
+            1,
+            {
+                "name": "scifact",
+                "type": "markdown_folder",
+                "path": benchmark["path"],
+                # Both formats: the PDFs are the point of writing a quarter of
+                # the corpus as PDFs, and excluding them would leave the
+                # extraction path unexercised by the numbers.
+                "include": ["**/*.md", "**/*.pdf"],
+                "sync": {"on_startup": False},
+            },
+        )
+        # With ~400 documents, the demo-scale floors are no longer doing the
+        # work they were lowered to do, and `max_results: 2` is no longer the
+        # only thing making rank matter.
+        config["tuning"]["max_results"] = 5
+        config["tuning"]["minimum_paired_queries"] = 5
+        config["evaluation"]["cohorts"]["anchor_minimum_queries"] = 10
     path = root / "pheasant.yaml"
     path.write_text(yaml.safe_dump(config), encoding="utf-8")
     return path
 
 
-def _drive(app) -> None:
+def _drive_benchmark(client, engine, benchmark: dict) -> None:
+    """Ask the benchmark's claims, and record its expert annotations as proof.
+
+    The judgements are **not** invented here. Each one is a domain expert
+    having read that abstract and marked the sentences that support or
+    contradict the claim — which is precisely what pheasant's proof taxonomy
+    calls ``explicit_accept``: somebody looked, and said so.
+
+    A CONTRADICT annotation is recorded as a positive too, deliberately.
+    Finding the paper that refutes a claim is a correct answer to "what does
+    the literature say about this", and scoring it as a negative would teach
+    the region to hide disagreement — which is the opposite of what a
+    knowledge base is for.
+    """
+
+    import pheasant.evaluation as evaluation
+
+    artifacts = {
+        str(row["relative_path"]): str(row["id"])
+        for row in engine.state.rows("SELECT id, relative_path FROM artifacts")
+    }
+    queries = [entry["query"] for entry in benchmark["queries"]]
+    # Three passes in different sessions: repetition is what the rolling
+    # cohort and the live-health sample count are built from.
+    for index in range(3):
+        for query in queries:
+            client.post(
+                "/search",
+                json={"query": query, "mode": "hybrid", "max_results": 5},
+                headers={
+                    "X-Pheasant-Session": f"scifact-{index}",
+                    "X-Pheasant-Principal": "user:reviewer",
+                },
+            )
+    recorded = 0
+    for entry in benchmark["evidence"]:
+        target = artifacts.get(entry["path"])
+        if not target:
+            continue
+        client.post(
+            "/evaluation/evidence",
+            json={
+                "query": entry["query"],
+                "target_id": target,
+                "event_type": entry["event_type"],
+                "principal": "user:reviewer",
+                "session_id": "scifact-0",
+                "interaction_id": f"scifact-{entry['doc_id']}",
+            },
+        )
+        recorded += 1
+    _ = evaluation
+    print(f"  benchmark: {len(queries)} claims asked, {recorded} expert judgements recorded")
+
+
+def _drive(app, benchmark: dict | None = None) -> None:
     """Put real content in front of the camera, through the real surfaces."""
 
     from fastapi.testclient import TestClient
@@ -195,6 +334,8 @@ def _drive(app) -> None:
 
     engine = app.state.engine
     engine.sync_source("handbook", "full")
+    if benchmark:
+        engine.sync_source("scifact", "full")
 
     artifacts = {
         str(row["relative_path"]): str(row["id"])
@@ -208,12 +349,24 @@ def _drive(app) -> None:
     with TestClient(app) as client:
         for text, scope, subject in MEMORIES:
             client.post("/memory", json={"text": text, "scope": scope, "subject": subject})
-        for query, session in SEARCHES:
-            client.post(
-                "/search",
-                json={"query": query, "mode": "hybrid", "max_results": 8},
-                headers={"X-Pheasant-Session": session, "X-Pheasant-Principal": "user:ada"},
-            )
+        # Three passes over the same questions, in different sessions. Not
+        # padding: a region gets asked the same things repeatedly, that
+        # repetition is what memory formation keys on, and it is what takes
+        # the live-health panel past its own minimum-sample floor. Below that
+        # floor the panel correctly refuses to publish a rate, which is right
+        # in production and photographs as an empty state.
+        for pass_index in range(3):
+            for query, session in SEARCHES:
+                client.post(
+                    "/search",
+                    json={"query": query, "mode": "hybrid", "max_results": 8},
+                    headers={
+                        "X-Pheasant-Session": f"{session}-{pass_index}" if pass_index else session,
+                        "X-Pheasant-Principal": "user:ada",
+                    },
+                )
+        if benchmark:
+            _drive_benchmark(client, engine, benchmark)
         # Typed proof, over the same endpoint an agent posts to.
         for query, path, event in EVIDENCE:
             target = artifacts.get(path)
@@ -236,6 +389,7 @@ def _drive(app) -> None:
     run_candidate_rules(engine)
     engine.sync_source("agent-memory", "full")
     _evaluate(engine)
+    _tune(engine)
 
 
 def _evaluate(engine) -> None:
@@ -255,14 +409,34 @@ def _evaluate(engine) -> None:
         raise SystemExit(f"the seeded evaluation run ended as {outcome.status}")
 
 
+def _tune(engine) -> None:
+    """One real tuning batch over the seeded region.
+
+    Real in the same sense the evaluation run is: it replays the searches the
+    script performed, attributes each miss to the stage that lost it, and
+    reaches whatever decision the evidence supports. The gate panel in the
+    README is often a *refusal* for that reason — a demo corpus has no holdout
+    cohort, so a genuine improvement cannot be confirmed and is not promoted.
+    """
+
+    import pheasant.tuning as tuning
+
+    outcome = tuning.run(engine, force=True)
+    decision = outcome.decision.outcome if outcome.decision else "none"
+    print(f"  tuning: {outcome.status}, {outcome.trials_run} trials, decision {decision}")
+    if outcome.status != "completed":
+        raise SystemExit(f"the seeded tuning batch ended as {outcome.status}")
+
+
 def _shoot(port: int, shots: dict[str, str]) -> None:
     """Navigate the way a person does: load once, then click.
 
-    A hard load of `/memory` does **not** reach the UI. That path is also an
-    API route, and FastAPI resolves it before the SPA's static mount -- so
-    `goto("/memory")` photographs a JSON body. The React router owns those
-    paths only after the app is running, which is exactly what clicking the
-    nav does.
+    Deep links now work -- a 404 falls back to the UI shell -- so `goto` would
+    reach most pages. Two reasons this still clicks. `/memory`, `/sources` and
+    `/graph` are *also* API routes, and FastAPI resolves those before the
+    static mount, so a hard load of one photographs a JSON body regardless of
+    the fallback. And clicking is what a person does, so it exercises the
+    router the way the app is actually used.
     """
     from playwright.sync_api import sync_playwright
 
@@ -375,6 +549,66 @@ def _shoot(port: int, shots: dict[str, str]) -> None:
         browser.close()
 
 
+def _shoot_tuning(port: int) -> None:
+    """The tuning plane's three panels, each cropped to what it is showing.
+
+    Separate from the full-page shot because these are the pieces a reader
+    needs to see close up: the stage histogram is the finding, the sweeps are
+    the evidence, and the gates are why a real improvement was refused.
+    """
+
+    from playwright.sync_api import sync_playwright
+
+    provisioned = Path("/opt/pw-browsers/chromium-1194/chrome-linux/chrome")
+    launch: dict[str, object] = {}
+    if provisioned.exists():
+        launch["executable_path"] = str(provisioned)
+
+    panels = {
+        "tuning-health": 'section:has(h2:text("Live pipeline health"))',
+        "tuning-diagnosis": 'section:has(h2:text("Where retrieval loses documents"))',
+        "tuning-sweeps": 'section:has(h2:text("Parameter sweeps"))',
+        "tuning-decision": 'section:has(h2:text("Decision"))',
+        "tuning-config": 'section:has(h2:text("What this region ranks with"))',
+    }
+    with sync_playwright() as play:
+        browser = play.chromium.launch(**launch)
+        page = browser.new_page(viewport=VIEWPORT, device_scale_factor=2)
+        errors: list[str] = []
+        page.on("pageerror", lambda exc: errors.append(str(exc)))
+        page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
+        page.wait_for_timeout(1200)
+        page.get_by_role("link", name="Tuning", exact=True).click()
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(2500)
+        # One explanation opened before the diagnosis is photographed. The
+        # whole point of the catalog is that a measure and its meaning are a
+        # click apart, and a screenshot of the collapsed state shows a "?"
+        # rather than the thing the "?" is for.
+        opener = page.locator(
+            'section:has(h2:text("Where retrieval loses documents")) .explain > summary'
+        )
+        if opener.count():
+            opener.first.click()
+            page.wait_for_timeout(400)
+
+        for name, selector in panels.items():
+            panel = page.locator(selector)
+            if not panel.count():
+                # Loud rather than quiet: a panel that vanished because its
+                # endpoint changed shape should fail the run, not silently
+                # leave a stale image in the README.
+                raise SystemExit(f"the tuning page has no {name!r} panel to photograph")
+            panel.first.scroll_into_view_if_needed()
+            page.wait_for_timeout(400)
+            out = TARGET / f"{name}.png"
+            panel.first.screenshot(path=str(out))
+            print(f"  {out.relative_to(REPO)}  ({out.stat().st_size // 1024} KiB)")
+        if errors:
+            raise SystemExit(f"the tuning page raised: {errors}")
+        browser.close()
+
+
 def _shoot_run_states(port: int, config) -> None:
     """Photograph the two states a batch reaches when a process goes away.
 
@@ -458,10 +692,9 @@ def _shoot_run_states(port: int, config) -> None:
             )
             if "run-inflight" not in reclaimed:
                 raise SystemExit("the stalled run was not reclaimed; nothing to photograph")
-            # Back to `/` and click, never `reload()`. The page is sitting on
-            # `/evaluation`, and a hard load of an SPA path does not reach the
-            # UI -- the React router owns those paths only once the app is
-            # running. The same trap `_shoot` documents for `/memory`.
+            # Back to `/` and click, never `reload()`. A reload would work now
+            # that deep links fall back to the shell, but clicking is what a
+            # person does and it keeps this identical to `_shoot`.
             page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
             page.wait_for_timeout(1200)
             page.get_by_role("link", name="Effectiveness", exact=True).click()
@@ -482,6 +715,16 @@ def main() -> int:
     parser.add_argument(
         "--keep", action="store_true", help="Leave the seeded region on disk for inspection."
     )
+    parser.add_argument(
+        "--no-benchmark",
+        action="store_true",
+        help=(
+            "Skip the SciFact corpus. The retrieval and tuning panels then run "
+            "over the nine-document narrative corpus, where every query is "
+            "served whatever the ranking does — useful for a fast local run, "
+            "and not what should be published."
+        ),
+    )
     args = parser.parse_args()
 
     dist = REPO / "ui" / "dist"
@@ -497,7 +740,8 @@ def main() -> int:
 
     root = Path(tempfile.mkdtemp(prefix="pheasant-shots-"))
     try:
-        config_path = _seed(root)
+        benchmark = None if args.no_benchmark else _fetch_benchmark(root)
+        config_path = _seed(root, benchmark)
         config = PheasantConfig.model_validate(
             yaml.safe_load(config_path.read_text(encoding="utf-8"))
         )
@@ -506,7 +750,7 @@ def main() -> int:
         # and seeding through a TestClient consumes that. The served app is a
         # fresh one reading what the first wrote -- which is also a fair
         # reflection of what a browser sees, since it is a cold process.
-        _drive(create_app(config, config_path=str(config_path)))
+        _drive(create_app(config, config_path=str(config_path)), benchmark)
         app = create_app(config, config_path=str(config_path))
 
         port = _free_port()
@@ -529,10 +773,12 @@ def main() -> int:
                 "notebook": "Notebook",
                 "memory": "Memory",
                 "evaluation": "Effectiveness",
+                "tuning": "Tuning",
                 "sources": "Sources",
                 "graph": "Graph",
             },
         )
+        _shoot_tuning(port)
         _shoot_run_states(port, config)
         server.should_exit = True
         thread.join(timeout=10)

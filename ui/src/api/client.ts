@@ -43,6 +43,16 @@ import type {
   KnowledgeBaseUpdate,
   RetrievalResponse,
   RetrievalSettings,
+  TuningBundle,
+  TuningExperimentSummary,
+  TuningGlossary,
+  TuningHealth,
+  TuningLineage,
+  TuningObjectives,
+  TuningTrials,
+  TuningParameters,
+  TuningReport,
+  TuningStatus,
   UploadResponse,
 } from "./types";
 
@@ -523,6 +533,58 @@ export const api = {
       events: EvaluationTaxonomyEvent[];
       defaults: Record<string, boolean>;
     }>("/evaluation/taxonomy"),
+
+  // The tuning plane. Same shape as the evaluation calls above, and for the
+  // same reason: `tuningStatus` reads `/state`, so it keeps answering for a
+  // batch this replica did not start and one whose container was restarted.
+  tuningStatus: (experiment?: string) =>
+    request<TuningStatus>(`/tuning/status${qs({ experiment })}`),
+  tuningRun: (body: { force?: boolean; apply?: boolean; diagnose_only?: boolean } = {}) =>
+    request<{ job_id: string; status: string }>("/tuning/run", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  tuningReport: (experiment?: string) =>
+    request<TuningReport>(`/tuning/report${qs({ experiment })}`),
+  tuningExperiments: (limit = 20) =>
+    request<{ experiments: TuningExperimentSummary[] }>(`/tuning/experiments${qs({ limit })}`),
+  tuningParameters: () => request<TuningParameters>("/tuning/parameters"),
+  tuningBundles: (limit = 20) =>
+    request<{ bundles: TuningBundle[] }>(`/tuning/bundles${qs({ limit })}`),
+  tuningApply: (bundleId: string) =>
+    request<{ applied: boolean; bundle: TuningBundle }>("/tuning/bundles/apply", {
+      method: "POST",
+      body: JSON.stringify({ bundle_id: bundleId, applied_by: "ui" }),
+    }),
+  tuningRollback: (to = "base") =>
+    request<{ reverted: boolean; bundle: TuningBundle | null; to: string }>(
+      "/tuning/bundles/rollback",
+      { method: "POST", body: JSON.stringify({ to }) },
+    ),
+  // Experiment observability, served from /state rather than from a tracking
+  // server: the parameter point, the score, the stage and the rationale are
+  // already rows, so the sweep a reader wants is a query and not an export.
+  tuningTrials: (experiment?: string) =>
+    request<TuningTrials>(`/tuning/trials${qs({ experiment })}`),
+  tuningHealth: (since?: string) => request<TuningHealth>(`/tuning/health${qs({ since })}`),
+  tuningCancel: (experimentId?: string) =>
+    request<{ cancelled: boolean; experiment_id: string }>("/tuning/cancel", {
+      method: "POST",
+      body: JSON.stringify({ experiment_id: experimentId, requested_by: "ui" }),
+    }),
+  tuningPin: (pinned: string[]) =>
+    request<{ pinned: string[]; persisted: boolean }>("/tuning/pinned", {
+      method: "PATCH",
+      body: JSON.stringify({ pinned }),
+    }),
+  tuningGlossary: () => request<TuningGlossary>("/tuning/glossary"),
+  tuningObjectives: () => request<TuningObjectives>("/tuning/objectives"),
+  tuningLineage: () => request<TuningLineage>("/tuning/lineage"),
+  tuningPrune: (experimentId: string) =>
+    request<{ pruned: string; removed: Record<string, number> }>(
+      `/tuning/experiments/${encodeURIComponent(experimentId)}`,
+      { method: "DELETE" },
+    ),
 };
 
 export { API_BASE };

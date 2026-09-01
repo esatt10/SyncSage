@@ -155,6 +155,44 @@ than N, and it never runs inside `sync_lock`.
 
 See [Knowledge-effectiveness evaluation](../knowledge-effectiveness.md).
 
+## Retrieval performance tuning (tuning plane)
+
+Off by default (`tuning.enabled`), and read-only unless a bundle is applied.
+Where the evaluation plane says *how well* retrieval is doing, this says **which
+step is failing** — and after the merge a lexical miss, a filtered-out document,
+a fusion demotion and a truncation all look identical, because they all produce
+an absent result.
+
+Everything these write lands in the `tuning_*` tables and under
+`/exports/tuning`, and none of it is ever indexed, chunked or returned by a
+search: a region must not retrieve its own experiments as knowledge.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/tuning/run` | Start a batch as a background job; returns `job_id`. Body: `force`, `apply`, `diagnose_only`. `diagnose_only` runs the first movement and stops — it attributes every miss to the stage that lost it and proposes nothing. `apply` lets a winner that passed every gate become the fleet's live ranking; separate from `force` on purpose, because "run it anyway" must not imply "change what every replica serves". `400` when tuning is disabled and `force` is not set. |
+| GET | `/tuning/status` | What a batch is doing **right now**, read from `/state` rather than the process running it — so it answers for a batch this replica did not start and one whose container has stopped. Returns `status`, `phase`, `completed_units`/`total_units`, `progress`, `searches`, `attempts`, `error`. An expired heartbeat reports `interrupted`, and the next attempt resumes from its stored trials. |
+| GET | `/tuning/report` | The latest report, or `?experiment=<id>`: the stage diagnosis, the trials with each one's motivating stage and rationale, the paired comparisons, every gate, the decision, and the bundle if one was produced. |
+| GET | `/tuning/experiments` | Recent batches with status, phase and searches spent. |
+| GET | `/tuning/parameters` | What this region ranks with, whether the values come from `config` or an applied `bundle`, the full tunable space (each parameter's stage, ladder and bounds), and the equivalent `search.ranking` block to paste into `pheasant.yaml`. |
+| GET | `/tuning/bundles` | Configuration bundles this region has produced, and which one is live. |
+| POST | `/tuning/bundles/apply` | Make one bundle the region's live retrieval overlay. Body: `bundle_id`, optional `applied_by`. `404` on an unknown id — a silent success would leave ranking unchanged while reporting that it changed. |
+| POST | `/tuning/bundles/rollback` | Stand the active overlay down; the region returns to its configured values. |
+
+**Applying is fleet-scoped by construction.** The active bundle is one row in
+`/state`; every replica resolves it on a short TTL, so a fleet converges without
+a rolling restart. There is deliberately no per-request and no per-principal
+override, and nowhere in the schema for one to live: retrieval parameters that
+varied by caller would make two agents disagree about what the region contains,
+and would make every number the evaluation plane publishes a measurement of
+whoever happened to ask.
+
+Running a batch is a background job because it replays a cohort through the real
+search path. It takes the `__tuning__` lease (so several replicas produce one
+batch), never takes `sync_lock`, and stands down while the index queue has work
+in it — indexing is somebody waiting, and this is a measurement.
+
+See [Retrieval performance tuning](../retrieval-tuning.md).
+
 ## Assistant (grounded chat)
 
 | Method | Path | Purpose |
@@ -168,7 +206,11 @@ See [Knowledge-effectiveness evaluation](../knowledge-effectiveness.md).
 See [Ask your knowledge base](../how-to/chat-and-ui.md) and
 [Customize the answering workflow](../how-to/agent-workflows.md).
 
-## Retrieval tuning
+## Answering effort (`assistant.retrieval`)
+
+How hard the answering workflows look before they answer. Not to be confused
+with the **retrieval tuning plane** above, which tunes how the region *ranks*;
+these knobs decide how much it *fetches* per question.
 
 | Method | Path | Purpose |
 |---|---|---|

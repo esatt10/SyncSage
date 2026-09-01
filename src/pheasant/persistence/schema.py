@@ -629,6 +629,144 @@ CREATE INDEX IF NOT EXISTS idx_evaluation_metrics_run
   ON evaluation_metrics(run_id, metric_id, variant_id);
 CREATE INDEX IF NOT EXISTS idx_evaluation_metrics_trend
   ON evaluation_metrics(kb_id, metric_id, cohort_id, variant_id);
+-- The tuning plane (docs/retrieval-tuning.md). Four tables, and the split
+-- between what is here and what is not is the point of the design: /state
+-- holds the small, queryable index -- an experiment, a trial's scores, a
+-- decision, a bundle -- and the bulky per-query, per-trial rankings go to
+-- /exports/tuning as compressed JSONL. A trial's ranked lists are
+-- regenerable from the corpus and the parameters; an operational database is
+-- not where they should accumulate, and putting them here would grow /state
+-- proportionally to (queries x trials) on every pass.
+--
+-- Every table here is additive and none of it is ever indexed, chunked, or
+-- returned by a search. A region must not retrieve its own experiments as
+-- knowledge, for the same reason it must not retrieve its own measurements.
+--
+-- One tuning batch. Content-addressed like `evaluation_runs` and for the same
+-- reason: an experiment IS its (region, snapshot, space, cohort, budget)
+-- tuple, so re-running an unchanged one is the same experiment rather than a
+-- second row that looks like a second data point. Progress lives in columns,
+-- not in a process, so the UI can watch a batch it did not start and a
+-- container that stops mid-pass leaves a reclaimable row rather than a
+-- spinner that never ends.
+CREATE TABLE IF NOT EXISTS tuning_experiments (
+  experiment_id TEXT PRIMARY KEY,
+  kb_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  cohort_id TEXT NOT NULL,
+  holdout_cohort_id TEXT,
+  control_cohort_id TEXT,
+  space_digest TEXT NOT NULL,
+  baseline_point_id TEXT NOT NULL,
+  budget_json TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  status TEXT NOT NULL,
+  phase TEXT,
+  phase_detail TEXT,
+  completed_units INTEGER NOT NULL DEFAULT 0,
+  total_units INTEGER NOT NULL DEFAULT 0,
+  heartbeat_at TEXT,
+  owner TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  searches INTEGER NOT NULL DEFAULT 0,
+  diagnosis_json TEXT,
+  report_json TEXT,
+  error TEXT,
+  -- Cancellation is a column, not a process flag. A batch runs in a thread
+  -- inside whichever replica started it, and the person cancelling is talking
+  -- to whichever replica their browser reached — usually a different one. The
+  -- runner reads this between units, so a cancel from any replica lands.
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  cancel_requested_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tuning_experiments_time
+  ON tuning_experiments(kb_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_tuning_experiments_live
+  ON tuning_experiments(kb_id, status, heartbeat_at);
+-- One point evaluated on one cohort. Written as each trial completes, which
+-- is what makes a batch **resumable**: the experiment id is content-addressed,
+-- so a restart re-derives it, loads the trials already done, and evaluates
+-- only what is missing. Same argument `evaluation_replays` makes, and the same
+-- argument `source_checkpoints` makes for a connector.
+--
+-- `metrics_json` is the scores; the ranked ids behind them are in cold storage
+-- under `cold_ref`. A trial row stays a few hundred bytes however large the
+-- cohort is.
+CREATE TABLE IF NOT EXISTS tuning_trials (
+  trial_id TEXT PRIMARY KEY,
+  experiment_id TEXT NOT NULL,
+  kb_id TEXT NOT NULL,
+  point_id TEXT NOT NULL,
+  cohort_id TEXT NOT NULL,
+  cohort_name TEXT NOT NULL,
+  cost_class TEXT NOT NULL,
+  motivating_stage TEXT NOT NULL,
+  generation INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  evaluated_queries INTEGER NOT NULL DEFAULT 0,
+  excluded_queries INTEGER NOT NULL DEFAULT 0,
+  searches INTEGER NOT NULL DEFAULT 0,
+  duration_ms REAL,
+  primary_metric REAL,
+  point_json TEXT NOT NULL,
+  proposal_json TEXT NOT NULL,
+  metrics_json TEXT NOT NULL,
+  histogram_json TEXT,
+  cold_ref TEXT,
+  failed TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tuning_trials_experiment
+  ON tuning_trials(experiment_id, cohort_id, point_id);
+CREATE INDEX IF NOT EXISTS idx_tuning_trials_rank
+  ON tuning_trials(experiment_id, primary_metric);
+-- What an experiment concluded, and every reason behind it. Separate from the
+-- experiment row because a decision outlives the batch that produced it: a
+-- bundle points at its decision, and reading "why is the region ranked this
+-- way" must not depend on an experiment row still being around.
+CREATE TABLE IF NOT EXISTS tuning_decisions (
+  decision_id TEXT PRIMARY KEY,
+  experiment_id TEXT NOT NULL,
+  kb_id TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  winning_point_id TEXT,
+  gates_passed INTEGER NOT NULL DEFAULT 0,
+  holdout_confirmed INTEGER NOT NULL DEFAULT 0,
+  control_regressed INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tuning_decisions_experiment
+  ON tuning_decisions(kb_id, experiment_id, created_at);
+-- A packaged configuration set, and the fleet's active pointer.
+--
+-- At most one row per kb_id has `applied_at` set and `superseded_at` NULL;
+-- that row IS the region's retrieval configuration overlay, and every replica
+-- reading this /state resolves it (see `search.ranking.RankingResolver`).
+-- Applying is fleet-scoped by construction: there is no principal column and
+-- no request column, so there is nowhere for a per-caller override to live.
+--
+-- `replaces_json` is what was in force when the bundle was applied. Rollback
+-- restores it, which makes reverting a stored fact rather than an operator's
+-- recollection of what the config used to say.
+CREATE TABLE IF NOT EXISTS tuning_bundles (
+  bundle_id TEXT NOT NULL,
+  kb_id TEXT NOT NULL,
+  experiment_id TEXT,
+  decision_id TEXT,
+  snapshot_id TEXT,
+  created_at TEXT NOT NULL,
+  applied_at TEXT,
+  applied_by TEXT,
+  superseded_at TEXT,
+  parameters_json TEXT NOT NULL,
+  replaces_json TEXT,
+  payload_json TEXT NOT NULL,
+  PRIMARY KEY (kb_id, bundle_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tuning_bundles_active
+  ON tuning_bundles(kb_id, applied_at, superseded_at);
 """
 
 #: SQLite-only: WAL, plus the FTS5 virtual tables.

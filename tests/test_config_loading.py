@@ -226,3 +226,115 @@ def test_removed_setting_warning_is_logged_once_per_process(tmp_path: Path, capl
     obsidian_warnings = [r for r in caplog.records if "obsidian" in r.getMessage()]  # type: ignore[attr-defined]
     assert len(obsidian_warnings) == 1
     assert "graph workspace" in obsidian_warnings[0].getMessage()
+
+
+#: Keys in ``pheasant.example.yaml`` that no schema field backs, with the
+#: reason each is deliberate. Every entry here is a **decision**, which is the
+#: point of listing them rather than letting the check ignore unknown keys
+#: wholesale — the same idiom ``WIZARD_EXEMPT`` and ``NOT_MIGRATED`` use.
+#:
+#: These four are descriptive: they document behaviour that is not configurable
+#: (the lexical engine *is* FTS5; idempotency is a product guarantee, not a
+#: setting). They predate this check. Adding a fifth without a reason is what
+#: it exists to stop.
+EXAMPLE_ONLY_KEYS = {
+    "search.keyword": "documents that the lexical engine is FTS5; not selectable",
+    "sync.startup": "descriptive; the real knobs are sources[].sync",
+    "sync.git.reindex_on_branch_switch": "descriptive; branch handling is not optional",
+    "sync.idempotency": "documents pillar 1, which is a guarantee rather than a setting",
+}
+
+
+def test_the_example_config_has_no_keys_the_schema_silently_drops() -> None:
+    """A documented key that does nothing is worse than an undocumented one.
+
+    ``model_validate`` filters unknown keys, so a stale block in the reference
+    config is invisible: it loads, it validates, and every value in it is
+    ignored. ``search.ranking`` sat that way for three releases — four
+    plausible-looking keys (``prefer_exact_path_matches``,
+    ``prefer_recent_commits``, ``graph_neighbor_boost``,
+    ``max_results_default``) that no field backed, in the block a reader would
+    copy first when they wanted to change ranking.
+
+    It was harmless while nothing read ``search.ranking``. It stopped being
+    harmless the moment that block became the real tuning surface, and the
+    person it would have cost is one who copied the reference config and then
+    could not work out why their ranking never changed.
+    """
+
+    import dataclasses
+
+    import yaml
+
+    from pheasant.config.schema import PheasantConfig
+
+    example = Path(__file__).resolve().parents[1] / "pheasant.example.yaml"
+    raw = yaml.safe_load(example.read_text(encoding="utf-8"))
+    unknown: list[str] = []
+
+    def walk(dc: type, data: object, path: str) -> None:
+        if not dataclasses.is_dataclass(dc) or not isinstance(data, dict):
+            return
+        fields = {f.name: f for f in dataclasses.fields(dc)}
+        for key, value in data.items():
+            where = f"{path}.{key}"
+            if key not in fields:
+                if where not in EXAMPLE_ONLY_KEYS:
+                    unknown.append(where)
+                continue
+            factory = fields[key].default_factory
+            if factory is dataclasses.MISSING or not isinstance(value, dict):
+                continue
+            try:
+                nested = factory()
+            except Exception:  # noqa: BLE001 - a factory that needs arguments
+                continue
+            if dataclasses.is_dataclass(nested):
+                walk(type(nested), value, where)
+
+    for field in dataclasses.fields(PheasantConfig):
+        if field.name == "sources" or field.name not in raw:
+            continue
+        factory = field.default_factory
+        if factory is dataclasses.MISSING:
+            continue
+        default = factory()
+        if dataclasses.is_dataclass(default):
+            walk(type(default), raw[field.name], field.name)
+
+    assert not unknown, (
+        "pheasant.example.yaml documents keys no schema field backs, so they load "
+        f"and are silently ignored: {', '.join(sorted(unknown))}. Add the field, fix "
+        "the example, or record the key in EXAMPLE_ONLY_KEYS with its reason."
+    )
+
+
+def test_the_examples_ranking_block_is_the_real_tuning_surface() -> None:
+    """Every tunable parameter appears in the reference config, at its default.
+
+    Stronger than "no unknown keys": the block a reader copies has to be
+    *complete*, because these are the parameters `pheasant tune` proposes and a
+    half-documented surface sends people to read the source.
+    """
+
+    import yaml
+
+    from pheasant.search.ranking import DEFAULT_RANKING, PARAMETER_STAGES
+
+    example = Path(__file__).resolve().parents[1] / "pheasant.example.yaml"
+    raw = yaml.safe_load(example.read_text(encoding="utf-8"))
+    documented = raw.get("search", {}).get("ranking", {})
+
+    missing = sorted(set(PARAMETER_STAGES) - set(documented))
+    assert not missing, f"tunable parameters missing from pheasant.example.yaml: {missing}"
+
+    defaults = DEFAULT_RANKING.values()
+    drifted = {
+        name: (documented[name], defaults[name])
+        for name in PARAMETER_STAGES
+        if float(documented[name]) != defaults[name]
+    }
+    assert not drifted, (
+        "pheasant.example.yaml states values that are not the defaults, so copying it "
+        f"silently changes ranking: {drifted}"
+    )

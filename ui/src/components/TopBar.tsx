@@ -54,6 +54,12 @@ export function TopBar() {
           Effectiveness
         </NavLink>
         <NavLink
+          to="/tuning"
+          className={({ isActive }) => (isActive ? "navlink active" : "navlink")}
+        >
+          Tuning
+        </NavLink>
+        <NavLink
           to="/sources"
           className={({ isActive }) => (isActive ? "navlink active" : "navlink")}
         >

@@ -3535,3 +3535,338 @@ select.text-input {
 }
 
 .eval-page .data-table .num { text-align: right; font-family: var(--font-mono); }
+
+/* --------------------------------------------------------------------------
+   Retrieval tuning
+   --------------------------------------------------------------------------
+   The stage histogram is the page, and the one thing its styling has to carry
+   is the distinction between a stage a parameter can reach and one it cannot.
+   A bar chart where "the fusion demoted it" and "it was never indexed" render
+   identically invites the same response to two problems that have nothing in
+   common, so an unreachable stage is drawn muted and struck through with a
+   different accent rather than just labelled. */
+
+.tune-page .tune-section {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin-bottom: 16px;
+  background: var(--surface);
+}
+
+.tune-page .tune-section > h2 {
+  margin: 0 0 10px;
+  font-size: 15px;
+}
+
+.tune-page .tuning__status {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.tune-page .stages {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.tune-page .stage__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.tune-page .stage__bar {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--border);
+  overflow: hidden;
+  margin: 4px 0;
+}
+
+.tune-page .stage__fill {
+  height: 100%;
+  background: var(--accent);
+}
+
+/* Not reachable by any parameter: a different colour, not a smaller bar. The
+   count is still true, and dimming the number would hide the finding. */
+.tune-page .stage--unreachable .stage__fill {
+  background: var(--border-strong);
+}
+
+.tune-page .stage--unreachable .stage__head strong {
+  color: var(--text-muted);
+}
+
+.tune-page .stage p {
+  margin: 2px 0 0;
+  font-size: 12px;
+}
+
+.tune-page .tune-warning {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--warn, var(--border-strong));
+  background: var(--surface-alt, transparent);
+  font-size: 13px;
+}
+
+.tune-page .tune-error {
+  color: var(--danger);
+}
+
+.tune-page .bundles {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.tune-page .bundle {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.tune-page .bundle--live {
+  border-color: var(--ok);
+}
+
+.tune-page .bundle__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.tune-page .bundle__params {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.tune-page .badge--live {
+  background: var(--ok);
+  color: var(--surface);
+}
+
+.tune-page .badge--promote { background: var(--ok); color: var(--surface); }
+.tune-page .badge--reject,
+.tune-page .badge--failed { background: var(--danger); color: var(--surface); }
+.tune-page .badge--running { background: var(--accent); color: var(--surface); }
+
+.tune-page .gate {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.tune-page .gate--fail .badge { background: var(--danger); color: var(--surface); }
+.tune-page .gate--pass .badge { background: var(--ok); color: var(--surface); }
+
+/* Tuning: sweeps, rate tiles, and the experiment observability surface.
+   Charts use the app's own tokens rather than a chart palette — the only
+   colour distinctions here are status-like (tunable vs not, good vs bad) and
+   each one is labelled in text, so nothing depends on telling two hues apart. */
+
+.tune-page .sweeps {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.tune-page .sweep {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px 8px;
+  background: var(--bg-raised);
+}
+
+.tune-page .sweep figcaption {
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.tune-page .sweep svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+/* Reserved so the readout swapping between its hover and resting text does
+   not reflow the grid — a chart that twitches as the pointer crosses it is
+   harder to read than one that does not. */
+.tune-page .sweep__readout {
+  min-height: 18px;
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.tune-page .rate-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.tune-page .rate-tile {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  background: var(--bg-raised);
+}
+
+.tune-page .rate-tile--good { border-left-color: var(--ok); }
+.tune-page .rate-tile--bad { border-left-color: var(--danger); }
+
+.tune-page .rate-tile__label {
+  font-size: 12px;
+  color: var(--text-soft);
+}
+
+.tune-page .rate-tile__value {
+  font-size: 22px;
+  font-variant-numeric: tabular-nums;
+  margin: 2px 0;
+}
+
+.tune-page .rate-tile__hint { font-style: italic; }
+
+/* Explanation, base/overlay layers, lineage and mechanism comparison.
+
+   `.explain` is a <details> rather than a tooltip: tooltips are unreachable by
+   keyboard on most implementations, vanish while you are reading them, and
+   cannot hold three paragraphs. This stays open while the reader looks
+   between it and the number it explains. */
+
+.tune-page .explain {
+  display: inline-block;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.tune-page .explain > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 0 7px;
+  display: inline-block;
+  list-style: none;
+  user-select: none;
+}
+
+.tune-page .explain > summary::-webkit-details-marker { display: none; }
+.tune-page .explain > summary:hover { color: var(--text); border-color: var(--border-strong); }
+.tune-page .explain > summary:focus-visible { outline: 2px solid var(--accent); }
+
+.tune-page .explain__body {
+  display: block;
+  margin-top: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  font-size: 12px;
+  line-height: 1.5;
+  max-width: 60ch;
+  white-space: normal;
+}
+
+.tune-page .explain__body p { margin: 0 0 8px; }
+.tune-page .explain__body p:last-child { margin-bottom: 0; }
+
+/* Set apart because it is the part people skip, and the part that prevents
+   the wrong action. */
+.tune-page .explain__caveat {
+  border-left: 2px solid var(--warn);
+  padding-left: 8px;
+}
+
+.tune-page .objective {
+  border: 1px solid var(--accent-border);
+  background: var(--accent-soft);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  margin-bottom: 16px;
+}
+
+.tune-page .objective__head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.tune-page .objective__label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.tune-page .objective p { margin: 6px 0 0; }
+.tune-page .objective__trade { color: var(--text-soft); }
+
+.tune-page .layers {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.tune-page .layer {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+
+.tune-page .layer--live { border-left-color: var(--accent); }
+.tune-page .layer--off { opacity: 0.75; }
+.tune-page .layer__name { font-weight: 600; font-size: 13px; }
+.tune-page .layer p { margin: 4px 0 0; }
+
+.tune-page .lineage {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.tune-page .lineage li {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+
+.tune-page .lineage__head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.tune-page .mechanisms { margin-top: 12px; }
+.tune-page .mechanisms__hybrid td { border-top: 2px solid var(--border-strong); }
+.tune-page .mechanisms__loss { color: var(--danger); font-weight: 600; }

@@ -986,3 +986,360 @@ export interface EvaluationTaxonomyEvent {
   strength: "weak" | "moderate" | "strong" | "conclusive";
   note: string;
 }
+
+// --------------------------------------------------------------------------
+// The tuning plane
+//
+// Where the evaluation types describe *how well* retrieval is doing, these
+// describe **which step** of it is failing. The shapes below are the API's,
+// verbatim, rather than a UI-convenient flattening of them: a diagnosis is
+// evidence for a decision somebody may have to argue with later, and a view
+// model that dropped the denominator or the rationale would make that
+// impossible on exactly the screen where it matters.
+
+/** One pipeline stage's share of the misses. */
+export interface TuningStageEntry {
+  stage: string;
+  count: number;
+}
+
+/**
+ * The diagnosis: how misses distribute over the retrieval pipeline.
+ *
+ * `actionable_share` is the fraction a ranking parameter could plausibly move.
+ * It is nullable, and the null means "there were no misses to attribute" —
+ * which is not the same as zero, and must not render as a 0% bar.
+ */
+export interface TuningHistogram {
+  counts: Record<string, number>;
+  evaluated: number;
+  served: number;
+  misses: number;
+  actionable_misses: number;
+  actionable_share: number | null;
+  dominant_stage: string | null;
+  ranked: TuningStageEntry[];
+}
+
+export interface TuningDiagnosis {
+  diagnosis_id: string;
+  cohort_name: string;
+  histogram: TuningHistogram;
+  unevidenced_queries: number;
+  summary: string;
+}
+
+export interface TuningPoint {
+  point_id: string;
+  values: Record<string, number>;
+  delta: Record<string, [number, number]>;
+  delta_description: string;
+}
+
+export interface TuningProposal {
+  point: TuningPoint;
+  motivating_stage: string;
+  rationale: string;
+  cost_class: string;
+  strategy: string;
+  generation: number;
+}
+
+export interface TuningTrial {
+  trial_id: string;
+  proposal: TuningProposal;
+  cohort_name: string;
+  metrics: Record<string, number>;
+  histogram: TuningHistogram;
+  evaluated_queries: number;
+  excluded_queries: number;
+  searches: number;
+  duration_ms: number;
+  failed: string;
+}
+
+export interface TuningComparison {
+  metric: string;
+  baseline_value: number;
+  treatment_value: number;
+  delta: number;
+  paired_queries: number;
+  improved_queries: number;
+  regressed_queries: number;
+  excluded_queries: number;
+  formula: string;
+  substituted: string;
+}
+
+/** A gate is not a metric: it is evaluated before aggregation and blocks. */
+export interface TuningGate {
+  gate_id: string;
+  passed: boolean;
+  blocking: boolean;
+  summary: string;
+  observed: unknown;
+  threshold: unknown;
+}
+
+export interface TuningDecision {
+  decision_id: string;
+  outcome: "promote" | "reject" | "no_change" | "insufficient_evidence";
+  reason: string;
+  winning_point_id: string;
+  comparisons: TuningComparison[];
+  gates: TuningGate[];
+  gates_passed: boolean;
+  holdout_confirmed: boolean;
+  control_regressed: boolean;
+}
+
+export interface TuningBundle {
+  bundle_id: string;
+  kb_id: string;
+  experiment_id: string;
+  decision_id: string;
+  parameters: Record<string, number>;
+  replaces: Record<string, number>;
+  metrics: Record<string, number>;
+  gates: TuningGate[];
+  motivating_stage: string;
+  rationale: string;
+  created_at: string;
+  applied_at?: string;
+  applied_by?: string;
+  superseded_at?: string;
+  active?: boolean;
+}
+
+export interface TuningReport {
+  experiment: { experiment_id: string; snapshot_id: string; cohort_id: string };
+  objective?: TuningObjective & {
+    baseline_score?: number | null;
+    baseline_substituted?: string;
+  };
+  mechanisms?: Record<string, TuningMechanism>;
+  diagnosis: TuningDiagnosis;
+  decision: TuningDecision;
+  bundle: TuningBundle | null;
+  baseline: TuningTrial;
+  trials: TuningTrial[];
+  trial_count: number;
+  searches: number;
+  primary_metric: string;
+}
+
+export interface TuningStatus {
+  experiment_id: string;
+  status: string;
+  phase: string;
+  phase_detail: string;
+  completed_units: number;
+  total_units: number;
+  progress: number | null;
+  searches: number;
+  attempts: number;
+  error: string;
+  enabled?: boolean;
+  auto_enabled?: boolean;
+  auto_apply?: boolean;
+  tracking_backend?: string;
+}
+
+export interface TuningExperimentSummary {
+  experiment_id: string;
+  status: string;
+  phase: string;
+  started_at: string;
+  finished_at: string;
+  searches: number;
+  progress: number | null;
+}
+
+export interface TuningParameterSpec {
+  name: string;
+  stage: string;
+  cost_class: string;
+  candidates: number[];
+  bounds: number[];
+  rationale: string;
+}
+
+export interface TuningParameters {
+  active: {
+    provenance: string;
+    bundle_id: string;
+    values: Record<string, number>;
+    bundle: TuningBundle | null;
+    /** The configured floor a rollback returns to. */
+    base: { values: Record<string, number>; source: string; explanation: string };
+    /** The promoted bundle layered over it, if any. */
+    overlay: {
+      values: Record<string, number>;
+      bundle_id: string;
+      applied_at: string;
+      applied_by: string;
+      explanation: string;
+    };
+    /** Only the parameters where active differs from base. */
+    changes: { parameter: string; stage: string; base: number; active: number }[];
+  };
+  objective?: TuningObjective;
+  explanations?: Record<string, GlossaryEntry>;
+  space: {
+    digest: string;
+    pinned: string[];
+    parameters: TuningParameterSpec[];
+    cost_classes: Record<string, string[]>;
+  };
+  config_fragment: { search: { ranking: Record<string, number> } };
+}
+
+/** One point on a parameter's sweep: what it was set to, and what that scored. */
+export interface TuningSweepPoint {
+  trial_id: string;
+  value: number | null;
+  baseline_value: number | null;
+  metric: number | null;
+  stage: string;
+  cost_class: string;
+}
+
+export interface TuningTrialRow {
+  trial_id: string;
+  point_id: string;
+  cohort_name: string;
+  cost_class: string;
+  motivating_stage: string;
+  generation: number;
+  metrics: Record<string, number>;
+  point: { delta_description?: string; values?: Record<string, number> };
+  proposal: { rationale?: string };
+  evaluated_queries: number;
+  searches: number;
+}
+
+export interface TuningTrials {
+  experiment_id: string;
+  primary_metric: string;
+  trials: TuningTrialRow[];
+  sweeps: Record<string, TuningSweepPoint[]>;
+}
+
+/**
+ * Pipeline behaviour on live traffic.
+ *
+ * `status` is `insufficient_evidence` until enough searches have been sampled.
+ * That is a distinct state from "healthy", and the UI must render it as an
+ * absence rather than as zeroes — a 0% empty rate over four searches is not
+ * good news, it is no news.
+ */
+export interface TuningHealth {
+  status: "measured" | "insufficient_evidence";
+  classification?: string;
+  samples: number;
+  minimum_samples?: number;
+  reason?: string;
+  sample_rate?: number;
+  observation_enabled?: boolean;
+  empty?: {
+    count: number;
+    rate: number;
+    by_stage: Record<string, { count: number; share: number | null }>;
+  };
+  arms?: Record<
+    string,
+    {
+      observed: number;
+      contributed: number;
+      contribution_rate: number | null;
+      failed: number;
+    }
+  >;
+  filters?: Record<string, { dropped: number; per_search: number }>;
+  truncation?: { count: number; rate: number };
+  results_per_search?: number;
+  bundles?: Record<string, number>;
+  mixed_configurations?: boolean;
+  does_not_support?: string;
+  explanations?: Record<string, GlossaryEntry>;
+}
+
+/**
+ * One measure explained.
+ *
+ * `does_not_mean` is the load-bearing field. A dashboard of rates gets read
+ * confidently and wrongly — a 42% truncation rate looks alarming and is
+ * normal, a 0% empty rate looks fine and proves nothing — so the misreading
+ * each number invites travels with it rather than living in docs a reader
+ * reaches after the mistake.
+ */
+export interface GlossaryEntry {
+  term: string;
+  label: string;
+  kind: string;
+  means: string;
+  impact: string;
+  does_not_mean: string;
+  direction: "higher" | "lower" | "neutral";
+  stage?: string;
+  cost_class?: string;
+  bounds?: number[];
+}
+
+export interface TuningGlossary {
+  metrics: GlossaryEntry[];
+  health: GlossaryEntry[];
+  stages: GlossaryEntry[];
+  gates: GlossaryEntry[];
+  parameters: GlossaryEntry[];
+  parameters_without_explanation: string[];
+  reading_notes: string[];
+}
+
+/** A definition of "better", with what it accepts getting worse. */
+export interface TuningObjective {
+  objective_id: string;
+  label: string;
+  weights: Record<string, number>;
+  primary_metric: string;
+  summary: string;
+  trades_away: string;
+  higher_is_better: boolean;
+}
+
+export interface TuningObjectives {
+  active: TuningObjective;
+  available: TuningObjective[];
+  configured_by: string;
+}
+
+/** One configuration this region served, and what it displaced. */
+export interface TuningLineageEntry {
+  bundle_id: string;
+  experiment_id: string;
+  decision_id: string;
+  created_at: string;
+  applied_at: string;
+  applied_by: string;
+  superseded_at: string;
+  active: boolean;
+  parameters: Record<string, number>;
+  replaced: Record<string, number>;
+}
+
+export interface TuningLineage {
+  lineage: TuningLineageEntry[];
+  base_explanation: string;
+}
+
+/** One retrieval mechanism scored alone, and what the merge adds over it. */
+export interface TuningMechanism {
+  metrics: Record<string, number>;
+  objective_score: number | null;
+  evaluated_queries: number;
+  hybrid_gain?: number;
+  /** Vector arm only: which embedder produced this score. */
+  provider?: string;
+  /** False when the score came from the offline `stub` embedder. */
+  semantic?: boolean;
+}

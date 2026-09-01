@@ -202,6 +202,7 @@ class StateStore:
         if interaction_columns and "result_paths_json" not in interaction_columns:
             self.conn.execute("ALTER TABLE interaction_events ADD COLUMN result_paths_json TEXT")
         self._migrate_evaluation_progress()
+        self._migrate_tuning_control()
         self.conn.commit()
         self._migrate_fts_titles()
 
@@ -221,6 +222,34 @@ class StateStore:
         ("attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("error", "TEXT"),
     )
+
+    #: Control columns on ``tuning_experiments``, added after the table
+    #: shipped. Guarded for exactly the reason the evaluation ones are: a
+    #: `/state` written before these existed keeps the old shape, because
+    #: `CREATE TABLE IF NOT EXISTS` cannot widen a table that already exists.
+    #:
+    #: ``cancel_requested`` is a *column* rather than a process flag on
+    #: purpose. A batch runs in a thread inside whichever replica started it,
+    #: and the person cancelling is talking to whichever replica their browser
+    #: reached — usually a different one. A cancel that only set an in-memory
+    #: flag would silently do nothing in a fleet, which is the same lesson
+    #: progress learned when it lived in a job registry.
+    _TUNING_EXPERIMENT_COLUMNS: tuple[tuple[str, str], ...] = (
+        ("cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
+        ("cancel_requested_by", "TEXT"),
+    )
+
+    def _migrate_tuning_control(self) -> None:
+        """Add the control columns to a pre-existing ``tuning_experiments``."""
+
+        existing = self.backend.table_columns("tuning_experiments")
+        if not existing:
+            return
+        for column, declaration in self._TUNING_EXPERIMENT_COLUMNS:
+            if column not in existing:
+                self.conn.execute(
+                    f"ALTER TABLE tuning_experiments ADD COLUMN {column} {declaration}"
+                )
 
     def _migrate_evaluation_progress(self) -> None:
         """Add the run-progress columns to a pre-existing ``evaluation_runs``.
@@ -301,6 +330,10 @@ class StateStore:
                     "ALTER TABLE interaction_events ADD COLUMN result_paths_json TEXT"
                 )
             self._migrate_evaluation_progress()
+            # Both paths, for the reason `_migrate_evaluation_progress` states:
+            # Postgres returns early from `migrate`, so an additive column
+            # named in only one place exists on exactly one backend.
+            self._migrate_tuning_control()
             self.conn.execute(
                 "INSERT INTO pheasant_schema_meta(key, value, updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "

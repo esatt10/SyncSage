@@ -86,6 +86,14 @@ TABLE_ORDER = (
     "evaluation_runs",
     # After runs, snapshots and cohorts: a metric row names all three.
     "evaluation_metrics",
+    # The tuning plane. `tuning_bundles` is the one table here whose loss is
+    # operationally visible rather than merely historical: the applied row is
+    # the region's live retrieval overlay, so a migration that dropped it
+    # would silently revert every replica's ranking to the config file.
+    "tuning_experiments",
+    "tuning_trials",
+    "tuning_decisions",
+    "tuning_bundles",
 )
 
 #: Core tables deliberately left behind, and why.

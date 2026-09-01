@@ -64,6 +64,13 @@ class QueryReplay:
     result_count: int = 0
     duration_ms: float = 0.0
     steering_applied: dict[str, Any] = field(default_factory=dict)
+    #: The per-stage diagnostic, present only when the engine was built with
+    #: ``explain=True`` -- which the evaluation plane never does and the
+    #: tuning plane always does. Empty here means "not asked for", never
+    #: "nothing happened": a stage block is large (three ranked arms and a
+    #: pre-truncation fused list per query) and belongs in cold storage, not
+    #: in an evaluation checkpoint that a resumed batch reloads in full.
+    stages: dict[str, Any] = field(default_factory=dict)
     failed: str = ""
 
     def rank_of(self, target_id: str) -> int | None:
@@ -89,6 +96,7 @@ class QueryReplay:
             "result_count": self.result_count,
             "duration_ms": round(self.duration_ms, 3),
             "steering_applied": self.steering_applied,
+            "stages": self.stages,
             "failed": self.failed,
         }
 
@@ -118,6 +126,7 @@ class QueryReplay:
             result_count=int(payload.get("result_count") or 0),
             duration_ms=float(payload.get("duration_ms") or 0.0),
             steering_applied=dict(payload.get("steering_applied") or {}),
+            stages=dict(payload.get("stages") or {}),
             failed=str(payload.get("failed") or ""),
         )
 
@@ -212,6 +221,7 @@ class ReplayEngine:
         max_results: int = 10,
         mode: str = "hybrid",
         shadow: list[dict[str, Any]] | None = None,
+        explain: bool = False,
     ):
         self.searcher = searcher
         self.kb_id = kb_id
@@ -220,6 +230,12 @@ class ReplayEngine:
         self.max_results = max(1, int(max_results))
         self.mode = mode
         self.shadow = list(shadow or [])
+        # Ask retrieval to report what each stage did. Off for the evaluation
+        # plane, which measures *outcomes* and whose checkpoints must stay
+        # small enough to reload wholesale; on for the tuning plane, which
+        # cannot propose a parameter without knowing which stage lost the
+        # document.
+        self.explain = bool(explain)
 
     def _policy(self, variant: Variant, query: EvaluatedQuery) -> dict[str, Any]:
         """The memory policy for one (variant, query) pair.
@@ -259,6 +275,7 @@ class ReplayEngine:
                 principal=expectation.get("principal"),
                 memory=self._policy(variant, query),
                 steering_kinds=variant.steering_kinds,
+                explain=self.explain,
                 extra_steering_records=(
                     shadow_records(self.shadow, now=query.occurred_at or "")
                     if variant.candidate_ids
@@ -305,8 +322,17 @@ class ReplayEngine:
                 result.memory_record_ids.append(record_id)
         result.result_count = len(result.ranked_ids)
         counts = payload.get("counts") or {}
+        stages = payload.get("stages") or {}
+        result.stages = dict(stages)
+        # With `explain` on these are the arms' real ranked lists; without it
+        # there is nothing to fill them with, and the arm *names* (which is
+        # all `counts` can give) are still worth recording, because "the
+        # vector arm contributed nothing" is a fact a metric may want.
+        surviving = stages.get("surviving") or {}
         result.arms = {
-            name: [] for name in ("text", "vector", "graph") if int(counts.get(name) or 0) > 0
+            name: [str(item) for item in surviving.get(name, [])]
+            for name in ("text", "vector", "graph")
+            if int(counts.get(name) or 0) > 0 or surviving.get(name)
         }
         result.steering_applied = dict(payload.get("memory_steering") or {})
         return result

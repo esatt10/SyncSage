@@ -27,6 +27,7 @@ from pheasant.search.criteria import (
     source_of,
 )
 from pheasant.search.hybrid import HybridSearch
+from pheasant.search.ranking import resolver_for
 from pheasant.search.sqlite_store import SearchStore
 from pheasant.security.path_policy import resolve_config_write_target, resolve_under
 from pheasant.sync.engine import SyncEngine
@@ -80,13 +81,14 @@ class PheasantTools:
         self.jobs = JobRegistry()
         self._job_lock = threading.Lock()
         self.searcher = HybridSearch(
-            SearchStore(self.state),
+            SearchStore(self.state, ranking=resolver_for(config, self.state)),
             vector=self.engine.vector_searcher(),
             node_index=self.engine.node_index,
             wasm_relationship_search=config.search.wasm_relationship_search,
             steering_enabled=config.memory.steering_enabled,
             default_memory_policy=config.memory.default_policy,
             usage_tracking=config.memory.usage_tracking,
+            stage_sample_rate=config.observability.interactions.stage_sample_rate,
         )
 
     def _publish_sync(
@@ -990,6 +992,415 @@ class PheasantTools:
         payload = evaluation.progress(self.state, self.config.knowledge_base_id, run_id)
         payload["enabled"] = bool(self.config.evaluation.enabled)
         return payload
+
+    # ---- the tuning plane ------------------------------------------------
+
+    def start_retrieval_tuning(
+        self,
+        knowledge_base: str,
+        diagnose_only: bool = False,
+        apply: bool = False,
+        force: bool = False,
+    ) -> dict:
+        """Start a retrieval tuning batch and return immediately with its id.
+
+        Answers the question an agent cannot otherwise ask: *which step of
+        retrieval is failing*. After the merge a lexical miss, a filtered-out
+        document, a fusion demotion and a truncation all look identical -- an
+        absent result -- and they call for four different responses.
+
+        ``diagnose_only`` runs the first movement and stops: it attributes
+        every miss to the stage that lost it and proposes nothing. That is the
+        right call first, because the most valuable thing this can tell you is
+        that the failures are *not* in a stage any retrieval parameter reaches.
+
+        ``apply`` lets a winner that passes every gate -- including
+        confirmation on a cohort it was never selected on -- become the
+        region's live ranking for every replica. Off by default and worth
+        leaving off: producing a bundle changes nothing, and applying one
+        re-ranks the whole fleet.
+
+        Minutes of work, so this hands back a job id. Poll
+        :meth:`get_retrieval_tuning_status`; progress lives in ``/state``, so
+        it survives a restart and is readable from any process.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        import threading
+
+        import pheasant.tuning as tuning
+
+        if not self.config.tuning.enabled and not force:
+            raise ValueError(
+                "Retrieval tuning is disabled for this knowledge base. Enable "
+                "`tuning.enabled` in pheasant.yaml, or pass force=true for a "
+                "one-off batch."
+            )
+        in_flight = tuning.progress(self.state, self.config.knowledge_base_id)
+        if in_flight.get("status") == "running":
+            return {"status": "already-running", **in_flight}
+
+        label = "tuning (diagnose)" if diagnose_only else "tuning"
+        job = self.jobs.create("tuning", label, targets=["tuning"])
+
+        def _run() -> None:
+            try:
+                kwargs: dict[str, Any] = {"force": True}
+                if diagnose_only:
+                    from pheasant.tuning.strategy import Budget
+
+                    kwargs["budget"] = Budget(
+                        refusion_trials=0, requery_trials=0, max_searches=10_000
+                    )
+                if apply:
+                    self.config.tuning.auto.apply = True
+                try:
+                    outcome = tuning.run(
+                        self.engine,
+                        on_progress=lambda phase, detail: self.jobs.progress(
+                            job.id, phase=phase, detail=detail or phase, source="tuning"
+                        ),
+                        **kwargs,
+                    )
+                finally:
+                    if apply:
+                        self.config.tuning.auto.apply = False
+                self.jobs.finish(
+                    job.id,
+                    status="succeeded" if outcome.status != "failed" else "failed",
+                    result={
+                        "experiment_id": outcome.experiment_id,
+                        "status": outcome.status,
+                        "outcome": outcome.decision.outcome if outcome.decision else "",
+                        "bundle_id": outcome.bundle_id,
+                        "applied": outcome.applied,
+                        "skipped_reason": outcome.skipped_reason,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - a job records its own failure
+                self.jobs.finish(job.id, status="failed", error=str(exc))
+
+        threading.Thread(target=_run, name="pheasant-mcp-tuning", daemon=True).start()
+        return {"job_id": job.id, "status": "running", "diagnose_only": bool(diagnose_only)}
+
+    def get_retrieval_tuning_status(
+        self, knowledge_base: str, experiment_id: str | None = None
+    ) -> dict:
+        """How far a tuning batch has got: phase, units done, attempts, status.
+
+        Read from ``/state``, so it answers for a batch this process did not
+        start and for one whose process has since stopped. A batch whose
+        heartbeat expired reports ``interrupted`` rather than pretending to
+        still be working, and the next attempt resumes from its trials.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        import pheasant.tuning as tuning
+
+        payload = tuning.progress(self.state, self.config.knowledge_base_id, experiment_id)
+        payload["enabled"] = bool(self.config.tuning.enabled)
+        return payload
+
+    def get_retrieval_diagnosis(
+        self, knowledge_base: str, experiment_id: str | None = None
+    ) -> dict:
+        """Where retrieval is losing documents, by pipeline stage.
+
+        The histogram, its denominator, and whether each stage is one a
+        parameter can reach. A stage marked not-reachable is a statement that
+        no amount of ranking work will help -- the failure is upstream, in what
+        is indexed or how it is chunked -- and it is the most useful thing here.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.tuning import store as tuning_store
+        from pheasant.tuning.stages import ACTIONABLE_STAGES
+
+        row = (
+            tuning_store.experiment_status(self.state, experiment_id)
+            if experiment_id
+            else tuning_store.latest_experiment(self.state, self.config.knowledge_base_id)
+        )
+        diagnosis = (row or {}).get("diagnosis")
+        if not diagnosis:
+            raise ValueError(
+                f"No retrieval diagnosis for {experiment_id}"
+                if experiment_id
+                else "No tuning batch has completed for this knowledge base yet. "
+                "Run `start_retrieval_tuning` with diagnose_only=true."
+            )
+        histogram = diagnosis.get("histogram") or {}
+        return {
+            "experiment_id": (row or {}).get("experiment_id", ""),
+            "summary": diagnosis.get("summary", ""),
+            "histogram": histogram,
+            "stages": [
+                {
+                    "stage": entry["stage"],
+                    "count": entry["count"],
+                    "reachable_by_tuning": entry["stage"] in ACTIONABLE_STAGES,
+                }
+                for entry in histogram.get("ranked") or []
+            ],
+        }
+
+    def get_retrieval_parameters(self, knowledge_base: str) -> dict:
+        """What this region ranks with, where it came from, and what is tunable.
+
+        ``provenance`` is ``config`` or ``bundle``. A ranking nobody expects is
+        most often a bundle somebody applied, and this is where that shows.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        import pheasant.tuning as tuning
+        from pheasant.tuning import glossary
+        from pheasant.tuning import objective as objective_module
+        from pheasant.tuning.bundle import as_config_fragment
+        from pheasant.tuning.space import ParameterSpace
+
+        active = tuning.active_parameters(self.state, self.config.knowledge_base_id, self.config)
+        space = ParameterSpace(pinned=frozenset(self.config.tuning.pinned_parameters or ()))
+        return {
+            "active": active,
+            "space": space.as_dict(),
+            "config_fragment": as_config_fragment(active),
+            "objective": objective_module.resolve(self.config.tuning.objective).as_dict(),
+            "explanations": {entry["term"]: entry for entry in glossary.catalog()["parameters"]},
+        }
+
+    def list_tuning_bundles(self, knowledge_base: str, limit: int = 20) -> dict:
+        """Configuration bundles this region has produced, and which is live."""
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.tuning import store as tuning_store
+
+        return {
+            "bundles": tuning_store.list_bundles(
+                self.state, self.config.knowledge_base_id, limit=max(1, min(int(limit), 200))
+            )
+        }
+
+    def apply_tuning_bundle(
+        self, knowledge_base: str, bundle_id: str, applied_by: str = "mcp"
+    ) -> dict:
+        """Make a bundle the fleet's live retrieval overlay.
+
+        Fleet-scoped: one row, resolved by every replica reading this
+        ``/state`` within its refresh window. There is deliberately no
+        per-principal or per-request variant -- parameters that varied by
+        caller would make two agents disagree about what this region contains.
+
+        Reversible: :meth:`rollback_tuning_bundle` returns the region to its
+        configured values, and what the bundle replaced is stored on it.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.tuning import store as tuning_store
+
+        payload = tuning_store.apply_bundle(
+            self.state, self.config.knowledge_base_id, bundle_id, applied_by=applied_by or "mcp"
+        )
+        self._invalidate_ranking()
+        return {"applied": True, "bundle": payload}
+
+    def rollback_tuning_bundle(self, knowledge_base: str, to: str = "base") -> dict:
+        """Stand the active overlay down, to the base or an earlier bundle.
+
+        ``to`` defaults to ``"base"`` — the configured values, which are the
+        thing an operator can read in a file. An earlier bundle id steps back
+        to a decision somebody made before, and is recorded as a rollback
+        rather than a fresh apply that happens to use old numbers.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.tuning import store as tuning_store
+
+        target = to or "base"
+        if target != "base" and not tuning_store.load_bundle_row(
+            self.state, self.config.knowledge_base_id, target
+        ):
+            raise ValueError(f"Unknown bundle: {target}")
+        reverted = tuning_store.revert_bundle(
+            self.state, self.config.knowledge_base_id, applied_by="mcp", to=target
+        )
+        self._invalidate_ranking()
+        return {"reverted": reverted is not None, "bundle": reverted, "to": target}
+
+    def get_retrieval_health(self, knowledge_base: str, since: str | None = None) -> dict:
+        """How the pipeline is behaving on live traffic, between batches.
+
+        Needs no cohort, no replay and no proof: it reads the sampled stage
+        digests off the interaction ledger. Consequently it says what the
+        pipeline *did* — empty rate and the stage that lost it, per-arm
+        contribution, filter drops, truncation — and never whether an answer
+        was correct.
+
+        Use it as a change detector. An empty rate that moves after a bundle
+        is applied is a fact about the bundle, and it is visible without
+        waiting for the next batch.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.tuning.health import stage_health
+
+        payload = stage_health(self.state, self.config.knowledge_base_id, since=since)
+        payload["sample_rate"] = self.config.observability.interactions.stage_sample_rate
+        return payload
+
+    def cancel_retrieval_tuning(
+        self, knowledge_base: str, experiment_id: str | None = None
+    ) -> dict:
+        """Ask the running tuning batch to stand down at its next checkpoint.
+
+        The batch stops with its trials already stored, so cancelling is
+        resumable rather than destructive. It lands as a row, so it reaches a
+        batch running in a different process or on a different replica.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        import pheasant.tuning as tuning
+        from pheasant.tuning import store as tuning_store
+
+        target = experiment_id or (
+            tuning.progress(self.state, self.config.knowledge_base_id) or {}
+        ).get("experiment_id")
+        if not target:
+            raise ValueError("No tuning batch is running for this knowledge base.")
+        if not tuning_store.request_cancel(
+            self.state, self.config.knowledge_base_id, target, requested_by="mcp"
+        ):
+            raise ValueError(f"{target} is not running, so there is nothing to cancel.")
+        return {"cancelled": True, "experiment_id": target}
+
+    def pin_retrieval_parameters(self, knowledge_base: str, pinned: list[str]) -> dict:
+        """Settle parameters so no tuning batch proposes them again.
+
+        Replaces the whole list rather than adding to it, so a caller states
+        the set they want rather than a delta against one they may not have
+        read.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.search.ranking import PARAMETER_STAGES
+
+        unknown = sorted(set(pinned or []) - set(PARAMETER_STAGES))
+        if unknown:
+            raise ValueError(
+                f"Not ranking parameters: {', '.join(unknown)}. "
+                f"Known: {', '.join(sorted(PARAMETER_STAGES))}"
+            )
+        self.config.tuning.pinned_parameters = sorted(set(pinned or []))
+        return {"pinned": self.config.tuning.pinned_parameters}
+
+    def list_tuning_trials(
+        self, knowledge_base: str, experiment_id: str | None = None, limit: int = 50
+    ) -> dict:
+        """Every trial in an experiment: point, score, stage, and why it was tried.
+
+        The audit trail behind a decision, at the granularity an agent can
+        reason about — each row names the parameter it moved, from what to
+        what, the stage that motivated it, and whether it cost a real search.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.tuning import store as tuning_store
+
+        target = experiment_id or (
+            tuning_store.latest_experiment(self.state, self.config.knowledge_base_id) or {}
+        ).get("experiment_id")
+        if not target:
+            raise ValueError("No tuning batch has run for this knowledge base yet.")
+        trials = tuning_store.load_trials(self.state, target)
+        rows = sorted(
+            (t for t in trials.values() if not t["failed"]),
+            key=lambda t: -(t["metrics"].get(tuning_store.PRIMARY_METRIC) or 0.0),
+        )
+        return {
+            "experiment_id": target,
+            "primary_metric": tuning_store.PRIMARY_METRIC,
+            "trials": rows[: max(1, min(int(limit), 500))],
+        }
+
+    def explain_retrieval_measures(self, knowledge_base: str, term: str | None = None) -> dict:
+        """What every tuning measure means, and — more usefully — what it does not.
+
+        Call this before acting on a number from `get_retrieval_health` or a
+        tuning report. Each entry says what the measure is (with its
+        denominator), what to do differently if it moves, and the misreading
+        it invites: a truncation rate of 42% looks alarming and is normal, an
+        empty rate of 0% is not evidence that results are good, and a metric
+        reporting `insufficient_evidence` is not reporting zero.
+
+        Pass ``term`` for one entry, or omit it for the whole catalog grouped
+        into metrics, live-health rates, pipeline stages, gates and parameters.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.tuning import glossary
+
+        if term:
+            entry = glossary.lookup(term)
+            if entry is None:
+                raise ValueError(
+                    f"No explanation for {term!r}. Call this without a term for the full catalog."
+                )
+            return entry
+        return glossary.catalog()
+
+    def get_tuning_objective(self, knowledge_base: str) -> dict:
+        """What "better" means here, and what optimizing it accepts getting worse.
+
+        A region whose callers read one result should tune for reciprocal
+        rank; one whose callers read a page and synthesize should tune for
+        recall, and would be harmed by a parameter set that sharpens rank one
+        at the cost of dropping a document out of the list. Both are
+        legitimate and they are different objectives, so this reports which
+        one is in force rather than assuming.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.tuning import objective as objective_module
+
+        return {
+            "active": objective_module.resolve(self.config.tuning.objective).as_dict(),
+            "available": objective_module.catalog(),
+            "configured_by": "tuning.objective.metric, or tuning.objective.weights",
+        }
+
+    def get_retrieval_lineage(self, knowledge_base: str, limit: int = 50) -> dict:
+        """Every configuration this region has served, newest first.
+
+        What changed, when, who applied it, and what it replaced. This is the
+        question asked after a regression, at exactly the moment the active
+        configuration no longer holds the answer.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        from pheasant.tuning import store as tuning_store
+
+        return {
+            "lineage": tuning_store.lineage(
+                self.state, self.config.knowledge_base_id, limit=max(1, min(int(limit), 200))
+            ),
+            "base_explanation": (
+                "Below the oldest entry is the configured base — "
+                "`search.ranking` in the mounted pheasant.yaml. Rolling back "
+                "returns there, or to any earlier entry."
+            ),
+        }
+
+    def _invalidate_ranking(self) -> None:
+        """Make this process pick up an overlay change at once.
+
+        Other replicas converge on their own TTL, which is the point of a
+        polled overlay; this is only about not making the process that changed
+        it wait for its own poll.
+        """
+
+        resolver = getattr(getattr(self.searcher, "store", None), "ranking", None)
+        invalidate = getattr(resolver, "invalidate", None)
+        if callable(invalidate):
+            invalidate()
 
     def get_evaluation_taxonomy(self, knowledge_base: str) -> dict:
         """Every evidence event type, its polarity and strength, and what it licenses."""

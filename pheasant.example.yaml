@@ -118,11 +118,49 @@ search:
   vector_store:
     provider: lancedb            # "lancedb" (pip install 'pheasant-kb[vector]') | "numpy"
     path: /state/vectors         # vectors live under <path>/<kb_id>/
+  # The numbers ranking actually reads. Every value here is the default, and
+  # every default is what the 2026-08-03 retrieval overhaul measured — so
+  # deleting this whole block changes nothing. It is spelled out because these
+  # were module constants until the tuning plane needed to address them, and a
+  # parameter no surface can name is a parameter no experiment can change.
+  #
+  # Fleet-scoped: these apply to the region, and an applied tuning bundle
+  # overlays them for every replica. There is deliberately no per-request or
+  # per-principal override.
+  #
+  # `pheasant tune diagnose` tells you which of these could possibly help
+  # before you change any of them. See docs/retrieval-tuning.md.
   ranking:
-    prefer_exact_path_matches: true
-    prefer_recent_commits: true
-    graph_neighbor_boost: true
-    max_results_default: 10
+    # BM25 (and ts_rank_cd) column weights. `title` is the file's BASENAME,
+    # which is why it outweighs body text eightfold: untuned, a filename match
+    # was worth exactly one body word and BM25's length normalization then
+    # ranked by body brevity.
+    title_weight: 8.0
+    path_weight: 3.0
+    heading_weight: 2.0
+    text_weight: 1.0
+    # Structural priors, applied as a DIVISOR on the negative BM25 cost, so
+    # they scale a match rather than displacing it: a strong deep hit still
+    # beats a weak shallow one. depth breaks ties toward files nearer the root
+    # (the only signal separating hundreds of identically-named READMEs);
+    # tests/samples push those below implementations for "where is X".
+    depth_prior: 0.05
+    test_prior: 0.60
+    sample_prior: 0.30
+    prefer_bonus: 0.35     # what a memory `preference` rule is worth
+    prior_floor: 0.25      # must stay positive or the ranking inverts
+    # Reciprocal-rank fusion. 60 is the RRF paper's value and a default, not a
+    # measurement of your corpus. The arm weights are 1.0 = unweighted RRF;
+    # 0.0 lets you prove the merge is better without a stale vector index,
+    # which is a legitimate outcome of a tuning pass.
+    rrf_k: 60.0
+    text_arm_weight: 1.0
+    vector_arm_weight: 1.0
+    graph_arm_weight: 1.0
+    # How far past max_results the arms fetch when ACL, memory-policy or
+    # section filtering will remove candidates afterwards. Under-fetching here
+    # shows up as a `filters` miss that no amount of ranking fixes.
+    filter_overfetch: 3.0
   # Run graph_search._scan_edges through the vendored WASM accelerator
   # (Synapse 34.5b) instead of pure Python. Needs the [wasm] extra; falls back
   # to pure Python on any failure or if the extra is missing, so it is never a
@@ -640,6 +678,79 @@ evaluation:
     # created it has demonstrated recall of its own evidence and nothing else.
     allow_originating_query_only_promotion: false
     insufficient_evidence_action: retain_candidate
+
+# Retrieval performance tuning (docs/retrieval-tuning.md).
+#
+# Off by default, and read-only when on unless `auto.apply` is set or you apply
+# a bundle yourself. Where `evaluation` says how *well* retrieval is doing,
+# this says which *step* is failing — the lexical arm, a filter, the fusion,
+# the cut — and after the merge all four look identical, because they all
+# produce an absent result.
+#
+# Needs `evaluation` above: it tunes against the same cohorts and the same
+# proof, deliberately, so the two cannot optimize for and measure different
+# things.
+tuning:
+  enabled: false
+  max_results: 10
+  mode: hybrid
+  # Two budgets, not one, because the two cost classes differ by roughly three
+  # orders of magnitude. Fusion parameters act AFTER the arms produce
+  # candidates, so they are re-computed from cached candidate lists and cost no
+  # retrieval at all — a thousand points for one replay. Only parameters that
+  # change what the arms retrieve need a real search per query, and that is the
+  # number that decides how long a batch runs.
+  refusion_trials: 400
+  requery_trials: 24
+  max_searches: 5000       # backstop, whatever the trial counts imply
+  minimum_paired_queries: 20
+  # Parameters you have settled and do not want a later sweep re-litigating.
+  pinned_parameters: []
+  # Backpressure. A running batch stands down while the index queue has work in
+  # it or a sync holds a source lease — indexing is somebody waiting, and this
+  # is a measurement. Checked BETWEEN units, so a batch that began on an idle
+  # region yields when a large re-index starts rather than finishing first.
+  # Standing down is resumable, not a failure.
+  max_index_queue_depth: 1
+  yield_to_sync: true
+  stale_seconds: 90.0
+  # What "better" means here. Each objective states what it TRADES AWAY as
+  # well as what it optimizes, because an objective without a stated trade is
+  # a preference presented as an optimum:
+  #
+  #   reciprocal_rank  how high the first good result lands (default). Accepts
+  #                    a document dropping out of the list for a sharper top.
+  #   recall_at_5/10   how many good documents appear in the window. Blind to
+  #                    order inside it, so the best answer can slide down.
+  #   hit_rate         did anything good appear at all. Position-blind.
+  #   balanced         half rank, half coverage. Refuses both trades, and is
+  #                    harder to reason about than either component.
+  #
+  # `weights` overrides the name with a custom combination over collected
+  # metrics, normalized to sum to one.
+  objective:
+    metric: reciprocal_rank
+    weights: {}
+  # /state is always the source of truth; this is a MIRROR of it, so losing it
+  # loses a dashboard rather than a result. `mlflow` needs the [tuning] extra;
+  # with no tracking_uri it writes a local file store under
+  # <exports>/tuning/mlruns that `mlflow ui --backend-store-uri` opens later
+  # with nothing running in between.
+  tracking:
+    backend: "off"          # "off" | "state" | "mlflow"
+    tracking_uri: ""
+    experiment_name: pheasant-retrieval-tuning
+  auto:
+    # Two switches, and the gap between them is the safety property. The first
+    # runs batches automatically (only where the scheduler runs, so API
+    # replicas never start one). The second lets a passing bundle change what
+    # every replica serves without asking. Leave `apply` off until you have
+    # read a few reports: the work still happens and the bundle waits for
+    # `pheasant tune apply`.
+    enabled: false
+    apply: false
+    on_material_snapshot: false
+    minimum_interval_seconds: 86400
 
 sources:
   - name: pheasant-repo

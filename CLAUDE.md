@@ -51,7 +51,7 @@ pheasant-kb/
 ├── CLAUDE.md · AGENTS.md      ← agent hand-off (this file is canonical)
 ├── README.md                  ← product front door
 ├── pyproject.toml             ← extras: mcp, vector, agent, a2a, wasm,
-│                                postgres, grpc, queue, docs, dev
+│                                postgres, grpc, queue, tuning, docs, dev
 ├── pheasant.example.yaml      ← reference config, every section
 ├── Dockerfile                 ← one universal image: API + MCP + UI, port 8765
 ├── docker-compose*.yml        ← default / override / fresh reset / scaled
@@ -73,6 +73,12 @@ pheasant-kb/
 │   │                            proof, cohorts, variants, replay, metrics,
 │   │                            gates, report, candidates, runner, store,
 │   │                            benchmark (the capacity measurement)
+│   ├── tuning/                ← the tuning plane: stages (which retrieval
+│   │                            step lost the document), space, refusion,
+│   │                            strategy, executor, gates, bundle, tracking,
+│   │                            store, runner, objective (what "better"
+│   │                            means), glossary (what every measure means),
+│   │                            health (live stage rates)
 │   ├── sharding.py            ← `pheasant shard plan`
 │   ├── jobs.py                ← per-source progress: phase, rate, ETA, stalled
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
@@ -86,7 +92,8 @@ pheasant-kb/
 │   │                            transcriber, office, msdoc
 │   ├── graph/                 ← model, simple, builder, enrichment, capacity
 │   ├── search/                ← sqlite_store (FTS5/tsvector + BM25),
-│   │                            graph_search, hybrid (RRF), criteria, vector
+│   │                            graph_search, hybrid (RRF), criteria, vector,
+│   │                            ranking (the tunable parameters, fleet-scoped)
 │   ├── memory/                ← store, projection, policy, steering, salience,
 │   │                            bridge, maintenance, formation, benchmark
 │   ├── persistence/           ← state_store, backends (sqlite|postgres),
@@ -144,6 +151,13 @@ pheasant eval run [--mode current_state|historical --as-of T]
 pheasant eval report [--run ID] [--json]
 pheasant eval trend --metric known_positive_reciprocal_rank
 pheasant eval status [--watch]             # a batch's live phase/progress, from /state
+pheasant tune diagnose                     # which retrieval stage is losing documents
+pheasant tune run [--apply]                # diagnose, search the blamed stages, gate a winner
+pheasant tune show [--yaml]                # the parameters in force, and where they came from
+pheasant tune bundles|apply <id>|rollback [--to] # the fleet's retrieval overlay
+pheasant tune lineage                      # every configuration ever served
+pheasant tune explain [term]               # what a measure means, and does not
+pheasant tune status [--watch] | report
 python -m pheasant.evaluation.benchmark    # measure a batch against the capacity model
 pheasant mcp --transport stdio
 pheasant client-config claude-code|cursor|vscode
@@ -384,6 +398,120 @@ returned by a search. A region must not answer a question with its own report.
   the first two coefficients shipped were out by 2x and 3x, found exactly that
   way. `docs/knowledge-effectiveness.md`.
 
+### Tuning
+
+`tuning.*`, off by default and read-only when on. Where evaluation says *how
+well* retrieval is doing, this says **which step is failing** — and after the
+merge a lexical miss, a filtered-out document, a fusion demotion and a
+truncation all look identical, because they all produce an absent result. Six
+causes, one symptom.
+
+- **A stage model, attributed to the first stage that lost the document.**
+  `search_context(explain=True)` reports each arm's candidates, what each
+  filter removed, and the fused order before truncation; `tuning.stages`
+  attributes every miss. Not to *every* stage that could be blamed — a
+  document the lexical arm never saw is not also a fusion failure, and counting
+  it as both makes the totals exceed the misses and every stage look guilty.
+  Arms are reconciled first: a target the vector arm missed and the text arm
+  returned is not a failure at all.
+- **Three refusals.** Absence from the corpus is never *inferred* from "no arm
+  returned it" — that needs a lookup, and without one it reports
+  `candidates_missing`. A query with no known positive is excluded from the
+  denominator rather than counted as served. And no stage is ever blamed on a
+  score threshold: fused RRF scores have no absolute scale.
+- **It declines.** When the misses are in stages no parameter reaches, the
+  batch proposes nothing and says why. That is the most valuable thing it
+  produces; searching anyway and shipping the highest number is the failure
+  mode the design exists to prevent.
+- **Most trials cost no retrieval.** The fusion family acts *after* the arms
+  produce candidates, so it is recomputed from cached candidate lists — a
+  thousand points for one replay. That is a re-implementation of the merge, so
+  `verify_equivalence` re-fuses at the parameters that actually ran and
+  compares id for id before any cheap trial is trusted, and a degraded capture
+  falls back to a real search rather than approximating.
+- **Nothing is promoted by its own evidence.** A winner selected on one cohort
+  must confirm on a holdout it never saw, with a control that must not regress.
+  Gates sit outside the score, and an empty gate list is a failure — `all([])`
+  is `True`, which the evaluation plane learned the expensive way.
+- **The objective is configured, not assumed.** `tuning.objective` picks
+  between reciprocal rank, recall@5/10, hit rate, a balanced composite, or
+  custom weights, and every one publishes what it *trades away*: a region
+  whose agents read one result and one whose agents read a page want opposite
+  things, and a plane that silently assumed the first would make the second
+  worse while reporting an improvement. A composite scores `None` rather than
+  zero when a component is missing — a point that could not be measured is not
+  one that measured badly.
+- **Every measure carries its own explanation** (`tuning.glossary`): what it
+  means with its denominator, what to do if it moves, and — the field that
+  prevents the wrong action — the misreading it invites. Served over HTTP and
+  MCP and rendered inline in the UI, because documentation a reader has to go
+  and find arrives after the mistake. `tests/test_tuning_objective.py` fails
+  when a stage, gate or parameter the plane emits has no entry.
+- **The demo and CI benchmark on SciFact**, not on a fixture. One of the BEIR
+  tasks; `scripts/fetch_benchmark_corpus.py` materializes 395 abstracts (a
+  quarter as real PDFs) with 66 **expert relevance judgements**, fetched at
+  benchmark time and never vendored. The point is the judgements: a fixture
+  whose known-positives were written by the seeding script produces evaluation
+  and tuning numbers that measure the seeding script. The subset rule is in the
+  manifest so it cannot be quietly tuned until the charts look good.
+- **Each mechanism is measured on its own.** The diagnosis ablates the arms —
+  text, vector, graph alone against the merge — by re-fusing captured
+  candidates with the others weighted to zero, so it costs no retrieval.
+  "Hybrid is better" is an assumption most regions never test and is
+  frequently false; when an arm alone beats the merge the report says so in
+  words. Reported, never acted on.
+- **Base, overlay, lineage.** The base is `search.ranking` in the mounted
+  config (compose-settable, version-controlled); the overlay is one row; the
+  active point is base + overlay, and all three are reported separately
+  because "what would a rollback give me" is asked when nobody can go and look
+  it up. `lineage` records what each promotion replaced, and rollback targets
+  the base (default) or a named earlier bundle.
+- **Fleet-scoped, and applying is a separate act.** A bundle is one row in
+  `/state` and every replica resolves it on a 30s TTL. There is no per-request
+  and no per-principal override, and nowhere in the schema for one. Producing a
+  bundle changes nothing; `pheasant tune apply` changes what the fleet serves,
+  and rollback restores what the bundle recorded that it replaced.
+- **It yields.** One executor slot, the `__tuning__` lease, never `sync_lock`,
+  and it stands down *between units* while the index queue has work — indexing
+  is somebody waiting, and this is a measurement. Standing down is resumable,
+  not a failure.
+- **Hot/cold.** `/state` holds experiments, trial scores, decisions and
+  bundles; per-query per-trial rankings go to `/exports/tuning` as zstd JSONL,
+  because they are derivable and an operational database is not where 80,000
+  ranked lists belong. MLflow is an optional mirror of `/state`, never
+  load-bearing, defaulting to a local file store.
+  `docs/retrieval-tuning.md`.
+
+### Retrieval telemetry
+
+Two signals, split by cost, because the tuning plane's stage attribution only
+exists inside a *replay* — which left production retrieval with a duration
+histogram and a counter, neither able to name a stage.
+
+- **Always on: counters.** `pheasant_retrieval_arm_total{arm,outcome}`,
+  `_arm_candidates`, `_filtered_total{filter,arm}`,
+  `_fusion_contributions_total{arms}`, `_fusion_depth`, `_truncated_total`,
+  and `_empty_total{stage}` — the live version of the stage histogram. An
+  in-memory increment per search; **no database write reaches the request
+  path**, which is the rule the observation plane's hot tier exists to keep.
+  `empty` and `failed` are separate arm outcomes because "the vector index is
+  down" and "it has nothing for this query" call for opposite responses.
+- **Sampled: the stage digest.** `observability.interactions.stage_sample_rate`
+  attaches a compact per-stage summary to a fraction of ledger rows —
+  including the bundle the search ranked under, which is what lets a stage
+  regression be traced to the configuration change that caused it. It
+  annotates the row the handler is *already* writing rather than writing one
+  of its own. Sampling is deterministic on the trace id (hashed whole, see the
+  traps), so every hop of a call agrees and the sampled set can be joined.
+- **`tuning.health` reads those digests** into per-stage rates with
+  denominators, classified `structural`: it says what the pipeline did, never
+  whether an answer was correct, because nobody judged those queries. Its
+  honest use is a change detector — an empty rate that moves after an apply is
+  a fact about the bundle, without waiting for a batch. Below
+  `MINIMUM_SAMPLES` it publishes nothing rather than a rate over four
+  searches, and it reports when its window spans two configurations rather
+  than averaging across the change somebody is looking for.
+
 ### Scale
 
 One container until it shouldn't be. Then four independent axes:
@@ -556,6 +684,77 @@ Each of these cost real time. They are listed because the shape recurs.
   memory *use* would let the evaluation raise the salience of the records it is
   measuring, which is why the replay searcher is built with
   `usage_tracking=False`.
+- **An inherited default that returns a constant is a defect waiting for its
+  first caller.** `SqliteBackend` inherited `Backend.statement()`, whose own
+  docstring said "nothing calls this default in practice" and which returned
+  `rowcount=0` unconditionally. True while only `PostgresBackend` implemented
+  it; a live defect the moment anything read that count on SQLite. Every lease
+  and batch claim here turns on it (`UPDATE … WHERE status <> 'running'`), so
+  the tuning plane's claim reported "I did not get it" on the default backend
+  and worked correctly on Postgres — the mirror image of the three portability
+  bugs above, and the worse direction, because the offline suite runs on
+  SQLite. Found by a second `run_tuning` being refused as "already running"
+  against a row that said `completed`.
+- **An owner that identifies a *process* cannot arbitrate a race inside one.**
+  `open_experiment` inserts `ON CONFLICT DO NOTHING` and reads the owner back
+  to learn whether it won — sound only if the owner is unique per *attempt*.
+  It was `host:pid`, which looks unique and is not: two threads in one replica
+  share it, so both read their own name back and both concluded they had
+  claimed the batch. The `__tuning__` lease did not separate them either,
+  because `SourceLease` grants a lease its current holder already owns, which
+  makes an in-process race indistinguishable from a re-entrant acquire. The
+  shape is ordinary — a scheduled batch and a hand-started one live in the
+  same process — and it produced two completed experiments where the design
+  promises one. Owners carry a uuid now. Found by running three batches from
+  three threads; every sequential test passed throughout.
+- **A fixed temp filename is a collision waiting for a second writer.** Cold
+  payloads were written to `<name>.partial` and renamed. Two batches racing
+  wrote the same path, the first rename took it, and the second `os.replace`
+  raised `FileNotFoundError` on a file that had just moved out from under it.
+  Unique per writer now, and a failed write unlinks its own temp file —
+  otherwise unique names would turn one orphan into one per attempt.
+- **A sampler that slices a trace id measures the id's shape, not the traffic.**
+  Stage sampling read the low four hex characters, reasoning that a W3C trace
+  id is random so any slice is uniform. True of ids pheasant mints, false of
+  ids arriving in an upstream `traceparent`: an SDK deriving them from a
+  counter or a clock leaves the low bits nearly constant, and sampling
+  collapsed to all-or-nothing — 100% at a requested 25%, looking exactly like
+  a working sampler. Hashed over the whole id now.
+- **`StaticFiles(html=True)` is not a single-page-app fallback.** It serves
+  `index.html` at `/` and 404s everything else, so every deep link into the UI
+  — `/evaluation`, `/memory`, `/tuning` — returned JSON to a browser. Not just
+  a broken bookmark: it is what a *hard refresh* does, so anyone who reloaded
+  the page they were on had to navigate back in from the root. The screenshot
+  script had grown a documented workaround for it. Fixed at the 404 handler,
+  which runs after routing has already failed and therefore cannot shadow an
+  API route, the `/mcp` mount, or a real asset.
+- **A resumed batch that *skips* is not a resumed batch.** Reusing stored
+  trials by `continue`-ing past them left the decision with an empty comparison
+  set, so a batch that had in fact evaluated everything reported
+  `insufficient_evidence`. A checkpoint has to come back as a *comparable*
+  result, which means the per-query rows have to come back too: an aggregate
+  cannot be paired after the fact, because it has already lost which queries it
+  covered. Expensive trials restore from cold storage; cheap ones are redone,
+  because redoing them costs nothing.
+- **A zero weight is a zero score, not an exclusion.** The mechanism ablation
+  isolated an arm by weighting the others to zero — but their candidates stay
+  in the merge and are ordered by `best_rank`, so with embeddings off "vector
+  alone" returned the *text* arm's ranking verbatim and scored just under it.
+  A plausible number measuring the wrong mechanism. Isolation now filters
+  which arms contribute at all; zero-weighting keeps its old meaning, because
+  an operator turning an arm down wants it to stop influencing the order, not
+  to have its documents disappear.
+- **A stub embedder scores like a lexical one, because it is one.** The
+  offline `stub` provider is a bag-of-words hasher with planted synonyms. A
+  "vector arm: 0.70" row from it reads as semantic retrieval and is not, so
+  the mechanisms payload carries the provider and `semantic: false`, and the
+  UI says so where the number is.
+- **A test corpus where every query succeeds proves nothing about ranking.**
+  The first tuning fixture had three documents and `max_results: 10`, so every
+  query returned its known positive and the stage histogram was pure `served`.
+  The plane correctly proposed nothing — and the batch tests passed while
+  exercising none of the search. Decoys plus a narrow cut is what makes *rank*
+  matter, which is the thing being tuned.
 - **`wasmtime.Trap` and `wasmtime.WasmtimeError` are siblings**, not parent and
   child. Catch `guest_failures()`.
 - **A mutation harness must `touch` the restored file and purge
@@ -657,5 +856,8 @@ Each of these cost real time. They are listed because the shape recurs.
   the log tier, and the two combination designs that were rejected
 - **Evaluation:** `docs/knowledge-effectiveness.md` — the evidence taxonomy,
   the cohort split, the ablation matrix, the gates, and what it refuses to claim
+- **Tuning:** `docs/retrieval-tuning.md` — the stage model, why re-fusion makes
+  a parameter search affordable, and the gates that keep a winner from being
+  promoted by its own evidence
 - **Synapse region spec:** `docs/SYNAPSE_INTEGRATION.md`
 - **Deployment:** `docs/deployment.md`, `deploy/kubernetes/`

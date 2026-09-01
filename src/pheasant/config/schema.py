@@ -390,11 +390,56 @@ class VectorStoreSettings(ModelMixin):
 
 
 @dataclass
+class SearchRankingSettings(ModelMixin):
+    """The numbers ranking reads. Every default is the shipped constant.
+
+    These were module constants in ``pheasant.search.sqlite_store`` and
+    ``pheasant.search.hybrid`` until the tuning plane needed to address them:
+    a parameter no surface can name is a parameter no experiment can change.
+    Leaving this whole block unset reproduces the 2026-08-03 retrieval
+    overhaul's measured values exactly, so a region that never opens it ranks
+    as it always did.
+
+    **Fleet-scoped by construction.** These apply to the region, and an
+    applied tuning bundle overlays them for every replica reading that
+    ``/state``. There is deliberately no per-request or per-principal
+    override: retrieval parameters that varied by caller would make two agents
+    disagree about what the region contains, and would make every number the
+    evaluation plane publishes a measurement of whoever happened to ask.
+
+    Bounds are enforced in :mod:`pheasant.search.ranking`, not here, because
+    a proposed bundle has to be clamped by the same rule as a hand-edited
+    config and there can only be one home for that rule.
+    """
+
+    #: BM25 / ``ts_rank_cd`` column weights. ``title`` is the file's basename.
+    title_weight: float = 8.0
+    path_weight: float = 3.0
+    heading_weight: float = 2.0
+    text_weight: float = 1.0
+    #: Structural priors, applied as a divisor on the negative BM25 cost so
+    #: they scale a match rather than displacing it.
+    depth_prior: float = 0.05
+    test_prior: float = 0.60
+    sample_prior: float = 0.30
+    prefer_bonus: float = 0.35
+    prior_floor: float = 0.25
+    #: Reciprocal-rank-fusion constant and the per-arm fusion weights.
+    rrf_k: float = 60.0
+    text_arm_weight: float = 1.0
+    vector_arm_weight: float = 1.0
+    graph_arm_weight: float = 1.0
+    #: Over-fetch multiplier applied when a filter will drop candidates.
+    filter_overfetch: float = 3.0
+
+
+@dataclass
 class SearchSettings(ModelMixin):
     default_mode: str = "hybrid"
     max_results_default: int = 10
     embeddings: EmbeddingsSettings = field(default_factory=EmbeddingsSettings)
     vector_store: VectorStoreSettings = field(default_factory=VectorStoreSettings)
+    ranking: SearchRankingSettings = field(default_factory=SearchRankingSettings)
     # Synapse Step 34.5b: run search.graph_search._scan_edges through the
     # vendored WASM accelerator instead of pure Python. Default off — needs
     # the [wasm] extra; falls back to pure Python on any failure or if the
@@ -1260,6 +1305,23 @@ class InteractionSettings(ModelMixin):
     """
 
     enabled: bool = False
+    #: Fraction of observed searches that carry a per-stage digest.
+    #:
+    #: The digest names what each retrieval stage did — arm candidate counts,
+    #: what each filter removed, the fused depth, and the bundle the search
+    #: ranked under. It is what lets a stage regression be traced to the
+    #: configuration change that caused it, and it gives the tuning plane a
+    #: *live* diagnosis source rather than one that is only as fresh as the
+    #: last batch.
+    #:
+    #: Sampled rather than universal because the digest is a few hundred bytes
+    #: on a row that is already a couple of kilobytes, and a ledger sized for
+    #: search traffic should not be resized by a diagnostic. Sampling is
+    #: deterministic on the trace id, so every hop of one call agrees about
+    #: whether it is sampled — a per-hop random draw produces traces that
+    #: cannot be joined. 0.0 disables it; the always-on Prometheus stage
+    #: counters are unaffected either way.
+    stage_sample_rate: float = 0.0
     #: Record no free text at all -- neither the question nor the answer.
     #:
     #: Named for what it does rather than for one of the two fields it
@@ -1606,6 +1668,129 @@ class EvaluationSettings(ModelMixin):
 
 
 @dataclass
+class TuningTrackingSettings(ModelMixin):
+    """Where experiment tracking is mirrored. ``/state`` is always the truth.
+
+    ``backend`` is ``off`` (default), ``state`` (an explicit spelling of the
+    same thing) or ``mlflow``. The MLflow sink needs the ``[tuning]`` extra and
+    defaults to a **local file store** under ``<exports>/tuning/mlruns`` -- no
+    server, no network, no credentials -- so a region can get run comparison
+    and a parameter-versus-metric plot without operating anything. Point
+    ``tracking_uri`` at a real server if you have one.
+
+    A tracking backend that is missing, down or misconfigured never fails a
+    batch: the rows are in ``/state`` either way and the mirror is a
+    projection of them.
+    """
+
+    backend: str = "off"
+    tracking_uri: str = ""
+    experiment_name: str = "pheasant-retrieval-tuning"
+
+
+@dataclass
+class TuningAutoSettings(ModelMixin):
+    """When a batch starts by itself, and whether it may change ranking.
+
+    ``enabled`` and ``apply`` are separate switches on purpose, and the gap
+    between them is the safety property. Running a batch is read-only: it
+    produces a diagnosis, some trials and at most a *proposed* bundle.
+    Applying one changes what every replica in the fleet serves. A region that
+    wants continuous measurement without unattended re-ranking sets the first
+    and not the second, which is the default.
+
+    ``on_material_snapshot`` fires only where the scheduler runs, so API
+    replicas never start batches -- the same rule the evaluation plane's
+    auto-trigger follows.
+    """
+
+    enabled: bool = False
+    apply: bool = False
+    on_material_snapshot: bool = False
+    minimum_interval_seconds: int = 86400
+
+
+@dataclass
+class TuningObjectiveSettings(ModelMixin):
+    """What "better" means for this region. See ``pheasant.tuning.objective``.
+
+    ``metric`` names a built-in objective: ``reciprocal_rank`` (default),
+    ``recall_at_5``, ``recall_at_10``, ``hit_rate`` or ``balanced``. Each one
+    is a different product decision, and each publishes what it *trades away*
+    as well as what it optimizes — an objective without a stated trade is a
+    preference presented as an optimum.
+
+    ``weights`` overrides the name entirely with a custom combination over
+    collected metrics, normalized to sum to one. A caller who wrote weights has
+    been more specific than one who picked a label, so weights win.
+
+    Getting this wrong is not a small thing. A region whose agents read one
+    result wants ``reciprocal_rank``; one whose agents read a page and
+    synthesize wants ``recall_at_10``, and would be actively harmed by a
+    parameter set that sharpens rank one at the cost of dropping a document
+    out of the list. Both are legitimate and they are not the same objective.
+    """
+
+    metric: str = "reciprocal_rank"
+    weights: dict[str, float] = field(default_factory=dict)
+    higher_is_better: bool = True
+
+
+@dataclass
+class TuningSettings(ModelMixin):
+    """The tuning plane: finding which retrieval stage is failing, and fixing it.
+
+    Off by default, and read-only when on unless ``auto.apply`` is set or
+    somebody applies a bundle. A batch replays a cohort through the real search
+    path with stage capture, attributes every miss to the step that lost it,
+    proposes parameters only for the stages actually to blame, and gates any
+    winner against a held-out cohort before it may change the region.
+
+    **Fleet-scoped.** What a batch produces is a bundle of region-wide
+    retrieval parameters. There is no per-request and no per-principal tuning:
+    parameters that varied by caller would make two agents disagree about what
+    the region contains, and would make every number the evaluation plane
+    publishes a measurement of whoever happened to ask.
+
+    **It yields.** The executor holds one slot, takes the ``__tuning__`` lease
+    rather than ``sync_lock``, and stands down while the index queue has work
+    in it -- a batch is a measurement and indexing is somebody waiting.
+
+    See ``docs/retrieval-tuning.md``.
+    """
+
+    enabled: bool = False
+    #: Results per query during a trial. The k values the metrics use are
+    #: capped by this, so raising a metric k without raising this measures a
+    #: truncated list.
+    max_results: int = 10
+    mode: str = "hybrid"
+    #: Points evaluated by re-fusion — the cheap family, which needs no
+    #: retrieval at all and can therefore be generous.
+    refusion_trials: int = 400
+    #: Points needing a real search per query. This is the number that decides
+    #: how long a batch runs.
+    requery_trials: int = 24
+    #: Backstop on total searches, whatever the trial counts imply.
+    max_searches: int = 5000
+    #: Paired queries required before a delta may decide anything.
+    minimum_paired_queries: int = 20
+    #: Parameters an operator has settled and does not want re-litigated. A
+    #: pinned name is never proposed.
+    pinned_parameters: list[str] = field(default_factory=list)
+    #: Index-queue depth above which a running batch stands down.
+    max_index_queue_depth: int = 1
+    #: Stand down while any source sync holds its lease.
+    yield_to_sync: bool = True
+    #: How long a batch may go without a heartbeat before another process may
+    #: declare it dead and mark it ``interrupted``.
+    stale_seconds: float = 90.0
+    objective: TuningObjectiveSettings = field(default_factory=TuningObjectiveSettings)
+    tracking: TuningTrackingSettings = field(default_factory=TuningTrackingSettings)
+    auto: TuningAutoSettings = field(default_factory=TuningAutoSettings)
+
+
+@dataclass
 class PheasantConfig(ModelMixin):
     pheasant: PheasantSettings = field(default_factory=PheasantSettings)
     server: ServerSettings = field(default_factory=ServerSettings)
@@ -1620,6 +1805,7 @@ class PheasantConfig(ModelMixin):
     observability: ObservabilitySettings = field(default_factory=ObservabilitySettings)
     assistant: AssistantSettings = field(default_factory=AssistantSettings)
     evaluation: EvaluationSettings = field(default_factory=EvaluationSettings)
+    tuning: TuningSettings = field(default_factory=TuningSettings)
     sources: list[SourceConfig] = field(default_factory=list)
 
     @classmethod
@@ -1657,6 +1843,8 @@ class PheasantConfig(ModelMixin):
                     raw["embeddings"] = build(EmbeddingsSettings, raw["embeddings"])
                 if "vector_store" in raw and isinstance(raw["vector_store"], dict):
                     raw["vector_store"] = build(VectorStoreSettings, raw["vector_store"])
+                if "ranking" in raw and isinstance(raw["ranking"], dict):
+                    raw["ranking"] = build(SearchRankingSettings, raw["ranking"])
             if dc is AssistantSettings:
                 if "retrieval" in raw and isinstance(raw["retrieval"], dict):
                     raw["retrieval"] = build(RetrievalSettings, raw["retrieval"])
@@ -1678,6 +1866,13 @@ class PheasantConfig(ModelMixin):
                 ):
                     if key in raw and isinstance(raw[key], dict):
                         raw[key] = build(nested, raw[key])
+            if dc is TuningSettings:
+                if "objective" in raw and isinstance(raw["objective"], dict):
+                    raw["objective"] = build(TuningObjectiveSettings, raw["objective"])
+                if "tracking" in raw and isinstance(raw["tracking"], dict):
+                    raw["tracking"] = build(TuningTrackingSettings, raw["tracking"])
+                if "auto" in raw and isinstance(raw["auto"], dict):
+                    raw["auto"] = build(TuningAutoSettings, raw["auto"])
             if dc is InteractionSettings:
                 if raw.get("spool_path") is not None:
                     raw["spool_path"] = Path(raw["spool_path"])
@@ -1719,6 +1914,7 @@ class PheasantConfig(ModelMixin):
             observability=build(ObservabilitySettings, data.get("observability")),
             assistant=build(AssistantSettings, data.get("assistant")),
             evaluation=build(EvaluationSettings, data.get("evaluation")),
+            tuning=build(TuningSettings, data.get("tuning")),
             sources=[],
         )
         cfg.sources = []

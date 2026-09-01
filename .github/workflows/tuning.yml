@@ -1,0 +1,481 @@
+name: Retrieval tuning
+
+# The tuning plane gets its own workflow for the same reason the memory
+# subsystem and the evaluation plane do: its correctness lives in the seams,
+# and the seams cross a database, a container boundary and the *real search
+# path*. `CI` runs every unit suite; nothing there proves the pieces hold
+# together against a backend that ranks differently, or that the plane stays
+# invisible to a region that never turns it on.
+#
+# Four jobs, and each answers a question the others cannot:
+#
+#   suites       — the plane on both storage backends. FTS5's `bm25()` and
+#                  Postgres's `ts_rank_cd` are different functions on purpose,
+#                  so a parameter that helps on one is not automatically a
+#                  parameter that helps on the other — and a claim tested on
+#                  one backend only is a claim about one backend only. Three
+#                  portability defects have already passed the offline suite
+#                  here and failed on a real PostgreSQL.
+#
+#   equivalence  — the assertion the whole cheap path rests on, run on its own
+#                  so a reviewer can see it pass. Offline re-fusion evaluates
+#                  most trials without retrieval; that is sound only while
+#                  re-fusing the captured inputs reproduces, id for id, what
+#                  the region really served. A re-implementation that drifted
+#                  would keep reporting improvements — for parameter points
+#                  that do nothing in production.
+#
+#   standalone   — the plane is off by default, and a region that never asks
+#                  for it must be byte-identical to one built before it
+#                  existed. Rule 7: every seam owes a test asserting the
+#                  no-infrastructure path is unchanged.
+#
+#   lifecycle    — the CLI against a real region: diagnose, run, apply, roll
+#                  back. This is the surface an operator actually touches, and
+#                  a broken argparse wiring or a printer reading the wrong
+#                  payload shape is invisible to every in-process test.
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+    paths:
+      - "src/pheasant/tuning/**"
+      - "src/pheasant/search/**"
+      - "src/pheasant/evaluation/**"
+      - "src/pheasant/persistence/**"
+      - "src/pheasant/config/schema.py"
+      - "src/pheasant/cli.py"
+      - "src/pheasant/api/app.py"
+      - "src/pheasant/mcp_server/**"
+      - "benchmarks/scifact-retrieval.json"
+      - "scripts/fetch_benchmark_corpus.py"
+      - "tests/test_tuning_*.py"
+      - "tests/test_ranking*.py"
+      - "tests/test_api_ui_routes.py"
+      - "tests/test_interactions.py"
+      - "tests/test_search_context.py"
+      - "tests/test_backend_parity.py"
+      - "ui/src/pages/TuningPage.tsx"
+      - "ui/src/tuning/**"
+      - "ui/src/api/types.ts"
+      - "ui/src/api/client.ts"
+      - ".github/workflows/tuning.yml"
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  suites:
+    name: Tuning suites (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          - sqlite
+          - postgres
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pheasant
+          POSTGRES_PASSWORD: pheasant
+          POSTGRES_DB: pheasant_tuning
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pheasant"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pheasant and the extras the plane crosses
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp,postgres]"
+
+      - name: Run the tuning suites
+        env:
+          # Only the postgres leg points at the service; the sqlite leg must
+          # stay on SQLite, which is the default every user gets — and the one
+          # where a conditional claim reading `rowcount` was silently broken
+          # until `SqliteBackend.statement` was given a real one.
+          PHEASANT_TEST_POSTGRES_DSN: ${{ matrix.backend == 'postgres' && 'postgresql://pheasant:pheasant@127.0.0.1:5432/pheasant_tuning' || '' }}
+          # Defence in depth. Nothing in the indexing path may reach a model,
+          # and nothing in this plane may either: a tuning batch replays real
+          # queries, and a stray provider key would turn a CI job into a
+          # metered one.
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GEMINI_API_KEY: ""
+        run: |
+          python -m pytest -q --durations=15 \
+            tests/test_tuning_plane.py \
+            tests/test_tuning_batch.py \
+            tests/test_tuning_refusion.py \
+            tests/test_tuning_durability.py \
+            tests/test_tuning_stress.py \
+            tests/test_tuning_objective.py \
+            tests/test_api_ui_routes.py \
+            tests/test_ranking_parameters.py \
+            tests/test_ranking.py \
+            tests/test_search_context.py \
+            tests/test_backend_parity.py \
+            tests/test_scaling_regressions.py \
+            tests/test_config_surface_freshness.py \
+            2>&1 | tee tuning-suite-${{ matrix.backend }}.log
+
+      - name: Upload the suite log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuning-suite-${{ matrix.backend }}
+          path: tuning-suite-${{ matrix.backend }}.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  equivalence:
+    name: Re-fusion is the real fusion
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pheasant
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp]"
+
+      # Its own job, and not because it is slow. This is the single assumption
+      # that makes a parameter search affordable, and if it ever stops holding
+      # the failure is silent: every fusion trial keeps producing numbers, and
+      # the numbers stop describing anything the region would serve.
+      - name: Prove re-fusion reproduces the served ranking, id for id
+        run: |
+          python -m pytest -q -v \
+            tests/test_tuning_refusion.py \
+            2>&1 | tee refusion-equivalence.log
+
+      - name: Publish the result
+        if: always()
+        run: |
+          {
+            echo "### Offline re-fusion equivalence"
+            echo
+            echo "Re-fusing each captured query at the parameters that actually ran"
+            echo "must reproduce what the region served, id for id — including"
+            echo "under changed parameters, checked against a real search."
+            echo
+            echo '```'
+            tail -n 20 refusion-equivalence.log
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  standalone:
+    name: A region that never turns it on is unchanged
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # Core only: no [postgres], no [vector], and deliberately no [tuning].
+      # This is the install every default user has, and the plane has to be
+      # inert on it — including its MLflow sink, which must degrade to a
+      # warning rather than an ImportError at module scope.
+      - name: Install pheasant with no optional extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp]"
+
+      - name: Prove the no-infrastructure path is untouched
+        run: |
+          python -m pytest -q \
+            tests/test_tuning_durability.py \
+            tests/test_ranking_parameters.py \
+            tests/test_search_context.py \
+            tests/test_sync_idempotency.py
+
+      - name: Prove the default ranking is the ranking that shipped
+        run: |
+          python - <<'PY'
+          from pheasant.config.schema import PheasantConfig
+          from pheasant.search.ranking import DEFAULT_RANKING, RankingParameters
+          from pheasant.search.sqlite_store import _BM25_WEIGHTS, _TS_RANK_WEIGHTS
+
+          # The literals these constants had before `search.ranking` existed.
+          # A change here re-ranks every region that never opened the block,
+          # so it is meant to be an explicit decision rather than a diff
+          # nobody looked at twice.
+          assert _BM25_WEIGHTS == "0.0, 0.0, 0.0, 8.0, 3.0, 2.0, 1.0", _BM25_WEIGHTS
+          assert _TS_RANK_WEIGHTS == "0.125, 0.25, 0.375, 1.0", _TS_RANK_WEIGHTS
+          assert RankingParameters.from_config(PheasantConfig()).values() == (
+              DEFAULT_RANKING.values()
+          )
+          assert PheasantConfig().tuning.enabled is False
+          assert PheasantConfig().tuning.auto.apply is False
+          print("default ranking is unchanged; tuning is off")
+          PY
+
+      - name: Prove the MLflow sink is optional
+        run: |
+          python - <<'PY'
+          import importlib.util
+
+          from pheasant.tuning.tracking import MlflowSink
+
+          # Constructing it without mlflow installed must warn, not raise:
+          # a tracking backend is a mirror of /state, and losing the mirror
+          # must never cost a tuning result.
+          sink = MlflowSink(tracking_uri="")
+          sink.finish(None, "completed")
+          print("mlflow installed:", importlib.util.find_spec("mlflow") is not None)
+          print("sink is inert without it")
+          PY
+
+  lifecycle:
+    name: The CLI against a real region
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pheasant
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp]"
+
+      # An end-to-end walk of the surface an operator actually touches. Every
+      # in-process test here calls Python functions; none of them would notice
+      # a mis-wired argparse subcommand, or a printer reading a payload shape
+      # the report does not have. Both have already happened.
+      - name: Diagnose, tune, apply and roll back
+        run: bash .github/scripts/tuning-lifecycle.sh
+
+      - name: Publish the diagnosis
+        if: always()
+        run: |
+          {
+            echo "### Retrieval tuning lifecycle"
+            echo
+            echo '```'
+            cat tuning-lifecycle.log 2>/dev/null | tail -n 60
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  stress:
+    name: Contention, not the happy path
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pheasant
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp]"
+
+      # Its own job because every correctness claim this plane makes is about
+      # *contention* — one batch across N replicas, an overlay changing while
+      # searches read it, a cancel from a process that is not running the
+      # batch. A single-threaded test cannot make any of them, and the last
+      # sampler defect found here (all-or-nothing sampling on counter-derived
+      # trace ids) looked exactly like a working sampler.
+      #
+      # Repeated, because a concurrency test that passes once has shown very
+      # little: an interleaving that only fails one run in five is the kind
+      # this is for.
+      - name: Drive the plane concurrently, several times
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::stress attempt ${attempt}"
+            python -m pytest -q -p no:randomly tests/test_tuning_stress.py
+            echo "::endgroup::"
+          done
+
+  benchmark:
+    name: The plane against a public benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pheasant
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp]"
+
+      # SciFact: one of the BEIR tasks, and the small retrieval benchmark most
+      # open-source retrieval stacks report on. Its known-positives are expert
+      # annotations rather than something this repository wrote, which is the
+      # whole reason to spend a network call on it — a fixture whose
+      # judgements come from the seeding script measures the seeding script.
+      #
+      # The only network step in this workflow. Everything else, including the
+      # entire offline suite, runs without it.
+      - name: Fetch the benchmark corpus
+        run: |
+          python scripts/fetch_benchmark_corpus.py --out .benchmark-corpus/scifact
+
+      - name: Diagnose and tune against it
+        env:
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GEMINI_API_KEY: ""
+        run: bash .github/scripts/tuning-benchmark.sh
+
+      - name: Publish the result
+        if: always()
+        run: |
+          {
+            echo "### Retrieval tuning on SciFact"
+            echo
+            echo '```'
+            tail -n 60 tuning-benchmark.log 2>/dev/null || echo "(no log)"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  ui:
+    name: The tuning page builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci --no-audit --no-fund
+
+      # The page is typed against `api/types.ts`, which is hand-written against
+      # the HTTP surface. A response shape that changed without the types
+      # following it fails here rather than rendering `undefined` in a browser.
+      - name: Typecheck
+        working-directory: ui
+        run: npm run typecheck
+
+      - name: Build the bundle that ships in the image
+        working-directory: ui
+        run: npm run build
+
+  render:
+    name: The tuning page renders
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Split from `ui` because they answer different questions and need
+    # different toolchains. `ui` asks "does the page compile and build", is
+    # Node-only, and is fast. This asks "does the page *draw*", which needs a
+    # served region and therefore the whole Python stack — and the first
+    # version of this step lived in the Node-only job, where `python` had no
+    # interpreter and no pheasant to import.
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install pheasant
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp]"
+
+      - name: Build the bundle the page is served from
+        working-directory: ui
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      # Typechecking proves the page compiles against the API's shapes; it
+      # does not prove the page *renders*. `api/types.ts` is hand-written, so
+      # a field that is actually nullable and typed as a number gives a
+      # type-clean build and a blank panel in a browser. A chart dividing by
+      # zero on an empty sweep is the same class of thing.
+      - name: Render the tuning page and fail on any console error
+        working-directory: ui
+        env:
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GEMINI_API_KEY: ""
+        run: |
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+          node ci-render.mjs
