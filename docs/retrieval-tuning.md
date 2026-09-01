@@ -216,6 +216,124 @@ anyone having judged a single result. The payload reports when its window spans
 more than one configuration, rather than averaging across exactly the change
 you were looking for.
 
+## The objective: what "better" means
+
+Until you say otherwise, a batch optimizes **reciprocal rank** — how high the
+first known-good document lands. That is a good default and a *product
+decision*, not a fact, so it is configurable:
+
+```yaml
+tuning:
+  objective:
+    metric: reciprocal_rank   # | recall_at_5 | recall_at_10 | hit_rate | balanced
+    weights: {}               # or a custom combination, normalized to sum to 1
+```
+
+| Objective | Optimizes | **Trades away** |
+|---|---|---|
+| `reciprocal_rank` | how high the first good result lands | a document dropping out of the list entirely, for a sharper top |
+| `recall_at_5` / `recall_at_10` | how many good documents are in the window | order inside it — the best answer can slide down |
+| `hit_rate` | did anything good appear at all | position entirely |
+| `balanced` | half rank, half coverage | clean optimization of either; harder to reason about |
+
+The trade column is not decoration. A region whose agents read one result wants
+reciprocal rank; one whose agents fetch a page and synthesize wants recall, and
+would be **actively harmed** by a parameter set that sharpens rank one at the
+cost of dropping a document out of the list. Both are legitimate, they are
+different objectives, and a plane that silently assumed the first would make
+the second region worse while reporting an improvement.
+
+Every report publishes the objective that produced it, with its trade and the
+substituted arithmetic. A composite scores `None` — not zero — when a component
+is missing, because a point that could not be measured is not one that measured
+badly.
+
+## Every measure, explained where it is shown
+
+The failure this guards against is a dashboard of rates read confidently and
+wrongly. A 42% truncation rate looks alarming and is normal. A 0% empty rate
+looks fine and proves nothing about quality. So every metric, stage, gate and
+parameter carries four fields, and the last is the one usually missing:
+
+- **means** — what the number is, with its denominator
+- **impact** — what to do differently if it moves
+- **does not mean** — the misreading it invites, written as the wrong
+  conclusion rather than as a hedge
+- **direction** — `higher`, `lower`, or `neutral`; several have no good
+  direction, and an arrow would imply a target that does not exist
+
+```bash
+pheasant tune explain                  # the whole catalog
+pheasant tune explain truncation_rate  # one entry
+```
+
+Also `GET /tuning/glossary`, MCP `explain_retrieval_measures`, and inline in
+the UI next to each number — documentation a reader has to go and find arrives
+after the mistake. The catalog names its own gaps: parameters with no
+explanation are listed rather than silently absent.
+
+## The benchmark corpus
+
+The demo and CI runs use **SciFact** (`benchmarks/scifact-retrieval.json`), one
+of the BEIR tasks and the small retrieval benchmark most open-source retrieval
+stacks report on:
+
+```bash
+python scripts/fetch_benchmark_corpus.py --out /tmp/corpus
+```
+
+395 abstracts — a quarter written as real PDFs, so the extraction path is
+exercised by the same corpus the numbers come from — 60 claims, and 66 expert
+relevance judgements.
+
+**The judgements are why it is worth the fetch.** Each is a domain expert
+having read that abstract and annotated the sentences that support or
+contradict the claim, which is exactly what this codebase calls typed proof:
+somebody looked, and said so. A fixture whose known-positives were written by
+the seeding script produces numbers that measure the seeding script.
+
+A CONTRADICT annotation is recorded as a **positive**, deliberately. Finding
+the paper that refutes a claim is a correct answer to "what does the literature
+say", and scoring it as a negative would teach the region to hide disagreement.
+
+The subset is deterministic and its rule is stated in the manifest — the first
+N evidenced dev claims, every document they cite, plus a seeded sample of
+uncited abstracts as decoys. A corpus assembled by hand until the charts looked
+good would be a worse lie than a synthetic one, because it would look real.
+
+Fetched at benchmark time, never vendored. The offline suite does not touch it.
+
+## Measuring each mechanism
+
+A diagnosis also ablates the arms — text, vector and graph scored **alone**,
+against the merge. It costs no extra retrieval: the arms already ran, so
+isolating one is a re-fusion over that arm's captured candidates.
+
+Worth having because "hybrid is better" is an assumption most regions never
+test and is frequently false. On the SciFact benchmark the text arm alone
+scores 0.77 and hybrid 0.68 — the graph arm contributes almost nothing on
+scientific prose and dilutes the merge. When an arm alone scores above the
+merge, the report says so in words rather than leaving it to be inferred.
+
+Reported, never acted on automatically. Dropping an arm has consequences beyond
+one cohort, and the gates already refuse a parameter set that empties one
+without saying so.
+
+**An arm is isolated by exclusion, not by weighting it to zero.** The
+distinction is not academic: a zero weight is a zero *score*, so the other
+arms' candidates stay in the merge ordered by their original ranks. Isolating
+by weight silently measured whichever arm had candidates — with embeddings off,
+"vector alone" returned the text arm's ranking verbatim and scored just under
+it. Both behaviours are wanted, for different callers: an operator setting
+`vector_arm_weight: 0` wants the arm to stop influencing the order, not to have
+its documents disappear.
+
+The vector row reports **which embedder produced it**. The offline `stub`
+provider is a bag-of-words hasher that exists so the suite can exercise the
+vector path without a network call; it behaves like a second lexical retriever
+and can score respectably. Only a real provider licenses reading that row as
+semantic retrieval, and the UI says so where the number is.
+
 ## Managing a run
 
 Every surface can drive the whole lifecycle, not just watch it.

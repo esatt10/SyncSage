@@ -109,6 +109,41 @@ def test_the_objective_reaches_the_report(tmp_path: Path) -> None:
         engine.close()
 
 
+def test_an_ablation_excludes_the_other_arms_rather_than_zero_weighting_them() -> None:
+    """A zero weight is a zero score, not exclusion — and the difference matters.
+
+    Zero-weighting leaves the other arms' candidates in the merge, ordered by
+    `best_rank`. So isolating "vector" by weight returned the *text* arm's
+    ranking verbatim whenever embeddings were off, and scored just under it —
+    a number that looked entirely plausible and measured the wrong mechanism.
+
+    Both behaviours are wanted, for different callers: an operator setting
+    `vector_arm_weight: 0` wants the arm to stop influencing the order, not to
+    have its documents disappear. So the fix is a separate `arms` argument
+    rather than a change to what a zero weight does, and this pins both.
+    """
+
+    from pheasant.search.ranking import RankingParameters
+    from pheasant.tuning.refusion import refuse
+
+    fusion_input = {
+        "text": [["c1", "n1", "chunk"], ["c2", "n2", "chunk"]],
+        "vector": [],
+        "graph": [["g1", "g1", "node"]],
+    }
+    default = RankingParameters()
+
+    # Exclusion: the arm under test contributes, and nothing else does.
+    assert refuse(fusion_input, 5, default, arms=("vector",)) == []
+    assert refuse(fusion_input, 5, default, arms=("text",)) == ["n1", "n2"]
+    assert refuse(fusion_input, 5, default, arms=("graph",)) == ["g1"]
+
+    # Zero weighting: the candidates survive, which is what an operator
+    # tuning the weight down actually wants.
+    silenced = RankingParameters(text_arm_weight=0.0, graph_arm_weight=0.0)
+    assert set(refuse(fusion_input, 5, silenced)) == {"n1", "n2", "g1"}
+
+
 def test_each_mechanism_is_measured_on_its_own(tmp_path: Path) -> None:
     """ "Hybrid is better" is an assumption most regions never test.
 
@@ -127,6 +162,10 @@ def test_each_mechanism_is_measured_on_its_own(tmp_path: Path) -> None:
         mechanisms = outcome.mechanisms
         assert "hybrid" in mechanisms
         assert {"text", "vector", "graph"} & set(mechanisms)
+        # The vector arm with embeddings off must report *nothing found*,
+        # not the text arm's ranking under another name.
+        assert mechanisms["vector"]["provider"] == "off"
+        assert mechanisms["vector"]["semantic"] is False
         for arm, entry in mechanisms.items():
             assert entry["evaluated_queries"] > 0, arm
             if arm != "hybrid":

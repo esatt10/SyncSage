@@ -52,6 +52,8 @@ on:
       - "src/pheasant/cli.py"
       - "src/pheasant/api/app.py"
       - "src/pheasant/mcp_server/**"
+      - "benchmarks/scifact-retrieval.json"
+      - "scripts/fetch_benchmark_corpus.py"
       - "tests/test_tuning_*.py"
       - "tests/test_ranking*.py"
       - "tests/test_api_ui_routes.py"
@@ -341,6 +343,56 @@ jobs:
             python -m pytest -q -p no:randomly tests/test_tuning_stress.py
             echo "::endgroup::"
           done
+
+  benchmark:
+    name: The plane against a public benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pheasant
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp]"
+
+      # SciFact: one of the BEIR tasks, and the small retrieval benchmark most
+      # open-source retrieval stacks report on. Its known-positives are expert
+      # annotations rather than something this repository wrote, which is the
+      # whole reason to spend a network call on it — a fixture whose
+      # judgements come from the seeding script measures the seeding script.
+      #
+      # The only network step in this workflow. Everything else, including the
+      # entire offline suite, runs without it.
+      - name: Fetch the benchmark corpus
+        run: |
+          python scripts/fetch_benchmark_corpus.py --out .benchmark-corpus/scifact
+
+      - name: Diagnose and tune against it
+        env:
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GEMINI_API_KEY: ""
+        run: bash .github/scripts/tuning-benchmark.sh
+
+      - name: Publish the result
+        if: always()
+        run: |
+          {
+            echo "### Retrieval tuning on SciFact"
+            echo
+            echo '```'
+            tail -n 60 tuning-benchmark.log 2>/dev/null || echo "(no log)"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
 
   ui:
     name: The tuning page builds

@@ -447,6 +447,13 @@ causes, one symptom.
   MCP and rendered inline in the UI, because documentation a reader has to go
   and find arrives after the mistake. `tests/test_tuning_objective.py` fails
   when a stage, gate or parameter the plane emits has no entry.
+- **The demo and CI benchmark on SciFact**, not on a fixture. One of the BEIR
+  tasks; `scripts/fetch_benchmark_corpus.py` materializes 395 abstracts (a
+  quarter as real PDFs) with 66 **expert relevance judgements**, fetched at
+  benchmark time and never vendored. The point is the judgements: a fixture
+  whose known-positives were written by the seeding script produces evaluation
+  and tuning numbers that measure the seeding script. The subset rule is in the
+  manifest so it cannot be quietly tuned until the charts look good.
 - **Each mechanism is measured on its own.** The diagnosis ablates the arms —
   text, vector, graph alone against the merge — by re-fusing captured
   candidates with the others weighted to zero, so it costs no retrieval.
@@ -729,6 +736,19 @@ Each of these cost real time. They are listed because the shape recurs.
   cannot be paired after the fact, because it has already lost which queries it
   covered. Expensive trials restore from cold storage; cheap ones are redone,
   because redoing them costs nothing.
+- **A zero weight is a zero score, not an exclusion.** The mechanism ablation
+  isolated an arm by weighting the others to zero — but their candidates stay
+  in the merge and are ordered by `best_rank`, so with embeddings off "vector
+  alone" returned the *text* arm's ranking verbatim and scored just under it.
+  A plausible number measuring the wrong mechanism. Isolation now filters
+  which arms contribute at all; zero-weighting keeps its old meaning, because
+  an operator turning an arm down wants it to stop influencing the order, not
+  to have its documents disappear.
+- **A stub embedder scores like a lexical one, because it is one.** The
+  offline `stub` provider is a bag-of-words hasher with planted synonyms. A
+  "vector arm: 0.70" row from it reads as semantic retrieval and is not, so
+  the mechanisms payload carries the provider and `semantic: false`, and the
+  UI says so where the number is.
 - **A test corpus where every query succeeds proves nothing about ranking.**
   The first tuning fixture had three documents and `max_results: 10`, so every
   query returned its known positive and the stage histogram was pure `served`.

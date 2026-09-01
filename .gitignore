@@ -234,3 +234,7 @@ __marimo__/
 # Synapse run summaries (framework convention: runs/ is local-only)
 runs/
 .venv-dev/
+
+# Benchmark corpora: fetched at benchmark time, never vendored.
+.benchmark-cache/
+.benchmark-corpus/

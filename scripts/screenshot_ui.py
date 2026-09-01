@@ -20,6 +20,7 @@ import argparse
 import json
 import shutil
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -116,7 +117,54 @@ def _free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def _seed(root: Path) -> Path:
+def _fetch_benchmark(root: Path) -> dict | None:
+    """Materialize SciFact beside the narrative corpus. ``None`` if unavailable.
+
+    Two corpora in one region, because they demonstrate different things and
+    neither substitutes for the other.
+
+    The handbook is a *narrative*: a handful of runbooks whose repeated,
+    related questions are what memory formation keys on. It is the right
+    corpus for the notebook and memory screenshots and a useless one for
+    retrieval measurement — with nine documents and a top-10, every query is
+    served whatever the ranking does.
+
+    SciFact is a *benchmark*: 395 scientific abstracts, a quarter of them real
+    PDFs, and 60 claims whose supporting documents a domain expert annotated.
+    Those annotations are the known-positives, so the evaluation and tuning
+    numbers measure retrieval rather than measuring this script's opinion of
+    what a good answer looks like — which is what they did while the fixture
+    was hand-written.
+
+    Skipped, loudly, when the fetch is not possible: the screenshots that do
+    not depend on it should still regenerate on a machine with no network.
+    """
+
+    import subprocess
+
+    corpus = root / "workspace" / "scifact"
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                str(REPO / "scripts" / "fetch_benchmark_corpus.py"),
+                "--cache",
+                str(REPO / ".benchmark-cache"),
+                "--out",
+                str(corpus),
+            ],
+            check=True,
+            cwd=REPO,
+        )
+    except Exception as exc:  # noqa: BLE001 - a missing benchmark is not fatal
+        print(f"  benchmark corpus unavailable ({exc}); tuning panels will be thin")
+        return None
+    index = json.loads((corpus.parent / "benchmark.json").read_text(encoding="utf-8"))
+    index["path"] = str(corpus)
+    return index
+
+
+def _seed(root: Path, benchmark: dict | None = None) -> Path:
     workspace = root / "workspace" / "handbook"
     for name, body in CORPUS.items():
         path = workspace / name
@@ -195,12 +243,89 @@ def _seed(root: Path) -> Path:
             },
         ],
     }
+    if benchmark:
+        # A second source, not a replacement. The two corpora answer different
+        # questions and a real region has several sources anyway.
+        config["sources"].insert(
+            1,
+            {
+                "name": "scifact",
+                "type": "markdown_folder",
+                "path": benchmark["path"],
+                # Both formats: the PDFs are the point of writing a quarter of
+                # the corpus as PDFs, and excluding them would leave the
+                # extraction path unexercised by the numbers.
+                "include": ["**/*.md", "**/*.pdf"],
+                "sync": {"on_startup": False},
+            },
+        )
+        # With ~400 documents, the demo-scale floors are no longer doing the
+        # work they were lowered to do, and `max_results: 2` is no longer the
+        # only thing making rank matter.
+        config["tuning"]["max_results"] = 5
+        config["tuning"]["minimum_paired_queries"] = 5
+        config["evaluation"]["cohorts"]["anchor_minimum_queries"] = 10
     path = root / "pheasant.yaml"
     path.write_text(yaml.safe_dump(config), encoding="utf-8")
     return path
 
 
-def _drive(app) -> None:
+def _drive_benchmark(client, engine, benchmark: dict) -> None:
+    """Ask the benchmark's claims, and record its expert annotations as proof.
+
+    The judgements are **not** invented here. Each one is a domain expert
+    having read that abstract and marked the sentences that support or
+    contradict the claim — which is precisely what pheasant's proof taxonomy
+    calls ``explicit_accept``: somebody looked, and said so.
+
+    A CONTRADICT annotation is recorded as a positive too, deliberately.
+    Finding the paper that refutes a claim is a correct answer to "what does
+    the literature say about this", and scoring it as a negative would teach
+    the region to hide disagreement — which is the opposite of what a
+    knowledge base is for.
+    """
+
+    import pheasant.evaluation as evaluation
+
+    artifacts = {
+        str(row["relative_path"]): str(row["id"])
+        for row in engine.state.rows("SELECT id, relative_path FROM artifacts")
+    }
+    queries = [entry["query"] for entry in benchmark["queries"]]
+    # Three passes in different sessions: repetition is what the rolling
+    # cohort and the live-health sample count are built from.
+    for index in range(3):
+        for query in queries:
+            client.post(
+                "/search",
+                json={"query": query, "mode": "hybrid", "max_results": 5},
+                headers={
+                    "X-Pheasant-Session": f"scifact-{index}",
+                    "X-Pheasant-Principal": "user:reviewer",
+                },
+            )
+    recorded = 0
+    for entry in benchmark["evidence"]:
+        target = artifacts.get(entry["path"])
+        if not target:
+            continue
+        client.post(
+            "/evaluation/evidence",
+            json={
+                "query": entry["query"],
+                "target_id": target,
+                "event_type": entry["event_type"],
+                "principal": "user:reviewer",
+                "session_id": "scifact-0",
+                "interaction_id": f"scifact-{entry['doc_id']}",
+            },
+        )
+        recorded += 1
+    _ = evaluation
+    print(f"  benchmark: {len(queries)} claims asked, {recorded} expert judgements recorded")
+
+
+def _drive(app, benchmark: dict | None = None) -> None:
     """Put real content in front of the camera, through the real surfaces."""
 
     from fastapi.testclient import TestClient
@@ -209,6 +334,8 @@ def _drive(app) -> None:
 
     engine = app.state.engine
     engine.sync_source("handbook", "full")
+    if benchmark:
+        engine.sync_source("scifact", "full")
 
     artifacts = {
         str(row["relative_path"]): str(row["id"])
@@ -238,6 +365,8 @@ def _drive(app) -> None:
                         "X-Pheasant-Principal": "user:ada",
                     },
                 )
+        if benchmark:
+            _drive_benchmark(client, engine, benchmark)
         # Typed proof, over the same endpoint an agent posts to.
         for query, path, event in EVIDENCE:
             target = artifacts.get(path)
@@ -586,6 +715,16 @@ def main() -> int:
     parser.add_argument(
         "--keep", action="store_true", help="Leave the seeded region on disk for inspection."
     )
+    parser.add_argument(
+        "--no-benchmark",
+        action="store_true",
+        help=(
+            "Skip the SciFact corpus. The retrieval and tuning panels then run "
+            "over the nine-document narrative corpus, where every query is "
+            "served whatever the ranking does — useful for a fast local run, "
+            "and not what should be published."
+        ),
+    )
     args = parser.parse_args()
 
     dist = REPO / "ui" / "dist"
@@ -601,7 +740,8 @@ def main() -> int:
 
     root = Path(tempfile.mkdtemp(prefix="pheasant-shots-"))
     try:
-        config_path = _seed(root)
+        benchmark = None if args.no_benchmark else _fetch_benchmark(root)
+        config_path = _seed(root, benchmark)
         config = PheasantConfig.model_validate(
             yaml.safe_load(config_path.read_text(encoding="utf-8"))
         )
@@ -610,7 +750,7 @@ def main() -> int:
         # and seeding through a TestClient consumes that. The served app is a
         # fresh one reading what the first wrote -- which is also a fair
         # reflection of what a browser sees, since it is a cold process.
-        _drive(create_app(config, config_path=str(config_path)))
+        _drive(create_app(config, config_path=str(config_path)), benchmark)
         app = create_app(config, config_path=str(config_path))
 
         port = _free_port()

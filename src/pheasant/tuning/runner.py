@@ -401,7 +401,15 @@ def _run(
             summary=_summarize(histogram, unevidenced),
         )
         # Each mechanism on its own, from the captures already in hand.
-        mechanisms = _measure_mechanisms(captures, positives, base_ranking, objective)
+        mechanisms = _measure_mechanisms(
+            captures,
+            positives,
+            base_ranking,
+            objective,
+            provider=str(getattr(getattr(config.search, "embeddings", None), "provider", "") or "")
+            if getattr(getattr(config.search, "embeddings", None), "enabled", False)
+            else "off",
+        )
         outcome.mechanisms = mechanisms
         outcome.diagnosis = diagnosis
         sink.log_diagnosis(experiment, diagnosis)
@@ -958,6 +966,7 @@ def _measure_mechanisms(
     positives: dict[str, list[str]],
     base_ranking: RankingParameters,
     objective: Objective,
+    provider: str = "",
 ) -> dict[str, Any]:
     """Each retrieval mechanism, scored on its own and in the merge.
 
@@ -982,19 +991,19 @@ def _measure_mechanisms(
 
     out: dict[str, Any] = {}
     for arm in (*ARMS, "hybrid"):
-        if arm == "hybrid":
-            point = base_ranking
-        else:
-            # One arm at full weight, the others silenced. A zero weight is a
-            # zero score, not a filter — the arm's candidates are still in the
-            # merge, they just cannot outrank a weighted arm.
-            point = base_ranking.with_overlay(
-                {f"{other}_arm_weight": (1.0 if other == arm else 0.0) for other in ARMS},
-                provenance="ablation",
-            )
+        # Isolated by *excluding* the other arms, not by weighting them to
+        # zero. A zero weight is a zero score, so the other arms' candidates
+        # would stay in the merge ordered by their original ranks — which made
+        # "vector alone" return the text arm's ranking verbatim whenever
+        # embeddings were off, and score just under it.
+        point = base_ranking
+        contributing = ARMS if arm == "hybrid" else (arm,)
         rankings = {
             query_id: refusion.refuse(
-                stages["fusion_input"], int(stages.get("max_results") or 10), point
+                stages["fusion_input"],
+                int(stages.get("max_results") or 10),
+                point,
+                arms=contributing,
             )
             for query_id, stages in captures.items()
             if refusion.refusable(stages)
@@ -1008,6 +1017,19 @@ def _measure_mechanisms(
             "objective_score": objective.score(metrics),
             "evaluated_queries": score.evaluated,
         }
+    # Which embedder produced the vector arm's numbers. Load-bearing for
+    # honesty rather than decoration: the offline `stub` provider is a
+    # bag-of-words hasher with a handful of planted synonyms, so it behaves
+    # like a second lexical retriever and can score respectably. Reporting
+    # that row as "vector" without saying so invites a reader to conclude the
+    # region's *semantic* retrieval was measured, when no embedding model ran.
+    if "vector" in out:
+        out["vector"]["provider"] = provider
+        # `off` is emphatically not a semantic result — no embedder ran at
+        # all — and neither is `stub`, which is a bag-of-words hasher. Only a
+        # real provider licenses reading that row as semantic retrieval.
+        out["vector"]["semantic"] = provider not in ("stub", "off", "", None)
+
     hybrid = (out.get("hybrid") or {}).get("objective_score")
     for arm, entry in out.items():
         if arm == "hybrid" or hybrid is None or entry["objective_score"] is None:

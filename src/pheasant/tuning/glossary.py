@@ -163,6 +163,21 @@ HEALTH: list[dict[str, Any]] = [
         kind="health",
     ),
     _entry(
+        "vector_arm_provider",
+        "Which embedder the vector arm used",
+        "The embedding provider behind the vector arm's score: a real model, "
+        "`stub` (pheasant's deterministic offline embedder), or `off`.",
+        "Read every vector number against this. `stub` is a bag-of-words "
+        "hasher with a handful of planted synonyms — it is there so the "
+        "offline suite can exercise the vector *path* without a network call, "
+        "and it behaves like a second lexical retriever.",
+        "A respectable score from the `stub` provider is **not** evidence "
+        "that semantic retrieval works here. No embedding model ran. Only a "
+        "score from a real provider says anything about semantic retrieval.",
+        NEUTRAL,
+        kind="health",
+    ),
+    _entry(
         "truncation_rate",
         "Truncated",
         "The share of searches where the fused candidate list was longer than "

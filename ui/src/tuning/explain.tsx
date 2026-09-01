@@ -110,7 +110,13 @@ export function MechanismTable({
 }: {
   mechanisms?: Record<
     string,
-    { objective_score: number | null; evaluated_queries: number; hybrid_gain?: number }
+    {
+      objective_score: number | null;
+      evaluated_queries: number;
+      hybrid_gain?: number;
+      provider?: string;
+      semantic?: boolean;
+    }
   >;
   objectiveLabel: string;
 }) {
@@ -118,6 +124,10 @@ export function MechanismTable({
   const hybrid = mechanisms.hybrid;
   const arms = Object.entries(mechanisms).filter(([name]) => name !== "hybrid");
   const beating = arms.filter(([, m]) => (m.hybrid_gain ?? 0) < 0);
+  // A stub embedder is a bag-of-words hasher, so its row reads like a
+  // semantic result and is not one. Said next to the number rather than in a
+  // footnote, because the number is what gets quoted.
+  const stubbed = mechanisms.vector && mechanisms.vector.semantic === false;
   return (
     <div className="mechanisms">
       <table className="data-table">
@@ -133,6 +143,9 @@ export function MechanismTable({
             <tr key={name}>
               <td>
                 <code>{name}</code> arm alone
+                {name === "vector" && m.provider ? (
+                  <span className="muted small"> · {m.provider}</span>
+                ) : null}
               </td>
               <td>{m.objective_score === null ? "—" : m.objective_score.toFixed(4)}</td>
               <td className={(m.hybrid_gain ?? 0) < 0 ? "mechanisms__loss" : undefined}>
@@ -155,6 +168,26 @@ export function MechanismTable({
           ) : null}
         </tbody>
       </table>
+      {stubbed ? (
+        <p className="tune-warning">
+          {mechanisms.vector?.provider === "off" ? (
+            <>
+              No embedder is configured, so the vector arm found nothing and its row is
+              an empty result rather than a semantic one. Set{" "}
+              <code>search.embeddings.enabled</code> to measure it.
+            </>
+          ) : (
+            <>
+              The vector arm ran on the <code>stub</code> embedder — a deterministic
+              bag-of-words hasher that exists so the offline suite can exercise the
+              vector path without a network call. It behaves like a second lexical
+              retriever, so its score says nothing about semantic retrieval. Configure a
+              real <code>search.embeddings.provider</code> before reading that row as
+              one.
+            </>
+          )}
+        </p>
+      ) : null}
       {beating.length ? (
         <p className="tune-warning">
           On this cohort the {beating.map(([n]) => n).join(" and ")} arm

@@ -1338,4 +1338,8 @@ export interface TuningMechanism {
   objective_score: number | null;
   evaluated_queries: number;
   hybrid_gain?: number;
+  /** Vector arm only: which embedder produced this score. */
+  provider?: string;
+  /** False when the score came from the offline `stub` embedder. */
+  semantic?: boolean;
 }

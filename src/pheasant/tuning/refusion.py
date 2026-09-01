@@ -54,8 +54,22 @@ def refuse(
     fusion_input: dict[str, list[list[str]]],
     max_results: int,
     ranking: RankingParameters,
+    arms: tuple[str, ...] = ARM_ORDER,
 ) -> list[str]:
     """Reciprocal-rank fusion over captured arm lists. Returns fused ids.
+
+    ``arms`` restricts which arms contribute candidates at all, which is a
+    different thing from weighting one to zero and the distinction is not
+    academic. A zero weight is a zero *score*: the arm's candidates stay in the
+    merge and are ordered by `best_rank`, so zero-weighting two arms returns
+    the third arm's candidates *plus theirs*, ordered by their original ranks.
+
+    That is correct for tuning — an operator setting `vector_arm_weight: 0`
+    wants the arm to stop influencing the order, not to have its documents
+    vanish — and it is wrong for an ablation, which needs true isolation.
+    Isolating by weight silently measured whichever arm had candidates: with
+    embeddings off, "vector alone" returned the text arm's ranking verbatim
+    and scored just under it.
 
     A line-for-line mirror of :func:`pheasant.search.hybrid._merge_rrf` over
     the triples ``(fusion key, reporting identity, kind)``. Every branch below
@@ -69,7 +83,7 @@ def refuse(
     identity: dict[str, str] = {}
     kinds: dict[str, str] = {}
 
-    for arm in ARM_ORDER:
+    for arm in arms:
         arm_weight = ranking.arm_weight(arm)
         for rank, entry in enumerate(fusion_input.get(arm) or [], start=1):
             key, node_id, kind = (list(entry) + ["", "", ""])[:3]
