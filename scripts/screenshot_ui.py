@@ -32,6 +32,8 @@ import yaml
 REPO = Path(__file__).resolve().parents[1]
 TARGET = REPO / "docs" / "assets" / "ui"
 VIEWPORT = {"width": 1440, "height": 900}
+#: Below this the Graph shot is a subselection rather than a network.
+MIN_GRAPH_NODES = 50
 
 #: A corpus small enough to seed in a second and real enough to search. The
 #: vocabulary mismatch is deliberate: the docs say `pheasant-flock`, the
@@ -507,6 +509,47 @@ def _shoot(port: int, shots: dict[str, str]) -> None:
                             )
                 else:
                     raise SystemExit("no content keys on the trace -- nothing to select")
+            if name == "graph":
+                # Expand before photographing.
+                #
+                # Arriving from the Notebook, the canvas is still filtered to
+                # the nodes that one answer surfaced -- which is the right
+                # default there ("what did this answer touch") and the wrong
+                # picture of a *knowledge graph*: four nodes, a couple of
+                # edges, and no structure. The shot that belongs beside the
+                # word "graph" is the graph.
+                #
+                # So: clear the answer filter, ask for the whole thing, and
+                # lay it out with force rather than concentric rings -- rings
+                # order nodes by degree and say nothing about what is joined
+                # to what, while a force layout is where clusters and hubs
+                # actually become visible.
+                clear = page.get_by_role("button", name="Clear ✕")
+                if clear.count():
+                    clear.first.click()
+                    page.wait_for_load_state("networkidle")
+                    page.wait_for_timeout(600)
+                page.get_by_role("button", name="Show all", exact=True).click()
+                page.get_by_label("Graph layout").select_option("cose")
+                page.wait_for_load_state("networkidle")
+                # A force layout is iterative: the network is on screen long
+                # before it has settled, and a shot taken early is a picture
+                # of a simulation mid-tick. This is the one page whose wait is
+                # about the physics rather than the fetch.
+                page.wait_for_timeout(9000)
+                drawn = page.locator(".graph-badge").first.inner_text()
+                print(f"  graph: {drawn}")
+                # The badge is the node count the canvas actually drew, so it
+                # is the one thing that distinguishes "the whole graph" from
+                # "the four nodes an answer touched" -- which is exactly the
+                # regression this branch exists to prevent, and exactly the
+                # kind a screenshot fails silently at.
+                count = int("".join(ch for ch in drawn if ch.isdigit()) or 0)
+                if count < MIN_GRAPH_NODES:
+                    raise SystemExit(
+                        f"the graph canvas drew {count} nodes -- expanding it did not "
+                        f"take, and the shot would be a subselection again"
+                    )
             if name == "evaluation":
                 # Open one metric. A page of tiles shows the health vector and
                 # hides the thing that makes a number arguable: the formula,
