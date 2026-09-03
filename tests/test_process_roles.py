@@ -1102,3 +1102,31 @@ def test_a_worker_may_hold_its_own_front_door_key(tmp_path: Path, monkeypatch: A
     monkeypatch.setenv("PHEASANT_API_TOKEN", "a-random-value")
     config = _fleet_config(tmp_path, server={"host": "0.0.0.0", "role": "worker"})  # noqa: S104
     validate_role(resolve_role(config, "worker"), config)
+
+
+def test_a_grpc_worker_needs_no_token_for_an_api_it_does_not_serve(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """`pheasant worker --transport grpc` binds a gRPC port, not the app.
+
+    The exposure check is about a reachable *knowledge-base API*. Applying it
+    to a process that serves none demands a token for a surface that does not
+    exist — and refuses a working deployment, which is the expensive direction
+    for a guard to be wrong in. What such a process may *hold* is unaffected,
+    and is asserted below.
+    """
+
+    monkeypatch.delenv("PHEASANT_API_TOKEN", raising=False)
+    config = _fleet_config(tmp_path, server={"host": "0.0.0.0", "role": "worker"})  # noqa: S104
+    assert config.server.api.enabled is True  # the default, and irrelevant here
+
+    with pytest.raises(RoleConfigurationError):
+        validate_role(resolve_role(config, "worker"), config)  # serves_http defaults True
+    validate_role(resolve_role(config, "worker"), config, serves_http=False)
+
+    # The allow-list still applies: not serving an API is not a licence to
+    # hold the database.
+    monkeypatch.setenv("PHEASANT_DATABASE_URL", "postgresql://u:p@db/x")
+    with pytest.raises(RoleConfigurationError) as refusal:
+        validate_role(resolve_role(config, "worker"), config, serves_http=False)
+    assert "PHEASANT_DATABASE_URL" in str(refusal.value)

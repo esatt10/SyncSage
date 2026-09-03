@@ -110,7 +110,7 @@ pheasant-kb/
 │   └── telemetry/             ← metrics.py (Prometheus exposition),
 │                                interactions.py (the observation plane)
 ├── ui/                        ← React + Vite workspace (baked into the image)
-└── tests/                     ← 87 pytest modules, offline by design
+└── tests/                     ← 119 pytest modules, offline by design
 ```
 
 Key entities: **knowledge base** (`kb_id` = `pheasant.name`) → **sources** →
@@ -137,7 +137,7 @@ pheasant mount <host-path> [--at /data/x]  # bind-mount + allow-list it
 pheasant scan                              # project RAM/disk/time before indexing
 pheasant validate && pheasant doctor
 pheasant sync --source <name> --mode incremental|full|validate_only|repair
-pheasant serve --role api|indexer|worker|all
+pheasant serve --role all|api|indexer|graph|worker|logger
 pheasant worker                            # stateless preparation worker
 pheasant queue status|drain|requeue-dead
 pheasant shard plan [--emit DIR]           # split a corpus across regions;
@@ -209,6 +209,11 @@ For deployment/configuration work, load
 10. **Verify against the real thing.** Postgres, NATS, wasmtime and a real
     container have each caught bugs a mock could not. When a change touches a
     backend, run that backend. When it touches the image, build the image.
+    CI does the Postgres half for you on **every** PR (`ci.yml`'s
+    `backend-parity` job, deliberately unfiltered); locally it is
+    `PHEASANT_TEST_POSTGRES_DSN=… pytest -q`, which turns on the parity suite
+    and the lease/queue differential. Neither replaces running the thing you
+    changed.
 11. **Config-schema changes owe the config surface an update.** Adding a
     *top-level* section to `src/pheasant/config/schema.py` needs three things:
     a mention in `docs/configuration.md`, a `Section` in
@@ -910,6 +915,31 @@ Each of these cost real time. They are listed because the shape recurs.
   "an ingress authenticates this". The general shape: when a control is a
   *property of the deployment* rather than of the code, it must be re-derived
   per deployment shape, not inherited.
+- **Backend coverage behind a path filter is coverage nobody can reason
+  about.** Postgres — the scale-out backend, and the one the offline suite
+  cannot see — ran only in the evaluation, memory and tuning workflows, each
+  gated on `paths:`. So whether a change was tested against it depended on
+  which files it happened to touch. Measured when the unfiltered job was
+  added: three of the twenty-two modules carrying dialect branching matched no
+  filter at all, and one was `sync/locks.py` — the per-source lease several
+  indexers rest on, and the exact file where a discarded `cursor.rowcount`
+  once made a claim fail on SQLite and pass on Postgres. `ci.yml` now runs the
+  whole suite against a real Postgres on every PR, and
+  `tests/test_workflow_coverage.py` fails if that job gains a filter, stops
+  running Postgres, or stops setting the DSN. The second-order lesson is in
+  that test: narrowing the run to a curated list of dialect-sensitive *tests*
+  would have been the same staleness one level down, so it runs everything.
+- **A startup refusal has to key on what a process does, not on what its
+  config could describe.** The "unauthenticated API on a routable bind" check
+  was applied wherever `validate_role` ran — including `pheasant worker
+  --transport grpc`, which binds a gRPC port and never starts the HTTP app at
+  all. It therefore demanded an API token for a surface that does not exist.
+  The shipped `worker.yaml` sets `server.api.enabled: false` and so happened
+  to satisfy it, which is why a real run and the whole suite both passed: it
+  was one config away from refusing a working deployment, in the direction
+  guards are most expensive to be wrong in. `serves_http=False` says so at the
+  call site now. Found by writing the test for an unrelated worker bug, which
+  is the usual way.
 - **A ceiling stated only in prose cannot be reached by anyone reading a
   dashboard.** One indexer is the sole commit authority, which every design
   document said and no metric showed — so "we scaled workers and ingest

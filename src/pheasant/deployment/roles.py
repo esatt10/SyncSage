@@ -393,7 +393,7 @@ def _validate_serving_exposure(policy: RolePolicy, config: object) -> None:
     )
 
 
-def validate_role(policy: RolePolicy, config: object) -> None:
+def validate_role(policy: RolePolicy, config: object, *, serves_http: bool = True) -> None:
     """Refuse a combination that cannot work, at startup.
 
     Each check earns its place by turning something silent into a refusal. An
@@ -408,6 +408,14 @@ def validate_role(policy: RolePolicy, config: object) -> None:
     trust boundaries, and an unauthenticated API on a routable address. None
     of those stops a process working, which is precisely why each needs to be
     refused here instead of discovered later.
+
+    ``serves_http=False`` for a process that does not start the HTTP app at
+    all — `pheasant worker --transport grpc` is the one, and it binds a gRPC
+    port instead. The exposure check below is about a *reachable
+    knowledge-base API*, so applying it to a process that serves none would
+    demand a token for a surface that does not exist and refuse a working
+    deployment. Everything else here still applies: what that process may
+    *hold* has nothing to do with what it serves.
     """
 
     if policy.role is Role.API:
@@ -439,7 +447,8 @@ def validate_role(policy: RolePolicy, config: object) -> None:
         # Skipped for the worker only because it cannot hold the graph token
         # at all: the surface check above already refused if it did.
         _validate_boundary_tokens(config)
-    _validate_serving_exposure(policy, config)
+    if serves_http:
+        _validate_serving_exposure(policy, config)
 
 
 def describe(policy: RolePolicy) -> dict[str, object]:

@@ -1008,3 +1008,50 @@ def test_remote_and_thread_executors_produce_identical_state(
         )
 
     assert shape(remote_artifacts) == shape(thread_artifacts)
+
+
+def test_the_worker_cli_reports_a_missing_grpc_extra_instead_of_a_traceback(
+    tmp_path: Path, capsys: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker tier scales hardest and comes up last, so its startup path is
+    the one an operator meets a broken image on.
+
+    `GrpcUnavailable` exists to turn a missing extra into one actionable line,
+    and `serve()` reached a bare `import grpc` before the call that raises it —
+    so the CLI's handler never ran and the operator got a stack trace ending in
+    `ModuleNotFoundError: No module named 'grpc'`.
+
+    Driven through `main` with `load_protos` forced to fail, so it asserts the
+    contract whether or not the extra happens to be installed here.
+    """
+
+    import yaml
+
+    from pheasant.cli import main
+    from pheasant.sync import grpc_worker
+
+    config_path = tmp_path / "pheasant.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "pheasant": {
+                    "name": "no-grpc",
+                    "state_path": str(tmp_path / "state"),
+                    "workspace_root": str(tmp_path / "ws"),
+                },
+                "sync": {"concurrency": {"remote_worker_enabled": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def missing(*_args: Any, **_kwargs: Any) -> Any:
+        raise grpc_worker.GrpcUnavailable(
+            "the gRPC worker transport needs the [grpc] extra: pip install 'pheasant[grpc]'"
+        )
+
+    monkeypatch.setattr(grpc_worker, "load_protos", missing)
+    monkeypatch.setenv("PHEASANT_INDEX_WORKER_TOKEN", "a-token")
+
+    assert main(["worker", "--config", str(config_path)]) == 1
+    assert "[grpc] extra" in capsys.readouterr().out

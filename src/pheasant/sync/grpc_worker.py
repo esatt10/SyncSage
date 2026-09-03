@@ -443,9 +443,16 @@ def serve(
 
     from concurrent.futures import ThreadPoolExecutor
 
+    # `load_protos` first, deliberately. It is the function whose whole job is
+    # to turn a missing extra into `GrpcUnavailable`, which is what the CLI
+    # catches to print one actionable line. A bare `import grpc` above it
+    # raised ModuleNotFoundError straight past that handler, so `pheasant
+    # worker` on an image without the [grpc] extra greeted an operator with a
+    # traceback instead — on the tier that scales hardest and comes up last.
+    _pb2, pb2_grpc = load_protos()
+
     import grpc
 
-    _pb2, pb2_grpc = load_protos()
     server = grpc.server(
         ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="pheasant-grpc"),
         options=[

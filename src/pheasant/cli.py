@@ -2971,7 +2971,10 @@ def main(argv: list[str] | None = None) -> int:
         # one Compose actually uses for the tier, so it was the one path where
         # a worker could hold the database URL and never be told.
         try:
-            validate_worker_role(POLICIES[Role.WORKER], cfg)
+            # `serves_http=False`: this command binds a gRPC port and never
+            # starts the HTTP app, so there is no knowledge-base API here to
+            # demand a token for. What it may *hold* is checked either way.
+            validate_worker_role(POLICIES[Role.WORKER], cfg, serves_http=False)
         except RoleConfigurationError as exc:
             print(f"Refusing to start: {exc}")
             return 1
