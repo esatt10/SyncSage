@@ -130,14 +130,41 @@ def test_every_workload_passes_a_role_this_code_knows(scaled: list[dict[str, Any
     assert seen == {"api", "graph", "indexer", "worker"}
 
 
+def _env_from_manifest(container: dict[str, Any]) -> dict[str, str]:
+    """The variables a workload actually wires, secret values stubbed.
+
+    A manifest names a Secret key; what a startup check reads is whatever that
+    key resolves to. Stubbing each with its own distinct value is what lets the
+    tests below assert on both — that a workload wires the variable at all, and
+    that two boundaries do not resolve to one string.
+    """
+
+    resolved: dict[str, str] = {}
+    for entry in container.get("env") or []:
+        name = entry["name"]
+        if "value" in entry:
+            resolved[name] = str(entry["value"])
+        else:
+            key = entry["valueFrom"]["secretKeyRef"]["key"]
+            resolved[name] = f"stub-value-for-{key}"
+    return resolved
+
+
 def test_the_embedded_configs_are_valid_for_the_role_that_uses_them(
     scaled: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The api role refuses to start without a queue — so the config must have one.
 
     This is the check that would have caught shipping a fleet ConfigMap with
     `sync.queue.enabled` left at its default: `validate_role` is the same
     function the process runs at startup.
+
+    Since 35.8 it is also the check that would have caught shipping a serving
+    workload with no `PHEASANT_API_TOKEN` wired, or with the graph and worker
+    tokens pointed at one Secret key — so the workload's own `env` block is
+    what the config is validated against, rather than an empty environment
+    that no pod ever has.
     """
 
     configs = {
@@ -148,11 +175,105 @@ def test_the_embedded_configs_are_valid_for_the_role_that_uses_them(
     assert set(configs) == {"pheasant-fleet-config", "pheasant-worker-config"}
 
     for workload in _workloads(scaled):
-        role = _container(workload)["args"][2]
+        container = _container(workload)
+        role = container["args"][2]
         volumes = {volume["name"]: volume for volume in _pod_spec(workload)["volumes"]}
         name = volumes["config"]["configMap"]["name"]
         config = configs[name]
-        validate_role(resolve_role(config, role), config)
+        with monkeypatch.context() as patched:
+            for key in ("PHEASANT_API_TOKEN", "PHEASANT_GRAPH_SERVICE_TOKEN"):
+                patched.delenv(key, raising=False)
+            for key, value in _env_from_manifest(container).items():
+                patched.setenv(key, value)
+            validate_role(resolve_role(config, role), config)
+
+
+def test_every_serving_workload_authenticates_its_api(scaled: list[dict[str, Any]]) -> None:
+    """A pod binds 0.0.0.0 by necessity; nothing else stands in front of it.
+
+    The finding this closes: the single-container posture — unauthenticated,
+    published on loopback — shipped unchanged into the fleet profile, where the
+    API is a multi-replica Service and the only control was a port-publishing
+    decision an operator can reasonably change.
+    """
+
+    for workload in _workloads(scaled):
+        container = _container(workload)
+        role = container["args"][2]
+        env = _env_from_manifest(container)
+        if role == "worker":
+            # The one workload that needs no token, because it serves no
+            # knowledge-base API at all — asserted directly below.
+            assert "PHEASANT_API_TOKEN" not in env
+            continue
+        assert "PHEASANT_API_TOKEN" in env, f"{role} serves an API with nothing in front of it"
+
+
+def test_the_worker_serves_no_knowledge_base_api(scaled: list[dict[str, Any]]) -> None:
+    """`server.api.enabled: false`, and it is enforced, not decorative.
+
+    A worker holds no state, no keys and no source list. Serving the
+    register-a-source API from the tier that scales hardest and runs
+    third-party parse code was surface bought for nothing.
+    """
+
+    worker = next(
+        PheasantConfig.model_validate(yaml.safe_load(raw))
+        for doc in _by_kind(scaled, "ConfigMap")
+        if doc["metadata"]["name"] == "pheasant-worker-config"
+        for raw in doc["data"].values()
+    )
+    assert worker.server.api.enabled is False
+    assert worker.server.ui.enabled is False
+    assert worker.server.mcp.enabled is False
+    # …and the preparation endpoints it does serve are still switched on.
+    assert worker.sync.concurrency.remote_worker_enabled is True
+
+
+def test_the_two_internal_boundaries_do_not_share_a_secret(scaled: list[dict[str, Any]]) -> None:
+    """One value across two boundaries makes the weaker holder set the strength.
+
+    Workers hold the indexing token by necessity and are the least-trusted
+    tier in the fleet. The Compose file used to wire the graph token to the
+    worker token's value, so compromising any worker also yielded the
+    credential for the internal graph API — which serves the whole graph.
+    """
+
+    for workload in _workloads(scaled):
+        env = _env_from_manifest(_container(workload))
+        graph, worker = (
+            env.get("PHEASANT_GRAPH_SERVICE_TOKEN"),
+            env.get("PHEASANT_INDEX_WORKER_TOKEN"),
+        )
+        if graph and worker:
+            assert graph != worker, "the graph and worker tokens resolve to one Secret key"
+
+
+def test_the_scaled_manifests_restrict_the_internal_tiers(scaled: list[dict[str, Any]]) -> None:
+    """A token check is the last line, not the only one.
+
+    The graph service returns nodes and edges; the workers accept parse work.
+    On a flat pod network every workload in the cluster gets to try, so the
+    scaled bundle ships a default-deny with one allowance per real caller.
+    """
+
+    policies = {doc["metadata"]["name"]: doc for doc in _by_kind(scaled, "NetworkPolicy")}
+    assert "pheasant-default-deny-ingress" in policies
+    default = policies["pheasant-default-deny-ingress"]
+    assert default["spec"]["podSelector"]["matchLabels"] == {"app.kubernetes.io/name": "pheasant"}
+    assert default["spec"]["policyTypes"] == ["Ingress"]
+    # A default-deny that names ingress rules is not a default-deny.
+    assert not default["spec"].get("ingress")
+
+    for component in ("graph", "worker"):
+        policy = policies[f"pheasant-{component}-ingress"]
+        sources = [source for rule in policy["spec"]["ingress"] for source in rule["from"]]
+        assert any("podSelector" in source for source in sources), (
+            f"the {component} tier accepts traffic from outside the namespace"
+        )
+        assert not any(source.get("namespaceSelector") == {} for source in sources), (
+            f"the {component} tier is open to every namespace"
+        )
 
 
 def test_the_api_and_indexer_share_one_knowledge_base(scaled: list[dict[str, Any]]) -> None:
@@ -615,7 +736,56 @@ def test_the_compose_worker_gets_no_database_url() -> None:
     assert "PHEASANT_INDEX_WORKER_TOKEN" in env
 
 
-def test_the_compose_configs_are_valid_for_their_roles() -> None:
+def _compose_env(path: Path, service: str) -> dict[str, str]:
+    """The environment one Compose service resolves, `${VAR:?...}` included.
+
+    Written out rather than shelled to `docker compose config` so the suite
+    stays offline. It only has to understand what these files use: a literal
+    value, `${VAR}`, `${VAR:-default}` and `${VAR:?message}` — the last of
+    which is the one that matters, because it is how the fleet refuses to come
+    up without a secret.
+    """
+
+    import re
+
+    compose = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw = compose["services"][service].get("environment") or {}
+    resolved: dict[str, str] = {}
+    for key, value in raw.items():
+        text = str(value)
+        for reference, default in re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:[?-][^}]*)?\}", text):
+            # The operator has not set anything, so `:-` gives its default and
+            # `:?` gives a stand-in named after the variable — distinct per
+            # variable, which is what makes the shared-secret check below real.
+            substitute = default[2:] if default.startswith(":-") else f"unset-{reference}"
+            text = re.sub(r"\$\{" + reference + r"(:[?-][^}]*)?\}", substitute, text)
+        resolved[key] = text
+    return resolved
+
+
+def test_the_compose_fleet_gives_each_boundary_its_own_secret() -> None:
+    """One value across two boundaries makes the weakest holder set the strength.
+
+    The shipped file wired `PHEASANT_GRAPH_SERVICE_TOKEN` to the worker
+    token's value. Workers are the least-trusted tier in the fleet and hold
+    the indexing token by necessity, so any compromised worker also held the
+    credential for the internal graph API — which serves the whole graph.
+    """
+
+    fleet_env = _compose_env(COMPOSE_FLEET, "api")
+    worker_env = _compose_env(COMPOSE_FLEET, "worker")
+
+    for required in ("PHEASANT_API_TOKEN", "PHEASANT_GRAPH_SERVICE_TOKEN"):
+        assert required in fleet_env
+        # `${VAR:?...}` — the fleet refuses to come up rather than defaulting.
+        assert fleet_env[required].startswith("unset-"), f"{required} has a default"
+    assert fleet_env["PHEASANT_GRAPH_SERVICE_TOKEN"] != fleet_env["PHEASANT_INDEX_WORKER_TOKEN"]
+
+    # And the worker still gets exactly one secret.
+    assert set(worker_env) == {"PHEASANT_CONFIG", "PHEASANT_INDEX_WORKER_TOKEN"}
+
+
+def test_the_compose_configs_are_valid_for_their_roles(monkeypatch: pytest.MonkeyPatch) -> None:
     fleet = PheasantConfig.model_validate(
         yaml.safe_load((COMPOSE_CONFIG / "fleet.yaml").read_text(encoding="utf-8"))
     )
@@ -623,9 +793,25 @@ def test_the_compose_configs_are_valid_for_their_roles() -> None:
         yaml.safe_load((COMPOSE_CONFIG / "worker.yaml").read_text(encoding="utf-8"))
     )
 
+    # The environment the compose file actually supplies each tier — a serving
+    # role refuses an unauthenticated non-loopback bind, and a worker refuses
+    # to hold a credential it can never use, so validating against an empty
+    # environment would test neither.
     for role in ("api", "graph", "indexer"):
-        validate_role(resolve_role(fleet, role), fleet)
-    validate_role(resolve_role(worker, "worker"), worker)
+        with monkeypatch.context() as patched:
+            for key, value in _compose_env(COMPOSE_FLEET, role).items():
+                patched.setenv(key, value)
+            validate_role(resolve_role(fleet, role), fleet)
+    with monkeypatch.context() as patched:
+        for key in ("PHEASANT_DATABASE_URL", "PHEASANT_API_TOKEN", "OPENAI_API_KEY"):
+            patched.delenv(key, raising=False)
+        for key, value in _compose_env(COMPOSE_FLEET, "worker").items():
+            patched.setenv(key, value)
+        validate_role(resolve_role(worker, "worker"), worker)
+
+    assert fleet.security.acl_enforced is True
+    assert fleet.security.api_auth.token_env == "PHEASANT_API_TOKEN"
+    assert worker.server.api.enabled is False
 
     assert fleet.sync.queue.enabled is True
     assert fleet.sync.queue.backend == "nats"
@@ -752,7 +938,9 @@ CI_COMPOSE = REPO_ROOT / "deploy" / "compose" / "ci" / "docker-compose.log-tier.
 CI_CONFIG = REPO_ROOT / "deploy" / "compose" / "ci" / "pheasant.log-tier.yaml"
 
 
-def test_the_log_tier_topology_splits_producing_from_draining() -> None:
+def test_the_log_tier_topology_splits_producing_from_draining(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The whole point of that compose file.
 
     `all` would drain what it publishes -- correct for one container, and it
@@ -770,9 +958,15 @@ def test_the_log_tier_topology_splits_producing_from_draining() -> None:
     config = PheasantConfig.model_validate(yaml.safe_load(CI_CONFIG.read_text(encoding="utf-8")))
     # Both roles must actually be startable against this config: `validate_role`
     # is the same function the process runs, and it refuses an api without an
-    # index queue and a logger without an observation queue.
+    # index queue, a logger without an observation queue, and either of them
+    # unauthenticated on a routable bind -- which is why the stack supplies a
+    # token rather than configuring the guard away.
+    env = _compose_env(CI_COMPOSE, "api")
+    assert env.get("PHEASANT_API_TOKEN")
     for role in ("api", "logger"):
-        validate_role(resolve_role(config, role), config)
+        with monkeypatch.context() as patched:
+            patched.setenv("PHEASANT_API_TOKEN", env["PHEASANT_API_TOKEN"])
+            validate_role(resolve_role(config, role), config)
 
     # And the producer must genuinely not drain, which is what
     # `_owns_log_upkeep` decides.

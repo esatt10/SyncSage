@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -686,7 +687,11 @@ LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
     "memory": True,
     "ingestion": False,  # captioner/transcriber are wired at engine construction
     "sync": False,  # watcher/scheduler services are started at boot
-    "security": False,  # path policy is read per request, but ACL wiring is not
+    # Path policy is read per request, but ACL wiring is not -- and since
+    # 35.8 neither is `api_auth`: the token is resolved once at construction
+    # and the middleware is only installed when one exists, so turning auth on
+    # or rotating the token is a restart.
+    "security": False,
     "synapse": True,
     # The tracer provider, the exporter and the buffer's flusher thread are
     # all wired once at app construction, and the log tier's queue binding
@@ -1131,6 +1136,19 @@ def graph_slice(
     }
 
 
+def _resolved_api_token(config: PheasantConfig) -> str:
+    """The shared bearer token for this region's API, or "" when there is none.
+
+    Read once at startup rather than per request: it is a process-wide secret,
+    and rotating it is a restart — the same contract as every other credential
+    here, none of which is ever read out of YAML.
+    """
+
+    auth = getattr(getattr(config, "security", None), "api_auth", None)
+    name = str(getattr(auth, "token_env", "") or "").strip()
+    return (os.environ.get(name, "") or "").strip() if name else ""
+
+
 def create_app(
     config: PheasantConfig | None = None,
     config_path: str | Path | None = None,
@@ -1464,6 +1482,95 @@ def create_app(
         finally:
             limiter.release(path)
 
+    # -- Phase 35.8: the two guards a fleet needs and a container does not ----
+    #
+    # Both are registered *after* `bound_concurrency`, which in Starlette means
+    # they run *before* it: a caller with no token must not take a concurrency
+    # slot, and a request to a surface this process does not serve must not
+    # become an observation.
+
+    #: What a process with `server.api.enabled: false` still answers. The
+    #: probes, so an orchestrator can tell a healthy pod from a dead one;
+    #: `/metrics`, so it is still a scrape target; and `/internal/*`, which is
+    #: the entire point of such a process — those routes enforce their own
+    #: per-boundary bearer tokens and 404 when their feature is off.
+    RESTRICTED_PATHS: frozenset[str] = frozenset({"/health", "/ready", "/metrics"})
+    RESTRICTED_PREFIX = "/internal/"
+    serves_public_api = bool(getattr(config.server.api, "enabled", True))
+
+    if not serves_public_api:
+
+        @app.middleware("http")
+        async def restricted_surface(request, call_next):  # type: ignore[no-untyped-def]
+            """Make `server.api.enabled: false` mean what it says.
+
+            `deploy/compose/worker.yaml` has declared `api.enabled: false`
+            since the worker tier existed, and nothing read it: a preparation
+            worker served the whole knowledge-base API — register a source
+            over any allow-listed path, rewrite the config, read what it finds
+            — on every pod of the tier designed to hold nothing and scale
+            hardest. The flag was documentation.
+
+            A 404 rather than a 403 because that is the truth: on this process
+            the route does not exist.
+            """
+
+            path = request.url.path
+            if path not in RESTRICTED_PATHS and not path.startswith(RESTRICTED_PREFIX):
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "detail": (
+                            "this process serves no knowledge-base API "
+                            "(server.api.enabled is false); it answers the probes, "
+                            "/metrics and its own /internal endpoints"
+                        )
+                    },
+                )
+            return await call_next(request)
+
+    api_token = _resolved_api_token(config)
+    if api_token:
+        expected_token = api_token.encode("utf-8")
+        auth_public_paths = frozenset(config.security.api_auth.public_paths or ())
+
+        @app.middleware("http")
+        async def require_api_token(request, call_next):  # type: ignore[no-untyped-def]
+            """A static shared bearer token, when one is configured.
+
+            Deliberately the whole feature. It is enough to make "behind an
+            authenticating ingress" the default rather than the instruction,
+            it needs no identity provider, and it cannot rot into a half-built
+            one. Anything richer belongs to the ingress —
+            `security.api_auth.behind_authenticating_proxy` says so and turns
+            this off.
+
+            `/internal/*` is exempt structurally rather than by the configured
+            list: each of those routes already enforces the token for its own
+            trust boundary (the worker token, the graph token), and requiring
+            a second one would mean handing the region's API credential to
+            every worker — the shape of the bug this phase removed from the
+            Compose file.
+            """
+
+            path = request.url.path
+            if path.startswith("/internal/") or path in auth_public_paths:
+                return await call_next(request)
+            scheme, _, supplied = (request.headers.get("authorization") or "").partition(" ")
+            # Compared as bytes: Starlette decodes headers as latin-1, so a
+            # single byte above 127 in the header makes `compare_digest` raise
+            # TypeError on str operands -- a 500 from the auth guard, on input
+            # any caller can send.
+            if scheme.lower() != "bearer" or not hmac.compare_digest(
+                supplied.encode("utf-8", "surrogateescape"), expected_token
+            ):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "this region requires a bearer token"},
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            return await call_next(request)
+
     def _record_stream_answer(parent: Any, req: Any, answer: Any, started: Any) -> None:
         """Observe a streamed answer as a child of the request that opened it.
 
@@ -1550,6 +1657,51 @@ def create_app(
             details,
         )
 
+    def _loaded_generation() -> dict[str, object]:
+        """Which graph this process is answering from. No I/O.
+
+        `loaded` is None on a process that holds no graph — an indexer
+        coordinator, a worker, or an API replica pointed at the graph service,
+        which is the deployment where the graph service's own probe is the one
+        to read.
+        """
+
+        payload: dict[str, object] = {"loaded": getattr(engine, "loaded_graph_generation", None)}
+        if remote_graph and role_policy.role is Role.API:
+            payload["source"] = "graph-service"
+        return payload
+
+    def _graph_generation() -> dict[str, object]:
+        """The loaded generation *and* what is published, which reads `/state`.
+
+        Two ids rather than one, because one of them cannot say anything on
+        its own. A replica that missed a reload serves an old graph correctly
+        and silently; publishing the loaded id beside the published id is what
+        turns "this region disagrees with itself" from an inference into a
+        comparison anyone can make from two probe responses.
+
+        Only `/ready` calls this, and only off the event loop. Reading the
+        publication record is two syscalls on a small file — cheap, and not
+        free, and `/health` is the liveness probe: a handler that does no I/O
+        at all is the reason it answers in 0.05s under a saturated thread pool
+        (see its docstring). Staleness belongs on the readiness probe anyway,
+        since that is the one that decides whether a replica should be
+        receiving traffic.
+        """
+
+        published: str | None = None
+        try:
+            record = engine.graph_store.published_generation(config.knowledge_base_id)
+            published = str(record["generation_id"]) if record else None
+        except Exception:  # noqa: BLE001 - a probe must never fail on a label
+            published = None
+        payload = _loaded_generation()
+        payload["published"] = published
+        loaded = payload.get("loaded")
+        if loaded is not None and published is not None:
+            payload["current"] = loaded == published
+        return payload
+
     @app.get("/health")
     async def health() -> dict:
         """Liveness: is this process running at all.
@@ -1568,7 +1720,12 @@ def create_app(
         answer; this one, unaffected by the pool, took 0.05s.
         """
 
-        payload = {"status": "ok", "service": "pheasant", "role": role_policy.name}
+        payload: dict[str, object] = {
+            "status": "ok",
+            "service": "pheasant",
+            "role": role_policy.name,
+            "graph_generation": _loaded_generation(),
+        }
         orchestration = getattr(app.state, "orchestration", None)
         if orchestration is not None:
             payload["leader"] = bool(orchestration.leader)
@@ -1656,6 +1813,17 @@ def create_app(
                 payload["status"] = "not_ready"
                 payload["reason"] = "graph query service unreachable"
                 return JSONResponse(status_code=503, content=payload)  # type: ignore[return-value]
+        # Last, and off the loop like the two probes above: reading the
+        # publication record is two syscalls, and a saturated replica must not
+        # pay them on the event loop just to label itself. A failure here is
+        # not an unready pod -- it is a missing label -- so it degrades to the
+        # in-memory half rather than to a 503.
+        try:
+            payload["graph_generation"] = await asyncio.wait_for(
+                asyncio.to_thread(_graph_generation), timeout=2.0
+            )
+        except Exception:  # noqa: BLE001 - a label must never fail a probe
+            payload["graph_generation"] = _loaded_generation()
         return payload
 
     def _authorize_worker(authorization: str | None) -> None:
@@ -1825,6 +1993,19 @@ def create_app(
             "pheasant_threadpool_tokens_total": pool.total_tokens,
             "pheasant_threadpool_tokens_available": pool.available_tokens,
         }
+        # Only where this process is the commit authority. On an api replica
+        # the meter would report a confident 0.0 from a process that publishes
+        # index work rather than running it — a reading that looks like "there
+        # is headroom" and means "this is not the tier with the ceiling".
+        if role_policy.indexes_locally:
+            saturation = engine.commit_meter.saturation()
+            if saturation is not None:
+                sample["pheasant_commit_authority_saturation"] = saturation
+        published_at = getattr(engine, "loaded_graph_published_at", None)
+        if published_at is not None:
+            sample["pheasant_graph_generation_age_seconds"] = max(
+                0.0, time.time() - float(published_at)
+            )
         sample.update(jobs.metrics_sample())
         # With the durable queue on, the backlog outlives this process, so
         # the in-memory job registry is no longer the whole truth — an HPA
@@ -3747,6 +3928,12 @@ def create_app(
                 req.source_types,
                 req.exclude_source_types,
             )
+        # Which graph answered. A retrieval diagnosis that cannot name the
+        # generation cannot tell "the document is not indexed" from "this
+        # replica has not picked up the index that has it" — and those call
+        # for opposite responses.
+        payload = dict(payload)
+        payload["graph_generation"] = getattr(engine, "loaded_graph_generation", None)
         record_retrieval(
             request,
             query=req.query,

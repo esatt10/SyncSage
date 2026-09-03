@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -8,8 +10,11 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from pheasant.graph.simple import SimpleMultiDiGraph
+
+logger = logging.getLogger(__name__)
 
 # Synapse step 21.6 (session A): compressed timestamped graph snapshots.
 # A snapshot lives beside the (uncompressed, fast-load) ``graph.latest.json``
@@ -39,10 +44,35 @@ def _tmp_for(path: Path) -> Path:
     return path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
 
 
+def generation_id(compressed: bytes) -> str:
+    """Name one published graph, identically on every replica.
+
+    Content-addressed, and deliberately not a counter or a clock. Two replicas
+    must agree on the name without coordinating, an unchanged graph must keep
+    its name across a re-save (pillar 1), and "which graph answered this
+    query" has to be answerable from the answer itself. A digest of the bytes
+    that were actually published is the only one of those three that a
+    sequence number also gives.
+
+    Sixteen hex characters: this names generations of one region's graph, not
+    the contents of the internet, and it is meant to be readable in a log line
+    and a `/health` payload.
+    """
+
+    return hashlib.sha256(compressed).hexdigest()[:16]
+
+
 class GraphStore:
     def __init__(self, root: str | Path):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        #: Called with (kb_id, publication record) after a generation is
+        #: durable. One hook here rather than a call beside each of the five
+        #: `save()` sites, which is how one of them would eventually be
+        #: forgotten. The store stays ignorant of what is on the other end:
+        #: the engine injects a notifier, and a region with no broker leaves
+        #: this None and behaves exactly as it did.
+        self.on_publish: Any = None
         # One store instance is shared by the sync thread and the API request
         # threads (``DELETE /sources`` saves the graph too), so writes are
         # serialized here: it keeps two threads from serializing the same
@@ -116,8 +146,9 @@ class GraphStore:
                 # if a process was killed between these two replacements.
                 stat = path.stat()
                 metadata = {
-                    "version": 1,
+                    "version": 2,
                     "published_at": datetime.now(UTC).isoformat(),
+                    "generation_id": generation_id(compressed),
                     "nodes": graph.number_of_nodes(),
                     "edges": graph.number_of_edges(),
                     "compressed_bytes": stat.st_size,
@@ -136,7 +167,62 @@ class GraphStore:
         self._fsync_dir(path.parent)
         self._retire_legacy(kb_id)
         self._sweep_stale_tmp(path.parent)
+        self._announce(kb_id, metadata)
         return path
+
+    def _announce(self, kb_id: str, metadata: dict[str, object]) -> None:
+        """Tell whoever is listening, and never let it cost the commit.
+
+        The graph is already durable by the time this runs. A broker that is
+        down, slow or absent must therefore be unable to affect the outcome —
+        the worst it can do is leave every replica to notice on its next poll,
+        which is what they did before this existed.
+        """
+
+        hook = self.on_publish
+        if hook is None:
+            return
+        try:
+            hook(kb_id, dict(metadata))
+        except Exception:  # noqa: BLE001 - a notification is not a commit
+            logger.warning("Could not announce a graph generation", exc_info=True)
+
+    def published_generation(self, kb_id: str) -> dict[str, object] | None:
+        """The publication record for the graph currently on disk, or None.
+
+        Cheap by construction — a small JSON sidecar, never the graph — and
+        validated against the graph file's own stat tuple, so a process killed
+        between the two atomic renames reports "no current generation" rather
+        than a record describing bytes that were never published.
+
+        A state directory written before generations existed has no id to
+        report. It gets one on its next save; until then the mtime/size stamp
+        the refresher already uses is what detects a change, which is why this
+        returning ``None`` is a missing *label*, never a missing reload.
+        """
+
+        path, metadata_path = self.graph_path(kb_id), self.metadata_path(kb_id)
+        if not path.exists() or not metadata_path.exists():
+            return None
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            stat = path.stat()
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if int(metadata.get("compressed_bytes", -1)) != stat.st_size:
+            return None
+        if int(metadata.get("graph_mtime_ns", -1)) != stat.st_mtime_ns:
+            return None
+        identifier = str(metadata.get("generation_id") or "")
+        if not identifier:
+            return None
+        return {
+            "generation_id": identifier,
+            "published_at": metadata.get("published_at"),
+            "nodes": int(metadata.get("nodes", 0)),
+            "edges": int(metadata.get("edges", 0)),
+            "compressed_bytes": int(metadata.get("compressed_bytes", 0)),
+        }
 
     def counts(self, kb_id: str) -> tuple[int, int]:
         """Return published graph counts without loading the graph when possible.
@@ -169,8 +255,9 @@ class GraphStore:
                 with self._write_lock:
                     stat = path.stat()
                     metadata = {
-                        "version": 1,
+                        "version": 2,
                         "published_at": datetime.now(UTC).isoformat(),
+                        "generation_id": generation_id(path.read_bytes()),
                         "nodes": nodes,
                         "edges": edges,
                         "compressed_bytes": stat.st_size,

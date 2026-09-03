@@ -472,3 +472,162 @@ def test_max_results_is_clamped(workspace: Path) -> None:
 
     assert response.status_code == 200
     assert len(response.json()["results"]) <= MAX_RESULTS_CEILING
+
+
+# ---------------------------------------------------------------------------
+# 8. An unauthenticated API with mount-anything power (Phase 35.8)
+#
+# The single-container posture — no authentication, published on loopback —
+# shipped unchanged into the fleet profile, where the API is a multi-replica
+# Service behind a port-publishing decision an operator can reasonably change.
+# Startup now refuses that combination (tests/test_process_roles.py); these
+# cover the other half, which is that a configured token is actually enforced
+# on the request path and that the exemptions are the ones intended.
+# ---------------------------------------------------------------------------
+
+
+def _authenticated(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    monkeypatch.setenv("PHEASANT_API_TOKEN", "s3cret-token")
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(workspace / "ws"),
+                "state_path": str(workspace / "state"),
+                "exports_path": str(workspace / "exports"),
+            },
+            "security": {"api_auth": {"token_env": "PHEASANT_API_TOKEN"}},
+            "sources": [],
+        }
+    )
+    return TestClient(create_app(config, config_path=str(workspace / "pheasant.yaml")))
+
+
+def test_a_configured_token_is_required_on_the_whole_api(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every route that can read or change the region, not a chosen subset."""
+
+    client = _authenticated(workspace, monkeypatch)
+
+    for method, path, payload in (
+        ("post", "/search", {"query": "widget", "max_results": 3}),
+        ("get", "/sources", None),
+        ("post", "/sources", {"name": "x", "type": "document_folder", "path": "/tmp"}),
+        ("get", "/config", None),
+    ):
+        response = getattr(client, method)(path, **({"json": payload} if payload else {}))
+        assert response.status_code == 401, f"{method} {path} answered without a token"
+        assert response.headers.get("WWW-Authenticate") == "Bearer"
+
+    ok = client.post(
+        "/search",
+        json={"query": "widget", "max_results": 3},
+        headers={"authorization": "Bearer s3cret-token"},
+    )
+    assert ok.status_code == 200
+
+
+def test_a_wrong_token_is_refused(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _authenticated(workspace, monkeypatch)
+    for header in ("Bearer wrong", "Basic s3cret-token", "s3cret-token", ""):
+        response = client.get("/sources", headers={"authorization": header})
+        assert response.status_code == 401
+
+
+def test_a_non_ascii_token_is_a_401_not_a_500(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Starlette decodes headers as latin-1, so any caller can send one.
+
+    `hmac.compare_digest` raises TypeError on str operands with a character
+    above 127 — which would turn one byte in a header into a 500 from the
+    guard itself, on unauthenticated input.
+    """
+
+    client = _authenticated(workspace, monkeypatch)
+    # Sent as bytes: the HTTP client refuses to encode a non-ASCII header
+    # value, but a raw socket has no such scruples and uvicorn hands the
+    # latin-1 decoding straight to the handler.
+    response = client.get("/sources", headers={"authorization": b"Bearer s3cret-tok\xe9n"})
+    assert response.status_code == 401
+
+
+def test_the_probes_and_metrics_stay_open(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A probe that needs a credential cannot tell a dead pod from an unauthorized one."""
+
+    client = _authenticated(workspace, monkeypatch)
+    for path in ("/health", "/ready", "/metrics"):
+        assert client.get(path).status_code == 200
+
+
+def test_internal_routes_keep_their_own_boundary_token(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`/internal/*` is exempt structurally, and still authenticated.
+
+    Requiring the API token there too would mean handing the region's front-door
+    credential to every preparation worker — the exact trust-boundary collapse
+    this phase removed from the Compose file. Each internal route enforces the
+    token for *its* boundary instead, so the exemption widens nothing.
+    """
+
+    monkeypatch.setenv("PHEASANT_INDEX_WORKER_TOKEN", "worker-token")
+    client = _authenticated(workspace, monkeypatch)
+
+    # No API token on the request, and the route still answers for itself:
+    # 404 while remote preparation is off, 401 once it is on and the worker
+    # token is wrong. Neither is the middleware's refusal.
+    body = {"source": {}, "item": {}, "payload": {}}
+    response = client.post("/internal/indexing/prepare", json=body)
+    assert response.status_code in {401, 404}
+    assert "this region requires a bearer token" not in response.text
+
+
+def test_no_token_configured_leaves_the_api_exactly_as_it_was(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rule 7. A laptop and every existing single container set no token."""
+
+    monkeypatch.delenv("PHEASANT_API_TOKEN", raising=False)
+    _config, client = _build(workspace)
+    assert client.get("/sources").status_code == 200
+
+
+def test_a_process_with_the_api_off_serves_only_its_own_surface(workspace: Path) -> None:
+    """`server.api.enabled: false` was documentation; now it is enforced.
+
+    `deploy/compose/worker.yaml` has declared it since the worker tier
+    existed, and a worker went on serving the whole knowledge-base API — on
+    the tier designed to hold nothing, scale hardest, and run third-party
+    parse code.
+    """
+
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "sec",
+                "workspace_root": str(workspace / "ws"),
+                "state_path": str(workspace / "state"),
+                "exports_path": str(workspace / "exports"),
+            },
+            "server": {"api": {"enabled": False}},
+            "sources": [],
+        }
+    )
+    client = TestClient(create_app(config, config_path=str(workspace / "pheasant.yaml")))
+
+    for path in ("/health", "/ready", "/metrics"):
+        assert client.get(path).status_code == 200
+    # 404 rather than 403: on this process the route does not exist.
+    assert client.get("/sources").status_code == 404
+    assert client.post("/search", json={"query": "widget"}).status_code == 404
+    # The preparation endpoint is the reason such a process runs at all: the
+    # surface guard must not be what answers it. (Remote preparation is off in
+    # this config, so the route refuses for its own reason — with its own
+    # message, which is how the two refusals are told apart.)
+    prepared = client.post(
+        "/internal/indexing/prepare",
+        json={"source": {}, "item": {}, "payload": {}},
+    )
+    assert "serves no knowledge-base API" not in prepared.text

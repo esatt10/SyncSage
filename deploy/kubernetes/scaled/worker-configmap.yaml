@@ -29,7 +29,14 @@ data:
       mcp:
         enabled: false
       api:
-        enabled: true
+        # False, and enforced rather than declared: with this off the process
+        # answers /health, /ready, /metrics and its own /internal preparation
+        # routes, and 404s everything else. A worker holds no state, no keys
+        # and no source list, so serving the knowledge-base API from the tier
+        # that scales hardest and runs third-party parse code was surface for
+        # nothing. The preparation endpoints are unaffected — they live under
+        # /internal and enforce PHEASANT_INDEX_WORKER_TOKEN themselves.
+        enabled: false
         openapi: false
         max_concurrent_requests: 32
         drain_seconds: 10

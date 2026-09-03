@@ -235,6 +235,45 @@ elects one indexer to own watcher, scheduler, queue drain and graph commits per
 shard. Extra indexers are hot standbys. Parallelism stays in multi-source
 preparation inside that authority and in the stateless worker tier.
 
+That ceiling used to be prose, which made it useless at the moment it mattered:
+a team scales workers, watches ingest stop improving, and cannot tell "the
+commit authority is full" from "retrieval is mistuned" — both look like a queue
+draining more slowly than work arrives, with more workers changing nothing.
+It is now a gauge:
+
+```promql
+pheasant_commit_authority_saturation   # 0..1, five-minute rolling window
+```
+
+Sustained **above 0.8**, more workers will not help and the region should be
+split. Below it, a slow queue is a tuning problem. It publishes nothing at all
+before it has seen a minute of wall time — two busy seconds in a pod's first
+four are not 50% saturation, and sharding a region that is doing nothing is
+the most expensive possible response to a misread number — and it is absent
+entirely on a process that is not the commit authority, rather than reporting
+a confident zero from an api replica that could not saturate if it tried.
+
+`pheasant scan` warns before you reach it, from the same measured
+seconds-per-1k-files the rest of this page uses: a corpus whose first index
+would take more than twelve hours on one indexer is one to plan differently,
+and the report says so beside the memory numbers.
+
+### Turning the proposal into files
+
+`pheasant shard plan --emit ./regions` writes what the plan implies: per
+region, a `pheasant.yaml` with its own knowledge-base id and only its own
+sources, a `docker-compose.yml` with its own project name, volume names and
+port, and a `.env.example` with secret stubs. Acting on a split used to mean
+hand-copying all of that and getting every name different from the first —
+with a silent failure at the end of it, because two regions sharing
+`pheasant.name` share a knowledge-base id, and every stable ID in this system
+starts with that.
+
+It applies nothing and moves no data: each region indexes its own sources from
+scratch, and the emitted `README.md` says so. It also refuses to overwrite
+existing files, so re-running against an edited region is a diff rather than a
+loss.
+
 ## Which storage backend
 
 Independent of the graph, and a different question:

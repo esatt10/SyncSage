@@ -62,9 +62,11 @@ from pheasant.sync.fingerprint import (
     embedding_fingerprint,
     source_fingerprint,
 )
+from pheasant.sync.graph_events import notifier_from_config as graph_notifier_from_config
 from pheasant.sync.locks import EngineLease, SourceLease, source_lock
 from pheasant.sync.pacing import serve_yield
 from pheasant.sync.queue import queue_from_config
+from pheasant.sync.saturation import CommitAuthorityMeter
 
 logger = logging.getLogger(__name__)
 
@@ -344,14 +346,38 @@ class SyncEngine:
         SourceRegistry(self.config, self.state).initialize()
         self.manifests = ManifestStore(self.paths.manifests, self.state)
         self.graph_store = GraphStore(self.paths.graphs)
+        # Announce every committed generation on the fleet's broker, so a
+        # serving replica reloads at commit latency instead of on its own poll
+        # (Phase 35.8). `notifier_from_config` returns the null notifier
+        # unless `sync.queue` is on the NATS backend, which is what keeps the
+        # standalone path byte-identical: no broker, no publish, no change.
+        self._graph_notifier = graph_notifier_from_config(config)
+        #: How full this process's commit stream is. Meaningful only where
+        #: this process is the commit authority — an api replica publishes
+        #: index work rather than running it, so its meter never opens a span
+        #: and `/metrics` omits the series rather than reporting a confident
+        #: zero from a process that could not saturate if it tried.
+        self.commit_meter = CommitAuthorityMeter()
+        if self._graph_notifier.enabled:
+            self.graph_store.on_publish = self._graph_notifier.publish
         self.graph_builder = GraphBuilder(config)
         self._loads_persisted_graph = bool(load_persisted_graph)
         self._graph_loaded = not self._loads_persisted_graph
+        #: Which published generation this process is actually serving, or
+        #: None for a process that holds no graph. "Stale" was previously
+        #: undetectable rather than merely unmeasured: a replica that missed a
+        #: reload answered from an old graph, correctly-looking, forever.
+        self.loaded_graph_generation: str | None = None
+        #: When that generation was published, as a unix timestamp. Kept
+        #: beside the id so the age gauge measures the graph this process is
+        #: serving rather than whatever has since been written to /state.
+        self.loaded_graph_published_at: float | None = None
         if self._loads_persisted_graph and not defer_persisted_graph_load:
             existing = self.graph_store.load(config.knowledge_base_id)
             if len(existing):
                 self.graph_builder.graph = existing
             self._graph_loaded = True
+            self._note_loaded_generation()
         # Optional embed-on-sync (Synapse 21.4): None when
         # search.embeddings.enabled is false, leaving sync byte-identical
         # to pre-21.4 behavior (no vector dir, no embedder calls).
@@ -409,6 +435,10 @@ class SyncEngine:
             except Exception as exc:  # pragma: no cover - shutdown must not raise
                 logger.warning("Could not flush vector store on shutdown: %s", exc)
         self.lease.release()
+        try:
+            self._graph_notifier.close()
+        except Exception as exc:  # pragma: no cover - shutdown must not raise
+            logger.warning("Could not close the graph event client: %s", exc)
         self.state.close()
 
     def checkpoint_graph(
@@ -463,8 +493,40 @@ class SyncEngine:
         # nothing is owed; drop the delta the load itself generated.
         loaded.take_index_delta()
         self.node_index._populated = False
-        logger.info("Reloaded graph from state: %d nodes", loaded.number_of_nodes())
+        self._note_loaded_generation()
+        logger.info(
+            "Reloaded graph from state: %d nodes (generation %s)",
+            loaded.number_of_nodes(),
+            self.loaded_graph_generation or "unlabelled",
+        )
         return loaded.number_of_nodes()
+
+    def _note_loaded_generation(self) -> None:
+        """Record which generation the in-RAM graph came from.
+
+        Read from the publication record *after* the load, so the label
+        describes the bytes that were read rather than whatever has been
+        published since. A state directory written before generations existed
+        has no id to record and reports None — a missing label, never a
+        missing graph.
+        """
+
+        try:
+            record = self.graph_store.published_generation(self.config.knowledge_base_id)
+        except Exception:  # noqa: BLE001 - a label must not break a load
+            record = None
+        self.loaded_graph_generation = str(record["generation_id"]) if record else None
+        self.loaded_graph_published_at = None
+        if record:
+            from datetime import datetime
+
+            try:
+                stamp = str(record.get("published_at") or "")
+                self.loaded_graph_published_at = datetime.fromisoformat(
+                    stamp.replace("Z", "+00:00")
+                ).timestamp()
+            except ValueError:
+                self.loaded_graph_published_at = None
 
     def _ensure_persisted_graph_loaded(self) -> None:
         """Materialize the published graph only when a task will mutate it.
@@ -485,6 +547,7 @@ class SyncEngine:
                 self.graph_builder.graph = loaded
                 loaded.take_index_delta()
             self._graph_loaded = True
+            self._note_loaded_generation()
 
     def _graph_counts(self) -> tuple[int, int]:
         if self._graph_loaded or not self._loads_persisted_graph:
@@ -1755,7 +1818,11 @@ class SyncEngine:
         # Test-only hook (Synapse 21.2 crash-safety tests): widens the window
         # between per-artifact writes so a kill -9 can land mid-sync.
         slow_sync_s = float(os.environ.get("PHEASANT_TEST_SLOW_SYNC_MS", "0") or 0) / 1000.0
-        with self._source_write_lock(source.name):
+        # The commit-authority meter opens here rather than at the top of
+        # the method: everything above is argument resolution, and a
+        # saturation gauge that counted it would report a busy region for
+        # work that never touched the commit stream.
+        with self.commit_meter.busy(), self._source_write_lock(source.name):
             remote_state: dict[str, Any] | None = None
             if source.type.value == "repository":
                 # URL quick-add repositories are managed checkouts. Updating

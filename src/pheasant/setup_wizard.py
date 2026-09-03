@@ -667,6 +667,19 @@ def build_sections() -> list[Section]:
                     kind="bool",
                     advanced=True,
                 ),
+                Question(
+                    key="security.api_auth.behind_authenticating_proxy",
+                    prompt="Is something in front of this API already authenticating callers?",
+                    help=(
+                        "Only matters for a fleet: every role but 'all' refuses to start "
+                        "on an address other machines can reach unless either this is on "
+                        "or PHEASANT_API_TOKEN holds a token. Answer yes only if an "
+                        "ingress really does authenticate — the failure it suppresses is "
+                        "an open API, and it is silent."
+                    ),
+                    kind="bool",
+                    advanced=True,
+                ),
             ],
         ),
         Section(

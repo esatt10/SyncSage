@@ -648,17 +648,32 @@ class _GraphRefresher:
     current from the shared database. Shipping fleet manifests without closing
     that would be shipping a fleet that quietly disagrees with itself.
 
-    Polling the file's mtime and size, rather than subscribing to anything:
-    the writer is a different pod on a shared volume, so there is no channel
-    between them, and a stat every 30 s costs nothing.
+    Two triggers, and the cheap one is not the primary one (Phase 35.8).
+    An indexer announces each committed generation on the fleet's broker, so
+    a replica reloads at commit latency rather than up to `interval_seconds`
+    later. The poll is **kept** underneath it as a backstop: a dropped
+    message, a broker restart, a region with no broker at all, and a legacy
+    state directory with no publication record all resolve to "notice on the
+    next stat", which is exactly the behavior this had before. That is what
+    lets the event path be at-most-once and stateless.
+
+    The subscription handler only sets an event. Reloading a large graph takes
+    seconds and holds two generations at once; doing that on the broker
+    client's own event loop would stall its keepalive, which is a
+    disconnection with extra steps.
     """
 
-    def __init__(self, engine, interval_seconds: float) -> None:
+    def __init__(self, engine, interval_seconds: float, notifier=None) -> None:
+        import threading
+
         self.engine = engine
         self.interval = max(1.0, float(interval_seconds))
+        self.notifier = notifier
         self._stop = None
         self._thread = None
+        self._wake = threading.Event()
         self._seen = self._stamp()
+        self._subscribed = False
 
     def _stamp(self):
         path = self.engine.graph_store.graph_path(self.engine.config.knowledge_base_id)
@@ -672,6 +687,10 @@ class _GraphRefresher:
         import threading
 
         self._stop = threading.Event()
+        if self.notifier is not None and self.notifier.enabled:
+            self._subscribed = self.notifier.subscribe(
+                self.engine.config.knowledge_base_id, self._wake.set
+            )
         self._thread = threading.Thread(
             target=self._run, name="pheasant-graph-refresh", daemon=True
         )
@@ -680,17 +699,29 @@ class _GraphRefresher:
     def stop(self) -> None:
         if self._stop is not None:
             self._stop.set()
+        self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
+        if self.notifier is not None:
+            self.notifier.close()
 
-    def check_once(self) -> bool:
-        """Reload if the file changed. Returns whether it did."""
+    def check_once(self, trigger: str = "poll") -> bool:
+        """Reload if the file changed. Returns whether it did.
+
+        Still keyed on the file's own stat tuple even when an event woke it:
+        a notification is a hint to look, never a fact to act on, so a message
+        that arrives twice, arrives for a generation already loaded, or is
+        forged costs one stat and nothing else.
+        """
 
         stamp = self._stamp()
         if stamp is None or stamp == self._seen:
             return False
         self._seen = stamp
         self.engine.reload_graph()
+        from pheasant.telemetry import metrics
+
+        metrics.REGISTRY.inc("pheasant_graph_reloads_total", trigger=trigger)
         # The generation swap drops the old graph, but CPython's allocator can
         # keep hundreds of MiB of its now-empty arenas mapped forever. Repeated
         # refreshes then make steady RSS look like a leak and eventually erase
@@ -713,9 +744,23 @@ class _GraphRefresher:
         import logging
 
         log = logging.getLogger("pheasant.cli")
-        while not self._stop.wait(self.interval):
+        while not self._stop.is_set():
+            # The interval is the ceiling on how long a miss can go unnoticed,
+            # not the cadence: an announcement returns from this immediately.
+            woken = self._wake.wait(self.interval)
+            self._wake.clear()
+            if self._stop.is_set():
+                return
             try:
-                self.check_once()
+                if self.check_once(trigger="event" if woken else "poll"):
+                    generation = self.engine.graph_store.published_generation(
+                        self.engine.config.knowledge_base_id
+                    )
+                    log.info(
+                        "Reloaded graph generation %s (%s)",
+                        (generation or {}).get("generation_id", "unknown"),
+                        "announced" if woken else "found by poll",
+                    )
             except Exception:  # noqa: BLE001 - a stale graph beats a dead thread
                 log.warning("graph refresh failed; will retry", exc_info=True)
 
@@ -817,6 +862,8 @@ def _log_drainer(cfg, engine, policy):
 def _graph_refresher(cfg, engine, policy):
     """The refresh loop, or ``None`` when this role indexes its own graph."""
 
+    from pheasant.sync.graph_events import notifier_from_config
+
     interval = float(getattr(cfg.server.api, "graph_refresh_seconds", 0) or 0)
     # A remote API has no local snapshot by design. Starting its legacy file
     # refresher would quietly re-materialize the full graph and erase the
@@ -825,7 +872,11 @@ def _graph_refresher(cfg, engine, policy):
         return None
     if not policy.refreshes_graph or interval <= 0:
         return None
-    return _GraphRefresher(engine, interval)
+    # Its own client rather than the engine's: the engine's exists to publish
+    # and belongs to processes that write graphs, this one exists to listen
+    # and belongs to processes that do not. No process does both — an `all`
+    # container reloads its own graph in-process and has no refresher at all.
+    return _GraphRefresher(engine, interval, notifier=notifier_from_config(cfg))
 
 
 def _print_evaluation_status(payload: dict) -> None:
@@ -1751,6 +1802,15 @@ def main(argv: list[str] | None = None) -> int:
     shard_plan_p.add_argument("--config", "-c", default="pheasant.yaml")
     shard_plan_p.add_argument("--shards", type=int, help="Split into exactly this many regions.")
     shard_plan_p.add_argument("--json", action="store_true")
+    shard_plan_p.add_argument(
+        "--emit",
+        metavar="DIR",
+        help=(
+            "Write each region's config, compose file and .env stub into DIR, "
+            "so acting on the plan is a reviewed pull request rather than a "
+            "weekend of copying. Nothing is applied and no data moves."
+        ),
+    )
     migrate_p = sub.add_parser(
         "migrate", help="Copy SQLite state into the configured Postgres backend."
     )
@@ -2436,6 +2496,36 @@ def main(argv: list[str] | None = None) -> int:
             shards=args.shards,
             max_nodes_per_shard=int(getattr(cfg.graph, "max_nodes", None) or 1_500_000),
         )
+        if getattr(args, "emit", None):
+            from pheasant.sharding import render_artifacts
+
+            target = Path(args.emit)
+            artifacts = render_artifacts(plan, cfg)
+            if not artifacts:
+                print("Nothing to emit: the plan proposes no regions.", file=sys.stderr)
+                return 1
+            # Refuse rather than overwrite. These are files an operator edits
+            # — a filled-in .env, a hand-tuned mem_limit — and a re-run that
+            # silently replaced them would be the second-worst outcome after
+            # not having them at all.
+            existing = [name for name in artifacts if (target / name).exists()]
+            if existing:
+                print(
+                    f"Refusing to overwrite {len(existing)} existing file(s) in {target}: "
+                    f"{', '.join(sorted(existing)[:3])}"
+                    f"{'...' if len(existing) > 3 else ''}\n"
+                    "Emit into an empty directory and diff, so an edited region config "
+                    "is never replaced by a regenerated one.",
+                    file=sys.stderr,
+                )
+                return 1
+            for name, content in sorted(artifacts.items()):
+                path = target / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            print(render_plan(plan))
+            print(f"Wrote {len(artifacts)} file(s) to {target}/ — review, then apply per region.")
+            return 0
         print(json.dumps(plan, indent=2, sort_keys=True) if args.json else render_plan(plan))
         return 0
     if args.command == "migrate":
@@ -2865,6 +2955,8 @@ def main(argv: list[str] | None = None) -> int:
         import logging
 
         from pheasant.config.loader import load_config
+        from pheasant.deployment.roles import POLICIES, Role, RoleConfigurationError
+        from pheasant.deployment.roles import validate_role as validate_worker_role
         from pheasant.sync.grpc_worker import GrpcUnavailable
         from pheasant.sync.grpc_worker import serve as serve_grpc_worker
         from pheasant.version import __version__
@@ -2875,6 +2967,14 @@ def main(argv: list[str] | None = None) -> int:
             level=level,
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         )
+        # The same allow-list `serve --role worker` runs. This command is the
+        # one Compose actually uses for the tier, so it was the one path where
+        # a worker could hold the database URL and never be told.
+        try:
+            validate_worker_role(POLICIES[Role.WORKER], cfg)
+        except RoleConfigurationError as exc:
+            print(f"Refusing to start: {exc}")
+            return 1
         if not cfg.sync.concurrency.remote_worker_enabled:
             print(
                 "Refusing to start: sync.concurrency.remote_worker_enabled is false.\n"

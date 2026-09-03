@@ -56,8 +56,14 @@ docker compose --env-file .env \
 Scalable fleet:
 
 ```bash
-# Set OPENAI_API_KEY and a random PHEASANT_INDEX_WORKER_TOKEN in .env.
-# Compose reuses that random value as the internal graph-service token.
+# Set OPENAI_API_KEY and THREE distinct random values in .env:
+#   PHEASANT_API_TOKEN            callers -> the region's API
+#   PHEASANT_GRAPH_SERVICE_TOKEN  API replicas -> the internal graph API
+#   PHEASANT_INDEX_WORKER_TOKEN   the indexer -> the preparation workers
+# One `openssl rand -hex 32` per line. Compose used to reuse the worker token
+# as the graph token; workers are the least-trusted tier and hold the first by
+# necessity, so that handed every worker the credential for the whole graph.
+# `serve` now refuses to start when those two resolve to the same value.
 docker compose --env-file .env -f deploy/compose/docker-compose.scale.yml up -d --build \
   --scale indexer=1 --scale worker=4
 ```

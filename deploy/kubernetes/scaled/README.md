@@ -51,10 +51,24 @@ something in pheasant's design, so they are stated with the reason:
    `pheasant_index_queue_depth` needs [prometheus-adapter] or [KEDA] to expose
    it; `worker-hpa.yaml` ships the KEDA form and the CPU fallback.
 
-6. **An internal graph bearer token.** Add
-   `PHEASANT_GRAPH_SERVICE_TOKEN` to `pheasant-secrets` (see
-   `secret.example.yaml`). It is consumed only by API/MCP clients and the graph
-   service; never place its value in the ConfigMap.
+6. **Three distinct bearer tokens** in `pheasant-secrets` (see
+   `secret.example.yaml`), one `openssl rand -hex 32` each:
+   `PHEASANT_API_TOKEN` for callers of the region's API — every serving pod
+   binds `0.0.0.0` and refuses to start without it, unless the ConfigMap sets
+   `security.api_auth.behind_authenticating_proxy`;
+   `PHEASANT_GRAPH_SERVICE_TOKEN` for API/MCP clients of the graph service;
+   and `PHEASANT_INDEX_WORKER_TOKEN`, the only secret the worker Deployment
+   mounts. Reusing one value across the last two is refused at startup —
+   workers hold the worker token by necessity, so sharing it would hand every
+   worker the credential for the whole graph. Never place any of their values
+   in the ConfigMap.
+
+7. **A CNI that enforces NetworkPolicy**, if `networkpolicy.yaml` is to do
+   anything. It default-denies ingress across the pheasant pods and adds back
+   one allowance per real caller, so the graph service and the workers are
+   reachable only from pheasant's own pods and the monitoring namespace. On a
+   CNI that ignores NetworkPolicy the file is inert and the tokens are the
+   only control.
 
 [prometheus-adapter]: https://github.com/kubernetes-sigs/prometheus-adapter
 [KEDA]: https://keda.sh

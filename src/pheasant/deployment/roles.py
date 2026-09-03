@@ -19,7 +19,16 @@ Role         Watch   Schedule   Drain  Index      Typical deployment
 ``indexer``  yes     yes        yes    in-proc    one per shard, a StatefulSet
 ``graph``    no      no         no     no         internal graph query service
 ``worker``   no      no         no     no         M replicas, autoscaled
+``logger``   no      no         log    no         the observation tier
 ===========  ======  =========  =====  =========  ==============================
+
+A role also says what a process may **hold**. ``validate_role`` refuses a
+worker that resolves a database DSN, a model key or a source list, refuses one
+secret spanning the worker and graph boundaries, and refuses an
+unauthenticated API on an address other machines can reach. Those are
+deployment invariants rather than process ones — none of them stops a process
+working, which is exactly why they have to be refused at startup instead of
+discovered later.
 
 ``all`` is the default and is **byte-identical to the behavior before roles
 existed** — it does not drain a queue, because that would change what a
@@ -191,15 +200,214 @@ def resolve_role(config: object, override: str | None = None) -> RolePolicy:
     return POLICIES[role]
 
 
+# -- The per-role config allow-list (Phase 35.8) -----------------------------
+#
+# `worker.yaml` exists precisely to shrink a worker's surface -- no DSN, no
+# keys, no sources, no MCP, no UI -- but it is the same 15-section schema
+# every other tier validates, so nothing *structurally* prevented a worker
+# config from carrying a database URL. The trust boundary between the indexer
+# and the workers is real and well-reasoned, and it was enforced by what the
+# operator put in a file rather than by what the process can express: a
+# misapplied ConfigMap, or one shared `environment:` anchor in Compose, gives
+# the least-trusted tier in the fleet credentials it was designed never to
+# hold.
+#
+# So the convention becomes a startup invariant, in the style the two checks
+# below already use: refuse, and name the field and the reason.
+
+#: Provider keys a worker can never need. Drawn from the catalog rather than
+#: from config alone, because ``assistant.provider: auto`` names no variable
+#: and resolves whichever of these is present.
+_MODEL_KEY_ENVS: tuple[str, ...] = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY")
+
+#: Hosts that are not reachable from another machine. A bind outside this set
+#: is a routable one, whatever the operator's firewall happens to say today.
+_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost", "ip6-localhost"})
+
+
+def _env_value(name: str | None) -> str:
+    """The resolved value of an environment variable named by config."""
+
+    import os
+
+    return (os.environ.get((name or "").strip(), "") or "").strip()
+
+
+def _credential_envs(config: object) -> list[tuple[str, str]]:
+    """(variable name, what holding it would mean) for every credential.
+
+    Read off the live config rather than hardcoded, so a region that points a
+    feature at its own variable is checked on *that* variable — the same
+    reason nothing here ever reads a secret out of YAML.
+    """
+
+    def named(path: str, default: str | None = None) -> str | None:
+        node: object = config
+        for part in path.split("."):
+            node = getattr(node, part, None)
+            if node is None:
+                return default
+        return str(node) if isinstance(node, str) else default
+
+    candidates: list[tuple[str | None, str]] = [
+        (named("storage.dsn_env"), "the state database"),
+        (named("search.embeddings.api_key_env"), "the embedding provider"),
+        (named("ingestion.captioner.api_key_env"), "the captioner provider"),
+        (named("ingestion.transcriber.api_key_env"), "the transcriber provider"),
+        (named("assistant.api_key_env"), "the chat provider"),
+        (named("security.idp.api_key_env"), "the identity provider"),
+        (named("graph.query_service_token_env"), "the internal graph-query API"),
+    ]
+    # `security.api_auth.token_env` is deliberately absent: that is the key to
+    # this process's own front door, not a credential to somewhere else, and a
+    # worker that serves an API at all needs it.
+    candidates.extend((name, "a chat provider") for name in _MODEL_KEY_ENVS)
+    seen: set[str] = set()
+    ordered: list[tuple[str, str]] = []
+    for name, reason in candidates:
+        key = (name or "").strip()
+        if key and key not in seen:
+            seen.add(key)
+            ordered.append((key, reason))
+    return ordered
+
+
+def _validate_worker_surface(config: object) -> None:
+    """Refuse a worker that resolves anything a worker must never hold.
+
+    A preparation worker parses bytes it is handed and returns chunks. It
+    opens no database, calls no model, reads no source and serves no graph —
+    which is exactly why it is the tier that scales, and the tier that may run
+    somebody else's connector code. Every item below is a capability it has no
+    use for, so holding one can only ever be a mistake or a compromise.
+    """
+
+    backend = str(getattr(getattr(config, "storage", None), "backend", "") or "").lower()
+    if backend and backend != "sqlite":
+        raise RoleConfigurationError(
+            f"role 'worker' resolves storage.backend: {backend!r}. A preparation worker "
+            "opens no state store — it is handed bytes and returns chunks — so a "
+            "database backend here means this process is running the wrong config. "
+            "Point it at worker.yaml (deploy/compose/worker.yaml)."
+        )
+    sources = getattr(config, "sources", None) or []
+    if sources:
+        names = ", ".join(str(getattr(item, "name", item)) for item in list(sources)[:3])
+        raise RoleConfigurationError(
+            f"role 'worker' resolves {len(sources)} source(s) ({names}...). A worker never "
+            "lists or reads a source; the indexer does that and sends it the bytes. A "
+            "non-empty sources list means this process is running the indexer's config."
+        )
+    for name, reason in _credential_envs(config):
+        if _env_value(name):
+            raise RoleConfigurationError(
+                f"role 'worker' holds {name}, the credential for {reason}. A worker is the "
+                "least-trusted tier in the fleet and needs none of it: give the worker "
+                "service its own `environment:` block rather than the shared anchor (or its "
+                "own Secret, in Kubernetes), and unset this variable for this process."
+            )
+
+
+def _validate_boundary_tokens(config: object) -> None:
+    """Two trust boundaries must not share one secret.
+
+    The worker token authenticates the *least*-trusted tier to the indexer.
+    The graph token guards an internal API that serves the region's whole
+    graph. Wiring both to one value — which the shipped Compose file did,
+    ``PHEASANT_GRAPH_SERVICE_TOKEN: ${PHEASANT_INDEX_WORKER_TOKEN}`` — means
+    compromising any worker also yields the graph credential, and the
+    carefully drawn boundary is defeated by a convenience in a deployment
+    file. Two variables in the manifests is the fix; this is what keeps it
+    fixed.
+    """
+
+    graph_env = str(getattr(getattr(config, "graph", None), "query_service_token_env", "") or "")
+    concurrency = getattr(getattr(config, "sync", None), "concurrency", None)
+    worker_env = str(getattr(concurrency, "remote_worker_token_env", "") or "")
+    if not graph_env or not worker_env:
+        return
+    if graph_env.strip() == worker_env.strip():
+        raise RoleConfigurationError(
+            f"graph.query_service_token_env and sync.concurrency.remote_worker_token_env both "
+            f"name {graph_env!r}. Those are two trust boundaries — a worker holds the second by "
+            "necessity — so one variable means any worker also holds the credential for the "
+            "internal graph-query API. Give them separate names."
+        )
+    graph_token, worker_token = _env_value(graph_env), _env_value(worker_env)
+    if graph_token and worker_token and graph_token == worker_token:
+        raise RoleConfigurationError(
+            f"{graph_env} and {worker_env} resolve to the same value. Those are two trust "
+            "boundaries: workers hold the indexing token by necessity, so sharing it hands "
+            "every worker the credential for the internal graph-query API, which serves the "
+            "whole graph. Generate a second random value for one of them."
+        )
+
+
+def _validate_serving_exposure(policy: RolePolicy, config: object) -> None:
+    """Refuse an unauthenticated API on an address other machines can reach.
+
+    The single-container posture — no authentication, published on loopback —
+    is defensible and stays exactly as it is: ``all`` is exempt below, so a
+    laptop, a ``pheasant up`` and every existing standalone container start
+    with no configuration at all, which rule 7 requires.
+
+    A role split is by definition a fleet. There the API is a multi-replica
+    Service that must bind ``0.0.0.0``, ACL enforcement is off by default, and
+    the surface behind it can register a source over any allow-listed path and
+    read what it finds. The published control was a port-publishing decision
+    an operator can reasonably change, and a warning in a comment. This turns
+    the warning into the refusal it always described — the same shape as
+    ``api`` without a queue.
+
+    Two ways to satisfy it, because both are real deployments: set a token
+    (``security.api_auth.token_env``), or declare the ingress that already
+    authenticates (``security.api_auth.behind_authenticating_proxy``).
+    """
+
+    if policy.role is Role.ALL:
+        return
+    server = getattr(config, "server", None)
+    host = str(getattr(server, "host", "") or "").strip()
+    if not host or host in _LOOPBACK_HOSTS:
+        return
+    if not getattr(getattr(server, "api", None), "enabled", True):
+        # No knowledge-base API to expose. `server.api.enabled: false` is
+        # enforced rather than declared (see `create_app`'s restricted-surface
+        # guard), so such a process answers the probes, `/metrics` and its own
+        # `/internal` routes — each of which authenticates its own boundary.
+        return
+    auth = getattr(getattr(config, "security", None), "api_auth", None)
+    if getattr(auth, "behind_authenticating_proxy", False):
+        return
+    token_env = str(getattr(auth, "token_env", "") or "")
+    if _env_value(token_env):
+        return
+    raise RoleConfigurationError(
+        f"role {policy.name!r} binds {host}, which other machines can reach, and nothing "
+        "authenticates it: this API can register a source over any allow-listed path and "
+        f"read what it finds. Set {token_env or 'security.api_auth.token_env'} to a random "
+        "value on every serving replica, or — if an ingress already authenticates callers — "
+        "set security.api_auth.behind_authenticating_proxy: true to say so. A process that "
+        "serves no knowledge-base API at all (server.api.enabled: false, as the preparation "
+        "workers use) needs neither."
+    )
+
+
 def validate_role(policy: RolePolicy, config: object) -> None:
     """Refuse a combination that cannot work, at startup.
 
-    Two checks, and each earns its place by turning a silent no-op into a
-    refusal. An ``api`` replica publishes its syncs instead of running them,
-    so without a queue a sync request would be accepted and then go
-    **nowhere** — the caller gets a job id, the UI shows a job, and nothing
-    ever indexes. A ``logger`` with nothing to drain is the same shape: a pod
-    that starts healthy, reports ready, and does nothing forever.
+    Each check earns its place by turning something silent into a refusal. An
+    ``api`` replica publishes its syncs instead of running them, so without a
+    queue a sync request would be accepted and then go **nowhere** — the
+    caller gets a job id, the UI shows a job, and nothing ever indexes. A
+    ``logger`` with nothing to drain is the same shape: a pod that starts
+    healthy, reports ready, and does nothing forever.
+
+    The rest are the deployment's invariants rather than the process's: a
+    worker holding a credential it can never use, one secret spanning two
+    trust boundaries, and an unauthenticated API on a routable address. None
+    of those stops a process working, which is precisely why each needs to be
+    refused here instead of discovered later.
     """
 
     if policy.role is Role.API:
@@ -225,6 +433,13 @@ def validate_role(policy: RolePolicy, config: object) -> None:
                 "With the queue off, whichever process observed a call also writes "
                 "it, so a separate log tier would have no work to claim."
             )
+    if policy.role is Role.WORKER:
+        _validate_worker_surface(config)
+    else:
+        # Skipped for the worker only because it cannot hold the graph token
+        # at all: the surface check above already refused if it did.
+        _validate_boundary_tokens(config)
+    _validate_serving_exposure(policy, config)
 
 
 def describe(policy: RolePolicy) -> dict[str, object]:

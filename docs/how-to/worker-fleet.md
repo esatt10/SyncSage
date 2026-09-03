@@ -199,11 +199,28 @@ version, and both are the *other* trade from the single container — take them
 only past the point where one container stops being enough
 ([capacity planning](capacity-planning.md)).
 
+### Three secrets, not one
+
+Before either runtime: the fleet has three trust boundaries and each needs its
+own value.
+
+```bash
+export PHEASANT_API_TOKEN=$(openssl rand -hex 32)            # callers -> the API
+export PHEASANT_GRAPH_SERVICE_TOKEN=$(openssl rand -hex 32)  # API -> the graph service
+export PHEASANT_INDEX_WORKER_TOKEN=$(openssl rand -hex 32)   # indexer -> the workers
+```
+
+One `openssl rand` per line, and that is the whole point. Workers are the
+least-trusted tier in the fleet — no database, no keys, no volumes, and the
+one place third-party parse code runs — and they hold the indexing token by
+necessity. A value shared with the graph boundary would mean any compromised
+worker also held the credential for the internal graph API, which serves the
+whole graph. The shipped Compose file used to do exactly that; `serve` now
+**refuses to start** when the two resolve to the same value.
+
 ### Compose
 
 ```bash
-export PHEASANT_INDEX_WORKER_TOKEN=$(openssl rand -hex 32)
-export OPENAI_API_KEY=...
 docker compose --env-file .env -f deploy/compose/docker-compose.scale.yml up -d \
   --scale indexer=1 --scale worker=4
 ```
@@ -229,10 +246,19 @@ load balancer in front of them; Compose deliberately publishes one API endpoint.
 kubectl apply -f deploy/kubernetes/namespace.yaml
 kubectl -n pheasant create secret generic pheasant-secrets \
   --from-literal=PHEASANT_DATABASE_URL='postgresql://…' \
+  --from-literal=PHEASANT_API_TOKEN="$(openssl rand -hex 32)" \
   --from-literal=PHEASANT_INDEX_WORKER_TOKEN="$(openssl rand -hex 32)" \
   --from-literal=PHEASANT_GRAPH_SERVICE_TOKEN="$(openssl rand -hex 32)"
 kubectl apply -f deploy/kubernetes/scaled/
 ```
+
+`deploy/kubernetes/scaled/networkpolicy.yaml` is applied by that last line: a
+default-deny on ingress, then one allowance per real caller. The API tier is
+the only one anything outside the namespace may reach; the graph service and
+the workers accept traffic from pheasant's own pods and the monitoring
+namespace, and nothing else. A CNI that does not enforce NetworkPolicy makes
+the file inert — check before relying on it, because the tokens are then the
+only control.
 
 | Workload | Kind | Scales on |
 |---|---|---|
@@ -251,10 +277,49 @@ requirements are easy to miss and neither is optional:
 * **Postgres.** SQLite permits one writer per file, and it is not one file
   across pods.
 
-The graph role polls the graph file every `server.api.graph_refresh_seconds`
-(30 s) and atomically swaps generations. API readiness includes an authenticated
-graph-service probe; a broken dependency removes that API replica from routing
-instead of silently serving stale graph results.
+#### How a committed graph reaches the tier serving it
+
+The indexer writes the graph; the graph service and any API replica holding a
+local snapshot reload it and swap generations atomically. Two things trigger
+that reload, and the cheap one is not the primary one.
+
+An indexer **announces** each committed generation on the broker the fleet
+already runs (`sync.queue.nats_graph_subject`, core NATS pub/sub, one subject
+per knowledge base). Every replica hears it and reloads at commit latency
+rather than up to `server.api.graph_refresh_seconds` later. The **poll is
+kept** underneath as a backstop, which is what lets the announcement be
+at-most-once and stateless: a dropped message, a broker restart, or a region
+with no broker at all costs one poll interval and nothing else. A region on
+the `local` queue backend behaves exactly as it did before this existed.
+
+Each generation has a content-addressed id — a digest of the published bytes,
+so two replicas agree on the name without coordinating and an unchanged graph
+keeps its name across a re-save. It is published where staleness becomes
+visible rather than inferable:
+
+```console
+$ curl -s localhost:8765/ready | jq .graph_generation
+{ "loaded": "9f2c41b0a7e35d18", "published": "9f2c41b0a7e35d18", "current": true }
+```
+
+`loaded` is the generation this process is answering from; `published` is what
+is on `/state` now. When they differ, that replica has not picked up the
+latest commit — the condition that used to be silent by construction.
+
+On `/ready` rather than `/health`, and read off the event loop beside the
+state-store probe: comparing the two means reading the publication record, and
+`/health` is the liveness probe whose entire design is that it does no I/O (a
+busy pod that fails it gets *restarted* by the thing meant to protect it).
+`/health` carries the in-memory half, `loaded`, alone. Every
+`/search` response carries the same id, so a retrieval diagnosis can tell "the
+document is not indexed" from "this replica has not picked up the index that
+has it". Two metrics go with it: `pheasant_graph_reloads_total{trigger}`
+(`event` or `poll` — a region where every reload is `poll` is one whose
+announcements are not arriving) and `pheasant_graph_generation_age_seconds`.
+
+API readiness includes an authenticated graph-service probe; a broken
+dependency removes that API replica from routing instead of silently serving
+stale graph results.
 
 ### Scale on the backlog, not on CPU
 
@@ -283,6 +348,60 @@ under bursty assistant fanout. It keeps only a bounded graph proxy. The graph
 tier owns snapshot residency; scale it independently on graph-query latency or
 CPU, and give every graph replica enough memory for the old and new snapshot
 during an atomic refresh.
+
+## The ceiling, and knowing when you have reached it
+
+Scale workers, not indexers — extra indexers for one shard are elected hot
+standbys, because the graph, the vectors and the graph FTS are one coordinated
+commit stream. That is a real consequence of a globally consistent graph, and
+it is fine right up until a team scales workers, watches ingest stop
+improving, and has nothing to tell them which of the two problems they have:
+the commit authority is full, or retrieval is mistuned. Those look identical
+from outside — the queue drains more slowly than work arrives, and adding
+workers changes nothing.
+
+So the ceiling is a number:
+
+```promql
+pheasant_commit_authority_saturation   # 0..1, five-minute rolling window
+```
+
+The fraction of the window the sole commit authority spent indexing. Sustained
+**above 0.8** means more workers will not help and the region should be split
+(`pheasant shard plan`). Below it, a slow queue is a tuning problem — take it
+to [retrieval tuning](../retrieval-tuning.md), not to the scaler.
+
+Three things it deliberately is not. It is not queue depth
+(`pheasant_index_queue_depth` already says work is waiting; this says *why*: a
+deep queue behind an idle indexer is a claim problem, behind a saturated one it
+is the ceiling). It is not an average since boot, or a region that indexed hard
+this morning would report itself full all afternoon. And it publishes nothing
+at all before it has seen a minute of wall time, because two busy seconds in a
+pod's first four are not 50% saturation, and sharding a region that is doing
+nothing is the most expensive possible response to a misread number.
+
+`pheasant scan` warns before you get there, from the same measured
+coefficients: a corpus whose first index would take more than twelve hours on
+one indexer is one to plan differently, and it says so.
+
+### Splitting a region
+
+`pheasant shard plan` packs whole sources into regions —
+[capacity planning](capacity-planning.md) covers why whole sources rather than
+an even split. `--emit` turns the proposal into files:
+
+```bash
+pheasant shard plan --shards 2 --emit ./regions
+```
+
+For each region: a `pheasant.yaml` carrying its own knowledge-base id and only
+its own sources (with retrieval settings copied verbatim — a split must not
+quietly become a second product), a `docker-compose.yml` with its own project
+name, volume names and port, and a `.env.example` with secret stubs. Plus a
+`README.md` saying what the emission did **not** do, which is the part that
+matters: no data moves, no router is configured, and each region indexes its
+own sources from scratch. It refuses to overwrite existing files, so a re-run
+against an edited region is a diff rather than a loss.
 
 ## Related
 

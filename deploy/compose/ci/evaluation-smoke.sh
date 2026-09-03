@@ -24,10 +24,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE=(docker compose -f "${HERE}/docker-compose.evaluation.yml")
 PSQL=("${COMPOSE[@]}" exec -T postgres psql -qtAX -U pheasant -d pheasant -c)
 API="http://127.0.0.1:8770"
+# Matches PHEASANT_API_TOKEN in docker-compose.evaluation.yml. The api replica
+# binds 0.0.0.0 and refuses to start unauthenticated, so every call carries it.
+API_TOKEN="ci-smoke-token"
 
 log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 query() { "${PSQL[@]}" "$1" | tr -d '[:space:]'; }
-status_field() { curl -fsS "${API}/evaluation/status" | python3 -c "import json,sys;print(json.load(sys.stdin).get('$1',''))"; }
+status_field() { curl -fsS -H "authorization: Bearer ${API_TOKEN}" "${API}/evaluation/status" | python3 -c "import json,sys;print(json.load(sys.stdin).get('$1',''))"; }
 
 await() {
   # $1 label, $2 SQL, $3 seconds. Succeeds on the first non-zero value.
@@ -161,7 +164,7 @@ log "The checkpoints were cleared once the report was committed"
 test "$(query 'SELECT count(*) FROM evaluation_replays;')" = "0"
 
 log "The api serves the finished report, with its gates and its denominators"
-curl -fsS "${API}/evaluation/report" > /tmp/eval-report.json
+curl -fsS -H "authorization: Bearer ${API_TOKEN}" "${API}/evaluation/report" > /tmp/eval-report.json
 python3 - <<'PY'
 import json
 report = json.load(open("/tmp/eval-report.json"))
@@ -194,7 +197,8 @@ log "Evaluation state is never retrievable as knowledge"
 # The boundary, checked where it matters: a region must not answer a question
 # with its own report.
 RUN_ID="$(query 'SELECT run_id FROM evaluation_runs LIMIT 1;')"
-curl -fsS -X POST "${API}/search" -H 'content-type: application/json' \
+curl -fsS -X POST "${API}/search" \
+  -H "authorization: Bearer ${API_TOKEN}" -H 'content-type: application/json' \
   -d "{\"query\": \"${RUN_ID}\", \"mode\": \"hybrid\", \"max_results\": 10}" > /tmp/eval-search.json
 python3 - "${RUN_ID}" <<'PY'
 import json, sys

@@ -57,10 +57,15 @@ Select the smallest adequate preset:
 - `deploy/compose/docker-compose.scale.yml`: PostgreSQL, NATS JetStream,
   LanceDB and gRPC preparation workers using `fleet.yaml` and `worker.yaml`.
 
-For advanced or fleet deployments, require `OPENAI_API_KEY` in `.env`. For the
-fleet, also require a long random `PHEASANT_INDEX_WORKER_TOKEN` and a real
-`POSTGRES_PASSWORD`. Never print or place secret values in YAML, logs, commits
-or responses.
+For advanced or fleet deployments, require `OPENAI_API_KEY` in `.env`. The
+fleet additionally requires a real `POSTGRES_PASSWORD` and three *distinct*
+long random values — `PHEASANT_API_TOKEN` (callers to the API),
+`PHEASANT_GRAPH_SERVICE_TOKEN` (API replicas to the internal graph API) and
+`PHEASANT_INDEX_WORKER_TOKEN` (the indexer to the preparation workers). Never
+reuse one value across two of them: workers are the least-trusted tier and
+hold the third by necessity, and a serving process refuses to start when the
+graph and worker tokens match. Never print or place secret values in YAML,
+logs, commits or responses.
 
 Start the advanced preset:
 

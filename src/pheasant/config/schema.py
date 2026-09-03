@@ -658,6 +658,11 @@ class SyncQueueSettings(ModelMixin):
     nats_stream: str = "PHEASANT_INDEX"
     nats_subject: str = "pheasant.index.tasks"
     nats_durable: str = "pheasant-indexers"
+    #: Subject prefix for graph-commit announcements (the kb id is appended).
+    #: Core NATS pub/sub rather than a JetStream stream, because every replica
+    #: must hear it and a dropped one costs a poll interval — see
+    #: :mod:`pheasant.sync.graph_events`.
+    nats_graph_subject: str = "pheasant.graph.committed"
 
 
 @dataclass
@@ -1107,6 +1112,46 @@ class IdPSettings(ModelMixin):
 
 
 @dataclass
+class ApiAuthSettings(ModelMixin):
+    """First-party bearer auth for the HTTP/MCP surface (Phase 35.8).
+
+    The HTTP API has no authentication of its own, and for one container on
+    loopback that is the right trade: a local tool behind the operator's own
+    perimeter. The fleet is a different deployment. There the API is a
+    multi-replica Service that necessarily binds ``0.0.0.0``, and the only
+    thing between it and the network is a port-publishing decision an
+    operator can reasonably change — while the surface behind it can register
+    a source over any allow-listed path and read what it finds.
+
+    So this exists to make "behind an authenticating ingress" the *default*
+    rather than the instruction. A static shared token is deliberately the
+    whole feature: it is enough to close the gap, it needs no IdP, and it
+    cannot rot into a half-built identity system. Anything richer belongs to
+    the ingress, which is what ``behind_authenticating_proxy`` declares.
+
+    Roles other than ``all`` refuse to serve a non-loopback bind with neither
+    of the two set — see :func:`pheasant.deployment.roles.validate_role`.
+    ``all`` is exempt because a single container is the local-first tool and
+    must keep starting with no configuration at all.
+    """
+
+    #: Environment variable holding the shared bearer token. The secret itself
+    #: never belongs in YAML, so — like every other credential here — only the
+    #: variable *name* is written to config.
+    token_env: str = "PHEASANT_API_TOKEN"
+    #: "Something in front of this authenticates callers." Turns off the
+    #: startup refusal without turning on a token. Opt-in and explicit,
+    #: because the failure it suppresses is silent by construction.
+    behind_authenticating_proxy: bool = False
+    #: Paths answerable without a token. The probes must stay open or the
+    #: orchestrator cannot tell a healthy pod from an unauthenticated one, and
+    #: ``/metrics`` is scraped by a collector that holds no pheasant identity.
+    #: ``/internal/*`` is deliberately absent: those routes enforce their own
+    #: per-boundary tokens and are exempted structurally, not by this list.
+    public_paths: list[str] = field(default_factory=lambda: ["/health", "/ready", "/metrics"])
+
+
+@dataclass
 class SecuritySettings(ModelMixin):
     allow_workspace_roots: list[Path] = field(
         default_factory=lambda: [Path("/workspace"), Path("/exports")]
@@ -1120,6 +1165,7 @@ class SecuritySettings(ModelMixin):
     default_visibility: str = "public"
     groups: dict[str, list[str]] = field(default_factory=dict)
     idp: IdPSettings = field(default_factory=IdPSettings)
+    api_auth: ApiAuthSettings = field(default_factory=ApiAuthSettings)
     allow_user_selected_source_paths: bool = True
     read_only_sources: bool = True
     deny_path_traversal: bool = True
@@ -1828,6 +1874,8 @@ class PheasantConfig(ModelMixin):
                     ]
                 if "idp" in raw and isinstance(raw["idp"], dict):
                     raw["idp"] = build(IdPSettings, raw["idp"])
+                if "api_auth" in raw and isinstance(raw["api_auth"], dict):
+                    raw["api_auth"] = build(ApiAuthSettings, raw["api_auth"])
             if dc is ServerSettings:
                 if "mcp" in raw and isinstance(raw["mcp"], dict):
                     raw["mcp"] = build(McpSettings, raw["mcp"])

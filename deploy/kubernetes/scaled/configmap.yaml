@@ -98,4 +98,18 @@ data:
       allow_workspace_roots:
         - /workspace
         - /state
+      # On in the fleet, off in the single container: a replica set behind a
+      # Service is a multi-tenant surface by construction. `public` keeps
+      # un-ACL'd content searchable, so this adds enforcement without
+      # requiring every artifact to carry an ACL first.
+      acl_enforced: true
+      default_visibility: public
+      api_auth:
+        # PHEASANT_API_TOKEN comes from the Secret (see secret.example.yaml).
+        # Every serving role refuses to start without it, because these pods
+        # bind 0.0.0.0 by necessity. If an ingress already authenticates
+        # callers, set behind_authenticating_proxy: true instead and drop the
+        # variable.
+        token_env: PHEASANT_API_TOKEN
+        behind_authenticating_proxy: false
     sources: []

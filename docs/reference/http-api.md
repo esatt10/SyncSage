@@ -7,12 +7,23 @@ available at `/docs` and the schema at `/openapi.json`.
 The routes below are the consolidated surface defined in
 `src/pheasant/api/app.py`.
 
+**Authentication.** None by default, which is right for one container on
+loopback. When `security.api_auth.token_env` resolves to a value, every route
+below needs `Authorization: Bearer <value>` and answers `401` without it —
+except `security.api_auth.public_paths` (`/health`, `/ready`, `/metrics`) and
+`/internal/*`, which enforces its own per-boundary tokens. Every role but
+`all` refuses to start on a bind other machines can reach without either that
+token or `security.api_auth.behind_authenticating_proxy`; see
+[the fleet trust model](../security.md#a-fleet-is-the-other-case-and-it-is-enforced).
+A process with `server.api.enabled: false` (the preparation workers) serves
+only the probes, `/metrics` and `/internal/*`, and `404`s the rest.
+
 ## Health & ops
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Liveness probe. Reports `role`, so a pod can be identified from the response. Stays 200 when the state store is unreachable — restarting a pod does not bring a database back. |
-| GET | `/ready` | Readiness probe. Reports the role and what it does (`watcher`, `scheduler`, `drains_queue`, `indexes_locally`), and returns **503** when the state store is unreachable so the replica leaves the Service without being restarted. Deliberately not gated on the index being populated: a replica held unready through a multi-hour first index would take the whole Service down for that time. |
+| GET | `/health` | Liveness probe. Reports `role`, so a pod can be identified from the response, and `graph_generation.loaded` — the graph generation this process is answering from. Does no I/O at all, which is why the staleness comparison lives on `/ready`. Stays 200 when the state store is unreachable — restarting a pod does not bring a database back. |
+| GET | `/ready` | Readiness probe. Reports the role and what it does (`watcher`, `scheduler`, `drains_queue`, `indexes_locally`), plus `graph_generation` — `loaded` beside `published`, so a replica that missed a graph reload is detectable rather than inferred. Returns **503** when the state store is unreachable so the replica leaves the Service without being restarted. Deliberately not gated on the index being populated: a replica held unready through a multi-hour first index would take the whole Service down for that time. |
 | GET | `/metrics` | Prometheus exposition text — index queue depth, per-source throughput/ETA/stall, search latency, graph size. See [Monitor indexing](../how-to/monitor-indexing.md). |
 | POST | `/internal/indexing/prepare` | Opt-in stateless remote preparation worker. Disabled unless `sync.concurrency.remote_worker_enabled`; requires `Authorization: Bearer` matching the environment variable named by `remote_worker_token_env`. Intended for pheasant coordinators, not public clients. |
 | POST | `/internal/indexing/prepare-batch` | Several preparation tasks in one request. Same gate and token as above. Honours `deadline_seconds` (or the `X-Pheasant-Deadline-Seconds` header) by stopping between tasks rather than finishing work whose caller has given up, and answers a repeated `idempotency_keys` entry from a bounded cache instead of re-parsing. `408` when the deadline has already passed, `413` over `MAX_PREPARE_BATCH` tasks or the per-file size limit, `422` when a task is unacceptable (the coordinator then prepares it locally). A worker predating this route returns `404`, and the coordinator falls back to the single-task path. |
@@ -88,7 +99,7 @@ actually behind. See [Monitor indexing](../how-to/monitor-indexing.md).
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/search` | Search (`mode`: `text` / `graph` / `vector` / `hybrid`). Also takes `source_name`, `source_types`, `exclude_source_types`, `exclude_sources`, `node_types`, `min_score`, `section` and `memory`. Every hit reports `provenance.source_type` — the kind of source it came from. |
+| POST | `/search` | Search (`mode`: `text` / `graph` / `vector` / `hybrid`). Also takes `source_name`, `source_types`, `exclude_source_types`, `exclude_sources`, `node_types`, `min_score`, `section` and `memory`. Every hit reports `provenance.source_type` — the kind of source it came from. The response carries `graph_generation`: which graph answered, so a diagnosis can tell "not indexed" from "this replica has not picked up the index that has it". |
 | POST | `/relevant-files` | Rank relevant files for a task/query. |
 | GET | `/files/summary` | Summarize a file node. |
 | GET | `/nodes/content` | Fetch a node's content. |

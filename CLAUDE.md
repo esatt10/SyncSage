@@ -83,7 +83,9 @@ pheasant-kb/
 │   ├── jobs.py                ← per-source progress: phase, rate, ETA, stalled
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
 │   ├── sync/                  ← engine, connectors, watcher, scheduler, locks,
-│   │                            queue, log_queue, worker_pool,
+│   │                            queue, log_queue, graph_events (commit
+│   │                            announcements), saturation (the commit-
+│   │                            authority ceiling), worker_pool,
 │   │                            worker_transport, grpc
 │   ├── connectors/            ← first-party SDK plugins: notion, gdrive,
 │   │                            slack, confluence, imap
@@ -138,7 +140,8 @@ pheasant sync --source <name> --mode incremental|full|validate_only|repair
 pheasant serve --role api|indexer|worker|all
 pheasant worker                            # stateless preparation worker
 pheasant queue status|drain|requeue-dead
-pheasant shard plan                        # split a corpus across regions
+pheasant shard plan [--emit DIR]           # split a corpus across regions;
+                                           # --emit writes each region's files
 pheasant migrate --to postgres             # one-shot, verified, preserves original
 pheasant backup|restore
 pheasant export parquet [--table NAME]      # /exports/parquet/<kb_id>/*.parquet
@@ -523,6 +526,10 @@ One container until it shouldn't be. Then four independent axes:
 | Corpus size | `pheasant shard plan` packs **whole sources** per region | graph nodes |
 | Observation volume | `--role logger` draining its **own** queue (`log_tasks`, never `index_tasks`) | `pheasant_log_queue_depth` |
 
+The second axis has a ceiling the others do not: one indexer is the sole commit
+authority per shard, so extra indexers are elected hot standbys and the third
+axis is the only way past it.
+
 Selectable backends, dependency-free side first: `storage.backend`
 sqlite|postgres, `sync.queue.backend` off|local|nats,
 `sync.concurrency.worker_transport` http|grpc,
@@ -551,6 +558,43 @@ arrangement of worker failures may change what a sync produces.
 Serving durability: bounded request concurrency answering `429` +
 `Retry-After` under saturation, and a SIGTERM drain that fails readiness and
 keeps serving on a timer thread — never by sleeping on the event loop.
+
+**The fleet's invariants are refusals, not conventions** (`deployment/roles.py`,
+one pass at startup). A serving role other than `all` refuses a bind other
+machines can reach with neither `security.api_auth.token_env` resolving nor
+`behind_authenticating_proxy` set — `all` is exempt so a laptop and every
+standalone container keep starting with no configuration at all, but a pod
+binds `0.0.0.0` by necessity and the bind address is not a control there. The
+graph and worker tokens must not name one variable or resolve to one value:
+two boundaries, and workers hold the second by necessity. A `worker` refuses
+to hold a DSN, a model key, the IdP token, the graph token, a source list or a
+non-SQLite backend, and `server.api.enabled: false` is *enforced* — such a
+process answers the probes, `/metrics` and its own `/internal` routes and 404s
+the rest. `/internal/*` is exempt from the API token structurally, because
+requiring it there would hand every worker the region's front-door credential.
+
+**The graph handoff is announced, and the poll is the backstop.** Each commit
+publishes a content-addressed `generation_id` in the publication record and,
+on the `nats` backend, announces it (core NATS pub/sub, one subject per kb —
+fan-out, since every replica must reload). A dropped message costs one
+`graph_refresh_seconds`, which is what lets the event path be at-most-once and
+stateless; a broker-less region keeps exactly the poll it had. `/ready` publishes `loaded` beside
+`published` so a stale replica is *detectable rather than inferred* (on
+`/ready`, off the loop, because comparing them reads `/state` and `/health` is
+the liveness probe that does no I/O — it carries `loaded` alone), and every
+search response carries the generation that answered it.
+
+**The single-writer ceiling is a metric, not prose.**
+`pheasant_commit_authority_saturation` (`sync/saturation.py`) is the busy
+fraction of a five-minute window on the process that owns the commit stream;
+sustained above `SHARD_THRESHOLD` (0.8) means more workers will not help and
+the region should be split. It publishes nothing below a minute of observed
+wall time, and nothing at all on a process that is not the commit authority —
+a confident zero from an api replica would read as headroom. `pheasant scan`
+warns from the same measured coefficients before a corpus reaches it, and
+`pheasant shard plan --emit` writes the second region's config, compose file
+and secret stubs so acting on a split is a reviewed diff rather than a weekend
+of copying.
 
 `src/pheasant/capacity.py` is the single home for sizing coefficients so
 `pheasant scan`, `pheasant shard plan` and the docs cannot disagree.
@@ -835,6 +879,47 @@ Each of these cost real time. They are listed because the shape recurs.
   handler is stripped exactly like a crash. Found by walking every tool
   against a fake corpus and diffing the refusals against the 1.x server; no
   test had ever asserted on error *text*, so nothing went red.
+- **A config flag nothing reads is a comment with a colon in it.**
+  `deploy/compose/worker.yaml` declared `server.api.enabled: false` from the
+  day the worker tier existed, and no code ever consulted it — so every
+  preparation worker served the whole knowledge-base API: register a source
+  over any allow-listed path, rewrite the config, read what it finds. On the
+  tier designed to hold nothing, scaled hardest, and running third-party parse
+  code. The flag looked like the trust boundary and was documentation of an
+  intention. Enforced now at the one place that can be checked (a 404 for
+  anything outside the probes, `/metrics` and `/internal/*`), and asserted by
+  a test that drives a real client at a route the flag claims does not exist.
+  The general shape: a setting with no reader is worse than no setting,
+  because it stops anyone looking for the missing enforcement.
+- **A convenience in a deployment file can undo a boundary the code got
+  right.** The worker tier is deliberately given no database, no keys and no
+  volumes, and it holds the indexing token by necessity. The shipped Compose
+  file then wired `PHEASANT_GRAPH_SERVICE_TOKEN` to
+  `${PHEASANT_INDEX_WORKER_TOKEN}` — one fewer value to generate — so any
+  compromised worker also held the credential for the internal graph API,
+  which serves the whole graph. Nothing in the Python was wrong. Two variables
+  is the fix; the refusal when they resolve equal is what keeps it fixed, and
+  it belongs beside the other startup checks rather than in a README.
+- **A security posture that is right for one process is a default that ships
+  into the fleet.** "Unauthenticated, on loopback" is defensible for a
+  local-first container and was carried unchanged into the role split, where
+  pods bind `0.0.0.0` because a Service cannot reach a loopback-bound one — so
+  the control the docs named did not exist in the deployment they described.
+  The fix is not a bigger warning: `all` stays exempt (rule 7), and every
+  other role refuses to start without either a token or an explicit
+  "an ingress authenticates this". The general shape: when a control is a
+  *property of the deployment* rather than of the code, it must be re-derived
+  per deployment shape, not inherited.
+- **A ceiling stated only in prose cannot be reached by anyone reading a
+  dashboard.** One indexer is the sole commit authority, which every design
+  document said and no metric showed — so "we scaled workers and ingest
+  stopped improving" and "retrieval is mistuned" produced identical symptoms.
+  Two decisions made the gauge honest rather than merely present: it publishes
+  `None` below a minute of observed wall time (two busy seconds in a pod's
+  first four are not 50% saturation, and the response to a misread is to shard
+  a region that is doing nothing), and it is absent entirely on a process that
+  is not the commit authority, because a confident `0.0` from an api replica
+  reads as headroom. Same posture as `tuning.health` below its sample floor.
 
 ---
 
@@ -847,6 +932,8 @@ Each of these cost real time. They are listed because the shape recurs.
   **HTTP:** `docs/reference/http-api.md`
 - **Scale:** `docs/how-to/capacity-planning.md`,
   `docs/how-to/worker-fleet.md`, `docs/how-to/indexing-performance.md`
+- **Security:** `docs/security.md` — the trust model for one container, the
+  fleet's three boundaries, and which startup refusals enforce them
 - **Analytics/exports:** `docs/how-to/parquet-exports.md`,
   `docs/reference/export-schema.md` (the contract an outside reader gets)
   — `/exports` is a PVC/named volume an outside reader mounts; nothing is

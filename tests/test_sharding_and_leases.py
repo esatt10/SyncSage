@@ -389,3 +389,336 @@ def test_sqlite_keeps_the_whole_state_lease(tmp_path: Path) -> None:
         assert engine.state.rows("SELECT source_id FROM source_leases") == []
     finally:
         engine.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 35.8 — the ceiling, published; the split, emitted
+#
+# The single-writer ceiling is a defensible consequence of a globally
+# consistent graph. What was not defensible is that it was undocumented as a
+# cliff and the escape from it was unautomated: a team scales workers, watches
+# ingest stop improving, and has nothing telling them they have reached the
+# commit-authority limit rather than a tuning problem.
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    """A hand-wound monotonic clock, so a five-minute window costs no seconds."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _meter(clock: _Clock, **kwargs: object):
+    from pheasant.sync.saturation import CommitAuthorityMeter
+
+    return CommitAuthorityMeter(clock=clock, **kwargs)
+
+
+def test_saturation_is_the_busy_fraction_of_the_window() -> None:
+    clock = _Clock()
+    meter = _meter(clock, window_seconds=100.0, minimum_seconds=10.0)
+
+    with meter.busy():
+        clock.advance(40.0)
+    clock.advance(60.0)
+
+    assert meter.saturation() == 0.4
+
+
+def test_it_publishes_nothing_before_it_has_seen_enough() -> None:
+    """Two busy seconds in a pod's first four are not 50% saturation.
+
+    A gauge that said so would invite sharding a region that is doing nothing,
+    which is the most expensive possible response to a misread number.
+    """
+
+    clock = _Clock()
+    meter = _meter(clock, window_seconds=100.0, minimum_seconds=60.0)
+    with meter.busy():
+        clock.advance(2.0)
+    clock.advance(2.0)
+
+    assert meter.saturation() is None
+
+
+def test_concurrent_sources_cannot_report_more_than_full() -> None:
+    """An indexer runs several sources through a pool; the spans overlap.
+
+    Summing durations would report 300% busy on a three-source pass — a
+    number that cannot be true of wall time and would trip every threshold.
+    """
+
+    clock = _Clock()
+    meter = _meter(clock, window_seconds=100.0, minimum_seconds=10.0)
+    meter._spans.extend([(1000.0, 1040.0), (1010.0, 1050.0), (1020.0, 1030.0)])
+    clock.advance(100.0)
+
+    assert meter.saturation() == 0.5
+
+
+def test_a_source_still_indexing_counts_while_it_runs() -> None:
+    """Otherwise one multi-hour source reports zero saturation for its whole
+    duration — which is exactly the run somebody would be looking at."""
+
+    clock = _Clock()
+    meter = _meter(clock, window_seconds=100.0, minimum_seconds=10.0)
+    clock.advance(20.0)  # idle first, so the window has something to divide by
+    with meter.busy():
+        clock.advance(80.0)
+        assert meter.saturation() == 0.8
+
+
+def test_the_window_rolls() -> None:
+    """A region that indexed hard this morning is not saturated this afternoon."""
+
+    clock = _Clock()
+    meter = _meter(clock, window_seconds=100.0, minimum_seconds=10.0)
+    with meter.busy():
+        clock.advance(50.0)
+    clock.advance(200.0)
+
+    assert meter.saturation() == 0.0
+
+
+def test_a_nested_sync_does_not_restart_the_clock() -> None:
+    """`sync_all` calls `sync_source`; the outer span is the one that counts."""
+
+    clock = _Clock()
+    meter = _meter(clock, window_seconds=100.0, minimum_seconds=10.0)
+    with meter.busy():
+        clock.advance(10.0)
+        with meter.busy():
+            clock.advance(10.0)
+        clock.advance(10.0)
+    clock.advance(70.0)
+
+    assert meter.saturation() == 0.3
+
+
+def test_the_capacity_model_warns_before_a_corpus_reaches_the_ceiling() -> None:
+    """The ceiling stated as a number, beside the other coefficients."""
+
+    from pheasant.capacity import COMMIT_AUTHORITY_WARN_HOURS, SHARD_ON_SATURATION, project
+    from pheasant.sync.saturation import SHARD_THRESHOLD
+
+    # One home for the threshold: a report and a live gauge that disagreed
+    # about where the line is would be worse than neither.
+    assert SHARD_ON_SATURATION == SHARD_THRESHOLD
+
+    small = project(10_000, 0)
+    assert not any("commit capacity" in warning for warning in small.warnings)
+
+    # Just past the documented window, from the same measured
+    # seconds-per-1k-files the projection already uses.
+    from pheasant.capacity import SECONDS_PER_1K_FILES
+
+    files = int((COMMIT_AUTHORITY_WARN_HOURS * 3600 / SECONDS_PER_1K_FILES) * 1000) + 1_000
+    large = project(files, 0)
+    ceiling = [w for w in large.warnings if "commit capacity" in w]
+    assert ceiling, large.warnings
+    assert "pheasant_commit_authority_saturation" in ceiling[0]
+    assert "shard plan" in ceiling[0]
+
+
+# ---------------------------------------------------------------------------
+# The emitted split
+# ---------------------------------------------------------------------------
+
+
+def _plan_config(tmp_path: Path, names: list[str]) -> PheasantConfig:
+    return PheasantConfig.model_validate(
+        {
+            "pheasant": {"name": "atlas", "state_path": str(tmp_path / "state")},
+            "search": {"ranking": {"rrf_k": 42}},
+            "sources": [
+                {"name": name, "type": "markdown_folder", "path": str(tmp_path / name)}
+                for name in names
+            ],
+        }
+    )
+
+
+def test_emitting_a_split_produces_one_project_per_region(tmp_path: Path) -> None:
+    """`shard plan` proposed a split and left the work of making it real."""
+
+    from pheasant.sharding import render_artifacts
+
+    config = _plan_config(tmp_path, ["docs", "code", "tickets"])
+    plan = plan_shards(
+        [SourceSize("docs", 300_000), SourceSize("code", 200_000), SourceSize("tickets", 100)],
+        max_nodes_per_shard=1_500_000,
+    )
+    artifacts = render_artifacts(plan, config)
+
+    assert len(plan["shards"]) == 3
+    for index in (1, 2, 3):
+        prefix = f"atlas-shard-{index}"
+        assert f"{prefix}/pheasant.yaml" in artifacts
+        assert f"{prefix}/docker-compose.yml" in artifacts
+        assert f"{prefix}/.env.example" in artifacts
+    assert "README.md" in artifacts
+
+
+def test_each_region_gets_its_own_knowledge_base_id(tmp_path: Path) -> None:
+    """The one mistake that cannot be fixed by editing a file afterwards.
+
+    Every stable ID starts with `pheasant.name`, so two regions sharing it
+    would already have collided inside their persisted graphs by the time
+    anyone noticed.
+    """
+
+    import yaml
+
+    from pheasant.sharding import render_artifacts
+
+    config = _plan_config(tmp_path, ["docs", "code"])
+    plan = plan_shards([SourceSize("docs", 2_000_000), SourceSize("code", 2_000_000)])
+    artifacts = render_artifacts(plan, config)
+
+    ids = {
+        yaml.safe_load(content)["pheasant"]["name"]
+        for name, content in artifacts.items()
+        if name.endswith("pheasant.yaml")
+    }
+    assert len(ids) == len(plan["shards"]) > 1
+    assert all(identifier != "atlas" for identifier in ids)
+
+
+def test_a_region_carries_only_its_own_sources_and_the_same_retrieval(
+    tmp_path: Path,
+) -> None:
+    """A split must not quietly become a second product.
+
+    Shards that ranked differently would answer differently for reasons
+    invisible in the plan that produced them.
+    """
+
+    import yaml
+
+    from pheasant.sharding import render_artifacts
+
+    config = _plan_config(tmp_path, ["docs", "code"])
+    plan = plan_shards([SourceSize("docs", 2_000_000), SourceSize("code", 2_000_000)])
+    artifacts = render_artifacts(plan, config)
+
+    seen: list[str] = []
+    for name, content in artifacts.items():
+        if not name.endswith("pheasant.yaml"):
+            continue
+        region = yaml.safe_load(content)
+        names = [source["name"] for source in region["sources"]]
+        assert len(names) == 1
+        seen.extend(names)
+        assert region["search"]["ranking"]["rrf_k"] == 42
+    assert sorted(seen) == ["code", "docs"]
+
+
+def test_two_regions_do_not_collide_on_volumes_or_ports(tmp_path: Path) -> None:
+    """Two compose projects sharing a volume name share a state directory."""
+
+    from pheasant.sharding import render_artifacts
+
+    config = _plan_config(tmp_path, ["docs", "code"])
+    plan = plan_shards([SourceSize("docs", 2_000_000), SourceSize("code", 2_000_000)])
+    artifacts = render_artifacts(plan, config)
+
+    composes = [c for name, c in artifacts.items() if name.endswith("docker-compose.yml")]
+    assert len(composes) == 2
+    assert "atlas-shard-1-state:" in composes[0]
+    assert "atlas-shard-2-state:" in composes[1]
+    assert "${PHEASANT_PORT:-8765}:8765" in composes[0]
+    assert "${PHEASANT_PORT:-8766}:8765" in composes[1]
+
+
+def test_the_emitted_secrets_are_stubs_and_say_how_many(tmp_path: Path) -> None:
+    """A generated file that carried a real value would be a generated leak."""
+
+    from pheasant.sharding import render_artifacts
+
+    config = _plan_config(tmp_path, ["docs"])
+    plan = plan_shards([SourceSize("docs", 1000)])
+    artifacts = render_artifacts(plan, config)
+
+    env = artifacts["atlas-shard-1/.env.example"]
+    assert "PHEASANT_API_TOKEN=" in env
+    assert "openssl rand" in env
+    # Every line is commented out or empty: nothing here is a usable secret.
+    assert all(not line.strip() or line.startswith("#") for line in env.splitlines())
+
+
+def test_the_readme_says_what_the_emission_did_not_do(tmp_path: Path) -> None:
+    """Automation that implied the data had moved would be the dangerous kind."""
+
+    from pheasant.sharding import render_artifacts
+
+    config = _plan_config(tmp_path, ["docs", "code"])
+    plan = plan_shards([SourceSize("docs", 2_000_000), SourceSize("code", 2_000_000)])
+    readme = render_artifacts(plan, config)["README.md"]
+
+    assert "No data moves" in readme
+    assert "indexes its own sources from scratch" in readme
+
+
+def test_the_emitted_compose_is_a_file_docker_will_accept(tmp_path: Path) -> None:
+    """A generated compose file that fails to parse is worse than none.
+
+    `mem_limit` takes an integer with a suffix, so the ladder's `0.5Gi` first
+    rung — which is what a small shard gets — is not a value it accepts.
+    """
+
+    import yaml
+
+    from pheasant.sharding import _compose_memory, render_artifacts
+
+    assert _compose_memory("0.5Gi") == "512m"
+    assert _compose_memory("12Gi") == "12288m"
+
+    config = _plan_config(tmp_path, ["docs"])
+    plan = plan_shards([SourceSize("docs", 500)])
+    compose = yaml.safe_load(render_artifacts(plan, config)["atlas-shard-1/docker-compose.yml"])
+
+    service = compose["services"]["pheasant"]
+    assert service["mem_limit"].endswith("m")
+    # The container paths the emitted config names must be the ones mounted.
+    mounted = {entry.split(":")[1] for entry in service["volumes"]}
+    assert {"/state", "/workspace", "/exports"} <= mounted
+
+
+def test_a_region_config_names_container_paths(tmp_path: Path) -> None:
+    """Not wherever the planning machine happened to keep its state."""
+
+    import yaml
+
+    from pheasant.sharding import render_artifacts
+
+    config = _plan_config(tmp_path, ["docs"])
+    plan = plan_shards([SourceSize("docs", 500)])
+    region = yaml.safe_load(render_artifacts(plan, config)["atlas-shard-1/pheasant.yaml"])
+
+    assert region["pheasant"]["state_path"] == "/state"
+    assert region["pheasant"]["workspace_root"] == "/workspace"
+
+
+def test_host_source_paths_are_named_but_never_assumed(tmp_path: Path) -> None:
+    """This machine's paths are not necessarily the deploying machine's.
+
+    A compose file that silently bind-mounted a guess would either fail to
+    start or index the wrong directory. Naming them is help; assuming them
+    is not — so they are emitted commented out.
+    """
+
+    from pheasant.sharding import render_artifacts
+
+    config = _plan_config(tmp_path, ["docs"])
+    plan = plan_shards([SourceSize("docs", 500)])
+    compose = render_artifacts(plan, config)["atlas-shard-1/docker-compose.yml"]
+
+    hint = next(line for line in compose.splitlines() if str(tmp_path / "docs") in line)
+    assert hint.strip().startswith("#")

@@ -90,8 +90,12 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 | `port` | integer | `8765` | Primary service port. |
 | `role` | string | `all` | Which jobs this process takes on. `pheasant serve --role` overrides it. See below. |
 
-The API is unauthenticated, so the bind address is a security control, not
-just a networking detail — see [security.md](security.md#trust-model-for-the-http-api).
+On one container the API is unauthenticated, so the bind address is a security
+control rather than a networking detail — see
+[security.md](security.md#trust-model-for-the-http-api). In a fleet the pods
+must bind `0.0.0.0`, so the bind address stops being a control at all and
+`security.api_auth` takes over: every role but `all` refuses to start on a
+routable bind without it.
 
 ### Process roles (`server.role`)
 
@@ -161,7 +165,7 @@ multi-hour first index would take the whole Service down for that time.
 |---|---|---|---|
 | `max_concurrent_requests` | integer | `0` | In-flight requests before the surplus is refused with **429 + `Retry-After`**. `0` disables it. |
 | `drain_seconds` | integer | `0` | Seconds to keep serving after SIGTERM while `/ready` already reports 503. `0` disables the delay. |
-| `graph_refresh_seconds` | integer | `30` | How often a legacy local-graph `api` or dedicated `graph` role re-reads a graph written by the indexer. A remote-graph API ignores it. `0` disables it. |
+| `graph_refresh_seconds` | integer | `30` | Backstop interval for re-reading a graph written by the indexer, on a legacy local-graph `api` or the dedicated `graph` role. Not the usual trigger: on the `nats` queue backend an indexer announces each commit and replicas reload at commit latency, and this is the ceiling on how long a *missed* announcement can go unnoticed. A remote-graph API ignores it. `0` disables it. |
 
 Both default off, and that is a decision rather than caution.
 
@@ -509,6 +513,7 @@ streams results, so one refused file no longer fails the whole batch.
 | `queue.max_attempts` | integer | `3` | Attempts before a task is dead-lettered. A dead task is kept, never deleted. |
 | `queue.nats_servers` | list[string] | `[]` | JetStream URLs, e.g. `nats://nats:4222`. |
 | `queue.nats_stream` / `nats_subject` / `nats_durable` | string | `PHEASANT_INDEX` / `pheasant.index.tasks` / `pheasant-indexers` | Stream, subject and durable consumer names. |
+| `queue.nats_graph_subject` | string | `pheasant.graph.committed` | Subject prefix for graph-commit announcements; the kb id is appended so two regions sharing a broker do not wake each other. Core NATS pub/sub, not a JetStream stream: every replica must hear it, and a dropped message costs one `server.api.graph_refresh_seconds` poll because the poll is kept as the backstop. Only used on the `nats` backend — a region with no broker keeps polling exactly as before. |
 
 Turn it on when a backlog needs to outlive the process holding it. Three
 things follow that a list cannot give: a sync killed nine sources into ten
@@ -726,6 +731,26 @@ shard into several regions.
 | `idp.api_key_env` | string | `IDP_TOKEN` | Env var holding the bearer token; never stored in config. |
 | `idp.sync_interval_minutes` | integer | `60` | How often the scheduler beat (or `POST /security/idp/sync`) refreshes the mapping. |
 | `idp.staleness_max_minutes` | integer | `1440` | SLA: a mapping older than this **fails closed** (grants nothing) until the next successful sync. |
+| `api_auth.token_env` | string | `PHEASANT_API_TOKEN` | Name of the env var holding a static shared bearer token; never the value. When it resolves, every route outside `public_paths` (and outside `/internal/*`, which enforces its own per-boundary tokens) needs `Authorization: Bearer <value>` or answers `401`. |
+| `api_auth.behind_authenticating_proxy` | bool | `false` | "An ingress already authenticates callers." Satisfies the startup check below without a token of pheasant's own. |
+| `api_auth.public_paths` | list[str] | `[/health, /ready, /metrics]` | Answerable without a token. The probes must stay open or an orchestrator cannot tell a healthy pod from an unauthorized one. |
+
+**Every role but `all` refuses to start** on a bind address other machines can
+reach with neither of the first two set. One container is exempt on purpose —
+a laptop and every existing standalone deployment start with no configuration
+at all — but a fleet pod binds `0.0.0.0` by necessity, so there the bind
+address is not the control it is in Compose. A process serving no
+knowledge-base API (`server.api.enabled: false`, as the preparation workers
+use) needs neither. See
+[the fleet trust model](security.md#a-fleet-is-the-other-case-and-it-is-enforced).
+
+Two further startup refusals live in the same pass. A serving process refuses
+when `graph.query_service_token_env` and
+`sync.concurrency.remote_worker_token_env` name one variable or resolve to one
+value — two trust boundaries, and workers hold the second by necessity. And a
+`worker` refuses to hold a database DSN, a model provider key, the IdP token,
+the graph token, a source list, or a non-SQLite state backend, none of which it
+can use.
 
 ---
 
