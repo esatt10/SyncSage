@@ -357,7 +357,12 @@ class SyncEngine:
         self._lease_mutex = threading.Lock()
         SourceRegistry(self.config, self.state).initialize()
         self.manifests = ManifestStore(self.paths.manifests, self.state)
-        self.graph_store = GraphStore(self.paths.graphs)
+        self.graph_store = GraphStore(
+            self.paths.graphs, state=self.state, graph_format=config.storage.graph_format
+        )
+        # A region upgrading into the row backend still has its graph file.
+        # Import it once, keep it, and let every later commit be a delta.
+        self.graph_store.import_persisted_file(config.knowledge_base_id)
         # Announce every committed generation on the fleet's broker, so a
         # serving replica reloads at commit latency instead of on its own poll
         # (Phase 35.8). `notifier_from_config` returns the null notifier
@@ -381,7 +386,13 @@ class SyncEngine:
         #: None for a process that holds no graph. "Stale" was previously
         #: undetectable rather than merely unmeasured: a replica that missed a
         #: reload answered from an old graph, correctly-looking, forever.
-        self.loaded_graph_generation: str | None = None
+        self._loaded_graph_generation: str | None = None
+        #: TTL on the resolved generation for a process that serves from the
+        #: store rather than from a copy. Same 2s as `RemoteGraph.stats`, and
+        #: for the same reason: the honest answer needs a read, and the read
+        #: must not land on every search.
+        self._generation_ttl = 2.0
+        self._generation_at = 0.0
         #: When that generation was published, as a unix timestamp. Kept
         #: beside the id so the age gauge measures the graph this process is
         #: serving rather than whatever has since been written to /state.
@@ -497,6 +508,13 @@ class SyncEngine:
         """
 
         if not self._loads_persisted_graph:
+            # Nothing private to reload. On the row backend that is the normal
+            # case for a serving replica — it reads the graph out of the shared
+            # database, so it is never behind — and the generation it reports
+            # still has to keep up, or `/ready` would claim a staleness that
+            # cannot happen. See `serving_graph`.
+            if self.graph_store.rows is not None:
+                self._note_loaded_generation()
             return 0
         loaded = self.graph_store.load(self.config.knowledge_base_id)
         if not len(loaded):
@@ -515,6 +533,57 @@ class SyncEngine:
         )
         return loaded.number_of_nodes()
 
+    @property
+    def loaded_graph_generation(self) -> str | None:
+        """Which published generation this process is actually serving.
+
+        For a process holding a **copy** — every process on the whole-file
+        backend, and any process that indexes — this is a remembered label,
+        set when the graph was loaded or committed. It can lag the published
+        one, and the gap between them is exactly the staleness `/ready`
+        exists to expose.
+
+        For a process serving **from the store** there is no copy and no gap:
+        it reads the rows the last commit wrote. Reporting a remembered label
+        there would invent a staleness that cannot happen, and would raise a
+        false alarm on the deployment shape the row backend exists to enable —
+        so it resolves the published id instead, behind a short TTL so the
+        read does not land on every search.
+        """
+
+        if self._loads_persisted_graph or self.graph_store.rows is None:
+            return self._loaded_graph_generation
+        now = time.monotonic()
+        if now - self._generation_at > self._generation_ttl:
+            record = self.graph_store.published_generation(self.config.knowledge_base_id)
+            self._loaded_graph_generation = str(record["generation_id"]) if record else None
+            self._generation_at = now
+        return self._loaded_graph_generation
+
+    @loaded_graph_generation.setter
+    def loaded_graph_generation(self, value: str | None) -> None:
+        self._loaded_graph_generation = value
+
+    def serving_graph(self) -> Any:
+        """The graph this process answers queries from.
+
+        Two different objects for two different jobs. A process that *builds*
+        the graph serves its own working set, which is current by construction
+        and is what `role: all` — every standalone container — uses. A process
+        that only serves gets whatever the store offers: on ``rows`` a
+        :class:`~pheasant.graph.sql.SqlGraph` holding nothing, on the file
+        backend the resident copy it loaded, because there is no third option
+        there.
+
+        That asymmetry is the residency win stated in one place: the file
+        backend has to give a graph to everyone who reads one, and the row
+        backend only to whoever writes one.
+        """
+
+        if self._loads_persisted_graph or self.graph_store.rows is None:
+            return self.graph_builder.graph
+        return self.graph_store.serving_graph(self.config.knowledge_base_id)
+
     def _on_graph_published(self, kb_id: str, record: dict) -> None:
         """This process just committed a generation: adopt it, then announce it.
 
@@ -532,7 +601,7 @@ class SyncEngine:
         did not, and the same operation returned different answers.
         """
 
-        self.loaded_graph_generation = str(record.get("generation_id") or "") or None
+        self._loaded_graph_generation = str(record.get("generation_id") or "") or None
         self.loaded_graph_published_at = _published_timestamp(record.get("published_at"))
         if self._graph_notifier.enabled:
             self._graph_notifier.publish(kb_id, record)
@@ -551,7 +620,7 @@ class SyncEngine:
             record = self.graph_store.published_generation(self.config.knowledge_base_id)
         except Exception:  # noqa: BLE001 - a label must not break a load
             record = None
-        self.loaded_graph_generation = str(record["generation_id"]) if record else None
+        self._loaded_graph_generation = str(record["generation_id"]) if record else None
         self.loaded_graph_published_at = (
             _published_timestamp(record.get("published_at")) if record else None
         )

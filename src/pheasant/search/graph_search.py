@@ -180,17 +180,37 @@ def _scan_edges_accelerated(
         return _scan_edges(graph, tokens, q, source_name)
 
 
+def _edge_candidates(graph: SimpleMultiDiGraph, tokens: list[str], source_name: str | None):
+    """Edges worth scoring — from an index where there is one.
+
+    Node search stopped scanning every node when ``graph_nodes_fts`` arrived;
+    relationship search kept doing exactly that, O(edges) per query with no
+    index, because the edges only existed inside a resident Python dict. A
+    row-backed graph can narrow first, so it is asked to.
+
+    The narrowing is a **superset** of what will score: the scorer below is
+    unchanged and still decides. Falling back to the full iteration is
+    correct, not degraded — it is what the in-memory graph has always done,
+    and its dicts are why it can afford to.
+    """
+
+    narrow = getattr(graph, "candidate_edges", None)
+    if callable(narrow) and tokens:
+        return narrow(tokens, source_name)
+    return graph.iter_edges()
+
+
 def _scan_edges(
     graph: SimpleMultiDiGraph,
     tokens: list[str],
     q: str,
     source_name: str | None,
 ) -> list[tuple[float, dict[str, Any]]]:
-    """Score every edge. Caller holds ``reading()``."""
+    """Score every candidate edge. Caller holds ``reading()``."""
 
     hits: list[tuple[float, dict[str, Any]]] = []
     nodes = graph.node_map()
-    for (source, target), edge_map in graph.iter_edges():
+    for (source, target), edge_map in _edge_candidates(graph, tokens, source_name):
         source_label = str((nodes.get(source) or {}).get("label") or source)
         target_label = str((nodes.get(target) or {}).get("label") or target)
         for _key, data in edge_map.items():

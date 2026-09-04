@@ -96,10 +96,18 @@ they rely on credentials, sidecars or live graph state.
 
 Unchanged CLI/worker syncs defer graph deserialization. They list and compare
 content-addressed manifest entries, update the checkpoint, and read counts from
-`graph.latest.meta.json`; the full graph is loaded only when a changed artifact
-must mutate it. Changed generations publish graph bytes first, generation
-metadata second, and source manifests last, so a crash causes safe reprocessing
-instead of an ahead-of-graph manifest.
+the publication record; the full graph is loaded only when a changed artifact
+must mutate it. Changed generations publish the graph first and the source
+manifests last, so a crash causes safe reprocessing instead of an
+ahead-of-graph manifest.
+
+On the default `storage.graph_format: rows` a changed generation writes only
+the rows that changed, in the same transaction as the artifacts and chunks — so
+a commit costs what the change costs rather than what the graph weighs
+(measured 1.1 ms versus 6.15 s at 100k files), and the graph can no longer
+disagree with the chunks after a crash between two writes. On
+`node_link_json` every commit re-serializes the whole graph, which is the
+cost `storage.graph_checkpoint_seconds` exists to space out.
 
 A redelivered **full** task resumes as an incremental delta only after a
 graph+manifest checkpoint was durably published. Before that boundary it

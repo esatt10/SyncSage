@@ -28,6 +28,27 @@ you can interpolate. Do **not** extrapolate far past the top row: a linear
 projection to 250k files predicted 3.8 GB and the measured answer was 4.3 GB,
 12% high.
 
+**The table above is `storage.graph_format: node_link_json`, and it is no
+longer the default.** On `rows` (the default since 35.10) the graph lives in
+the state database, so those three costs land differently:
+
+| Corpus | Nodes | RSS to *serve* | RSS to *index* | Commit | Database |
+|---|---|---|---|---|---|
+| 2,000 files | 12.6k | **0** | 34 MB | 1.0 ms | 23 MB |
+| 20,000 files | 126k | **0** | 314 MB | 1.0 ms | 206 MB |
+| 100,000 files | 630k | **0** | 1.5 GB | 1.1 ms | 1,033 MB |
+
+Two things move. The commit stops growing with the graph — it is the same
+millisecond at every size, because it writes only what changed — and the
+residency is paid by the process that *builds* the graph rather than by every
+process that reads one. An api replica on `rows` holds no graph at all, so the
+"Give the container" table below applies to your indexer; serving replicas size
+from request traffic.
+
+What you pay for it is disk: about **1,640 bytes per node** in the database
+(measured 1,637 at 20k files and 1,639 at 100k), against a compressed file
+roughly 55× smaller. `pheasant scan` includes it.
+
 ## Sizing a region
 
 | Corpus | Give the container | Notes |
@@ -106,7 +127,14 @@ embedding is a network wait, not CPU.
 
 ## Checkpoint cost, and why it is no longer the ceiling
 
-A checkpoint serializes the entire graph, so its cost grows with the index. The
+On the default `storage.graph_format: rows` this section is largely historical:
+a checkpoint writes the changed rows and costs about a millisecond whatever the
+graph weighs, so the interval below is spacing out something that is no longer
+expensive. Leave the settings alone; they cost nothing and they are what
+`node_link_json` still needs.
+
+On `node_link_json` a checkpoint serializes the entire graph, so its cost grows
+with the index. The
 interval is **derived from that cost**, not fixed — pheasant uses Young's
 formula (`T = sqrt(2 x C x MTBF)`), the standard HPC/ML-training result, which
 minimizes the *sum* of checkpoint overhead and work redone after a crash rather
@@ -160,14 +188,22 @@ graph:
 ```
 
 The `graph` role loads and refreshes the snapshot; API/MCP replicas keep only a
-bounded proxy. This is worth the extra network hop and service when either:
+bounded proxy.
+
+On `storage.graph_format: rows` this is **optional**: an API replica already
+holds no graph, because it queries `graph_nodes` directly. The residency
+arguments below are the `node_link_json` case. Keep the graph service on `rows`
+when you want graph reads on their own connection pool and their own scaling
+curve — not to save memory, which it no longer does.
+
+On `node_link_json` it is worth the extra network hop and service when either:
 
 * API graph residency is regularly above roughly **60-70% of a 3 GiB limit**;
 * two or more API replicas would otherwise duplicate a large graph; or
 * graph-query CPU/latency needs to scale independently from text/vector/API
   traffic.
 
-It does **not** make graph enrichment or snapshot saves faster: those remain in
+It does **not** make graph enrichment or graph commits faster: those remain in
 the single commit authority. If save/enrichment dominates an indexing run,
 split sources into multiple knowledge-base shards below so each indexer and
 graph service owns a smaller snapshot. For one API below the memory threshold,

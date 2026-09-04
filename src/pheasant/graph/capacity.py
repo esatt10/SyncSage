@@ -110,6 +110,79 @@ def build_graph(files: int) -> SimpleMultiDiGraph:
     return graph
 
 
+def measure_rows(files: int, root: Path, graph: SimpleMultiDiGraph) -> dict[str, Any]:
+    """The same scale point against the row backend (Phase 35.10).
+
+    The comparison that decided the default, and the one CI republishes so it
+    cannot rot. Three numbers matter and only one of them is a speed:
+
+    * **incremental commit** — the cost of publishing after a one-file change.
+      This is the number that made the file backend a ceiling: it was O(total
+      graph) for an O(one file) change, on the sole commit authority, under
+      the sync mutex.
+    * **resident bytes to serve** — zero here by construction, which is what
+      lets an api replica answer a bounded walk without being given the graph.
+    * **stored bytes** — the cost side. Rows plus their two indexes are larger
+      than the compressed blob they replace, and pretending otherwise in the
+      capacity model would fill somebody's volume.
+    """
+
+    from pheasant.persistence.graph_rows import GraphRowStore
+    from pheasant.persistence.state_store import StateStore
+
+    database = root / f"rows-{files}.db"
+    database.unlink(missing_ok=True)
+    state = StateStore(database)
+    state.migrate()
+    rows = GraphRowStore(state)
+    kb = "capacity"
+
+    graph.mark_all_pending()
+    delta = graph.graph_delta()
+    started = time.perf_counter()
+    rows.apply_delta(
+        kb,
+        node_upserts=delta["node_upserts"],
+        node_removals=delta["node_removals"],
+        edge_upserts=delta["edge_upserts"],
+        edge_removals=delta["edge_removals"],
+    )
+    rows.publish(kb)
+    initial_seconds = time.perf_counter() - started
+
+    # One file's worth of change, which is what an incremental sync actually
+    # produces: NODES_PER_FILE nodes and the edges that hang off them.
+    touched = delta["node_upserts"][: int(NODES_PER_FILE)]
+    touched_edges = delta["edge_upserts"][: int(EDGES_PER_FILE)]
+    started = time.perf_counter()
+    rows.apply_delta(kb, node_upserts=touched, edge_upserts=touched_edges)
+    rows.publish(kb)
+    incremental_seconds = time.perf_counter() - started
+
+    from pheasant.graph.sql import SqlGraph
+    from pheasant.graph.traversal import neighbors
+
+    served = SqlGraph(state, kb)
+    start_node = delta["node_upserts"][0][0]
+    gc.collect()
+    rss_before = _resident_bytes()
+    started = time.perf_counter()
+    for _ in range(20):
+        neighbors(served, start_node, depth=3, max_nodes=100)
+    walk_seconds = (time.perf_counter() - started) / 20
+    rss_after = _resident_bytes()
+
+    stored = sum(path.stat().st_size for path in root.glob(f"rows-{files}.db*") if path.exists())
+    state.close()
+    return {
+        "initial_load_seconds": round(initial_seconds, 4),
+        "incremental_commit_seconds": round(incremental_seconds, 5),
+        "stored_bytes": stored,
+        "serving_rss_delta_bytes": (rss_after - rss_before) if (rss_after and rss_before) else None,
+        "bounded_walk_seconds": round(walk_seconds, 6),
+    }
+
+
 def measure(files: int, root: Path) -> dict[str, Any]:
     """One scale point. Returns plain numbers, ready for a table."""
 
@@ -152,10 +225,12 @@ def measure(files: int, root: Path) -> dict[str, Any]:
                     matched += 1
     scan_seconds = time.perf_counter() - started
 
+    rows = measure_rows(files, root, graph)
     return {
         "files": files,
         "nodes": graph.number_of_nodes(),
         "edges": graph.number_of_edges(),
+        "rows": rows,
         "graph_bytes": in_memory,
         "rss_delta_bytes": (rss_after - rss_before) if (rss_after and rss_before) else None,
         "json_bytes": len(payload),

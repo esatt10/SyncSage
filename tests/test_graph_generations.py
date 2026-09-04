@@ -310,7 +310,7 @@ def test_an_announcement_for_an_unchanged_graph_reloads_nothing(tmp_path: Path) 
 # --------------------------------------------------------------------------
 
 
-def _served(tmp_path: Path) -> TestClient:
+def _served(tmp_path: Path, graph_format: str = "rows") -> TestClient:
     (tmp_path / "ws").mkdir(exist_ok=True)
     config = PheasantConfig.model_validate(
         {
@@ -321,6 +321,7 @@ def _served(tmp_path: Path) -> TestClient:
                 "exports_path": str(tmp_path / "exports"),
             },
             "server": {"host": "127.0.0.1"},
+            "storage": {"graph_format": graph_format},
             "sources": [],
         }
     )
@@ -330,9 +331,14 @@ def _served(tmp_path: Path) -> TestClient:
 def test_readiness_publishes_the_loaded_generation_beside_the_published_one(
     tmp_path: Path,
 ) -> None:
-    """One id says nothing on its own; the pair is the staleness check."""
+    """One id says nothing on its own; the pair is the staleness check.
 
-    client = _served(tmp_path)
+    On the whole-file backend, where staleness is a thing that happens: each
+    process holds a private copy, so one that misses a reload answers from an
+    old graph, correctly-looking, forever.
+    """
+
+    client = _served(tmp_path, graph_format="node_link_json")
     engine = client.app.state.engine
     engine.graph_store.save(KB, _graph(3))
     engine.reload_graph()
@@ -350,6 +356,60 @@ def test_readiness_publishes_the_loaded_generation_beside_the_published_one(
     payload = client.get("/ready").json()["graph_generation"]
     assert payload["loaded"] != payload["published"]
     assert payload["current"] is False
+
+
+def test_a_row_backed_replica_cannot_be_stale(tmp_path: Path) -> None:
+    """The staleness above is a property of *copies*, and rows have none.
+
+    A replica reading `graph_nodes` answers from the same rows the indexer
+    committed to, so the pair `/ready` publishes is equal by construction
+    rather than by having reloaded in time. This is the assertion that the
+    scenario the previous test constructs is not merely unobserved here but
+    unconstructible: it commits through a *second store over the same
+    database*, which is what another process is, and the serving replica is
+    current immediately with no reload and no announcement.
+
+    Worth its own test rather than a parametrization: the two backends are
+    being asserted to have different properties, and a shared body would have
+    to branch to say so, which is how a weaker guarantee gets quietly accepted
+    for both.
+    """
+
+    (tmp_path / "ws").mkdir(exist_ok=True)
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": KB,
+                "state_path": str(tmp_path / "state"),
+                "workspace_root": str(tmp_path / "ws"),
+                "exports_path": str(tmp_path / "exports"),
+            },
+            "server": {"host": "127.0.0.1"},
+            "storage": {"graph_format": "rows"},
+            # An `api` replica, because that is the role the property belongs
+            # to: it serves and never indexes, so on this backend it holds no
+            # graph at all. `all` still keeps a working set — it is the process
+            # that builds one — and is still subject to the test above.
+            "sync": {"queue": {"enabled": True}},
+            "sources": [],
+        }
+    )
+    client = TestClient(create_app(config, config_path=str(tmp_path / "pheasant.yaml"), role="api"))
+    engine = client.app.state.engine
+    assert engine.serving_graph().__class__.__name__ == "SqlGraph", (
+        "the point of the test is that this replica holds no graph"
+    )
+
+    # Another process commits, through a second store over the same database.
+    second = GraphStore(engine.graph_store.root, state=engine.state, graph_format="rows")
+    second.save(KB, _graph(11))
+
+    payload = client.get("/ready").json()["graph_generation"]
+    assert payload["published"] == second.published_generation(KB)["generation_id"]
+    assert payload["loaded"] == payload["published"], (
+        "a row-backed replica reads the committed rows; it has no private copy to be behind"
+    )
+    assert payload["current"] is True
 
 
 def test_liveness_reports_the_loaded_generation_without_touching_the_disk(

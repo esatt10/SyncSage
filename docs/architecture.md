@@ -30,8 +30,8 @@ incremental runs deterministic.
 | Source registry | Configured and runtime source metadata, lifecycle state, and audit history. |
 | Indexer | Watch, schedule, drain durable work, coordinate preparation, and make the one authoritative commit per knowledge-base shard. |
 | Preparation worker | Stateless read/parse/extract/chunk work over authenticated HTTP or gRPC. It has no database or connector credentials. |
-| Graph-query service | Read-only graph search/traversal over an atomically refreshed snapshot. Fleet APIs use a bounded proxy and do not load the full graph. |
-| PostgreSQL/SQLite | Artifacts, chunks, lexical ranking, manifests, leases, queue state, and metadata. |
+| Graph-query service | Read-only graph search/traversal. Optional on `storage.graph_format: rows`, where any replica queries the graph tables directly; on `node_link_json` it is the one process that keeps the snapshot resident so fleet APIs need only a bounded proxy. |
+| PostgreSQL/SQLite | Artifacts, chunks, lexical ranking, the knowledge graph, manifests, leases, queue state, and metadata. |
 | Vector store | Optional semantic vectors; NumPy and LanceDB are supported. |
 | Log tier | Optional. Persists the interaction ledger, rolls expired rows to Parquet, and drops expired partitions. Exists so none of that runs on a process serving requests or holding the indexer's sync lock. |
 | NATS JetStream | Durable source-task transport between API and indexer in the fleet. Carries the log tier's batches on a separate stream when observation is enabled. |
@@ -97,7 +97,8 @@ truncate them. Local-small and local-advanced defaults are unchanged.
 
 ## Persistence and consistency boundaries
 
-- `/state` contains operational graph snapshots, vector data, caches, and
+- `/state` contains the state database (which holds the published graph on the
+  default backend), graph snapshots, vector data, caches, and
   local state. `/exports` contains reproducible downstream exports.
 - SQLite is the single-container backend. PostgreSQL is required when several
   pods serve one knowledge base.

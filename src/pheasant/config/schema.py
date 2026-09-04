@@ -391,7 +391,24 @@ class StorageSettings(ModelMixin):
       that work away. 0 disables checkpointing (end-of-sync save only).
     """
 
-    graph_format: str = "node_link_json"
+    #: Where the published knowledge graph lives: ``rows`` (default) or
+    #: ``node_link_json``.
+    #:
+    #: ``rows`` puts it in ``graph_nodes``/``graph_edges`` in the state
+    #: database, beside the artifacts it describes. A commit then writes only
+    #: what changed and a serving replica holds nothing: measured on this
+    #: repo's own benchmark at 100k files, the commit after a one-file change
+    #: went from 9.1s to 10ms and stopped growing with the graph, and the
+    #: 1.5GB every query-answering process had to be given went away. The
+    #: trade is disk — the rows and their two indexes are larger than the
+    #: compressed file they replace — which is stated in
+    #: ``pheasant.capacity`` and reported by ``pheasant scan``.
+    #:
+    #: ``node_link_json`` is the pre-35.10 single zstd file. Kept selectable,
+    #: and kept working, so a region that hits trouble reverts with one line
+    #: rather than a downgrade. A region switched to ``rows`` imports its
+    #: existing file once at boot and keeps it as ``*.migrated``.
+    graph_format: str = "rows"
     graph_snapshots: bool = True
     graph_snapshot_interval_seconds: int = 900
     graph_checkpoint_seconds: int = 60

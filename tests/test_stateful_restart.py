@@ -8,7 +8,6 @@ rather than by re-reading the world.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from pheasant.config.loader import load_config
@@ -41,12 +40,33 @@ def _engine(config_file: Path) -> SyncEngine:
     return SyncEngine(load_config(config_file))
 
 
-def _read_graph(path: Path) -> dict:
-    """The stored graph is zstd-compressed node-link JSON."""
+def _persisted(engine: SyncEngine):
+    """What is actually on disk, read back through the store.
 
-    import zstandard as zstd
+    Through the store rather than by decompressing a known filename, because
+    the persisted form is a choice (`storage.graph_format`) and the property
+    under test is not. These tests are about a checkpoint surviving a crash
+    and a lost graph being rebuilt, neither of which is about zstd.
+    """
 
-    return json.loads(zstd.ZstdDecompressor().decompress(path.read_bytes()))
+    return engine.graph_store.load(engine.config.knowledge_base_id)
+
+
+def _lose_the_graph(engine: SyncEngine) -> None:
+    """Destroy the persisted graph, keeping every artifact row.
+
+    The failure being simulated is an interrupted first sync: the state store
+    knows about every file and the published graph does not. On the file
+    backend that is unlinking the blob; on the row backend it is truncating
+    the two graph tables — the same gap, in whichever place the graph lives.
+    """
+
+    kb = engine.config.knowledge_base_id
+    if engine.graph_store.rows is not None:
+        for table in ("graph_nodes", "graph_edges", "graph_generations"):
+            engine.state.execute(f"DELETE FROM {table} WHERE kb_id=?", (kb,))
+        return
+    engine.graph_store.graph_path(kb).unlink()
 
 
 def test_restart_reindexes_nothing_and_keeps_the_graph(tmp_path, workspace_copy) -> None:
@@ -111,9 +131,8 @@ def test_graph_and_manifest_are_checkpointed_mid_sync(tmp_path, workspace_copy) 
     try:
         engine.config.storage.graph_checkpoint_seconds = 0  # checkpoint only on demand
         engine.sync_source("pheasant-repo", "full")
-        graph_path = engine.graph_store.graph_path(engine.config.knowledge_base_id)
-        saved = _read_graph(graph_path)
-        assert len(saved["nodes"]) == engine.graph_builder.graph.number_of_nodes()
+        saved = _persisted(engine)
+        assert saved.number_of_nodes() == engine.graph_builder.graph.number_of_nodes()
 
         # Work happening after the last save, then a shutdown.
         engine.graph_builder.upsert_node("late:node", "concept", "late", {})
@@ -121,8 +140,7 @@ def test_graph_and_manifest_are_checkpointed_mid_sync(tmp_path, workspace_copy) 
         manifest = {"source_id": "pheasant-repo", "artifacts": {"late.md": {"sha256": "a" * 64}}}
         assert engine.checkpoint_graph("pheasant-repo", manifest) is True
 
-        reloaded = _read_graph(graph_path)
-        assert any(node.get("id") == "late:node" for node in reloaded["nodes"])
+        assert _persisted(engine).has_node("late:node")
         assert "late.md" in engine.manifests.load("pheasant-repo").get("artifacts", {})
         # Nothing dirty: a second checkpoint writes nothing.
         assert engine.checkpoint_graph("pheasant-repo", manifest) is False
@@ -135,16 +153,14 @@ def test_repair_heals_a_graph_gap_without_re_reading_everything(tmp_path, worksp
 
     config_file = _render_config(tmp_path, "gap", workspace_copy)
     engine = _engine(config_file)
-    graph_path = engine.graph_store.graph_path(engine.config.knowledge_base_id)
     try:
         indexed = engine.sync_source("pheasant-repo", "full").indexed_artifacts
         assert indexed > 0
+        # Lose the graph the way an interrupted first sync does: the state
+        # store still has every artifact, the published graph is gone.
+        _lose_the_graph(engine)
     finally:
         engine.close()
-
-    # Lose the graph the way an interrupted first sync does: SQLite still has
-    # every artifact, the node-link file does not.
-    graph_path.unlink()
 
     recovered = _engine(config_file)
     try:

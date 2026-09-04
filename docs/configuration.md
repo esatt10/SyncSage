@@ -140,12 +140,18 @@ blocking sync (`wait: true`) against an api replica returns **409** with the
 fix, because publishing is a different promise from "run this and return the
 result".
 
-With `graph.query_service_url` set, API and mounted MCP replicas do not load
-`graph.latest.json`; the `graph` role is the only serving process that keeps it
-resident and refreshes it after indexer commits. API readiness fails when that
-service is unreachable. There is deliberately no fallback to a local graph:
-fallback would duplicate the graph into every replica at the exact moment the
-graph tier is unhealthy and memory headroom is most valuable.
+With `graph.query_service_url` set, API and mounted MCP replicas do not load a
+graph of their own; the `graph` role answers for them. API readiness fails when
+that service is unreachable. There is deliberately no fallback to a local
+graph: fallback would duplicate the graph into every replica at the exact
+moment the graph tier is unhealthy and memory headroom is most valuable.
+
+On the default `storage.graph_format: rows` that tier is **optional** rather
+than the only way out — a serving replica queries `graph_nodes` directly and
+holds nothing, so a bounded walk costs a query instead of 1.65 GB of resident
+graph (measured at 100k files). Keep the graph service when you want graph
+reads on their own connection pool and their own scaling curve; drop it when
+you do not.
 
 Routes are *not* hidden per role. What keeps search traffic off an indexer is
 the Service selector in front of it; a role whose `/search` returned 404 would
@@ -238,9 +244,38 @@ both answer correctly. That property is pinned by a test.
 
 ## `storage` (state + persistence)
 
+### `graph_format`: where the published graph lives
+
+`rows` (default) keeps the graph in the state database, next to the artifacts
+it describes. `node_link_json` keeps the pre-35.10 single zstd file. Measured
+with `python -m pheasant.graph.capacity` at 100k files (630k nodes, 630k edges):
+
+| | `node_link_json` | `rows` |
+|---|---|---|
+| commit after a one-file change | 6.15 s, growing with the graph | **1.1 ms, flat** |
+| load before a replica can serve | 4.9 s | none |
+| resident bytes to answer a query | 1.65 GB | none |
+| bounded 3-hop walk | in-RAM | 0.12 ms |
+| stored bytes | 17.9 MB | 1,033 MB |
+
+The last row is the cost, and it is real: the graph stops being something every
+replica holds and becomes something the volume holds, at roughly 1,640 bytes
+per node. `pheasant scan` includes it, so size the PVC from there rather than
+from the old file.
+
+Choose `rows` unless you have a reason not to. Choose `node_link_json` if disk
+is your binding constraint and your corpus is small enough that a whole-graph
+rewrite per commit is free.
+
+Switching to `rows` imports an existing graph file once at boot and renames it
+`*.migrated` — nothing is deleted, and switching back reads it again. Both
+backends write snapshots as files, so `graphs/` and your backup procedure are
+unchanged either way.
+
+
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `graph_format` | string | `node_link_json` | Graph serialization format. |
+| `graph_format` | string | `rows` | Where the published graph lives: `rows` (in `graph_nodes`/`graph_edges` in the state database) or `node_link_json` (one zstd file). See below. |
 | `graph_snapshot_interval_seconds` | integer | `900` | Graph snapshot cadence. |
 | `sqlite_path` | absolute path | `/state/pheasant.db` | Main SQLite database file. |
 | `graph_path` | absolute path | `/state/graphs` | Directory for graph snapshots. |

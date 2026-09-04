@@ -20,6 +20,19 @@ from pheasant.sync.pacing import serve_yield
 logger = logging.getLogger(__name__)
 
 
+def _same_content(existing: dict, candidate: dict) -> bool:
+    """Do these two versions of a node or edge differ only in when they were seen?
+
+    ``updated_at`` is excluded on both sides, and so is nothing else: any
+    other difference is a real change and must move the stamp, or the graph
+    generation would stop tracking the graph.
+    """
+
+    return {key: value for key, value in existing.items() if key != "updated_at"} == {
+        key: value for key, value in candidate.items() if key != "updated_at"
+    }
+
+
 class GraphBuilder:
     def __init__(self, config: PheasantConfig):
         self.config = config
@@ -33,20 +46,43 @@ class GraphBuilder:
         self.similarity_pass = SemanticSimilarityPass()
 
     def upsert_node(self, node_id: str, node_type: str, label: str, attrs: dict) -> None:
+        """Write a node, moving ``updated_at`` only when something changed.
+
+        The stamp used to move on every upsert, which made it a record of when
+        a sync last *ran* rather than of when the node last changed — and that
+        turned the published graph generation into something that changed on
+        every re-sync of an unchanged corpus. The generation id is
+        content-addressed precisely so it does not (pillar 1, and
+        ``generation_id``'s own docstring), so a timestamp nothing reads was
+        quietly the one input making it move: every replica reloaded a graph
+        identical to the one it held, on every scheduler beat.
+
+        Held on both backends and predated both: the whole-file store digests
+        bytes that contain this stamp, and the row store digests a row that
+        contains it. `tests/test_graph_backends.py` is the first thing to
+        assert the property directly, which is how it surfaced.
+        """
+
         now = utc_now()
-        existing_created = (
-            self.graph.nodes[node_id].get("created_at") if self.graph.has_node(node_id) else now
-        )
-        self.graph.add_node(
-            node_id,
-            id=node_id,
-            type=node_type,
-            label=label,
-            created_at=existing_created,
-            updated_at=now,
-            knowledge_base_id=self.kb_id,
+        existing = dict(self.graph.nodes[node_id]) if self.graph.has_node(node_id) else None
+        merged = {
+            "id": node_id,
+            "type": node_type,
+            "label": label,
+            "created_at": (existing or {}).get("created_at", now),
+            "knowledge_base_id": self.kb_id,
             **attrs,
-        )
+        }
+        # Compared against what `add_node` will actually store, which *merges*
+        # over the existing attributes rather than replacing them. Comparing
+        # against the payload alone would call every node changed as soon as
+        # one call site attached an attribute another does not — a false
+        # "changed", which moves the stamp for nothing.
+        if existing is not None and _same_content(existing, {**existing, **merged}):
+            merged["updated_at"] = existing.get("updated_at", now)
+        else:
+            merged["updated_at"] = now
+        self.graph.add_node(node_id, **merged)
 
     def upsert_edge(
         self,
@@ -58,8 +94,16 @@ class GraphBuilder:
         attrs = attrs or {}
         for _key, data in self.graph.get_edge_data(source, target, default={}).items():
             if data.get("type") == edge_type:
+                before = dict(data)
                 data.update(attrs)
-                data["updated_at"] = utc_now()
+                # Same rule as `upsert_node`: an edge re-asserted unchanged has
+                # not been updated, and stamping it would move the published
+                # generation id for a graph nobody touched.
+                if _same_content(before, data):
+                    data["updated_at"] = before.get("updated_at", before.get("created_at"))
+                else:
+                    data["updated_at"] = utc_now()
+                    self.graph.touch_edge(source, target)
                 return
         self.graph.add_edge(
             source,

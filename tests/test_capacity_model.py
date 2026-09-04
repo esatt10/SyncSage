@@ -27,7 +27,13 @@ from pheasant.config.schema import PheasantConfig
 from pheasant.sync.engine import SyncEngine
 
 
-def _config(tmp_path: Path, *, state_name: str = "state", files: int = 4) -> PheasantConfig:
+def _config(
+    tmp_path: Path,
+    *,
+    state_name: str = "state",
+    files: int = 4,
+    graph_format: str = "rows",
+) -> PheasantConfig:
     workspace = tmp_path / f"workspace-{state_name}"
     workspace.mkdir(parents=True, exist_ok=True)
     for index in range(files):
@@ -45,7 +51,7 @@ def _config(tmp_path: Path, *, state_name: str = "state", files: int = 4) -> Phe
                 "workspace_root": str(workspace),
                 "exports_path": str(tmp_path / f"{state_name}-exports"),
             },
-            "storage": {"graph_snapshots": False},
+            "storage": {"graph_snapshots": False, "graph_format": graph_format},
             "sources": [
                 {
                     "name": "docs",
@@ -254,12 +260,22 @@ def test_a_projection_reports_every_axis_a_sizing_decision_needs(tmp_path: Path)
     assert projection.shards == 1
 
 
-def test_a_projection_without_a_byte_count_omits_disk_rather_than_inventing_it() -> None:
-    """`scan` always has bytes; an API caller might not. Zero beats a guess."""
+def test_a_projection_without_a_byte_count_reports_only_what_files_can_tell_it() -> None:
+    """`scan` always has bytes; an API caller might not.
+
+    The content half of state tracks bytes and is omitted rather than guessed.
+    The *graph* half tracks file count, so once the graph moved into the
+    database (35.10) it became knowable from files alone — and reporting zero
+    there would understate a real cost by exactly the amount that decides
+    whether a volume is big enough.
+    """
+
+    from pheasant.capacity import GRAPH_ROW_BYTES_PER_NODE
 
     projection = project(1_000)
-    assert projection.state_bytes == 0
+    assert projection.state_bytes == projection.nodes * GRAPH_ROW_BYTES_PER_NODE
     assert projection.rss_bytes > 0
+    assert project(1_000, graph_format="node_link_json").state_bytes == 0
 
 
 def test_chunks_are_projected_from_bytes_not_from_file_count() -> None:
@@ -340,28 +356,40 @@ def test_recommend_memory_is_monotonic() -> None:
     assert values == sorted(values)
 
 
-#: Points measured by `python -m pheasant.sync.benchmark --mode capacity`
-#: after the O(N²) fix, on the machine that produced the constants.
-#: (files, corpus_bytes, seconds, state_bytes)
+#: Points measured by `python -m pheasant.sync.benchmark --mode capacity`,
+#: re-run on `storage.graph_format: rows` (35.10) because the graph now lives
+#: in the database and the earlier points did not include it: at 4,000 files
+#: state went from 86.6MB to 106.0MB, and 19.4MB of that is 12,003 graph nodes
+#: at the measured `GRAPH_ROW_BYTES_PER_NODE` — which is the coefficient
+#: predicting the difference to within 2%, on a run it was not fitted to.
+#:
+#: `graph_nodes` is carried because the synthetic fixture produces **3.0**
+#: nodes per file where a real corpus produces 6.3 (see `NODES_PER_FILE`).
+#: Projecting from `files` here would compare the model's estimate of this
+#: fixture's structure against the fixture, which measures the estimate and
+#: not the coefficient under test.
+#: (files, corpus_bytes, seconds, state_bytes, graph_nodes)
 MEASURED = [
-    (4000, 21_826_890, 12.29, 86_633_067),
-    (8000, 43_653_780, 26.22, 173_266_134),
+    (4000, 21_826_890, 10.37, 106_004_480, 12_003),
+    (8000, 43_654_890, 21.23, 213_090_304, 24_003),
 ]
 
 
-@pytest.mark.parametrize(("files", "corpus_bytes", "seconds", "state_bytes"), MEASURED)
+@pytest.mark.parametrize(
+    ("files", "corpus_bytes", "seconds", "state_bytes", "graph_nodes"), MEASURED
+)
 def test_the_projection_matches_what_was_actually_measured(
-    files: int, corpus_bytes: int, seconds: float, state_bytes: int
+    files: int, corpus_bytes: int, seconds: float, state_bytes: int, graph_nodes: int
 ) -> None:
     """The constants are measurements, so drift in either direction is a bug.
 
     Tolerances are wide enough to survive a different machine's clock but
     narrow enough that a changed constant fails here rather than quietly
-    producing worse advice. Measured error at the largest point was 0.8% on
-    disk and 0.7% on time.
+    producing worse advice. Measured error at the largest point was 0.4% on
+    disk.
     """
 
-    projection = project(files, corpus_bytes)
+    projection = project(files, corpus_bytes, nodes=graph_nodes)
 
     disk_error = abs(projection.state_bytes - state_bytes) / state_bytes
     assert disk_error < 0.15, f"state projection off by {disk_error:.0%}"
@@ -475,5 +503,21 @@ def test_the_state_breakdown_attributes_the_database_correctly(tmp_path: Path) -
 
     buckets = _directory_bytes(state_root)
     assert buckets["database"] > 0, "the SQLite database was not attributed"
-    assert buckets["graph"] > 0, "the graph was not attributed"
+    # On the default backend the graph *is* rows in that database, so the
+    # graph directory holds only snapshots. The split by directory therefore
+    # no longer separates them, which is a fact about where the graph lives
+    # rather than a gap in the measurement — `graph_nodes` in the same report
+    # is what sizes it, through `GRAPH_ROW_BYTES_PER_NODE`.
+    assert buckets["graph"] == 0, "the row backend keeps no graph file"
     assert sum(buckets.values()) > 0
+
+    legacy = SyncEngine(
+        _config(tmp_path, state_name="breakdown-file", files=4, graph_format="node_link_json")
+    )
+    try:
+        legacy.sync_source("docs", "full")
+        legacy_root = Path(legacy.config.pheasant.state_path)
+    finally:
+        legacy.close()
+    legacy_buckets = _directory_bytes(legacy_root)
+    assert legacy_buckets["graph"] > 0, "the file backend's graph was not attributed"

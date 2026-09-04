@@ -94,6 +94,14 @@ TABLE_ORDER = (
     "tuning_trials",
     "tuning_decisions",
     "tuning_bundles",
+    # The knowledge graph (Phase 35.10). Copied rather than rebuilt: the rows
+    # *are* the graph now, and their `digest` column is what the published
+    # generation id folds, so re-deriving them on the target would be
+    # re-deriving the region's identity. `graph_generations` last, after the
+    # rows whose digests it summarizes.
+    "graph_nodes",
+    "graph_edges",
+    "graph_generations",
 )
 
 #: Core tables deliberately left behind, and why.

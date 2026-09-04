@@ -77,11 +77,22 @@ server:
     graph_visualization: true
 
 storage:
-  graph_format: node_link_json
+  # Where the published graph lives.
+  #   rows            - graph_nodes/graph_edges in the state database (default).
+  #                     A commit writes only what changed (1.1ms at 100k files,
+  #                     flat) and a serving replica holds no graph at all. Costs
+  #                     ~1,640 bytes of database per node; `pheasant scan` says
+  #                     how much for your corpus.
+  #   node_link_json  - one zstd file. Every commit re-serializes the whole
+  #                     graph (6.15s at 100k files) and every process that
+  #                     answers a graph query holds it (1.65 GB). Smaller on
+  #                     disk. Switching to rows imports an existing file once
+  #                     and keeps it as *.migrated.
+  graph_format: rows
   # Synapse 21.6A: zstd-compressed timestamped graph snapshots written after a
-  # successful sync (graphs/<kb_id>/graph.<utc-ts>.json.zst), beside the
-  # uncompressed graph.latest.json. Throttled by the interval; bounded by the
-  # retention cap (oldest evicted first; latest.json/db/contract never evicted).
+  # successful sync (graphs/<kb_id>/graph.<utc-ts>.json.zst). Files on both
+  # backends. Throttled by the interval; bounded by the retention cap (oldest
+  # evicted first; the published graph, db and contract never evicted).
   graph_snapshots: true
   graph_snapshot_interval_seconds: 900
   # How often an in-progress sync writes graph.latest.json. The graph used to

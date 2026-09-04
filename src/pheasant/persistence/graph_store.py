@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from pheasant.graph.simple import SimpleMultiDiGraph
+from pheasant.persistence.graph_rows import GraphRowStore
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +63,53 @@ def generation_id(compressed: bytes) -> str:
     return hashlib.sha256(compressed).hexdigest()[:16]
 
 
+#: ``storage.graph_format`` values this store understands.
+#:
+#: ``rows`` is the default and is what makes an incremental commit incremental:
+#: see :mod:`pheasant.persistence.graph_rows` for the measurements. ``node_link_json``
+#: is the pre-35.10 whole-file backend, kept selectable so a region that hits
+#: trouble rolls back with one config line rather than a downgrade — and kept
+#: *working*, because snapshots are still files and are written by the same code.
+GRAPH_FORMATS = ("rows", "node_link_json")
+
+
 class GraphStore:
-    def __init__(self, root: str | Path):
+    """Where the published graph lives, in whichever of two shapes.
+
+    The file backend serializes the whole graph per commit and requires every
+    reader to hold it; the row backend writes what changed and lets a reader
+    query. The seam is here rather than at the call sites because the callers —
+    the engine's five save sites, the snapshot scheduler, ``counts`` on the
+    status endpoints — are asking the same question either way.
+
+    ``state`` is optional so every existing construction (and every test that
+    builds a store over a temp directory) keeps working on the file backend
+    without one. A ``rows`` store without a state handle is a configuration
+    error, not a fallback: silently degrading to the whole-file path would make
+    a region's commit cost depend on how its store happened to be constructed.
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        state: Any = None,
+        graph_format: str = "node_link_json",
+    ):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        if graph_format not in GRAPH_FORMATS:
+            raise ValueError(
+                f"Unknown storage.graph_format {graph_format!r}; expected one of "
+                f"{', '.join(GRAPH_FORMATS)}"
+            )
+        if graph_format == "rows" and state is None:
+            raise ValueError(
+                "storage.graph_format='rows' needs a state store; the graph lives in "
+                "the same database as the artifacts it describes."
+            )
+        self.graph_format = graph_format
+        self.state = state
+        self.rows = GraphRowStore(state) if graph_format == "rows" else None
         #: Called with (kb_id, publication record) after a generation is
         #: durable. One hook here rather than a call beside each of the five
         #: `save()` sites, which is how one of them would eventually be
@@ -114,7 +158,44 @@ class GraphStore:
 
         return self.kb_dir(kb_id) / "graph.latest.meta.json"
 
-    def save(self, kb_id: str, graph: SimpleMultiDiGraph) -> Path:
+    def save(self, kb_id: str, graph: SimpleMultiDiGraph) -> Path | None:
+        """Publish the graph. Returns the file written, or None on ``rows``.
+
+        The return value was always the path and one caller reads it (the
+        snapshot scheduler asks whether there is a file). ``None`` says "there
+        is no file for this generation", which is the truth on the row backend
+        and is what makes a snapshot materialize instead of copy.
+        """
+
+        if self.rows is not None:
+            self._save_rows(kb_id, graph)
+            return None
+        return self._save_file(kb_id, graph)
+
+    def _save_rows(self, kb_id: str, graph: SimpleMultiDiGraph) -> None:
+        """Write what changed, then name the result.
+
+        The delta is read, written and only then cleared — never claimed up
+        front. A delta claimed by a commit that then fails is a node the graph
+        no longer believes is dirty and that nothing will ever write again;
+        the search index can afford that (it is a cache and rebuilds), and the
+        published graph cannot. Same reasoning, opposite conclusion, which is
+        why ``take_index_delta`` and ``graph_delta`` are shaped differently.
+        """
+
+        delta = graph.graph_delta()
+        self.rows.apply_delta(
+            kb_id,
+            node_upserts=delta["node_upserts"],
+            node_removals=delta["node_removals"],
+            edge_upserts=delta["edge_upserts"],
+            edge_removals=delta["edge_removals"],
+        )
+        graph.clear_graph_delta(delta)
+        metadata = self.rows.publish(kb_id)
+        self._announce(kb_id, metadata)
+
+    def _save_file(self, kb_id: str, graph: SimpleMultiDiGraph) -> Path:
         import zstandard as zstd
 
         path = self.graph_path(kb_id)
@@ -170,6 +251,97 @@ class GraphStore:
         self._announce(kb_id, metadata)
         return path
 
+    def publication_stamp(self, kb_id: str) -> Any:
+        """Something that changes when a new generation is published, or None.
+
+        The poll's key. On the file backend it is the graph file's own stat
+        tuple, which is what the refresher used directly and which works on a
+        state directory too old to carry a generation id. On ``rows`` there is
+        no file to stat, so it is the published id itself — content-addressed,
+        so an unchanged graph re-published still compares equal and does not
+        provoke a pointless reload.
+
+        Asked of the store rather than computed by the caller because "what
+        identifies the current published graph" is the store's question, and
+        the refresher reading a path that only one backend has is how a poll
+        silently stops finding anything.
+        """
+
+        if self.rows is not None:
+            record = self.rows.published_generation(kb_id)
+            return record["generation_id"] if record else None
+        try:
+            stat = self.graph_path(kb_id).stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def serving_graph(self, kb_id: str) -> Any:
+        """A graph to answer queries from, without deciding to hold one.
+
+        On ``rows`` this is a :class:`~pheasant.graph.sql.SqlGraph`: a bounded
+        walk is a bounded query, so a replica that only serves holds nothing.
+        That is the residency the ``graph`` role was invented to stop every
+        replica paying — 1.5 GB at 100k files, measured.
+
+        On ``node_link_json`` there is no such thing, so this is
+        :meth:`load` and the caller is back to holding the graph. The seam is
+        real either way; only one side of it can be cheap.
+        """
+
+        if self.rows is None:
+            return self.load(kb_id)
+        from pheasant.graph.sql import SqlGraph
+
+        return SqlGraph(self.state, kb_id)
+
+    def import_persisted_file(self, kb_id: str) -> dict[str, int] | None:
+        """One-shot: move a graph file into rows, keeping the file.
+
+        Runs on the row backend when a graph file exists and the tables are
+        empty — a region upgrading into 35.10. Idempotent by that condition and
+        by the write itself (the rows are content-addressed, so a repeat
+        produces the same digests and the same generation id).
+
+        The file is **renamed, never deleted** — ``/state`` is user data
+        (CLAUDE.md rule 2), and the same ``.migrated`` suffix the
+        pre-compression graph already used. Returns None when there was
+        nothing to import, so a caller can tell "migrated" from "already
+        there" rather than inferring it from row counts.
+        """
+
+        if self.rows is None:
+            return None
+        if self.rows.counts(kb_id)[0]:
+            return None
+        path, legacy = self.graph_path(kb_id), self.legacy_graph_path(kb_id)
+        if not path.exists() and not legacy.exists():
+            return None
+        graph = self._load_file(kb_id)
+        if not len(graph):
+            return None
+        graph.mark_all_pending()
+        delta = graph.graph_delta()
+        written = self.rows.apply_delta(
+            kb_id,
+            node_upserts=delta["node_upserts"],
+            edge_upserts=delta["edge_upserts"],
+        )
+        self.rows.publish(kb_id)
+        for original in (path, legacy):
+            if original.exists():
+                try:
+                    original.rename(original.with_suffix(original.suffix + ".migrated"))
+                except OSError:  # pragma: no cover - best effort, never fails a boot
+                    logger.warning("Could not park the migrated graph file %s", original)
+        logger.info(
+            "Imported the persisted graph into %s: %d nodes, %d edges",
+            "graph_nodes/graph_edges",
+            written["nodes"],
+            written["edges"],
+        )
+        return written
+
     def _announce(self, kb_id: str, metadata: dict[str, object]) -> None:
         """Tell whoever is listening, and never let it cost the commit.
 
@@ -201,6 +373,8 @@ class GraphStore:
         returning ``None`` is a missing *label*, never a missing reload.
         """
 
+        if self.rows is not None:
+            return self.rows.published_generation(kb_id)
         path, metadata_path = self.graph_path(kb_id), self.metadata_path(kb_id)
         if not path.exists() or not metadata_path.exists():
             return None
@@ -231,6 +405,8 @@ class GraphStore:
         one legacy load; their next graph save writes the sidecar.
         """
 
+        if self.rows is not None:
+            return self.rows.counts(kb_id)
         path = self.graph_path(kb_id)
         metadata_path = self.metadata_path(kb_id)
         if path.exists() and metadata_path.exists():
@@ -308,6 +484,37 @@ class GraphStore:
             pass
 
     def load(self, kb_id: str) -> SimpleMultiDiGraph:
+        """Materialize the whole graph into memory.
+
+        Still the right call for the **indexer**, whose working set this is:
+        the builder mutates it and the whole-graph enrichment passes walk it.
+        It is the wrong call for a process that only answers queries, which is
+        what :meth:`serving_graph` is for — on the row backend that process now
+        holds nothing at all.
+        """
+
+        if self.rows is not None:
+            graph = SimpleMultiDiGraph()
+            for node_id, attrs in self.rows.iter_nodes(kb_id):
+                graph.add_node(node_id, **attrs)
+            for (source, target), edge_map in self.rows.iter_edges(kb_id):
+                for attrs in edge_map.values():
+                    graph.add_edge(source, target, **attrs)
+            # Loading is not a change. Without this the first commit after a
+            # restart would rewrite every row it had just read — an O(total)
+            # write, which is the exact cost this backend exists to remove.
+            graph.clear_graph_delta(graph.graph_delta())
+            return graph
+        return self._load_file(kb_id)
+
+    def _load_file(self, kb_id: str) -> SimpleMultiDiGraph:
+        """Read the whole-file backend's payload, whichever generation wrote it.
+
+        Reachable on the ``rows`` backend too, and only from
+        :meth:`import_persisted_file` — that is the one moment a row-backed
+        region has a reason to read a graph file.
+        """
+
         import zstandard as zstd
 
         path = self.graph_path(kb_id)
@@ -334,11 +541,22 @@ class GraphStore:
         keeps a crash from leaving a torn ``.zst`` file.
         """
 
+        return self.write_snapshot_payload(kb_id, graph.to_node_link(), utc_ts)
+
+    def write_snapshot_payload(self, kb_id: str, node_link: dict, utc_ts: str) -> Path:
+        """The bytes half of :meth:`write_snapshot`, given an already-built payload.
+
+        Split out so a snapshot from rows and a snapshot from a resident graph
+        are the same file written by the same code — a history format that
+        differed by which backend produced it would be a history nobody could
+        diff.
+        """
+
         import zstandard as zstd
 
         path = self.snapshot_path(kb_id, utc_ts)
         tmp = _tmp_for(path)
-        payload = json.dumps(graph.to_node_link(), indent=2, sort_keys=True).encode("utf-8")
+        payload = json.dumps(node_link, indent=2, sort_keys=True).encode("utf-8")
         compressed = zstd.ZstdCompressor(level=10).compress(payload)
         try:
             with self._write_lock:
@@ -363,6 +581,15 @@ class GraphStore:
         consistent and orders of magnitude cheaper.
         """
 
+        if self.rows is not None:
+            # No file to copy, so the snapshot is materialized. O(graph), and
+            # in the right place: snapshots are history, they are interval-gated
+            # rather than per-commit, and they are read whole or not at all.
+            from pheasant.graph.sql import SqlGraph
+
+            return self.write_snapshot_payload(
+                kb_id, SqlGraph(self.state, kb_id).to_node_link(), utc_ts
+            )
         source = self.graph_path(kb_id)
         if not source.exists():
             raise FileNotFoundError(f"No published graph generation for {kb_id}")

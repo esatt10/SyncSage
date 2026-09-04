@@ -94,8 +94,9 @@ pheasant-kb/
 │   ├── ingestion/             ← pipeline, chunking, content_types, taxonomy,
 │   │                            extractor (7 doc formats), captioner,
 │   │                            transcriber, office, msdoc
-│   ├── graph/                 ← model, simple, builder, enrichment, capacity,
-│   │                            traversal (the pure hierarchy-first walk)
+│   ├── graph/                 ← model, simple (the indexer's working set),
+│   │                            sql (the serving read surface), builder,
+│   │                            enrichment, capacity, traversal
 │   ├── search/                ← sqlite_store (FTS5/tsvector + BM25),
 │   │                            graph_search, hybrid, fusion (the one RRF
 │   │                            loop, two entry points), explain (the stage
@@ -104,7 +105,9 @@ pheasant-kb/
 │   ├── memory/                ← store, projection, policy, steering, salience,
 │   │                            bridge, maintenance, formation, benchmark
 │   ├── persistence/           ← state_store, backends (sqlite|postgres),
-│   │                            schema, graph_store, manifest, migrate, paths
+│   │                            schema, graph_store (file|rows), graph_rows
+│   │                            (the delta write + the XOR generation fold),
+│   │                            manifest, migrate, paths
 │   ├── services/              ← the application layer: one implementation per
 │   │                            operation, two transports. errors (refusals
 │   │                            both surfaces spell the same), retrieval,
@@ -119,7 +122,7 @@ pheasant-kb/
 │   └── telemetry/             ← metrics.py (Prometheus exposition),
 │                                interactions.py (the observation plane)
 ├── ui/                        ← React + Vite workspace (baked into the image)
-└── tests/                     ← 123 pytest modules, offline by design
+└── tests/                     ← 124 pytest modules, offline by design
 ```
 
 Key entities: **knowledge base** (`kb_id` = `pheasant.name`) → **sources** →
@@ -320,6 +323,71 @@ are cut at section boundaries so one chunk is one section.
 third-party plugin needs no dispatch code here. Five ship first-party: Notion,
 Google Drive, Slack, Confluence, IMAP. `pheasant.testing.ConnectorConformance`
 is the public quality bar.
+
+### Where the graph lives
+
+`storage.graph_format`: **`rows` (default)** or `node_link_json`. The graph was
+one zstd node-link file that every commit re-serialized whole and every process
+answering a graph query held resident. Measured with
+`python -m pheasant.graph.capacity` at 100k files (630k nodes / 630k edges):
+
+| | file | rows |
+|---|---|---|
+| commit after a one-file change | 6.15 s, growing with the graph | **1.1 ms, flat** |
+| load before a replica can serve | 4.9 s | none |
+| resident bytes to answer a query | 1.65 GB | none |
+| 3-hop bounded walk | in-RAM | 0.12 ms |
+| stored bytes | 17.9 MB | 1,033 MB |
+
+The commit number is the point, and not because six seconds is slow: it was
+**O(total graph)** for an O(one file) change, on the sole commit authority,
+under the sync mutex — so corpus size, not write rate, was what saturated the
+commit stream, and the only documented way past it was to shard. The trade is
+disk, roughly 55×, stated as `capacity.GRAPH_ROW_BYTES_PER_NODE` (measured
+1,637 at 20k files and 1,639 at 100k) and reported by `pheasant scan`.
+
+- **Two objects, two jobs.** `SimpleMultiDiGraph` is the *indexer's working
+  set* — the builder mutates it, the whole-graph enrichment passes walk it, and
+  it belongs in RAM because that is what those passes need.
+  `graph/sql.SqlGraph` is the *serving read surface*, and it holds nothing.
+  `SyncEngine.serving_graph()` picks: a process that builds the graph serves
+  its own copy, a process that only serves gets the store. So the residency
+  the `graph` role exists to stop every replica paying is now paid by whoever
+  writes, and by nobody else — which also makes that role optional rather than
+  the only way out.
+- **The delta, not the graph.** `SimpleMultiDiGraph` tracks dirty and removed
+  nodes and endpoint *pairs* (a pair, because parallel edges have no identity
+  of their own — `add_edge` keys them by arrival). `graph_delta()` reads and
+  `clear_graph_delta()` forgets, deliberately split where `take_index_delta`
+  claims on read: the search index is a cache and a lost flush costs a
+  rebuild, while a lost graph delta is a node that reaches no disk and that
+  nothing believes is dirty any more.
+- **The generation id survives the move.** Still content-addressed, still
+  clock-free, still identical on two replicas holding the same rows. Every row
+  carries its own digest and the published id folds them with **XOR**, which
+  is its own inverse — so a commit folds each changed row's old digest out and
+  its new one in, in O(changed). `recompute_folds` re-derives both with a full
+  scan, because an incrementally maintained aggregate nothing checks is one
+  that drifts.
+- **A serving replica cannot be stale.** Staleness is a property of *copies*.
+  A row-backed api replica reads the rows the indexer committed, so `/ready`
+  publishes `loaded == published` by construction and the refresher finds
+  nothing to do. The whole-file backend still needs all of it, and still has
+  it.
+- **Snapshots stay files.** History is read whole or not at all and is
+  interval-gated rather than per-commit, so materializing one from rows at
+  O(N) is the right cost in the right place — and it keeps a snapshot the same
+  document whichever backend produced it.
+- **What did not change.** Artifacts and chunks were already rows and are
+  untouched; they are the model this followed. Vectors stay in LanceDB, which
+  is columnar and append-incremental and never had the whole-file-rewrite
+  problem — they remain outside the graph's transaction, so repair is still
+  what reconciles them. What *did* improve for free: the graph and the chunks
+  it describes now commit in **one transaction** instead of a database write
+  followed by a separate file rename.
+- **Migration.** A region upgrading imports its existing file once at boot and
+  parks it as `*.migrated` (rule 2). `node_link_json` stays selectable and
+  working, so a region that hits trouble reverts with one config line.
 
 ### Retrieval
 
@@ -594,12 +662,20 @@ One container until it shouldn't be. Then four independent axes:
 
 The second axis has a ceiling the others do not: one indexer is the sole commit
 authority per shard, so extra indexers are elected hot standbys and the third
-axis is the only way past it.
+axis is the only way past it. What 35.10 changed is *where* that ceiling sits:
+publishing a generation used to cost O(total graph) per commit, so the ceiling
+moved down as the corpus grew. With the graph in rows a commit costs what the
+change costs, and the third axis is a decision about the indexer's own working
+set rather than about every replica's.
 
 Selectable backends, dependency-free side first: `storage.backend`
 sqlite|postgres, `sync.queue.backend` off|local|nats,
 `sync.concurrency.worker_transport` http|grpc,
-`observability.interactions.queue.backend` off|local|nats.
+`observability.interactions.queue.backend` off|local|nats. One exception, and
+it is deliberate: `storage.graph_format` defaults to `rows`, the side that is
+*better*, because both sides need the same state store and neither adds a
+dependency — the rule is about not requiring infrastructure, not about
+preferring the older mechanism.
 
 The fourth axis rises with **request traffic, not corpus churn**, which is why
 it is a separate queue and a separate role rather than a `kind` column: sharing
@@ -1103,6 +1179,82 @@ Each of these cost real time. They are listed because the shape recurs.
   moved to the side that parses it, and `cli.py` re-exports it). Both had been
   invisible for as long as they existed, because nothing had ever asked which
   direction they pointed.
+- **A tidy `WHERE` clause can be a full table scan, and the plan is the only
+  way to know.** The row backend addresses edges by exact endpoint pair, which
+  needs an `OR` chain — `source IN (…) AND target IN (…)` is a cross product
+  and over-matches, which would fold digests out that were never replaced and
+  delete edges nobody touched. Written the obvious way, `WHERE kb_id=? AND
+  ((source=? AND target IN (…)) OR …)`, SQLite cannot use its multi-index-OR
+  optimization at all: each branch has to be independently indexable, and
+  `source=?` alone is not a prefix of `(kb_id, source, target, type, seq)`.
+  `EXPLAIN QUERY PLAN` said `SEARCH … USING INDEX idx_graph_edges_target
+  (kb_id=?)` — the whole table. Repeating `kb_id` inside every branch gives
+  `MULTI-INDEX OR` with exact primary-key lookups. Measured: **300 ms per
+  incremental commit at 100k files versus 1 ms**, and the tidy form was
+  O(total graph) — which would have made the row backend cost exactly what the
+  file backend cost, for exactly the same reason, one layer down. It shipped
+  green: every test passed, because a fixture with twelve edges cannot tell a
+  scan from a seek.
+- **`COUNT(*)` on a commit path is the same mistake wearing a different hat.**
+  The first version asked "is this knowledge base empty" with a count and
+  published counts by counting. Two full scans per commit, 364 ms at 100k
+  files and growing — again O(total) for an O(changed) write. The emptiness
+  probe is a `LIMIT 1` (the trick `NodeIndex.populated` already documents for
+  exactly this reason) and the counts are maintained from the exact number of
+  rows each delta inserts and replaces, which the fold bookkeeping already
+  knows. `recount()` is the honest scan, for repair and for the tests.
+- **XOR is an involution, so folding a row out twice folds it back in.** The
+  published generation id is a XOR over every row's content digest, which is
+  what makes it maintainable in O(changed). It is also what makes a duplicate
+  fatal: an edge reached both as a replaced pair and as the casualty of a
+  removed endpoint would be folded out twice and silently return, and the
+  published id would be wrong with nothing else to notice. `_digests_for`
+  keys by primary key rather than accumulating a list, so identity — not
+  arrival — decides.
+- **An index with no reader is a config flag with no reader.** Two of the four
+  indexes first written for `graph_edges`/`graph_nodes` looked obviously
+  useful (`source_id` on edges, `artifact_id` on nodes) and nothing queried
+  either: per-source deletion goes through the node table and cascades by
+  endpoint. They measured 50 MB of a 1,085 MB database between them and, worse
+  than the bytes, they looked like the mechanism — the next person to ask "how
+  does per-source deletion stay cheap" would have found the wrong answer.
+- **A test whose fixture cannot exhibit the failure is a test that passes.**
+  Three separate defects above — the OR-chain scan, the `COUNT(*)`, and the
+  graph service reading `graph_builder.graph` instead of the serving graph —
+  were invisible to the offline suite and obvious the moment
+  `python -m pheasant.graph.capacity` ran at 100k files. Two of the three were
+  *performance* bugs of the exact class this change existed to remove, and the
+  third returned a plausible zero. The benchmark is the test for them, which
+  is why it is a module and not a script somebody ran once.
+- **A timestamp nothing reads was the one input making a content-addressed id
+  move.** `GraphBuilder.upsert_node` stamped `updated_at` on *every* upsert,
+  so re-asserting an unchanged node changed its bytes — and the published
+  graph generation is a digest of those bytes on the file backend and of that
+  row on the row backend. An unchanged corpus therefore published a new id as
+  soon as the clock ticked, and every replica reloaded a graph identical to
+  the one it held, on every beat: 4.9s per replica per beat at 100k files, for
+  nothing. It predated both backends and nothing had ever asserted the
+  property `generation_id`'s own docstring promises. Only `graph_search`
+  (which skips it) and the Parquet export read the field, so holding it steady
+  is free — and makes the exported value mean "when this node last changed"
+  rather than "when a sync last ran". The stamp moves on a real difference and
+  not otherwise, which is the rule `created_at` already had.
+- **The same fix exposed an in-place mutation the delta could not see.**
+  `upsert_edge` updates an existing edge through the dict `get_edge_data`
+  hands back, so the change never passes through `add_edge`. Free on a backend
+  that re-serializes everything; a silently dropped write on one that writes
+  only what it is told changed. `touch_edge` marks the pair. The general
+  shape: moving from "write it all" to "write the delta" makes every
+  mutation-by-side-effect a correctness question, and they do not announce
+  themselves.
+- **A `full` re-index still moves the generation id, and that is written down
+  rather than fixed here.** It removes a source's nodes and rebuilds them, so
+  `created_at` legitimately resets. Arguably wrong — "full" ought to mean
+  "rebuild the same graph", not "rebuild it with new birthdays" — but
+  `created_at` would have to come from the artifact rows rather than from a
+  graph that was just wiped, which changes what a full sync *means*.
+  `tests/test_graph_backends.py` asserts stability on `incremental`, where it
+  genuinely holds, and says why.
 
 ---
 

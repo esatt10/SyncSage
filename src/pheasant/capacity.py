@@ -34,13 +34,33 @@ from pheasant.sync.saturation import SHARD_THRESHOLD
 #: of a fixture that was never meant to be representative.
 NODES_PER_FILE = 6.3
 
-#: Process RSS per graph node, measured flat across four scales in
-#: `pheasant.graph.capacity` (2k → 250k files).
+#: Process RSS per graph node **for a process that holds the graph**, measured
+#: flat across four scales in `pheasant.graph.capacity` (2k → 250k files).
+#:
+#: On ``storage.graph_format: rows`` — the default since 35.10 — that is the
+#: indexer and nothing else: a serving replica queries `graph_nodes` and its
+#: measured graph RSS is zero. On ``node_link_json`` every process that answers
+#: a graph query pays this, which is why the `graph` role exists at all.
 RSS_BYTES_PER_NODE = 2400
 
 #: The graph is roughly this share of process RSS; the rest is the
 #: interpreter, the search stores and whatever is being served.
 GRAPH_SHARE_OF_RSS = 0.6
+
+#: Database bytes per graph node with ``storage.graph_format: rows``, covering
+#: the node row, its one edge row and ``idx_graph_edges_target``.
+#:
+#: **Measured 1,637 at 20k files and 1,639 at 100k** — flat, which it should be
+#: — with `python -m pheasant.graph.capacity`. Roughly 55× the compressed
+#: node-link file it replaces (17.9MB vs 1,033MB at 100k files), and that is
+#: the honest cost of the change: the graph stops being a thing every replica
+#: holds and starts being a thing the volume holds. Disk is the resource this
+#: trades *for* RAM and commit latency, and a projection that hid it would
+#: fill somebody's PVC.
+#:
+#: One node per edge is this corpus's ratio and the demo corpus's (13,503
+#: nodes / 13,502 edges). A corpus with a much denser graph pays more.
+GRAPH_ROW_BYTES_PER_NODE = 1640
 
 #: State-directory bytes per *corpus* byte. **Measured 3.95–4.09** across the
 #: 500→8,000-file sweep, converging on ~3.97; the value below is the round
@@ -165,6 +185,8 @@ def project(
     embedding_dimensions: int = 0,
     max_nodes_per_shard: int = 1_500_000,
     seconds_per_1k_files: float = SECONDS_PER_1K_FILES,
+    graph_format: str = "rows",
+    nodes: int | None = None,
 ) -> Projection:
     """Project cost from a file count and (optionally) a byte count.
 
@@ -172,11 +194,23 @@ def project(
     makes the disk number meaningful: state size tracks *content*, while RSS
     and node count track file count. Passing 0 skips the disk projection
     rather than inventing one.
+
+    ``graph_format`` moves cost between the two: on ``rows`` the graph is in
+    the database and out of every serving process's memory, on
+    ``node_link_json`` it is the other way round. Both are projected from the
+    same measured node count, so the two answers are comparable — which is the
+    point, since choosing between them is the decision this informs.
+
+    ``nodes`` overrides the ``NODES_PER_FILE`` estimate with a real count. For
+    a corpus nobody has indexed yet there is nothing better than the estimate;
+    for one that *has* been indexed — and for the benchmark checking this
+    model against a real run — the count is known, and using the estimate
+    there would compare the model against itself.
     """
 
     files = max(0, int(files))
     corpus_bytes = max(0, int(corpus_bytes))
-    nodes = int(files * NODES_PER_FILE)
+    nodes = int(files * NODES_PER_FILE) if nodes is None else max(0, int(nodes))
     # From bytes where we have them: a corpus of 100 large files and one of
     # 100 small ones differ by an order of magnitude in chunks and not at all
     # in file count. Falling back to one chunk per file is the floor, since
@@ -188,6 +222,8 @@ def project(
     state = int(corpus_bytes * STATE_BYTES_PER_CORPUS_BYTE) if corpus_bytes else 0
     if embedding_dimensions > 0:
         state += chunks * embedding_dimensions * VECTOR_BYTES_PER_CHUNK_PER_DIM
+    if graph_format == "rows":
+        state += nodes * GRAPH_ROW_BYTES_PER_NODE
 
     seconds = files / 1000.0 * seconds_per_1k_files
     shards = max(1, -(-nodes // max(1, max_nodes_per_shard)))  # ceil

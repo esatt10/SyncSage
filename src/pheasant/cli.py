@@ -642,13 +642,20 @@ def _queue_drainer(cfg, config_path: str, policy, *, sync_lock=None):
 class _GraphRefresher:
     """Pick up a graph written by another process.
 
-    The graph is a file. A process loads it once at startup, and the only
-    existing reload path runs after a sync **that process** performed. Split
-    the roles and that stops being enough: an api replica never indexes, so
-    without this it answers graph queries from whatever the graph was when the
-    pod started — indefinitely, and silently, while text and vector search stay
-    current from the shared database. Shipping fleet manifests without closing
-    that would be shipping a fleet that quietly disagrees with itself.
+    On the whole-file backend a process loads the graph once at startup, and
+    the only other reload path runs after a sync **that process** performed.
+    Split the roles and that stops being enough: an api replica never indexes,
+    so without this it answers graph queries from whatever the graph was when
+    the pod started — indefinitely, and silently, while text and vector search
+    stay current from the shared database. Shipping fleet manifests without
+    closing that would be shipping a fleet that quietly disagrees with itself.
+
+    On the ``rows`` backend a serving replica reads the graph out of the same
+    database, so it *cannot* be stale and there is nothing to reload. This
+    still runs: it keeps the process's reported generation in step with the
+    published one, and it is what makes the two backends answer ``/ready``
+    with the same shape. A refresh that finds nothing to do is the correct
+    outcome there, not a missed one.
 
     Two triggers, and the cheap one is not the primary one (Phase 35.8).
     An indexer announces each committed generation on the fleet's broker, so
@@ -678,12 +685,7 @@ class _GraphRefresher:
         self._subscribed = False
 
     def _stamp(self):
-        path = self.engine.graph_store.graph_path(self.engine.config.knowledge_base_id)
-        try:
-            stat = path.stat()
-        except OSError:
-            return None
-        return (stat.st_mtime_ns, stat.st_size)
+        return self.engine.graph_store.publication_stamp(self.engine.config.knowledge_base_id)
 
     def start(self) -> None:
         import threading
@@ -708,12 +710,12 @@ class _GraphRefresher:
             self.notifier.close()
 
     def check_once(self, trigger: str = "poll") -> bool:
-        """Reload if the file changed. Returns whether it did.
+        """Reload if the published graph changed. Returns whether it did.
 
-        Still keyed on the file's own stat tuple even when an event woke it:
-        a notification is a hint to look, never a fact to act on, so a message
-        that arrives twice, arrives for a generation already loaded, or is
-        forged costs one stat and nothing else.
+        Still keyed on the store's own publication stamp even when an event
+        woke it: a notification is a hint to look, never a fact to act on, so
+        a message that arrives twice, arrives for a generation already loaded,
+        or is forged costs one cheap read and nothing else.
         """
 
         stamp = self._stamp()

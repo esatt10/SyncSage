@@ -1,0 +1,266 @@
+"""A graph you can query without holding it.
+
+:class:`~pheasant.graph.simple.SimpleMultiDiGraph` is the indexer's working
+set: the builder mutates it, whole-graph enrichment passes walk it, and it
+belongs in RAM because that is what those passes need. This is the other half —
+the read surface every *serving* process actually uses — backed by the
+``graph_nodes`` / ``graph_edges`` rows instead of by residency.
+
+The distinction is the point of the change. Before it, answering "what is
+adjacent to this node" required the whole graph in memory, so every API
+replica paid 1.5 GB at 100k files to serve bounded three-hop walks — and the
+``graph`` role exists precisely to stop each replica paying it. A bounded walk
+is a bounded query; it needed a store, not a snapshot.
+
+**It implements the read protocol, not the graph.** ``out_edges``,
+``nodes.get``, ``__contains__``, counts and the streaming iterators — enough
+for :mod:`pheasant.graph.traversal`, :mod:`pheasant.search.graph_search`, the
+exporter and the analytics extract, and nothing else. Every mutator raises:
+this is not a place to write a graph from, and a silently-accepted write would
+be a node that exists in one process and nowhere else.
+
+Two methods have no counterpart on the in-memory graph, and both exist so a
+walk costs one query per *level* rather than one per node:
+:meth:`out_edges_batch` and :meth:`prefetch_nodes`. ``SimpleMultiDiGraph``
+implements them too — trivially, since its lookups are already O(1) — so the
+traversal has one code path rather than a branch.
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Iterator
+from contextlib import nullcontext
+from typing import Any
+
+from pheasant.persistence.graph_rows import GraphRowStore
+
+
+class _NodeView:
+    """``graph.nodes`` over rows, with the mapping surface callers already use."""
+
+    def __init__(self, graph: SqlGraph) -> None:
+        self.graph = graph
+
+    def __getitem__(self, key: str) -> dict[str, Any]:
+        found = self.graph.rows.get_node(self.graph.kb_id, key)
+        if found is None:
+            raise KeyError(key)
+        return found
+
+    def __contains__(self, key: str) -> bool:
+        return self.graph.rows.get_node(self.graph.kb_id, key) is not None
+
+    def get(self, key: str, default: Any = None) -> Any:
+        found = self.graph.rows.get_node(self.graph.kb_id, key)
+        return default if found is None else found
+
+    def __iter__(self) -> Iterator[str]:
+        return (node_id for node_id, _attrs in self.graph.iter_nodes())
+
+    def __call__(self, data: bool = False):
+        if data:
+            return list(self.graph.iter_nodes())
+        return [node_id for node_id, _attrs in self.graph.iter_nodes()]
+
+
+class _LazyNodeMap:
+    """``node_map()`` for a store-backed graph: fetch on ask, remember the answer.
+
+    ``_scan_edges`` reads the label of both endpoints of every edge it scores.
+    On the in-memory graph that is a dict lookup; here it would be a query per
+    endpoint, and the same handful of hub nodes are asked for over and over
+    within one scan. Bounded because it lives for one scan and the scan is
+    already bounded by its candidate set.
+    """
+
+    def __init__(self, graph: SqlGraph) -> None:
+        self.graph = graph
+        self._seen: dict[str, dict[str, Any] | None] = {}
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key not in self._seen:
+            self._seen[key] = self.graph.rows.get_node(self.graph.kb_id, key)
+        found = self._seen[key]
+        return default if found is None else found
+
+
+class SqlGraph:
+    """Read-only graph over the state store's ``graph_*`` tables."""
+
+    #: Read by the serving code the way ``RemoteGraph.is_remote_graph`` is, so
+    #: a caller can tell "this graph is not resident" without an isinstance.
+    is_stored_graph = True
+
+    #: TTL on the per-type tally. The in-memory graph maintains that tally on
+    #: write because "re-counting 240k node types per request was costing
+    #: seconds on endpoints the UI polls"; here it is a ``GROUP BY``, and the
+    #: same polling would put a full scan on every one. Same 2s as
+    #: ``RemoteGraph.stats``, and the same reasoning.
+    TYPE_COUNT_TTL = 2.0
+
+    def __init__(self, state: Any, kb_id: str) -> None:
+        self.rows = GraphRowStore(state)
+        self.kb_id = kb_id
+        self.nodes = _NodeView(self)
+        self._types: dict[str, int] | None = None
+        self._types_at = 0.0
+
+    # --- reads -----------------------------------------------------------
+
+    def reading(self):
+        """No-op pin.
+
+        The in-memory graph hands readers a lock because a sync thread mutates
+        it underneath them. Here the database provides the isolation, and
+        promising a cross-call transaction this does not open would be worse
+        than promising nothing — the same reasoning ``RemoteGraph.reading``
+        already applies.
+        """
+
+        return nullcontext()
+
+    def __contains__(self, node_id: str) -> bool:
+        return self.rows.get_node(self.kb_id, node_id) is not None
+
+    def has_node(self, node_id: str) -> bool:
+        return node_id in self
+
+    def __len__(self) -> int:
+        return self.number_of_nodes()
+
+    def number_of_nodes(self) -> int:
+        return self.rows.counts(self.kb_id)[0]
+
+    def number_of_edges(self) -> int:
+        return self.rows.counts(self.kb_id)[1]
+
+    def type_counts(self) -> dict[str, int]:
+        now = time.monotonic()
+        if self._types is None or now - self._types_at > self.TYPE_COUNT_TTL:
+            self._types = self.rows.type_counts(self.kb_id)
+            self._types_at = now
+        return dict(self._types)
+
+    def out_edges(self, node_id: str) -> list[tuple[str, str, dict[int, dict]]]:
+        return self.out_edges_batch([node_id]).get(node_id, [])
+
+    def out_edges_batch(
+        self, node_ids: list[str]
+    ) -> dict[str, list[tuple[str, str, dict[int, dict]]]]:
+        """One query for a whole BFS frontier, grouped the way callers expect.
+
+        Parallel edges between one pair are collapsed into the ``{key: attrs}``
+        map ``out_edges`` returns, so a caller cannot tell which backend
+        answered.
+        """
+
+        grouped = self.rows.out_edges(self.kb_id, node_ids)
+        result: dict[str, list[tuple[str, str, dict[int, dict]]]] = {}
+        for source, entries in grouped.items():
+            pairs: dict[tuple[str, str], dict[int, dict]] = {}
+            for edge_source, target, attrs in entries:
+                bucket = pairs.setdefault((edge_source, target), {})
+                bucket[len(bucket)] = attrs
+            result[source] = [
+                (edge_source, target, edge_map) for (edge_source, target), edge_map in pairs.items()
+            ]
+        return result
+
+    def prefetch_nodes(self, node_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Attributes for a whole frontier, in one query."""
+
+        return self.rows.get_nodes(self.kb_id, node_ids)
+
+    def neighbors(self, node_id: str) -> list[str]:
+        return [target for _source, target, _edges in self.out_edges(node_id)]
+
+    def get_edge_data(self, source: str, target: str, default: Any = None) -> Any:
+        for edge_source, edge_target, edge_map in self.out_edges(source):
+            if edge_source == source and edge_target == target:
+                return edge_map
+        return default
+
+    def node_map(self):
+        return _LazyNodeMap(self)
+
+    def search_blobs(self) -> dict[str, str]:
+        """Deliberately empty.
+
+        The in-memory graph keeps a lowercased concatenation of every node's
+        attributes so a query can reject most nodes with one substring test.
+        That is a residency optimization, and materializing it here would
+        re-materialize the graph. ``search_graph`` treats a missing blob as
+        "cannot reject" and scores the candidate instead, which is correct:
+        by the time it gets here the ``graph_nodes_fts`` index has already
+        done the narrowing the blob existed to do.
+        """
+
+        return {}
+
+    def iter_nodes(self) -> Iterator[tuple[str, dict[str, Any]]]:
+        return self.rows.iter_nodes(self.kb_id)
+
+    def iter_edges(self) -> Iterator[tuple[tuple[str, str], dict[int, dict]]]:
+        return self.rows.iter_edges(self.kb_id)
+
+    def edges(self) -> list[tuple[tuple[str, str], dict[int, dict]]]:
+        return list(self.iter_edges())
+
+    def candidate_edges(
+        self, tokens: list[str], source_name: str | None = None, limit: int = 2000
+    ) -> Iterator[tuple[tuple[str, str], dict[int, dict]]]:
+        """Edges worth scoring, for relationship search. See the row store."""
+
+        return self.rows.candidate_edges(self.kb_id, tokens, source_name, limit)
+
+    def index_rows(self) -> list[tuple[str, str, str]]:
+        """Rebuild input for ``graph_nodes_fts``.
+
+        Streamed from the same database the index lives in, which is why a
+        rebuild on a serving replica is now possible at all.
+        """
+
+        from pheasant.graph.simple import _search_blob
+
+        return [
+            (node_id, str(attrs.get("source_id") or ""), _search_blob(attrs))
+            for node_id, attrs in self.iter_nodes()
+        ]
+
+    def to_node_link(self) -> dict[str, Any]:
+        """The node-link payload, materialized from rows.
+
+        O(graph) and honestly so: the callers are the exporter, a snapshot and
+        the Synapse contract, all of which want the whole graph by definition.
+        Byte-compatible with what the file backend produced — same key order,
+        same edge canonicalization — so a snapshot taken from rows and one
+        taken from a file are the same document.
+        """
+
+        nodes = [attrs for _node_id, attrs in self.iter_nodes()]
+        links = []
+        for (source, target), edge_map in self.iter_edges():
+            for key, data in enumerate(edge_map.values()):
+                links.append({"source": source, "target": target, "key": key, **data})
+        return {
+            "directed": True,
+            "multigraph": True,
+            "graph": {},
+            "nodes": nodes,
+            "links": links,
+        }
+
+    # --- writes ----------------------------------------------------------
+
+    def _read_only(self, *_args: Any, **_kwargs: Any):
+        raise TypeError(
+            "SqlGraph is the serving read surface and cannot be mutated. The indexer "
+            "builds into a SimpleMultiDiGraph and commits the delta through GraphStore; "
+            "a write here would be a node that exists in one process and nowhere else."
+        )
+
+    add_node = _read_only
+    add_edge = _read_only
+    remove_nodes_from = _read_only
+    remove_edges_from = _read_only

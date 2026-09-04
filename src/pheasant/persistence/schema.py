@@ -767,6 +767,77 @@ CREATE TABLE IF NOT EXISTS tuning_bundles (
 );
 CREATE INDEX IF NOT EXISTS idx_tuning_bundles_active
   ON tuning_bundles(kb_id, applied_at, superseded_at);
+-- The knowledge graph, as rows rather than one file (Phase 35.10).
+--
+-- The graph used to be a single zstd node-link blob that every commit
+-- re-serialized whole and every serving replica held resident. Measured on
+-- this repo's own benchmark at 100k files (630k nodes / 630k edges): 9.1s to
+-- write for a one-file change, 4.6s to load before a replica can serve, and
+-- 1.5GB of RSS in every process that answers a graph query. As rows the same
+-- commit writes only what changed -- 10ms, and flat in graph size -- and a
+-- bounded traversal is an indexed walk that needs no residency at all.
+--
+-- `attrs` carries every attribute *not* promoted to a column, so the promoted
+-- ones are not stored twice. Reconstituting a node is the row's columns
+-- merged over its `attrs`, which is the one place that projection may live.
+--
+-- `digest` is the row's own content hash, and it is what makes the
+-- content-addressed generation id survive the move: the published id folds
+-- every row's digest with XOR, which is invertible, so a commit updates it in
+-- O(changed) by folding the old digest out and the new one in. A counter or a
+-- clock would have been cheaper and would have broken pillar 1 -- two replicas
+-- must name an unchanged graph identically without coordinating.
+CREATE TABLE IF NOT EXISTS graph_nodes (
+  kb_id TEXT NOT NULL,
+  node_id TEXT NOT NULL,
+  type TEXT,
+  label TEXT,
+  source_id TEXT,
+  relative_path TEXT,
+  artifact_id TEXT,
+  attrs TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  PRIMARY KEY (kb_id, node_id)
+);
+-- Per-source deletion (`remove_source_content`, `replace_source`) and the
+-- source filter every graph query may carry.
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_source ON graph_nodes(kb_id, source_id);
+CREATE TABLE IF NOT EXISTS graph_edges (
+  kb_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  target TEXT NOT NULL,
+  type TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  source_id TEXT,
+  attrs TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  PRIMARY KEY (kb_id, source, target, type, seq)
+);
+-- Out-adjacency is the primary key's own prefix, so traversal needs no index
+-- of its own. The reverse index is not for reading: removing a node has to
+-- remove the edges that point *at* it, and without this that delete is a full
+-- scan of the edge table -- the O(edges) cost this whole change exists to take
+-- off the sync path.
+CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(kb_id, target);
+-- Two more looked obviously useful and are deliberately absent: one on
+-- `graph_edges(source_id)` and one on `graph_nodes(artifact_id)`. Nothing
+-- reads either -- per-source deletion goes through the node table and
+-- cascades by endpoint -- and at 630k edges they measured 190MB of the
+-- database between them. An index with no reader is the storage version of a
+-- config flag with no reader: it looks like the mechanism, and it is not.
+-- One row per knowledge base: the publication record the graph file used to
+-- keep in a JSON sidecar. `node_fold`/`edge_fold` are the XOR aggregates the
+-- generation id is derived from, persisted rather than recomputed so a restart
+-- does not owe a full scan.
+CREATE TABLE IF NOT EXISTS graph_generations (
+  kb_id TEXT PRIMARY KEY,
+  generation_id TEXT NOT NULL,
+  published_at TEXT NOT NULL,
+  nodes INTEGER NOT NULL,
+  edges INTEGER NOT NULL,
+  node_fold TEXT NOT NULL,
+  edge_fold TEXT NOT NULL
+);
 """
 
 #: SQLite-only: WAL, plus the FTS5 virtual tables.

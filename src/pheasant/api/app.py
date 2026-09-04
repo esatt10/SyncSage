@@ -994,9 +994,17 @@ def create_app(
     # coordinate child commits; workers prepare immutable files; remote APIs
     # query the graph service. None of those needs a second graph copy.
     remote_graph = bool(str(config.graph.query_service_url or "").strip())
-    loads_graph = role_policy.role in {Role.ALL, Role.GRAPH} or (
-        role_policy.role is Role.API and not remote_graph
-    )
+    # On the row backend only a process that *builds* the graph holds one: a
+    # bounded walk is a bounded query there, so an api or graph replica serves
+    # from `graph_nodes`/`graph_edges` and never materializes 1.5GB (measured
+    # at 100k files) to answer a three-hop neighbourhood. On the whole-file
+    # backend there is no such option, and this resolves exactly as it did.
+    stores_graph = config.storage.graph_format == "rows"
+    builds_graph = role_policy.role in {Role.ALL, Role.INDEXER}
+    loads_graph = (
+        role_policy.role in {Role.ALL, Role.GRAPH}
+        or (role_policy.role is Role.API and not remote_graph)
+    ) and (builds_graph or not stores_graph)
     engine = SyncEngine(
         config,
         paths,
@@ -1006,7 +1014,7 @@ def create_app(
     )
     serving_graph = graph_for_config(
         config,
-        lambda: engine.graph_builder.graph,
+        engine.serving_graph,
         force_local=role_policy.role is not Role.API,
     )
     # One resolver for the whole process: the searcher ranks with it, and
@@ -4121,7 +4129,12 @@ def create_app(
 
         _authorize_graph_query(authorization)
         parameters = dict(req.parameters or {})
-        graph_obj = engine.graph_builder.graph
+        # Through the serving graph, not `graph_builder.graph`. This endpoint
+        # *is* the graph service, and on the row backend a graph replica holds
+        # no working set at all — reaching for the builder's copy answered
+        # every query from an empty graph, with a plausible-looking zero.
+        # `force_local` above already guarantees this cannot proxy to itself.
+        graph_obj = serving_graph
         operation = req.operation.strip().lower()
 
         if operation == "stats":
