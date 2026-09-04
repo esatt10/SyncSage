@@ -92,6 +92,12 @@ BOUNDS: dict[str, tuple[float, float]] = {
 }
 
 
+#: The default over-fetch factor, exported so a module that must take it as a
+#: parameter (the vector arm, which is called with it rather than resolving it)
+#: has a default without writing the number down a second time.
+DEFAULT_FILTER_OVERFETCH = 3.0
+
+
 def clamp(name: str, value: float) -> float:
     low, high = BOUNDS.get(name, (float("-inf"), float("inf")))
     return min(max(float(value), low), high)
@@ -128,9 +134,21 @@ class RankingParameters:
     text_arm_weight: float = 1.0
     vector_arm_weight: float = 1.0
     graph_arm_weight: float = 1.0
-    #: How far past ``max_results`` the arms fetch when a filter (ACL, memory
-    #: policy, section) will remove candidates afterwards.
-    filter_overfetch: float = 3.0
+    #: How far past ``max_results`` the arms fetch when a filter will remove
+    #: candidates afterwards — ACL, memory policy, section, *and* the
+    #: retrieval criteria the surfaces apply (`exclude_sources`, `node_types`,
+    #: `min_score`, `source_types`). One parameter, because it is one
+    #: behaviour: a post-filter is going to drop rows, so ask for more.
+    #:
+    #: It did not used to be. The surfaces each carried their own hardcoded
+    #: `max_results * 4`, so raising this moved the ACL/section/memory
+    #: over-fetch and did nothing for criteria — while the tuning glossary told
+    #: an operator that a `filters` miss might mean "filter_overfetch is too
+    #: small". A bundle could be promoted on a parameter that half-governed the
+    #: stage it was attributed to. Every over-fetch goes through
+    #: :meth:`overfetch` now, and `tests/test_ranking_parameters.py` fails if a
+    #: second multiplier appears anywhere else.
+    filter_overfetch: float = DEFAULT_FILTER_OVERFETCH
     #: Where these values came from, for the audit trail. Never part of
     #: ranking; carried so a served result can be traced to a decision.
     provenance: str = "default"
@@ -139,6 +157,23 @@ class RankingParameters:
     def __post_init__(self) -> None:
         for name in PARAMETER_STAGES:
             object.__setattr__(self, name, clamp(name, getattr(self, name)))
+
+    def overfetch(self, max_results: int, *, filtering: bool) -> int:
+        """How many candidates to ask the arms for.
+
+        The single home for the arithmetic, so "how far past `max_results` do
+        we fetch" has one answer per configuration rather than one per surface.
+        `filtering=False` returns `max_results` unchanged: over-fetching when
+        nothing will be dropped is pure cost.
+
+        Never returns fewer than `max_results` — the clamp keeps a bundle that
+        proposed a factor below 1.0 from turning an over-fetch into a
+        truncation, which would silently shorten every filtered answer.
+        """
+
+        if not filtering:
+            return max(0, int(max_results))
+        return max(int(max_results), int(int(max_results) * self.filter_overfetch))
 
     @property
     def bm25_weights(self) -> str:

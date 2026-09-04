@@ -43,11 +43,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from pheasant.search import fusion
 from pheasant.search.ranking import RankingParameters
 
-#: Arms in the order ``_merge_rrf`` walks them. The order matters: it decides
-#: which arm's record wins a fused slot, and therefore which `kind` survives.
-ARM_ORDER: tuple[str, ...] = ("text", "vector", "graph")
+#: Arms in the order the merge walks them. The order matters: it decides which
+#: arm's record wins a fused slot, and therefore which `kind` survives — so it
+#: is re-exported from the merge rather than restated, for the same reason the
+#: loop is.
+ARM_ORDER: tuple[str, ...] = fusion.ARM_ORDER
 
 
 def refuse(
@@ -58,59 +61,35 @@ def refuse(
 ) -> list[str]:
     """Reciprocal-rank fusion over captured arm lists. Returns fused ids.
 
+    The tuning plane's entry point onto :func:`pheasant.search.fusion.fuse` —
+    the same loop the query path runs, reading triples out of a captured
+    explain block instead of projecting them from live records.
+
+    It used to be a hand-maintained mirror of ``hybrid._merge_rrf``, described
+    in its own docstring as "a line-for-line mirror ... every branch below
+    corresponds to one there". That is the responsible version of a duplicate
+    and it is still two loops: a change to one side passes review and diverges
+    until :func:`verify_equivalence` happens to cover the case. There is one
+    loop now, so the correspondence is not maintained, it is structural.
+
     ``arms`` restricts which arms contribute candidates at all, which is a
-    different thing from weighting one to zero and the distinction is not
-    academic. A zero weight is a zero *score*: the arm's candidates stay in the
-    merge and are ordered by `best_rank`, so zero-weighting two arms returns
-    the third arm's candidates *plus theirs*, ordered by their original ranks.
-
-    That is correct for tuning — an operator setting `vector_arm_weight: 0`
-    wants the arm to stop influencing the order, not to have its documents
-    vanish — and it is wrong for an ablation, which needs true isolation.
-    Isolating by weight silently measured whichever arm had candidates: with
-    embeddings off, "vector alone" returned the text arm's ranking verbatim
-    and scored just under it.
-
-    A line-for-line mirror of :func:`pheasant.search.hybrid._merge_rrf` over
-    the triples ``(fusion key, reporting identity, kind)``. Every branch below
-    corresponds to one there, and the correspondence is what
-    :func:`verify_equivalence` checks -- so if that function is passing, this
-    is the merge.
+    different thing from weighting one to zero — see `fusion.fuse`, which
+    carries the argument and the reasoning. That distinction is the tuning
+    plane's own and is why this entry point exists rather than the caller
+    using `fuse` directly.
     """
 
-    scores: dict[str, float] = {}
-    best_rank: dict[str, int] = {}
-    identity: dict[str, str] = {}
-    kinds: dict[str, str] = {}
-
-    for arm in arms:
-        arm_weight = ranking.arm_weight(arm)
-        for rank, entry in enumerate(fusion_input.get(arm) or [], start=1):
-            key, node_id, kind = (list(entry) + ["", "", ""])[:3]
-            if not key:
-                continue
-            scores[key] = scores.get(key, 0.0) + arm_weight / (ranking.rrf_k + rank)
-            best_rank[key] = min(best_rank.get(key, rank), rank)
-            # "Keep the richest record": a text or vector row wins the slot
-            # from a graph node even when the graph arm saw the item first.
-            if key not in identity or (arm != "graph" and kinds.get(key) == "node"):
-                identity[key] = node_id
-                kinds[key] = kind
-
-    ordered = sorted(identity, key=lambda key: (-scores[key], best_rank[key], key))
-
-    results: list[str] = []
-    seen_nodes: set[str] = set()
-    for key in ordered:
-        if len(results) >= max_results:
-            break
-        node_id = identity[key]
-        if kinds.get(key) != "relationship" and node_id and node_id in seen_nodes:
-            continue
-        if node_id:
-            seen_nodes.add(node_id)
-        results.append(node_id)
-    return results
+    candidates = {
+        arm: [
+            fusion.Candidate(key=key, node_id=node_id, kind=kind)
+            for entry in (fusion_input.get(arm) or [])
+            for key, node_id, kind in [(list(entry) + ["", "", ""])[:3]]
+            if key
+        ]
+        for arm in arms
+    }
+    merged = fusion.fuse(candidates, max_results=max_results, ranking=ranking, arms=arms)
+    return [item.node_id for item in merged.selected]
 
 
 def refusable(stages: dict[str, Any]) -> bool:
@@ -137,6 +116,15 @@ def verify_equivalence(stages: dict[str, Any], ranking: RankingParameters) -> tu
     Returns ``(True, "")`` or ``(False, reason)``. The reason names the first
     divergence rather than reporting a count, because a re-fusion that differs
     at rank 1 and a re-fusion that differs at rank 9 are different bugs.
+
+    What this checks changed when the two merges became one. It was a drift
+    detector between two loops; there is one loop now, so a divergence can no
+    longer be the merge disagreeing with itself. What it still checks is the
+    thing that was always the larger risk: whether the **captured** candidate
+    lists reproduce the query that ran. A truncated arm, a stage block from an
+    older schema, or a capture taken around a filter that is not replayed all
+    produce a faithful merge over unfaithful inputs — and a number that looks
+    like a measurement. So it stays, and it stays load-bearing.
     """
 
     if not refusable(stages):

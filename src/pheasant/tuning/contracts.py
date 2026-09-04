@@ -36,6 +36,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from pheasant import decision
 from pheasant.evaluation.contracts import digest, utc_now
 
 __all__ = [
@@ -343,9 +344,14 @@ class Decision:
         plane shipped without it, a skipped run carried no gates, ``all([])``
         answered ``True``, and a batch that never ran reported that its gates
         passed -- straight into a CLI exit status.
+
+        One spelling for both planes since 35.9. This property and the
+        evaluation plane's were two implementations of one invariant, the
+        second written from the first one's incident report; a third plane
+        would have started from zero again.
         """
 
-        return bool(self.gates) and all(bool(gate.get("passed")) for gate in self.gates)
+        return decision.all_passed(self.gates)
 
     def as_dict(self) -> dict[str, Any]:
         return {

@@ -170,3 +170,94 @@ def test_arm_weight_of_zero_removes_an_arm_from_the_merge() -> None:
     # The arm still contributes its candidate — a zero weight is a zero score,
     # not a filter — but it can no longer outrank a weighted arm.
     assert text_only[0] == "n1"
+
+
+# ---------------------------------------------------------------------------
+# One loop, two entry points
+#
+# The re-fusion used to be "a line-for-line mirror" of `hybrid._merge_rrf`,
+# with `verify_equivalence` catching drift after the fact. Both now call
+# `search.fusion.fuse`, so the correspondence is structural rather than
+# maintained — and these are the tests that keep it that way.
+# ---------------------------------------------------------------------------
+
+
+def test_neither_side_still_carries_its_own_merge_loop() -> None:
+    """The duplication this removed, asserted gone.
+
+    Greps for the accumulator the two loops shared. A second one is a second
+    answer to "how does this region rank", which is the thing that could
+    diverge silently until a guard happened to cover the case.
+    """
+
+    import re
+    from pathlib import Path
+
+    from pheasant.search import fusion as fusion_module
+
+    root = Path(fusion_module.__file__).resolve().parents[1]
+    # `scores[key] = scores.get(key, 0.0) + ... / (rrf_k + rank)` — the RRF
+    # accumulation itself, wherever it is spelled.
+    accumulation = re.compile(r"/\s*\(\s*(?:ranking\.)?rrf_k\s*\+")
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        if path == Path(fusion_module.__file__).resolve():
+            continue
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if accumulation.search(line):
+                offenders.append(f"{path.relative_to(root)}:{number}: {line.strip()}")
+
+    assert not offenders, (
+        "reciprocal rank fusion is computed outside search/fusion.py:\n  "
+        + "\n  ".join(offenders)
+        + "\nBoth the query path and the re-fusion are entry points onto one loop; "
+        "a third implementation is a third ranking this region can produce."
+    )
+
+
+def test_both_entry_points_agree_on_a_generated_merge() -> None:
+    """Differential over the two entry points, rather than trust in the grep.
+
+    The query path fuses rich records and the re-fusion fuses captured
+    triples. Feeding both the same candidates must produce the same order —
+    which is what `verify_equivalence` used to have to prove and now cannot
+    fail to be true.
+    """
+
+    import random
+
+    from pheasant.search.hybrid import _merge_rrf
+    from pheasant.search.ranking import RankingParameters
+    from pheasant.tuning.refusion import refuse
+
+    rng = random.Random(20260904)
+    for _ in range(25):
+        arms: dict[str, list[dict]] = {}
+        for arm in ("text", "vector", "graph"):
+            arms[arm] = [
+                {
+                    "chunk_id": f"c{rng.randrange(12)}",
+                    "node_id": f"n{rng.randrange(8)}",
+                    "kind": rng.choice(["chunk", "node", "relationship"]),
+                }
+                for _ in range(rng.randrange(0, 7))
+            ]
+        ranking = RankingParameters(
+            rrf_k=rng.choice([10.0, 60.0, 200.0]),
+            text_arm_weight=rng.choice([0.0, 1.0, 2.0]),
+            vector_arm_weight=rng.choice([0.0, 1.0, 2.0]),
+            graph_arm_weight=rng.choice([0.0, 1.0, 2.0]),
+        )
+        limit = rng.randrange(1, 8)
+
+        collected: dict = {}
+        served = _merge_rrf(
+            [dict(item) for item in arms["text"]],
+            [dict(item) for item in arms["vector"]],
+            [dict(item) for item in arms["graph"]],
+            limit,
+            ranking,
+            collect=collected,
+        )
+        recomputed = refuse(collected["fusion_input"], limit, ranking)
+        assert [str(item.get("node_id") or "") for item in served] == recomputed

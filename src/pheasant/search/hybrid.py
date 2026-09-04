@@ -15,7 +15,9 @@ from pheasant.memory.policy import (
     resolve,
     utc_now_iso,
 )
+from pheasant.search import fusion
 from pheasant.search.criteria import source_type_map, stamp_source_types
+from pheasant.search.fusion import Fused
 from pheasant.search.graph_search import search_graph
 from pheasant.search.observability import observe_search, should_sample, stage_digest
 from pheasant.search.ranking import DEFAULT_RANKING, RankingParameters
@@ -183,11 +185,7 @@ class HybridSearch:
         # of records and `off` can drop a lot.
         sectioned = bool(section_needle(section))
         ranking = self.ranking_parameters()
-        fetch_n = (
-            max(max_results, int(max_results * ranking.filter_overfetch))
-            if (enforced or sectioned or memory_filtered)
-            else max_results
-        )
+        fetch_n = ranking.overfetch(max_results, filtering=enforced or sectioned or memory_filtered)
         # Nothing is collected unless a caller asked or this search was
         # sampled, so the ordinary path allocates one `None` and does no extra
         # work at all.
@@ -244,7 +242,15 @@ class HybridSearch:
             )
         if mode in {"hybrid", "vector"} and self.vector is not None:
             jobs["vector"] = lambda: self.vector.search(
-                query, source_name=source_name, max_results=fetch_n
+                query,
+                source_name=source_name,
+                max_results=fetch_n,
+                # The vector arm filters by source *inside* itself, so it needs
+                # its own headroom on top of `fetch_n`. Passed down rather than
+                # hardcoded there: one parameter governs every over-fetch, and
+                # a vector store that carried its own multiplier is exactly the
+                # divergence this consolidation removed.
+                overfetch=ranking.filter_overfetch,
             )
 
         failed_arms: list[str] = []
@@ -557,66 +563,46 @@ def _merge_rrf(
     ranking: RankingParameters = DEFAULT_RANKING,
     collect: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Fuse the arms on **rank**, not on their scores.
+    """The query path's entry point onto :func:`pheasant.search.fusion.fuse`.
 
-    The three retrievers score on scales that are not comparable, and merging
-    them by raw score silently reduced hybrid to whichever arm scored highest
-    in absolute terms. Measured on a real corpus: text (BM25-derived) returned
-    0.86-0.92, vector (cosine) 0.6679-0.6735, graph a flat 0.60 — so text won
-    every position, every time, and the other two arms cost latency while
-    contributing nothing to the ordering. Worse, each arm's internal spread
-    was tiny (vector separated unrelated files by 0.006), so even within an
-    arm the numbers barely ranked anything.
+    Projects the rich records down to the three fields the merge reads,
+    fuses, and maps the answer back to the dicts it started with. The loop
+    itself lives in `search.fusion` because the tuning plane's re-fusion needs
+    the same one: it used to be a hand-maintained mirror of this function,
+    checked for drift by `verify_equivalence` rather than prevented from
+    drifting at all.
 
-    Reciprocal rank fusion sidesteps calibration entirely: an item scores
-    ``sum(1 / (RRF_K + rank))`` over the arms that returned it, so only each
-    arm's own ordering matters and agreement between arms is what promotes a
-    result. That is the property hybrid search was supposed to have.
-
-    Ordering is deterministic: ties break on the fused score, then on the best
-    rank any arm gave the item, then on node id.
+    What stays here is what is genuinely the query path's: which dict is the
+    richest record for a key, and the mutation of the returned rows with their
+    score, rank and contributing arms.
     """
 
     def key_of(item: dict[str, Any]) -> str:
         return str(item.get("chunk_id") or item.get("node_id") or item.get("title") or "")
 
-    fused: dict[str, dict[str, Any]] = {}
-    scores: dict[str, float] = {}
-    best_rank: dict[str, int] = {}
-    contributors: dict[str, set[str]] = {}
-
-    for arm, results in (
+    arms: tuple[tuple[str, list[dict[str, Any]]], ...] = (
         ("text", text_results),
         ("vector", vector_results),
         ("graph", graph_results),
-    ):
-        # An arm weight of 1.0 -- every arm's default -- makes this the
-        # unweighted `1 / (k + rank)` the fusion always computed. The weights
-        # exist because the diagnosis can tell "the arm never had it" from
-        # "the arm had it and fusion buried it", and only the second is
-        # something a fusion parameter can fix.
-        arm_weight = ranking.arm_weight(arm)
-        for rank, item in enumerate(results, start=1):
-            key = key_of(item)
-            if not key:
-                continue
-            scores[key] = scores.get(key, 0.0) + arm_weight / (ranking.rrf_k + rank)
-            best_rank[key] = min(best_rank.get(key, rank), rank)
-            contributors.setdefault(key, set()).add(arm)
-            # Keep the richest record: chunk hits carry previews and line
-            # ranges that graph hits do not, so a text/vector row wins the slot
-            # even when the graph arm saw the item first.
-            if key not in fused or (arm != "graph" and fused[key].get("kind") == "node"):
-                fused[key] = item
-
-    ordered = sorted(
-        fused.values(),
-        key=lambda item: (
-            -scores[key_of(item)],
-            best_rank[key_of(item)],
-            key_of(item),
-        ),
     )
+    candidates = {
+        arm: [
+            fusion.Candidate(
+                key=key_of(item),
+                node_id=str(item.get("node_id") or ""),
+                kind=str(item.get("kind") or ""),
+            )
+            for item in results
+        ]
+        for arm, results in arms
+    }
+    by_arm = dict(arms)
+    merged = fusion.fuse(candidates, max_results=max_results, ranking=ranking)
+
+    def record(item: Fused) -> dict[str, Any]:
+        """The original dict the merge kept for this key."""
+
+        return by_arm[item.arm][item.position]
 
     if collect is not None:
         # The fusion's own inputs, in the arms' own order: `(fusion key,
@@ -638,15 +624,10 @@ def _merge_rrf(
                 for item in results[:EXPLAIN_MAX_IDS]
                 if key_of(item)
             ]
-            for arm, results in (
-                ("text", text_results),
-                ("vector", vector_results),
-                ("graph", graph_results),
-            )
+            for arm, results in arms
         }
         collect["fusion_input_truncated"] = any(
-            len(results) > EXPLAIN_MAX_IDS
-            for results in (text_results, vector_results, graph_results)
+            len(results) > EXPLAIN_MAX_IDS for _arm, results in arms
         )
         collect["max_results"] = max_results
         # The fused order *before* truncation. This is the one list that
@@ -654,39 +635,30 @@ def _merge_rrf(
         # max_results was 10" — two failures that look identical downstream
         # and have nothing in common: the first is a fusion or arm-weight
         # problem, the second is a caller asking for too few results.
+        head = merged.ordered[:EXPLAIN_MAX_IDS]
         collect["fusion"] = {
-            "ranked": [_identity(item) for item in ordered[:EXPLAIN_MAX_IDS] if _identity(item)],
+            "ranked": [_identity(record(item)) for item in head if _identity(record(item))],
             "scores": {
-                _identity(item): round(scores[key_of(item)], 6)
-                for item in ordered[:EXPLAIN_MAX_IDS]
-                if _identity(item)
+                _identity(record(item)): round(item.score, 6)
+                for item in head
+                if _identity(record(item))
             },
             "contributors": {
-                _identity(item): sorted(contributors[key_of(item)])
-                for item in ordered[:EXPLAIN_MAX_IDS]
-                if _identity(item)
+                _identity(record(item)): list(item.contributors)
+                for item in head
+                if _identity(record(item))
             },
             "rrf_k": ranking.rrf_k,
             "arm_weights": {arm: ranking.arm_weight(arm) for arm in ("text", "vector", "graph")},
         }
 
     results: list[dict[str, Any]] = []
-    seen_nodes: set[str] = set()
-    for item in ordered:
-        if len(results) >= max_results:
-            break
-        node_id = item.get("node_id")
-        if item.get("kind") != "relationship" and node_id and node_id in seen_nodes:
-            continue
-        if node_id:
-            seen_nodes.add(node_id)
-        key = key_of(item)
-        item["score"] = round(scores[key], 6)
-        item["retrieved_by"] = "+".join(sorted(contributors[key]))
-        results.append(item)
-
-    for rank, item in enumerate(results, start=1):
-        item["rank"] = rank
+    for rank, item in enumerate(merged.selected, start=1):
+        row = record(item)
+        row["score"] = round(item.score, 6)
+        row["retrieved_by"] = item.retrieved_by
+        row["rank"] = rank
+        results.append(row)
     return results
 
 

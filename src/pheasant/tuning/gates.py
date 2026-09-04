@@ -50,6 +50,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from pheasant import decision
 from pheasant.search.ranking import BOUNDS, PARAMETER_STAGES
 from pheasant.tuning.contracts import Comparison
 
@@ -86,16 +87,20 @@ def gate(
     ``observed`` and ``threshold`` are carried separately from ``summary`` so
     a UI can render the comparison and a reader can argue with the number
     rather than with a sentence about it.
+
+    Built through :class:`pheasant.decision.Gate` and returned as its dict, so
+    the wire shape that decision records and the UI already read is unchanged
+    while the vocabulary has one definition.
     """
 
-    return {
-        "gate_id": gate_id,
-        "passed": bool(passed),
-        "blocking": blocking,
-        "summary": summary,
-        "observed": observed,
-        "threshold": threshold,
-    }
+    return decision.Gate(
+        gate_id=gate_id,
+        passed=bool(passed),
+        summary=summary,
+        observed=observed,
+        threshold=threshold,
+        blocking=blocking,
+    ).as_dict()
 
 
 def evaluate(
@@ -236,8 +241,4 @@ def evaluate(
 def blocking_failures(gates: list[dict[str, Any]]) -> list[str]:
     """Gate ids that failed and are allowed to stop a promotion."""
 
-    return [
-        str(item["gate_id"])
-        for item in gates
-        if item.get("blocking", True) and not item.get("passed")
-    ]
+    return decision.blocking_failures(gates)

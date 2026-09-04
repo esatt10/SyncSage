@@ -795,7 +795,10 @@ class PheasantTools:
         filtering = criteria_active(
             exclude_sources, node_types, min_score, source_types, exclude_source_types
         )
-        fetch = max_results * 4 if filtering else max_results
+        # Through the ranking parameter rather than a literal — see
+        # `RankingParameters.overfetch`. The HTTP surface computes the same
+        # number the same way, which is the point.
+        fetch = self.searcher.ranking_parameters().overfetch(max_results, filtering=filtering)
         payload = self.searcher.search_context(
             knowledge_base or self.config.knowledge_base_id,
             query,

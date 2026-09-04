@@ -3876,7 +3876,12 @@ def create_app(
         )
 
         # Over-fetch when a post-filter will drop rows, so `max_results` keeps
-        # meaning "give me this many" — the same bookkeeping the MCP tool does.
+        # meaning "give me this many". Through the ranking parameter, not a
+        # literal: this used to be a hardcoded `* 4` here and another in the
+        # MCP tool, so `search.ranking.filter_overfetch` governed the ACL and
+        # memory filters and had no effect at all on retrieval criteria —
+        # while the tuning glossary told operators it governed the `filters`
+        # stage. One name, one behaviour, one place it is computed.
         filtering = criteria_active(
             req.exclude_sources,
             req.node_types,
@@ -3890,7 +3895,7 @@ def create_app(
                 req.knowledge_base or config.knowledge_base_id,
                 req.query,
                 req.mode,
-                req.max_results * 4 if filtering else req.max_results,
+                search.ranking_parameters().overfetch(req.max_results, filtering=filtering),
                 req.source_name,
                 graph=serving_graph,
                 principal=req.principal,

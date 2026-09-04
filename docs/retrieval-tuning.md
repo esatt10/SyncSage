@@ -105,6 +105,16 @@ design is arranged to prevent.
 
 **Most trials cost no retrieval at all.**
 
+`filter_overfetch` is the `filters` stage's parameter, and it governs **every**
+post-filter: ACL, memory policy, section, and the retrieval criteria a caller
+passes. That is worth stating because it was not always true — each surface
+carried its own hardcoded multiplier for criteria filtering, so a bundle could
+be promoted on the strength of a parameter that half-governed the stage it was
+attributed to, and an operator following the glossary's advice would not see
+the effect it predicted. There is one over-fetch now, computed in one place
+(`RankingParameters.overfetch`), and a test fails if a second multiplier
+appears anywhere.
+
 The fusion parameters (`rrf_k`, the three arm weights) act *after* the arms have
 produced their candidates. They appear nowhere in the SQL, the embedding lookup
 or the graph walk — only in one loop, over lists that are already in hand. So

@@ -80,6 +80,8 @@ pheasant-kb/
 │   │                            means), glossary (what every measure means),
 │   │                            health (live stage rates)
 │   ├── sharding.py            ← `pheasant shard plan`
+│   ├── decision.py            ← the gate vocabulary both planes share: a
+│   │                            GateSet that cannot be constructed empty
 │   ├── jobs.py                ← per-source progress: phase, rate, ETA, stalled
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
 │   ├── sync/                  ← engine, connectors, watcher, scheduler, locks,
@@ -94,7 +96,9 @@ pheasant-kb/
 │   │                            transcriber, office, msdoc
 │   ├── graph/                 ← model, simple, builder, enrichment, capacity
 │   ├── search/                ← sqlite_store (FTS5/tsvector + BM25),
-│   │                            graph_search, hybrid (RRF), criteria, vector,
+│   │                            graph_search, hybrid, fusion (the one RRF
+│   │                            loop, two entry points), explain (the stage
+│   │                            block's declared shape), criteria, vector,
 │   │                            ranking (the tunable parameters, fleet-scoped)
 │   ├── memory/                ← store, projection, policy, steering, salience,
 │   │                            bridge, maintenance, formation, benchmark
@@ -110,7 +114,7 @@ pheasant-kb/
 │   └── telemetry/             ← metrics.py (Prometheus exposition),
 │                                interactions.py (the observation plane)
 ├── ui/                        ← React + Vite workspace (baked into the image)
-└── tests/                     ← 119 pytest modules, offline by design
+└── tests/                     ← 121 pytest modules, offline by design
 ```
 
 Key entities: **knowledge base** (`kb_id` = `pheasant.name`) → **sources** →
@@ -221,7 +225,11 @@ For deployment/configuration work, load
     (`api/app.py`) saying whether a running server can pick the change up.
     `tests/test_config_surface_freshness.py` fails CI on all three,
     mechanically. **Individual field defaults need no second edit** — the
-    wizard reads them off the live dataclasses.
+    wizard reads them off the live dataclasses — and neither does **nesting**:
+    `model_validate` derives it from the annotations, so a nested section is
+    constructed because its type says it is one. That last edit used to be a
+    fourth, hand-written branch that the freshness test did *not* cover, so a
+    section added without it loaded silently as defaults.
 12. **DuckDB is read-side only.** `src/pheasant/analytics.py` uses it as a
     Parquet writer and a query engine over `/exports`; it must never become a
     `storage.backend` or appear on the sync path. Three reasons, each measured
@@ -279,6 +287,14 @@ Ranking carries deliberate structure: `chunks_fts.title` holds the file's
 by path depth and by tests/samples membership. Query expansion drops framing
 stopwords. Criteria (`source_name`, `exclude_sources`, `node_types`,
 `min_score`, `section`, `principal`) are available identically on MCP and HTTP.
+
+**One over-fetch.** When a post-filter will drop rows the arms fetch further,
+so `max_results` keeps meaning "give me this many" — and that is
+`ranking.filter_overfetch`, computed in `RankingParameters.overfetch` and
+nowhere else. It governs the ACL, section, memory *and* criteria filters; each
+surface used to carry its own `× 4` for the last of those, so the tunable
+parameter half-governed the stage the glossary attributed it to.
+`tests/test_ranking_parameters.py` fails if a second multiplier appears.
 
 Concept extraction was **retired**: it was 87% of nodes and 98.6% of edges and
 failed every test set for it. `graph.enrichment._add_concept` is a no-op whose
@@ -915,6 +931,47 @@ Each of these cost real time. They are listed because the shape recurs.
   "an ingress authenticates this". The general shape: when a control is a
   *property of the deployment* rather than of the code, it must be re-derived
   per deployment shape, not inherited.
+- **Two mechanisms for one idea, and only one of them tunable.** Retrieval
+  over-fetches when a post-filter will drop rows, so `max_results` keeps
+  meaning "give me this many". That existed twice: `ranking.filter_overfetch`
+  governed the ACL/section/memory filters, and each *surface* carried its own
+  hardcoded `max_results * 4` for retrieval criteria — with the vector arm
+  holding a third copy and the assistant's retrieval path doing no over-fetch
+  at all while still post-filtering. The parameter is declared tunable, bounded
+  and mapped to the `filters` stage, and the tuning glossary tells an operator
+  that a `filters` miss may mean it is too small; so a bundle could be promoted
+  on a parameter that half-governed the stage it was attributed to, and an
+  operator following that advice would see no effect. The arithmetic lives in
+  one method now and a test greps for a numeric multiplier on a result count
+  anywhere else — which immediately found a *sixth* site, in vocabulary
+  publication. That one is genuinely a different concern, so it got a name
+  (`VOCAB_OVERFETCH`) rather than the parameter: the guard's real output is
+  forcing the distinction to be stated.
+- **A lesson can propagate while the code does not.** `all([])` is `True`, so a
+  skipped evaluation run reported that it passed the gates it never evaluated.
+  The tuning plane, written afterwards, shipped its *own* copy of the guard,
+  with a docstring citing the evaluation plane's incident as justification. Two
+  implementations of one invariant, and a third plane would have started from
+  zero. `pheasant.decision` owns the vocabulary now, and the invariant is a
+  constructor precondition rather than a remembered check: `GateSet` refuses to
+  be built empty, "no gates" is the *absence* of a GateSet, and absence has no
+  `passed` to misread.
+- **A lambda closes over the name, not the value.** Consolidating the memory
+  policy into one rule with two renderers put each clause's SQL fragment in a
+  lambda. Two clauses built a placeholder string into a local called
+  `placeholders`, so the steering fragment rendered with the scope clause's
+  placeholder count and SQLite refused the statement outright. Caught by the
+  parity test the consolidation was supposed to make redundant — which is the
+  point worth keeping: removing the drift *between* two renderings does not
+  make either rendering correct, so the test that compares them stays.
+- **`get_args(list[X])` is also `(X,)`.** Deriving config construction from the
+  dataclasses meant asking "does this annotation name a nested section" and
+  "does it name a Path". Both answers unwrap unions — and a `list[Path]`
+  unwraps identically to `Path | None`, so the whole list went to `Path()`, and
+  `list[SourceConfig]` looked like a section and was handed to a constructor
+  with three required arguments. The origin has to be checked before the args.
+  Both surfaced immediately here; the second was latent (the only such field is
+  skipped by name), which is the kind that waits for the second one.
 - **Backend coverage behind a path filter is coverage nobody can reason
   about.** Postgres — the scale-out backend, and the one the offline suite
   cannot see — ran only in the evaluation, memory and tuning workflows, each

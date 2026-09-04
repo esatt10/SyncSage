@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from dataclasses import fields as dataclass_fields
 from enum import Enum, StrEnum
+from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args, get_origin, get_type_hints
 
 #: Patterns that keep credentials out of the index. Unlike the rest of
 #: ``DEFAULT_EXCLUDES``, these are **not** merely a default a caller can
@@ -126,6 +127,99 @@ FILESYSTEM_SOURCE_TYPES = frozenset(
 
 _TRUTHY = {"true", "yes", "on", "1"}
 _FALSY = {"false", "no", "off", "0"}
+
+
+@cache
+def _field_types(dc: type) -> dict[str, Any]:
+    """Resolved annotations for a config dataclass.
+
+    ``from __future__ import annotations`` makes every annotation in this file
+    a string, so the nesting has to be resolved rather than read. Cached
+    because it is resolved once per class and then consulted on every config
+    load, including the live-edit path.
+
+    Resolution is against the defining module's namespace, so a config
+    dataclass has to live at module level — which every one of them does, and
+    which is the arrangement this whole scheme assumes. A section defined
+    inside a function raises here rather than silently loading as its
+    defaults, and that is the right direction to fail in: the silent version
+    is the bug this replaced.
+    """
+
+    return get_type_hints(dc)
+
+
+def _model_type(annotation: Any) -> type | None:
+    """The nested config dataclass an annotation names, ignoring ``| None``.
+
+    A container of them is **not** one: `get_args(list[SourceConfig])` is also
+    `(SourceConfig,)`, so without the origin check a list field would be
+    handed to the dataclass constructor as though it were a single section.
+    `sources` is the only such field today and `model_validate` skips it by
+    name, which is exactly why this needs to be right rather than incidentally
+    unreached — the second one would be a silent misconstruction.
+    """
+
+    if get_origin(annotation) in {list, tuple, dict, set}:
+        return None
+    for candidate in get_args(annotation) or (annotation,):
+        if isinstance(candidate, type) and issubclass(candidate, ModelMixin):
+            return candidate
+    return None
+
+
+def _is_path(annotation: Any) -> bool:
+    """``Path`` or ``Path | None`` — deliberately not ``list[Path]``.
+
+    `get_args(list[Path])` is also `(Path,)`, so a union check alone matches
+    the list annotation and hands the whole list to `Path()`. The container
+    case is answered by :func:`_is_path_list` and excluded here.
+    """
+
+    if get_origin(annotation) is list:
+        return False
+    return any(candidate is Path for candidate in (get_args(annotation) or (annotation,)))
+
+
+def _is_path_list(annotation: Any) -> bool:
+    return get_origin(annotation) is list and get_args(annotation)[:1] == (Path,)
+
+
+def _build(annotation: Any, raw: Any) -> Any:
+    """One value of a config tree, from plain data.
+
+    Recursive and derived: a nested section is built because its annotation
+    says it is one, not because a branch upstream remembered to name it. Paths
+    are coerced the same way, so a new ``Path`` field needs no edit either.
+
+    ``None`` and non-mapping values pass through: a section absent from YAML
+    gets the dataclass's own default, which is what makes every field's
+    default the single source of truth the wizard already reads.
+    """
+
+    model = _model_type(annotation)
+    if model is not None:
+        if not isinstance(raw, dict):
+            # Absent, or already built (the live-edit path hands over
+            # instances). Either way the caller's default stands.
+            return raw if isinstance(raw, model) else model()
+        values = dict(raw)
+        _coerce_scalar_fields(model, values)
+        hints = _field_types(model)
+        return model(
+            **{
+                name: _build(hints[name], value)
+                for name, value in values.items()
+                if name in model.__dataclass_fields__
+            }
+        )
+    if raw is None:
+        return None
+    if _is_path(annotation):
+        return Path(raw)
+    if _is_path_list(annotation):
+        return [Path(item) for item in raw or []]
+    return raw
 
 
 def _coerce_scalar_fields(dc: type, raw: dict[str, Any]) -> None:
@@ -1856,114 +1950,28 @@ class PheasantConfig(ModelMixin):
 
     @classmethod
     def model_validate(cls, data: dict[str, Any]) -> PheasantConfig:
-        def build(dc, raw):
-            raw = raw or {}
-            _coerce_scalar_fields(dc, raw)
-            if dc is PheasantSettings:
-                for key in ("state_path", "workspace_root", "exports_path"):
-                    if key in raw:
-                        raw[key] = Path(raw[key])
-            if dc is StorageSettings:
-                for key in ("sqlite_path", "graph_path", "manifest_path"):
-                    if key in raw and raw[key] is not None:
-                        raw[key] = Path(raw[key])
-            if dc is SecuritySettings:
-                if "allow_workspace_roots" in raw:
-                    raw["allow_workspace_roots"] = [
-                        Path(item) for item in raw["allow_workspace_roots"] or []
-                    ]
-                if "idp" in raw and isinstance(raw["idp"], dict):
-                    raw["idp"] = build(IdPSettings, raw["idp"])
-                if "api_auth" in raw and isinstance(raw["api_auth"], dict):
-                    raw["api_auth"] = build(ApiAuthSettings, raw["api_auth"])
-            if dc is ServerSettings:
-                if "mcp" in raw and isinstance(raw["mcp"], dict):
-                    raw["mcp"] = build(McpSettings, raw["mcp"])
-                if "api" in raw and isinstance(raw["api"], dict):
-                    raw["api"] = build(ApiSettings, raw["api"])
-                if "ui" in raw and isinstance(raw["ui"], dict):
-                    raw["ui"] = build(UiSettings, raw["ui"])
-            if dc is VectorStoreSettings:
-                if raw.get("path") is not None:
-                    raw["path"] = Path(raw["path"])
-            if dc is SearchSettings:
-                if "embeddings" in raw and isinstance(raw["embeddings"], dict):
-                    raw["embeddings"] = build(EmbeddingsSettings, raw["embeddings"])
-                if "vector_store" in raw and isinstance(raw["vector_store"], dict):
-                    raw["vector_store"] = build(VectorStoreSettings, raw["vector_store"])
-                if "ranking" in raw and isinstance(raw["ranking"], dict):
-                    raw["ranking"] = build(SearchRankingSettings, raw["ranking"])
-            if dc is AssistantSettings:
-                if "retrieval" in raw and isinstance(raw["retrieval"], dict):
-                    raw["retrieval"] = build(RetrievalSettings, raw["retrieval"])
-            if dc is MemorySettings:
-                if "synthesis" in raw and isinstance(raw["synthesis"], dict):
-                    raw["synthesis"] = build(MemorySynthesisSettings, raw["synthesis"])
-                if "formation" in raw and isinstance(raw["formation"], dict):
-                    raw["formation"] = build(MemoryFormationSettings, raw["formation"])
-            if dc is ObservabilitySettings:
-                if "interactions" in raw and isinstance(raw["interactions"], dict):
-                    raw["interactions"] = build(InteractionSettings, raw["interactions"])
-            if dc is EvaluationSettings:
-                for key, nested in (
-                    ("proof", EvaluationProofSettings),
-                    ("cohorts", EvaluationCohortSettings),
-                    ("variants", EvaluationVariantSettings),
-                    ("gates", EvaluationGateSettings),
-                    ("promotion", EvaluationPromotionSettings),
-                ):
-                    if key in raw and isinstance(raw[key], dict):
-                        raw[key] = build(nested, raw[key])
-            if dc is TuningSettings:
-                if "objective" in raw and isinstance(raw["objective"], dict):
-                    raw["objective"] = build(TuningObjectiveSettings, raw["objective"])
-                if "tracking" in raw and isinstance(raw["tracking"], dict):
-                    raw["tracking"] = build(TuningTrackingSettings, raw["tracking"])
-                if "auto" in raw and isinstance(raw["auto"], dict):
-                    raw["auto"] = build(TuningAutoSettings, raw["auto"])
-            if dc is InteractionSettings:
-                if raw.get("spool_path") is not None:
-                    raw["spool_path"] = Path(raw["spool_path"])
-                if "queue" in raw and isinstance(raw["queue"], dict):
-                    raw["queue"] = build(LogQueueSettings, raw["queue"])
-            if dc is IngestionSettings:
-                if "captioner" in raw and isinstance(raw["captioner"], dict):
-                    raw["captioner"] = build(CaptionerSettings, raw["captioner"])
-                if "transcriber" in raw and isinstance(raw["transcriber"], dict):
-                    raw["transcriber"] = build(TranscriberSettings, raw["transcriber"])
-                if "extractor" in raw and isinstance(raw["extractor"], dict):
-                    raw["extractor"] = build(ExtractorSettings, raw["extractor"])
-            if dc is SyncSettings:
-                if "watcher" in raw and isinstance(raw["watcher"], dict):
-                    raw["watcher"] = build(WatcherSettings, raw["watcher"])
-                if "git" in raw and isinstance(raw["git"], dict):
-                    raw["git"] = build(GitSettings, raw["git"])
-                if "scheduler" in raw and isinstance(raw["scheduler"], dict):
-                    raw["scheduler"] = build(SchedulerSettings, raw["scheduler"])
-                if "limits" in raw and isinstance(raw["limits"], dict):
-                    raw["limits"] = build(SyncLimitsSettings, raw["limits"])
-                if "concurrency" in raw and isinstance(raw["concurrency"], dict):
-                    raw["concurrency"] = build(SyncConcurrencySettings, raw["concurrency"])
-                if "queue" in raw and isinstance(raw["queue"], dict):
-                    raw["queue"] = build(SyncQueueSettings, raw["queue"])
-            return dc(**{k: v for k, v in raw.items() if k in dc.__dataclass_fields__})
+        """Build the config tree from plain data.
+
+        Nesting is derived from the dataclasses rather than wired by hand.
+        This used to be ~90 lines of `if dc is ServerSettings: if "mcp" in raw:
+        raw["mcp"] = build(McpSettings, ...)`, one branch per nested section —
+        a fourth edit that rule 11's freshness test did not cover, so a section
+        added without it loaded silently as defaults. Every section in this
+        file was one forgotten line away from being ignored, and two were added
+        during this work with exactly that hazard.
+
+        What stays hand-written is what is genuinely not derivable: the source
+        list, whose `path` is anchored to `workspace_root` and whose `type` may
+        be a plugin string outside the enum, and the three state paths defaulted
+        from `pheasant.state_path` at the end.
+        """
 
         cfg = cls(
-            pheasant=build(PheasantSettings, data.get("pheasant")),
-            server=build(ServerSettings, data.get("server")),
-            storage=build(StorageSettings, data.get("storage")),
-            search=build(SearchSettings, data.get("search")),
-            ingestion=build(IngestionSettings, data.get("ingestion")),
-            sync=build(SyncSettings, data.get("sync")),
-            graph=build(GraphSettings, data.get("graph")),
-            security=build(SecuritySettings, data.get("security")),
-            synapse=build(SynapseSettings, data.get("synapse")),
-            memory=build(MemorySettings, data.get("memory")),
-            observability=build(ObservabilitySettings, data.get("observability")),
-            assistant=build(AssistantSettings, data.get("assistant")),
-            evaluation=build(EvaluationSettings, data.get("evaluation")),
-            tuning=build(TuningSettings, data.get("tuning")),
-            sources=[],
+            **{
+                name: _build(annotation, data.get(name))
+                for name, annotation in _field_types(cls).items()
+                if name != "sources"
+            }
         )
         cfg.sources = []
         for raw in data.get("sources", []) or []:
@@ -1980,18 +1988,13 @@ class PheasantConfig(ModelMixin):
             if not src_path.is_absolute() and raw["type"] in FILESYSTEM_SOURCE_TYPES:
                 src_path = cfg.pheasant.workspace_root / src_path
             raw["path"] = src_path
-            if "repo" in raw:
-                raw["repo"] = build(RepoSettings, raw["repo"])
-            if "chunking" in raw:
-                raw["chunking"] = build(ChunkingSettings, raw["chunking"])
-            if "sync" in raw:
-                raw["sync"] = build(SourceSyncSettings, raw["sync"])
-            if "connector" in raw:
-                raw["connector"] = build(SourceConnectorSettings, raw["connector"])
-            if "taxonomy" in raw:
-                raw["taxonomy"] = build(TaxonomySettings, raw["taxonomy"])
-            if raw.get("limits") is not None:
-                raw["limits"] = build(SyncLimitsSettings, raw["limits"])
+            hints = _field_types(SourceConfig)
+            for key, value in list(raw.items()):
+                if key in {"type", "path"} or key not in hints:
+                    continue
+                nested = _model_type(hints[key])
+                if nested is not None and isinstance(value, dict):
+                    raw[key] = _build(hints[key], value)
             _coerce_scalar_fields(SourceConfig, raw)
             cfg.sources.append(
                 SourceConfig(

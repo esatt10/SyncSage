@@ -339,6 +339,7 @@ with body matches on rare ones. The top hit agrees on the gold set;
 | `ranking.prefer_recent_commits` | bool | `true` (example) | Boost content tied to recent commits. |
 | `ranking.graph_neighbor_boost` | bool | `true` (example) | Boost graph-adjacent matches. |
 | `ranking.max_results_default` | integer | `10` | Default result count cap. |
+| `ranking.filter_overfetch` | float | `3.0` | How far past `max_results` the arms fetch when a post-filter will remove candidates afterwards — ACL, memory policy, section, **and** the retrieval criteria a caller passes (`exclude_sources`, `node_types`, `min_score`, `source_types`). One parameter for every over-fetch: the surfaces each carried a hardcoded `× 4` until 35.9, so raising this moved some filters and not others while the tuning glossary said it governed the `filters` stage. Clamped to `(1.0, 10.0)`; below 1.0 would turn an over-fetch into a truncation. |
 | `wasm_relationship_search` | bool | `false` | Run `graph_search._scan_edges` through the vendored WASM accelerator (Synapse 34.5b) instead of pure Python. Needs the `[wasm]` extra; falls back to pure Python on any failure or if the extra is missing — never a correctness dependency. A consistent, growing win (2-8x at 34.4's benchmark scale) on the relationship-search query path. **The Docker image turns this on** in a config it generates itself, since it always installs the `[wasm]` extra. |
 
 ---
