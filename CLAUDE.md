@@ -94,7 +94,8 @@ pheasant-kb/
 │   ├── ingestion/             ← pipeline, chunking, content_types, taxonomy,
 │   │                            extractor (7 doc formats), captioner,
 │   │                            transcriber, office, msdoc
-│   ├── graph/                 ← model, simple, builder, enrichment, capacity
+│   ├── graph/                 ← model, simple, builder, enrichment, capacity,
+│   │                            traversal (the pure hierarchy-first walk)
 │   ├── search/                ← sqlite_store (FTS5/tsvector + BM25),
 │   │                            graph_search, hybrid, fusion (the one RRF
 │   │                            loop, two entry points), explain (the stage
@@ -104,6 +105,10 @@ pheasant-kb/
 │   │                            bridge, maintenance, formation, benchmark
 │   ├── persistence/           ← state_store, backends (sqlite|postgres),
 │   │                            schema, graph_store, manifest, migrate, paths
+│   ├── services/              ← the application layer: one implementation per
+│   │                            operation, two transports. errors (refusals
+│   │                            both surfaces spell the same), retrieval,
+│   │                            graph, assistant
 │   ├── mcp_server/            ← server.py (MCPServer), tools.py (PheasantTools)
 │   ├── api/app.py             ← the HTTP surface
 │   ├── assistant/             ← grounded answering + workflows
@@ -114,7 +119,7 @@ pheasant-kb/
 │   └── telemetry/             ← metrics.py (Prometheus exposition),
 │                                interactions.py (the observation plane)
 ├── ui/                        ← React + Vite workspace (baked into the image)
-└── tests/                     ← 121 pytest modules, offline by design
+└── tests/                     ← 123 pytest modules, offline by design
 ```
 
 Key entities: **knowledge base** (`kb_id` = `pheasant.name`) → **sources** →
@@ -242,10 +247,50 @@ For deployment/configuration work, load
     mount `/state:ro` on the API replicas while the indexer writes. The export
     takes no lease and issues nothing but `SELECT`, which is what makes it safe
     to run during a sync.
+13. **One operation, one implementation.** An operation both surfaces expose
+    lives in `src/pheasant/services/` and nowhere else; `api/app.py` and
+    `mcp_server/tools.py` parse a request, call it, and marshal the answer.
+    Layering is transport → services → domain → persistence with no upward
+    edges, and both halves are tests, not conventions
+    (`tests/test_surface_conformance.py`, `tests/test_service_layering.py`).
+    Adding an operation to one surface only is how the last four divergences
+    started; if it genuinely belongs to one transport, say so in the adapter,
+    where a reader can see it.
 
 ---
 
 ## 5. How the system works now
+
+### Surfaces and layering
+
+**transport → services → domain → persistence, no upward edges.** pheasant has
+two public APIs — HTTP (whose largest consumer is the bundled UI) and MCP
+(whose consumers are agents) — and they are one implementation exposed twice.
+That is now true; it used to be documentation. `api/app.py` referenced
+`PheasantTools` once, for introspection, and four of the five shared
+operations had already drifted apart, including `relevant_files` applying the
+memory policy over HTTP and not over MCP — an agent could be served a record
+the region *knew* had been corrected.
+
+An operation lives in `services/` once and owns retrieval criteria, the
+over-fetch, the memory policy, metrics and **its refusal text**. The two
+transports are adapters: parse a request, call one function, marshal the
+answer. A behaviour that differs between the surfaces has to be a difference
+in an adapter — a thing a reader can see — rather than a difference between
+two implementations, which is a thing nobody sees until it is reported.
+
+Refusals are `ServiceError(ValueError)` subclasses carrying a `status` hint, so
+the MCP server's existing `ValueError`/`KeyError` → `ToolError` translation and
+HTTP's 400 both keep working, and each adapter can be taught the richer mapping
+independently.
+
+Two tests hold it. `tests/test_surface_conformance.py` drives the same
+operations through both surfaces against one corpus and asserts identical
+results *and* identical refusal text — it is what found the `graph_generation`
+bug below. `tests/test_service_layering.py` is an import-graph test: no module
+imports a layer above its own, `services/` imports no transport, and every
+package declares its layer, with `cli.py` and the benchmarks named as
+composition roots because building a transport is their job.
 
 ### Ingestion
 
@@ -1007,6 +1052,57 @@ Each of these cost real time. They are listed because the shape recurs.
   a region that is doing nothing), and it is absent entirely on a process that
   is not the commit authority, because a confident `0.0` from an api replica
   reads as headroom. Same posture as `tuning.health` below its sample floor.
+- **"One facade, exposed twice" is a claim only a test can hold.** The HTTP and
+  MCP surfaces were documented as one API and were two implementations of it:
+  `api/app.py` mentioned `PheasantTools` once, for introspection, and two of
+  its docstrings said a function "mirrors" a tool it had in fact drifted from.
+  Four of the five shared operations differed, and the worst was silent —
+  `relevant_files` applied the memory policy over HTTP and not over MCP, so the
+  surface built for agents could serve a record the region *knew* had been
+  superseded, while the surface a human watches could not. Nobody decided any
+  of it; it is what happens when a fix lands on the surface whose bug report
+  arrived. The extraction is only half the answer: `tests/test_surface_conformance.py`
+  drives both surfaces over one corpus and asserts identical results *and*
+  identical refusal text, because two spellings of one refusal is the same
+  defect one level down.
+- **A conformance test finds bugs in the thing it was written to protect.**
+  The matrix's first run reported `graph_generation: null` on MCP and a real
+  value on HTTP — not a divergence between the surfaces but a defect in the
+  event-driven graph reload committed a week earlier: `loaded_graph_generation`
+  was set when a replica *read* a graph and never when a process *published*
+  one, so `role: all` — the default, every standalone container — reported
+  "no generation loaded" forever, and the staleness signal `/ready` publishes
+  was unusable exactly where most deployments live. The engine adopts the
+  generation it just committed now. The general shape: a test that compares two
+  independent paths reveals things neither path's own tests can, because each
+  was written by someone who already believed the answer.
+- **Not every divergence a comparison finds is a bug to fix in that commit.**
+  The same matrix then found the graph arm ordering equal-scoring nodes one way
+  from an in-memory graph and another from the same graph loaded off disk.
+  Real, and *not* fixed there: a deterministic tie-break inside a retrieval arm
+  is a ranking change, it moves results for every deployed region, and it needs
+  its own evidence rather than a line in a refactor. The fixture equalises the
+  two by reloading, the divergence is written down, and the change is a change.
+  A refactor that quietly fixes ranking is a refactor nobody can review.
+- **A package can span two layers, and the layer test is how you find out.**
+  `assistant` was classified as application-level because it orchestrates
+  retrieval to answer a question — true of `chat.py`, `retrieval.py` and
+  `workflows/`, and false of `catalog.py`, `providers.py`, `llm.py` and
+  `credentials.py`, which are model-access adapters that `memory/synthesis.py`
+  and `setup_wizard.py` legitimately reach for. Declaring one layer per
+  top-level package would have forced a choice between a false failure and
+  deleting the rule. Layers resolve by longest declared prefix instead, so the
+  split is stated where a reader can see it — and `memory` importing
+  `assistant.chat`, the edge that would actually be wrong, still fails.
+- **Extracting a layer inverts dependencies you did not know you had.** Two
+  fell out of the same test run and neither is about HTTP: `services/graph.py`
+  held the pure hierarchy-first walk *and* the ACL guard, so the assistant
+  could not reach the walk without importing the service layer (split into
+  `graph/traversal.py`), and `sync/worker.py` imported `pheasant.cli` for one
+  progress-marker string, putting the whole CLI under the worker (the constant
+  moved to the side that parses it, and `cli.py` re-exports it). Both had been
+  invisible for as long as they existed, because nothing had ever asked which
+  direction they pointed.
 
 ---
 

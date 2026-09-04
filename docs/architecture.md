@@ -25,7 +25,8 @@ incremental runs deterministic.
 
 | Component | Responsibility |
 |---|---|
-| API/MCP/UI | Health, source control, sync submission, search, answering, and agent tools. |
+| API/MCP/UI | Transport adapters. Parse a request, call one application service, marshal the answer. |
+| Application services | One implementation per operation, shared by HTTP and MCP: retrieval criteria, over-fetch, memory policy, metrics and refusal text. |
 | Source registry | Configured and runtime source metadata, lifecycle state, and audit history. |
 | Indexer | Watch, schedule, drain durable work, coordinate preparation, and make the one authoritative commit per knowledge-base shard. |
 | Preparation worker | Stateless read/parse/extract/chunk work over authenticated HTTP or gRPC. It has no database or connector credentials. |
@@ -34,6 +35,40 @@ incremental runs deterministic.
 | Vector store | Optional semantic vectors; NumPy and LanceDB are supported. |
 | Log tier | Optional. Persists the interaction ledger, rolls expired rows to Parquet, and drops expired partitions. Exists so none of that runs on a process serving requests or holding the indexer's sync lock. |
 | NATS JetStream | Durable source-task transport between API and indexer in the fleet. Carries the log tier's batches on a separate stream when observation is enabled. |
+
+## Layering
+
+```
+transport (api, mcp_server, cli)
+    ↓
+services      one implementation per operation, transport-neutral
+    ↓
+domain        search, graph, memory, ingestion, sync
+    ↓
+persistence   state store, graph store, manifests
+```
+
+No upward edges. HTTP and MCP are the same API exposed twice, and that is a
+property the suite holds rather than an intention the docs state: the two
+surfaces had already drifted on four of five shared operations before the
+services layer existed, and the divergence that mattered was invisible —
+`relevant_files` applied the memory policy over HTTP and not over MCP, so the
+surface built for agents could serve a record the region knew had been
+corrected.
+
+An operation therefore lives in `src/pheasant/services/` once and owns its
+refusal text as well as its behaviour; `api/app.py` and
+`mcp_server/tools.py` are adapters. Refusals are `ServiceError` subclasses of
+`ValueError` carrying an HTTP status *hint*, so neither transport's error
+vocabulary leaks into the layer both of them call.
+
+Two tests hold the boundary. `tests/test_surface_conformance.py` drives the
+same operations through both surfaces against one corpus and asserts identical
+results and identical refusal text. `tests/test_service_layering.py` is an
+import-graph test: nothing imports a layer above its own, `services/` imports
+no transport, and every package declares its layer — `cli.py` and the
+benchmarks are named composition roots, because constructing a transport is
+what they are for.
 
 ## Retrieval decision
 

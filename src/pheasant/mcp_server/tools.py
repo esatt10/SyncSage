@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import threading
-from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -22,23 +21,29 @@ from pheasant.registry.knowledge_base_registry import KnowledgeBaseRegistry
 from pheasant.registry.source_registry import SourceRegistry
 from pheasant.search.criteria import (
     apply_retrieval_criteria,
-    criteria_active,
-    criteria_dict,
     source_of,
 )
 from pheasant.search.hybrid import HybridSearch
 from pheasant.search.ranking import resolver_for
 from pheasant.search.sqlite_store import SearchStore
 from pheasant.security.path_policy import resolve_config_write_target, resolve_under
+from pheasant.services import ServiceContext
+from pheasant.services import graph as graph_service
+from pheasant.services import retrieval as retrieval_service
+from pheasant.services.errors import SourceNotFound
 from pheasant.sync.engine import SyncEngine
 
 logger = logging.getLogger(__name__)
 
 #: Step 33.6 — the criteria filters moved to `pheasant.search.criteria` so
 #: `POST /search` and the MCP tool share one implementation instead of HTTP
-#: silently having fewer filters. `apply_retrieval_criteria` stays importable
-#: from this module (it is imported above, and callers and tests reach for it
-#: here); `_source_of` keeps its old private name for the same reason.
+#: silently having fewer filters. Applying them moved again in 35.9, into
+#: `services.retrieval.search`, so neither surface decides when they run
+#: either. `apply_retrieval_criteria` stays importable from this module —
+#: callers and tests reach for it here — and `_source_of` keeps its old
+#: private name for the same reason.
+__all__ = ["PheasantTools", "apply_retrieval_criteria", "source_of"]
+
 _source_of = source_of
 
 
@@ -89,6 +94,16 @@ class PheasantTools:
             default_memory_policy=config.memory.default_policy,
             usage_tracking=config.memory.usage_tracking,
             stage_sample_rate=config.observability.interactions.stage_sample_rate,
+        )
+        # The same application layer the HTTP surface calls, assembled the same
+        # way. Operations that exist on both surfaces are one function taking
+        # this; what remains on either side is transport.
+        self.services = ServiceContext(
+            config=config,
+            state=self.state,
+            searcher=self.searcher,
+            graph=self.graph,
+            engine=self.engine,
         )
 
     def _publish_sync(
@@ -789,49 +804,30 @@ class PheasantTools:
         subject and when it was asserted.
         """
         self._require_knowledge_base(knowledge_base)
-        # Over-fetch when a filter will drop rows, so `max_results` still
-        # means "give me this many" rather than "look at this many and give me
-        # whatever survives" — the latter silently returns short answers.
-        filtering = criteria_active(
-            exclude_sources, node_types, min_score, source_types, exclude_source_types
-        )
-        # Through the ranking parameter rather than a literal — see
-        # `RankingParameters.overfetch`. The HTTP surface computes the same
-        # number the same way, which is the point.
-        fetch = self.searcher.ranking_parameters().overfetch(max_results, filtering=filtering)
-        payload = self.searcher.search_context(
-            knowledge_base or self.config.knowledge_base_id,
-            query,
-            mode,
-            fetch,
-            source_name,
-            graph=self.graph,
-            principal=principal,
-            principal_groups=principal_groups,
-            security=self.config.security,
-            section=section,
-            memory=memory,
-        )
-        if filtering:
-            payload = dict(payload)
-            payload["results"] = apply_retrieval_criteria(
-                payload.get("results") or [],
+        # Transport adapter. The operation is `services.retrieval.search`:
+        # over-fetch, criteria, the memory policy, the metric and the graph
+        # generation are decided there, so the HTTP route of the same name
+        # cannot answer differently. Before that, this tool computed its own
+        # over-fetch and never recorded a search metric at all.
+        return retrieval_service.search(
+            self.services,
+            retrieval_service.SearchRequest(
+                query=query,
+                knowledge_base=knowledge_base,
+                mode=mode,
+                max_results=max_results,
+                source_name=source_name,
+                section=section,
+                principal=principal,
+                principal_groups=principal_groups,
+                memory=memory,
                 exclude_sources=exclude_sources,
                 node_types=node_types,
                 min_score=min_score,
                 source_types=source_types,
                 exclude_source_types=exclude_source_types,
-            )[:max_results]
-            payload["criteria"] = criteria_dict(
-                source_name,
-                exclude_sources,
-                node_types,
-                min_score,
-                memory,
-                source_types,
-                exclude_source_types,
-            )
-        return payload
+            ),
+        )
 
     def record_evidence(
         self,
@@ -1445,7 +1441,7 @@ class PheasantTools:
         (a vector mode is not offered when no vector index is built).
         """
         self._require_knowledge_base(knowledge_base)
-        from pheasant.api.app import RETRIEVAL_FIELD_HELP
+        from pheasant.services.assistant import RETRIEVAL_FIELD_HELP
 
         settings = self.config.assistant.retrieval
         has_vectors = self.engine.vectors is not None
@@ -1744,24 +1740,36 @@ class PheasantTools:
         max_files: int = 8,
         principal: str | None = None,
         principal_groups: list[str] | None = None,
+        section: str | None = None,
+        memory: Any = None,
     ) -> dict:
+        """Files most relevant to a described task.
+
+        Transport adapter for `services.retrieval.relevant_files`. That shared
+        implementation is what makes three behaviours true here that were true
+        only over HTTP before: results are deduplicated to one entry per file,
+        `section` narrows to a document's taxonomy, and the memory policy
+        applies — so a corrected record is no longer served to an agent.
+
+        ``section`` and ``memory`` are new parameters with defaults matching
+        the previous behaviour where it was correct to keep it, which is
+        additive evolution (rule 8).
+        """
+
         self._require_knowledge_base(knowledge_base)
-        # This is `search_context` with a different projection, so it runs
-        # under the same ACL enforcement — without `security` it returned
-        # unfiltered hits to every caller whenever acl_enforced was on.
-        # No `graph=`: this route answers with files, and graph nodes carry
-        # no path, so admitting them would crowd the file hits out.
-        payload = self.searcher.search_context(
-            knowledge_base or self.config.knowledge_base_id,
-            task,
-            "hybrid",
-            max_files,
-            source_name,
-            principal=principal,
-            principal_groups=principal_groups,
-            security=self.config.security,
+        return retrieval_service.relevant_files(
+            self.services,
+            retrieval_service.FilesRequest(
+                task=task,
+                knowledge_base=knowledge_base,
+                max_files=max_files,
+                source_name=source_name,
+                section=section,
+                principal=principal,
+                principal_groups=principal_groups,
+                memory=memory,
+            ),
         )
-        return {"files": payload["results"]}
 
     def get_graph_neighbors(
         self,
@@ -1769,93 +1777,61 @@ class PheasantTools:
         node_id: str,
         depth: int = 1,
         edge_types: list[str] | None = None,
+        max_nodes: int | None = None,
     ) -> dict:
-        self._require_knowledge_base(knowledge_base)
-        if getattr(self.graph, "is_remote_graph", False):
-            from pheasant.api.app import graph_neighbors
+        """Neighbouring nodes, breadth-first.
 
-            return graph_neighbors(self.graph, node_id, depth, edge_types)
-        graph = self.graph
-        if node_id not in graph:
-            return {"node_id": node_id, "neighbors": []}
-        max_depth = max(1, min(int(depth or 1), 10))
-        allowed = set(edge_types or [])
-        queue = deque([(node_id, 0, [node_id])])
-        visited = {node_id}
-        neighbors = []
-        while queue:
-            current, current_depth, path = queue.popleft()
-            if current_depth >= max_depth:
-                continue
-            for _source, target, edge_map in graph.out_edges(current):
-                matching_edges = [
-                    data for data in edge_map.values() if not allowed or data.get("type") in allowed
-                ]
-                if not matching_edges:
-                    continue
-                next_depth = current_depth + 1
-                # One entry per node, not per edge into it — the same fix as
-                # `api.app.graph_neighbors`, which this mirrors. `visited`
-                # guarded the queue but not the append, so a node reachable by
-                # two paths came back twice and `get_graph_slice` built a
-                # duplicated `nodes` payload from it.
-                if target in visited:
-                    continue
-                visited.add(target)
-                edge_type_values = sorted(
-                    {data.get("type") for data in matching_edges if data.get("type")}
-                )
-                neighbors.append(
-                    {
-                        "node_id": target,
-                        "depth": next_depth,
-                        "edge_types": edge_type_values,
-                        "path": [*path, target],
-                        "node": dict(graph.nodes.get(target, {})),
-                    }
-                )
-                queue.append((target, next_depth, [*path, target]))
-        return {"node_id": node_id, "depth": depth, "neighbors": neighbors}
+        Transport adapter for `services.graph.neighbors`. This used to be a
+        second BFS — without the hierarchy-first ordering, without `max_nodes`
+        and without either exclusion — so the same node returned a different
+        set of neighbours in a different order depending on which surface asked.
+        It also imported the HTTP module for the remote-graph case, which put
+        `api.app` on the import path of the tool layer.
+
+        ``max_nodes`` is new here and defaults to unbounded, which is what this
+        tool did before (rule 8: additive).
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        return graph_service.neighbors(self.graph, node_id, depth, edge_types, max_nodes=max_nodes)
 
     def get_file_summary(
         self,
         knowledge_base: str,
         path: str,
         source_name: str | None = None,
+        principal: str | None = None,
+        principal_groups: list[str] | None = None,
     ) -> dict:
+        """One indexed file: its artifact row, ordered summary, and content.
+
+        Transport adapter for `services.graph.file_summary`. Two things the
+        shared implementation brings that this tool did not have: chunk-ordered
+        concatenation (a bare `GROUP_CONCAT` returned summaries in whatever
+        order the join produced) and the **ACL check** — this endpoint hands
+        back an artifact body, and the guard existed on the HTTP route only.
+        """
+
         self._require_knowledge_base(knowledge_base)
-        rows = self.state.rows(
-            """SELECT artifacts.*, GROUP_CONCAT(chunks.summary, '\n') AS summary FROM artifacts
-        LEFT JOIN chunks ON chunks.artifact_id=artifacts.id
-        WHERE artifacts.relative_path=? AND (? IS NULL OR artifacts.source_id=?)
-        GROUP BY artifacts.id LIMIT 1""",
-            (path, source_name, source_name),
+        return graph_service.file_summary(
+            self.services, path, source_name, principal, principal_groups
         )
-        return dict(rows[0]) if rows else {"path": path, "summary": None}
 
     def get_repo_map(self, knowledge_base: str, source_name: str, depth: int = 3) -> dict:
+        """Every indexed path in one source. Adapter for `services.graph.repo_map`."""
+
         self._require_knowledge_base(knowledge_base)
-        rows = self.state.rows(
-            """SELECT relative_path,type,size_bytes
-            FROM artifacts WHERE source_id=? ORDER BY relative_path""",
-            (source_name,),
-        )
-        return {"source_name": source_name, "files": [dict(row) for row in rows]}
+        return graph_service.repo_map(self.services, source_name, depth)
 
     def explain_node(self, knowledge_base: str, node_id: str) -> dict:
+        """What a node is. Adapter for `services.graph.explain_node`.
+
+        The shared implementation returns the node's attributes under `node`,
+        which this tool omitted and the HTTP route did not.
+        """
+
         self._require_knowledge_base(knowledge_base)
-        graph = self.graph
-        attrs = graph.nodes.get(node_id)
-        if attrs is None:
-            return {"node_id": node_id, "explanation": "Node is not present in the current graph."}
-        node = dict(attrs)
-        return {
-            "node_id": node_id,
-            "type": node.get("type"),
-            "label": node.get("label"),
-            "explanation": f"{node.get('label')} is a {node.get('type')} node indexed by pheasant.",
-            "provenance": node.get("provenance"),
-        }
+        return graph_service.explain_node(self.services, node_id)
 
     def get_sync_status(self, knowledge_base: str) -> dict:
         self._require_knowledge_base(knowledge_base)
@@ -1905,40 +1881,32 @@ class PheasantTools:
         edge_types: list[str] | None = None,
         limit: int = 100,
     ) -> dict:
-        self._require_knowledge_base(knowledge_base)
-        if getattr(self.graph, "is_remote_graph", False):
-            from pheasant.api.app import graph_slice
+        """A bounded sub-graph around a node.
 
-            return graph_slice(self.graph, node_id, depth, edge_types, limit)
-        traversal = self.get_graph_neighbors(knowledge_base, node_id, depth, edge_types)
-        graph = self.graph
-        node_ids = [node_id] + [item["node_id"] for item in traversal["neighbors"][:limit]]
-        node_set = set(node_ids)
-        links = []
-        for source in node_set:
-            for _src, target, edge_map in graph.out_edges(source):
-                if target not in node_set:
-                    continue
-                for key, data in edge_map.items():
-                    if edge_types and data.get("type") not in set(edge_types):
-                        continue
-                    links.append({"source": source, "target": target, "key": key, **data})
-        return {
-            "node_id": node_id,
-            "depth": depth,
-            "nodes": [
-                dict(attrs) for attrs in (graph.nodes.get(item) for item in node_ids) if attrs
-            ],
-            "links": links,
-        }
+        Transport adapter for `services.graph.slice_`. The third
+        implementation of this walk lived here and was the thinnest: it kept no
+        `depths` map, reported no `truncated` flag, and asked for exactly
+        `limit` neighbours rather than one more — so a slice that had filled
+        its budget was indistinguishable from one that had run out of graph.
+        """
+
+        self._require_knowledge_base(knowledge_base)
+        return graph_service.slice_(self.graph, node_id, depth, edge_types, limit)
 
     def _require_knowledge_base(self, knowledge_base: str | None) -> None:
-        if knowledge_base and knowledge_base != self.config.knowledge_base_id:
-            raise ValueError(f"Unknown knowledge base: {knowledge_base}")
+        """Refuse a knowledge base this region does not hold.
+
+        Through the shared vocabulary since the service extraction, so the two
+        surfaces say the same thing: `UnknownKnowledgeBase` subclasses
+        `ValueError`, which is what `server.py` already translates into an
+        informative `ToolError`, so the SDK boundary is unchanged.
+        """
+
+        self.services.knowledge_base(knowledge_base)
 
     def _require_source(self, source_name: str) -> None:
         if not self.state.get_source(source_name):
-            raise KeyError(f"Unknown source: {source_name}")
+            raise SourceNotFound(source_name)
 
     def _source_config(self, source_name: str) -> SourceConfig:
         for source in self.config.sources:

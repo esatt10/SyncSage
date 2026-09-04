@@ -396,7 +396,7 @@ class GraphBuilder:
         sections, and a section `contains` its subsections — the same edge the
         directory/file hierarchy uses, so the taxonomy is walkable by the
         graph traversal that already knows how to follow `contains` (see
-        `api/app.py:HIERARCHY_EDGE_TYPES`).
+        `graph/traversal.py:HIERARCHY_EDGE_TYPES`).
         """
         headings = getattr(artifact, "headings", None)
         if not headings:

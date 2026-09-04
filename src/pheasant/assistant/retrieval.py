@@ -39,8 +39,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from pheasant.api.app import graph_neighbors as _graph_neighbors
-from pheasant.api.app import graph_slice as _graph_slice
+from pheasant.graph.traversal import neighbors as _graph_neighbors
+from pheasant.graph.traversal import slice_ as _graph_slice
 from pheasant.ingestion.content_types import ARTIFACT_TYPES
 
 VALID_MODES = ("hybrid", "text", "graph", "vector")

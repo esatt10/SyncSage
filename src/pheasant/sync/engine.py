@@ -70,6 +70,18 @@ from pheasant.sync.saturation import CommitAuthorityMeter
 
 logger = logging.getLogger(__name__)
 
+
+def _published_timestamp(value: object) -> float | None:
+    """A publication record's ISO-8601 instant as a unix timestamp, or None."""
+
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(str(value or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 SyncMode = Literal["incremental", "full", "validate_only", "repair"]
 SYNC_MODES = {"incremental", "full", "validate_only", "repair"}
 FULL_RESUME_SCOPE = "source:{name}:full_sync_phase"
@@ -358,8 +370,10 @@ class SyncEngine:
         #: and `/metrics` omits the series rather than reporting a confident
         #: zero from a process that could not saturate if it tried.
         self.commit_meter = CommitAuthorityMeter()
-        if self._graph_notifier.enabled:
-            self.graph_store.on_publish = self._graph_notifier.publish
+        # One hook for both jobs, covering every save site by construction —
+        # the same argument that put the announcement here rather than beside
+        # each `graph_store.save`.
+        self.graph_store.on_publish = self._on_graph_published
         self.graph_builder = GraphBuilder(config)
         self._loads_persisted_graph = bool(load_persisted_graph)
         self._graph_loaded = not self._loads_persisted_graph
@@ -501,6 +515,28 @@ class SyncEngine:
         )
         return loaded.number_of_nodes()
 
+    def _on_graph_published(self, kb_id: str, record: dict) -> None:
+        """This process just committed a generation: adopt it, then announce it.
+
+        Adopting it matters more than it looks. A process that indexes *is*
+        serving the graph it just wrote — its in-RAM graph is those bytes — but
+        `loaded_graph_generation` was only ever set when a graph was **read**.
+        So the single container, which is `role: all` and indexes in-process,
+        reported `graph_generation: null` on `/health`, on `/ready` and on
+        every search response, for its whole life. The staleness comparison
+        that exists to make a stale replica detectable was inert on the
+        deployment most people run.
+
+        Found by the two-surface conformance matrix: the HTTP app had loaded a
+        graph at construction and had an id, the MCP facade had indexed one and
+        did not, and the same operation returned different answers.
+        """
+
+        self.loaded_graph_generation = str(record.get("generation_id") or "") or None
+        self.loaded_graph_published_at = _published_timestamp(record.get("published_at"))
+        if self._graph_notifier.enabled:
+            self._graph_notifier.publish(kb_id, record)
+
     def _note_loaded_generation(self) -> None:
         """Record which generation the in-RAM graph came from.
 
@@ -516,17 +552,9 @@ class SyncEngine:
         except Exception:  # noqa: BLE001 - a label must not break a load
             record = None
         self.loaded_graph_generation = str(record["generation_id"]) if record else None
-        self.loaded_graph_published_at = None
-        if record:
-            from datetime import datetime
-
-            try:
-                stamp = str(record.get("published_at") or "")
-                self.loaded_graph_published_at = datetime.fromisoformat(
-                    stamp.replace("Z", "+00:00")
-                ).timestamp()
-            except ValueError:
-                self.loaded_graph_published_at = None
+        self.loaded_graph_published_at = (
+            _published_timestamp(record.get("published_at")) if record else None
+        )
 
     def _ensure_persisted_graph_loaded(self) -> None:
         """Materialize the published graph only when a task will mutate it.

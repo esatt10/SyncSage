@@ -6,6 +6,8 @@ import os
 import sys
 from pathlib import Path
 
+from pheasant.sync.worker import PROGRESS_MARKER as worker_progress_marker
+
 
 def _print_scan(report: dict) -> None:
     """Human-readable pre-flight for one source.
@@ -1331,9 +1333,10 @@ def _engine(
     )
 
 
-#: Progress lines carry this marker so the parent can tell them apart from the
-#: final report (which is also JSON on stdout) without guessing at shape.
-PROGRESS_MARKER = "pheasant.progress"
+#: Re-exported from the worker that parses it. The CLI emits these lines and
+#: `sync.worker` reads them, so the constant belongs on the reading side; it
+#: keeps its name here because callers and tests import it from the CLI.
+PROGRESS_MARKER = worker_progress_marker
 
 
 def _progress_emitter():

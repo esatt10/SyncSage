@@ -42,11 +42,15 @@ THRESHOLD = 800
 #: size. Ratchet: lower these as the files shrink, and treat raising one as a
 #: decision rather than a formality.
 #:
-#: `api/app.py` is the one to watch — it is the finding's headline, and the
-#: service-layer extraction is what will actually move it.
+#: `api/app.py` is the one to watch — it is the finding's headline. The
+#: service-layer extraction has now taken its first bite (the retrieval and
+#: graph operations moved to `services/`, and both surfaces call them), which
+#: is why its ceiling and `mcp_server/tools.py`'s are lower than they were.
+#: Lowering a ceiling after a split is what makes the ratchet mean anything:
+#: the space the extraction freed is not left available for the next feature.
 CEILINGS: dict[str, int] = {
     "analytics.py": 1100,
-    "api/app.py": 5750,
+    "api/app.py": 5500,
     "assistant/chat.py": 950,
     "assistant/retrieval.py": 1150,
     "assistant/workflows/agentic.py": 1050,
@@ -59,7 +63,7 @@ CEILINGS: dict[str, int] = {
     "ingestion/taxonomy.py": 1100,
     "jobs.py": 950,
     "mcp_server/server.py": 1300,
-    "mcp_server/tools.py": 2100,
+    "mcp_server/tools.py": 2050,
     "memory/formation.py": 1150,
     "memory/store.py": 950,
     "persistence/schema.py": 1050,

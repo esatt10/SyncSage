@@ -34,6 +34,16 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+#: Progress lines carry this marker so the parent can tell them apart from the
+#: final report (which is also JSON on stdout) without guessing at shape.
+#:
+#: Defined here rather than in `cli.py` because it is a protocol between two
+#: processes and this is the side that *parses* it — the CLI emits it, and a
+#: domain module importing the CLI to learn its own wire format is the
+#: dependency running the wrong way.
+PROGRESS_MARKER = "pheasant.progress"
+
 #: A sync that has produced no output at all for this long is presumed hung.
 DEFAULT_TIMEOUT_S = 6 * 60 * 60
 DEFAULT_INACTIVITY_TIMEOUT_S = 30 * 60
@@ -150,8 +160,6 @@ def _run_streaming(
             command, capture_output=True, text=True, timeout=timeout, check=False
         )
         return completed.returncode, completed.stdout, completed.stderr
-
-    from pheasant.cli import PROGRESS_MARKER
 
     with subprocess.Popen(
         command,

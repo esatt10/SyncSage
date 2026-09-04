@@ -342,9 +342,11 @@ def test_readiness_publishes_the_loaded_generation_beside_the_published_one(
     assert payload["loaded"] == payload["published"]
     assert payload["current"] is True
 
-    # Another process commits. This one has not reloaded yet — which is
-    # exactly the state that used to be invisible.
-    engine.graph_store.save(KB, _graph(11))
+    # Another process commits. Through a second store over the same directory,
+    # because that is what another process *is*: writing through this engine's
+    # own store would have it adopt the generation it just published, which is
+    # correct and is not the case under test.
+    GraphStore(engine.graph_store.root).save(KB, _graph(11))
     payload = client.get("/ready").json()["graph_generation"]
     assert payload["loaded"] != payload["published"]
     assert payload["current"] is False
@@ -387,3 +389,55 @@ def test_a_search_says_which_graph_answered(tmp_path: Path) -> None:
     response = client.post("/search", json={"query": "anything", "max_results": 3})
     assert response.status_code == 200
     assert response.json()["graph_generation"] == engine.loaded_graph_generation
+
+
+def test_a_process_that_indexes_adopts_the_generation_it_published(tmp_path: Path) -> None:
+    """The single container is the deployment most people run, and it indexes.
+
+    `loaded_graph_generation` was set only when a graph was *read*, so a
+    process that built and committed one served it while reporting no
+    generation at all — `graph_generation: null` on `/health`, on `/ready` and
+    on every search response, for the process's whole life. The staleness
+    comparison that exists to make a stale replica detectable was inert on
+    `role: all`.
+
+    Found by the two-surface conformance matrix, which compared an HTTP app
+    that had loaded a graph against an MCP facade that had indexed one.
+    """
+
+    from pheasant.config.schema import PheasantConfig
+    from pheasant.sync.engine import SyncEngine
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "note.md").write_text("# Note\n\nrotation happens nightly\n", encoding="utf-8")
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "adopted",
+                "state_path": str(tmp_path / "state"),
+                "workspace_root": str(workspace),
+                "exports_path": str(tmp_path / "exports"),
+            },
+            "storage": {"graph_snapshots": False},
+            "sources": [
+                {
+                    "name": "docs",
+                    "type": "markdown_folder",
+                    "path": str(workspace),
+                    "include": ["**/*.md"],
+                }
+            ],
+        }
+    )
+    engine = SyncEngine(config)
+    try:
+        assert engine.loaded_graph_generation is None  # nothing published yet
+        engine.sync_source("docs", "full")
+
+        published = engine.graph_store.published_generation("adopted")
+        assert published is not None
+        assert engine.loaded_graph_generation == published["generation_id"]
+        assert engine.loaded_graph_published_at is not None
+    finally:
+        engine.close()
