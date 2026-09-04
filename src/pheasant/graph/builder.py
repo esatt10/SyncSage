@@ -9,7 +9,6 @@ from pheasant.graph.enrichment import (
     ArtifactEnrichment,
     CodeEnrichmentPass,
     MarkdownDocumentEnrichmentPass,
-    SemanticSimilarityPass,
     resolve_cross_source_edges,
 )
 from pheasant.graph.simple import SimpleMultiDiGraph
@@ -43,7 +42,6 @@ class GraphBuilder:
             CodeEnrichmentPass(),
             MarkdownDocumentEnrichmentPass(),
         ]
-        self.similarity_pass = SemanticSimilarityPass()
 
     def upsert_node(self, node_id: str, node_type: str, label: str, attrs: dict) -> None:
         """Write a node, moving ``updated_at`` only when something changed.
@@ -382,10 +380,15 @@ class GraphBuilder:
         headings: dict[str, list[str]] = {}
         entities: dict[str, list[str]] = {}
         referenced: dict[str, list[str]] = {}
-        node_types: dict[str, str] = {}
+        # Targets whose type rung 1 will actually ask about, resolved after the
+        # edge walk rather than during the node walk. The first version built
+        # `node_types` for **every node in the graph** to answer that question
+        # about the handful of targets a memory record's own edges reach — a
+        # whole-graph dict for a bounded lookup, and one of the structures
+        # keeping the indexer resident.
+        candidate_targets: dict[str, list[str]] = {}
         with self.graph.reading():
             for node_id, attrs in self.graph.iter_nodes():
-                node_types[node_id] = str(attrs.get("type") or "")
                 node_type = attrs.get("type")
                 if attrs.get("source_id") in memory_sources:
                     continue
@@ -413,9 +416,16 @@ class GraphBuilder:
                     # link rather than for what the record is about — visible
                     # on a live run, where one record drew two edges and only
                     # one of them reached a file.
-                    if node_types.get(target) in ARTIFACT_TYPES:
-                        referenced.setdefault(source, []).append(target)
+                    candidate_targets.setdefault(source, []).append(target)
                     break
+            # One pass over the candidates, not over the graph. `node_map()`
+            # is the live mapping under the lock already held, so this is the
+            # same lookup the old dict served — without materializing it.
+            nodes = self.graph.node_map()
+            for source, targets in candidate_targets.items():
+                for target in targets:
+                    if (nodes.get(target) or {}).get("type") in ARTIFACT_TYPES:
+                        referenced.setdefault(source, []).append(target)
 
         return BridgeInputs(
             records=records,
@@ -533,27 +543,26 @@ class GraphBuilder:
         source_name: str | None = None,
         changed_ids: set[str] | None = None,
     ) -> None:
-        """Link artifacts that share concept terms.
+        """Retired. Kept as a no-op because callers still name it.
 
-        ``changed_ids`` restricts the pass to pairs touching an artifact this
-        sync actually rewrote; the rest already have their edges and are
-        idempotent, so re-deriving them only costs CPU.
+        It linked artifacts sharing ``concept_terms`` — and concept extraction
+        was retired (``enrichment._add_concept``), so ``_base_concepts``
+        returns an empty enrichment and no node has carried a ``concept_term``
+        since. The pass therefore built an inverted index over an empty term
+        set and emitted nothing: measured on a real sync, **zero** nodes with
+        `concept_terms` and **zero** `similar_to` edges, which is the same
+        "the live graph contained zero similar_to edges" the concept
+        retirement already recorded as its third justification.
+
+        What it still cost was a walk over every node in the graph **plus a
+        `dict(attrs)` copy of every artifact node**, on every sync, to produce
+        that nothing. A no-op rather than a deletion because ``sync/engine.py``
+        calls it and the signature is the seam a future similarity pass would
+        re-use; deleting the call sites too would make re-introducing one a
+        larger diff than it needs to be.
         """
 
-        artifacts = []
-        with self.graph.reading():
-            for node_id, attrs in self.graph.iter_nodes():
-                if attrs.get("type") not in ARTIFACT_TYPES:
-                    continue
-                if source_name and attrs.get("source_id") != source_name:
-                    continue
-                artifacts.append((node_id, dict(attrs)))
-        for index, edge in enumerate(self.similarity_pass.run(artifacts, changed_ids=changed_ids)):
-            self.upsert_edge(edge.source, edge.target, edge.type, edge.attrs)
-            # Enrichment is one long CPU-bound stretch; without a yield it
-            # blocks every request thread for its whole duration.
-            if index % 500 == 499:
-                serve_yield()
+        return
 
     def add_cross_source_edges(self) -> int:
         """Resolve references whose targets resolve into a *different* source.
@@ -570,8 +579,21 @@ class GraphBuilder:
         # One lock hold, no copying: this walks every edge in the graph, so
         # snapshotting them first (1.5M dict copies on a real index) cost more
         # than the pass itself.
+        #
+        # The *nodes* are narrowed to the two kinds the resolver reads, which
+        # is what both `resolve_cross_source_edges` and its WASM twin already
+        # filter to on arrival: artifacts carrying a path, and the
+        # `external_reference` stubs a link produces. It used to hand over
+        # `dict(attrs)` for **every node in the graph** — measured 2.26s and
+        # roughly double peak memory at 100k files, to build a list whose
+        # first act was to throw three quarters of it away. Chunks are 55% of
+        # a real graph and symbols 20%; neither is looked at here.
+        nodes: list[tuple[str, dict[str, Any]]] = []
         with self.graph.reading():
-            nodes = [(node_id, dict(attrs)) for node_id, attrs in self.graph.iter_nodes()]
+            for node_id, attrs in self.graph.iter_nodes():
+                node_type = attrs.get("type")
+                if node_type == "external_reference" or node_type in ARTIFACT_TYPES:
+                    nodes.append((node_id, dict(attrs)))
             node_map = self.graph.node_map()
             for (source, target), edge_map in self.graph.iter_edges():
                 target_attrs = node_map.get(target)
@@ -616,12 +638,23 @@ class GraphBuilder:
             return resolve_cross_source_edges(nodes, ref_edges)
 
     def remove_source_content(self, source_name: str) -> None:
+        """Drop everything one source contributed.
+
+        Iterated under ``reading()`` rather than through ``nodes(data=True)``,
+        which materializes ``(node_id, attrs)`` for the **whole graph** before
+        the filter looks at the first one — measured **1.16s** at 100k files,
+        an order of magnitude more than the removal it was preparing for. The
+        live mapping is safe here because the lock is held for the walk and the
+        result is a plain list of ids.
+        """
+
         source_node = f"source:{self.kb_id}:{source_name}"
-        nodes = [
-            node_id
-            for node_id, attrs in self.graph.nodes(data=True)
-            if attrs.get("source_id") == source_name or node_id == source_node
-        ]
+        with self.graph.reading():
+            nodes = [
+                node_id
+                for node_id, attrs in self.graph.iter_nodes()
+                if attrs.get("source_id") == source_name or node_id == source_node
+            ]
         self.graph.remove_nodes_from(nodes)
 
     def remove_artifact_nodes(self, artifact_ids: list[str]) -> None:
@@ -639,11 +672,16 @@ class GraphBuilder:
         ids = set(artifact_ids)
         if not ids:
             return
-        nodes = [
-            node_id
-            for node_id, attrs in self.graph.nodes(data=True)
-            if node_id in ids or attrs.get("artifact_id") in ids
-        ]
+        # Same reasoning as `remove_source_content`: under the lock, not
+        # through a whole-graph snapshot. This one is called from memory
+        # maintenance for a handful of archived records, so the snapshot was
+        # the entire cost of the call.
+        with self.graph.reading():
+            nodes = [
+                node_id
+                for node_id, attrs in self.graph.iter_nodes()
+                if node_id in ids or attrs.get("artifact_id") in ids
+            ]
         self.graph.remove_nodes_from(nodes)
 
 

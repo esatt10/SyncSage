@@ -199,6 +199,21 @@ class SimpleMultiDiGraph:
                     # in Python the work the reverse index exists to do in SQL.
                     self._pending_removed_nodes.add(node)
                 self._out.pop(node, None)
+            # One walk of the edge table, because an edge is dropped when
+            # *either* endpoint goes and only the outgoing half is indexed.
+            #
+            # Two ways to make this O(degree) were measured and neither
+            # earned its place. Taking the outgoing half off `_out` and
+            # scanning only for incoming edges came out at 122.5ms against
+            # this loop's 126.0ms (100k files, 630k edges) — inside the
+            # noise, because the scan is what costs, not the test inside it.
+            # An in-adjacency index removes the scan properly and costs about
+            # what `_out` costs to maintain: ~215 bytes per node, 15% of the
+            # working set, to save ~120ms on a call that fires once per full
+            # sync and on a memory-maintenance beat. Written down rather than
+            # left for the next reader to re-derive: the shape is O(total) and
+            # the constant is small, so the fix is to stop holding the graph,
+            # not to index it further.
             for edge in list(self._edges):
                 if edge[0] in remove or edge[1] in remove:
                     dropped = self._edges.pop(edge, None)

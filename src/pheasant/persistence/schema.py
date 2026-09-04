@@ -802,6 +802,13 @@ CREATE TABLE IF NOT EXISTS graph_nodes (
 -- Per-source deletion (`remove_source_content`, `replace_source`) and the
 -- source filter every graph query may carry.
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_source ON graph_nodes(kb_id, source_id);
+-- The per-type tally `/overview`, `/graph/diagnostics` and the graph service's
+-- `stats` all publish, and the UI polls. As a *covering* index the GROUP BY
+-- never touches the table: measured 386ms -> 61.5ms at 630k nodes, for 10.8MB
+-- (1% of that database). The in-memory graph maintains the same tally on write
+-- for the same reason -- "re-counting 240k node types per request was costing
+-- seconds on endpoints the UI polls" -- so this is that decision, kept.
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_type ON graph_nodes(kb_id, type);
 CREATE TABLE IF NOT EXISTS graph_edges (
   kb_id TEXT NOT NULL,
   source TEXT NOT NULL,

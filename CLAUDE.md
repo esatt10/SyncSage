@@ -122,7 +122,7 @@ pheasant-kb/
 │   └── telemetry/             ← metrics.py (Prometheus exposition),
 │                                interactions.py (the observation plane)
 ├── ui/                        ← React + Vite workspace (baked into the image)
-└── tests/                     ← 124 pytest modules, offline by design
+└── tests/                     ← 125 pytest modules, offline by design
 ```
 
 Key entities: **knowledge base** (`kb_id` = `pheasant.name`) → **sources** →
@@ -388,6 +388,41 @@ disk, roughly 55×, stated as `capacity.GRAPH_ROW_BYTES_PER_NODE` (measured
 - **Migration.** A region upgrading imports its existing file once at boot and
   parks it as `*.migrated` (rule 2). `node_link_json` stays selectable and
   working, so a region that hits trouble reverts with one config line.
+- **The indexer still holds one, and that is now the only place residency is
+  required.** The builder mutates it and the enrichment passes walk it. Those
+  passes were written when "walk the whole graph" was free — because the whole
+  graph was already a dict in front of them — and three of them were doing it
+  for data they never read. Measured at 100k files and fixed:
+  `add_cross_source_edges` copied `dict(attrs)` for **every** node to hand the
+  resolver a list it immediately narrowed to 15% (2.95s and +160MB → 319ms and
+  +24MB); `_bridge_inputs` built `{node_id: type}` for every node to answer one
+  question about a handful of edge targets; and `remove_source_content` /
+  `remove_artifact_nodes` called `nodes(data=True)`, materializing the whole
+  graph before the filter looked at the first entry (1.16s, an order of
+  magnitude more than the removal it was preparing for).
+  `tests/test_graph_working_set.py` bounds what each pass may touch.
+- **What is left, and what it would cost.** `remove_nodes_from` is still
+  O(total edges) — an edge goes when *either* endpoint does and only the
+  outgoing half is indexed. Two fixes were measured and neither ships: taking
+  the outgoing half off `_out` came out at 122.5ms against 126.0ms, inside the
+  noise, because the scan is what costs rather than the test inside it; and an
+  in-adjacency index removes the scan properly for ~215 bytes per node, 15% of
+  the working set, to save ~120ms on a call that fires once per full sync and
+  on a memory-maintenance beat. The shape is O(total) and the constant is
+  small, so the answer is to stop holding the graph rather than to index it
+  further — see the next bullet for what that needs.
+- **The prerequisite for dropping the working set is batching, and Postgres
+  sets the bar.** The builder does a read-modify-write per node (`upsert_node`
+  reads `created_at`, `upsert_edge` reads the existing edge). Against rows
+  that is a point lookup: **8.2µs batched / 13.1µs each on SQLite** (630k of
+  them ≈ 5–8s, about 2% of a full index) but **46.5µs batched / 456µs each on
+  Postgres** — a socket round trip is 35× an in-process one, so the same 630k
+  is 29s batched and **287s unbatched**. Batching is therefore the whole
+  feasibility argument, not an optimization, and the fleet is exactly where
+  Postgres runs. The only irreducibly global structure left is cross-source
+  resolution's `by_path` index — every artifact path in the region, because a
+  reference resolves only once both sources are indexed — and that is ~15% of
+  nodes held for one pass rather than for the process.
 
 ### Retrieval
 
@@ -1255,6 +1290,51 @@ Each of these cost real time. They are listed because the shape recurs.
   graph that was just wiped, which changes what a full sync *means*.
   `tests/test_graph_backends.py` asserts stability on `incremental`, where it
   genuinely holds, and says why.
+- **A pass that walks the whole graph for a slice of it keeps the whole graph
+  alive.** Three did, and none of them was written wrongly — they were written
+  when the whole graph was already a dict in front of them, so narrowing had
+  no visible benefit. It has one now: the walk *is* the reason the working set
+  exists. `add_cross_source_edges` was the clearest, handing the resolver
+  `dict(attrs)` for every node when both the Python and WASM resolvers filter
+  arrivals to artifacts-with-a-path plus `external_reference` stubs — 15% of a
+  real graph, and the copy roughly doubled peak memory to build a list whose
+  first act was to throw three quarters of it away. The general shape: when a
+  data structure stops being free, every consumer written against "it is free"
+  becomes a question, and they do not announce themselves either.
+- **Dead code that walks is worse than dead code that sits.**
+  `add_similarity_edges` keyed off `concept_terms`, and concept extraction was
+  retired — so `_base_concepts` returns an empty enrichment and nothing has
+  carried a concept term since. The pass still walked every node *and copied
+  every artifact's attributes* to emit zero edges, on every sync. The concept
+  retirement's own third justification was already "the live graph contained
+  zero `similar_to` edges"; what nobody went back for was the walk still being
+  paid to produce them. `tests/test_graph_working_set.py` asserts both halves —
+  the pass emits nothing, *and* no node carries a concept term — so if
+  enrichment ever starts emitting them again the no-op is caught rather than
+  silently dropping edges.
+- **An efficiency claim needs a bound, not a stopwatch.** Every assertion in
+  `tests/test_graph_working_set.py` counts what the code *touches* — the node
+  types handed to the resolver, whether a whole-graph snapshot was taken — and
+  none of them times anything. A timing test measures the CI runner and goes
+  flaky; a bound fails exactly when someone puts the work back. Which also
+  means the change that could not be bounded is the one that did not ship: the
+  `remove_nodes_from` rework measured 122.5ms against 126.0ms, so it was
+  reverted rather than kept for looking better.
+- **An incremental sync leaks a chunk node per edit. Open, pre-existing, not
+  fixed here.** Chunk node ids embed the chunk's sha256, so editing a file
+  produces *new* chunk nodes — and nothing removes the old ones on the
+  incremental path: `remove_artifact_nodes` exists and does exactly the right
+  thing, but its only caller is memory maintenance. A full sync is correct,
+  because it clears the source first. Measured on a real region: one file
+  edited three times ends with **four** chunk nodes and four `has_chunk`
+  edges, and the count rises by one on every subsequent edit, so an actively
+  edited corpus accumulates orphaned chunks without bound — graph memory,
+  traversal budget and `graph_nodes` rows spent on content that no longer
+  exists. Reproduced identically on the commit before the working-set changes,
+  so it is not one of theirs. Left alone deliberately: wiring removal into the
+  incremental path changes what an incremental sync *does*, which is a
+  correctness change with its own blast radius and deserves its own evidence
+  rather than riding along with an efficiency pass.
 
 ---
 

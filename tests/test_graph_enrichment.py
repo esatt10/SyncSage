@@ -116,6 +116,14 @@ def test_similarity_index_matches_all_pairs_exactly() -> None:
     threshold, so restricting candidates to "shares at least one term" cannot
     change the outcome — only the cost. This asserts that against a literal
     all-pairs implementation.
+
+    **This class is unreachable from a sync.** It keys off ``concept_terms``,
+    and concept extraction was retired, so nothing has fed it since — the
+    terms below are hand-written by the test.
+    ``GraphBuilder.add_similarity_edges`` is a no-op for that reason
+    (`tests/test_graph_working_set.py`). These tests are kept because the
+    class is the seam a real similarity pass would reuse, and this is what it
+    would owe; they are not evidence that similarity edges are being emitted.
     """
 
     import random
