@@ -275,17 +275,29 @@ class SimpleMultiDiGraph:
                 edges.append((node, target, {key: dict(data) for key, data in edge_map.items()}))
             return edges
 
-    def out_edges_batch(self, node_ids):
+    def out_edges_batch(self, node_ids, targets=None):
         """``out_edges`` for a whole BFS frontier, under one lock hold.
 
         Exists so :mod:`pheasant.graph.traversal` can expand a level at a time
         without asking which backend it has. Here that is a convenience — the
         lookups were already O(1) — and on the row-backed graph it is the
         difference between one query per level and one per node.
+
+        ``targets`` restricts the answer to edges landing inside that set: the
+        *induced sub-graph* over ``node_ids`` × ``targets``, which is what a
+        bounded slice actually wants. Filtering here rather than in the caller
+        is free on this backend and is the whole cost on a stored one.
         """
 
+        keep = None if targets is None else set(targets)
         with self._lock:
-            return {node_id: self.out_edges(node_id) for node_id in node_ids}
+            edges = {node_id: self.out_edges(node_id) for node_id in node_ids}
+        if keep is None:
+            return edges
+        return {
+            node_id: [entry for entry in entries if entry[1] in keep]
+            for node_id, entries in edges.items()
+        }
 
     def prefetch_nodes(self, node_ids):
         """Attributes for a whole frontier. See :meth:`out_edges_batch`."""

@@ -566,9 +566,9 @@ def test_the_walk_batches_one_query_per_level(tmp_path: Path) -> None:
         calls = {"edges": 0, "nodes": 0}
         real_edges, real_nodes = stored.out_edges_batch, stored.prefetch_nodes
 
-        def counted_edges(node_ids: list[str]) -> Any:
+        def counted_edges(node_ids: list[str], targets: list[str] | None = None) -> Any:
             calls["edges"] += 1
-            return real_edges(node_ids)
+            return real_edges(node_ids, targets)
 
         def counted_nodes(node_ids: list[str]) -> Any:
             calls["nodes"] += 1
@@ -597,6 +597,9 @@ def test_the_in_memory_graph_answers_the_same_batch_protocol() -> None:
     batched = graph.out_edges_batch(["a", "b"])
     assert [entry[1] for entry in batched["a"]] == ["b"]
     assert batched["b"] == []
+    # The induced-sub-graph form, which `slice_` uses on both backends.
+    assert graph.out_edges_batch(["a"], ["b"])["a"] == batched["a"]
+    assert graph.out_edges_batch(["a"], ["a"])["a"] == []
 
 
 def test_streaming_reads_page_rather_than_materialize(tmp_path: Path) -> None:
@@ -840,6 +843,50 @@ def test_the_graph_arm_does_not_query_once_per_candidate(tmp_path: Path) -> None
     assert calls, "the arm did not batch at all"
     assert len(calls) <= 1 + sum(calls) // graph_search.CANDIDATE_BLOCK, (
         f"{len(calls)} queries for {sum(calls)} candidates; that is one per candidate"
+    )
+
+
+def test_a_bounded_slice_reads_only_the_edges_inside_it(tmp_path: Path) -> None:
+    """The induced sub-graph, not every edge leaving the nodes it contains.
+
+    `slice_` keeps a link only when *both* endpoints are in the slice, and it
+    used to establish that by fetching every out-edge of every node it held
+    and discarding the rest. Free on a resident graph; on a stored one a slice
+    holding a single `source` node read that node's whole fan-out — measured
+    **3,580 edge rows to draw ~150 links**, 16.7ms of a 46ms call, and the
+    cost scaled with the region's size rather than with the slice's.
+
+    Asserted as a bound on rows read, because the same fix has to hold when
+    the corpus is larger than the fixture: a slice of N nodes may not read
+    more than N² edges however big the graph around it is.
+    """
+
+    engine = _synced(tmp_path, "rows")
+    try:
+        hub = _hub_graph(engine, fan_out=300)
+        stored = SqlGraph(engine.state, KB)
+        rows_read: list[int] = []
+        real = stored.rows.out_edges
+
+        def counted(kb_id: str, sources: Any, targets: Any = None) -> Any:
+            found = real(kb_id, sources, targets)
+            rows_read.append(sum(len(entries) for entries in found.values()))
+            return found
+
+        stored.rows.out_edges = counted  # type: ignore[method-assign]
+        result = slice_(stored, hub, depth=2, limit=20)
+    finally:
+        engine.close()
+
+    kept = len(result["nodes"])
+    assert kept > 1, "the fixture produced no slice to bound"
+    assert rows_read, "the slice read no adjacency at all"
+    # The walk's own frontier fetch is unbounded by design — it needs a hub's
+    # whole fan to order it hierarchy-first — so only the *link* fetch, which
+    # is the last one, is bounded here.
+    assert rows_read[-1] <= kept * kept, (
+        f"the link fetch read {rows_read[-1]} edges for a {kept}-node slice; "
+        "it is reading the fan-out rather than the induced sub-graph"
     )
 
 

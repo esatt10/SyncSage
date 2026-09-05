@@ -72,6 +72,48 @@ and five times. Graph *read* latency got worse, because reading a graph you do
 not hold means reconstructing what you read. Text search and an unchanged
 re-sync are untouched.
 
+## The same measurement on a fleet: Postgres, five repositories
+
+The table above is one SQLite region with one source — the standalone shape.
+The fleet shape is `storage.backend: postgres` with several repositories in one
+region, so here it is: five repositories of 1,600 files (40,122 nodes / 112,111
+edges / 88,000 cross-repository reference edges), same corpus and same Postgres
+server on both sides.
+
+| | before | after | |
+|---|---|---|---|
+| graph publish per commit | 1.44 s | **0.004 s** | 357× faster |
+| incremental sync, one file changed | 5.18 s | **3.44 s** | 1.5× faster |
+| boot before a replica can answer | 1.91 s | **0.08 s** | 23× faster |
+| RSS for a replica that answers graph queries | 135 MB | **~0** | it holds none |
+| re-sync of five unchanged sources | 4.01 s | 3.47 s | 1.2× faster |
+| cross-source resolution | 2.92 s | 2.66 s | 1.1× faster |
+| text search p50 | 52.3 ms | 44.7 ms | 1.2× faster |
+| hybrid p50 | 75.3 ms | 84.9 ms | 1.13× slower |
+| hybrid p95 | 198.1 ms | **110.6 ms** | 1.8× faster |
+| graph arm p50 | 60.7 ms | 82.0 ms | 1.35× slower |
+| 3-hop walk from a hub (1,620 edges) | 2.4 ms | 14.2 ms | 5.9× slower |
+| bounded slice | 5.7 ms | 17.1 ms | 3.0× slower |
+| five full indexes | 64.2 s | 68.3 s | 1.06× slower |
+| stored bytes (database + `/state`) | 142 MB | 241 MB | 1.7× larger |
+
+The trade is the same shape it is on SQLite, which is the reason to run it —
+none of it was a SQLite artifact. Two things only the fleet shape shows.
+Cross-source resolution did **not** get more expensive with five repositories
+linking to each other, and the p50/p95 split reverses: the median hybrid query
+is 13% slower and the tail is nearly twice as fast, because the baseline's tail
+is the graph it is holding. A serving replica wants that direction.
+
+**Scale replicas, not threads.** Hybrid search is mostly Python once the rows
+are back, so the GIL — not the backend — sets per-process throughput, on both
+versions. Measured as independent processes against one Postgres on a four-core
+box: before, 13.6 → 23.0 → 36.0 → 36.5 qps at 1/2/4/8 processes; after, 9.9 →
+18.8 → 24.9 → 24.7. Both scale until the cores run out. So budget about **30%
+less throughput per core, and no graph residency per replica** — four
+row-backed replicas hold nothing where four file-backed ones hold four copies
+of the graph (540 MB at this size, 6.6 GB at 100k files). Adding a container is
+the axis; it is the axis the file backend priced out of reach.
+
 **One caveat, for standalone SQLite regions serving concurrent graph traffic.**
 Hybrid throughput holds at one thread and falls about 3.7× at four. That is not
 the row backend: concurrent SQLite reads do not scale in a containerised

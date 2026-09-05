@@ -434,6 +434,50 @@ disk, roughly 55×, stated as `capacity.GRAPH_ROW_BYTES_PER_NODE` (measured
   graph you do not hold means reconstructing what you read. Text search and
   the unchanged re-sync are untouched, which is the check that nothing leaked
   sideways.
+- **And measured again on the fleet's own shape: Postgres, five sources.**
+  The table above is one SQLite region with one source, which is the
+  *standalone* deployment. The fleet is `storage.backend: postgres` with
+  several repositories in one region, so that was run too — five repositories
+  of 1,600 files each (40,122 nodes / 112,111 edges / 88,000 cross-repo
+  reference edges), same corpus and same Postgres both sides:
+
+  | | baseline | now | |
+  |---|---|---|---|
+  | graph publish per commit | 1.44 s | **0.004 s** | 357× |
+  | incremental sync, 1 file changed | 5.18 s | **3.44 s** | 1.5× |
+  | boot before a replica can answer | 1.91 s | **0.08 s** | 23× |
+  | RSS for a replica that answers | 135 MB | **~0** | — |
+  | re-sync of five unchanged sources | 4.01 s | 3.47 s | 1.2× |
+  | cross-source resolution | 2.92 s | 2.66 s | 1.1× |
+  | text search p50 | 52.3 ms | 44.7 ms | 1.2× |
+  | hybrid p50 / p95 | 75.3 / 198.1 ms | 84.9 / **110.6** ms | p95 1.8× |
+  | graph arm p50 | 60.7 ms | 82.0 ms | 1.35× *slower* |
+  | 3-hop walk off a 1,620-edge hub | 2.4 ms | 14.2 ms | 5.9× *slower* |
+  | bounded slice | 5.7 ms | 17.1 ms | 3.0× *slower* |
+  | five full indexes | 64.2 s | 68.3 s | 1.06× *slower* |
+  | stored bytes (db + `/state`) | 142 MB | 241 MB | 1.7× *larger* |
+
+  Same shape as the SQLite run, which is the point of running it: nothing
+  about the trade is a SQLite artifact. Two things only the fleet shape shows.
+  **Cross-source resolution did not get more expensive** — 88,000 reference
+  edges across five repositories resolve in the same 2.7s, so narrowing that
+  pass to `external_reference` + artifacts held up on a corpus where it has
+  real work. And **hybrid p95 improved by 1.8× while p50 got 1.13× worse**:
+  the baseline's tail is the graph it is holding, so the row backend trades a
+  slower median for a much tighter tail — which is the direction a serving
+  replica wants.
+- **Replicas scale; threads do not, on either tree.** Hybrid search from 1, 4
+  and 8 *threads* in one process goes 11.5 → 15.6 → 15.6 qps on the baseline
+  and 12.0 → 11.6 → 10.2 now. That is not the backend: hybrid search is mostly
+  Python once the rows are back, so the GIL is the ceiling and the row backend
+  simply does more Python per query. Run as independent *processes* on a
+  4-core box, both scale and stop where the cores do — baseline 13.6 → 23.0 →
+  36.0 → 36.5 qps at 1/2/4/8, now 9.9 → 18.8 → 24.9 → 24.7. So the honest
+  reading is: **~31% less throughput per core, and the residency to buy more
+  cores with.** Four baseline replicas hold four copies of the graph (540 MB
+  here, 6.6 GB at 100k files) to serve 36 qps; four row-backed replicas hold
+  none to serve 25. Adding a fifth container is the axis the fleet has, and it
+  is the axis the baseline could not afford.
 - **Serving concurrency on SQLite is the one caveat worth knowing.** Hybrid
   throughput held at 1 thread and fell 3.7× at 4. The cause is not the design:
   concurrent SQLite reads do not scale *in a container like this one* — the
@@ -1376,6 +1420,30 @@ Each of these cost real time. They are listed because the shape recurs.
   the worst possible shape. Batched, that is 4 queries. The general lesson:
   moving a data structure behind a store turns every `.get()` in a loop into a
   round trip, and they are spread across modules that never mentioned storage.
+- **A filter the caller applies afterwards is a filter the store should have
+  applied, and only a store makes that visible.** `slice_` keeps a link only
+  when *both* endpoints are inside the slice, and established that by fetching
+  every out-edge of every node it held and discarding the rest. On a resident
+  graph the discard is a comparison; against rows it is the whole cost — a
+  51-node slice containing one `source` node read **3,580 edge rows to draw
+  ~150 links**, 16.7 ms of a 46 ms call, and it scaled with the region rather
+  than with the slice. The store answers the *induced sub-graph* now (`source
+  IN (…) AND target IN (…)`, where the cross product is precisely the question
+  being asked, unlike `_pair_clauses` where it would over-match): 0.96 ms, 80
+  rows, byte-identical answer, and the whole call 46 → 17 ms. Found by
+  counting rows per query on a real five-repository region, because the
+  fixture's hub has four edges and cannot tell 3,580 from 150.
+- **The walk's frontier fetch is still unbounded, and the tidy fix is wrong.**
+  A bounded walk fetches a whole level's out-edges before expanding it, so a
+  hub returns 1,620 rows to keep 100 — 5.6 ms of a 14 ms walk. The obvious
+  bound is `ORDER BY … LIMIT budget`, and it changes the answer: the walk
+  orders `_hierarchy_first`, which ranks an endpoint **pair** by whether *any*
+  of its edges is `contains`, so a per-edge `CASE` splits a mixed pair across
+  two rank groups and the one-pass grouping then emits that pair twice with
+  half its edges each. Doing it properly needs a per-pair window aggregate in
+  both dialects plus `HIERARCHY_EDGE_TYPES` pushed into persistence, to save
+  ~7 ms on a UI canvas call. Written down rather than shipped, and the
+  ordering rule is the reason — not the arithmetic.
 - **Two fixes were built, measured and thrown away in the same pass.** An
   out-adjacency index for `remove_nodes_from` measured 122.5ms against
   126.0ms, and an exact short-circuit in `_node_score` — provably identical

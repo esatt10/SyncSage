@@ -146,19 +146,22 @@ class SqlGraph:
         return self.out_edges_batch([node_id]).get(node_id, [])
 
     def out_edges_batch(
-        self, node_ids: list[str]
+        self, node_ids: list[str], targets: list[str] | None = None
     ) -> dict[str, list[tuple[str, str, dict[int, dict]]]]:
         """One query for a whole BFS frontier, grouped the way callers expect.
 
         Parallel edges between one pair are collapsed into the ``{key: attrs}``
         map ``out_edges`` returns, so a caller cannot tell which backend
         answered.
+
+        ``targets`` narrows to the induced sub-graph, which is what a bounded
+        slice asks for and what keeps a hub node's fan-out off the wire.
         """
 
         # Already grouped by pair in the store, which is the shape callers
         # want: regrouping here meant a second pass and a second set of
         # objects over every row a hub node returns.
-        return self.rows.out_edges(self.kb_id, node_ids)
+        return self.rows.out_edges(self.kb_id, node_ids, targets)
 
     def prefetch_nodes(self, node_ids: list[str]) -> dict[str, dict[str, Any]]:
         """Attributes for a whole frontier, in one query."""

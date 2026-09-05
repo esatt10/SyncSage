@@ -170,19 +170,32 @@ def neighbors(
     return {"node_id": node_id, "depth": depth, "neighbors": found}
 
 
-def _out_edges_for(graph: Any, node_ids: list[str]) -> dict[str, list]:
+def _out_edges_for(
+    graph: Any, node_ids: list[str], targets: list[str] | None = None
+) -> dict[str, list]:
     """Outgoing edges for a whole frontier, batched when the graph can.
 
     ``RemoteGraph`` never reaches here — it answers the whole walk remotely —
     so the fallback is for any graph-shaped object a test or a caller passes
     that implements only the single-node primitive. Correct either way; the
     batch is the difference between one query per level and one per node.
+
+    ``targets``, when given, asks only for edges landing inside that set. The
+    caller filtered for exactly that afterwards, so nothing about the answer
+    changes; what changes is who reads a hub node's 1,600 out-edges.
     """
 
     batch = getattr(graph, "out_edges_batch", None)
     if callable(batch):
-        return batch(node_ids)
-    return {node_id: graph.out_edges(node_id) for node_id in node_ids}
+        return batch(node_ids, targets)
+    edges = {node_id: graph.out_edges(node_id) for node_id in node_ids}
+    if targets is None:
+        return edges
+    keep = set(targets)
+    return {
+        node_id: [entry for entry in entries if entry[1] in keep]
+        for node_id, entries in edges.items()
+    }
 
 
 #: Node attributes fetched per block by :class:`_BatchedNodes`. Large enough
@@ -303,13 +316,22 @@ def slice_(
     allowed = set(edge_types or [])
     # Both of these are batched for the same reason the walk above is: a slice
     # of 100 nodes was 200 single-node lookups, which is free in RAM and 200
-    # round trips against a store.
-    adjacency = _out_edges_for(graph, sorted(node_set))
+    # round trips against a store. The edges are asked for as an *induced
+    # sub-graph* — from this node set into itself — because that is the only
+    # part of the answer the loop below keeps. Without the second set a slice
+    # containing one `source` node read that node's whole fan-out: 3,580 edge
+    # rows to draw ~150 links, and 16.7ms of a 46ms call.
+    inside = sorted(node_set)
+    adjacency = _out_edges_for(graph, inside, inside)
     # Bounded by construction: `node_ids` is the start plus at most `limit`
     # kept neighbours, so this is the eager path and stays one query.
     attributes = _nodes_for(graph, node_ids)
     for source in node_set:
         for _src, target, edge_map in adjacency.get(source, []):
+            # Already true of everything `adjacency` holds — kept because it is
+            # the invariant the induced fetch above encodes, and a backend that
+            # answered more loosely would silently draw links to nodes the
+            # slice does not contain.
             if target not in node_set:
                 continue
             for key, data in edge_map.items():
