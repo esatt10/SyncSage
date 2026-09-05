@@ -230,12 +230,29 @@ Zero-tolerance, all four blocking:
 - Current-only stale leakage = 0 (memory validity is filtered at query time).
 - Benchmark artifacts in the searchable corpus = 0.
 
-The last is **enforcement, not detection**. `readiness.corpus_denylist` is a
-list of fnmatch patterns, tested against an item's relative path and its bare
-filename, and a matching submission is refused with `CORPUS_DENYLISTED` —
-distinct from a validation failure so a caller cannot mistake it for a size
-limit and retry smaller. A check that evaluation artifacts are absent can only
-run once they have been indexed, and by then they have been retrievable.
+The last is **enforcement, not detection**, and it is enforced at *every* door
+into the corpus. `readiness.corpus_denylist` is a list of fnmatch patterns
+tested against an item's relative path and its bare filename; the rule is
+`security/corpus_policy.py` and both write paths call it:
+
+| Door | Behaviour |
+|---|---|
+| `POST /ingest/submit`, `submit_documents` | Refused per item with `CORPUS_DENYLISTED`, before the bytes are written — distinct from a validation failure so a caller cannot mistake it for a size limit and retry smaller. |
+| Any source the engine syncs — folder, git, upload directory, every connector | Refused per item **before the item is read**, logged, and counted in the sync report's `refused` / `refused_total`. |
+
+Both halves matter. The first version of this control was enforced on
+submissions alone, so a region with a denylist configured still indexed an
+answer key that arrived through a folder source, the UI drop zone or a git
+repository — while this gate reported the boundary intact. A control on one of
+several doors is a door with a sign on it.
+
+And enforcement is still not the whole gate, because it only stops *new*
+arrivals. The `contamination_refused` probe therefore asserts three things: the
+submission door refuses, the indexing door refuses, and **no artifact this
+region holds matches the denylist** — a scan of `artifacts`, which is what
+makes the gate a statement about this corpus rather than about this code. It
+can fail on a region whose code is correct and whose corpus was populated
+before the denylist existed; `pheasant sync --mode full` is the repair.
 
 An empty denylist means there is no boundary to prove, so the contamination
 probe reports `skipped` and the **core gate set is incomplete**. A region can be
@@ -297,7 +314,7 @@ rather than by an implementation, and both are marked as such.
 | `G-PHE-012` | Evidence semantics | **partial, declared** | record- and proof-level typed; claim-to-claim stance `unsupported` — see [§3.3](#33-knowledge-and-provenance-phe-know) |
 | `G-PHE-013` | Read/resolve | proven | `resolve_result` |
 | `G-PHE-014` | Namespace/ACL isolation | proven | `principal_isolation` (needs `security.acl_enforced`) |
-| `G-PHE-015` | Benchmark contamination | proven | `contamination_refused` (needs `readiness.corpus_denylist`) |
+| `G-PHE-015` | Benchmark contamination | proven | `contamination_refused`: both doors refuse, and `artifacts` holds nothing the denylist forbids (needs `readiness.corpus_denylist`) |
 | `G-PHE-016` | Structured errors | proven | `structured_errors`; codes published in the contract |
 | `G-PHE-017` | Concurrent writers | proven | `concurrent_writers` |
 | `G-PHE-018` | Memory toggle/version | proven | `memory_state_reported` |

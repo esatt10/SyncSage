@@ -468,3 +468,131 @@ def test_the_predicted_artifact_id_matches_the_pipeline_s_own(region: dict[str, 
         f"the pipeline did not mint {predicted}. `services/ingestion._artifact_id` "
         "duplicates `ingestion/pipeline`'s grammar; one of them moved."
     )
+
+
+# ---------------------------------------------------------------------------
+# The denylist governs every door, not just the submission one
+# ---------------------------------------------------------------------------
+
+
+def test_a_denylisted_file_in_a_folder_source_is_never_indexed(
+    tmp_path: Path,
+) -> None:
+    """The door the first version of this control left open.
+
+    `check_denylist` was enforced only in `services/ingestion.submit`, so a
+    region with a denylist configured still indexed a benchmark answer key that
+    arrived through a folder source, the UI drop zone, a git repository or any
+    connector — while the readiness gate reported the boundary intact. A
+    control on one of several doors is a door with a sign on it.
+
+    This plants the file the way every one of those paths effectively does —
+    bytes in a directory a source watches — and asserts the engine refuses it
+    before reading it.
+    """
+
+    workspace = tmp_path / "workspace"
+    (workspace / "benchmark").mkdir(parents=True)
+    (workspace / "ordinary.md").write_text("# Ordinary\n\nRegular content.\n", encoding="utf-8")
+    (workspace / "benchmark" / "answers.md").write_text(
+        "# Answer key\n\nThe answer is zarquon.\n", encoding="utf-8"
+    )
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "denylist",
+                "state_path": str(tmp_path / "state"),
+                "workspace_root": str(workspace),
+                "exports_path": str(tmp_path / "exports"),
+            },
+            "storage": {"graph_snapshots": False},
+            "readiness": {"enabled": True, "corpus_denylist": ["benchmark/*"]},
+            "sources": [
+                {
+                    "name": "docs",
+                    "type": "markdown_folder",
+                    "path": str(workspace),
+                    "include": ["**/*.md"],
+                }
+            ],
+        }
+    )
+    tools = PheasantTools(config)
+    try:
+        result = tools.engine.sync_source("docs", "full")
+        held = [
+            str(row["relative_path"])
+            for row in tools.state.rows("SELECT relative_path FROM artifacts", ())
+        ]
+    finally:
+        tools.engine.close()
+
+    assert "ordinary.md" in held
+    assert not [path for path in held if path.startswith("benchmark/")]
+    # Counted and named, never silent: a control whose only evidence is the
+    # absence of something cannot be told from a typo in the pattern.
+    refused = result.details.get("refused") or []
+    assert [entry["relative_path"] for entry in refused] == ["benchmark/answers.md"]
+    assert refused[0]["pattern"] == "benchmark/*"
+    assert result.details["refused_total"] == 1
+
+
+def test_a_region_with_no_denylist_reports_no_refusals(tmp_path: Path) -> None:
+    """The no-configuration path is byte-identical, which is rule 7.
+
+    An empty denylist costs one truth test per item and adds no key to the
+    sync report — the same "add the key only when it says something" rule
+    `heading_path` and `memory_policy` follow.
+    """
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "ordinary.md").write_text("# Ordinary\n\nContent.\n", encoding="utf-8")
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {
+                "name": "no-denylist",
+                "state_path": str(tmp_path / "state"),
+                "workspace_root": str(workspace),
+                "exports_path": str(tmp_path / "exports"),
+            },
+            "storage": {"graph_snapshots": False},
+            "sources": [
+                {
+                    "name": "docs",
+                    "type": "markdown_folder",
+                    "path": str(workspace),
+                    "include": ["**/*.md"],
+                }
+            ],
+        }
+    )
+    tools = PheasantTools(config)
+    try:
+        result = tools.engine.sync_source("docs", "full")
+    finally:
+        tools.engine.close()
+    assert result.indexed_artifacts == 1
+    assert "refused" not in result.details
+    assert "refused_total" not in result.details
+
+
+def test_the_submission_and_indexing_doors_enforce_one_rule() -> None:
+    """Both call `security.corpus_policy.denied_by`, so they cannot disagree.
+
+    Two spellings of one boundary is the same defect as two implementations of
+    one operation — and here it would be worse, because the halves would
+    diverge silently and the gate would report whichever one it happened to
+    exercise.
+    """
+
+    import inspect
+
+    from pheasant.security import corpus_policy
+    from pheasant.services.ingestion import check_denylist
+    from pheasant.sync import engine as sync_engine
+
+    assert "corpus_policy.denied_by" in inspect.getsource(check_denylist)
+    assert "corpus_policy.denied_by" in inspect.getsource(sync_engine.SyncEngine._prepare_item)
+    assert corpus_policy.denied_by("benchmark/x.md", ["benchmark/*"]) == "benchmark/*"
+    assert corpus_policy.denied_by("src/x.md", ["benchmark/*"]) is None

@@ -43,11 +43,11 @@ import hashlib
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
 from pheasant.persistence import receipts as receipt_ledger
+from pheasant.security import corpus_policy
 from pheasant.services import ServiceContext
 from pheasant.services.errors import ContaminationRefused, InvalidRequest
 
@@ -365,34 +365,32 @@ def _check_size(relative: str, content: bytes, max_bytes: int | None) -> None:
 
 
 def _denylist(config: Any) -> tuple[str, ...]:
-    settings = getattr(config, "readiness", None)
-    return tuple(getattr(settings, "corpus_denylist", ()) or ())
+    return corpus_policy.denylist_of(config)
 
 
 def check_denylist(relative: str, patterns: tuple[str, ...]) -> None:
-    """Refuse a path the region has declared may never enter the corpus.
+    """Refuse a write the region has declared may never enter the corpus.
 
-    This is the enforcement half of benchmark contamination. A *check* that
-    evaluation artifacts are absent can only ever be run after the fact, and
-    after the fact is too late: a benchmark answer that reached the index has
-    already been retrievable. So the region refuses the write, and the
-    readiness probe then confirms the refusal happened rather than assuming it.
+    The rule itself is `security.corpus_policy.denied_by`, at layer 1, because
+    the *sync* path enforces it too and `sync/` cannot import `services/`. This
+    is the submission half: it raises, because a caller submitting one item is
+    making a request that can be refused. The indexing half skips and counts,
+    because a connector listing a thousand files is not.
+
+    Enforcing it in both places is the correction that matters. The first
+    version lived here alone, so a region with a denylist configured still
+    indexed a benchmark file arriving through a folder source, the UI drop
+    zone, a git repository or any connector — while the readiness gate reported
+    the boundary intact. A control on one of several doors is a door with a
+    sign on it.
 
     Empty by default, and an empty list costs one truth test per item — the
     no-configuration path is unchanged, which is rule 7.
-
-    Public because the readiness probe uses *this* predicate to check that the
-    path it is about to submit will genuinely be refused. Re-deriving glob
-    semantics there would be a second implementation of the boundary, and the
-    two would disagree in exactly the case that matters — a probe reporting a
-    failure against a region that is behaving correctly.
     """
 
-    if not patterns:
-        return
-    for pattern in patterns:
-        if fnmatch(relative, pattern) or fnmatch(Path(relative).name, pattern):
-            raise ContaminationRefused(relative, pattern)
+    pattern = corpus_policy.denied_by(relative, patterns)
+    if pattern:
+        raise ContaminationRefused(relative, pattern)
 
 
 def _public(receipt: dict[str, Any] | None) -> dict[str, Any]:

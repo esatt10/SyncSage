@@ -10,6 +10,7 @@ rather than one long test.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any
 
 from pheasant.readiness.probes import (
@@ -20,6 +21,7 @@ from pheasant.readiness.probes import (
     ProbeResult,
     probe,
 )
+from pheasant.security import corpus_policy
 from pheasant.services import ingestion as ingest_service
 from pheasant.services import retrieval as retrieval_service
 from pheasant.services.errors import ContaminationRefused
@@ -315,13 +317,26 @@ def _reconciliation(context: ProbeContext) -> ProbeResult:
 
 @probe("contamination_refused")
 def _contamination_refused(context: ProbeContext) -> ProbeResult:
-    """A denylisted path is refused entry rather than found afterwards.
+    """A denylisted path is refused at every door, and the corpus is clean.
 
-    Enforcement, not detection. A check that benchmark artifacts are absent can
-    only run after they have been indexed, and by then they have been
-    retrievable — so the write is refused and this confirms the refusal
-    happened, with its own error code so a caller cannot mistake it for a size
-    limit and retry smaller.
+    Three assertions, and the third is the one the specification's box actually
+    asks for.
+
+    **Refused at the submission door.** With its own error code, so a caller
+    cannot mistake it for a size limit and retry smaller.
+
+    **Refused at the indexing door.** The submission path is not the only way
+    in — a folder source, the UI drop zone, a git repository and every
+    connector reach the corpus without passing through it. The first version of
+    this probe checked only the first door and reported the boundary intact on
+    a region where the other four were open, which is exactly the overclaim the
+    control exists to prevent. So this writes a denylisted file *into a real
+    source's directory* and syncs, then asserts it did not land.
+
+    **And the corpus is clean.** Enforcement stops new arrivals; it says
+    nothing about content indexed before the denylist existed. Only a scan of
+    what the region actually holds can, so the gate reads `artifacts` — which
+    is what makes it a statement about this corpus rather than about this code.
     """
 
     patterns = tuple(getattr(context.settings(), "corpus_denylist", ()) or ())
@@ -331,46 +346,92 @@ def _contamination_refused(context: ProbeContext) -> ProbeResult:
             "Set it to the paths your benchmark artifacts use."
         )
     probe_path = _first_matching_name(patterns)
+    body = b"# benchmark answer key\n\nThis must never be indexed.\n"
+
     submission = ingest_service.submit(
         context.services,
         ingest_service.SubmissionRequest(
-            items=[
-                ingest_service.SubmissionItem(
-                    relative_path=probe_path,
-                    content=b"# benchmark answer key\n\nThis must never be indexed.\n",
-                )
-            ],
+            items=[ingest_service.SubmissionItem(relative_path=probe_path, content=body)],
             source_name=PROBE_SOURCE,
             agent_id="readiness",
         ),
     )
     rejected = submission["rejected"]
-    refused = bool(rejected) and rejected[0]["error_code"] == "CORPUS_DENYLISTED"
-    leaked = retrieval_service.search(
-        context.services,
-        retrieval_service.SearchRequest(query="benchmark answer key", mode="text", max_results=10),
+    refused_at_submission = (
+        bool(rejected)
+        and rejected[0]["error_code"] == "CORPUS_DENYLISTED"
+        and not submission["accepted"]
     )
-    hits = [
-        result.get("relative_path")
-        for result in leaked.get("results") or []
-        if str(result.get("relative_path") or "").endswith(probe_path)
-    ]
-    passed = refused and not submission["accepted"] and not hits
+
+    # The other door: bytes placed directly in the source directory, which is
+    # what a folder source, a git checkout or the UI drop zone all amount to.
+    landed = _plant_in_source(context, probe_path, body)
+    if landed is None:
+        raise NotRunnable(
+            "the readiness scratch source has no directory yet; run the "
+            "ingestion probes first so there is a real source to plant in"
+        )
+    index_probe_source(context)
+    refused_at_index = not context.state.rows(
+        "SELECT 1 FROM artifacts WHERE relative_path=? LIMIT 1", (probe_path,)
+    )
+    landed.unlink(missing_ok=True)
+
+    held = _denylisted_artifacts(context, patterns)
+    passed = refused_at_submission and refused_at_index and not held
     return ProbeResult(
         "contamination_refused",
         passed,
         (
-            f"{probe_path} was refused at the write and is absent from the corpus"
+            f"{probe_path} was refused at both doors, and no artifact in this "
+            "corpus matches the denylist"
             if passed
-            else "a denylisted path was not refused, or is retrievable"
+            else "a denylisted path reached the corpus, or was not refused"
         ),
         observed={
             "pattern_count": len(patterns),
             "probe_path": probe_path,
+            "refused_at_submission": refused_at_submission,
+            "refused_at_index": refused_at_index,
             "error_code": rejected[0]["error_code"] if rejected else None,
-            "retrievable": hits,
+            "denylisted_artifacts_held": held[:20],
+            "denylisted_artifacts_total": len(held),
         },
     )
+
+
+def _plant_in_source(context: ProbeContext, relative: str, body: bytes) -> Path | None:
+    """Write bytes straight into the scratch source, bypassing submission.
+
+    Deliberately not through `submit`: the point is to exercise the door that
+    does *not* go through it. This is what a folder source watching a directory
+    somebody dropped a file into looks like from the engine's side.
+    """
+
+    rows = context.state.rows("SELECT path FROM sources WHERE name=?", (PROBE_SOURCE,))
+    if not rows:
+        return None
+    target = Path(str(rows[0]["path"])) / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(body)
+    return target
+
+
+def _denylisted_artifacts(context: ProbeContext, patterns: tuple[str, ...]) -> list[str]:
+    """Every artifact this region holds whose path the denylist forbids.
+
+    Matched in Python rather than in SQL because the patterns are fnmatch and
+    the two do not agree — `LIKE` has no character classes and `GLOB` has no
+    `**` — and a gate that quietly matched a *different* rule than the one the
+    write path enforces would report a boundary nobody has.
+    """
+
+    held: list[str] = []
+    for row in context.state.rows("SELECT relative_path FROM artifacts", ()):
+        relative = str(row["relative_path"] or "")
+        if relative and corpus_policy.denied_by(relative, patterns):
+            held.append(relative)
+    return held
 
 
 def _first_matching_name(patterns: tuple[str, ...]) -> str:

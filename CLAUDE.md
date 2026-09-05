@@ -126,7 +126,9 @@ pheasant-kb/
 │   ├── assistant/             ← grounded answering + workflows
 │   ├── sandbox/               ← WASM runtime, sandboxed connector, accel/
 │   ├── deployment/            ← roles, serving durability, mounts, host
-│   ├── security/              ← path_policy, acl, idp
+│   ├── security/              ← path_policy (what may be read),
+│   │                            corpus_policy (what may never be indexed),
+│   │                            acl, idp
 │   ├── synapse/               ← contract publisher, events, signing
 │   └── telemetry/             ← metrics.py (Prometheus exposition),
 │                                interactions.py (the observation plane)
@@ -795,10 +797,15 @@ guard.
   `silent_loss` as receipts claiming an artifact the region does not hold,
   never as a difference between two totals — two totals can agree while one
   item was lost and another double-written.
-- **Contamination is refused at the write.** `readiness.corpus_denylist` is
+- **Contamination is refused at every door.** `readiness.corpus_denylist` is
   enforcement, not detection: a check that benchmark artifacts are absent can
   only run once they have been indexed, and by then they have been retrievable.
-  Empty by default, one truth test per item.
+  The rule is `security/corpus_policy.py` (layer 1, because `sync/` cannot
+  import `services/`) and both write paths call it — the submission path
+  raises `CORPUS_DENYLISTED`, the sync path refuses the item *before reading
+  it* and counts it in the report. Empty by default, one truth test per item.
+  The gate goes further and scans `artifacts`, because enforcement stops new
+  arrivals and says nothing about what was indexed before the denylist existed.
 - **A skipped probe is not a pass, and neither is a partly-skipped gate set.**
   A verdict is tri-state: `True` only when every gate in the set was evaluated
   *and* passed. The demo region caught the first version reporting memory as
@@ -1662,6 +1669,24 @@ Each of these cost real time. They are listed because the shape recurs.
   `state_store.py`, the readiness tools out of `mcp_server/tools.py`, and the
   readiness routes out of `api/app.py` — the last being the "one router per
   plane" that file's own ceiling comment names as its fix.
+- **A control enforced at one of several doors is a door with a sign on it.**
+  `readiness.corpus_denylist` refuses content that may never become
+  retrievable — a benchmark answer key an experiment scores against. It was
+  enforced in `services/ingestion.submit` and nowhere else, so a region with
+  the denylist configured still indexed that file when it arrived through a
+  folder source, the UI drop zone, a git repository or any connector; and the
+  Core gate that exists to prove the boundary reported it intact, because the
+  probe only knocked on the door that was locked. Two things fixed it and both
+  generalise. The rule moved to `security/corpus_policy.py` at layer 1, because
+  the other caller is `sync/` and `sync/` cannot import `services/` — a control
+  that protects *the corpus* belongs where everything enters the corpus, not
+  where the first caller happened to be. And the probe now asserts the
+  *outcome* rather than the mechanism: it plants a file the way a folder source
+  would, and it scans `artifacts` for anything the denylist forbids, so the
+  gate is a statement about this corpus rather than about this code and can
+  fail on a region whose code is correct. Verified by deleting the enforcement
+  line and watching the check turn NO-GO — a gate nobody has seen fail is a
+  gate nobody knows works.
 - **A measured field in a response breaks every whole-payload comparison
   downstream.** `lineage.timing.retrieval_ms` is the only non-deterministic
   field a search returns, and adding it broke a parity test in
