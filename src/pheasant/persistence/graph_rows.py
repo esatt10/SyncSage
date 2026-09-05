@@ -45,7 +45,7 @@ existing import of this module keeps working.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -64,6 +64,7 @@ from pheasant.persistence.graph_codec import (
     edge_row,
     fold,
     node_attrs,
+    node_attrs_dict,
     node_row,
 )
 
@@ -78,10 +79,56 @@ __all__ = [
     "edge_row",
     "fold",
     "node_attrs",
+    "node_attrs_dict",
     "node_row",
 ]
 
 logger = logging.getLogger(__name__)
+
+
+def _ranked_frontier(where: str, priority_types: Sequence[str], limited: bool) -> str:
+    """The frontier statement, ranked per source so a ``LIMIT`` is meaningful.
+
+    ``MIN(CASE …) OVER (PARTITION BY source, target)`` is the per-*pair*
+    priority — 0 when any edge of the pair carries a priority type — and
+    ``DENSE_RANK`` then numbers pairs within each source, so ``pr <= N`` is
+    "the first N pairs this source would have offered". Both halves are
+    ordinary SQL:2003 window functions, present in SQLite since 3.25 and in
+    every Postgres this supports.
+
+    Used whenever a caller asks for the order, ``limited`` or not. Asking for
+    priority order and getting insertion order back on the unbounded path is
+    the bug this shape was introduced with: the traversal stopped re-sorting
+    once it could ask, so an unordered answer silently changed which
+    neighbours a *filtered* walk returned — and filtered walks are exactly the
+    ones that lift the limit. A promise with an exception is not a promise.
+
+    Written as text rather than composed because the shape is fixed; the only
+    variable is how many priority types there are, and those are parameters.
+    """
+
+    if priority_types:
+        placeholders = ",".join("?" for _ in priority_types)
+        priority = f"MIN(CASE WHEN type IN ({placeholders}) THEN 0 ELSE 1 END)"
+    else:
+        priority = "MIN(0)"
+    ranked = (
+        f"SELECT *, {priority} OVER (PARTITION BY source, target) AS rank_group"
+        f" FROM graph_edges WHERE {where}"
+    )
+    order = " ORDER BY source, rank_group, target, type, seq"
+    if not limited:
+        # Ordering alone needs no numbering. The unbounded path is the
+        # *filtered* walk, which is already the expensive one, so paying for a
+        # DENSE_RANK nothing reads there would be a tax on the case that can
+        # least afford it.
+        return f"WITH ranked AS ({ranked}) SELECT * FROM ranked{order}"
+    return (
+        f"WITH ranked AS ({ranked}),"
+        " numbered AS (SELECT *, DENSE_RANK() OVER"
+        " (PARTITION BY source ORDER BY rank_group, target) AS pair_rank FROM ranked)"
+        f" SELECT * FROM numbered WHERE pair_rank <= ?{order}"
+    )
 
 
 class GraphRowStore:
@@ -208,11 +255,10 @@ class GraphRowStore:
 
         node_out: dict[Any, str] = {}
         for batch in _batched(touched_nodes):
-            placeholders = ",".join("?" for _ in batch)
+            clause, params = self.state.dialect.in_clause("node_id", batch)
             for row in self.state.rows(
-                "SELECT node_id, digest FROM graph_nodes WHERE kb_id=? "
-                f"AND node_id IN ({placeholders})",
-                (kb_id, *batch),
+                f"SELECT node_id, digest FROM graph_nodes WHERE kb_id=? AND {clause}",
+                (kb_id, *params),
             ):
                 node_out[str(row["node_id"])] = str(row["digest"])
         edge_out: dict[Any, str] = {}
@@ -233,10 +279,10 @@ class GraphRowStore:
 
     def _delete_nodes(self, kb_id: str, node_ids: list[str]) -> None:
         for batch in _batched(node_ids):
-            placeholders = ",".join("?" for _ in batch)
+            clause, params = self.state.dialect.in_clause("node_id", batch)
             self.state.conn.execute(
-                f"DELETE FROM graph_nodes WHERE kb_id=? AND node_id IN ({placeholders})",
-                (kb_id, *batch),
+                f"DELETE FROM graph_nodes WHERE kb_id=? AND {clause}",
+                (kb_id, *params),
             )
 
     def _delete_edges(self, kb_id: str, pairs: set[tuple[str, str]]) -> None:
@@ -449,23 +495,78 @@ class GraphRowStore:
         )
         return node_attrs(rows[0]) if rows else None
 
-    def get_nodes(self, kb_id: str, node_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
-        """Many nodes in one round trip — what a batched traversal hop needs."""
+    def get_nodes(
+        self, kb_id: str, node_ids: Iterable[str], materialized: bool = False
+    ) -> dict[str, dict[str, Any]]:
+        """Many nodes in one round trip — what a batched traversal hop needs.
 
+        ``materialized`` picks the decoder. A traversal hop reads ``type`` and
+        nothing else, so it wants :class:`_LazyAttrs`; the search arm's scorer
+        reads every attribute of every candidate, so laziness there is a
+        mapping-protocol copy it pays for and never uses. See
+        :func:`node_attrs_dict`.
+        """
+
+        decode = node_attrs_dict if materialized else node_attrs
         found: dict[str, dict[str, Any]] = {}
         for batch in _batched(list(node_ids)):
             if not batch:
                 continue
-            placeholders = ",".join("?" for _ in batch)
+            clause, params = self.state.dialect.in_clause("node_id", batch)
             for row in self.state.rows(
-                f"SELECT * FROM graph_nodes WHERE kb_id=? AND node_id IN ({placeholders})",
-                (kb_id, *batch),
+                f"SELECT * FROM graph_nodes WHERE kb_id=? AND {clause}",
+                (kb_id, *params),
             ):
-                found[str(row["node_id"])] = node_attrs(row)
+                found[str(row["node_id"])] = decode(row)
+        return found
+
+    def nodes_matching(
+        self,
+        kb_id: str,
+        subquery: str,
+        params: Iterable[Any],
+        materialized: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        """Nodes whose id a ``SELECT`` selects, without the ids leaving the server.
+
+        The search arm's candidate set comes from ``graph_nodes_fts``, which
+        lives in this same database — so the two-step version shipped up to
+        2,000 ids and sent every one of them straight back down as a bind
+        parameter, for a set the planner could have resolved as a semi-join.
+        Measured on the fleet region: **22.0ms against 14.6ms**, and the gap
+        grows with how *unselective* the query is, which is the shape that
+        already bit twice here.
+
+        ``ORDER BY node_id`` is not decoration. The rows come back as a dict
+        the arm then iterates, and without it the order is whatever the plan
+        yields — the arm's final sort is stable on ``(-score, title)``, so two
+        candidates tying on both would swap between runs. A stated order is
+        the same answer this backend gives everywhere else it cannot
+        reproduce insertion order, and it measured *faster* than no order at
+        all (14.6ms against 18.7ms) because the sort lets the planner take the
+        index path.
+
+        ``subquery`` is SQL this module does not author — it comes from
+        :meth:`~pheasant.search.node_index.NodeIndex.candidate_query`, which
+        owns what a candidate is. Its parameters are spliced after ``kb_id``.
+        """
+
+        decode = node_attrs_dict if materialized else node_attrs
+        found: dict[str, dict[str, Any]] = {}
+        for row in self.state.rows(
+            f"SELECT * FROM graph_nodes WHERE kb_id=? AND node_id IN ({subquery}) ORDER BY node_id",
+            (kb_id, *params),
+        ):
+            found[str(row["node_id"])] = decode(row)
         return found
 
     def out_edges(
-        self, kb_id: str, sources: Iterable[str], targets: Iterable[str] | None = None
+        self,
+        kb_id: str,
+        sources: Iterable[str],
+        targets: Iterable[str] | None = None,
+        priority_types: Sequence[str] = (),
+        limit_per_source: int | None = None,
     ) -> dict[str, list[tuple[str, str, dict[int, Any]]]]:
         """``{source: [(source, target, {seq: attrs})]}`` for a whole BFS frontier.
 
@@ -498,6 +599,28 @@ class GraphRowStore:
         discarded every other row anyway. Unlike :func:`_pair_clauses` the
         cross product is *wanted* here — "every edge from S to S" is the
         question — so this needs no ``OR`` chain and stays two ``IN`` lists.
+
+        ``priority_types`` and ``limit_per_source`` let a *bounded* walk stop
+        reading a hub's whole fan-out. A depth-3 walk asking for 100
+        neighbours off a ``source`` node read **1,620 pairs to keep 100**,
+        because the budget bound the walk and nothing bound the fetch. The
+        ordering is what makes a limit safe to apply at all: a pair ranks
+        ahead of another when *any* of its edges carries a priority type,
+        which is exactly what
+        :func:`~pheasant.graph.traversal._hierarchy_first` computes, so a
+        prefix here is the same prefix the caller would have taken. It has to
+        be a per-*pair* aggregate — a per-edge ``CASE`` would split a pair
+        carrying both a priority edge and an ordinary one across two rank
+        groups and hand the caller that pair twice with half its edges each.
+
+        The window sort costs more on the server than shipping the rows does
+        (2.96ms against 2.54ms). It still wins by 2.7× — **10.40ms against
+        3.81ms** — because the rows that never arrive are also rows nobody
+        decodes and groups, which is where the time actually was. Measuring
+        the statement alone said the opposite.
+
+        Whether a limit is *sound* is the caller's to decide, not this
+        module's: see :func:`~pheasant.graph.traversal._out_edges_for`.
         """
 
         grouped: dict[str, list[tuple[str, str, dict[int, Any]]]] = {}
@@ -506,21 +629,35 @@ class GraphRowStore:
             target_batches = [None]
         else:
             target_batches = [batch for batch in _batched(sorted(set(targets))) if batch]
+        dialect = self.state.dialect
         for batch in _batched(list(sources)):
             if not batch:
                 continue
-            placeholders = ",".join("?" for _ in batch)
+            source_clause, source_params = dialect.in_clause("source", batch)
             for target_batch in target_batches:
-                clause = f"SELECT * FROM graph_edges WHERE kb_id=? AND source IN ({placeholders})"
-                params: list[Any] = [kb_id, *batch]
+                where = f"kb_id=? AND {source_clause}"
+                params: list[Any] = [kb_id, *source_params]
                 if target_batch is not None:
-                    clause += f" AND target IN ({','.join('?' for _ in target_batch)})"
-                    params.extend(target_batch)
+                    target_clause, target_params = dialect.in_clause("target", target_batch)
+                    where += f" AND {target_clause}"
+                    params.extend(target_params)
+                if not priority_types and limit_per_source is None:
+                    statement = (
+                        f"SELECT * FROM graph_edges WHERE {where}"
+                        " ORDER BY source, target, type, seq"
+                    )
+                else:
+                    statement = _ranked_frontier(
+                        where, priority_types, limit_per_source is not None
+                    )
+                    # The priority list is spelled *before* the WHERE in the
+                    # ranked statement, so its parameters go in front of it.
+                    params = [*priority_types, *params]
+                    if limit_per_source is not None:
+                        params.append(int(limit_per_source))
                 current: tuple[str, str] | None = None
                 edge_map: dict[int, Any] = {}
-                for row in self.state.rows(
-                    clause + " ORDER BY source, target, type, seq", tuple(params)
-                ):
+                for row in self.state.rows(statement, tuple(params)):
                     pair = (str(row["source"]), str(row["target"]))
                     if pair != current:
                         current, edge_map = pair, {}
@@ -538,7 +675,7 @@ class GraphRowStore:
         """
 
         for row in self._stream("graph_nodes", ("node_id",), kb_id):
-            yield str(row["node_id"]), dict(node_attrs(row))
+            yield str(row["node_id"]), node_attrs_dict(row)
 
     def iter_edges(self, kb_id: str) -> Iterator[tuple[tuple[str, str], dict[int, dict]]]:
         """Every edge, streamed and grouped by endpoint pair.

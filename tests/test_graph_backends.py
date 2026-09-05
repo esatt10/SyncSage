@@ -566,9 +566,9 @@ def test_the_walk_batches_one_query_per_level(tmp_path: Path) -> None:
         calls = {"edges": 0, "nodes": 0}
         real_edges, real_nodes = stored.out_edges_batch, stored.prefetch_nodes
 
-        def counted_edges(node_ids: list[str], targets: list[str] | None = None) -> Any:
+        def counted_edges(node_ids: list[str], *args: Any, **kwargs: Any) -> Any:
             calls["edges"] += 1
-            return real_edges(node_ids, targets)
+            return real_edges(node_ids, *args, **kwargs)
 
         def counted_nodes(node_ids: list[str]) -> Any:
             calls["nodes"] += 1
@@ -791,9 +791,9 @@ def test_a_bounded_walk_fetches_attributes_for_what_it_keeps(tmp_path: Path) -> 
         asked: list[int] = []
         real = stored.prefetch_nodes
 
-        def counted(node_ids: list[str]) -> Any:
+        def counted(node_ids: list[str], materialized: bool = False) -> Any:
             asked.append(len(node_ids))
-            return real(node_ids)
+            return real(node_ids, materialized)
 
         stored.prefetch_nodes = counted  # type: ignore[method-assign]
         found = neighbors(stored, hub, depth=3, max_nodes=25)
@@ -807,13 +807,19 @@ def test_a_bounded_walk_fetches_attributes_for_what_it_keeps(tmp_path: Path) -> 
     )
 
 
-def test_the_graph_arm_does_not_query_once_per_candidate(tmp_path: Path) -> None:
-    """The index hands back every match; fetching them one at a time is an N+1.
+def test_the_graph_arm_costs_a_constant_number_of_statements(tmp_path: Path) -> None:
+    """Not one per candidate, and now not one per block either.
 
-    Measured at ~2,000 single-row queries per search on an 8,000-file corpus —
-    the graph arm ended up slower than the in-memory scan it replaced, and the
-    cost scaled with how *unselective* the query was rather than with how much
-    it returned.
+    The first version of this arm issued ~2,000 single-row queries per search
+    on an 8,000-file corpus — an N+1 whose cost scaled with how *unselective*
+    the query was rather than with how much it returned, which made the arm
+    slower than the in-memory scan it replaced. Batching cut that to one
+    statement per 500 candidates; resolving the index and the nodes in one
+    statement cuts it to one, because both tables live in the same database
+    and the ids never needed to travel.
+
+    Asserted as a bound on statements against a corpus large enough to need
+    several blocks, so it fails if either the join or the batching is undone.
     """
 
     from pheasant.search import graph_search
@@ -821,29 +827,199 @@ def test_the_graph_arm_does_not_query_once_per_candidate(tmp_path: Path) -> None
     engine = _synced(tmp_path, "rows")
     try:
         graph = engine.graph_builder.graph
-        for index in range(300):
+        for index in range(1200):
             node = f"widget:{index}"
             graph.add_node(node, id=node, type="symbol", label=f"widget {index}", source_id="docs")
         engine.graph_store.save(KB, graph)
         engine.rebuild_node_index()
 
         stored = SqlGraph(engine.state, KB)
-        calls: list[int] = []
-        real = stored.prefetch_nodes
+        reads: list[str] = []
+        real = engine.state.rows
 
-        def counted(node_ids: list[str]) -> Any:
-            calls.append(len(node_ids))
-            return real(node_ids)
+        def counted(sql: str, params: Any = ()) -> Any:
+            if "graph_nodes" in sql:
+                reads.append(sql)
+            return real(sql, params)
 
-        stored.prefetch_nodes = counted  # type: ignore[method-assign]
-        graph_search.search_graph(stored, "widget", max_results=5, node_index=engine.node_index)
+        engine.state.rows = counted  # type: ignore[method-assign]
+        found = graph_search.search_graph(
+            stored, "widget", max_results=5, node_index=engine.node_index
+        )
+        engine.state.rows = real  # type: ignore[method-assign]
     finally:
         engine.close()
 
-    assert calls, "the arm did not batch at all"
-    assert len(calls) <= 1 + sum(calls) // graph_search.CANDIDATE_BLOCK, (
-        f"{len(calls)} queries for {sum(calls)} candidates; that is one per candidate"
+    assert found, "the arm returned nothing, so it proves nothing about its cost"
+    assert len(reads) == 1, (
+        f"{len(reads)} statements touched graph_nodes for 1,200 candidates: "
+        "the index and the nodes are one database and should be one statement"
     )
+
+
+def test_the_joined_and_two_step_candidate_paths_agree(tmp_path: Path) -> None:
+    """One statement or two, the arm must see the same candidates.
+
+    The join is an optimization of *how* candidates are fetched, never of
+    which ones — so this drives both paths over one corpus and compares. The
+    order is the one difference, and it is a deliberate one: the two-step path
+    yields in the index's own order and the joined path in `node_id` order,
+    because a dict came back from a `SELECT` whose order was otherwise
+    whatever the plan happened to give. The arm's own sort is stable on
+    `(-score, title)`, so that only shows up for candidates tying on both.
+    """
+
+    from pheasant.search import graph_search
+
+    engine = _synced(tmp_path, "rows")
+    try:
+        graph = engine.graph_builder.graph
+        for index in range(40):
+            node = f"widget:{index}"
+            graph.add_node(node, id=node, type="symbol", label=f"widget {index}", source_id="docs")
+        engine.graph_store.save(KB, graph)
+        engine.rebuild_node_index()
+        stored = SqlGraph(engine.state, KB)
+
+        joined = stored.search_candidates(engine.node_index, ["widget"], None)
+        two_step = dict(
+            graph_search._candidate_nodes(
+                stored, engine.node_index.candidates(["widget"], source_name=None)
+            )
+        )
+    finally:
+        engine.close()
+
+    assert joined, "the joined path found no candidates"
+    assert set(joined) == set(two_step), "the two paths disagree on which nodes are candidates"
+    assert all(joined[node_id] == two_step[node_id] for node_id in joined), (
+        "the two paths disagree on a candidate's attributes"
+    )
+
+
+def test_a_bounded_walk_reads_a_bounded_frontier(tmp_path: Path) -> None:
+    """The budget bound the walk and nothing bound the fetch.
+
+    A hub returned every one of its pairs so the walk could keep `max_nodes`
+    of them — 1,620 pairs to keep 100 on the fleet region, and the cost is not
+    the statement (the ranked form is *slower* on the server, 2.96ms against
+    2.54ms) but the rows nobody decodes: 10.40ms against 3.81ms once the
+    grouping is counted, and 14.5ms against 7.3ms for the whole walk.
+
+    Bounded as pairs read against the budget asked for, so it fails if the
+    limit stops reaching the store.
+    """
+
+    engine = _synced(tmp_path, "rows")
+    try:
+        hub = _hub_graph(engine, fan_out=600)
+        stored = SqlGraph(engine.state, KB)
+        pairs: list[int] = []
+        real = stored.rows.out_edges
+
+        def counted(kb_id: str, sources: Any, *args: Any, **kwargs: Any) -> Any:
+            found = real(kb_id, sources, *args, **kwargs)
+            pairs.append(sum(len(entries) for entries in found.values()))
+            return found
+
+        stored.rows.out_edges = counted  # type: ignore[method-assign]
+        found = neighbors(stored, hub, depth=3, max_nodes=25)
+    finally:
+        engine.close()
+
+    assert len(found["neighbors"]) == 25, "the walk did not fill its budget"
+    assert pairs and max(pairs) <= 60, (
+        f"read {max(pairs)} pairs for a 25-node budget off a 600-edge hub; "
+        "the budget is not reaching the fetch"
+    )
+
+
+def test_the_bounded_frontier_returns_what_the_unbounded_one_would(tmp_path: Path) -> None:
+    """A prefix of the priority order is the prefix the walk would have taken.
+
+    The whole risk of pushing the budget down is that it changes the answer,
+    and the subtle way it could is per-*pair* ranking: a pair carrying both a
+    priority edge and an ordinary one ranks ahead **whole**, so a per-edge
+    `CASE` would split it across two rank groups and hand the caller that pair
+    twice with half its edges each. The fixture below has exactly that pair.
+    """
+
+    engine = _synced(tmp_path, "rows")
+    try:
+        graph = engine.graph_builder.graph
+        hub = "hub:mixed"
+        graph.add_node(hub, id=hub, type="source", label="hub", source_id="docs")
+        for index in range(60):
+            leaf = f"leaf:{index:03d}"
+            graph.add_node(leaf, id=leaf, type="chunk", label=f"leaf {index}", source_id="docs")
+            graph.add_edge(hub, leaf, type="indexes")
+        for index in (5, 40):  # a pair that is both `contains` and `indexes`
+            graph.add_edge(hub, f"leaf:{index:03d}", type="contains")
+        for index in range(3):
+            child = f"dir:{index}"
+            graph.add_node(child, id=child, type="heading", label=f"dir {index}", source_id="docs")
+            graph.add_edge(hub, child, type="contains")
+        engine.graph_store.save(KB, graph)
+        stored = SqlGraph(engine.state, KB)
+
+        whole = stored.out_edges_batch([hub], None, ("contains",))[hub]
+        prefix = stored.out_edges_batch([hub], None, ("contains",), 12)[hub]
+    finally:
+        engine.close()
+
+    assert len(prefix) == 12, f"the limit is on pairs, got {len(prefix)}"
+    assert prefix == whole[:12], "the bounded frontier is not a prefix of the ordered one"
+    # Every pair appears once, carrying all of its edges.
+    targets = [entry[1] for entry in whole]
+    assert len(targets) == len(set(targets)), "a pair was split across two rank groups"
+    mixed = next(entry for entry in whole if entry[1] == "leaf:005")
+    assert {data.get("type") for data in mixed[2].values()} == {"contains", "indexes"}
+    assert whole.index(mixed) < 5, "a pair with a priority edge did not rank ahead whole"
+
+
+def test_a_filtered_walk_is_not_bounded(tmp_path: Path) -> None:
+    """Because the bound would be unsound, and correct beats fast.
+
+    `max_nodes + visited` pairs is enough only when nothing between the fetch
+    and the result can reject one. An edge-type filter can: a hub whose 600
+    `indexes` pairs are all excluded needs every one of them to reach its
+    `contains` pairs. The walk asks for no limit in that case, and this is the
+    assertion that keeps someone from "simplifying" the rule away.
+    """
+
+    from pheasant.graph import traversal
+
+    engine = _synced(tmp_path, "rows")
+    try:
+        hub = _hub_graph(engine, fan_out=200)
+        graph = engine.graph_builder.graph
+        for index in range(3):
+            node = f"ref:{index}"
+            graph.add_node(node, id=node, type="symbol", label=f"ref {index}", source_id="docs")
+            graph.add_edge(hub, node, type="references")
+        engine.graph_store.save(KB, graph)
+        stored = SqlGraph(engine.state, KB)
+        limits: list[Any] = []
+        real = stored.rows.out_edges
+
+        def counted(
+            kb_id: str, sources: Any, targets: Any = None, priority: Any = (), limit: Any = None
+        ) -> Any:
+            limits.append(limit)
+            return real(kb_id, sources, targets, priority, limit)
+
+        stored.rows.out_edges = counted  # type: ignore[method-assign]
+        filtered = neighbors(stored, hub, depth=1, max_nodes=5, edge_types=["references"])
+    finally:
+        engine.close()
+
+    assert limits and all(limit is None for limit in limits), (
+        "an edge-type filter must lift the frontier bound, or the walk can miss neighbours"
+    )
+    # And the point of not bounding it: the three `references` targets are
+    # behind 200 `indexes` pairs, so a bounded fetch would have returned none.
+    assert {item["node_id"] for item in filtered["neighbors"]} == {"ref:0", "ref:1", "ref:2"}
+    assert traversal._frontier_budget(5, 1, set(), None, None) == 6
 
 
 def test_a_bounded_slice_reads_only_the_edges_inside_it(tmp_path: Path) -> None:
@@ -868,8 +1044,8 @@ def test_a_bounded_slice_reads_only_the_edges_inside_it(tmp_path: Path) -> None:
         rows_read: list[int] = []
         real = stored.rows.out_edges
 
-        def counted(kb_id: str, sources: Any, targets: Any = None) -> Any:
-            found = real(kb_id, sources, targets)
+        def counted(kb_id: str, sources: Any, *args: Any, **kwargs: Any) -> Any:
+            found = real(kb_id, sources, *args, **kwargs)
             rows_read.append(sum(len(entries) for entries in found.values()))
             return found
 

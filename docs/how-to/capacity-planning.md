@@ -82,37 +82,42 @@ server on both sides.
 
 | | before | after | |
 |---|---|---|---|
-| graph publish per commit | 1.44 s | **0.004 s** | 357× faster |
-| incremental sync, one file changed | 5.18 s | **3.44 s** | 1.5× faster |
-| boot before a replica can answer | 1.91 s | **0.08 s** | 23× faster |
-| RSS for a replica that answers graph queries | 135 MB | **~0** | it holds none |
-| re-sync of five unchanged sources | 4.01 s | 3.47 s | 1.2× faster |
-| cross-source resolution | 2.92 s | 2.66 s | 1.1× faster |
-| text search p50 | 52.3 ms | 44.7 ms | 1.2× faster |
-| hybrid p50 | 75.3 ms | 84.9 ms | 1.13× slower |
-| hybrid p95 | 198.1 ms | **110.6 ms** | 1.8× faster |
-| graph arm p50 | 60.7 ms | 82.0 ms | 1.35× slower |
-| 3-hop walk from a hub (1,620 edges) | 2.4 ms | 14.2 ms | 5.9× slower |
-| bounded slice | 5.7 ms | 17.1 ms | 3.0× slower |
-| five full indexes | 64.2 s | 68.3 s | 1.06× slower |
-| stored bytes (database + `/state`) | 142 MB | 241 MB | 1.7× larger |
+| graph publish per commit | 1.32 s | **0.005 s** | 270× faster |
+| incremental sync, one file changed | 5.02 s | **3.55 s** | 1.4× faster |
+| boot before a replica can answer | 1.08 s | **0.07 s** | 17× faster |
+| RSS for a replica that answers graph queries | 131 MB | **~0** | it holds none |
+| hybrid p95 | 173.3 ms | **77.0 ms** | 2.3× faster |
+| hybrid throughput, 4 threads | 18.6 qps | **20.8 qps** | 1.12× faster |
+| hybrid p50 | 60.4 ms | 61.5 ms | unchanged |
+| text search p50 | 46.4 ms | 47.5 ms | unchanged |
+| cross-source resolution | 2.75 s | 2.75 s | unchanged |
+| graph arm p50 | 45.7 ms | 59.9 ms | 1.31× slower |
+| 3-hop walk from a hub (1,620 edges) | 2.3 ms | 7.6 ms | 3.3× slower |
+| bounded slice | 4.8 ms | 9.8 ms | 2.0× slower |
+| five full indexes | 65.4 s | 69.7 s | 1.07× slower |
+| stored bytes (database + `/state`) | 141 MB | 240 MB | 1.7× larger |
 
 The trade is the same shape it is on SQLite, which is the reason to run it —
 none of it was a SQLite artifact. Two things only the fleet shape shows.
 Cross-source resolution did **not** get more expensive with five repositories
-linking to each other, and the p50/p95 split reverses: the median hybrid query
-is 13% slower and the tail is nearly twice as fast, because the baseline's tail
-is the graph it is holding. A serving replica wants that direction.
+linking to each other. And the p50/p95 split reverses: the median hybrid query
+is a wash while the tail is 2.3× faster, because the file backend's tail *is*
+the graph it is holding. A serving replica wants that direction.
 
-**Scale replicas, not threads.** Hybrid search is mostly Python once the rows
-are back, so the GIL — not the backend — sets per-process throughput, on both
-versions. Measured as independent processes against one Postgres on a four-core
-box: before, 13.6 → 23.0 → 36.0 → 36.5 qps at 1/2/4/8 processes; after, 9.9 →
-18.8 → 24.9 → 24.7. Both scale until the cores run out. So budget about **30%
-less throughput per core, and no graph residency per replica** — four
-row-backed replicas hold nothing where four file-backed ones hold four copies
-of the graph (540 MB at this size, 6.6 GB at 100k files). Adding a container is
-the axis; it is the axis the file backend priced out of reach.
+Graph *reads* are still the side that pays — an arm and a walk that reconstruct
+what they read cannot beat one that already holds it — but the gap is now
+1.3–3.3× rather than the 1.8–5.9× the first row-backed release measured, and
+serving throughput and tail latency are ahead rather than behind.
+
+**Sizing replicas.** Per-process throughput is set by Python, not by the
+backend, so a replica saturates a core before it saturates Postgres. Measured
+as independent processes against one Postgres on a four-core box: before, 13.3
+→ 26.0 → 36.0 → 36.4 qps at 1/2/4/8 processes; after, 13.1 → 25.6 → 32.1 →
+32.0. Both stop where the cores do. So budget roughly the **same throughput per
+core, and no graph residency per replica** — four row-backed replicas hold
+nothing where four file-backed ones hold four copies of the graph (524 MB at
+this size, 6.6 GB at 100k files). Adding a container is the axis; it is the
+axis the file backend priced out of reach.
 
 **One caveat, for standalone SQLite regions serving concurrent graph traffic.**
 Hybrid throughput holds at one thread and falls about 3.7× at four. That is not

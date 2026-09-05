@@ -275,7 +275,7 @@ class SimpleMultiDiGraph:
                 edges.append((node, target, {key: dict(data) for key, data in edge_map.items()}))
             return edges
 
-    def out_edges_batch(self, node_ids, targets=None):
+    def out_edges_batch(self, node_ids, targets=None, priority_types=(), limit_per_source=None):
         """``out_edges`` for a whole BFS frontier, under one lock hold.
 
         Exists so :mod:`pheasant.graph.traversal` can expand a level at a time
@@ -284,23 +284,52 @@ class SimpleMultiDiGraph:
         difference between one query per level and one per node.
 
         ``targets`` restricts the answer to edges landing inside that set: the
-        *induced sub-graph* over ``node_ids`` × ``targets``, which is what a
+        *induced sub-graph* over ``node_ids`` x ``targets``, which is what a
         bounded slice actually wants. Filtering here rather than in the caller
         is free on this backend and is the whole cost on a stored one.
+
+        ``priority_types`` and ``limit_per_source`` are the bounded walk's
+        frontier. Applied here too — not because this backend needs them, but
+        because the traversal stops re-sorting once it has asked for the
+        order, so a graph that took the arguments and ignored them would hand
+        back an unordered frontier and quietly change which neighbours a
+        bounded walk returns.
         """
 
         keep = None if targets is None else set(targets)
         with self._lock:
             edges = {node_id: self.out_edges(node_id) for node_id in node_ids}
-        if keep is None:
-            return edges
-        return {
-            node_id: [entry for entry in entries if entry[1] in keep]
-            for node_id, entries in edges.items()
-        }
+        if keep is not None:
+            edges = {
+                node_id: [entry for entry in entries if entry[1] in keep]
+                for node_id, entries in edges.items()
+            }
+        if priority_types:
+            wanted = set(priority_types)
+            for node_id, entries in edges.items():
+                # Stable, and by *pair*: a pair carrying one priority edge
+                # ranks ahead whole, which is what the row backend's per-pair
+                # window aggregate computes and what `_hierarchy_first` did.
+                edges[node_id] = sorted(
+                    entries,
+                    key=lambda entry: (
+                        0 if {data.get("type") for data in entry[2].values()} & wanted else 1
+                    ),
+                )
+        if limit_per_source is not None:
+            cut = max(0, int(limit_per_source))
+            edges = {node_id: entries[:cut] for node_id, entries in edges.items()}
+        return edges
 
-    def prefetch_nodes(self, node_ids):
-        """Attributes for a whole frontier. See :meth:`out_edges_batch`."""
+    def prefetch_nodes(self, node_ids, materialized=False):
+        """Attributes for a whole frontier. See :meth:`out_edges_batch`.
+
+        ``materialized`` is accepted and ignored: these attributes are already
+        plain dicts, and the copy below is already a full one. It exists so
+        the traversal and the search arm can state what they need without
+        asking which backend they have — the same reason the batch methods
+        exist at all.
+        """
 
         with self._lock:
             return {

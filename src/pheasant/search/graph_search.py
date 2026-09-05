@@ -65,9 +65,19 @@ def search_graph(
     # Ask the index which nodes could match. It returns None when it cannot
     # answer (absent, empty, or FTS5 unavailable), and then — and only then —
     # we fall back to scanning every node, which is correct but O(graph).
+    # A graph whose nodes live in the same database as the index can resolve
+    # both in one statement — the ids never travel. Asked for the way the
+    # batch methods are: offered by the backend that has it, absent on the one
+    # that does not need it. `resolved is None` means the index could not
+    # answer, which is the same signal `candidates` gives.
     candidates = None
+    resolved: dict[str, dict[str, Any]] | None = None
+    joined = getattr(graph, "search_candidates", None)
     if node_index is not None:
-        candidates = node_index.candidates(tokens, source_name=source_name)
+        if callable(joined):
+            resolved = joined(node_index, tokens, source_name)
+        else:
+            candidates = node_index.candidates(tokens, source_name=source_name)
 
     # One compiled alternation runs the reject inside the regex engine rather
     # than as a Python loop per token per node — on a 400k-node graph that
@@ -75,7 +85,12 @@ def search_graph(
     matcher = _reject_matcher(tokens, q)
     with graph.reading():
         blobs = graph.search_blobs()
-        walk = _candidate_nodes(graph, candidates) if candidates is not None else graph.iter_nodes()
+        if resolved is not None:
+            walk: Any = resolved.items()
+        elif candidates is not None:
+            walk = _candidate_nodes(graph, candidates)
+        else:
+            walk = graph.iter_nodes()
         for node_id, attrs in walk:
             if not attrs:
                 continue
@@ -121,7 +136,10 @@ def _candidate_nodes(graph: SimpleMultiDiGraph, candidates: Iterable[str]):
     *unselective* the query is: measured **~2,000 single-row queries per
     search** on an 8,000-file corpus, which made the graph arm slower than the
     resident scan it replaced. The scorer reads every attribute of everything
-    it is given, so these are materialized rather than lazy.
+    it is given, so these are asked for *materialized* rather than lazy: a
+    lazy mapping is right for a traversal hop, which reads `type` alone, and
+    is a dict the store already holds handed over one `__getitem__` at a time
+    when the reader wants all of it.
     """
 
     batch = getattr(graph, "prefetch_nodes", None)
@@ -132,11 +150,11 @@ def _candidate_nodes(graph: SimpleMultiDiGraph, candidates: Iterable[str]):
         return
     for start in range(0, len(ids), CANDIDATE_BLOCK):
         block = ids[start : start + CANDIDATE_BLOCK]
-        found = batch(block)
+        found = batch(block, materialized=True)
         for node_id in block:
             attrs = found.get(node_id)
             if attrs is not None:
-                yield node_id, dict(attrs)
+                yield node_id, attrs
 
 
 def _reject_matcher(tokens: list[str], q: str) -> re.Pattern[str] | None:
@@ -365,18 +383,35 @@ def _field_score(
     base_all: float,
     base_any: float,
 ) -> float:
+    """One tier of the ladder: exact, contains-query, all-tokens, any-token.
+
+    Counted in a single pass rather than as ``all(...)`` then ``any(...)``.
+    Those were the same scan twice in the "some but not all" case and, more
+    than that, two generator objects created per field — this runs about six
+    times per node over 1,836 candidates a query, and the profile put ~1.1M
+    generator ``next`` calls plus the ``any``/``all`` frames around them at a
+    fifth of the whole graph arm. Measured **10.85µs against 3.66µs** for one
+    node's twelve fields. Identical output: duplicate tokens count the same
+    both ways, and an empty ``tokens`` still falls through to zero.
+    """
+
     if not text:
         return 0.0
     low = text.lower()
-    if q and low == q:
-        return base_exact
-    if q and q in low:
-        return (base_exact + base_all) / 2
-    if tokens and all(token in low for token in tokens):
+    if q:
+        if low == q:
+            return base_exact
+        if q in low:
+            return (base_exact + base_all) / 2
+    if not tokens:
+        return 0.0
+    hits = 0
+    for token in tokens:
+        if token in low:
+            hits += 1
+    if hits == len(tokens):
         return base_all
-    if tokens and any(token in low for token in tokens):
-        return base_any
-    return 0.0
+    return base_any if hits else 0.0
 
 
 def _stringify(value: Any) -> str:

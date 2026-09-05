@@ -29,7 +29,7 @@ traversal has one code path rather than a branch.
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
 from typing import Any
 
@@ -146,7 +146,11 @@ class SqlGraph:
         return self.out_edges_batch([node_id]).get(node_id, [])
 
     def out_edges_batch(
-        self, node_ids: list[str], targets: list[str] | None = None
+        self,
+        node_ids: list[str],
+        targets: list[str] | None = None,
+        priority_types: Sequence[str] = (),
+        limit_per_source: int | None = None,
     ) -> dict[str, list[tuple[str, str, dict[int, dict]]]]:
         """One query for a whole BFS frontier, grouped the way callers expect.
 
@@ -156,17 +160,58 @@ class SqlGraph:
 
         ``targets`` narrows to the induced sub-graph, which is what a bounded
         slice asks for and what keeps a hub node's fan-out off the wire.
+        ``priority_types`` and ``limit_per_source`` do the same for a bounded
+        *walk*: the pairs come back priority-first, so a prefix of them is the
+        prefix the caller would have taken anyway.
         """
 
         # Already grouped by pair in the store, which is the shape callers
         # want: regrouping here meant a second pass and a second set of
         # objects over every row a hub node returns.
-        return self.rows.out_edges(self.kb_id, node_ids, targets)
+        return self.rows.out_edges(self.kb_id, node_ids, targets, priority_types, limit_per_source)
 
-    def prefetch_nodes(self, node_ids: list[str]) -> dict[str, dict[str, Any]]:
-        """Attributes for a whole frontier, in one query."""
+    def prefetch_nodes(
+        self, node_ids: list[str], materialized: bool = False
+    ) -> dict[str, dict[str, Any]]:
+        """Attributes for a whole frontier, in one query.
 
-        return self.rows.get_nodes(self.kb_id, node_ids)
+        ``materialized`` says the caller will read every attribute, so the row
+        is decoded straight into a dict instead of into the lazy mapping a
+        traversal hop wants. See :func:`~pheasant.persistence.graph_codec.node_attrs_dict`.
+        """
+
+        return self.rows.get_nodes(self.kb_id, node_ids, materialized)
+
+    def search_candidates(
+        self, node_index: Any, tokens: list[str], source_name: str | None = None
+    ) -> dict[str, dict[str, Any]] | None:
+        """Candidate nodes *with* their attributes, in one round trip.
+
+        The index and the nodes are two tables in one database, so asking the
+        index for ids and then asking for those ids is a round trip that
+        exists only because the two live behind different objects in Python.
+        ``None`` keeps the caller's existing contract: the index could not
+        answer, so scan.
+
+        The in-memory graph has no counterpart and needs none — there the ids
+        come back and the lookup is a dict — so
+        :func:`~pheasant.search.graph_search.search_graph` asks for this and
+        falls back to the two-step, exactly as it does for the batch methods.
+        """
+
+        built = node_index.candidate_query(tokens, source_name=source_name)
+        if built is None:
+            return None
+        subquery, params = built
+        try:
+            found = self.rows.nodes_matching(self.kb_id, subquery, params, materialized=True)
+        except Exception:
+            # Same posture as `NodeIndex.candidates`: a malformed MATCH must
+            # degrade to the scan rather than fail the search.
+            return None
+        if found:
+            return found
+        return found if node_index.still_populated() else None
 
     def neighbors(self, node_id: str) -> list[str]:
         return [target for _source, target, _edges in self.out_edges(node_id)]

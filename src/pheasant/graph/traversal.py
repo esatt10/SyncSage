@@ -16,6 +16,7 @@ remote, the walk happens where the graph lives.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Sequence
 from typing import Any
 
 from pheasant.graph.simple import SimpleMultiDiGraph
@@ -94,7 +95,14 @@ def neighbors(
             break
         level = list(frontier)
         frontier = deque()
-        adjacency = _out_edges_for(graph, [current for current, _d, _p in level])
+        adjacency = _out_edges_for(
+            graph,
+            [current for current, _d, _p in level],
+            priority_types=HIERARCHY_EDGE_TYPES,
+            limit_per_source=_frontier_budget(
+                max_nodes, len(visited), allowed, exclude_edge_types, exclude_node_types
+            ),
+        )
         # Attributes are needed for the targets this level actually *keeps* —
         # `max_nodes` of them — plus any it inspects and rejects. Fetching every
         # reachable target instead is the shape that made a hub node expensive:
@@ -119,7 +127,12 @@ def neighbors(
             # budget jumping straight to files and the directory tree between
             # them never gets walked — the parent/child structure is present in
             # the graph but invisible in any bounded view of it.
-            for _source, target, edge_map in _hierarchy_first(adjacency.get(current, [])):
+            # Already hierarchy-first: `_out_edges_for` was asked for that
+            # order, and both backends promise it. Re-sorting here would be a
+            # stable no-op that costs a sort per level — and on the bounded
+            # path it would be sorting the wrong thing anyway, since the store
+            # already took its prefix in this order.
+            for _source, target, edge_map in adjacency.get(current, []):
                 matching = [
                     data
                     for data in edge_map.values()
@@ -170,8 +183,48 @@ def neighbors(
     return {"node_id": node_id, "depth": depth, "neighbors": found}
 
 
+def _frontier_budget(
+    max_nodes: int | None,
+    visited: int,
+    allowed: set[str],
+    exclude_edge_types: set[str] | None,
+    exclude_node_types: set[str] | None,
+) -> int | None:
+    """How many pairs per source the walk can possibly need, or None.
+
+    A hub returns 1,620 pairs so a walk can keep 100, and the fetch is where
+    that costs — 10.4ms against 3.8ms once the rows are decoded and grouped.
+    Bounding it is only *sound* when nothing between the fetch and the
+    ``found`` list can reject a pair, because every rejection means the walk
+    must read one more pair than the budget accounts for:
+
+    - ``edge_types`` / ``exclude_edge_types`` reject by edge type. A hub whose
+      1,600 ``indexes`` pairs are all filtered out needs every one of them to
+      reach its 20 ``contains`` pairs.
+    - ``exclude_node_types`` rejects by the *target's* type, which is
+      unbounded for the same reason.
+
+    With none of those set, the only reason a pair does not become a
+    neighbour is that its target is already visited — and there are at most
+    ``visited`` of those in the whole graph, let alone under one source. So
+    ``max_nodes + visited`` pairs is provably enough, and asking for fewer is
+    the only way this could change an answer.
+
+    Returning ``None`` for the filtered walks keeps them exactly as they were:
+    slower than they could be, and correct, which is the right way round.
+    """
+
+    if max_nodes is None or allowed or exclude_edge_types or exclude_node_types:
+        return None
+    return int(max_nodes) + int(visited)
+
+
 def _out_edges_for(
-    graph: Any, node_ids: list[str], targets: list[str] | None = None
+    graph: Any,
+    node_ids: list[str],
+    targets: list[str] | None = None,
+    priority_types: Sequence[str] = (),
+    limit_per_source: int | None = None,
 ) -> dict[str, list]:
     """Outgoing edges for a whole frontier, batched when the graph can.
 
@@ -187,15 +240,20 @@ def _out_edges_for(
 
     batch = getattr(graph, "out_edges_batch", None)
     if callable(batch):
-        return batch(node_ids, targets)
+        return batch(node_ids, targets, priority_types, limit_per_source)
+    # A graph-shaped object implementing only the single-node primitive. It
+    # cannot promise the priority order, so the sort happens here and no limit
+    # is applied — correct, just not cheap.
     edges = {node_id: graph.out_edges(node_id) for node_id in node_ids}
-    if targets is None:
-        return edges
-    keep = set(targets)
-    return {
-        node_id: [entry for entry in entries if entry[1] in keep]
-        for node_id, entries in edges.items()
-    }
+    if targets is not None:
+        keep = set(targets)
+        edges = {
+            node_id: [entry for entry in entries if entry[1] in keep]
+            for node_id, entries in edges.items()
+        }
+    if priority_types:
+        edges = {node_id: _hierarchy_first(entries) for node_id, entries in edges.items()}
+    return edges
 
 
 #: Node attributes fetched per block by :class:`_BatchedNodes`. Large enough

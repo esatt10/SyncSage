@@ -443,41 +443,50 @@ disk, roughly 55×, stated as `capacity.GRAPH_ROW_BYTES_PER_NODE` (measured
 
   | | baseline | now | |
   |---|---|---|---|
-  | graph publish per commit | 1.44 s | **0.004 s** | 357× |
-  | incremental sync, 1 file changed | 5.18 s | **3.44 s** | 1.5× |
-  | boot before a replica can answer | 1.91 s | **0.08 s** | 23× |
-  | RSS for a replica that answers | 135 MB | **~0** | — |
-  | re-sync of five unchanged sources | 4.01 s | 3.47 s | 1.2× |
-  | cross-source resolution | 2.92 s | 2.66 s | 1.1× |
-  | text search p50 | 52.3 ms | 44.7 ms | 1.2× |
-  | hybrid p50 / p95 | 75.3 / 198.1 ms | 84.9 / **110.6** ms | p95 1.8× |
-  | graph arm p50 | 60.7 ms | 82.0 ms | 1.35× *slower* |
-  | 3-hop walk off a 1,620-edge hub | 2.4 ms | 14.2 ms | 5.9× *slower* |
-  | bounded slice | 5.7 ms | 17.1 ms | 3.0× *slower* |
-  | five full indexes | 64.2 s | 68.3 s | 1.06× *slower* |
-  | stored bytes (db + `/state`) | 142 MB | 241 MB | 1.7× *larger* |
+  | graph publish per commit | 1.32 s | **0.005 s** | 270× |
+  | incremental sync, 1 file changed | 5.02 s | **3.55 s** | 1.4× |
+  | boot before a replica can answer | 1.08 s | **0.07 s** | 17× |
+  | RSS for a replica that answers | 131 MB | **~0** | — |
+  | hybrid p95 | 173.3 ms | **77.0 ms** | 2.3× |
+  | hybrid throughput, 4 threads | 18.6 qps | **20.8 qps** | 1.12× |
+  | hybrid p50 | 60.4 ms | 61.5 ms | — |
+  | text search p50 | 46.4 ms | 47.5 ms | — |
+  | cross-source resolution | 2.75 s | 2.75 s | — |
+  | graph arm p50 | 45.7 ms | 59.9 ms | 1.31× *slower* |
+  | 3-hop walk off a 1,620-edge hub | 2.3 ms | 7.6 ms | 3.3× *slower* |
+  | bounded slice | 4.8 ms | 9.8 ms | 2.0× *slower* |
+  | five full indexes | 65.4 s | 69.7 s | 1.07× *slower* |
+  | stored bytes (db + `/state`) | 141 MB | 240 MB | 1.7× *larger* |
 
   Same shape as the SQLite run, which is the point of running it: nothing
   about the trade is a SQLite artifact. Two things only the fleet shape shows.
   **Cross-source resolution did not get more expensive** — 88,000 reference
-  edges across five repositories resolve in the same 2.7s, so narrowing that
+  edges across five repositories resolve in the same 2.75s, so narrowing that
   pass to `external_reference` + artifacts held up on a corpus where it has
-  real work. And **hybrid p95 improved by 1.8× while p50 got 1.13× worse**:
-  the baseline's tail is the graph it is holding, so the row backend trades a
-  slower median for a much tighter tail — which is the direction a serving
-  replica wants.
-- **Replicas scale; threads do not, on either tree.** Hybrid search from 1, 4
-  and 8 *threads* in one process goes 11.5 → 15.6 → 15.6 qps on the baseline
-  and 12.0 → 11.6 → 10.2 now. That is not the backend: hybrid search is mostly
-  Python once the rows are back, so the GIL is the ceiling and the row backend
-  simply does more Python per query. Run as independent *processes* on a
-  4-core box, both scale and stop where the cores do — baseline 13.6 → 23.0 →
-  36.0 → 36.5 qps at 1/2/4/8, now 9.9 → 18.8 → 24.9 → 24.7. So the honest
-  reading is: **~31% less throughput per core, and the residency to buy more
-  cores with.** Four baseline replicas hold four copies of the graph (540 MB
-  here, 6.6 GB at 100k files) to serve 36 qps; four row-backed replicas hold
-  none to serve 25. Adding a fifth container is the axis the fleet has, and it
-  is the axis the baseline could not afford.
+  real work. And the **p50/p95 split reverses**: the median hybrid query is a
+  wash and the tail is 2.3× better, because the baseline's tail *is* the graph
+  it is holding. A serving replica wants that direction.
+
+  The first version of this table was much worse — graph arm 82ms, walk 14.2ms,
+  slice 17.1ms, and throughput at 0.64× of baseline across four threads. Four
+  changes closed it, and the shape of all four is the same: **work that was
+  free while the graph was a dict in front of you, and is not free behind a
+  store.** One statement instead of seven for the arm's candidates; a
+  materializing decoder for readers that want every attribute; one token pass
+  per field instead of two generator expressions; and the walk's budget
+  reaching the fetch. None of them changes an answer.
+- **Threads scale now, and replicas are still the axis.** Hybrid search across
+  1, 4 and 8 *threads* in one process: baseline 13.3 → 18.6 → 17.7 qps, now
+  **15.3 → 20.8 → 19.4** — ahead at every count, where before these changes it
+  was 12.0 → 11.6 → 10.2 and behind at every count. It scales because most of
+  what the arm now does is wait on one statement rather than run Python under
+  the GIL. As independent *processes* on a 4-core box both trees stop where
+  the cores do: baseline 13.3 → 26.0 → 36.0 → 36.4 at 1/2/4/8, now 13.1 →
+  25.6 → 32.1 → 32.0 — parity at one and two, ~11% behind at four (it was
+  ~31%), with a better p95 throughout. Which is the fleet reading: **the same
+  throughput per core, and no graph residency per replica.** Four file-backed
+  replicas hold four copies of the graph — 524 MB here, 6.6 GB at 100k files —
+  to serve 36 qps; four row-backed ones hold none to serve 32.
 - **Serving concurrency on SQLite is the one caveat worth knowing.** Hybrid
   throughput held at 1 thread and fell 3.7× at 4. The cause is not the design:
   concurrent SQLite reads do not scale *in a container like this one* — the
@@ -1433,17 +1442,72 @@ Each of these cost real time. They are listed because the shape recurs.
   rows, byte-identical answer, and the whole call 46 → 17 ms. Found by
   counting rows per query on a real five-repository region, because the
   fixture's hub has four edges and cannot tell 3,580 from 150.
-- **The walk's frontier fetch is still unbounded, and the tidy fix is wrong.**
-  A bounded walk fetches a whole level's out-edges before expanding it, so a
-  hub returns 1,620 rows to keep 100 — 5.6 ms of a 14 ms walk. The obvious
-  bound is `ORDER BY … LIMIT budget`, and it changes the answer: the walk
-  orders `_hierarchy_first`, which ranks an endpoint **pair** by whether *any*
-  of its edges is `contains`, so a per-edge `CASE` splits a mixed pair across
-  two rank groups and the one-pass grouping then emits that pair twice with
-  half its edges each. Doing it properly needs a per-pair window aggregate in
-  both dialects plus `HIERARCHY_EDGE_TYPES` pushed into persistence, to save
-  ~7 ms on a UI canvas call. Written down rather than shipped, and the
-  ordering rule is the reason — not the arithmetic.
+- **A bound is only sound when nothing downstream can reject what it counted.**
+  A bounded walk fetched a whole level's out-edges before expanding it, so a
+  hub returned 1,620 pairs to keep 100. The budget now reaches the fetch, and
+  the two things that made it hard are both worth keeping:
+  **the ordering has to be per-pair.** `_hierarchy_first` ranks an endpoint
+  *pair* by whether **any** of its edges is `contains`, so a per-edge `CASE`
+  splits a pair carrying both a `contains` and an `indexes` edge across two
+  rank groups — and the store's one-pass grouping then emits that pair twice
+  with half its edges each. It is a `MIN(CASE …) OVER (PARTITION BY source,
+  target)` window aggregate, in both dialects.
+  **And the budget is only enough when nothing between the fetch and the
+  result can reject a pair.** `max_nodes + visited` pairs per source is
+  provably sufficient because at most `visited` targets can be skipped as
+  already-seen — but an `edge_types` filter, an `exclude_edge_types` or an
+  `exclude_node_types` rejects for reasons the count knows nothing about, and
+  a hub whose 1,600 `indexes` pairs are all filtered out needs every one of
+  them to reach its 20 `contains` pairs. Those walks ask for **no** limit and
+  stay exactly as slow as they were. `_frontier_budget` is that rule, in one
+  function, with a test that fails if someone simplifies it away.
+  Measured: 14.5 ms → 7.3 ms for the walk, 17.1 → 9.8 for a slice, and the
+  same 20 walks over the fleet region return byte-identical results.
+- **The statement was the wrong thing to time.** The ranked frontier is
+  *slower* as a query — 2.96 ms against 2.54 ms, because the server sorts
+  1,620 rows to return 120 — and 2.7× faster as an operation: **10.40 ms
+  against 3.81 ms** once the rows are decoded and grouped. Rows that never
+  arrive are rows nobody builds a `Row` dict for, decodes into `_LazyAttrs`,
+  or groups into pairs, and that is where the time was. Timing the SQL alone
+  said do not do it.
+- **A lazy mapping is a cost to a reader that wants all of it.**
+  `_LazyAttrs` exists because a traversal hop reads `type` and nothing else,
+  and it is exactly wrong for the search arm, which reads every attribute of
+  every candidate: `dict(lazy)` goes through the mapping protocol, one
+  Python-level `__getitem__` per key, over 1,836 candidates a query.
+  **8.0µs per node against 3.75µs** for the same dict built in one step. The
+  fix is not to choose one — it is that the *caller* says which it wants
+  (`prefetch_nodes(..., materialized=True)`), because only the caller knows.
+  The streaming iterators, which feed exports that read everything, were on
+  the wrong side of this too.
+- **Two generator expressions per field, six fields per node, 1,836 nodes.**
+  `_field_score` asked `all(token in low …)` and then `any(token in low …)` —
+  the same scan twice in the "some but not all" case, and two generator
+  objects created every time either way. The profile put ~1.1M generator
+  `next` calls plus the `any`/`all` frames at a fifth of the whole graph arm.
+  One counting loop is **10.85µs against 3.66µs** for a node's twelve fields
+  and returns the identical ladder. The general shape: a comprehension is not
+  free at the bottom of a loop that runs ten thousand times a request, and a
+  profile is the only thing that says which loop that is.
+- **Two tables in one database do not need a round trip between them.** The
+  graph arm asked `graph_nodes_fts` for candidate ids, shipped up to 2,000 of
+  them into Python, and sent every one straight back down as a bind parameter
+  for `graph_nodes` — a semi-join the planner would have done, spelled as a
+  round trip because the two tables live behind different objects. 22.0 ms
+  against 14.6 ms, seven statements per search against three, and the gap
+  grows with how *unselective* the query is, which is the shape that has now
+  bitten three times here. `NodeIndex.candidate_query` hands over the
+  `SELECT` unexecuted and `GraphRowStore.nodes_matching` runs it as a
+  subquery; neither module imports the other.
+- **`IN (?,?,?)` makes the statement text a function of the batch size.**
+  psycopg3 prepares a statement after its fifth execution of the same text,
+  so a key-set predicate that never repeats its spelling is one that is never
+  prepared and re-planned on every call — **8.93 ms against 6.15 ms** for a
+  500-key node fetch. Postgres gets `= ANY(?)` with the list as one array
+  parameter: one text, one plan, every batch size. SQLite keeps the `IN`
+  list, which is its reference spelling and has no array type to bind. It is
+  `Dialect.in_clause`, so the choice is made once rather than at each of the
+  call sites that batch.
 - **Two fixes were built, measured and thrown away in the same pass.** An
   out-adjacency index for `remove_nodes_from` measured 122.5ms against
   126.0ms, and an exact short-circuit in `_node_score` — provably identical
