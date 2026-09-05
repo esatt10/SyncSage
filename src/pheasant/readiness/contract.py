@@ -423,7 +423,22 @@ def build_contract(
         "corpus_denylist": list(getattr(settings, "corpus_denylist", ()) or ()),
         "unsupported": [row["logical"] for row in rows if row["status"] == "unsupported"],
     }
-    payload["digest"] = _digest(rows, limits, payload["server_version"])
+    # Over the *build's* shape, not this run's results. `status` is in `rows`
+    # and moves with a probe outcome, so digesting the rows made a capability
+    # snapshot change when a latency probe was a millisecond slower — which
+    # defeats the one thing a pinned digest is for. Recomputed here without
+    # probe results, which is the same table a region publishes before any
+    # check has ever run.
+    build_rows = [
+        {
+            "logical": cap.logical,
+            "gap": cap.gap,
+            "gate": cap.gate,
+            "status": capability_status(cap, None)[0],
+        }
+        for cap in CAPABILITIES
+    ]
+    payload["digest"] = _digest(build_rows, limits, payload["server_version"])
     if proven is not None:
         payload["probes"] = dict(sorted(proven.items()))
     return payload
@@ -460,6 +475,13 @@ def refusal_codes() -> list[dict[str, Any]]:
 
 
 def _digest(rows: list[dict[str, Any]], limits: dict[str, Any], version: str) -> str:
+    """The capability snapshot's id: what this build is, and its limits.
+
+    Deliberately *not* what a run found. A harness pins this to detect the
+    region it is talking to changing shape between arms; a digest that also
+    moved with probe timings would report a change on every check.
+    """
+
     hasher = blake2b(digest_size=16)
     hasher.update(version.encode("utf-8"))
     hasher.update(

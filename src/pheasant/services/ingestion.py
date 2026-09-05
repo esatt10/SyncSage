@@ -49,7 +49,7 @@ from typing import Any
 
 from pheasant.persistence import receipts as receipt_ledger
 from pheasant.services import ServiceContext
-from pheasant.services.errors import InvalidRequest
+from pheasant.services.errors import ContaminationRefused, InvalidRequest
 
 #: Dispositions, in the order a receipt may travel through them. `accepted` and
 #: `indexed` are a barrier, not a status gradient: `rejected` and `failed` are
@@ -387,28 +387,6 @@ def _check_denylist(relative: str, patterns: tuple[str, ...]) -> None:
     for pattern in patterns:
         if fnmatch(relative, pattern) or fnmatch(Path(relative).name, pattern):
             raise ContaminationRefused(relative, pattern)
-
-
-class ContaminationRefused(InvalidRequest):
-    """A write matching ``readiness.corpus_denylist``.
-
-    Its own type because a harness has to tell this apart from an ordinary
-    validation failure: a rejected oversized file is a file to shrink, and this
-    is a file that must never be in the corpus at all. Reporting both as
-    `INVALID_REQUEST` would let a contamination refusal be retried with a
-    smaller payload.
-    """
-
-    status = 403
-    code = "CORPUS_DENYLISTED"
-
-    def __init__(self, relative: str, pattern: str) -> None:
-        super().__init__(
-            f"Refused: {relative} matches readiness.corpus_denylist pattern {pattern!r}. "
-            "Evaluation artifacts must not enter the searchable corpus."
-        )
-        self.relative_path = relative
-        self.pattern = pattern
 
 
 def _public(receipt: dict[str, Any] | None) -> dict[str, Any]:

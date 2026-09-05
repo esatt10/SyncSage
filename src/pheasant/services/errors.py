@@ -196,3 +196,25 @@ class RegionBusy(ServiceError):
     def __init__(self, what: str) -> None:
         super().__init__(f"Busy: {what}")
         self.what = what
+
+
+class ContaminationRefused(InvalidRequest):
+    """A write matching ``readiness.corpus_denylist``.
+
+    Its own type because a harness has to tell this apart from an ordinary
+    validation failure: a rejected oversized file is a file to shrink, and this
+    is a file that must never be in the corpus at all. Reporting both as
+    `INVALID_REQUEST` would let a contamination refusal be retried with a
+    smaller payload.
+    """
+
+    status = 403
+    code = "CORPUS_DENYLISTED"
+
+    def __init__(self, relative: str, pattern: str) -> None:
+        super().__init__(
+            f"Refused: {relative} matches readiness.corpus_denylist pattern {pattern!r}. "
+            "Evaluation artifacts must not enter the searchable corpus."
+        )
+        self.relative_path = relative
+        self.pattern = pattern
