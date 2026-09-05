@@ -308,7 +308,14 @@ def _lineage(
                 # `memory_policy` above: "no memory took part" is the answer a
                 # memory-off arm needs to be able to *record*, and an absent
                 # key is indistinguishable from a key nobody looked at.
-                "enabled": bool(getattr(getattr(context.config, "memory", None), "enabled", False)),
+                #
+                # Asked through `memory_source`, which is the one predicate the
+                # rest of the region uses — there is no `memory.enabled` flag,
+                # and the first version of this read one. It was always False,
+                # so a region with memory fully on reported it off, and the
+                # probe that checked the field agreed with it. A flag nobody
+                # declared reads exactly like a flag nobody sets.
+                "enabled": _memory_enabled(context),
                 "policy": memory_policy,
                 "steering": payload.get("memory_steering"),
             },
@@ -332,3 +339,22 @@ def _lineage(
         },
         "trace_id": request.trace_id,
     }
+
+
+def _memory_enabled(context: ServiceContext) -> bool:
+    """Whether this region has an enabled memory source.
+
+    The same question `describe_retrieval` and the memory routes ask, asked the
+    same way — through `memory_source`, with the state store passed so the
+    runtime-registry fallback applies. Memory enabled from the UI lives in the
+    registry and reaches `config.sources` only in the process that created it,
+    so a check reading the config alone would report "off" on every replica but
+    one.
+    """
+
+    try:
+        from pheasant.memory.store import memory_source
+
+        return memory_source(context.config, context.state) is not None
+    except Exception:  # noqa: BLE001 - lineage must never break a search
+        return False

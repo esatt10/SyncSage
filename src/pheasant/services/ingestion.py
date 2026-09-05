@@ -235,6 +235,11 @@ def acknowledge_indexed(
             artifact_id=artifact_id,
             chunk_count=int(rows[0]["chunks"] or 0),
             detail=dict(receipt.get("detail") or {}),
+            # The region crossing a barrier is not the caller submitting
+            # again. Counting it here made three submissions plus one
+            # acknowledgement report four, which is a counter that moves when
+            # nobody submitted anything.
+            counts_as_submission=False,
         )
         crossed += 1
     return {

@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
+from pheasant.api.readiness_routes import register_readiness_routes
 from pheasant.assistant.credentials import SessionKeyStore
 from pheasant.config.loader import (
     ConfigError,
@@ -136,6 +137,18 @@ class SearchRequest(BaseModel):
     # How this region's agent memory takes part: "auto" (default), "off",
     # "only", "prefer", or an object with scopes/subject/current_only/as_of.
     memory: dict | str | None = None
+    # Pin this search to a sealed snapshot. The region verifies it still
+    # stands there and refuses with SNAPSHOT_DRIFTED if it does not — it holds
+    # one version of its corpus, so the guarantee is that two runs naming one
+    # snapshot cannot silently have seen different corpora.
+    snapshot_id: str | None = None
+    # The instant memory validity is evaluated at, echoed into the lineage
+    # even where the region holds no memory — an arm that ran with memory off
+    # has to be able to record that it did.
+    as_of: str | None = None
+    # The caller's correlation id, echoed so a result joins to the ledger row
+    # and the span that produced it.
+    trace_id: str | None = None
 
 
 class MemoryEnableRequest(BaseModel):
@@ -1909,6 +1922,13 @@ def create_app(
             metrics.render_with(sample),
             media_type="text/plain; version=0.0.4; charset=utf-8",
         )
+
+    # The readiness plane's routes register from their own module. `app.py` is
+    # the module ratchet's headline, and its docstring names the fix: one
+    # router per plane, easier once the service layer exists. It does now for
+    # these operations, so this plane starts on the right side of that line
+    # rather than adding to the pile.
+    register_readiness_routes(app, config=config, services=services, engine=engine)
 
     @app.get("/contract")
     def contract() -> dict:
@@ -3770,6 +3790,9 @@ def create_app(
                 min_score=req.min_score,
                 source_types=req.source_types,
                 exclude_source_types=req.exclude_source_types,
+                snapshot_id=req.snapshot_id,
+                as_of=req.as_of,
+                trace_id=req.trace_id,
             ),
         )
         record_retrieval(

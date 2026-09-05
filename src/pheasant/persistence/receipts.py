@@ -51,6 +51,7 @@ def record(
     error_code: str | None = None,
     retryable: bool = False,
     detail: dict[str, Any] | None = None,
+    counts_as_submission: bool = True,
 ) -> dict[str, Any]:
     """Write (or fold onto) one receipt, and return it.
 
@@ -66,6 +67,14 @@ def record(
     transport, because a barrier a caller waits on must not un-cross itself; a
     retry that *fails* does record the failure, since that is new information
     rather than a stale earlier state.
+
+    ``counts_as_submission`` is what keeps ``submissions`` meaning what its
+    name says. Crossing the index barrier writes this row too, and the first
+    version counted that — so three caller submissions plus one acknowledgement
+    reported four, and a harness proving its retry was absorbed would have read
+    a number that moves when the *region* acts. It is the shape
+    `pheasant_memory_reinforcement_ratio` was already caught by: a counter
+    derived from every write measures writes, not the thing the name promises.
     """
 
     key = receipt_id(kb_id, idempotency_key)
@@ -75,7 +84,7 @@ def record(
             submitted_at,updated_at,disposition,indexed_at,artifact_id,
             content_sha256,chunk_count,submissions,error_code,retryable,detail_json
         )
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(receipt_id) DO UPDATE SET
             updated_at=excluded.updated_at,
             submission_id=excluded.submission_id,
@@ -89,7 +98,7 @@ def record(
             artifact_id=COALESCE(excluded.artifact_id, ingest_receipts.artifact_id),
             content_sha256=COALESCE(excluded.content_sha256, ingest_receipts.content_sha256),
             chunk_count=COALESCE(excluded.chunk_count, ingest_receipts.chunk_count),
-            submissions=ingest_receipts.submissions + 1,
+            submissions=ingest_receipts.submissions + ?,
             error_code=excluded.error_code,
             retryable=excluded.retryable,
             detail_json=excluded.detail_json""",
@@ -106,9 +115,11 @@ def record(
             artifact_id,
             content_sha256,
             chunk_count,
+            1 if counts_as_submission else 0,
             error_code,
             int(bool(retryable)),
             json.dumps(detail or {}, default=str, sort_keys=True),
+            1 if counts_as_submission else 0,
         ),
     )
     stored = get(state, kb_id, idempotency_key)
