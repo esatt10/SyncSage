@@ -95,16 +95,22 @@ def neighbors(
         level = list(frontier)
         frontier = deque()
         adjacency = _out_edges_for(graph, [current for current, _d, _p in level])
-        # The targets this level could reach, fetched once. `exclude_node_types`
-        # and the `node` payload both need a target's attributes, and asking
-        # for them one at a time is the N+1 the batch exists to remove.
-        reachable = {
+        # Attributes are needed for the targets this level actually *keeps* —
+        # `max_nodes` of them — plus any it inspects and rejects. Fetching every
+        # reachable target instead is the shape that made a hub node expensive:
+        # one `source` node indexes every artifact, so a depth-3 walk asking for
+        # 100 neighbours fetched **8,040** node rows to keep 100. Measured 163ms
+        # against 13ms for the same walk over a resident graph, and it is the
+        # kind of waste only a real corpus exposes — a fixture's hub has four
+        # edges. `_BatchedNodes` keeps the batching (one query per block, not
+        # per node) and spends it only on what the loop reaches.
+        reachable = [
             target
             for entries in adjacency.values()
             for _source, target, _edge_map in entries
             if target not in visited
-        }
-        attributes = _nodes_for(graph, sorted(reachable))
+        ]
+        attributes = _nodes_for(graph, reachable, budget=max_nodes)
         for current, current_depth, path in level:
             if max_nodes is not None and len(found) >= max_nodes:
                 break
@@ -179,13 +185,66 @@ def _out_edges_for(graph: Any, node_ids: list[str]) -> dict[str, list]:
     return {node_id: graph.out_edges(node_id) for node_id in node_ids}
 
 
-def _nodes_for(graph: Any, node_ids: list[str]) -> dict[str, dict]:
-    """Attributes for a whole frontier, batched when the graph can."""
+#: Node attributes fetched per block by :class:`_BatchedNodes`. Large enough
+#: that a bounded walk is one or two queries, small enough that a hub node's
+#: fan-out is not fetched to be thrown away.
+PREFETCH_BLOCK = 256
+
+
+class _BatchedNodes:
+    """Attributes for the targets a walk actually reaches, a block at a time.
+
+    Sits between "one query per node", which is the N+1 a store-backed walk
+    cannot afford, and "one query for everything reachable", which is what a
+    hub node makes ruinous. Candidates arrive in the order the walk will
+    consume them, so a block usually satisfies many lookups; a miss outside the
+    current block still resolves, at the cost of pulling that key in with the
+    next one.
+    """
+
+    def __init__(self, fetch: Any, candidates: list[str], block: int) -> None:
+        self._fetch = fetch
+        self._candidates = candidates
+        self._at = 0
+        self._block = max(1, block)
+        self._known: dict[str, dict | None] = {}
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key not in self._known:
+            self._fill(key)
+        found = self._known.get(key)
+        return default if found is None else found
+
+    def _fill(self, key: str) -> None:
+        batch: list[str] = []
+        while self._at < len(self._candidates) and len(batch) < self._block:
+            candidate = self._candidates[self._at]
+            self._at += 1
+            if candidate not in self._known:
+                batch.append(candidate)
+        if key not in batch and key not in self._known:
+            batch.append(key)
+        found = self._fetch(batch) if batch else {}
+        for node_id in batch:
+            self._known[node_id] = found.get(node_id)
+
+
+def _nodes_for(graph: Any, node_ids: list[str], budget: int | None = None) -> Any:
+    """A mapping of node attributes, batched and bounded by what is asked for.
+
+    ``budget`` is the walk's ``max_nodes``: a level cannot keep more than that,
+    so fetching every candidate spends queries on rows the truncation is about
+    to discard.
+    """
 
     batch = getattr(graph, "prefetch_nodes", None)
-    if callable(batch):
+    if not callable(batch):
+        return {node_id: (graph.nodes.get(node_id) or {}) for node_id in node_ids}
+    block = PREFETCH_BLOCK if budget is None else max(1, min(int(budget), PREFETCH_BLOCK))
+    if len(node_ids) <= block:
+        # Small enough that laziness would only add indirection.
         return batch(node_ids)
-    return {node_id: (graph.nodes.get(node_id) or {}) for node_id in node_ids}
+    return _BatchedNodes(batch, node_ids, block)
 
 
 def slice_(
@@ -246,6 +305,8 @@ def slice_(
     # of 100 nodes was 200 single-node lookups, which is free in RAM and 200
     # round trips against a store.
     adjacency = _out_edges_for(graph, sorted(node_set))
+    # Bounded by construction: `node_ids` is the start plus at most `limit`
+    # kept neighbours, so this is the eager path and stays one query.
     attributes = _nodes_for(graph, node_ids)
     for source in node_set:
         for _src, target, edge_map in adjacency.get(source, []):

@@ -106,7 +106,8 @@ pheasant-kb/
 │   │                            bridge, maintenance, formation, benchmark
 │   ├── persistence/           ← state_store, backends (sqlite|postgres),
 │   │                            schema, graph_store (file|rows), graph_rows
-│   │                            (the delta write + the XOR generation fold),
+│   │                            (the delta write), graph_codec (rows to
+│   │                            attributes, and the XOR generation fold),
 │   │                            manifest, migrate, paths
 │   ├── services/              ← the application layer: one implementation per
 │   │                            operation, two transports. errors (refusals
@@ -411,6 +412,39 @@ disk, roughly 55×, stated as `capacity.GRAPH_ROW_BYTES_PER_NODE` (measured
   on a memory-maintenance beat. The shape is O(total) and the constant is
   small, so the answer is to stop holding the graph rather than to index it
   further — see the next bullet for what that needs.
+- **Measured against the pre-35.10 baseline, end to end.** An 8,000-file
+  corpus (24,443 nodes / 72,441 edges), same corpus both sides, `834452b`
+  against now:
+
+  | | baseline | now | |
+  |---|---|---|---|
+  | graph publish per commit | 0.82 s | **0.0007 s** | 1,231× |
+  | incremental sync, 1 file changed | 4.36 s | **3.32 s** | 1.3× |
+  | RSS for a replica that answers | 142 MB | **29 MB** | 4.9× |
+  | text search p50 | 49.6 ms | 47.4 ms | — |
+  | graph arm p50 | 34.7 ms | 55.9 ms | 1.6× *slower* |
+  | 3-hop walk, ordinary node | 0.24 ms | 1.7 ms | 7× *slower* |
+  | 3-hop walk, hub (8,040 edges) | 12.6 ms | 46 ms | 3.7× *slower* |
+  | full index | 25.9 s | 27.7 s | 1.1× *slower* |
+  | `/state` on disk | 115 MB | 177 MB | 1.5× *larger* |
+
+  It is **not uniformly faster**, and the shape of the trade is the point: the
+  axes it was built for — commit cost and residency — moved by three orders of
+  magnitude and five times; graph *read* latency got worse, because reading a
+  graph you do not hold means reconstructing what you read. Text search and
+  the unchanged re-sync are untouched, which is the check that nothing leaked
+  sideways.
+- **Serving concurrency on SQLite is the one caveat worth knowing.** Hybrid
+  throughput held at 1 thread and fell 3.7× at 4. The cause is not the design:
+  concurrent SQLite reads do not scale *in a container like this one* — the
+  same probe against the **baseline's** database reading `chunks` went 486/s
+  to 13/s across 1→4 threads, with per-thread connections and no WAL backlog.
+  The row backend simply moved graph reads onto that resource, so the graph
+  paths inherit it. Postgres does not share it: the same batched fetch scales
+  41 → 86 → 160 qps across 1 → 4 → 8 threads, which is where the fleet runs
+  and where replicas exist. A standalone SQLite container serving heavily
+  concurrent *graph* queries is the one shape that is worse off than before,
+  and `storage.graph_format: node_link_json` is still there for it.
 - **The prerequisite for dropping the working set is batching, and Postgres
   sets the bar.** The builder does a read-modify-write per node (`upsert_node`
   reads `created_at`, `upsert_edge` reads the existing edge). Against rows
@@ -1320,6 +1354,36 @@ Each of these cost real time. They are listed because the shape recurs.
   means the change that could not be bounded is the one that did not ship: the
   `remove_nodes_from` rework measured 122.5ms against 126.0ms, so it was
   reverted rather than kept for looking better.
+- **A micro-benchmark that picks a convenient starting node measures the easy
+  half.** `graph/capacity.py` timed a bounded 3-hop walk at **0.12 ms** and
+  the same walk on a real corpus took **220 ms** — because the benchmark
+  started from an arbitrary node with a handful of edges and a real walk
+  starts wherever the caller points, often at a `source` node that indexes
+  every artifact in the region. Three separate defects hid behind that gap and
+  every one of them was invisible to the whole test suite: the walk prefetched
+  attributes for every *reachable* target rather than the ones it would keep
+  (8,040 node rows to return 100); every edge's JSON attribute blob was parsed
+  to read `type`, which is a column and not in the blob (8,040 `json.loads`,
+  42% of the walk); and the rows were grouped by endpoint pair twice, once in
+  the store and again in the caller. The benchmark measures a hub explicitly
+  now, next to the ordinary node, because reporting only the ordinary one
+  described the case that was already fine.
+- **The same N+1 appeared one layer up, in the graph search arm.**
+  `graph.nodes.get(node_id)` is a dict lookup on a resident graph and a
+  `SELECT` on a stored one, so the obvious loop over the index's candidates
+  issued **~2,000 single-row queries per search** — and the cost scaled with
+  how *unselective* the query was rather than with what it returned, which is
+  the worst possible shape. Batched, that is 4 queries. The general lesson:
+  moving a data structure behind a store turns every `.get()` in a loop into a
+  round trip, and they are spread across modules that never mentioned storage.
+- **Two fixes were built, measured and thrown away in the same pass.** An
+  out-adjacency index for `remove_nodes_from` measured 122.5ms against
+  126.0ms, and an exact short-circuit in `_node_score` — provably identical
+  output, skipping the attribute scan when `label`/`name` already scored above
+  everything that follows — did not fire on a real corpus, because labels are
+  paths and the query words are in the body. Both were reverted. A change that
+  cannot show a number is not an optimization, it is a diff; and one that
+  touches ranking without showing a number is worse than that.
 - **An incremental sync leaks a chunk node per edit. Open, pre-existing, not
   fixed here.** Chunk node ids embed the chunk's sha256, so editing a file
   produces *new* chunk nodes — and nothing removes the old ones on the

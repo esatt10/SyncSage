@@ -49,6 +49,40 @@ What you pay for it is disk: about **1,640 bytes per node** in the database
 (measured 1,637 at 20k files and 1,639 at 100k), against a compressed file
 roughly 55× smaller. `pheasant scan` includes it.
 
+## Measured against the pre-row-backend baseline
+
+An 8,000-file corpus (24,443 nodes / 72,441 edges), the same corpus driven
+through both versions:
+
+| | before | after | |
+|---|---|---|---|
+| graph publish per commit | 0.82 s | **0.0007 s** | 1,231× faster |
+| incremental sync, one file changed | 4.36 s | **3.32 s** | 1.3× faster |
+| RSS for a replica that answers graph queries | 142 MB | **29 MB** | 4.9× smaller |
+| text search p50 | 49.6 ms | 47.4 ms | unchanged |
+| graph arm p50 | 34.7 ms | 55.9 ms | 1.6× slower |
+| 3-hop walk, ordinary node | 0.24 ms | 1.7 ms | 7× slower |
+| 3-hop walk from a hub (8,040 edges) | 12.6 ms | 46 ms | 3.7× slower |
+| full index | 25.9 s | 27.7 s | 1.1× slower |
+| `/state` on disk | 115 MB | 177 MB | 1.5× larger |
+
+Read it as a trade, not a win: commit cost and residency — the two things that
+decided when a region had to be sharded — moved by three orders of magnitude
+and five times. Graph *read* latency got worse, because reading a graph you do
+not hold means reconstructing what you read. Text search and an unchanged
+re-sync are untouched.
+
+**One caveat, for standalone SQLite regions serving concurrent graph traffic.**
+Hybrid throughput holds at one thread and falls about 3.7× at four. That is not
+the row backend: concurrent SQLite reads do not scale in a containerised
+filesystem — the same probe against a *pre-change* database reading `chunks`
+fell from 486/s to 13/s across one to four threads. The change moved graph
+reads onto that resource, so the graph paths inherit it. Postgres does not
+share the problem (41 → 86 → 160 qps across one to eight threads), and the
+fleet runs Postgres. If you serve heavily concurrent graph queries from a
+single SQLite container, either put the `graph` role in front of it or keep
+`storage.graph_format: node_link_json`.
+
 ## Sizing a region
 
 | Corpus | Give the container | Notes |

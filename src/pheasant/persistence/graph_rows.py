@@ -8,10 +8,10 @@ own synthetic corpus, at 100k files (630k nodes / 630k edges):
 ===================================  ==========  ==========
                                      file        rows
 ===================================  ==========  ==========
-commit after a one-file change       9.1 s       0.010 s
+commit after a one-file change       9.1 s       0.001 s
 load before a replica can serve      4.6 s       none
 resident bytes to answer a query     1.5 GB      none
-3-hop bounded traversal              in-RAM      0.026 ms
+3-hop bounded traversal              in-RAM      0.13 ms
 ===================================  ==========  ==========
 
 The commit number is the one that matters, and not because 9 seconds is slow:
@@ -19,7 +19,8 @@ it is **O(total graph)** where the change was O(one file), it runs while the
 sync mutex is held, and one process is the sole commit authority per shard
 (``sync/saturation.py``). That made corpus size, not write rate, the thing
 that saturated the commit stream — and the only documented way past it was to
-shard the region. As rows the same commit is 10 ms *and flat in graph size*.
+shard the region. As rows the same commit is a millisecond *and flat in graph
+size*.
 
 **What this deliberately does not change.**
 
@@ -36,220 +37,51 @@ shard the region. As rows the same commit is 10 ms *and flat in graph size*.
   now land in **one transaction** instead of a database write followed by a
   separate file rename.
 
-**The generation id survives the move.** It is content-addressed, carries no
-clock, and two replicas must name an unchanged graph identically without
-coordinating (pillar 1). A digest over a serialized whole graph gave that for
-free and cost O(N). Here every row carries its own digest and the published id
-folds them with **XOR**, which is its own inverse: a commit folds each changed
-row's old digest out and its new one in, so the published id is exact and the
-update is O(changed). Each key contributes exactly once — both tables have a
-primary key — so the multiset cancellation XOR set-hashes are criticized for
-cannot arise. :meth:`recompute_folds` re-derives them with a full scan for
-``sync --mode repair`` and for the tests, because an incrementally maintained
-aggregate that nothing ever checks is an aggregate that drifts.
+The row↔attribute codec and the generation fold live in
+:mod:`pheasant.persistence.graph_codec` and are re-exported here, so every
+existing import of this module keeps working.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 from typing import Any
 
+from pheasant.persistence.graph_codec import (
+    _ZERO_FOLD,
+    BATCH,
+    DIGEST_HEX,
+    EDGE_KEY,
+    PROMOTED_EDGE_KEYS,
+    PROMOTED_NODE_KEYS,
+    _batched,
+    _digest,
+    _endpoint_clauses,
+    _pair_clauses,
+    edge_attrs,
+    edge_row,
+    fold,
+    node_attrs,
+    node_row,
+)
+
+__all__ = [
+    "BATCH",
+    "DIGEST_HEX",
+    "EDGE_KEY",
+    "PROMOTED_EDGE_KEYS",
+    "PROMOTED_NODE_KEYS",
+    "GraphRowStore",
+    "edge_attrs",
+    "edge_row",
+    "fold",
+    "node_attrs",
+    "node_row",
+]
+
 logger = logging.getLogger(__name__)
-
-#: Attributes promoted out of ``attrs`` into their own column. Chosen because
-#: something filters or joins on each of them — not to make rows look tidy.
-#: They are stored once: :func:`node_row` removes them from the JSON and
-#: :func:`node_attrs` merges them back, so the projection lives in one place.
-PROMOTED_NODE_KEYS = ("type", "label", "source_id", "relative_path", "artifact_id")
-
-#: Same, for an edge. ``type`` and ``seq`` are part of the primary key.
-PROMOTED_EDGE_KEYS = ("type", "source_id")
-
-#: The composite key of ``graph_edges``, in its declared order. Named once
-#: because it is both the primary key and the order every streaming read
-#: pages by, and those two agreeing is what makes the paging a range scan.
-EDGE_KEY = ("source", "target", "type", "seq")
-
-#: Rows per statement. The same figure ``persistence/migrate.py`` uses, for the
-#: same reason: a million-row table should not be a million round trips, and a
-#: parameter list should not be measured in gigabytes.
-BATCH = 1_000
-
-#: Endpoint *sources* per statement when addressing edges by exact pair.
-#:
-#: Deliberately far smaller than :data:`BATCH`. Addressing pairs needs an
-#: ``OR`` chain — ``source IN (…) AND target IN (…)`` is a cross product, which
-#: over-matches, and over-matching here would fold out digests that were never
-#: replaced and delete edges nobody touched. An ``OR`` chain nests one level
-#: per term, and SQLite refuses an expression tree deeper than 1000 outright:
-#: batching pairs at ``BATCH`` raised "Expression tree is too large" on the
-#: first real graph. Grouping the targets under each source keeps the chain
-#: proportional to *distinct sources*, and this caps that.
-PAIR_GROUP_BATCH = 100
-
-#: Targets listed per source inside one group. An ``IN`` list is one node in
-#: the tree however long it is, so this bounds the parameter count rather than
-#: the depth.
-PAIR_TARGET_BATCH = 400
-
-#: Hex digits of SHA-256 kept per row. 128 bits is far past what a collision
-#: between two versions of one region's node needs, and the fold is stored as
-#: text so it reads in a `SELECT` and survives both dialects without a bytea
-#: round trip.
-DIGEST_HEX = 32
-
-_ZERO_FOLD = "0" * DIGEST_HEX
-
-
-def _canonical(payload: dict[str, Any]) -> str:
-    """Deterministic JSON for hashing and for the ``attrs`` column.
-
-    Key-sorted and separator-compact, exactly as the file backend serialized
-    the whole graph — so a node's bytes here are the bytes it had there, and
-    the digest of an unchanged node does not depend on which backend wrote it.
-    """
-
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def _digest(*parts: str) -> str:
-    hasher = hashlib.sha256()
-    for part in parts:
-        hasher.update(part.encode("utf-8"))
-        hasher.update(b"\x00")
-    return hasher.hexdigest()[:DIGEST_HEX]
-
-
-def fold(current: str, *digests: str) -> str:
-    """XOR ``digests`` into ``current``.
-
-    Its own inverse, which is the whole reason the id can be maintained
-    incrementally: folding a digest in twice is folding it out.
-    """
-
-    value = int(current or _ZERO_FOLD, 16)
-    for item in digests:
-        value ^= int(item, 16)
-    return format(value, f"0{DIGEST_HEX}x")
-
-
-def node_row(kb_id: str, node_id: str, attrs: dict[str, Any]) -> tuple:
-    """One ``graph_nodes`` row, with its digest, from a node's attributes."""
-
-    rest = {key: value for key, value in attrs.items() if key not in PROMOTED_NODE_KEYS}
-    encoded = _canonical(rest)
-    promoted = [_text(attrs.get(key)) for key in PROMOTED_NODE_KEYS]
-    digest = _digest(node_id, *[value or "" for value in promoted], encoded)
-    return (kb_id, node_id, *promoted, encoded, digest)
-
-
-def node_attrs(row: Any) -> dict[str, Any]:
-    """Rebuild a node's attribute dict from its row.
-
-    The inverse of :func:`node_row`, and the *only* inverse: a caller that
-    reads ``row["attrs"]`` directly gets a node missing its type and label.
-    Promoted columns win over the JSON so a row written by an older schema
-    cannot shadow them.
-    """
-
-    attrs = dict(json.loads(row["attrs"] or "{}"))
-    for key in PROMOTED_NODE_KEYS:
-        value = row[key]
-        if value is not None:
-            attrs[key] = value
-    return attrs
-
-
-def edge_row(kb_id: str, source: str, target: str, seq: int, attrs: dict[str, Any]) -> tuple:
-    """One ``graph_edges`` row, with its digest."""
-
-    rest = {key: value for key, value in attrs.items() if key not in PROMOTED_EDGE_KEYS}
-    encoded = _canonical(rest)
-    edge_type = _text(attrs.get("type")) or "related"
-    source_id = _text(attrs.get("source_id"))
-    digest = _digest(source, target, edge_type, str(seq), source_id or "", encoded)
-    return (kb_id, source, target, edge_type, int(seq), source_id, encoded, digest)
-
-
-def edge_attrs(row: Any) -> dict[str, Any]:
-    """Rebuild an edge's attribute dict from its row."""
-
-    attrs = dict(json.loads(row["attrs"] or "{}"))
-    attrs["type"] = row["type"]
-    if row["source_id"] is not None:
-        attrs["source_id"] = row["source_id"]
-    return attrs
-
-
-def _text(value: Any) -> str | None:
-    if value is None:
-        return None
-    return value if isinstance(value, str) else str(value)
-
-
-def _batched(items: list, size: int = BATCH) -> Iterator[list]:
-    for start in range(0, len(items), size):
-        yield items[start : start + size]
-
-
-def _pair_clauses(kb_id: str, pairs: Iterable[tuple[str, str]]) -> Iterator[tuple[str, list[Any]]]:
-    """``(sql, params)`` fragments addressing an exact set of endpoint pairs.
-
-    Grouped by source and capped twice — see :data:`PAIR_GROUP_BATCH`. Yields
-    nothing for an empty set, which is what lets both callers skip the
-    statement entirely rather than build ``WHERE ... AND ()``.
-
-    **``kb_id`` is repeated inside every term, and that is the whole point.**
-    Factoring it out to ``WHERE kb_id=? AND (… OR …)`` reads better and costs
-    a full table scan: SQLite's multi-index-OR optimization needs each branch
-    to be independently indexable, and ``source=?`` alone is not a prefix of
-    ``(kb_id, source, target, type, seq)``. ``EXPLAIN QUERY PLAN`` says
-    ``SEARCH … USING INDEX idx_graph_edges_target (kb_id=?)`` for the tidy
-    form and ``MULTI-INDEX OR`` with exact primary-key lookups for this one.
-    Measured: 300ms per incremental commit at 100k files versus 2ms, and the
-    tidy form was O(total graph) — which would have made the row backend cost
-    what the file backend cost, for the same reason, one layer down.
-    """
-
-    grouped: dict[str, list[str]] = {}
-    for source, target in sorted(pairs):
-        grouped.setdefault(source, []).append(target)
-    groups: list[tuple[str, list[str]]] = []
-    for source, targets in grouped.items():
-        for chunk in _batched(targets, PAIR_TARGET_BATCH):
-            groups.append((source, chunk))
-    for batch in _batched(groups, PAIR_GROUP_BATCH):
-        clause = " OR ".join(
-            f"(kb_id=? AND source=? AND target IN ({','.join('?' for _ in targets)}))"
-            for _source, targets in batch
-        )
-        params: list[Any] = []
-        for source, targets in batch:
-            params.extend((kb_id, source))
-            params.extend(targets)
-        yield clause, params
-
-
-def _endpoint_clauses(kb_id: str, node_ids: list[str]) -> Iterator[tuple[str, list[Any]]]:
-    """``(sql, params)`` fragments for every edge touching one of ``node_ids``.
-
-    Two indexable branches per node rather than one ``OR`` between two ``IN``
-    lists, for the reason :func:`_pair_clauses` spells out: the out-edge branch
-    rides the primary key and the in-edge branch rides
-    ``idx_graph_edges_target``, and neither can be reached with ``kb_id``
-    hoisted out of the ``OR``.
-    """
-
-    for batch in _batched(node_ids, PAIR_GROUP_BATCH):
-        placeholders = ",".join("?" for _ in batch)
-        clause = (
-            f"(kb_id=? AND source IN ({placeholders})) OR (kb_id=? AND target IN ({placeholders}))"
-        )
-        yield clause, [kb_id, *batch, kb_id, *batch]
 
 
 class GraphRowStore:
@@ -634,8 +466,8 @@ class GraphRowStore:
 
     def out_edges(
         self, kb_id: str, sources: Iterable[str]
-    ) -> dict[str, list[tuple[str, str, dict[str, Any]]]]:
-        """``{source: [(source, target, attrs)]}`` for a whole BFS frontier.
+    ) -> dict[str, list[tuple[str, str, dict[int, Any]]]]:
+        """``{source: [(source, target, {seq: attrs})]}`` for a whole BFS frontier.
 
         One query per *level* rather than per node. The primary key already
         leads with ``(kb_id, source)``, so this is a range scan over the key
@@ -648,28 +480,45 @@ class GraphRowStore:
         honest replacement; ``tests/test_graph_backends.py`` asserts the two
         backends return the same *set* and each is internally deterministic,
         rather than asserting an equality that is not true.
+
+        Grouped by endpoint pair here rather than flat-then-regrouped by the
+        caller. The two-pass version built one tuple per edge and then one dict
+        per pair over the same rows, which is invisible on an ordinary node and
+        not on a hub: a ``source`` node indexing 8,000 artifacts made that
+        ~15ms of pure object churn per traversal. The ``ORDER BY`` already
+        clusters a pair's rows together, so one pass is enough.
         """
 
-        grouped: dict[str, list[tuple[str, str, dict[str, Any]]]] = {}
+        grouped: dict[str, list[tuple[str, str, dict[int, Any]]]] = {}
         for batch in _batched(list(sources)):
             if not batch:
                 continue
             placeholders = ",".join("?" for _ in batch)
+            current: tuple[str, str] | None = None
+            edge_map: dict[int, Any] = {}
             for row in self.state.rows(
                 f"SELECT * FROM graph_edges WHERE kb_id=? AND source IN ({placeholders})"
                 " ORDER BY source, target, type, seq",
                 (kb_id, *batch),
             ):
-                grouped.setdefault(str(row["source"]), []).append(
-                    (str(row["source"]), str(row["target"]), edge_attrs(row))
-                )
+                pair = (str(row["source"]), str(row["target"]))
+                if pair != current:
+                    current, edge_map = pair, {}
+                    grouped.setdefault(pair[0], []).append((pair[0], pair[1], edge_map))
+                edge_map[len(edge_map)] = edge_attrs(row)
         return grouped
 
     def iter_nodes(self, kb_id: str) -> Iterator[tuple[str, dict[str, Any]]]:
-        """Every node, streamed. For exports and whole-graph passes."""
+        """Every node, streamed. For exports and whole-graph passes.
+
+        Materialized, unlike the point lookups: a caller streaming the whole
+        graph is going to read all of it, so :class:`_LazyAttrs` would be pure
+        overhead — and these feed `json.dumps` (snapshots, the node-link
+        export), which serializes a `dict` and refuses anything else.
+        """
 
         for row in self._stream("graph_nodes", ("node_id",), kb_id):
-            yield str(row["node_id"]), node_attrs(row)
+            yield str(row["node_id"]), dict(node_attrs(row))
 
     def iter_edges(self, kb_id: str) -> Iterator[tuple[tuple[str, str], dict[int, dict]]]:
         """Every edge, streamed and grouped by endpoint pair.
@@ -688,7 +537,8 @@ class GraphRowStore:
                 if current is not None:
                     yield current, parallel
                 current, parallel = pair, {}
-            parallel[len(parallel)] = edge_attrs(row)
+            # Materialized, for the reason `iter_nodes` gives.
+            parallel[len(parallel)] = dict(edge_attrs(row))
         if current is not None:
             yield current, parallel
 

@@ -155,17 +155,10 @@ class SqlGraph:
         answered.
         """
 
-        grouped = self.rows.out_edges(self.kb_id, node_ids)
-        result: dict[str, list[tuple[str, str, dict[int, dict]]]] = {}
-        for source, entries in grouped.items():
-            pairs: dict[tuple[str, str], dict[int, dict]] = {}
-            for edge_source, target, attrs in entries:
-                bucket = pairs.setdefault((edge_source, target), {})
-                bucket[len(bucket)] = attrs
-            result[source] = [
-                (edge_source, target, edge_map) for (edge_source, target), edge_map in pairs.items()
-            ]
-        return result
+        # Already grouped by pair in the store, which is the shape callers
+        # want: regrouping here meant a second pass and a second set of
+        # objects over every row a hub node returns.
+        return self.rows.out_edges(self.kb_id, node_ids)
 
     def prefetch_nodes(self, node_ids: list[str]) -> dict[str, dict[str, Any]]:
         """Attributes for a whole frontier, in one query."""

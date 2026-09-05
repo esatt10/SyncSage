@@ -47,6 +47,12 @@ from pheasant.graph.simple import SimpleMultiDiGraph
 NODES_PER_FILE = 6.3
 EDGES_PER_FILE = 6.3
 
+#: Out-edges on the synthetic hub node. A `source` node carries an `indexes`
+#: edge to every artifact it holds, so on a real corpus this is the file count
+#: — 8,040 on the 8,000-file stress corpus. Fixed here so the hub number is
+#: comparable between scale points instead of growing with them.
+HUB_FAN_OUT = 8000
+
 #: Node types in the proportion a real graph has them, so attribute payloads
 #: (which dominate the JSON size) are representative rather than uniform.
 NODE_SHAPES = (
@@ -172,6 +178,26 @@ def measure_rows(files: int, root: Path, graph: SimpleMultiDiGraph) -> dict[str,
     walk_seconds = (time.perf_counter() - started) / 20
     rss_after = _resident_bytes()
 
+    # The same walk off a **hub**, which is the case that separates the two
+    # backends and the one no fixture has. A real `source` node indexes every
+    # artifact, so a bounded walk there has thousands of edges to choose its
+    # hundred from — and fetching that fan-out is the cost residency used to
+    # hide. Reported separately because quoting only the ordinary number would
+    # describe the easy half.
+    hub = f"hub:{kb}"
+    rows.apply_delta(
+        kb,
+        node_upserts=[(hub, {"type": "source", "label": "hub", "source_id": "corpus"})],
+        edge_upserts=[
+            (hub, node_id, 0, {"type": "contains", "source_id": "corpus"})
+            for node_id, _attrs in delta["node_upserts"][:HUB_FAN_OUT]
+        ],
+    )
+    started = time.perf_counter()
+    for _ in range(10):
+        neighbors(served, hub, depth=3, max_nodes=100)
+    hub_walk_seconds = (time.perf_counter() - started) / 10
+
     stored = sum(path.stat().st_size for path in root.glob(f"rows-{files}.db*") if path.exists())
     state.close()
     return {
@@ -180,6 +206,8 @@ def measure_rows(files: int, root: Path, graph: SimpleMultiDiGraph) -> dict[str,
         "stored_bytes": stored,
         "serving_rss_delta_bytes": (rss_after - rss_before) if (rss_after and rss_before) else None,
         "bounded_walk_seconds": round(walk_seconds, 6),
+        "hub_walk_seconds": round(hub_walk_seconds, 6),
+        "hub_fan_out": HUB_FAN_OUT,
     }
 
 

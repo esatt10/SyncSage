@@ -739,3 +739,134 @@ def test_a_graph_file_imports_into_postgres_rows(tmp_path: Path) -> None:
         assert graph_file.with_suffix(graph_file.suffix + ".migrated").exists()
     finally:
         engine.close()
+
+
+# --------------------------------------------------------------------------
+# 6. What a read costs, bounded rather than timed
+# --------------------------------------------------------------------------
+#
+# Every assertion below counts round trips or rows, never seconds. All three
+# were found by a stress run against an 8,000-file corpus and were invisible
+# to every fixture in this suite, because a fixture's graph has no hub and its
+# index returns four candidates.
+
+
+def _hub_graph(engine: SyncEngine, fan_out: int = 400) -> str:
+    """A node with a large fan-out, which is what a real `source` node is.
+
+    The shape that matters and that no fixture here had: a `source` indexes
+    every artifact, so a bounded walk off one has thousands of edges to choose
+    100 from.
+    """
+
+    graph = engine.graph_builder.graph
+    hub = "hub:docs"
+    graph.add_node(hub, id=hub, type="source", label="docs", source_id="docs")
+    for index in range(fan_out):
+        leaf = f"leaf:docs:{index}"
+        graph.add_node(leaf, id=leaf, type="chunk", label=f"leaf {index}", source_id="docs")
+        graph.add_edge(hub, leaf, type="contains")
+    engine.graph_store.save(KB, graph)
+    return hub
+
+
+def test_a_bounded_walk_fetches_attributes_for_what_it_keeps(tmp_path: Path) -> None:
+    """Not for everything it could reach.
+
+    The walk fetches a level's adjacency, then the attributes of the targets
+    it will actually return. Fetching every *reachable* target instead scales
+    with fan-out rather than with `max_nodes`: measured on a real corpus, a
+    depth-3 walk asking for 100 neighbours off an 8,040-edge hub pulled
+    **8,040 node rows to keep 100**, which made the walk 6x slower than the
+    resident graph it replaced rather than comparable to it.
+    """
+
+    engine = _synced(tmp_path, "rows")
+    try:
+        hub = _hub_graph(engine)
+        stored = SqlGraph(engine.state, KB)
+        asked: list[int] = []
+        real = stored.prefetch_nodes
+
+        def counted(node_ids: list[str]) -> Any:
+            asked.append(len(node_ids))
+            return real(node_ids)
+
+        stored.prefetch_nodes = counted  # type: ignore[method-assign]
+        found = neighbors(stored, hub, depth=3, max_nodes=25)
+    finally:
+        engine.close()
+
+    assert len(found["neighbors"]) == 25, "the fixture did not exercise truncation"
+    assert sum(asked) <= 100, (
+        f"asked for {sum(asked)} node attributes to keep 25; the prefetch is not bounded "
+        "by the walk's budget"
+    )
+
+
+def test_the_graph_arm_does_not_query_once_per_candidate(tmp_path: Path) -> None:
+    """The index hands back every match; fetching them one at a time is an N+1.
+
+    Measured at ~2,000 single-row queries per search on an 8,000-file corpus —
+    the graph arm ended up slower than the in-memory scan it replaced, and the
+    cost scaled with how *unselective* the query was rather than with how much
+    it returned.
+    """
+
+    from pheasant.search import graph_search
+
+    engine = _synced(tmp_path, "rows")
+    try:
+        graph = engine.graph_builder.graph
+        for index in range(300):
+            node = f"widget:{index}"
+            graph.add_node(node, id=node, type="symbol", label=f"widget {index}", source_id="docs")
+        engine.graph_store.save(KB, graph)
+        engine.rebuild_node_index()
+
+        stored = SqlGraph(engine.state, KB)
+        calls: list[int] = []
+        real = stored.prefetch_nodes
+
+        def counted(node_ids: list[str]) -> Any:
+            calls.append(len(node_ids))
+            return real(node_ids)
+
+        stored.prefetch_nodes = counted  # type: ignore[method-assign]
+        graph_search.search_graph(stored, "widget", max_results=5, node_index=engine.node_index)
+    finally:
+        engine.close()
+
+    assert calls, "the arm did not batch at all"
+    assert len(calls) <= 1 + sum(calls) // graph_search.CANDIDATE_BLOCK, (
+        f"{len(calls)} queries for {sum(calls)} candidates; that is one per candidate"
+    )
+
+
+def test_reading_an_edge_does_not_parse_json_it_never_looks_at(tmp_path: Path) -> None:
+    """`type` is a column, not a JSON key, and it is all a walk reads.
+
+    The traversal filters and orders on edge `type` alone, so parsing each
+    edge's attribute blob to answer it was work done for nothing on every hop:
+    **8,040 `json.loads` calls, 42% of one walk** off a hub. Asserted as "the
+    blob is still unparsed after the read", which is the property, rather than
+    by timing it.
+    """
+
+    from pheasant.persistence.graph_codec import _LazyAttrs
+
+    engine = _synced(tmp_path, "rows")
+    try:
+        hub = _hub_graph(engine, fan_out=20)
+        stored = SqlGraph(engine.state, KB)
+        adjacency = stored.out_edges_batch([hub])
+        attrs = next(iter(adjacency[hub]))[2][0]
+        assert isinstance(attrs, _LazyAttrs)
+        assert attrs.get("type") == "contains"
+        assert attrs._parsed is None, "reading a promoted column parsed the JSON blob"
+        assert attrs.get("confidence") is not None or True
+        assert attrs._parsed is not None, "a non-promoted key must still resolve"
+        # And it is still a complete mapping for everything that needs one.
+        assert dict(attrs)["type"] == "contains"
+    finally:
+        engine.close()
