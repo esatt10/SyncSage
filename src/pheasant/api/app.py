@@ -696,6 +696,12 @@ LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
     # *bundle* is a different thing entirely — it lives in /state, not in this
     # config, and every replica picks it up on its own TTL without a restart.
     "tuning": True,
+    # Read per check, not wired into a service: a readiness run reads
+    # `config.readiness` when it starts. The one part that is *not* per-check
+    # is `corpus_denylist`, which the ingestion service reads on every
+    # submission — also per call, so also live. Nothing here is a service
+    # started at boot, which is the question this table actually asks.
+    "readiness": True,
     "storage": False,
     "server": False,
     "pheasant": False,
@@ -1552,9 +1558,26 @@ def create_app(
         "Unknown source: notes" is what a caller acts on, and an agent told
         only that something failed will retry the same call. The conformance
         test asserts both surfaces produce it identically.
+
+        ``code`` and ``retryable`` ride *beside* the text rather than inside
+        it, which is the one place the two surfaces deliberately differ. The
+        MCP SDK's `ToolError` carries a string and nothing else, so a code
+        spelled into the message would be the only way to get it across — and
+        that would change the refusal text on both surfaces to serve one of
+        them. Instead the readiness contract publishes the code table, an MCP
+        client maps the text it already has, and an HTTP client reads the field.
+        The asymmetry is here, in an adapter, where a reader can see it.
         """
 
-        return JSONResponse(status_code=exc.status, content={"detail": str(exc)})
+        payload = exc.as_dict()
+        return JSONResponse(
+            status_code=exc.status,
+            content={
+                "detail": payload["error"],
+                "code": payload["code"],
+                "retryable": payload["retryable"],
+            },
+        )
 
     @app.get("/health")
     async def health() -> dict:
