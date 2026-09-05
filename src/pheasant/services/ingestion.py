@@ -132,7 +132,7 @@ def submit(context: ServiceContext, request: SubmissionRequest) -> dict[str, Any
         existing = receipt_ledger.get(context.state, kb_id, key)
         try:
             relative = _placement(item.relative_path, existing)
-            _check_denylist(relative, denylist)
+            check_denylist(relative, denylist)
             _check_size(relative, item.content, max_bytes)
         except InvalidRequest as exc:
             receipt = receipt_ledger.record(
@@ -369,7 +369,7 @@ def _denylist(config: Any) -> tuple[str, ...]:
     return tuple(getattr(settings, "corpus_denylist", ()) or ())
 
 
-def _check_denylist(relative: str, patterns: tuple[str, ...]) -> None:
+def check_denylist(relative: str, patterns: tuple[str, ...]) -> None:
     """Refuse a path the region has declared may never enter the corpus.
 
     This is the enforcement half of benchmark contamination. A *check* that
@@ -380,6 +380,12 @@ def _check_denylist(relative: str, patterns: tuple[str, ...]) -> None:
 
     Empty by default, and an empty list costs one truth test per item — the
     no-configuration path is unchanged, which is rule 7.
+
+    Public because the readiness probe uses *this* predicate to check that the
+    path it is about to submit will genuinely be refused. Re-deriving glob
+    semantics there would be a second implementation of the boundary, and the
+    two would disagree in exactly the case that matters — a probe reporting a
+    failure against a region that is behaving correctly.
     """
 
     if not patterns:

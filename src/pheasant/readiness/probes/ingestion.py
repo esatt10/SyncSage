@@ -22,9 +22,11 @@ from pheasant.readiness.probes import (
 )
 from pheasant.services import ingestion as ingest_service
 from pheasant.services import retrieval as retrieval_service
+from pheasant.services.errors import ContaminationRefused
+from pheasant.services.ingestion import check_denylist
 
 
-def _documents(count: int, *, prefix: str, marker: str = PROBE_MARKER) -> list[Any]:
+def probe_documents(count: int, *, prefix: str, marker: str = PROBE_MARKER) -> list[Any]:
     return [
         ingest_service.SubmissionItem(
             relative_path=f"{prefix}-{index}.md",
@@ -38,7 +40,7 @@ def _documents(count: int, *, prefix: str, marker: str = PROBE_MARKER) -> list[A
     ]
 
 
-def _index_probe_source(context: ProbeContext) -> None:
+def index_probe_source(context: ProbeContext) -> None:
     if context.sync is None:
         raise NotRunnable("no sync callable was supplied, so nothing can cross the index barrier")
     context.sync(PROBE_SOURCE)
@@ -57,7 +59,7 @@ def _ingest_roundtrip(context: ProbeContext) -> ProbeResult:
     submission = ingest_service.submit(
         context.services,
         ingest_service.SubmissionRequest(
-            items=_documents(1, prefix=f"roundtrip-{context.run_id}"),
+            items=probe_documents(1, prefix=f"roundtrip-{context.run_id}"),
             source_name=PROBE_SOURCE,
             agent_id="readiness",
         ),
@@ -69,7 +71,7 @@ def _ingest_roundtrip(context: ProbeContext) -> ProbeResult:
             "the region accepted nothing",
             observed={"rejected": submission["rejected"]},
         )
-    _index_probe_source(context)
+    index_probe_source(context)
     acknowledged = ingest_service.acknowledge_indexed(
         context.services, None, submission["submission_id"]
     )
@@ -157,7 +159,7 @@ def _idempotent_write(context: ProbeContext) -> ProbeResult:
     counter from a boolean.
     """
 
-    item = _documents(1, prefix=f"idem-{context.run_id}")[0]
+    item = probe_documents(1, prefix=f"idem-{context.run_id}")[0]
     receipts = []
     for _ in range(3):
         submission = ingest_service.submit(
@@ -169,7 +171,7 @@ def _idempotent_write(context: ProbeContext) -> ProbeResult:
         receipts.append(submission["accepted"][0])
     ids = {receipt["receipt_id"] for receipt in receipts}
     artifacts = {receipt["artifact_id"] for receipt in receipts}
-    _index_probe_source(context)
+    index_probe_source(context)
     ingest_service.acknowledge_indexed(context.services, None, None)
     stored = context.state.rows(
         "SELECT COUNT(*) AS c FROM artifacts WHERE id=?", (receipts[-1]["artifact_id"],)
@@ -206,7 +208,7 @@ def _partial_failure(context: ProbeContext) -> ProbeResult:
     after it. Same lesson, one layer up.
     """
 
-    good = _documents(2, prefix=f"partial-{context.run_id}")
+    good = probe_documents(2, prefix=f"partial-{context.run_id}")
     empty = ingest_service.SubmissionItem(
         relative_path=f"partial-{context.run_id}-empty.md", content=b""
     )
@@ -256,7 +258,7 @@ def _index_barrier(context: ProbeContext) -> ProbeResult:
     submission = ingest_service.submit(
         context.services,
         ingest_service.SubmissionRequest(
-            items=_documents(1, prefix=f"barrier-{context.run_id}"),
+            items=probe_documents(1, prefix=f"barrier-{context.run_id}"),
             source_name=PROBE_SOURCE,
             agent_id="readiness",
         ),
@@ -270,7 +272,7 @@ def _index_barrier(context: ProbeContext) -> ProbeResult:
 
     before = _receipt()
     started = time.perf_counter()
-    _index_probe_source(context)
+    index_probe_source(context)
     ingest_service.acknowledge_indexed(context.services, None, submission["submission_id"])
     lag_ms = (time.perf_counter() - started) * 1000.0
     after = _receipt()
@@ -376,28 +378,42 @@ def _first_matching_name(patterns: tuple[str, ...]) -> str:
 
     Derived from the operator's own patterns rather than hardcoded: a probe
     that submits ``benchmark/answers.md`` against a denylist of ``eval-*.json``
-    would be refused by nothing and report a boundary that does not exist.
+    would be refused by nothing and report a boundary that does not exist —
+    a *false failure*, which is the worst thing a gate can produce, because
+    the region is behaving correctly and the check says it is not.
+
+    So a derived candidate is **verified against the same predicate the write
+    path uses** rather than assumed to match. Deriving a filename from a glob
+    is a guess: `**/*.json` un-globs to `readiness.json`, which `fnmatch` then
+    does *not* match, because `**` is not a path-aware operator there. Rather
+    than encode a second, subtly different glob semantics here, each candidate
+    is tried against `_check_denylist` and the first one that is genuinely
+    refused wins.
+
+    When no candidate matches — an exotic pattern, or one that only ever
+    matches a path this probe may not write — the probe reports ``skipped``
+    with the patterns it tried, which is honest. It is not evidence that the
+    boundary is broken; it is evidence that this check could not exercise it.
     """
 
     for pattern in patterns:
-        candidate = pattern.replace("**/", "").replace("*", "readiness").replace("?", "x")
-        candidate = candidate.strip("/")
-        if candidate:
-            return candidate
-    return "benchmark/answers.md"
+        for candidate in _candidates(pattern):
+            try:
+                check_denylist(candidate, patterns)
+            except ContaminationRefused:
+                return candidate
+    raise NotRunnable(
+        "could not derive a path that readiness.corpus_denylist rejects, from "
+        f"{list(patterns)}. The boundary may well hold; this probe cannot show "
+        "it. Add a literal-ish pattern (e.g. 'benchmark/*') to make it checkable."
+    )
 
 
-def _first_matching_name(patterns: tuple[str, ...]) -> str:
-    """A path the configured denylist will actually reject.
+def _candidates(pattern: str) -> list[str]:
+    """Concrete paths a glob might have been written to describe."""
 
-    Derived from the operator's own patterns rather than hardcoded: a probe
-    that submits ``benchmark/answers.md`` against a denylist of ``eval-*.json``
-    would be refused by nothing and report a boundary that does not exist.
-    """
-
-    for pattern in patterns:
-        candidate = pattern.replace("**/", "").replace("*", "readiness").replace("?", "x")
-        candidate = candidate.strip("/")
-        if candidate:
-            return candidate
-    return "benchmark/answers.md"
+    stripped = pattern.strip("/")
+    plain = stripped.replace("?", "x")
+    filled = plain.replace("**/", "").replace("*", "readiness")
+    leaf = filled.rsplit("/", 1)[-1]
+    return [value for value in (filled, f"readiness/{leaf}", leaf) if value]

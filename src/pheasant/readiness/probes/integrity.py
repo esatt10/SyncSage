@@ -18,7 +18,7 @@ from pheasant.readiness.probes import (
     ProbeResult,
     probe,
 )
-from pheasant.readiness.probes.ingestion import _documents, _index_probe_source
+from pheasant.readiness.probes.ingestion import index_probe_source, probe_documents
 from pheasant.services import ingestion as ingest_service
 from pheasant.services import retrieval as retrieval_service
 from pheasant.services import snapshots as snapshot_service
@@ -83,12 +83,12 @@ def _snapshot_drift_refused(context: ProbeContext) -> ProbeResult:
     ingest_service.submit(
         context.services,
         ingest_service.SubmissionRequest(
-            items=_documents(1, prefix=f"drift-{context.run_id}"),
+            items=probe_documents(1, prefix=f"drift-{context.run_id}"),
             source_name=PROBE_SOURCE,
             agent_id="readiness",
         ),
     )
-    _index_probe_source(context)
+    index_probe_source(context)
 
     refused = False
     code = ""
@@ -257,7 +257,7 @@ def _concurrent_writers(context: ProbeContext) -> ProbeResult:
             ingest_service.submit(
                 context.services,
                 ingest_service.SubmissionRequest(
-                    items=_documents(per_writer, prefix=f"conc-{context.run_id}-w{worker}"),
+                    items=probe_documents(per_writer, prefix=f"conc-{context.run_id}-w{worker}"),
                     source_name=PROBE_SOURCE,
                     submission_id=submission_id,
                     agent_id=f"readiness-w{worker}",

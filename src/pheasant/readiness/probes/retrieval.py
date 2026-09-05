@@ -17,7 +17,7 @@ from pheasant.readiness.probes import (
     probe,
 )
 from pheasant.services import retrieval as retrieval_service
-from pheasant.services.retrieval import _memory_enabled
+from pheasant.services.retrieval import memory_enabled
 
 
 @probe("retrieval_lineage")
@@ -154,7 +154,7 @@ def _memory_state_reported(context: ProbeContext) -> ProbeResult:
 def _memory_export(context: ProbeContext) -> ProbeResult:
     """Memory records and candidates are enumerable for audit."""
 
-    if not _memory_enabled(context.services):
+    if not memory_enabled(context.services):
         raise NotRunnable(
             "this region has no enabled memory source, so there is nothing to "
             "export. Register one (POST /memory/enable) before the memory arm."
@@ -182,7 +182,7 @@ def _memory_as_of(context: ProbeContext) -> ProbeResult:
     than no probe at all.
     """
 
-    if not _memory_enabled(context.services):
+    if not memory_enabled(context.services):
         raise NotRunnable(
             "this region has no enabled memory source, so validity has nothing to replay."
         )

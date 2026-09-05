@@ -315,7 +315,7 @@ def _lineage(
                 # so a region with memory fully on reported it off, and the
                 # probe that checked the field agreed with it. A flag nobody
                 # declared reads exactly like a flag nobody sets.
-                "enabled": _memory_enabled(context),
+                "enabled": memory_enabled(context),
                 "policy": memory_policy,
                 "steering": payload.get("memory_steering"),
             },
@@ -341,7 +341,7 @@ def _lineage(
     }
 
 
-def _memory_enabled(context: ServiceContext) -> bool:
+def memory_enabled(context: ServiceContext) -> bool:
     """Whether this region has an enabled memory source.
 
     The same question `describe_retrieval` and the memory routes ask, asked the
@@ -350,6 +350,9 @@ def _memory_enabled(context: ServiceContext) -> bool:
     registry and reaches `config.sources` only in the process that created it,
     so a check reading the config alone would report "off" on every replica but
     one.
+
+    Public because the readiness probes ask it too, and a predicate two callers
+    share is not an internal detail of either.
     """
 
     try:

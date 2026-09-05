@@ -263,7 +263,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         logical="isolation.benchmark",
         gap="G-PHE-015",
         summary="Evaluation artifacts are refused entry to the searchable corpus.",
-        implementation=("pheasant.services.ingestion:_check_denylist",),
+        implementation=("pheasant.services.ingestion:check_denylist",),
         http_routes=("/ingest/submit",),
         probes=("contamination_refused",),
     ),

@@ -190,3 +190,56 @@ def test_a_failure_stands_even_when_other_gates_were_skipped() -> None:
     failing = ProbeResult("memory_state_reported", False, "no memory state reported")
     gates, skipped = evaluate_gates("memory", {"memory_state_reported": failing})
     assert _verdict(gates, skipped) is False
+
+
+# ---------------------------------------------------------------------------
+# The contamination probe's derived path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "patterns",
+    [
+        ("benchmark/*",),
+        ("**/*.json",),
+        ("*.answers.json",),
+        ("eval/**",),
+        ("benchmark/*", "*.answers.json"),
+    ],
+)
+def test_the_contamination_probe_derives_a_path_that_is_actually_refused(
+    patterns: tuple[str, ...],
+) -> None:
+    """A false failure is the worst thing a gate can produce.
+
+    The probe submits a path derived from the operator's own patterns, because
+    a hardcoded `benchmark/answers.md` proves nothing against a denylist of
+    `eval-*.json`. Deriving a filename from a glob is a *guess*, though —
+    `**/*.json` un-globs to `readiness.json`, which `fnmatch` then does not
+    match, because `**` is not path-aware there. So the derived candidate is
+    verified against the same predicate the write path uses, and this asserts
+    that it comes back refused rather than merely plausible.
+    """
+
+    from pheasant.readiness.probes.ingestion import _first_matching_name
+    from pheasant.services.errors import ContaminationRefused
+    from pheasant.services.ingestion import check_denylist
+
+    candidate = _first_matching_name(patterns)
+    with pytest.raises(ContaminationRefused):
+        check_denylist(candidate, patterns)
+
+
+def test_an_underivable_denylist_skips_rather_than_failing() -> None:
+    """ "This check could not exercise the boundary" is not "the boundary is broken".
+
+    An exotic pattern the probe cannot construct a path for is a gap in the
+    check, and reporting it as a failure would send an operator to fix a region
+    that is behaving correctly.
+    """
+
+    from pheasant.readiness.probes import NotRunnable
+    from pheasant.readiness.probes.ingestion import _first_matching_name
+
+    with pytest.raises(NotRunnable):
+        _first_matching_name(("[!a-z]",))
