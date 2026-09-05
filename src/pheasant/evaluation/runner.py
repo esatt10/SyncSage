@@ -59,6 +59,7 @@ from dataclasses import dataclass, field
 from datetime import UTC
 from typing import Any
 
+from pheasant import decision
 from pheasant.evaluation import candidates as candidate_validation
 from pheasant.evaluation import cohorts as cohort_builder
 from pheasant.evaluation import gates as gate_checks
@@ -125,9 +126,14 @@ class RunOutcome:
         ``pheasant eval run`` turns this straight into its exit status, so the
         vacuous reading is a green CI gate for a run that never happened -- the
         `insufficient_evidence`-rather-than-`0.0` rule, one level up.
+
+        Delegated to :mod:`pheasant.decision` since 35.9. This plane and the
+        tuning plane each carried their own copy of the guard, the second one
+        citing the first one's incident in its docstring -- which is the lesson
+        propagating while the code does not.
         """
 
-        return bool(self.gates) and all(gate.passed for gate in self.gates)
+        return decision.all_passed(self.gates)
 
 
 def _owner() -> str:

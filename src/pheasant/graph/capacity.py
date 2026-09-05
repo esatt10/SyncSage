@@ -47,6 +47,12 @@ from pheasant.graph.simple import SimpleMultiDiGraph
 NODES_PER_FILE = 6.3
 EDGES_PER_FILE = 6.3
 
+#: Out-edges on the synthetic hub node. A `source` node carries an `indexes`
+#: edge to every artifact it holds, so on a real corpus this is the file count
+#: — 8,040 on the 8,000-file stress corpus. Fixed here so the hub number is
+#: comparable between scale points instead of growing with them.
+HUB_FAN_OUT = 8000
+
 #: Node types in the proportion a real graph has them, so attribute payloads
 #: (which dominate the JSON size) are representative rather than uniform.
 NODE_SHAPES = (
@@ -110,6 +116,101 @@ def build_graph(files: int) -> SimpleMultiDiGraph:
     return graph
 
 
+def measure_rows(files: int, root: Path, graph: SimpleMultiDiGraph) -> dict[str, Any]:
+    """The same scale point against the row backend (Phase 35.10).
+
+    The comparison that decided the default, and the one CI republishes so it
+    cannot rot. Three numbers matter and only one of them is a speed:
+
+    * **incremental commit** — the cost of publishing after a one-file change.
+      This is the number that made the file backend a ceiling: it was O(total
+      graph) for an O(one file) change, on the sole commit authority, under
+      the sync mutex.
+    * **resident bytes to serve** — zero here by construction, which is what
+      lets an api replica answer a bounded walk without being given the graph.
+    * **stored bytes** — the cost side. Rows plus their two indexes are larger
+      than the compressed blob they replace, and pretending otherwise in the
+      capacity model would fill somebody's volume.
+    """
+
+    from pheasant.persistence.graph_rows import GraphRowStore
+    from pheasant.persistence.state_store import StateStore
+
+    database = root / f"rows-{files}.db"
+    database.unlink(missing_ok=True)
+    state = StateStore(database)
+    state.migrate()
+    rows = GraphRowStore(state)
+    kb = "capacity"
+
+    graph.mark_all_pending()
+    delta = graph.graph_delta()
+    started = time.perf_counter()
+    rows.apply_delta(
+        kb,
+        node_upserts=delta["node_upserts"],
+        node_removals=delta["node_removals"],
+        edge_upserts=delta["edge_upserts"],
+        edge_removals=delta["edge_removals"],
+    )
+    rows.publish(kb)
+    initial_seconds = time.perf_counter() - started
+
+    # One file's worth of change, which is what an incremental sync actually
+    # produces: NODES_PER_FILE nodes and the edges that hang off them.
+    touched = delta["node_upserts"][: int(NODES_PER_FILE)]
+    touched_edges = delta["edge_upserts"][: int(EDGES_PER_FILE)]
+    started = time.perf_counter()
+    rows.apply_delta(kb, node_upserts=touched, edge_upserts=touched_edges)
+    rows.publish(kb)
+    incremental_seconds = time.perf_counter() - started
+
+    from pheasant.graph.sql import SqlGraph
+    from pheasant.graph.traversal import neighbors
+
+    served = SqlGraph(state, kb)
+    start_node = delta["node_upserts"][0][0]
+    gc.collect()
+    rss_before = _resident_bytes()
+    started = time.perf_counter()
+    for _ in range(20):
+        neighbors(served, start_node, depth=3, max_nodes=100)
+    walk_seconds = (time.perf_counter() - started) / 20
+    rss_after = _resident_bytes()
+
+    # The same walk off a **hub**, which is the case that separates the two
+    # backends and the one no fixture has. A real `source` node indexes every
+    # artifact, so a bounded walk there has thousands of edges to choose its
+    # hundred from — and fetching that fan-out is the cost residency used to
+    # hide. Reported separately because quoting only the ordinary number would
+    # describe the easy half.
+    hub = f"hub:{kb}"
+    rows.apply_delta(
+        kb,
+        node_upserts=[(hub, {"type": "source", "label": "hub", "source_id": "corpus"})],
+        edge_upserts=[
+            (hub, node_id, 0, {"type": "contains", "source_id": "corpus"})
+            for node_id, _attrs in delta["node_upserts"][:HUB_FAN_OUT]
+        ],
+    )
+    started = time.perf_counter()
+    for _ in range(10):
+        neighbors(served, hub, depth=3, max_nodes=100)
+    hub_walk_seconds = (time.perf_counter() - started) / 10
+
+    stored = sum(path.stat().st_size for path in root.glob(f"rows-{files}.db*") if path.exists())
+    state.close()
+    return {
+        "initial_load_seconds": round(initial_seconds, 4),
+        "incremental_commit_seconds": round(incremental_seconds, 5),
+        "stored_bytes": stored,
+        "serving_rss_delta_bytes": (rss_after - rss_before) if (rss_after and rss_before) else None,
+        "bounded_walk_seconds": round(walk_seconds, 6),
+        "hub_walk_seconds": round(hub_walk_seconds, 6),
+        "hub_fan_out": HUB_FAN_OUT,
+    }
+
+
 def measure(files: int, root: Path) -> dict[str, Any]:
     """One scale point. Returns plain numbers, ready for a table."""
 
@@ -152,10 +253,12 @@ def measure(files: int, root: Path) -> dict[str, Any]:
                     matched += 1
     scan_seconds = time.perf_counter() - started
 
+    rows = measure_rows(files, root, graph)
     return {
         "files": files,
         "nodes": graph.number_of_nodes(),
         "edges": graph.number_of_edges(),
+        "rows": rows,
         "graph_bytes": in_memory,
         "rss_delta_bytes": (rss_after - rss_before) if (rss_after and rss_before) else None,
         "json_bytes": len(payload),

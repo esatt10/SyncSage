@@ -384,6 +384,37 @@ def register_default_metrics(version: str) -> None:
         "pheasant_indexer_leader",
         "1 on the elected indexer orchestrator; standby indexers report 0.",
     )
+
+    # The graph handoff. The generation id itself is deliberately not a label:
+    # it changes on every commit, and a per-generation series is an unbounded
+    # cardinality leak for a value that is already on /health and on every
+    # search response. What a dashboard needs is *how* replicas are learning
+    # and *how far behind* one is.
+    REGISTRY.counter(
+        "pheasant_graph_reloads_total",
+        "Graph generations picked up by a serving replica, by trigger: "
+        "'event' (announced on the broker) or 'poll' (found by the backstop "
+        "stat). A region where every reload is 'poll' is one whose "
+        "announcements are not arriving.",
+        ("trigger",),
+    )
+    REGISTRY.gauge(
+        "pheasant_graph_generation_age_seconds",
+        "Seconds since the graph generation this process serves was "
+        "published. Not a staleness measure on its own -- an idle region's "
+        "graph is legitimately old -- but a replica whose age exceeds its "
+        "neighbours' is one that missed a reload.",
+    )
+    REGISTRY.gauge(
+        "pheasant_commit_authority_saturation",
+        "Fraction of the last five minutes the sole commit authority spent "
+        "indexing (0-1). One indexer owns the commit stream for a knowledge "
+        "base and extra indexers are hot standbys, so sustained above 0.8 "
+        "means more workers will not help and the region should be sharded "
+        "(`pheasant shard plan`). Absent on a process that is not the commit "
+        "authority, and absent before the window has enough observation to "
+        "publish a rate. See pheasant.sync.saturation.",
+    )
     REGISTRY.gauge(
         "pheasant_index_dead_letters",
         "Index tasks that exhausted their attempts and need attention.",

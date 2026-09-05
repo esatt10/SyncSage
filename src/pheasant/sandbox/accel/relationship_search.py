@@ -54,12 +54,23 @@ def _serialize_input(
 
 
 def _edge_rows(
-    graph: SimpleMultiDiGraph, source_name: str | None
+    graph: SimpleMultiDiGraph,
+    source_name: str | None,
+    tokens: list[str] | None = None,
 ) -> list[tuple[str, str, dict[str, Any], str, str]]:
-    """(source, target, data, source_label, target_label) per edge instance, in iteration order."""
+    """(source, target, data, source_label, target_label) per edge instance, in iteration order.
+
+    Narrowed through the graph's own candidate query where it has one, the
+    same as the pure-Python scan. Acceleration that streamed every edge out of
+    a database to hand it to a guest would be slower than the thing it
+    accelerates — the WASM path pays off against a resident dict, which is
+    what it was written for.
+    """
     nodes = graph.node_map()
     rows = []
-    for (source, target), edge_map in graph.iter_edges():
+    narrow = getattr(graph, "candidate_edges", None)
+    edges = narrow(tokens, source_name) if (callable(narrow) and tokens) else graph.iter_edges()
+    for (source, target), edge_map in edges:
         source_label = str((nodes.get(source) or {}).get("label") or source)
         target_label = str((nodes.get(target) or {}).get("label") or target)
         for _key, data in edge_map.items():
@@ -74,7 +85,7 @@ def scan_edges_wasm(
     source_name: str | None,
 ) -> list[tuple[float, dict[str, Any]]]:
     """WASM-accelerated equivalent of ``_scan_edges``. Caller holds ``reading()``."""
-    edge_rows = _edge_rows(graph, source_name)
+    edge_rows = _edge_rows(graph, source_name, tokens)
     serializable_rows = [
         (
             source_label,

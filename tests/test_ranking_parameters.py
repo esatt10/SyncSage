@@ -174,3 +174,135 @@ def test_rrf_k_of_zero_is_refused_by_the_bounds() -> None:
 
     assert BOUNDS["rrf_k"][0] >= 1.0
     assert ranking.clamp("rrf_k", 0.0) >= 1.0
+
+
+# ---------------------------------------------------------------------------
+# One over-fetch, not four
+#
+# `filter_overfetch` is declared tunable: it sits in `PARAMETER_STAGES` mapped
+# to the `filters` stage, is bounded (1.0, 10.0), and ships a candidate ladder
+# in the tuning space. The glossary tells an operator that a `filters` miss may
+# mean "filter_overfetch is too small".
+#
+# It governed the ACL, section and memory filters only. Retrieval *criteria*
+# — exclude_sources, node_types, min_score, source_types — were post-filtered
+# by the surfaces at a hardcoded `× 4`, and the vector arm carried a third
+# copy. So a tuning bundle could be promoted on the strength of a parameter
+# that half-governed the stage it was attributed to, and an operator following
+# the glossary's own advice would not see the effect it predicted.
+# ---------------------------------------------------------------------------
+
+
+def test_the_overfetch_is_computed_in_exactly_one_place() -> None:
+    """The assertion that would have caught it, in the spirit of the
+    DOCUMENT_EXTENSIONS/EXTRACTED_EXTENSIONS set-equality guard.
+
+    Greps the source for a numeric multiplier applied to a result count
+    anywhere outside `ranking.py`. A second one is not necessarily wrong — but
+    it is necessarily a second answer to "how far past max_results do we
+    fetch", which is the thing that diverged.
+    """
+
+    import re
+    from pathlib import Path
+
+    source_root = Path(ranking.__file__).resolve().parents[1]
+    # `max_results * 4`, `fetch * 2`, `limit*3` — a literal factor on a count.
+    multiplier = re.compile(r"\b(?:max_results|fetch|limit|fetch_n)\s*\*\s*\d")
+    offenders: list[str] = []
+    for path in sorted(source_root.rglob("*.py")):
+        if path.name == "ranking.py":
+            continue
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if multiplier.search(line) and "noqa: overfetch" not in line:
+                offenders.append(f"{path.relative_to(source_root)}:{number}: {line.strip()}")
+
+    assert not offenders, (
+        "a result count is multiplied by a literal outside ranking.py:\n  "
+        + "\n  ".join(offenders)
+        + "\nRoute it through RankingParameters.overfetch, or — if it is genuinely a "
+        "different concern — give it its own named parameter and say so in the tuning "
+        "glossary, because one name covering two behaviours is what this guard exists for."
+    )
+
+
+def test_overfetch_never_returns_fewer_than_asked() -> None:
+    """A factor below 1.0 would turn an over-fetch into a truncation.
+
+    The bounds clamp it, and this pins the behaviour at the boundary rather
+    than trusting that they always will.
+    """
+
+    for factor in (0.0, 0.5, 1.0, 3.0, 10.0):
+        parameters = ranking.RankingParameters(filter_overfetch=factor)
+        assert parameters.overfetch(10, filtering=True) >= 10
+    assert ranking.RankingParameters().overfetch(10, filtering=False) == 10
+
+
+def test_the_tunable_parameter_reaches_criteria_filtering() -> None:
+    """The defect itself: raising it must change what a criteria-filtered
+    search asks the arms for."""
+
+    small = ranking.RankingParameters(filter_overfetch=2.0)
+    large = ranking.RankingParameters(filter_overfetch=8.0)
+    assert small.overfetch(10, filtering=True) == 20
+    assert large.overfetch(10, filtering=True) == 80
+
+
+def test_the_stage_it_is_attributed_to_is_the_one_it_governs() -> None:
+    """`filters` — and now every filter, not a subset of them."""
+
+    assert ranking.PARAMETER_STAGES["filter_overfetch"] == "filters"
+    assert ranking.BOUNDS["filter_overfetch"] == (1.0, 10.0)
+    assert ranking.DEFAULT_FILTER_OVERFETCH == ranking.RankingParameters().filter_overfetch
+
+
+def test_both_surfaces_over_fetch_by_the_configured_factor(loaded_config, tmp_path) -> None:
+    """The behavioural half of the guard above.
+
+    The grep catches a literal; this catches the thing the literal *did* — a
+    surface that computes its own fetch count and therefore does not move when
+    the tunable parameter does. Driven through both public surfaces, because
+    C1 was a divergence between them and the layer beneath.
+    """
+
+    from fastapi.testclient import TestClient
+
+    from pheasant.api.app import create_app
+    from pheasant.mcp_server.tools import PheasantTools
+    from pheasant.search.hybrid import HybridSearch
+
+    loaded_config.pheasant.workspace_root = tmp_path
+    seen: list[int] = []
+    real = HybridSearch.search_context
+
+    def recording(self, kb, query, mode, max_results, *args, **kwargs):
+        seen.append(max_results)
+        return real(self, kb, query, mode, max_results, *args, **kwargs)
+
+    criteria = {"query": "anything", "max_results": 5, "exclude_sources": ["noise"]}
+
+    for factor, expected in ((2.0, 10), (6.0, 30)):
+        loaded_config.search.ranking.filter_overfetch = factor
+
+        seen.clear()
+        client = TestClient(create_app(config=loaded_config))
+        HybridSearch.search_context = recording
+        try:
+            assert client.post("/search", json=criteria).status_code == 200
+            http_fetch = seen[-1]
+
+            seen.clear()
+            tools = PheasantTools(loaded_config)
+            tools.search_context(
+                loaded_config.knowledge_base_id,
+                query="anything",
+                max_results=5,
+                exclude_sources=["noise"],
+            )
+            mcp_fetch = seen[-1]
+        finally:
+            HybridSearch.search_context = real
+
+        assert http_fetch == expected, f"HTTP over-fetched {http_fetch}, expected {expected}"
+        assert mcp_fetch == expected, f"MCP over-fetched {mcp_fetch}, expected {expected}"

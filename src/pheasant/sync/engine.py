@@ -62,11 +62,25 @@ from pheasant.sync.fingerprint import (
     embedding_fingerprint,
     source_fingerprint,
 )
+from pheasant.sync.graph_events import notifier_from_config as graph_notifier_from_config
 from pheasant.sync.locks import EngineLease, SourceLease, source_lock
 from pheasant.sync.pacing import serve_yield
 from pheasant.sync.queue import queue_from_config
+from pheasant.sync.saturation import CommitAuthorityMeter
 
 logger = logging.getLogger(__name__)
+
+
+def _published_timestamp(value: object) -> float | None:
+    """A publication record's ISO-8601 instant as a unix timestamp, or None."""
+
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(str(value or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
 
 SyncMode = Literal["incremental", "full", "validate_only", "repair"]
 SYNC_MODES = {"incremental", "full", "validate_only", "repair"}
@@ -343,15 +357,52 @@ class SyncEngine:
         self._lease_mutex = threading.Lock()
         SourceRegistry(self.config, self.state).initialize()
         self.manifests = ManifestStore(self.paths.manifests, self.state)
-        self.graph_store = GraphStore(self.paths.graphs)
+        self.graph_store = GraphStore(
+            self.paths.graphs, state=self.state, graph_format=config.storage.graph_format
+        )
+        # A region upgrading into the row backend still has its graph file.
+        # Import it once, keep it, and let every later commit be a delta.
+        self.graph_store.import_persisted_file(config.knowledge_base_id)
+        # Announce every committed generation on the fleet's broker, so a
+        # serving replica reloads at commit latency instead of on its own poll
+        # (Phase 35.8). `notifier_from_config` returns the null notifier
+        # unless `sync.queue` is on the NATS backend, which is what keeps the
+        # standalone path byte-identical: no broker, no publish, no change.
+        self._graph_notifier = graph_notifier_from_config(config)
+        #: How full this process's commit stream is. Meaningful only where
+        #: this process is the commit authority — an api replica publishes
+        #: index work rather than running it, so its meter never opens a span
+        #: and `/metrics` omits the series rather than reporting a confident
+        #: zero from a process that could not saturate if it tried.
+        self.commit_meter = CommitAuthorityMeter()
+        # One hook for both jobs, covering every save site by construction —
+        # the same argument that put the announcement here rather than beside
+        # each `graph_store.save`.
+        self.graph_store.on_publish = self._on_graph_published
         self.graph_builder = GraphBuilder(config)
         self._loads_persisted_graph = bool(load_persisted_graph)
         self._graph_loaded = not self._loads_persisted_graph
+        #: Which published generation this process is actually serving, or
+        #: None for a process that holds no graph. "Stale" was previously
+        #: undetectable rather than merely unmeasured: a replica that missed a
+        #: reload answered from an old graph, correctly-looking, forever.
+        self._loaded_graph_generation: str | None = None
+        #: TTL on the resolved generation for a process that serves from the
+        #: store rather than from a copy. Same 2s as `RemoteGraph.stats`, and
+        #: for the same reason: the honest answer needs a read, and the read
+        #: must not land on every search.
+        self._generation_ttl = 2.0
+        self._generation_at = 0.0
+        #: When that generation was published, as a unix timestamp. Kept
+        #: beside the id so the age gauge measures the graph this process is
+        #: serving rather than whatever has since been written to /state.
+        self.loaded_graph_published_at: float | None = None
         if self._loads_persisted_graph and not defer_persisted_graph_load:
             existing = self.graph_store.load(config.knowledge_base_id)
             if len(existing):
                 self.graph_builder.graph = existing
             self._graph_loaded = True
+            self._note_loaded_generation()
         # Optional embed-on-sync (Synapse 21.4): None when
         # search.embeddings.enabled is false, leaving sync byte-identical
         # to pre-21.4 behavior (no vector dir, no embedder calls).
@@ -409,6 +460,10 @@ class SyncEngine:
             except Exception as exc:  # pragma: no cover - shutdown must not raise
                 logger.warning("Could not flush vector store on shutdown: %s", exc)
         self.lease.release()
+        try:
+            self._graph_notifier.close()
+        except Exception as exc:  # pragma: no cover - shutdown must not raise
+            logger.warning("Could not close the graph event client: %s", exc)
         self.state.close()
 
     def checkpoint_graph(
@@ -453,6 +508,13 @@ class SyncEngine:
         """
 
         if not self._loads_persisted_graph:
+            # Nothing private to reload. On the row backend that is the normal
+            # case for a serving replica — it reads the graph out of the shared
+            # database, so it is never behind — and the generation it reports
+            # still has to keep up, or `/ready` would claim a staleness that
+            # cannot happen. See `serving_graph`.
+            if self.graph_store.rows is not None:
+                self._note_loaded_generation()
             return 0
         loaded = self.graph_store.load(self.config.knowledge_base_id)
         if not len(loaded):
@@ -463,8 +525,105 @@ class SyncEngine:
         # nothing is owed; drop the delta the load itself generated.
         loaded.take_index_delta()
         self.node_index._populated = False
-        logger.info("Reloaded graph from state: %d nodes", loaded.number_of_nodes())
+        self._note_loaded_generation()
+        logger.info(
+            "Reloaded graph from state: %d nodes (generation %s)",
+            loaded.number_of_nodes(),
+            self.loaded_graph_generation or "unlabelled",
+        )
         return loaded.number_of_nodes()
+
+    @property
+    def loaded_graph_generation(self) -> str | None:
+        """Which published generation this process is actually serving.
+
+        For a process holding a **copy** — every process on the whole-file
+        backend, and any process that indexes — this is a remembered label,
+        set when the graph was loaded or committed. It can lag the published
+        one, and the gap between them is exactly the staleness `/ready`
+        exists to expose.
+
+        For a process serving **from the store** there is no copy and no gap:
+        it reads the rows the last commit wrote. Reporting a remembered label
+        there would invent a staleness that cannot happen, and would raise a
+        false alarm on the deployment shape the row backend exists to enable —
+        so it resolves the published id instead, behind a short TTL so the
+        read does not land on every search.
+        """
+
+        if self._loads_persisted_graph or self.graph_store.rows is None:
+            return self._loaded_graph_generation
+        now = time.monotonic()
+        if now - self._generation_at > self._generation_ttl:
+            record = self.graph_store.published_generation(self.config.knowledge_base_id)
+            self._loaded_graph_generation = str(record["generation_id"]) if record else None
+            self._generation_at = now
+        return self._loaded_graph_generation
+
+    @loaded_graph_generation.setter
+    def loaded_graph_generation(self, value: str | None) -> None:
+        self._loaded_graph_generation = value
+
+    def serving_graph(self) -> Any:
+        """The graph this process answers queries from.
+
+        Two different objects for two different jobs. A process that *builds*
+        the graph serves its own working set, which is current by construction
+        and is what `role: all` — every standalone container — uses. A process
+        that only serves gets whatever the store offers: on ``rows`` a
+        :class:`~pheasant.graph.sql.SqlGraph` holding nothing, on the file
+        backend the resident copy it loaded, because there is no third option
+        there.
+
+        That asymmetry is the residency win stated in one place: the file
+        backend has to give a graph to everyone who reads one, and the row
+        backend only to whoever writes one.
+        """
+
+        if self._loads_persisted_graph or self.graph_store.rows is None:
+            return self.graph_builder.graph
+        return self.graph_store.serving_graph(self.config.knowledge_base_id)
+
+    def _on_graph_published(self, kb_id: str, record: dict) -> None:
+        """This process just committed a generation: adopt it, then announce it.
+
+        Adopting it matters more than it looks. A process that indexes *is*
+        serving the graph it just wrote — its in-RAM graph is those bytes — but
+        `loaded_graph_generation` was only ever set when a graph was **read**.
+        So the single container, which is `role: all` and indexes in-process,
+        reported `graph_generation: null` on `/health`, on `/ready` and on
+        every search response, for its whole life. The staleness comparison
+        that exists to make a stale replica detectable was inert on the
+        deployment most people run.
+
+        Found by the two-surface conformance matrix: the HTTP app had loaded a
+        graph at construction and had an id, the MCP facade had indexed one and
+        did not, and the same operation returned different answers.
+        """
+
+        self._loaded_graph_generation = str(record.get("generation_id") or "") or None
+        self.loaded_graph_published_at = _published_timestamp(record.get("published_at"))
+        if self._graph_notifier.enabled:
+            self._graph_notifier.publish(kb_id, record)
+
+    def _note_loaded_generation(self) -> None:
+        """Record which generation the in-RAM graph came from.
+
+        Read from the publication record *after* the load, so the label
+        describes the bytes that were read rather than whatever has been
+        published since. A state directory written before generations existed
+        has no id to record and reports None — a missing label, never a
+        missing graph.
+        """
+
+        try:
+            record = self.graph_store.published_generation(self.config.knowledge_base_id)
+        except Exception:  # noqa: BLE001 - a label must not break a load
+            record = None
+        self._loaded_graph_generation = str(record["generation_id"]) if record else None
+        self.loaded_graph_published_at = (
+            _published_timestamp(record.get("published_at")) if record else None
+        )
 
     def _ensure_persisted_graph_loaded(self) -> None:
         """Materialize the published graph only when a task will mutate it.
@@ -485,6 +644,7 @@ class SyncEngine:
                 self.graph_builder.graph = loaded
                 loaded.take_index_delta()
             self._graph_loaded = True
+            self._note_loaded_generation()
 
     def _graph_counts(self) -> tuple[int, int]:
         if self._graph_loaded or not self._loads_persisted_graph:
@@ -1755,7 +1915,11 @@ class SyncEngine:
         # Test-only hook (Synapse 21.2 crash-safety tests): widens the window
         # between per-artifact writes so a kill -9 can land mid-sync.
         slow_sync_s = float(os.environ.get("PHEASANT_TEST_SLOW_SYNC_MS", "0") or 0) / 1000.0
-        with self._source_write_lock(source.name):
+        # The commit-authority meter opens here rather than at the top of
+        # the method: everything above is argument resolution, and a
+        # saturation gauge that counted it would report a busy region for
+        # work that never touched the commit stream.
+        with self.commit_meter.busy(), self._source_write_lock(source.name):
             remote_state: dict[str, Any] | None = None
             if source.type.value == "repository":
                 # URL quick-add repositories are managed checkouts. Updating

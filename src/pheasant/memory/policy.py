@@ -13,18 +13,29 @@ optional everywhere and its default reproduces the pre-33.6 behavior, except
 that a corrected record is no longer returned — which is a bug fix, not a
 policy choice.
 
-**One rule, two encodings.** Validity is filtered in SQL for the text arm
+**One rule, two renderings.** Validity is filtered in SQL for the text arm
 (post-filtering a globally-ranked page can return nothing from a narrow slice
 while its rows sit just past the cut) and in Python for the vector and graph
-arms. :func:`sql_predicate` and :func:`admits` therefore have to agree exactly,
-so they live side by side here and `tests/test_memory_policy.py` asserts they
-return the same answer over a matrix of records — the same "one module owns the
-normalization" arrangement as `section_needle`/`section_matches`.
+arms. Those two have to agree exactly, and they used to be two independent
+transcriptions of the same rule that a parity test compared afterwards.
+
+They are now one definition with two renderers. :func:`clauses` builds the rule
+as a list of :class:`Clause` objects, each carrying its SQL fragment *and* its
+Python predicate in one place; :func:`sql_predicate` joins the first,
+:func:`admits` evaluates the second. The value is visible in the corners: the
+"an empty string means unset" rule needs `NULLIF(tier,'')` in SQL and
+`or "hot"` in Python, and getting one without the other silently excluded rows
+from one arm only. Both spellings now sit on adjacent lines of the same object,
+where nobody can change one without seeing the other.
+
+`tests/test_memory_policy.py` still compares the two over a matrix of records
+— not as the thing keeping them in agreement, but because a renderer can be
+wrong on its own.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -207,35 +218,143 @@ def validity_instant(policy: MemoryPolicy, now: str) -> str | None:
     return now if policy.current_only else None
 
 
+@dataclass(frozen=True)
+class Clause:
+    """One condition of the validity rule, in both of its renderings.
+
+    ``sql`` returns ``(fragment, params)`` for a given table alias; ``holds``
+    answers the same question about an in-memory record. They are fields of one
+    object rather than lines in two functions because the corners are where
+    these disagree, and a corner is only safe when both spellings are in front
+    of the reader at once.
+    """
+
+    name: str
+    sql: Callable[[str], tuple[str, list[Any]]]
+    holds: Callable[[Mapping[str, Any]], bool]
+
+
+def clauses(policy: MemoryPolicy, *, now: str) -> list[Clause]:
+    """The validity rule, once.
+
+    Every condition that decides whether a *memory record* qualifies. The
+    record-vs-not-a-record and mode wrapping live in the two renderers below,
+    because they are about what surrounds the rule rather than part of it.
+    """
+
+    built: list[Clause] = []
+
+    if not policy.include_rules:
+        # Named uniquely, not `placeholders`: every clause below builds one of
+        # these, and a lambda closes over the *name*. Sharing it made the
+        # steering fragment render with the scope clause's placeholder count —
+        # a binding-count error at query time, caught by the parity test that
+        # this consolidation was supposed to make redundant. It is not
+        # redundant; it checks the renderers, which can each be wrong alone.
+        steering_placeholders = ",".join("?" for _ in STEERING_KINDS)
+        built.append(
+            Clause(
+                name="steering",
+                sql=lambda alias: (
+                    f"COALESCE({alias}.kind, '') NOT IN ({steering_placeholders})",
+                    list(STEERING_KINDS),
+                ),
+                holds=lambda record: str(record.get("kind") or "") not in STEERING_KINDS,
+            )
+        )
+
+    tiers = allowed_tiers(policy)
+    tier_placeholders = ",".join("?" for _ in tiers)
+    built.append(
+        Clause(
+            name="tier",
+            # `NULLIF(tier,'')` before `COALESCE`, not `COALESCE` alone: the
+            # Python side's `or "hot"` treats an empty string as unset (falsy)
+            # and substitutes "hot", but plain `COALESCE` only replaces NULL —
+            # an empty string passes through as itself and would then fail to
+            # match 'hot' in the IN-list, silently excluding the row. NULLIF
+            # converts '' to NULL first so COALESCE actually catches it.
+            sql=lambda alias: (
+                f"COALESCE(NULLIF({alias}.tier, ''), 'hot') IN ({tier_placeholders})",
+                list(tiers),
+            ),
+            holds=lambda record: str(record.get("tier") or "hot") in tiers,
+        )
+    )
+
+    if policy.scopes:
+        scopes = tuple(policy.scopes)
+        scope_placeholders = ",".join("?" for _ in scopes)
+        built.append(
+            Clause(
+                name="scope",
+                sql=lambda alias: (f"{alias}.scope IN ({scope_placeholders})", list(scopes)),
+                holds=lambda record: str(record.get("scope") or "") in scopes,
+            )
+        )
+
+    needle = (policy.subject or "").strip().lower()
+    if needle:
+        built.append(
+            Clause(
+                name="subject",
+                sql=lambda alias: (
+                    f"LOWER(COALESCE({alias}.subject, '')) LIKE ?",
+                    [f"%{needle}%"],
+                ),
+                holds=lambda record: needle in str(record.get("subject") or "").lower(),
+            )
+        )
+
+    instant = validity_instant(policy, now)
+    if instant is not None:
+        # COALESCE on both sides so an empty string means "unset", exactly as
+        # the Python branch reads it. Without it, `'' > instant` is false in
+        # SQL and true-ish in Python and the two halves disagree on a corner.
+        built.append(
+            Clause(
+                name="valid_from",
+                sql=lambda alias: (
+                    f"(COALESCE({alias}.valid_from, '') = '' OR {alias}.valid_from <= ?)",
+                    [instant],
+                ),
+                holds=lambda record: (
+                    not (
+                        str(record.get("valid_from") or "")
+                        and str(record.get("valid_from") or "") > instant
+                    )
+                ),
+            )
+        )
+        built.append(
+            Clause(
+                name="valid_until",
+                sql=lambda alias: (
+                    f"(COALESCE({alias}.valid_until, '') = '' OR {alias}.valid_until > ?)",
+                    [instant],
+                ),
+                holds=lambda record: (
+                    not (
+                        str(record.get("valid_until") or "")
+                        and str(record.get("valid_until") or "") <= instant
+                    )
+                ),
+            )
+        )
+
+    return built
+
+
 def admits(policy: MemoryPolicy, record: Mapping[str, Any] | None, *, now: str) -> bool:
     """Does this policy allow a hit through? `record=None` means "not a memory".
 
-    The Python half of the rule. Kept byte-for-byte equivalent to
-    :func:`sql_predicate`; see the module docstring.
+    The Python renderer of :func:`clauses`; :func:`sql_predicate` is the other.
     """
     if record is None:
         return policy.mode != "only"
     if policy.mode == "off":
         return False
-    if not policy.include_rules and str(record.get("kind") or "") in STEERING_KINDS:
-        return False
-    if str(record.get("tier") or "hot") not in allowed_tiers(policy):
-        return False
-    if policy.scopes and str(record.get("scope") or "") not in policy.scopes:
-        return False
-    if policy.subject:
-        needle = policy.subject.strip().lower()
-        if needle and needle not in str(record.get("subject") or "").lower():
-            return False
-    instant = validity_instant(policy, now)
-    if instant is not None:
-        valid_from = str(record.get("valid_from") or "")
-        valid_until = str(record.get("valid_until") or "")
-        if valid_from and valid_from > instant:
-            return False
-        if valid_until and valid_until <= instant:
-            return False
-    return True
+    return all(clause.holds(record) for clause in clauses(policy, now=now))
 
 
 def unique_records(index: Mapping[str, Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -281,7 +400,7 @@ def may_filter(policy: MemoryPolicy, index: Mapping[str, Mapping[str, Any]], *, 
 def sql_predicate(
     policy: MemoryPolicy, *, now: str, alias: str = "memory_records"
 ) -> tuple[str, list[Any]]:
-    """The SQL half of the rule, for a LEFT JOIN against `memory_records`.
+    """The SQL renderer of :func:`clauses`, for a LEFT JOIN against `memory_records`.
 
     Returns `(condition, params)`. A row with `record_id IS NULL` is not a
     memory record; under every mode but `only` it passes untouched, which is
@@ -290,44 +409,14 @@ def sql_predicate(
     if policy.mode == "off":
         return f"{alias}.record_id IS NULL", []
 
-    clauses: list[str] = []
+    fragments: list[str] = []
     params: list[Any] = []
-    if not policy.include_rules:
-        placeholders = ",".join("?" for _ in STEERING_KINDS)
-        clauses.append(f"COALESCE({alias}.kind, '') NOT IN ({placeholders})")
-        params.extend(STEERING_KINDS)
-    tiers = allowed_tiers(policy)
-    tier_placeholders = ",".join("?" for _ in tiers)
-    # `NULLIF(tier,'')` before `COALESCE`, not `COALESCE` alone: `admits`'s
-    # `record.get("tier") or "hot"` treats an empty string as unset (falsy)
-    # and substitutes "hot", but plain `COALESCE` only replaces NULL — an
-    # empty string passes through as itself and would then fail to match
-    # 'hot' in the IN-list, silently excluding the row. NULLIF converts ''
-    # to NULL first so COALESCE actually catches it. (`valid_from`/
-    # `valid_until` don't need this: their "unset" branch is a bare OR that
-    # skips the comparison entirely rather than substituting a default.)
-    clauses.append(f"COALESCE(NULLIF({alias}.tier, ''), 'hot') IN ({tier_placeholders})")
-    params.extend(tiers)
-    if policy.scopes:
-        placeholders = ",".join("?" for _ in policy.scopes)
-        clauses.append(f"{alias}.scope IN ({placeholders})")
-        params.extend(policy.scopes)
-    if policy.subject:
-        needle = policy.subject.strip().lower()
-        if needle:
-            clauses.append(f"LOWER(COALESCE({alias}.subject, '')) LIKE ?")
-            params.append(f"%{needle}%")
-    instant = validity_instant(policy, now)
-    if instant is not None:
-        # COALESCE on both sides so an empty string means "unset", exactly as
-        # `admits` reads it. Without it, `'' > instant` is false in SQL and
-        # true-ish in Python and the two halves disagree on a corner case.
-        clauses.append(f"(COALESCE({alias}.valid_from, '') = '' OR {alias}.valid_from <= ?)")
-        params.append(instant)
-        clauses.append(f"(COALESCE({alias}.valid_until, '') = '' OR {alias}.valid_until > ?)")
-        params.append(instant)
+    for clause in clauses(policy, now=now):
+        fragment, clause_params = clause.sql(alias)
+        fragments.append(fragment)
+        params.extend(clause_params)
 
-    qualifies = " AND ".join(clauses) if clauses else "1=1"
+    qualifies = " AND ".join(fragments) if fragments else "1=1"
     if policy.mode == "only":
         return f"({alias}.record_id IS NOT NULL AND {qualifies})", params
     return f"({alias}.record_id IS NULL OR ({qualifies}))", params

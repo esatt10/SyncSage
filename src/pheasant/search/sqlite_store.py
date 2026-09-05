@@ -658,6 +658,18 @@ _VOCAB_NOISE = frozenset(
 )
 
 
+#: How many raw vocabulary terms to read for every one published.
+#:
+#: Deliberately **not** `search.ranking.filter_overfetch`, and named so the
+#: difference is visible: that parameter is retrieval's, tunable, and
+#: attributed to the `filters` stage of a *query*. This is contract
+#: publication — it runs once per sync, has nothing to do with `max_results`,
+#: and its post-filter is a fixed stopword/noise list rather than anything a
+#: caller asked for. One name covering both behaviours is exactly the
+#: confusion `tests/test_ranking_parameters.py` guards against.
+VOCAB_OVERFETCH = 4
+
+
 def corpus_vocabulary(state: StateStore, limit: int = 64) -> list[tuple[str, int]]:
     """The corpus's most widely-used content terms, as ``(term, doc_count)``.
 
@@ -690,13 +702,13 @@ def corpus_vocabulary(state: StateStore, limit: int = 64) -> list[tuple[str, int
                 "ts_stat('SELECT search_vector FROM chunks_fts') "
                 "WHERE length(word) > 3 AND word !~ '[0-9]' "
                 "ORDER BY ndoc DESC, word ASC LIMIT ?",
-                (limit * 4,),
+                (limit * VOCAB_OVERFETCH,),
             )
         else:
             rows = state.rows(
                 "SELECT term, doc FROM chunks_vocab WHERE length(term) > 3 "
                 "AND term NOT GLOB '*[0-9]*' ORDER BY doc DESC, term ASC LIMIT ?",
-                (limit * 4,),
+                (limit * VOCAB_OVERFETCH,),
             )
     except Exception:  # fts5vocab unavailable (older SQLite) — degrade quietly
         logger.warning("Corpus vocabulary unavailable; publishing an empty one", exc_info=True)

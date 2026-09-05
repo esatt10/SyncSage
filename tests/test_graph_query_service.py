@@ -27,6 +27,11 @@ def _config(tmp_path: Path, *, remote: bool = False) -> PheasantConfig:
             "exports_path": str(tmp_path / "exports"),
         },
         "storage": {"graph_snapshots": False},
+        # Loopback: these tests run the app in-process and bind nothing. A
+        # non-loopback bind with no token is what a fleet role refuses at
+        # startup (tests/test_process_roles.py), and claiming that posture
+        # here would be describing a deployment none of this performs.
+        "server": {"host": "127.0.0.1"},
         "sync": {"queue": {"enabled": True}},
         "sources": [
             {

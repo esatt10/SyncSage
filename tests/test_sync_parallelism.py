@@ -186,10 +186,19 @@ def test_parallel_sources_overlap_without_losing_state(
     assert artifact_count == 2
 
 
-def test_process_workers_preserve_exact_persisted_graph_bytes(
+def test_process_workers_preserve_the_exact_published_generation(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
+    """Parallelism must not change what gets published (pillar 1).
+
+    Asserted on the **generation id** rather than on the persisted bytes. That
+    is not a weakening: the id is a digest of every row's own content digest,
+    so two regions agreeing on it agree node-for-node and edge-for-edge — and
+    unlike a zstd blob it says so whichever backend wrote it. Comparing bytes
+    also quietly asserted things nobody meant, like compression level.
+    """
+
     workspace = tmp_path / "workspace"
     _write_docs(workspace)
     monkeypatch.setattr(
@@ -202,7 +211,7 @@ def test_process_workers_preserve_exact_persisted_graph_bytes(
         serial.sync_source("docs", "full")
     finally:
         serial.close()
-    serial_bytes = serial.graph_store.graph_path(serial.config.knowledge_base_id).read_bytes()
+    serial_generation = serial.graph_store.published_generation(serial.config.knowledge_base_id)
 
     parallel = SyncEngine(
         _config(
@@ -217,9 +226,14 @@ def test_process_workers_preserve_exact_persisted_graph_bytes(
         parallel.sync_source("docs", "full")
     finally:
         parallel.close()
-    parallel_bytes = parallel.graph_store.graph_path(parallel.config.knowledge_base_id).read_bytes()
+    parallel_generation = parallel.graph_store.published_generation(
+        parallel.config.knowledge_base_id
+    )
 
-    assert parallel_bytes == serial_bytes
+    assert serial_generation is not None and parallel_generation is not None
+    assert parallel_generation["generation_id"] == serial_generation["generation_id"]
+    assert parallel_generation["nodes"] == serial_generation["nodes"]
+    assert parallel_generation["edges"] == serial_generation["edges"]
 
 
 def test_embedding_batches_run_concurrently_then_commit_once(tmp_path: Path) -> None:

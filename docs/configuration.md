@@ -90,8 +90,12 @@ pheasant config show --effective --profile dev --config pheasant.yaml
 | `port` | integer | `8765` | Primary service port. |
 | `role` | string | `all` | Which jobs this process takes on. `pheasant serve --role` overrides it. See below. |
 
-The API is unauthenticated, so the bind address is a security control, not
-just a networking detail — see [security.md](security.md#trust-model-for-the-http-api).
+On one container the API is unauthenticated, so the bind address is a security
+control rather than a networking detail — see
+[security.md](security.md#trust-model-for-the-http-api). In a fleet the pods
+must bind `0.0.0.0`, so the bind address stops being a control at all and
+`security.api_auth` takes over: every role but `all` refuses to start on a
+routable bind without it.
 
 ### Process roles (`server.role`)
 
@@ -136,12 +140,18 @@ blocking sync (`wait: true`) against an api replica returns **409** with the
 fix, because publishing is a different promise from "run this and return the
 result".
 
-With `graph.query_service_url` set, API and mounted MCP replicas do not load
-`graph.latest.json`; the `graph` role is the only serving process that keeps it
-resident and refreshes it after indexer commits. API readiness fails when that
-service is unreachable. There is deliberately no fallback to a local graph:
-fallback would duplicate the graph into every replica at the exact moment the
-graph tier is unhealthy and memory headroom is most valuable.
+With `graph.query_service_url` set, API and mounted MCP replicas do not load a
+graph of their own; the `graph` role answers for them. API readiness fails when
+that service is unreachable. There is deliberately no fallback to a local
+graph: fallback would duplicate the graph into every replica at the exact
+moment the graph tier is unhealthy and memory headroom is most valuable.
+
+On the default `storage.graph_format: rows` that tier is **optional** rather
+than the only way out — a serving replica queries `graph_nodes` directly and
+holds nothing, so a bounded walk costs a query instead of 1.65 GB of resident
+graph (measured at 100k files). Keep the graph service when you want graph
+reads on their own connection pool and their own scaling curve; drop it when
+you do not.
 
 Routes are *not* hidden per role. What keeps search traffic off an indexer is
 the Service selector in front of it; a role whose `/search` returned 404 would
@@ -161,7 +171,7 @@ multi-hour first index would take the whole Service down for that time.
 |---|---|---|---|
 | `max_concurrent_requests` | integer | `0` | In-flight requests before the surplus is refused with **429 + `Retry-After`**. `0` disables it. |
 | `drain_seconds` | integer | `0` | Seconds to keep serving after SIGTERM while `/ready` already reports 503. `0` disables the delay. |
-| `graph_refresh_seconds` | integer | `30` | How often a legacy local-graph `api` or dedicated `graph` role re-reads a graph written by the indexer. A remote-graph API ignores it. `0` disables it. |
+| `graph_refresh_seconds` | integer | `30` | Backstop interval for re-reading a graph written by the indexer, on a legacy local-graph `api` or the dedicated `graph` role. Not the usual trigger: on the `nats` queue backend an indexer announces each commit and replicas reload at commit latency, and this is the ceiling on how long a *missed* announcement can go unnoticed. A remote-graph API ignores it. `0` disables it. |
 
 Both default off, and that is a decision rather than caution.
 
@@ -234,9 +244,38 @@ both answer correctly. That property is pinned by a test.
 
 ## `storage` (state + persistence)
 
+### `graph_format`: where the published graph lives
+
+`rows` (default) keeps the graph in the state database, next to the artifacts
+it describes. `node_link_json` keeps the pre-35.10 single zstd file. Measured
+with `python -m pheasant.graph.capacity` at 100k files (630k nodes, 630k edges):
+
+| | `node_link_json` | `rows` |
+|---|---|---|
+| commit after a one-file change | 6.15 s, growing with the graph | **1.1 ms, flat** |
+| load before a replica can serve | 4.9 s | none |
+| resident bytes to answer a query | 1.65 GB | none |
+| bounded 3-hop walk | in-RAM | 0.12 ms |
+| stored bytes | 17.9 MB | 1,033 MB |
+
+The last row is the cost, and it is real: the graph stops being something every
+replica holds and becomes something the volume holds, at roughly 1,640 bytes
+per node. `pheasant scan` includes it, so size the PVC from there rather than
+from the old file.
+
+Choose `rows` unless you have a reason not to. Choose `node_link_json` if disk
+is your binding constraint and your corpus is small enough that a whole-graph
+rewrite per commit is free.
+
+Switching to `rows` imports an existing graph file once at boot and renames it
+`*.migrated` — nothing is deleted, and switching back reads it again. Both
+backends write snapshots as files, so `graphs/` and your backup procedure are
+unchanged either way.
+
+
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `graph_format` | string | `node_link_json` | Graph serialization format. |
+| `graph_format` | string | `rows` | Where the published graph lives: `rows` (in `graph_nodes`/`graph_edges` in the state database) or `node_link_json` (one zstd file). See below. |
 | `graph_snapshot_interval_seconds` | integer | `900` | Graph snapshot cadence. |
 | `sqlite_path` | absolute path | `/state/pheasant.db` | Main SQLite database file. |
 | `graph_path` | absolute path | `/state/graphs` | Directory for graph snapshots. |
@@ -335,6 +374,7 @@ with body matches on rare ones. The top hit agrees on the gold set;
 | `ranking.prefer_recent_commits` | bool | `true` (example) | Boost content tied to recent commits. |
 | `ranking.graph_neighbor_boost` | bool | `true` (example) | Boost graph-adjacent matches. |
 | `ranking.max_results_default` | integer | `10` | Default result count cap. |
+| `ranking.filter_overfetch` | float | `3.0` | How far past `max_results` the arms fetch when a post-filter will remove candidates afterwards — ACL, memory policy, section, **and** the retrieval criteria a caller passes (`exclude_sources`, `node_types`, `min_score`, `source_types`). One parameter for every over-fetch: the surfaces each carried a hardcoded `× 4` until 35.9, so raising this moved some filters and not others while the tuning glossary said it governed the `filters` stage. Clamped to `(1.0, 10.0)`; below 1.0 would turn an over-fetch into a truncation. |
 | `wasm_relationship_search` | bool | `false` | Run `graph_search._scan_edges` through the vendored WASM accelerator (Synapse 34.5b) instead of pure Python. Needs the `[wasm]` extra; falls back to pure Python on any failure or if the extra is missing — never a correctness dependency. A consistent, growing win (2-8x at 34.4's benchmark scale) on the relationship-search query path. **The Docker image turns this on** in a config it generates itself, since it always installs the `[wasm]` extra. |
 
 ---
@@ -509,6 +549,7 @@ streams results, so one refused file no longer fails the whole batch.
 | `queue.max_attempts` | integer | `3` | Attempts before a task is dead-lettered. A dead task is kept, never deleted. |
 | `queue.nats_servers` | list[string] | `[]` | JetStream URLs, e.g. `nats://nats:4222`. |
 | `queue.nats_stream` / `nats_subject` / `nats_durable` | string | `PHEASANT_INDEX` / `pheasant.index.tasks` / `pheasant-indexers` | Stream, subject and durable consumer names. |
+| `queue.nats_graph_subject` | string | `pheasant.graph.committed` | Subject prefix for graph-commit announcements; the kb id is appended so two regions sharing a broker do not wake each other. Core NATS pub/sub, not a JetStream stream: every replica must hear it, and a dropped message costs one `server.api.graph_refresh_seconds` poll because the poll is kept as the backstop. Only used on the `nats` backend — a region with no broker keeps polling exactly as before. |
 
 Turn it on when a backlog needs to outlive the process holding it. Three
 things follow that a list cannot give: a sync killed nine sources into ten
@@ -726,6 +767,26 @@ shard into several regions.
 | `idp.api_key_env` | string | `IDP_TOKEN` | Env var holding the bearer token; never stored in config. |
 | `idp.sync_interval_minutes` | integer | `60` | How often the scheduler beat (or `POST /security/idp/sync`) refreshes the mapping. |
 | `idp.staleness_max_minutes` | integer | `1440` | SLA: a mapping older than this **fails closed** (grants nothing) until the next successful sync. |
+| `api_auth.token_env` | string | `PHEASANT_API_TOKEN` | Name of the env var holding a static shared bearer token; never the value. When it resolves, every route outside `public_paths` (and outside `/internal/*`, which enforces its own per-boundary tokens) needs `Authorization: Bearer <value>` or answers `401`. |
+| `api_auth.behind_authenticating_proxy` | bool | `false` | "An ingress already authenticates callers." Satisfies the startup check below without a token of pheasant's own. |
+| `api_auth.public_paths` | list[str] | `[/health, /ready, /metrics]` | Answerable without a token. The probes must stay open or an orchestrator cannot tell a healthy pod from an unauthorized one. |
+
+**Every role but `all` refuses to start** on a bind address other machines can
+reach with neither of the first two set. One container is exempt on purpose —
+a laptop and every existing standalone deployment start with no configuration
+at all — but a fleet pod binds `0.0.0.0` by necessity, so there the bind
+address is not the control it is in Compose. A process serving no
+knowledge-base API (`server.api.enabled: false`, as the preparation workers
+use) needs neither. See
+[the fleet trust model](security.md#a-fleet-is-the-other-case-and-it-is-enforced).
+
+Two further startup refusals live in the same pass. A serving process refuses
+when `graph.query_service_token_env` and
+`sync.concurrency.remote_worker_token_env` name one variable or resolve to one
+value — two trust boundaries, and workers hold the second by necessity. And a
+`worker` refuses to hold a database DSN, a model provider key, the IdP token,
+the graph token, a source list, or a non-SQLite state backend, none of which it
+can use.
 
 ---
 

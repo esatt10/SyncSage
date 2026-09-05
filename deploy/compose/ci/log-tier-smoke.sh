@@ -21,6 +21,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE=(docker compose -f "${HERE}/docker-compose.log-tier.yml")
+# Matches PHEASANT_API_TOKEN in that file. The api replica binds 0.0.0.0, so
+# it refuses to start unauthenticated -- and every call here carries the token,
+# which means this script also proves the guard admits a real caller.
+API_TOKEN="ci-smoke-token"
 PSQL=("${COMPOSE[@]}" exec -T postgres psql -qtAX -U pheasant -d pheasant -c)
 
 log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -51,6 +55,7 @@ log "Phase 1: postgres, the migrator and an api replica -- deliberately no logge
 log "Driving real searches through the api replica"
 for query_text in "pheasant-flock rollout" "filewatch daemon nightly" "vault seal rotation"; do
   curl -fsS -X POST localhost:8765/search \
+    -H "authorization: Bearer ${API_TOKEN}" \
     -H 'content-type: application/json' \
     -H 'X-Pheasant-Session: ci-session' \
     -H 'X-Pheasant-Principal: user:ci' \

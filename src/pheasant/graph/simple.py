@@ -94,6 +94,21 @@ class SimpleMultiDiGraph:
         # it still owe"; losing it costs a rebuild, never correctness.
         self._dirty_nodes: set[str] = set()
         self._removed_nodes: set[str] = set()
+        # The same bookkeeping for the *persisted* graph, which is a second
+        # reader of "what changed" and — unlike the search index — not a cache:
+        # the row backend writes exactly this delta, so losing it would lose a
+        # commit rather than cost a rebuild. Which is why `take_graph_delta`
+        # only clears these once the write is durable, where
+        # `take_index_delta` clears on claim.
+        #
+        # Edges are tracked by *endpoint pair*, not per parallel edge, because
+        # that is the unit the writer replaces: parallel edges between one pair
+        # have no stable identity of their own (`add_edge` keys them by arrival
+        # order), so the only sound update is to rewrite the pair.
+        self._pending_nodes: set[str] = set()
+        self._pending_removed_nodes: set[str] = set()
+        self._pending_pairs: set[tuple[str, str]] = set()
+        self._pending_removed_pairs: set[tuple[str, str]] = set()
         self.nodes = NodeView(self)
 
     def reading(self):
@@ -124,6 +139,8 @@ class SimpleMultiDiGraph:
             self._search_blobs[node] = _search_blob(merged)
             self._dirty_nodes.add(node)
             self._removed_nodes.discard(node)
+            self._pending_nodes.add(node)
+            self._pending_removed_nodes.discard(node)
 
     def add_edge(self, source, target, **attrs):
         with self._lock:
@@ -131,6 +148,24 @@ class SimpleMultiDiGraph:
             data[len(data)] = attrs
             self._edge_count += 1
             self._out.setdefault(source, {})[target] = None
+            self._pending_pairs.add((source, target))
+            self._pending_removed_pairs.discard((source, target))
+
+    def touch_edge(self, source, target):
+        """Mark an endpoint pair as owing a write.
+
+        ``GraphBuilder.upsert_edge`` updates an existing edge's attributes *in
+        place*, through the dict ``get_edge_data`` hands back — so the change
+        never passes through :meth:`add_edge` and the persisted-graph delta
+        would not know about it. Free on the whole-file backend, which
+        re-serializes everything anyway; a silently dropped update on the row
+        backend, which writes only what it is told changed.
+        """
+
+        with self._lock:
+            if (source, target) in self._edges:
+                self._pending_pairs.add((source, target))
+                self._pending_removed_pairs.discard((source, target))
 
     def _retype(self, old: Any, new: Any) -> None:
         """Keep the per-type tally in step with a node write. Lock held."""
@@ -155,14 +190,36 @@ class SimpleMultiDiGraph:
                     self._retype(existing.get("type"), None)
                 self._search_blobs.pop(node, None)
                 self._dirty_nodes.discard(node)
+                self._pending_nodes.discard(node)
                 if existing is not None:
                     self._removed_nodes.add(node)
+                    # The persisted delta records the *node* removal and lets
+                    # the writer cascade to its edges, which it can do with one
+                    # indexed statement. Listing every pair here would rebuild
+                    # in Python the work the reverse index exists to do in SQL.
+                    self._pending_removed_nodes.add(node)
                 self._out.pop(node, None)
+            # One walk of the edge table, because an edge is dropped when
+            # *either* endpoint goes and only the outgoing half is indexed.
+            #
+            # Two ways to make this O(degree) were measured and neither
+            # earned its place. Taking the outgoing half off `_out` and
+            # scanning only for incoming edges came out at 122.5ms against
+            # this loop's 126.0ms (100k files, 630k edges) — inside the
+            # noise, because the scan is what costs, not the test inside it.
+            # An in-adjacency index removes the scan properly and costs about
+            # what `_out` costs to maintain: ~215 bytes per node, 15% of the
+            # working set, to save ~120ms on a call that fires once per full
+            # sync and on a memory-maintenance beat. Written down rather than
+            # left for the next reader to re-derive: the shape is O(total) and
+            # the constant is small, so the fix is to stop holding the graph,
+            # not to index it further.
             for edge in list(self._edges):
                 if edge[0] in remove or edge[1] in remove:
                     dropped = self._edges.pop(edge, None)
                     self._edge_count -= len(dropped or ())
                     self._drop_adjacency(*edge)
+                    self._pending_pairs.discard(edge)
 
     def remove_edges_from(self, edges):
         with self._lock:
@@ -170,6 +227,9 @@ class SimpleMultiDiGraph:
                 dropped = self._edges.pop((source, target), None)
                 self._edge_count -= len(dropped or ())
                 self._drop_adjacency(source, target)
+                self._pending_pairs.discard((source, target))
+                if dropped:
+                    self._pending_removed_pairs.add((source, target))
 
     def _drop_adjacency(self, source: str, target: str) -> None:
         """Unlink one endpoint pair. Caller holds the lock."""
@@ -214,6 +274,69 @@ class SimpleMultiDiGraph:
                     continue
                 edges.append((node, target, {key: dict(data) for key, data in edge_map.items()}))
             return edges
+
+    def out_edges_batch(self, node_ids, targets=None, priority_types=(), limit_per_source=None):
+        """``out_edges`` for a whole BFS frontier, under one lock hold.
+
+        Exists so :mod:`pheasant.graph.traversal` can expand a level at a time
+        without asking which backend it has. Here that is a convenience — the
+        lookups were already O(1) — and on the row-backed graph it is the
+        difference between one query per level and one per node.
+
+        ``targets`` restricts the answer to edges landing inside that set: the
+        *induced sub-graph* over ``node_ids`` x ``targets``, which is what a
+        bounded slice actually wants. Filtering here rather than in the caller
+        is free on this backend and is the whole cost on a stored one.
+
+        ``priority_types`` and ``limit_per_source`` are the bounded walk's
+        frontier. Applied here too — not because this backend needs them, but
+        because the traversal stops re-sorting once it has asked for the
+        order, so a graph that took the arguments and ignored them would hand
+        back an unordered frontier and quietly change which neighbours a
+        bounded walk returns.
+        """
+
+        keep = None if targets is None else set(targets)
+        with self._lock:
+            edges = {node_id: self.out_edges(node_id) for node_id in node_ids}
+        if keep is not None:
+            edges = {
+                node_id: [entry for entry in entries if entry[1] in keep]
+                for node_id, entries in edges.items()
+            }
+        if priority_types:
+            wanted = set(priority_types)
+            for node_id, entries in edges.items():
+                # Stable, and by *pair*: a pair carrying one priority edge
+                # ranks ahead whole, which is what the row backend's per-pair
+                # window aggregate computes and what `_hierarchy_first` did.
+                edges[node_id] = sorted(
+                    entries,
+                    key=lambda entry: (
+                        0 if {data.get("type") for data in entry[2].values()} & wanted else 1
+                    ),
+                )
+        if limit_per_source is not None:
+            cut = max(0, int(limit_per_source))
+            edges = {node_id: entries[:cut] for node_id, entries in edges.items()}
+        return edges
+
+    def prefetch_nodes(self, node_ids, materialized=False):
+        """Attributes for a whole frontier. See :meth:`out_edges_batch`.
+
+        ``materialized`` is accepted and ignored: these attributes are already
+        plain dicts, and the copy below is already a full one. It exists so
+        the traversal and the search arm can state what they need without
+        asking which backend they have — the same reason the batch methods
+        exist at all.
+        """
+
+        with self._lock:
+            return {
+                node_id: dict(self._nodes[node_id])
+                for node_id in node_ids
+                if node_id in self._nodes
+            }
 
     def number_of_nodes(self):
         return len(self._nodes)
@@ -274,6 +397,73 @@ class SimpleMultiDiGraph:
             self._dirty_nodes.clear()
             self._removed_nodes.clear()
             return upserts, removals
+
+    def graph_delta(self) -> dict[str, Any]:
+        """What the persisted graph still owes, without claiming it.
+
+        Deliberately split from :meth:`clear_graph_delta`, where
+        ``take_index_delta`` does both at once. The search index is a cache —
+        a lost flush costs a rebuild — so claiming on read is right there. The
+        persisted graph is not: a delta claimed and then lost to a crashed
+        commit is a node that never reaches disk and that nothing will ever
+        write again, because the in-memory graph no longer believes it is
+        dirty. So the writer reads here, commits, and clears only after.
+
+        Edge upserts carry every parallel edge of a touched pair, because the
+        writer replaces a pair wholesale — see ``_pending_pairs``.
+        """
+
+        with self._lock:
+            node_upserts = [
+                (node_id, dict(self._nodes[node_id]))
+                for node_id in self._pending_nodes
+                if node_id in self._nodes
+            ]
+            edge_upserts = [
+                (source, target, seq, dict(attrs))
+                for (source, target) in self._pending_pairs
+                for seq, attrs in enumerate(self._edges.get((source, target), {}).values())
+            ]
+            return {
+                "node_upserts": node_upserts,
+                "node_removals": sorted(self._pending_removed_nodes),
+                "edge_upserts": edge_upserts,
+                "edge_removals": sorted(self._pending_pairs | self._pending_removed_pairs),
+            }
+
+    def clear_graph_delta(self, delta: dict[str, Any]) -> None:
+        """Forget a delta that is now durable.
+
+        Takes the delta it is clearing rather than emptying the sets, so a
+        write that raced a concurrent mutation does not discard the mutation's
+        own bookkeeping. That race is real: the sync thread commits while a
+        ``DELETE /sources`` handler mutates on a request thread.
+        """
+
+        with self._lock:
+            self._pending_nodes.difference_update(
+                node_id for node_id, _attrs in delta.get("node_upserts", ())
+            )
+            self._pending_removed_nodes.difference_update(delta.get("node_removals", ()))
+            self._pending_pairs.difference_update(
+                (source, target) for source, target, _seq, _attrs in delta.get("edge_upserts", ())
+            )
+            self._pending_removed_pairs.difference_update(delta.get("edge_removals", ()))
+
+    def mark_all_pending(self) -> None:
+        """Treat the whole graph as unwritten.
+
+        For the first write of a graph the store has never seen — a fresh
+        region, or the one-shot import of a graph file — where "the delta" is
+        everything. A full write is the degenerate case of an incremental one,
+        so it goes through the same path rather than a second one.
+        """
+
+        with self._lock:
+            self._pending_nodes = set(self._nodes)
+            self._pending_pairs = set(self._edges)
+            self._pending_removed_nodes = set()
+            self._pending_removed_pairs = set()
 
     def node_map(self):
         """The live id→attrs mapping. Caller MUST hold ``reading()``.

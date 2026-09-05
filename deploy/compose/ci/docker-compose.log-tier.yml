@@ -45,6 +45,12 @@ services:
     environment: &env
       PHEASANT_CONFIG: /config/pheasant.yaml
       PHEASANT_DATABASE_URL: postgresql://pheasant:pheasant@postgres:5432/pheasant
+      # A role-split stack binds 0.0.0.0, so `serve` refuses to start without
+      # authentication. A literal token is right here and only here: the value
+      # is public, the stack is torn down with the job, and the smoke scripts
+      # send it — which is the point, since it means CI exercises the guard
+      # rather than configuring its way around it.
+      PHEASANT_API_TOKEN: ci-smoke-token
       OPENAI_API_KEY: ""
       ANTHROPIC_API_KEY: ""
     depends_on:

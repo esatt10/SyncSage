@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 from pathlib import Path
 
+from pheasant.config.schema import ModelMixin
 from tests.conftest import call_cli, first_attr, import_any, require_attr
 
 
@@ -338,3 +340,158 @@ def test_the_examples_ranking_block_is_the_real_tuning_surface() -> None:
         "pheasant.example.yaml states values that are not the defaults, so copying it "
         f"silently changes ranking: {drifted}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Nesting is derived, not wired
+#
+# `model_validate` used to carry ~90 lines of `if dc is ServerSettings: if
+# "mcp" in raw: raw["mcp"] = build(McpSettings, ...)` — one branch per nested
+# section. Miss a line and the section loaded silently as defaults: no error,
+# no warning, and a config file whose every value was ignored.
+#
+# That edit was the one rule 11's freshness test did not cover, which made it
+# the one that could be forgotten.
+# ---------------------------------------------------------------------------
+
+
+def test_every_nested_section_in_the_schema_actually_loads() -> None:
+    """Derived from the dataclasses, so a new section needs no second edit.
+
+    Walks the whole tree, sets one non-default value on every nested section it
+    finds, and asserts the value survives the round trip. A section that
+    `model_validate` failed to construct would come back as its default —
+    which is exactly the silent failure this replaced.
+    """
+
+    import dataclasses
+    import typing
+    from typing import get_type_hints
+
+    from pheasant.config.schema import ModelMixin, PheasantConfig
+
+    def probe(dc: type, path: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], object]]:
+        """(dotted path, a value that is not the default) per nested section."""
+
+        found: list[tuple[tuple[str, ...], object]] = []
+        hints = get_type_hints(dc)
+        for field in dataclasses.fields(dc):
+            annotation = hints[field.name]
+            # A *container* of sections is not a section: `list[SourceConfig]`
+            # unwraps to `(SourceConfig,)` too, and walking into it asks for a
+            # dataclass with three required arguments.
+            if typing.get_origin(annotation) in {list, tuple, dict, set}:
+                continue
+            nested = next(
+                (
+                    candidate
+                    for candidate in (getattr(annotation, "__args__", None) or (annotation,))
+                    if isinstance(candidate, type) and issubclass(candidate, ModelMixin)
+                ),
+                None,
+            )
+            if nested is None or nested is dc:
+                continue
+            # A bool field is the cheapest probe: flip the default.
+            flag = next(
+                (
+                    inner
+                    for inner in dataclasses.fields(nested)
+                    if get_type_hints(nested).get(inner.name) is bool
+                ),
+                None,
+            )
+            if flag is not None:
+                default = getattr(nested(), flag.name)
+                found.append(((*path, field.name, flag.name), not default))
+            found.extend(probe(nested, (*path, field.name)))
+        return found
+
+    probes = probe(PheasantConfig)
+    assert len(probes) >= 15, f"only found {len(probes)} nested sections to probe"
+
+    for dotted, value in probes:
+        payload: dict = {}
+        cursor = payload
+        for key in dotted[:-1]:
+            cursor = cursor.setdefault(key, {})
+        cursor[dotted[-1]] = value
+
+        config = PheasantConfig.model_validate(payload)
+        loaded: object = config
+        for key in dotted:
+            loaded = getattr(loaded, key)
+        assert loaded == value, (
+            f"{'.'.join(dotted)} did not survive model_validate: got {loaded!r}, "
+            f"expected {value!r}. A nested section that is not constructed loads as "
+            "its defaults, silently."
+        )
+
+
+@dataclasses.dataclass
+class _Inner(ModelMixin):
+    """A section this file invents. Module level, because that is where every
+    real one lives and where `get_type_hints` can resolve it from."""
+
+    enabled: bool = False
+    threshold: int = 1
+    where: Path | None = None
+
+
+@dataclasses.dataclass
+class _Outer(ModelMixin):
+    label: str = "unset"
+    inner: _Inner = dataclasses.field(default_factory=_Inner)
+
+
+def test_a_new_nested_section_needs_no_wiring() -> None:
+    """The property, stated directly rather than inferred from the sweep above.
+
+    A two-level config this file invents, built by the same `_build` every real
+    section goes through. Nothing in `model_validate` knows these names — and
+    that is the whole change: nesting is read off the annotations, so adding a
+    section is one edit to `schema.py` rather than two, the second of which was
+    invisible when forgotten.
+    """
+
+    from pheasant.config.schema import _build
+
+    built = _build(
+        _Outer,
+        {"label": "set", "inner": {"enabled": True, "threshold": "7", "where": "/state/x"}},
+    )
+
+    assert isinstance(built, _Outer)
+    assert built.label == "set"
+    assert isinstance(built.inner, _Inner)
+    assert built.inner.enabled is True
+    # Scalar coercion still runs at every level: "7" from YAML is an int here.
+    assert built.inner.threshold == 7
+    # …and so does Path coercion, derived from the annotation rather than from
+    # a list of field names somebody kept up to date.
+    assert built.inner.where == Path("/state/x")
+
+    # An absent section is its own default, not None: this is what makes every
+    # field's default the single source of truth the wizard reads.
+    assert _build(_Outer, {}).inner == _Inner()
+    assert _build(_Outer, None).inner == _Inner()
+
+
+def test_an_unknown_key_is_ignored_rather_than_fatal() -> None:
+    """A config written for a newer version must still load.
+
+    The hand-written builder filtered to known fields at every level; the
+    derived one has to keep doing it, or a rolled-back deployment fails to
+    start on a config file it wrote itself.
+    """
+
+    from pheasant.config.schema import PheasantConfig
+
+    config = PheasantConfig.model_validate(
+        {
+            "pheasant": {"name": "kb", "invented_by_a_future_version": True},
+            "server": {"api": {"enabled": False, "not_a_field": 3}},
+        }
+    )
+    assert config.pheasant.name == "kb"
+    assert config.server.api.enabled is False

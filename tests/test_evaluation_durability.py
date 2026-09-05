@@ -593,7 +593,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CI_DIR = REPO_ROOT / "deploy" / "compose" / "ci"
 
 
-def test_every_ci_compose_config_is_valid_for_the_role_it_is_given() -> None:
+def test_every_ci_compose_config_is_valid_for_the_role_it_is_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """`validate_role` over every CI topology, the way `test_fleet_manifests`
     already does for the Kubernetes manifests.
 
@@ -638,9 +640,15 @@ def test_every_ci_compose_config_is_valid_for_the_role_it_is_given() -> None:
             config = PheasantConfig.model_validate(
                 yaml.safe_load(config_path.read_text(encoding="utf-8"))
             )
-            # The same call the process makes at startup, so a config that
-            # would exit 1 in a container fails here instead.
-            validate_role(resolve_role(config, role), config)
+            # The same call the process makes at startup, against the same
+            # environment the service is given -- a serving role refuses an
+            # unauthenticated non-loopback bind, and validating against an
+            # empty environment would miss a topology that forgot the token
+            # just as surely as one that forgot the queue.
+            with monkeypatch.context() as patched:
+                for key, value in (service.get("environment") or {}).items():
+                    patched.setenv(str(key), str(value))
+                validate_role(resolve_role(config, role), config)
             checked += 1
 
     assert checked >= 2, f"expected several roled services across the topologies, saw {checked}"

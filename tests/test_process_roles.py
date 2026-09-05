@@ -17,7 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from pheasant.api.app import create_app
-from pheasant.config.schema import PheasantConfig
+from pheasant.config.schema import PheasantConfig, SourceConfig, SourceType
 from pheasant.deployment.roles import (
     POLICIES,
     Role,
@@ -70,8 +70,13 @@ def _config(
         payload["sync"]["queue"] = {"enabled": True}
     if observability:
         payload["observability"] = {"interactions": {"enabled": True, "queue": {"enabled": True}}}
+    # Loopback, because that is what an in-process test actually is. A role
+    # other than `all` refuses an unauthenticated bind other machines can
+    # reach (see the exposure tests below); saying 0.0.0.0 here would be
+    # claiming a fleet posture that none of these tests deploys.
+    payload["server"] = {"host": "127.0.0.1"}
     if role is not None:
-        payload["server"] = {"role": role}
+        payload["server"]["role"] = role
     return PheasantConfig.model_validate(payload)
 
 
@@ -246,7 +251,14 @@ def test_the_api_role_starts_with_a_queue(tmp_path: Path) -> None:
 def test_other_roles_need_no_queue(tmp_path: Path, role: str) -> None:
     """Only `api` depends on a queue: the rest can index or do nothing."""
 
-    config = _config(tmp_path, state_name=f"noqueue-{role}", role=role)
+    # No sources for the worker: it is the one role that refuses to hold a
+    # source list at all, which the allow-list tests below cover directly.
+    config = _config(
+        tmp_path,
+        state_name=f"noqueue-{role}",
+        role=role,
+        sources=0 if role == "worker" else 2,
+    )
     validate_role(resolve_role(config), config)
 
 
@@ -827,7 +839,9 @@ def test_background_services_start_only_for_their_roles(tmp_path: Path, monkeypa
         config = _config(
             tmp_path,
             state_name=f"svc-{role}",
-            sources=1,
+            # A worker holds no source list -- `validate_role` refuses one,
+            # because a worker is handed bytes rather than going to find them.
+            sources=0 if role == "worker" else 1,
             queue=True,
             # `validate_role` refuses `logger` without it, which is the point
             # of that guard: a log tier with nothing to drain is a pod that
@@ -898,3 +912,221 @@ def test_a_thread_is_not_left_running_after_stop(tmp_path: Path) -> None:
 
     leaked = {thread.name for thread in threading.enumerate()} - before
     assert "pheasant-drainer" not in leaked
+
+
+# --------------------------------------------------------------------------
+# Phase 35.8 — what a role may hold, and who may reach it
+#
+# Three deployment invariants, all of the same shape: none of them stops a
+# process working, which is exactly why each has to be refused at startup
+# rather than discovered later. They follow the template the two checks above
+# already set — refuse, and name the field and the reason.
+# --------------------------------------------------------------------------
+
+
+def _fleet_config(tmp_path: Path, **overrides: Any) -> PheasantConfig:
+    """A serving config shaped like a pod's: routable bind, no sources."""
+
+    payload: dict[str, Any] = {
+        "pheasant": {
+            "name": "fleet",
+            "state_path": str(tmp_path / "fleet-state"),
+            "workspace_root": str(tmp_path / "fleet-workspace"),
+            "exports_path": str(tmp_path / "fleet-exports"),
+        },
+        "server": {"host": "0.0.0.0", "role": "api"},  # noqa: S104 - the point of the test
+        "sync": {"queue": {"enabled": True}},
+        "sources": [],
+    }
+    for key, value in overrides.items():
+        payload[key] = value
+    return PheasantConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize("role", ["api", "graph", "indexer"])
+def test_a_serving_role_refuses_a_routable_bind_with_no_authentication(
+    tmp_path: Path, role: str, monkeypatch: Any
+) -> None:
+    """The single-container posture must not ship into the fleet unchanged.
+
+    Unauthenticated, plus able to register a source over any allow-listed path
+    and read it, plus one port-publishing decision away from the network, is a
+    combination that stays safe by luck. A pod binds 0.0.0.0 by necessity, so
+    the bind is not the control it is in Compose.
+    """
+
+    monkeypatch.delenv("PHEASANT_API_TOKEN", raising=False)
+    config = _fleet_config(tmp_path)
+    with pytest.raises(RoleConfigurationError) as refusal:
+        validate_role(resolve_role(config, role), config)
+    # The message has to name the fix; a refusal an operator cannot act on is
+    # a crash loop with extra steps.
+    assert "PHEASANT_API_TOKEN" in str(refusal.value)
+    assert "behind_authenticating_proxy" in str(refusal.value)
+
+
+def test_the_single_container_is_exempt(tmp_path: Path, monkeypatch: Any) -> None:
+    """Rule 7: a router-less, infrastructure-free pheasant keeps working.
+
+    `all` on 0.0.0.0 with no token is `pheasant up`, `pheasant serve` on a
+    laptop, and every standalone container ever deployed. Refusing it would
+    make a security posture for fleets into a breaking change for everyone.
+    """
+
+    monkeypatch.delenv("PHEASANT_API_TOKEN", raising=False)
+    config = _fleet_config(tmp_path, server={"host": "0.0.0.0", "role": "all"})  # noqa: S104
+    validate_role(resolve_role(config, "all"), config)
+
+
+@pytest.mark.parametrize(
+    "satisfier",
+    [
+        pytest.param("token", id="a token of its own"),
+        pytest.param("proxy", id="an ingress that authenticates"),
+        pytest.param("no-api", id="no knowledge-base API at all"),
+        pytest.param("loopback", id="a bind nothing else can reach"),
+    ],
+)
+def test_the_four_ways_to_satisfy_the_exposure_check(
+    tmp_path: Path, satisfier: str, monkeypatch: Any
+) -> None:
+    """Each is a real deployment, so each has to be a way through."""
+
+    monkeypatch.delenv("PHEASANT_API_TOKEN", raising=False)
+    config = _fleet_config(tmp_path)
+    if satisfier == "token":
+        monkeypatch.setenv("PHEASANT_API_TOKEN", "a-random-value")
+    elif satisfier == "proxy":
+        config.security.api_auth.behind_authenticating_proxy = True
+    elif satisfier == "no-api":
+        config.server.api.enabled = False
+    else:
+        config.server.host = "127.0.0.1"
+    validate_role(resolve_role(config, "api"), config)
+
+
+def test_the_graph_and_worker_tokens_may_not_be_one_secret(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The shipped Compose file wired one value to both, and it read as thrift.
+
+    Workers are the least-trusted tier and hold the indexing token by
+    necessity. One value means compromising any worker also yields the
+    credential for the internal graph-query API, which serves the whole graph.
+    """
+
+    monkeypatch.setenv("PHEASANT_API_TOKEN", "api-token")
+    monkeypatch.setenv("PHEASANT_INDEX_WORKER_TOKEN", "shared-by-mistake")
+    monkeypatch.setenv("PHEASANT_GRAPH_SERVICE_TOKEN", "shared-by-mistake")
+    config = _fleet_config(tmp_path)
+    with pytest.raises(RoleConfigurationError) as refusal:
+        validate_role(resolve_role(config, "api"), config)
+    assert "same value" in str(refusal.value)
+
+    monkeypatch.setenv("PHEASANT_GRAPH_SERVICE_TOKEN", "its-own-value")
+    validate_role(resolve_role(config, "api"), config)
+
+
+def test_one_variable_named_for_both_boundaries_is_refused(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Pointing both settings at one variable is the same collapse, spelled in YAML."""
+
+    monkeypatch.setenv("PHEASANT_API_TOKEN", "api-token")
+    config = _fleet_config(tmp_path)
+    config.graph.query_service_token_env = "PHEASANT_INDEX_WORKER_TOKEN"
+    with pytest.raises(RoleConfigurationError) as refusal:
+        validate_role(resolve_role(config, "api"), config)
+    assert "two trust boundaries" in str(refusal.value)
+
+
+@pytest.mark.parametrize(
+    ("variable", "fragment"),
+    [
+        ("PHEASANT_DATABASE_URL", "the state database"),
+        ("OPENAI_API_KEY", "provider"),
+        ("PHEASANT_GRAPH_SERVICE_TOKEN", "graph-query API"),
+        ("IDP_TOKEN", "identity provider"),
+    ],
+)
+def test_a_worker_refuses_every_credential_it_can_never_use(
+    tmp_path: Path, variable: str, fragment: str, monkeypatch: Any
+) -> None:
+    """`worker.yaml` shrank the surface; nothing structurally held it there.
+
+    A worker parses bytes it is handed and returns chunks. One shared
+    `environment:` anchor in Compose, or a misapplied ConfigMap, gave the
+    least-trusted tier in the fleet a credential it was designed never to
+    hold — and it started happily.
+    """
+
+    for name in ("PHEASANT_DATABASE_URL", "OPENAI_API_KEY", "PHEASANT_GRAPH_SERVICE_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    config = _fleet_config(tmp_path, server={"host": "0.0.0.0", "role": "worker"})  # noqa: S104
+    config.server.api.enabled = False
+    validate_role(resolve_role(config, "worker"), config)  # clean, so it starts
+
+    monkeypatch.setenv(variable, "a-secret")
+    with pytest.raises(RoleConfigurationError) as refusal:
+        validate_role(resolve_role(config, "worker"), config)
+    assert variable in str(refusal.value)
+    assert fragment in str(refusal.value)
+
+
+def test_a_worker_refuses_a_state_backend_and_a_source_list(tmp_path: Path) -> None:
+    """Both mean the same thing: this process is running the indexer's config."""
+
+    config = _fleet_config(tmp_path, server={"host": "127.0.0.1", "role": "worker"})
+    config.storage.backend = "postgres"
+    with pytest.raises(RoleConfigurationError) as refusal:
+        validate_role(resolve_role(config, "worker"), config)
+    assert "storage.backend" in str(refusal.value)
+
+    config.storage.backend = "sqlite"
+    config.sources = [
+        SourceConfig(name="notes", type=SourceType.markdown_folder, path=tmp_path / "notes")
+    ]
+    with pytest.raises(RoleConfigurationError) as refusal:
+        validate_role(resolve_role(config, "worker"), config)
+    assert "source" in str(refusal.value)
+
+
+def test_a_worker_may_hold_its_own_front_door_key(tmp_path: Path, monkeypatch: Any) -> None:
+    """The forbidden list is credentials to *elsewhere*, not this process's own.
+
+    Otherwise the two guards contradict: the exposure check would demand a
+    token that the allow-list refuses, and a worker serving HTTP could never
+    start at all.
+    """
+
+    monkeypatch.setenv("PHEASANT_API_TOKEN", "a-random-value")
+    config = _fleet_config(tmp_path, server={"host": "0.0.0.0", "role": "worker"})  # noqa: S104
+    validate_role(resolve_role(config, "worker"), config)
+
+
+def test_a_grpc_worker_needs_no_token_for_an_api_it_does_not_serve(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """`pheasant worker --transport grpc` binds a gRPC port, not the app.
+
+    The exposure check is about a reachable *knowledge-base API*. Applying it
+    to a process that serves none demands a token for a surface that does not
+    exist — and refuses a working deployment, which is the expensive direction
+    for a guard to be wrong in. What such a process may *hold* is unaffected,
+    and is asserted below.
+    """
+
+    monkeypatch.delenv("PHEASANT_API_TOKEN", raising=False)
+    config = _fleet_config(tmp_path, server={"host": "0.0.0.0", "role": "worker"})  # noqa: S104
+    assert config.server.api.enabled is True  # the default, and irrelevant here
+
+    with pytest.raises(RoleConfigurationError):
+        validate_role(resolve_role(config, "worker"), config)  # serves_http defaults True
+    validate_role(resolve_role(config, "worker"), config, serves_http=False)
+
+    # The allow-list still applies: not serving an API is not a licence to
+    # hold the database.
+    monkeypatch.setenv("PHEASANT_DATABASE_URL", "postgresql://u:p@db/x")
+    with pytest.raises(RoleConfigurationError) as refusal:
+        validate_role(resolve_role(config, "worker"), config, serves_http=False)
+    assert "PHEASANT_DATABASE_URL" in str(refusal.value)

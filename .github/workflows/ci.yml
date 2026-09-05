@@ -59,6 +59,60 @@ jobs:
       - name: Run pytest suite
         run: python -m pytest -q
 
+  backend-parity:
+    # The scale-out backend, on EVERY pull request.
+    #
+    # Postgres used to be exercised only by the evaluation, memory and tuning
+    # workflows, each behind a `paths:` filter -- so whether the fleet's
+    # database backend got tested depended on which files a change happened to
+    # touch. Measured at the time this job was added: three of the twenty-two
+    # modules carrying dialect branching matched no filter at all, and one of
+    # them was `sync/locks.py` -- the per-source lease, the mechanism several
+    # indexers rest on, and the exact file where a `rowcount` divergence once
+    # made a claim fail on SQLite and pass on Postgres.
+    #
+    # No `paths:` here, and the whole suite rather than a list of
+    # dialect-sensitive modules: a curated list is the thing that went stale
+    # the first time, and repeating it one level down would buy nothing.
+    # `tests/test_workflow_coverage.py` fails if this job stops being
+    # unfiltered, stops running Postgres, or stops setting the DSN.
+    name: Backend parity against a real Postgres
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pheasant
+          POSTGRES_PASSWORD: pheasant
+          POSTGRES_DB: pheasant_parity
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pheasant"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project, test and Postgres dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,mcp,postgres]"
+
+      - name: Run pytest suite against Postgres
+        env:
+          PHEASANT_TEST_POSTGRES_DSN: postgresql://pheasant:pheasant@127.0.0.1:5432/pheasant_parity
+        run: python -m pytest -q
+
   package-build:
     name: Build Python package
     runs-on: ubuntu-latest
@@ -170,10 +224,15 @@ jobs:
           # The advanced, scale-out and reset topologies are published artifacts too,
           # and nothing else in CI parses them. `config` resolves the image
           # references and every interpolation, so a malformed one fails here
-          # rather than on a user's host. The fleet declares the worker token
-          # as required-with-no-default on purpose; a placeholder satisfies
-          # the parse without pretending it is a usable value.
-          PHEASANT_INDEX_WORKER_TOKEN=ci-config-check OPENAI_API_KEY=ci-config-check \
+          # rather than on a user's host. The fleet declares its three secrets
+          # as required-with-no-default on purpose; placeholders satisfy the
+          # parse without pretending they are usable values. Distinct
+          # placeholders, because the graph and worker tokens are two trust
+          # boundaries and a serving process refuses to start when they match.
+          PHEASANT_API_TOKEN=ci-config-check-api \
+          PHEASANT_GRAPH_SERVICE_TOKEN=ci-config-check-graph \
+          PHEASANT_INDEX_WORKER_TOKEN=ci-config-check-worker \
+          OPENAI_API_KEY=ci-config-check \
             docker compose -f deploy/compose/docker-compose.scale.yml config --quiet
           OPENAI_API_KEY=ci-config-check \
             docker compose -f deploy/compose/docker-compose.advanced.yml config --quiet

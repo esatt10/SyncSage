@@ -69,6 +69,7 @@ from urllib.request import Request, urlopen
 
 import numpy as np
 
+from pheasant.search.ranking import DEFAULT_FILTER_OVERFETCH
 from pheasant.search.sqlite_store import _row_result
 
 if TYPE_CHECKING:
@@ -1132,13 +1133,25 @@ class VectorSearcher:
         query: str,
         source_name: str | None = None,
         max_results: int = 10,
+        *,
+        overfetch: float = DEFAULT_FILTER_OVERFETCH,
     ) -> list[dict[str, Any]]:
+        """Nearest neighbours, over-fetching when the source filter will cut.
+
+        ``overfetch`` is `search.ranking.filter_overfetch`, handed down by the
+        caller. It used to be a hardcoded ``* 4`` here, which made this the
+        third independent implementation of one idea and the one an operator
+        raising the tunable parameter could not reach at all.
+        """
+
         if not (query or "").strip():
             return []
         query_vec = self.embed_query(query)
         if not any(query_vec):
             return []
-        fetch = max_results * 4 if source_name else max_results
+        # Only when a post-filter will drop rows — the same rule the fused
+        # path applies, spelled by the same helper.
+        fetch = max(max_results, int(max_results * overfetch)) if source_name else max_results
         hits = self.store.search(query_vec, k=fetch)
         if source_name:
             hits = [hit for hit in hits if hit[2].get("source_id") == source_name]

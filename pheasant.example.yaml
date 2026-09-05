@@ -77,11 +77,22 @@ server:
     graph_visualization: true
 
 storage:
-  graph_format: node_link_json
+  # Where the published graph lives.
+  #   rows            - graph_nodes/graph_edges in the state database (default).
+  #                     A commit writes only what changed (1.1ms at 100k files,
+  #                     flat) and a serving replica holds no graph at all. Costs
+  #                     ~1,640 bytes of database per node; `pheasant scan` says
+  #                     how much for your corpus.
+  #   node_link_json  - one zstd file. Every commit re-serializes the whole
+  #                     graph (6.15s at 100k files) and every process that
+  #                     answers a graph query holds it (1.65 GB). Smaller on
+  #                     disk. Switching to rows imports an existing file once
+  #                     and keeps it as *.migrated.
+  graph_format: rows
   # Synapse 21.6A: zstd-compressed timestamped graph snapshots written after a
-  # successful sync (graphs/<kb_id>/graph.<utc-ts>.json.zst), beside the
-  # uncompressed graph.latest.json. Throttled by the interval; bounded by the
-  # retention cap (oldest evicted first; latest.json/db/contract never evicted).
+  # successful sync (graphs/<kb_id>/graph.<utc-ts>.json.zst). Files on both
+  # backends. Throttled by the interval; bounded by the retention cap (oldest
+  # evicted first; the published graph, db and contract never evicted).
   graph_snapshots: true
   graph_snapshot_interval_seconds: 900
   # How often an in-progress sync writes graph.latest.json. The graph used to
@@ -263,6 +274,13 @@ sync:
     nats_stream: PHEASANT_INDEX
     nats_subject: pheasant.index.tasks
     nats_durable: pheasant-indexers
+    # Graph-commit announcements, so a serving replica reloads at commit
+    # latency instead of on its own 30s poll. Core NATS pub/sub, not a
+    # JetStream stream: every replica must hear it (a work queue would give it
+    # to one), and a dropped message costs one poll because the poll is kept
+    # as the backstop. The kb id is appended, so two regions sharing a broker
+    # do not wake each other.
+    nats_graph_subject: pheasant.graph.committed
 
 # Turning binary/markup files into indexable text. Every handler here is
 # opt-in by file extension: a source whose `include` globs admit only code and
@@ -312,6 +330,25 @@ security:
   read_only_sources: true
   deny_path_traversal: true
   default_exclude_secrets: true
+  # First-party bearer auth for the HTTP/MCP surface. Off here, which is right
+  # for one container on loopback: this is a local-first tool behind the
+  # operator's own perimeter, and a token would be a password on your own
+  # laptop.
+  #
+  # A fleet is the other case. There the API is a multi-replica Service that
+  # binds 0.0.0.0 by necessity, and the surface behind it can register a source
+  # over any allow-listed path and read what it finds — so every role but
+  # `all` REFUSES TO START on a routable bind with neither of the two below
+  # set. Deliberately a static shared token and nothing more: enough to make
+  # "behind an authenticating ingress" the default rather than the
+  # instruction, and small enough that it cannot rot into a half-built
+  # identity system. Richer auth belongs to the ingress, which is what the
+  # second setting declares.
+  #
+  # api_auth:
+  #   token_env: PHEASANT_API_TOKEN     # the variable's NAME; never the value
+  #   behind_authenticating_proxy: false
+  #   public_paths: ["/health", "/ready", "/metrics"]
 
 # Synapse federation (Synapse 21.5). Standalone-safe: every router-facing
 # behavior is a no-op unless you opt in here. With the defaults below the

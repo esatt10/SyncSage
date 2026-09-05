@@ -80,24 +80,39 @@ pheasant-kb/
 │   │                            means), glossary (what every measure means),
 │   │                            health (live stage rates)
 │   ├── sharding.py            ← `pheasant shard plan`
+│   ├── decision.py            ← the gate vocabulary both planes share: a
+│   │                            GateSet that cannot be constructed empty
 │   ├── jobs.py                ← per-source progress: phase, rate, ETA, stalled
 │   ├── config/                ← schema.py (dataclasses), loader, profiles
 │   ├── sync/                  ← engine, connectors, watcher, scheduler, locks,
-│   │                            queue, log_queue, worker_pool,
+│   │                            queue, log_queue, graph_events (commit
+│   │                            announcements), saturation (the commit-
+│   │                            authority ceiling), worker_pool,
 │   │                            worker_transport, grpc
 │   ├── connectors/            ← first-party SDK plugins: notion, gdrive,
 │   │                            slack, confluence, imap
 │   ├── ingestion/             ← pipeline, chunking, content_types, taxonomy,
 │   │                            extractor (7 doc formats), captioner,
 │   │                            transcriber, office, msdoc
-│   ├── graph/                 ← model, simple, builder, enrichment, capacity
+│   ├── graph/                 ← model, simple (the indexer's working set),
+│   │                            sql (the serving read surface), builder,
+│   │                            enrichment, capacity, traversal
 │   ├── search/                ← sqlite_store (FTS5/tsvector + BM25),
-│   │                            graph_search, hybrid (RRF), criteria, vector,
+│   │                            graph_search, hybrid, fusion (the one RRF
+│   │                            loop, two entry points), explain (the stage
+│   │                            block's declared shape), criteria, vector,
 │   │                            ranking (the tunable parameters, fleet-scoped)
 │   ├── memory/                ← store, projection, policy, steering, salience,
 │   │                            bridge, maintenance, formation, benchmark
 │   ├── persistence/           ← state_store, backends (sqlite|postgres),
-│   │                            schema, graph_store, manifest, migrate, paths
+│   │                            schema, graph_store (file|rows), graph_rows
+│   │                            (the delta write), graph_codec (rows to
+│   │                            attributes, and the XOR generation fold),
+│   │                            manifest, migrate, paths
+│   ├── services/              ← the application layer: one implementation per
+│   │                            operation, two transports. errors (refusals
+│   │                            both surfaces spell the same), retrieval,
+│   │                            graph, assistant
 │   ├── mcp_server/            ← server.py (MCPServer), tools.py (PheasantTools)
 │   ├── api/app.py             ← the HTTP surface
 │   ├── assistant/             ← grounded answering + workflows
@@ -108,7 +123,7 @@ pheasant-kb/
 │   └── telemetry/             ← metrics.py (Prometheus exposition),
 │                                interactions.py (the observation plane)
 ├── ui/                        ← React + Vite workspace (baked into the image)
-└── tests/                     ← 87 pytest modules, offline by design
+└── tests/                     ← 125 pytest modules, offline by design
 ```
 
 Key entities: **knowledge base** (`kb_id` = `pheasant.name`) → **sources** →
@@ -135,10 +150,11 @@ pheasant mount <host-path> [--at /data/x]  # bind-mount + allow-list it
 pheasant scan                              # project RAM/disk/time before indexing
 pheasant validate && pheasant doctor
 pheasant sync --source <name> --mode incremental|full|validate_only|repair
-pheasant serve --role api|indexer|worker|all
+pheasant serve --role all|api|indexer|graph|worker|logger
 pheasant worker                            # stateless preparation worker
 pheasant queue status|drain|requeue-dead
-pheasant shard plan                        # split a corpus across regions
+pheasant shard plan [--emit DIR]           # split a corpus across regions;
+                                           # --emit writes each region's files
 pheasant migrate --to postgres             # one-shot, verified, preserves original
 pheasant backup|restore
 pheasant export parquet [--table NAME]      # /exports/parquet/<kb_id>/*.parquet
@@ -206,6 +222,11 @@ For deployment/configuration work, load
 10. **Verify against the real thing.** Postgres, NATS, wasmtime and a real
     container have each caught bugs a mock could not. When a change touches a
     backend, run that backend. When it touches the image, build the image.
+    CI does the Postgres half for you on **every** PR (`ci.yml`'s
+    `backend-parity` job, deliberately unfiltered); locally it is
+    `PHEASANT_TEST_POSTGRES_DSN=… pytest -q`, which turns on the parity suite
+    and the lease/queue differential. Neither replaces running the thing you
+    changed.
 11. **Config-schema changes owe the config surface an update.** Adding a
     *top-level* section to `src/pheasant/config/schema.py` needs three things:
     a mention in `docs/configuration.md`, a `Section` in
@@ -213,7 +234,11 @@ For deployment/configuration work, load
     (`api/app.py`) saying whether a running server can pick the change up.
     `tests/test_config_surface_freshness.py` fails CI on all three,
     mechanically. **Individual field defaults need no second edit** — the
-    wizard reads them off the live dataclasses.
+    wizard reads them off the live dataclasses — and neither does **nesting**:
+    `model_validate` derives it from the annotations, so a nested section is
+    constructed because its type says it is one. That last edit used to be a
+    fourth, hand-written branch that the freshness test did *not* cover, so a
+    section added without it loaded silently as defaults.
 12. **DuckDB is read-side only.** `src/pheasant/analytics.py` uses it as a
     Parquet writer and a query engine over `/exports`; it must never become a
     `storage.backend` or appear on the sync path. Three reasons, each measured
@@ -226,10 +251,50 @@ For deployment/configuration work, load
     mount `/state:ro` on the API replicas while the indexer writes. The export
     takes no lease and issues nothing but `SELECT`, which is what makes it safe
     to run during a sync.
+13. **One operation, one implementation.** An operation both surfaces expose
+    lives in `src/pheasant/services/` and nowhere else; `api/app.py` and
+    `mcp_server/tools.py` parse a request, call it, and marshal the answer.
+    Layering is transport → services → domain → persistence with no upward
+    edges, and both halves are tests, not conventions
+    (`tests/test_surface_conformance.py`, `tests/test_service_layering.py`).
+    Adding an operation to one surface only is how the last four divergences
+    started; if it genuinely belongs to one transport, say so in the adapter,
+    where a reader can see it.
 
 ---
 
 ## 5. How the system works now
+
+### Surfaces and layering
+
+**transport → services → domain → persistence, no upward edges.** pheasant has
+two public APIs — HTTP (whose largest consumer is the bundled UI) and MCP
+(whose consumers are agents) — and they are one implementation exposed twice.
+That is now true; it used to be documentation. `api/app.py` referenced
+`PheasantTools` once, for introspection, and four of the five shared
+operations had already drifted apart, including `relevant_files` applying the
+memory policy over HTTP and not over MCP — an agent could be served a record
+the region *knew* had been corrected.
+
+An operation lives in `services/` once and owns retrieval criteria, the
+over-fetch, the memory policy, metrics and **its refusal text**. The two
+transports are adapters: parse a request, call one function, marshal the
+answer. A behaviour that differs between the surfaces has to be a difference
+in an adapter — a thing a reader can see — rather than a difference between
+two implementations, which is a thing nobody sees until it is reported.
+
+Refusals are `ServiceError(ValueError)` subclasses carrying a `status` hint, so
+the MCP server's existing `ValueError`/`KeyError` → `ToolError` translation and
+HTTP's 400 both keep working, and each adapter can be taught the richer mapping
+independently.
+
+Two tests hold it. `tests/test_surface_conformance.py` drives the same
+operations through both surfaces against one corpus and asserts identical
+results *and* identical refusal text — it is what found the `graph_generation`
+bug below. `tests/test_service_layering.py` is an import-graph test: no module
+imports a layer above its own, `services/` imports no transport, and every
+package declares its layer, with `cli.py` and the benchmarks named as
+composition roots because building a transport is their job.
 
 ### Ingestion
 
@@ -260,6 +325,192 @@ third-party plugin needs no dispatch code here. Five ship first-party: Notion,
 Google Drive, Slack, Confluence, IMAP. `pheasant.testing.ConnectorConformance`
 is the public quality bar.
 
+### Where the graph lives
+
+`storage.graph_format`: **`rows` (default)** or `node_link_json`. The graph was
+one zstd node-link file that every commit re-serialized whole and every process
+answering a graph query held resident. Measured with
+`python -m pheasant.graph.capacity` at 100k files (630k nodes / 630k edges):
+
+| | file | rows |
+|---|---|---|
+| commit after a one-file change | 6.15 s, growing with the graph | **1.1 ms, flat** |
+| load before a replica can serve | 4.9 s | none |
+| resident bytes to answer a query | 1.65 GB | none |
+| 3-hop bounded walk | in-RAM | 0.12 ms |
+| stored bytes | 17.9 MB | 1,033 MB |
+
+The commit number is the point, and not because six seconds is slow: it was
+**O(total graph)** for an O(one file) change, on the sole commit authority,
+under the sync mutex — so corpus size, not write rate, was what saturated the
+commit stream, and the only documented way past it was to shard. The trade is
+disk, roughly 55×, stated as `capacity.GRAPH_ROW_BYTES_PER_NODE` (measured
+1,637 at 20k files and 1,639 at 100k) and reported by `pheasant scan`.
+
+- **Two objects, two jobs.** `SimpleMultiDiGraph` is the *indexer's working
+  set* — the builder mutates it, the whole-graph enrichment passes walk it, and
+  it belongs in RAM because that is what those passes need.
+  `graph/sql.SqlGraph` is the *serving read surface*, and it holds nothing.
+  `SyncEngine.serving_graph()` picks: a process that builds the graph serves
+  its own copy, a process that only serves gets the store. So the residency
+  the `graph` role exists to stop every replica paying is now paid by whoever
+  writes, and by nobody else — which also makes that role optional rather than
+  the only way out.
+- **The delta, not the graph.** `SimpleMultiDiGraph` tracks dirty and removed
+  nodes and endpoint *pairs* (a pair, because parallel edges have no identity
+  of their own — `add_edge` keys them by arrival). `graph_delta()` reads and
+  `clear_graph_delta()` forgets, deliberately split where `take_index_delta`
+  claims on read: the search index is a cache and a lost flush costs a
+  rebuild, while a lost graph delta is a node that reaches no disk and that
+  nothing believes is dirty any more.
+- **The generation id survives the move.** Still content-addressed, still
+  clock-free, still identical on two replicas holding the same rows. Every row
+  carries its own digest and the published id folds them with **XOR**, which
+  is its own inverse — so a commit folds each changed row's old digest out and
+  its new one in, in O(changed). `recompute_folds` re-derives both with a full
+  scan, because an incrementally maintained aggregate nothing checks is one
+  that drifts.
+- **A serving replica cannot be stale.** Staleness is a property of *copies*.
+  A row-backed api replica reads the rows the indexer committed, so `/ready`
+  publishes `loaded == published` by construction and the refresher finds
+  nothing to do. The whole-file backend still needs all of it, and still has
+  it.
+- **Snapshots stay files.** History is read whole or not at all and is
+  interval-gated rather than per-commit, so materializing one from rows at
+  O(N) is the right cost in the right place — and it keeps a snapshot the same
+  document whichever backend produced it.
+- **What did not change.** Artifacts and chunks were already rows and are
+  untouched; they are the model this followed. Vectors stay in LanceDB, which
+  is columnar and append-incremental and never had the whole-file-rewrite
+  problem — they remain outside the graph's transaction, so repair is still
+  what reconciles them. What *did* improve for free: the graph and the chunks
+  it describes now commit in **one transaction** instead of a database write
+  followed by a separate file rename.
+- **Migration.** A region upgrading imports its existing file once at boot and
+  parks it as `*.migrated` (rule 2). `node_link_json` stays selectable and
+  working, so a region that hits trouble reverts with one config line.
+- **The indexer still holds one, and that is now the only place residency is
+  required.** The builder mutates it and the enrichment passes walk it. Those
+  passes were written when "walk the whole graph" was free — because the whole
+  graph was already a dict in front of them — and three of them were doing it
+  for data they never read. Measured at 100k files and fixed:
+  `add_cross_source_edges` copied `dict(attrs)` for **every** node to hand the
+  resolver a list it immediately narrowed to 15% (2.95s and +160MB → 319ms and
+  +24MB); `_bridge_inputs` built `{node_id: type}` for every node to answer one
+  question about a handful of edge targets; and `remove_source_content` /
+  `remove_artifact_nodes` called `nodes(data=True)`, materializing the whole
+  graph before the filter looked at the first entry (1.16s, an order of
+  magnitude more than the removal it was preparing for).
+  `tests/test_graph_working_set.py` bounds what each pass may touch.
+- **What is left, and what it would cost.** `remove_nodes_from` is still
+  O(total edges) — an edge goes when *either* endpoint does and only the
+  outgoing half is indexed. Two fixes were measured and neither ships: taking
+  the outgoing half off `_out` came out at 122.5ms against 126.0ms, inside the
+  noise, because the scan is what costs rather than the test inside it; and an
+  in-adjacency index removes the scan properly for ~215 bytes per node, 15% of
+  the working set, to save ~120ms on a call that fires once per full sync and
+  on a memory-maintenance beat. The shape is O(total) and the constant is
+  small, so the answer is to stop holding the graph rather than to index it
+  further — see the next bullet for what that needs.
+- **Measured against the pre-35.10 baseline, end to end.** An 8,000-file
+  corpus (24,443 nodes / 72,441 edges), same corpus both sides, `834452b`
+  against now:
+
+  | | baseline | now | |
+  |---|---|---|---|
+  | graph publish per commit | 0.82 s | **0.0007 s** | 1,231× |
+  | incremental sync, 1 file changed | 4.36 s | **3.32 s** | 1.3× |
+  | RSS for a replica that answers | 142 MB | **29 MB** | 4.9× |
+  | text search p50 | 49.6 ms | 47.4 ms | — |
+  | graph arm p50 | 34.7 ms | 55.9 ms | 1.6× *slower* |
+  | 3-hop walk, ordinary node | 0.24 ms | 1.7 ms | 7× *slower* |
+  | 3-hop walk, hub (8,040 edges) | 12.6 ms | 46 ms | 3.7× *slower* |
+  | full index | 25.9 s | 27.7 s | 1.1× *slower* |
+  | `/state` on disk | 115 MB | 177 MB | 1.5× *larger* |
+
+  It is **not uniformly faster**, and the shape of the trade is the point: the
+  axes it was built for — commit cost and residency — moved by three orders of
+  magnitude and five times; graph *read* latency got worse, because reading a
+  graph you do not hold means reconstructing what you read. Text search and
+  the unchanged re-sync are untouched, which is the check that nothing leaked
+  sideways.
+- **And measured again on the fleet's own shape: Postgres, five sources.**
+  The table above is one SQLite region with one source, which is the
+  *standalone* deployment. The fleet is `storage.backend: postgres` with
+  several repositories in one region, so that was run too — five repositories
+  of 1,600 files each (40,122 nodes / 112,111 edges / 88,000 cross-repo
+  reference edges), same corpus and same Postgres both sides:
+
+  | | baseline | now | |
+  |---|---|---|---|
+  | graph publish per commit | 1.32 s | **0.005 s** | 270× |
+  | incremental sync, 1 file changed | 5.02 s | **3.55 s** | 1.4× |
+  | boot before a replica can answer | 1.08 s | **0.07 s** | 17× |
+  | RSS for a replica that answers | 131 MB | **~0** | — |
+  | hybrid p95 | 173.3 ms | **77.0 ms** | 2.3× |
+  | hybrid throughput, 4 threads | 18.6 qps | **20.8 qps** | 1.12× |
+  | hybrid p50 | 60.4 ms | 61.5 ms | — |
+  | text search p50 | 46.4 ms | 47.5 ms | — |
+  | cross-source resolution | 2.75 s | 2.75 s | — |
+  | graph arm p50 | 45.7 ms | 59.9 ms | 1.31× *slower* |
+  | 3-hop walk off a 1,620-edge hub | 2.3 ms | 7.6 ms | 3.3× *slower* |
+  | bounded slice | 4.8 ms | 9.8 ms | 2.0× *slower* |
+  | five full indexes | 65.4 s | 69.7 s | 1.07× *slower* |
+  | stored bytes (db + `/state`) | 141 MB | 240 MB | 1.7× *larger* |
+
+  Same shape as the SQLite run, which is the point of running it: nothing
+  about the trade is a SQLite artifact. Two things only the fleet shape shows.
+  **Cross-source resolution did not get more expensive** — 88,000 reference
+  edges across five repositories resolve in the same 2.75s, so narrowing that
+  pass to `external_reference` + artifacts held up on a corpus where it has
+  real work. And the **p50/p95 split reverses**: the median hybrid query is a
+  wash and the tail is 2.3× better, because the baseline's tail *is* the graph
+  it is holding. A serving replica wants that direction.
+
+  The first version of this table was much worse — graph arm 82ms, walk 14.2ms,
+  slice 17.1ms, and throughput at 0.64× of baseline across four threads. Four
+  changes closed it, and the shape of all four is the same: **work that was
+  free while the graph was a dict in front of you, and is not free behind a
+  store.** One statement instead of seven for the arm's candidates; a
+  materializing decoder for readers that want every attribute; one token pass
+  per field instead of two generator expressions; and the walk's budget
+  reaching the fetch. None of them changes an answer.
+- **Threads scale now, and replicas are still the axis.** Hybrid search across
+  1, 4 and 8 *threads* in one process: baseline 13.3 → 18.6 → 17.7 qps, now
+  **15.3 → 20.8 → 19.4** — ahead at every count, where before these changes it
+  was 12.0 → 11.6 → 10.2 and behind at every count. It scales because most of
+  what the arm now does is wait on one statement rather than run Python under
+  the GIL. As independent *processes* on a 4-core box both trees stop where
+  the cores do: baseline 13.3 → 26.0 → 36.0 → 36.4 at 1/2/4/8, now 13.1 →
+  25.6 → 32.1 → 32.0 — parity at one and two, ~11% behind at four (it was
+  ~31%), with a better p95 throughout. Which is the fleet reading: **the same
+  throughput per core, and no graph residency per replica.** Four file-backed
+  replicas hold four copies of the graph — 524 MB here, 6.6 GB at 100k files —
+  to serve 36 qps; four row-backed ones hold none to serve 32.
+- **Serving concurrency on SQLite is the one caveat worth knowing.** Hybrid
+  throughput held at 1 thread and fell 3.7× at 4. The cause is not the design:
+  concurrent SQLite reads do not scale *in a container like this one* — the
+  same probe against the **baseline's** database reading `chunks` went 486/s
+  to 13/s across 1→4 threads, with per-thread connections and no WAL backlog.
+  The row backend simply moved graph reads onto that resource, so the graph
+  paths inherit it. Postgres does not share it: the same batched fetch scales
+  41 → 86 → 160 qps across 1 → 4 → 8 threads, which is where the fleet runs
+  and where replicas exist. A standalone SQLite container serving heavily
+  concurrent *graph* queries is the one shape that is worse off than before,
+  and `storage.graph_format: node_link_json` is still there for it.
+- **The prerequisite for dropping the working set is batching, and Postgres
+  sets the bar.** The builder does a read-modify-write per node (`upsert_node`
+  reads `created_at`, `upsert_edge` reads the existing edge). Against rows
+  that is a point lookup: **8.2µs batched / 13.1µs each on SQLite** (630k of
+  them ≈ 5–8s, about 2% of a full index) but **46.5µs batched / 456µs each on
+  Postgres** — a socket round trip is 35× an in-process one, so the same 630k
+  is 29s batched and **287s unbatched**. Batching is therefore the whole
+  feasibility argument, not an optimization, and the fleet is exactly where
+  Postgres runs. The only irreducibly global structure left is cross-source
+  resolution's `by_path` index — every artifact path in the region, because a
+  reference resolves only once both sources are indexed — and that is ~15% of
+  nodes held for one pass rather than for the process.
+
 ### Retrieval
 
 Three arms — text (BM25 over an FTS5 or `tsvector` index), vector (LanceDB),
@@ -271,6 +522,14 @@ Ranking carries deliberate structure: `chunks_fts.title` holds the file's
 by path depth and by tests/samples membership. Query expansion drops framing
 stopwords. Criteria (`source_name`, `exclude_sources`, `node_types`,
 `min_score`, `section`, `principal`) are available identically on MCP and HTTP.
+
+**One over-fetch.** When a post-filter will drop rows the arms fetch further,
+so `max_results` keeps meaning "give me this many" — and that is
+`ranking.filter_overfetch`, computed in `RankingParameters.overfetch` and
+nowhere else. It governs the ACL, section, memory *and* criteria filters; each
+surface used to carry its own `× 4` for the last of those, so the tunable
+parameter half-governed the stage the glossary attributed it to.
+`tests/test_ranking_parameters.py` fails if a second multiplier appears.
 
 Concept extraction was **retired**: it was 87% of nodes and 98.6% of edges and
 failed every test set for it. `graph.enrichment._add_concept` is a no-op whose
@@ -523,10 +782,22 @@ One container until it shouldn't be. Then four independent axes:
 | Corpus size | `pheasant shard plan` packs **whole sources** per region | graph nodes |
 | Observation volume | `--role logger` draining its **own** queue (`log_tasks`, never `index_tasks`) | `pheasant_log_queue_depth` |
 
+The second axis has a ceiling the others do not: one indexer is the sole commit
+authority per shard, so extra indexers are elected hot standbys and the third
+axis is the only way past it. What 35.10 changed is *where* that ceiling sits:
+publishing a generation used to cost O(total graph) per commit, so the ceiling
+moved down as the corpus grew. With the graph in rows a commit costs what the
+change costs, and the third axis is a decision about the indexer's own working
+set rather than about every replica's.
+
 Selectable backends, dependency-free side first: `storage.backend`
 sqlite|postgres, `sync.queue.backend` off|local|nats,
 `sync.concurrency.worker_transport` http|grpc,
-`observability.interactions.queue.backend` off|local|nats.
+`observability.interactions.queue.backend` off|local|nats. One exception, and
+it is deliberate: `storage.graph_format` defaults to `rows`, the side that is
+*better*, because both sides need the same state store and neither adds a
+dependency — the rule is about not requiring infrastructure, not about
+preferring the older mechanism.
 
 The fourth axis rises with **request traffic, not corpus churn**, which is why
 it is a separate queue and a separate role rather than a `kind` column: sharing
@@ -551,6 +822,43 @@ arrangement of worker failures may change what a sync produces.
 Serving durability: bounded request concurrency answering `429` +
 `Retry-After` under saturation, and a SIGTERM drain that fails readiness and
 keeps serving on a timer thread — never by sleeping on the event loop.
+
+**The fleet's invariants are refusals, not conventions** (`deployment/roles.py`,
+one pass at startup). A serving role other than `all` refuses a bind other
+machines can reach with neither `security.api_auth.token_env` resolving nor
+`behind_authenticating_proxy` set — `all` is exempt so a laptop and every
+standalone container keep starting with no configuration at all, but a pod
+binds `0.0.0.0` by necessity and the bind address is not a control there. The
+graph and worker tokens must not name one variable or resolve to one value:
+two boundaries, and workers hold the second by necessity. A `worker` refuses
+to hold a DSN, a model key, the IdP token, the graph token, a source list or a
+non-SQLite backend, and `server.api.enabled: false` is *enforced* — such a
+process answers the probes, `/metrics` and its own `/internal` routes and 404s
+the rest. `/internal/*` is exempt from the API token structurally, because
+requiring it there would hand every worker the region's front-door credential.
+
+**The graph handoff is announced, and the poll is the backstop.** Each commit
+publishes a content-addressed `generation_id` in the publication record and,
+on the `nats` backend, announces it (core NATS pub/sub, one subject per kb —
+fan-out, since every replica must reload). A dropped message costs one
+`graph_refresh_seconds`, which is what lets the event path be at-most-once and
+stateless; a broker-less region keeps exactly the poll it had. `/ready` publishes `loaded` beside
+`published` so a stale replica is *detectable rather than inferred* (on
+`/ready`, off the loop, because comparing them reads `/state` and `/health` is
+the liveness probe that does no I/O — it carries `loaded` alone), and every
+search response carries the generation that answered it.
+
+**The single-writer ceiling is a metric, not prose.**
+`pheasant_commit_authority_saturation` (`sync/saturation.py`) is the busy
+fraction of a five-minute window on the process that owns the commit stream;
+sustained above `SHARD_THRESHOLD` (0.8) means more workers will not help and
+the region should be split. It publishes nothing below a minute of observed
+wall time, and nothing at all on a process that is not the commit authority —
+a confident zero from an api replica would read as headroom. `pheasant scan`
+warns from the same measured coefficients before a corpus reaches it, and
+`pheasant shard plan --emit` writes the second region's config, compose file
+and secret stubs so acting on a split is a reviewed diff rather than a weekend
+of copying.
 
 `src/pheasant/capacity.py` is the single home for sizing coefficients so
 `pheasant scan`, `pheasant shard plan` and the docs cannot disagree.
@@ -835,6 +1143,394 @@ Each of these cost real time. They are listed because the shape recurs.
   handler is stripped exactly like a crash. Found by walking every tool
   against a fake corpus and diffing the refusals against the 1.x server; no
   test had ever asserted on error *text*, so nothing went red.
+- **A config flag nothing reads is a comment with a colon in it.**
+  `deploy/compose/worker.yaml` declared `server.api.enabled: false` from the
+  day the worker tier existed, and no code ever consulted it — so every
+  preparation worker served the whole knowledge-base API: register a source
+  over any allow-listed path, rewrite the config, read what it finds. On the
+  tier designed to hold nothing, scaled hardest, and running third-party parse
+  code. The flag looked like the trust boundary and was documentation of an
+  intention. Enforced now at the one place that can be checked (a 404 for
+  anything outside the probes, `/metrics` and `/internal/*`), and asserted by
+  a test that drives a real client at a route the flag claims does not exist.
+  The general shape: a setting with no reader is worse than no setting,
+  because it stops anyone looking for the missing enforcement.
+- **A convenience in a deployment file can undo a boundary the code got
+  right.** The worker tier is deliberately given no database, no keys and no
+  volumes, and it holds the indexing token by necessity. The shipped Compose
+  file then wired `PHEASANT_GRAPH_SERVICE_TOKEN` to
+  `${PHEASANT_INDEX_WORKER_TOKEN}` — one fewer value to generate — so any
+  compromised worker also held the credential for the internal graph API,
+  which serves the whole graph. Nothing in the Python was wrong. Two variables
+  is the fix; the refusal when they resolve equal is what keeps it fixed, and
+  it belongs beside the other startup checks rather than in a README.
+- **A security posture that is right for one process is a default that ships
+  into the fleet.** "Unauthenticated, on loopback" is defensible for a
+  local-first container and was carried unchanged into the role split, where
+  pods bind `0.0.0.0` because a Service cannot reach a loopback-bound one — so
+  the control the docs named did not exist in the deployment they described.
+  The fix is not a bigger warning: `all` stays exempt (rule 7), and every
+  other role refuses to start without either a token or an explicit
+  "an ingress authenticates this". The general shape: when a control is a
+  *property of the deployment* rather than of the code, it must be re-derived
+  per deployment shape, not inherited.
+- **Two mechanisms for one idea, and only one of them tunable.** Retrieval
+  over-fetches when a post-filter will drop rows, so `max_results` keeps
+  meaning "give me this many". That existed twice: `ranking.filter_overfetch`
+  governed the ACL/section/memory filters, and each *surface* carried its own
+  hardcoded `max_results * 4` for retrieval criteria — with the vector arm
+  holding a third copy and the assistant's retrieval path doing no over-fetch
+  at all while still post-filtering. The parameter is declared tunable, bounded
+  and mapped to the `filters` stage, and the tuning glossary tells an operator
+  that a `filters` miss may mean it is too small; so a bundle could be promoted
+  on a parameter that half-governed the stage it was attributed to, and an
+  operator following that advice would see no effect. The arithmetic lives in
+  one method now and a test greps for a numeric multiplier on a result count
+  anywhere else — which immediately found a *sixth* site, in vocabulary
+  publication. That one is genuinely a different concern, so it got a name
+  (`VOCAB_OVERFETCH`) rather than the parameter: the guard's real output is
+  forcing the distinction to be stated.
+- **A lesson can propagate while the code does not.** `all([])` is `True`, so a
+  skipped evaluation run reported that it passed the gates it never evaluated.
+  The tuning plane, written afterwards, shipped its *own* copy of the guard,
+  with a docstring citing the evaluation plane's incident as justification. Two
+  implementations of one invariant, and a third plane would have started from
+  zero. `pheasant.decision` owns the vocabulary now, and the invariant is a
+  constructor precondition rather than a remembered check: `GateSet` refuses to
+  be built empty, "no gates" is the *absence* of a GateSet, and absence has no
+  `passed` to misread.
+- **A lambda closes over the name, not the value.** Consolidating the memory
+  policy into one rule with two renderers put each clause's SQL fragment in a
+  lambda. Two clauses built a placeholder string into a local called
+  `placeholders`, so the steering fragment rendered with the scope clause's
+  placeholder count and SQLite refused the statement outright. Caught by the
+  parity test the consolidation was supposed to make redundant — which is the
+  point worth keeping: removing the drift *between* two renderings does not
+  make either rendering correct, so the test that compares them stays.
+- **`get_args(list[X])` is also `(X,)`.** Deriving config construction from the
+  dataclasses meant asking "does this annotation name a nested section" and
+  "does it name a Path". Both answers unwrap unions — and a `list[Path]`
+  unwraps identically to `Path | None`, so the whole list went to `Path()`, and
+  `list[SourceConfig]` looked like a section and was handed to a constructor
+  with three required arguments. The origin has to be checked before the args.
+  Both surfaced immediately here; the second was latent (the only such field is
+  skipped by name), which is the kind that waits for the second one.
+- **Backend coverage behind a path filter is coverage nobody can reason
+  about.** Postgres — the scale-out backend, and the one the offline suite
+  cannot see — ran only in the evaluation, memory and tuning workflows, each
+  gated on `paths:`. So whether a change was tested against it depended on
+  which files it happened to touch. Measured when the unfiltered job was
+  added: three of the twenty-two modules carrying dialect branching matched no
+  filter at all, and one was `sync/locks.py` — the per-source lease several
+  indexers rest on, and the exact file where a discarded `cursor.rowcount`
+  once made a claim fail on SQLite and pass on Postgres. `ci.yml` now runs the
+  whole suite against a real Postgres on every PR, and
+  `tests/test_workflow_coverage.py` fails if that job gains a filter, stops
+  running Postgres, or stops setting the DSN. The second-order lesson is in
+  that test: narrowing the run to a curated list of dialect-sensitive *tests*
+  would have been the same staleness one level down, so it runs everything.
+- **A startup refusal has to key on what a process does, not on what its
+  config could describe.** The "unauthenticated API on a routable bind" check
+  was applied wherever `validate_role` ran — including `pheasant worker
+  --transport grpc`, which binds a gRPC port and never starts the HTTP app at
+  all. It therefore demanded an API token for a surface that does not exist.
+  The shipped `worker.yaml` sets `server.api.enabled: false` and so happened
+  to satisfy it, which is why a real run and the whole suite both passed: it
+  was one config away from refusing a working deployment, in the direction
+  guards are most expensive to be wrong in. `serves_http=False` says so at the
+  call site now. Found by writing the test for an unrelated worker bug, which
+  is the usual way.
+- **A ceiling stated only in prose cannot be reached by anyone reading a
+  dashboard.** One indexer is the sole commit authority, which every design
+  document said and no metric showed — so "we scaled workers and ingest
+  stopped improving" and "retrieval is mistuned" produced identical symptoms.
+  Two decisions made the gauge honest rather than merely present: it publishes
+  `None` below a minute of observed wall time (two busy seconds in a pod's
+  first four are not 50% saturation, and the response to a misread is to shard
+  a region that is doing nothing), and it is absent entirely on a process that
+  is not the commit authority, because a confident `0.0` from an api replica
+  reads as headroom. Same posture as `tuning.health` below its sample floor.
+- **"One facade, exposed twice" is a claim only a test can hold.** The HTTP and
+  MCP surfaces were documented as one API and were two implementations of it:
+  `api/app.py` mentioned `PheasantTools` once, for introspection, and two of
+  its docstrings said a function "mirrors" a tool it had in fact drifted from.
+  Four of the five shared operations differed, and the worst was silent —
+  `relevant_files` applied the memory policy over HTTP and not over MCP, so the
+  surface built for agents could serve a record the region *knew* had been
+  superseded, while the surface a human watches could not. Nobody decided any
+  of it; it is what happens when a fix lands on the surface whose bug report
+  arrived. The extraction is only half the answer: `tests/test_surface_conformance.py`
+  drives both surfaces over one corpus and asserts identical results *and*
+  identical refusal text, because two spellings of one refusal is the same
+  defect one level down.
+- **A conformance test finds bugs in the thing it was written to protect.**
+  The matrix's first run reported `graph_generation: null` on MCP and a real
+  value on HTTP — not a divergence between the surfaces but a defect in the
+  event-driven graph reload committed a week earlier: `loaded_graph_generation`
+  was set when a replica *read* a graph and never when a process *published*
+  one, so `role: all` — the default, every standalone container — reported
+  "no generation loaded" forever, and the staleness signal `/ready` publishes
+  was unusable exactly where most deployments live. The engine adopts the
+  generation it just committed now. The general shape: a test that compares two
+  independent paths reveals things neither path's own tests can, because each
+  was written by someone who already believed the answer.
+- **Not every divergence a comparison finds is a bug to fix in that commit.**
+  The same matrix then found the graph arm ordering equal-scoring nodes one way
+  from an in-memory graph and another from the same graph loaded off disk.
+  Real, and *not* fixed there: a deterministic tie-break inside a retrieval arm
+  is a ranking change, it moves results for every deployed region, and it needs
+  its own evidence rather than a line in a refactor. The fixture equalises the
+  two by reloading, the divergence is written down, and the change is a change.
+  A refactor that quietly fixes ranking is a refactor nobody can review.
+- **A package can span two layers, and the layer test is how you find out.**
+  `assistant` was classified as application-level because it orchestrates
+  retrieval to answer a question — true of `chat.py`, `retrieval.py` and
+  `workflows/`, and false of `catalog.py`, `providers.py`, `llm.py` and
+  `credentials.py`, which are model-access adapters that `memory/synthesis.py`
+  and `setup_wizard.py` legitimately reach for. Declaring one layer per
+  top-level package would have forced a choice between a false failure and
+  deleting the rule. Layers resolve by longest declared prefix instead, so the
+  split is stated where a reader can see it — and `memory` importing
+  `assistant.chat`, the edge that would actually be wrong, still fails.
+- **Extracting a layer inverts dependencies you did not know you had.** Two
+  fell out of the same test run and neither is about HTTP: `services/graph.py`
+  held the pure hierarchy-first walk *and* the ACL guard, so the assistant
+  could not reach the walk without importing the service layer (split into
+  `graph/traversal.py`), and `sync/worker.py` imported `pheasant.cli` for one
+  progress-marker string, putting the whole CLI under the worker (the constant
+  moved to the side that parses it, and `cli.py` re-exports it). Both had been
+  invisible for as long as they existed, because nothing had ever asked which
+  direction they pointed.
+- **A tidy `WHERE` clause can be a full table scan, and the plan is the only
+  way to know.** The row backend addresses edges by exact endpoint pair, which
+  needs an `OR` chain — `source IN (…) AND target IN (…)` is a cross product
+  and over-matches, which would fold digests out that were never replaced and
+  delete edges nobody touched. Written the obvious way, `WHERE kb_id=? AND
+  ((source=? AND target IN (…)) OR …)`, SQLite cannot use its multi-index-OR
+  optimization at all: each branch has to be independently indexable, and
+  `source=?` alone is not a prefix of `(kb_id, source, target, type, seq)`.
+  `EXPLAIN QUERY PLAN` said `SEARCH … USING INDEX idx_graph_edges_target
+  (kb_id=?)` — the whole table. Repeating `kb_id` inside every branch gives
+  `MULTI-INDEX OR` with exact primary-key lookups. Measured: **300 ms per
+  incremental commit at 100k files versus 1 ms**, and the tidy form was
+  O(total graph) — which would have made the row backend cost exactly what the
+  file backend cost, for exactly the same reason, one layer down. It shipped
+  green: every test passed, because a fixture with twelve edges cannot tell a
+  scan from a seek.
+- **`COUNT(*)` on a commit path is the same mistake wearing a different hat.**
+  The first version asked "is this knowledge base empty" with a count and
+  published counts by counting. Two full scans per commit, 364 ms at 100k
+  files and growing — again O(total) for an O(changed) write. The emptiness
+  probe is a `LIMIT 1` (the trick `NodeIndex.populated` already documents for
+  exactly this reason) and the counts are maintained from the exact number of
+  rows each delta inserts and replaces, which the fold bookkeeping already
+  knows. `recount()` is the honest scan, for repair and for the tests.
+- **XOR is an involution, so folding a row out twice folds it back in.** The
+  published generation id is a XOR over every row's content digest, which is
+  what makes it maintainable in O(changed). It is also what makes a duplicate
+  fatal: an edge reached both as a replaced pair and as the casualty of a
+  removed endpoint would be folded out twice and silently return, and the
+  published id would be wrong with nothing else to notice. `_digests_for`
+  keys by primary key rather than accumulating a list, so identity — not
+  arrival — decides.
+- **An index with no reader is a config flag with no reader.** Two of the four
+  indexes first written for `graph_edges`/`graph_nodes` looked obviously
+  useful (`source_id` on edges, `artifact_id` on nodes) and nothing queried
+  either: per-source deletion goes through the node table and cascades by
+  endpoint. They measured 50 MB of a 1,085 MB database between them and, worse
+  than the bytes, they looked like the mechanism — the next person to ask "how
+  does per-source deletion stay cheap" would have found the wrong answer.
+- **A test whose fixture cannot exhibit the failure is a test that passes.**
+  Three separate defects above — the OR-chain scan, the `COUNT(*)`, and the
+  graph service reading `graph_builder.graph` instead of the serving graph —
+  were invisible to the offline suite and obvious the moment
+  `python -m pheasant.graph.capacity` ran at 100k files. Two of the three were
+  *performance* bugs of the exact class this change existed to remove, and the
+  third returned a plausible zero. The benchmark is the test for them, which
+  is why it is a module and not a script somebody ran once.
+- **A timestamp nothing reads was the one input making a content-addressed id
+  move.** `GraphBuilder.upsert_node` stamped `updated_at` on *every* upsert,
+  so re-asserting an unchanged node changed its bytes — and the published
+  graph generation is a digest of those bytes on the file backend and of that
+  row on the row backend. An unchanged corpus therefore published a new id as
+  soon as the clock ticked, and every replica reloaded a graph identical to
+  the one it held, on every beat: 4.9s per replica per beat at 100k files, for
+  nothing. It predated both backends and nothing had ever asserted the
+  property `generation_id`'s own docstring promises. Only `graph_search`
+  (which skips it) and the Parquet export read the field, so holding it steady
+  is free — and makes the exported value mean "when this node last changed"
+  rather than "when a sync last ran". The stamp moves on a real difference and
+  not otherwise, which is the rule `created_at` already had.
+- **The same fix exposed an in-place mutation the delta could not see.**
+  `upsert_edge` updates an existing edge through the dict `get_edge_data`
+  hands back, so the change never passes through `add_edge`. Free on a backend
+  that re-serializes everything; a silently dropped write on one that writes
+  only what it is told changed. `touch_edge` marks the pair. The general
+  shape: moving from "write it all" to "write the delta" makes every
+  mutation-by-side-effect a correctness question, and they do not announce
+  themselves.
+- **A `full` re-index still moves the generation id, and that is written down
+  rather than fixed here.** It removes a source's nodes and rebuilds them, so
+  `created_at` legitimately resets. Arguably wrong — "full" ought to mean
+  "rebuild the same graph", not "rebuild it with new birthdays" — but
+  `created_at` would have to come from the artifact rows rather than from a
+  graph that was just wiped, which changes what a full sync *means*.
+  `tests/test_graph_backends.py` asserts stability on `incremental`, where it
+  genuinely holds, and says why.
+- **A pass that walks the whole graph for a slice of it keeps the whole graph
+  alive.** Three did, and none of them was written wrongly — they were written
+  when the whole graph was already a dict in front of them, so narrowing had
+  no visible benefit. It has one now: the walk *is* the reason the working set
+  exists. `add_cross_source_edges` was the clearest, handing the resolver
+  `dict(attrs)` for every node when both the Python and WASM resolvers filter
+  arrivals to artifacts-with-a-path plus `external_reference` stubs — 15% of a
+  real graph, and the copy roughly doubled peak memory to build a list whose
+  first act was to throw three quarters of it away. The general shape: when a
+  data structure stops being free, every consumer written against "it is free"
+  becomes a question, and they do not announce themselves either.
+- **Dead code that walks is worse than dead code that sits.**
+  `add_similarity_edges` keyed off `concept_terms`, and concept extraction was
+  retired — so `_base_concepts` returns an empty enrichment and nothing has
+  carried a concept term since. The pass still walked every node *and copied
+  every artifact's attributes* to emit zero edges, on every sync. The concept
+  retirement's own third justification was already "the live graph contained
+  zero `similar_to` edges"; what nobody went back for was the walk still being
+  paid to produce them. `tests/test_graph_working_set.py` asserts both halves —
+  the pass emits nothing, *and* no node carries a concept term — so if
+  enrichment ever starts emitting them again the no-op is caught rather than
+  silently dropping edges.
+- **An efficiency claim needs a bound, not a stopwatch.** Every assertion in
+  `tests/test_graph_working_set.py` counts what the code *touches* — the node
+  types handed to the resolver, whether a whole-graph snapshot was taken — and
+  none of them times anything. A timing test measures the CI runner and goes
+  flaky; a bound fails exactly when someone puts the work back. Which also
+  means the change that could not be bounded is the one that did not ship: the
+  `remove_nodes_from` rework measured 122.5ms against 126.0ms, so it was
+  reverted rather than kept for looking better.
+- **A micro-benchmark that picks a convenient starting node measures the easy
+  half.** `graph/capacity.py` timed a bounded 3-hop walk at **0.12 ms** and
+  the same walk on a real corpus took **220 ms** — because the benchmark
+  started from an arbitrary node with a handful of edges and a real walk
+  starts wherever the caller points, often at a `source` node that indexes
+  every artifact in the region. Three separate defects hid behind that gap and
+  every one of them was invisible to the whole test suite: the walk prefetched
+  attributes for every *reachable* target rather than the ones it would keep
+  (8,040 node rows to return 100); every edge's JSON attribute blob was parsed
+  to read `type`, which is a column and not in the blob (8,040 `json.loads`,
+  42% of the walk); and the rows were grouped by endpoint pair twice, once in
+  the store and again in the caller. The benchmark measures a hub explicitly
+  now, next to the ordinary node, because reporting only the ordinary one
+  described the case that was already fine.
+- **The same N+1 appeared one layer up, in the graph search arm.**
+  `graph.nodes.get(node_id)` is a dict lookup on a resident graph and a
+  `SELECT` on a stored one, so the obvious loop over the index's candidates
+  issued **~2,000 single-row queries per search** — and the cost scaled with
+  how *unselective* the query was rather than with what it returned, which is
+  the worst possible shape. Batched, that is 4 queries. The general lesson:
+  moving a data structure behind a store turns every `.get()` in a loop into a
+  round trip, and they are spread across modules that never mentioned storage.
+- **A filter the caller applies afterwards is a filter the store should have
+  applied, and only a store makes that visible.** `slice_` keeps a link only
+  when *both* endpoints are inside the slice, and established that by fetching
+  every out-edge of every node it held and discarding the rest. On a resident
+  graph the discard is a comparison; against rows it is the whole cost — a
+  51-node slice containing one `source` node read **3,580 edge rows to draw
+  ~150 links**, 16.7 ms of a 46 ms call, and it scaled with the region rather
+  than with the slice. The store answers the *induced sub-graph* now (`source
+  IN (…) AND target IN (…)`, where the cross product is precisely the question
+  being asked, unlike `_pair_clauses` where it would over-match): 0.96 ms, 80
+  rows, byte-identical answer, and the whole call 46 → 17 ms. Found by
+  counting rows per query on a real five-repository region, because the
+  fixture's hub has four edges and cannot tell 3,580 from 150.
+- **A bound is only sound when nothing downstream can reject what it counted.**
+  A bounded walk fetched a whole level's out-edges before expanding it, so a
+  hub returned 1,620 pairs to keep 100. The budget now reaches the fetch, and
+  the two things that made it hard are both worth keeping:
+  **the ordering has to be per-pair.** `_hierarchy_first` ranks an endpoint
+  *pair* by whether **any** of its edges is `contains`, so a per-edge `CASE`
+  splits a pair carrying both a `contains` and an `indexes` edge across two
+  rank groups — and the store's one-pass grouping then emits that pair twice
+  with half its edges each. It is a `MIN(CASE …) OVER (PARTITION BY source,
+  target)` window aggregate, in both dialects.
+  **And the budget is only enough when nothing between the fetch and the
+  result can reject a pair.** `max_nodes + visited` pairs per source is
+  provably sufficient because at most `visited` targets can be skipped as
+  already-seen — but an `edge_types` filter, an `exclude_edge_types` or an
+  `exclude_node_types` rejects for reasons the count knows nothing about, and
+  a hub whose 1,600 `indexes` pairs are all filtered out needs every one of
+  them to reach its 20 `contains` pairs. Those walks ask for **no** limit and
+  stay exactly as slow as they were. `_frontier_budget` is that rule, in one
+  function, with a test that fails if someone simplifies it away.
+  Measured: 14.5 ms → 7.3 ms for the walk, 17.1 → 9.8 for a slice, and the
+  same 20 walks over the fleet region return byte-identical results.
+- **The statement was the wrong thing to time.** The ranked frontier is
+  *slower* as a query — 2.96 ms against 2.54 ms, because the server sorts
+  1,620 rows to return 120 — and 2.7× faster as an operation: **10.40 ms
+  against 3.81 ms** once the rows are decoded and grouped. Rows that never
+  arrive are rows nobody builds a `Row` dict for, decodes into `_LazyAttrs`,
+  or groups into pairs, and that is where the time was. Timing the SQL alone
+  said do not do it.
+- **A lazy mapping is a cost to a reader that wants all of it.**
+  `_LazyAttrs` exists because a traversal hop reads `type` and nothing else,
+  and it is exactly wrong for the search arm, which reads every attribute of
+  every candidate: `dict(lazy)` goes through the mapping protocol, one
+  Python-level `__getitem__` per key, over 1,836 candidates a query.
+  **8.0µs per node against 3.75µs** for the same dict built in one step. The
+  fix is not to choose one — it is that the *caller* says which it wants
+  (`prefetch_nodes(..., materialized=True)`), because only the caller knows.
+  The streaming iterators, which feed exports that read everything, were on
+  the wrong side of this too.
+- **Two generator expressions per field, six fields per node, 1,836 nodes.**
+  `_field_score` asked `all(token in low …)` and then `any(token in low …)` —
+  the same scan twice in the "some but not all" case, and two generator
+  objects created every time either way. The profile put ~1.1M generator
+  `next` calls plus the `any`/`all` frames at a fifth of the whole graph arm.
+  One counting loop is **10.85µs against 3.66µs** for a node's twelve fields
+  and returns the identical ladder. The general shape: a comprehension is not
+  free at the bottom of a loop that runs ten thousand times a request, and a
+  profile is the only thing that says which loop that is.
+- **Two tables in one database do not need a round trip between them.** The
+  graph arm asked `graph_nodes_fts` for candidate ids, shipped up to 2,000 of
+  them into Python, and sent every one straight back down as a bind parameter
+  for `graph_nodes` — a semi-join the planner would have done, spelled as a
+  round trip because the two tables live behind different objects. 22.0 ms
+  against 14.6 ms, seven statements per search against three, and the gap
+  grows with how *unselective* the query is, which is the shape that has now
+  bitten three times here. `NodeIndex.candidate_query` hands over the
+  `SELECT` unexecuted and `GraphRowStore.nodes_matching` runs it as a
+  subquery; neither module imports the other.
+- **`IN (?,?,?)` makes the statement text a function of the batch size.**
+  psycopg3 prepares a statement after its fifth execution of the same text,
+  so a key-set predicate that never repeats its spelling is one that is never
+  prepared and re-planned on every call — **8.93 ms against 6.15 ms** for a
+  500-key node fetch. Postgres gets `= ANY(?)` with the list as one array
+  parameter: one text, one plan, every batch size. SQLite keeps the `IN`
+  list, which is its reference spelling and has no array type to bind. It is
+  `Dialect.in_clause`, so the choice is made once rather than at each of the
+  call sites that batch.
+- **Two fixes were built, measured and thrown away in the same pass.** An
+  out-adjacency index for `remove_nodes_from` measured 122.5ms against
+  126.0ms, and an exact short-circuit in `_node_score` — provably identical
+  output, skipping the attribute scan when `label`/`name` already scored above
+  everything that follows — did not fire on a real corpus, because labels are
+  paths and the query words are in the body. Both were reverted. A change that
+  cannot show a number is not an optimization, it is a diff; and one that
+  touches ranking without showing a number is worse than that.
+- **An incremental sync leaks a chunk node per edit. Open, pre-existing, not
+  fixed here.** Chunk node ids embed the chunk's sha256, so editing a file
+  produces *new* chunk nodes — and nothing removes the old ones on the
+  incremental path: `remove_artifact_nodes` exists and does exactly the right
+  thing, but its only caller is memory maintenance. A full sync is correct,
+  because it clears the source first. Measured on a real region: one file
+  edited three times ends with **four** chunk nodes and four `has_chunk`
+  edges, and the count rises by one on every subsequent edit, so an actively
+  edited corpus accumulates orphaned chunks without bound — graph memory,
+  traversal budget and `graph_nodes` rows spent on content that no longer
+  exists. Reproduced identically on the commit before the working-set changes,
+  so it is not one of theirs. Left alone deliberately: wiring removal into the
+  incremental path changes what an incremental sync *does*, which is a
+  correctness change with its own blast radius and deserves its own evidence
+  rather than riding along with an efficiency pass.
 
 ---
 
@@ -847,6 +1543,8 @@ Each of these cost real time. They are listed because the shape recurs.
   **HTTP:** `docs/reference/http-api.md`
 - **Scale:** `docs/how-to/capacity-planning.md`,
   `docs/how-to/worker-fleet.md`, `docs/how-to/indexing-performance.md`
+- **Security:** `docs/security.md` — the trust model for one container, the
+  fleet's three boundaries, and which startup refusals enforce them
 - **Analytics/exports:** `docs/how-to/parquet-exports.md`,
   `docs/reference/export-schema.md` (the contract an outside reader gets)
   — `/exports` is a PVC/named volume an outside reader mounts; nothing is

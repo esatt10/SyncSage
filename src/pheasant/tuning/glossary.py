@@ -279,7 +279,10 @@ STAGES: list[dict[str, Any]] = [
         "Two possible causes with opposite fixes. If the policy is correct, "
         "this is not a fault at all. If it is not, either the policy is too "
         "narrow or `filter_overfetch` is too small — the arms fetched a page, "
-        "the filter ate most of it, and nothing was left to rank.",
+        "the filter ate most of it, and nothing was left to rank. That "
+        "parameter governs every post-filter, including the retrieval criteria "
+        "a caller passes; it once governed only some of them, which made this "
+        "advice true of half the stage.",
         "A filter drop is not automatically a bug. An ACL doing its job "
         "produces this stage, and the right response is nothing.",
         LOWER,

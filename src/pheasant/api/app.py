@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
 import socket
 import threading
 import time
-from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
@@ -47,6 +47,10 @@ from pheasant.security.path_policy import (
     resolve_config_write_target,
     resolve_under,
 )
+from pheasant.services import ServiceContext, ServiceError
+from pheasant.services import assistant as assistant_service
+from pheasant.services import graph as graph_service
+from pheasant.services import retrieval as retrieval_service
 from pheasant.sync.engine import SyncEngine
 from pheasant.sync.fingerprint import EMBEDDING_SCOPE, embedding_fingerprint
 from pheasant.sync.remote_worker import ResultCache
@@ -461,24 +465,9 @@ class GraphQueryRequest(BaseModel):
     parameters: dict[str, Any] = {}
 
 
-#: One line per retrieval knob, so a UI (or an agent reading
-#: ``describe_retrieval``) can explain a setting without the caller having to
-#: go and read the workflow module's docstring.
-RETRIEVAL_FIELD_HELP: dict[str, str] = {
-    "max_rounds": "plan → retrieve → grade turns before answering with what is in "
-    "hand. 1 disables the re-plan loop.",
-    "per_query_results": "passages fetched per query per search mode.",
-    "max_context_passages": "total passages offered to the answering step.",
-    "retrieval_modes": "search modes to fan out over (text, vector, graph, hybrid). "
-    "'vector' is dropped automatically when no vector index is built.",
-    "expand_graph": "walk the knowledge graph out of the best hits, reaching "
-    "documents that share no vocabulary with the question.",
-    "expand_depth": "hops to walk when expanding.",
-    "expand_per_node": "neighbours taken per expanded node.",
-    "grade_evidence": "ask the model to grade its own evidence before answering.",
-    "verify_citations": "drop [n] markers that do not resolve to a real citation.",
-    "max_facts": "graph facts surfaced alongside the answer.",
-}
+#: Re-exported: the text is the same on both surfaces, so it lives with the
+#: operation rather than in whichever transport happened to define it first.
+RETRIEVAL_FIELD_HELP = assistant_service.RETRIEVAL_FIELD_HELP
 
 
 #: Config sections that can be changed on a running server, and what changing
@@ -686,7 +675,11 @@ LIVE_APPLICABLE_SECTIONS: dict[str, bool] = {
     "memory": True,
     "ingestion": False,  # captioner/transcriber are wired at engine construction
     "sync": False,  # watcher/scheduler services are started at boot
-    "security": False,  # path policy is read per request, but ACL wiring is not
+    # Path policy is read per request, but ACL wiring is not -- and since
+    # 35.8 neither is `api_auth`: the token is resolved once at construction
+    # and the middleware is only installed when one exists, so turning auth on
+    # or rotating the token is a restart.
+    "security": False,
     "synapse": True,
     # The tracer provider, the exporter and the buffer's flusher thread are
     # all wired once at app construction, and the log tier's queue binding
@@ -865,105 +858,13 @@ def _source_payload(
     return payload
 
 
-#: Edges expanded before anything else at each hop. `contains` is the
-#: directory/file hierarchy, and walking it first is what makes a bounded
-#: horizon show a *tree* rather than an arbitrary slice of a flat fan-out.
-HIERARCHY_EDGE_TYPES = ("contains",)
-
-
-def graph_neighbors(
-    graph: SimpleMultiDiGraph,
-    node_id: str,
-    depth: int = 1,
-    edge_types: list[str] | None = None,
-    max_nodes: int | None = None,
-    exclude_edge_types: set[str] | None = None,
-    exclude_node_types: set[str] | None = None,
-) -> dict:
-    """Breadth-first neighbor expansion (mirrors PheasantTools.get_graph_neighbors).
-
-    ``max_nodes`` stops the walk once that many neighbors are collected.
-    Callers that only keep the first N (the canvas asks for a bounded horizon)
-    must pass it: three hops off a hub node reaches most of the graph, and
-    enumerating all of it to then throw nearly all of it away is what made a
-    depth-3 slice take minutes. Truncation is in BFS order either way, so the
-    kept set is identical — only the work is smaller.
-    """
-    remote = getattr(graph, "remote_neighbors", None)
-    if callable(remote):
-        return remote(
-            node_id=node_id,
-            depth=depth,
-            edge_types=edge_types,
-            max_nodes=max_nodes,
-            exclude_edge_types=sorted(exclude_edge_types) if exclude_edge_types else None,
-            exclude_node_types=sorted(exclude_node_types) if exclude_node_types else None,
-        )
-    if node_id not in graph:
-        return {"node_id": node_id, "depth": depth, "neighbors": []}
-    max_depth = max(1, min(int(depth or 1), 10))
-    allowed = set(edge_types or [])
-    queue: deque = deque([(node_id, 0, [node_id])])
-    visited = {node_id}
-    neighbors: list[dict] = []
-    while queue:
-        if max_nodes is not None and len(neighbors) >= max_nodes:
-            break
-        current, current_depth, path = queue.popleft()
-        if current_depth >= max_depth:
-            continue
-        # Hierarchy first. A source node carries an `indexes` shortcut to every
-        # one of its artifacts, so a plain fan-out spends the whole budget
-        # jumping straight to files and the directory tree between them never
-        # gets walked — the parent/child structure is present in the graph but
-        # invisible in any bounded view of it.
-        for _source, target, edge_map in _hierarchy_first(graph.out_edges(current)):
-            matching = [
-                data
-                for data in edge_map.values()
-                if (not allowed or data.get("type") in allowed)
-                and not (exclude_edge_types and data.get("type") in exclude_edge_types)
-            ]
-            if not matching:
-                continue
-            # Types the caller hides are pruned here rather than after the
-            # fetch: a concept-heavy graph otherwise spends the entire budget
-            # on nodes the view is about to discard, and the structure the
-            # caller actually asked for never fits.
-            if exclude_node_types:
-                target_type = graph.nodes.get(target, {}).get("type")
-                if target_type in exclude_node_types:
-                    continue
-            next_depth = current_depth + 1
-            # One entry per *node*, not per edge into it. `visited` guarded the
-            # queue but not the append, so a node reachable by two paths was
-            # listed twice — every consumer treats this as a node list, and
-            # `graph_slice` built its `nodes` payload straight off it, so the
-            # canvas received duplicate element ids. It also charged the same
-            # node to the budget twice, cutting a bounded slice short of the
-            # structure it was asked for. First sighting wins, which is BFS
-            # order and therefore the shortest path — the same rule `depths`
-            # applies. No edge is lost: `graph_slice` derives links from the
-            # graph itself, so both parents still draw.
-            if target in visited:
-                continue
-            visited.add(target)
-            edge_type_values = sorted({data.get("type") for data in matching if data.get("type")})
-            neighbors.append(
-                {
-                    "node_id": target,
-                    "depth": next_depth,
-                    "edge_types": edge_type_values,
-                    "path": [*path, target],
-                    "node": dict(graph.nodes.get(target, {})),
-                }
-            )
-            queue.append((target, next_depth, [*path, target]))
-            # A single hub can have thousands of out-edges, so the budget has
-            # to bind inside the fan-out, not just between hops.
-            if max_nodes is not None and len(neighbors) >= max_nodes:
-                break
-    return {"node_id": node_id, "depth": depth, "neighbors": neighbors}
+#: Re-exported from the service layer, which now owns the traversal. Kept as
+#: module-level names here because `graph_neighbors` and `graph_slice` are
+#: imported from this module by name in several places, and because the HTTP
+#: routes below read better calling them unqualified. The implementation moved;
+#: the spelling did not.
+graph_neighbors = graph_service.neighbors
+graph_slice = graph_service.slice_
 
 
 def _shortest_path(
@@ -1053,82 +954,17 @@ def _edge_type_set(value: str | None) -> set[str] | None:
     return items or None
 
 
-def _hierarchy_first(out_edges: list) -> list:
-    """Structural edges before shortcuts, order otherwise preserved."""
+def _resolved_api_token(config: PheasantConfig) -> str:
+    """The shared bearer token for this region's API, or "" when there is none.
 
-    def rank(entry) -> int:
-        types = {data.get("type") for data in entry[2].values()}
-        return 0 if types & set(HIERARCHY_EDGE_TYPES) else 1
+    Read once at startup rather than per request: it is a process-wide secret,
+    and rotating it is a restart — the same contract as every other credential
+    here, none of which is ever read out of YAML.
+    """
 
-    return sorted(out_edges, key=rank)
-
-
-def graph_slice(
-    graph: SimpleMultiDiGraph,
-    node_id: str,
-    depth: int = 1,
-    edge_types: list[str] | None = None,
-    limit: int = 100,
-    exclude_edge_types: set[str] | None = None,
-    exclude_node_types: set[str] | None = None,
-) -> dict:
-    """Connected sub-graph around a node (mirrors PheasantTools.get_graph_slice)."""
-    remote = getattr(graph, "remote_slice", None)
-    if callable(remote):
-        return remote(
-            node_id=node_id,
-            depth=depth,
-            edge_types=edge_types,
-            limit=limit,
-            exclude_edge_types=sorted(exclude_edge_types) if exclude_edge_types else None,
-            exclude_node_types=sorted(exclude_node_types) if exclude_node_types else None,
-        )
-    # Ask for one more neighbour than the caller will receive.  Without that
-    # sentinel a bounded UI slice silently looked complete whenever it filled
-    # its budget, which made large documents appear to have lost chunks.
-    neighbour_limit = max(0, int(limit))
-    traversal = graph_neighbors(
-        graph,
-        node_id,
-        depth,
-        edge_types,
-        max_nodes=neighbour_limit + 1,
-        exclude_edge_types=exclude_edge_types,
-        exclude_node_types=exclude_node_types,
-    )
-    all_neighbors = traversal["neighbors"]
-    kept = all_neighbors[:neighbour_limit]
-    node_ids = [node_id] + [item["node_id"] for item in kept]
-    node_set = set(node_ids)
-    # Hop distance per node, nearest wins (BFS order, so the first sighting is
-    # the shortest path). The UI rings the canvas by this and lets the user
-    # widen the horizon a layer at a time instead of rendering the whole graph.
-    depths: dict[str, int] = {node_id: 0}
-    for item in kept:
-        target = str(item["node_id"])
-        hop = int(item.get("depth") or 0)
-        if hop < depths.get(target, hop + 1):
-            depths[target] = hop
-    links = []
-    allowed = set(edge_types or [])
-    for source in node_set:
-        if source not in graph:
-            continue
-        for _src, target, edge_map in graph.out_edges(source):
-            if target not in node_set:
-                continue
-            for key, data in edge_map.items():
-                if allowed and data.get("type") not in allowed:
-                    continue
-                links.append({"source": source, "target": target, "key": key, **data})
-    return {
-        "node_id": node_id,
-        "depth": depth,
-        "nodes": [dict(attrs) for attrs in (graph.nodes.get(item) for item in node_ids) if attrs],
-        "links": links,
-        "depths": depths,
-        "truncated": len(all_neighbors) > neighbour_limit,
-    }
+    auth = getattr(getattr(config, "security", None), "api_auth", None)
+    name = str(getattr(auth, "token_env", "") or "").strip()
+    return (os.environ.get(name, "") or "").strip() if name else ""
 
 
 def create_app(
@@ -1158,9 +994,17 @@ def create_app(
     # coordinate child commits; workers prepare immutable files; remote APIs
     # query the graph service. None of those needs a second graph copy.
     remote_graph = bool(str(config.graph.query_service_url or "").strip())
-    loads_graph = role_policy.role in {Role.ALL, Role.GRAPH} or (
-        role_policy.role is Role.API and not remote_graph
-    )
+    # On the row backend only a process that *builds* the graph holds one: a
+    # bounded walk is a bounded query there, so an api or graph replica serves
+    # from `graph_nodes`/`graph_edges` and never materializes 1.5GB (measured
+    # at 100k files) to answer a three-hop neighbourhood. On the whole-file
+    # backend there is no such option, and this resolves exactly as it did.
+    stores_graph = config.storage.graph_format == "rows"
+    builds_graph = role_policy.role in {Role.ALL, Role.INDEXER}
+    loads_graph = (
+        role_policy.role in {Role.ALL, Role.GRAPH}
+        or (role_policy.role is Role.API and not remote_graph)
+    ) and (builds_graph or not stores_graph)
     engine = SyncEngine(
         config,
         paths,
@@ -1170,7 +1014,7 @@ def create_app(
     )
     serving_graph = graph_for_config(
         config,
-        lambda: engine.graph_builder.graph,
+        engine.serving_graph,
         force_local=role_policy.role is not Role.API,
     )
     # One resolver for the whole process: the searcher ranks with it, and
@@ -1187,6 +1031,17 @@ def create_app(
         default_memory_policy=config.memory.default_policy,
         usage_tracking=config.memory.usage_tracking,
         stage_sample_rate=config.observability.interactions.stage_sample_rate,
+    )
+
+    # The application layer's collaborators, assembled once. Every operation
+    # below that has an MCP counterpart takes this and nothing else, which is
+    # what makes "the same operation" a fact rather than a convention.
+    services = ServiceContext(
+        config=config,
+        state=state,
+        searcher=search,
+        graph=serving_graph,
+        engine=engine,
     )
 
     # Built before the lifespan so the lifespan closure can start its session
@@ -1464,6 +1319,95 @@ def create_app(
         finally:
             limiter.release(path)
 
+    # -- Phase 35.8: the two guards a fleet needs and a container does not ----
+    #
+    # Both are registered *after* `bound_concurrency`, which in Starlette means
+    # they run *before* it: a caller with no token must not take a concurrency
+    # slot, and a request to a surface this process does not serve must not
+    # become an observation.
+
+    #: What a process with `server.api.enabled: false` still answers. The
+    #: probes, so an orchestrator can tell a healthy pod from a dead one;
+    #: `/metrics`, so it is still a scrape target; and `/internal/*`, which is
+    #: the entire point of such a process — those routes enforce their own
+    #: per-boundary bearer tokens and 404 when their feature is off.
+    RESTRICTED_PATHS: frozenset[str] = frozenset({"/health", "/ready", "/metrics"})
+    RESTRICTED_PREFIX = "/internal/"
+    serves_public_api = bool(getattr(config.server.api, "enabled", True))
+
+    if not serves_public_api:
+
+        @app.middleware("http")
+        async def restricted_surface(request, call_next):  # type: ignore[no-untyped-def]
+            """Make `server.api.enabled: false` mean what it says.
+
+            `deploy/compose/worker.yaml` has declared `api.enabled: false`
+            since the worker tier existed, and nothing read it: a preparation
+            worker served the whole knowledge-base API — register a source
+            over any allow-listed path, rewrite the config, read what it finds
+            — on every pod of the tier designed to hold nothing and scale
+            hardest. The flag was documentation.
+
+            A 404 rather than a 403 because that is the truth: on this process
+            the route does not exist.
+            """
+
+            path = request.url.path
+            if path not in RESTRICTED_PATHS and not path.startswith(RESTRICTED_PREFIX):
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "detail": (
+                            "this process serves no knowledge-base API "
+                            "(server.api.enabled is false); it answers the probes, "
+                            "/metrics and its own /internal endpoints"
+                        )
+                    },
+                )
+            return await call_next(request)
+
+    api_token = _resolved_api_token(config)
+    if api_token:
+        expected_token = api_token.encode("utf-8")
+        auth_public_paths = frozenset(config.security.api_auth.public_paths or ())
+
+        @app.middleware("http")
+        async def require_api_token(request, call_next):  # type: ignore[no-untyped-def]
+            """A static shared bearer token, when one is configured.
+
+            Deliberately the whole feature. It is enough to make "behind an
+            authenticating ingress" the default rather than the instruction,
+            it needs no identity provider, and it cannot rot into a half-built
+            one. Anything richer belongs to the ingress —
+            `security.api_auth.behind_authenticating_proxy` says so and turns
+            this off.
+
+            `/internal/*` is exempt structurally rather than by the configured
+            list: each of those routes already enforces the token for its own
+            trust boundary (the worker token, the graph token), and requiring
+            a second one would mean handing the region's API credential to
+            every worker — the shape of the bug this phase removed from the
+            Compose file.
+            """
+
+            path = request.url.path
+            if path.startswith("/internal/") or path in auth_public_paths:
+                return await call_next(request)
+            scheme, _, supplied = (request.headers.get("authorization") or "").partition(" ")
+            # Compared as bytes: Starlette decodes headers as latin-1, so a
+            # single byte above 127 in the header makes `compare_digest` raise
+            # TypeError on str operands -- a 500 from the auth guard, on input
+            # any caller can send.
+            if scheme.lower() != "bearer" or not hmac.compare_digest(
+                supplied.encode("utf-8", "surrogateescape"), expected_token
+            ):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "this region requires a bearer token"},
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            return await call_next(request)
+
     def _record_stream_answer(parent: Any, req: Any, answer: Any, started: Any) -> None:
         """Observe a streamed answer as a child of the request that opened it.
 
@@ -1550,6 +1494,68 @@ def create_app(
             details,
         )
 
+    def _loaded_generation() -> dict[str, object]:
+        """Which graph this process is answering from. No I/O.
+
+        `loaded` is None on a process that holds no graph — an indexer
+        coordinator, a worker, or an API replica pointed at the graph service,
+        which is the deployment where the graph service's own probe is the one
+        to read.
+        """
+
+        payload: dict[str, object] = {"loaded": getattr(engine, "loaded_graph_generation", None)}
+        if remote_graph and role_policy.role is Role.API:
+            payload["source"] = "graph-service"
+        return payload
+
+    def _graph_generation() -> dict[str, object]:
+        """The loaded generation *and* what is published, which reads `/state`.
+
+        Two ids rather than one, because one of them cannot say anything on
+        its own. A replica that missed a reload serves an old graph correctly
+        and silently; publishing the loaded id beside the published id is what
+        turns "this region disagrees with itself" from an inference into a
+        comparison anyone can make from two probe responses.
+
+        Only `/ready` calls this, and only off the event loop. Reading the
+        publication record is two syscalls on a small file — cheap, and not
+        free, and `/health` is the liveness probe: a handler that does no I/O
+        at all is the reason it answers in 0.05s under a saturated thread pool
+        (see its docstring). Staleness belongs on the readiness probe anyway,
+        since that is the one that decides whether a replica should be
+        receiving traffic.
+        """
+
+        published: str | None = None
+        try:
+            record = engine.graph_store.published_generation(config.knowledge_base_id)
+            published = str(record["generation_id"]) if record else None
+        except Exception:  # noqa: BLE001 - a probe must never fail on a label
+            published = None
+        payload = _loaded_generation()
+        payload["published"] = published
+        loaded = payload.get("loaded")
+        if loaded is not None and published is not None:
+            payload["current"] = loaded == published
+        return payload
+
+    @app.exception_handler(ServiceError)
+    async def service_error(_request, exc: ServiceError):  # type: ignore[no-untyped-def]
+        """Translate an application-layer refusal into HTTP.
+
+        One handler rather than a `try` in every adapter: the service layer
+        raises the same refusal whichever transport called it, and each
+        transport decides once how to say it. The MCP side does the mirror of
+        this at the SDK boundary in `mcp_server/server.py`.
+
+        The *text* is passed through unchanged, because it is the contract —
+        "Unknown source: notes" is what a caller acts on, and an agent told
+        only that something failed will retry the same call. The conformance
+        test asserts both surfaces produce it identically.
+        """
+
+        return JSONResponse(status_code=exc.status, content={"detail": str(exc)})
+
     @app.get("/health")
     async def health() -> dict:
         """Liveness: is this process running at all.
@@ -1568,7 +1574,12 @@ def create_app(
         answer; this one, unaffected by the pool, took 0.05s.
         """
 
-        payload = {"status": "ok", "service": "pheasant", "role": role_policy.name}
+        payload: dict[str, object] = {
+            "status": "ok",
+            "service": "pheasant",
+            "role": role_policy.name,
+            "graph_generation": _loaded_generation(),
+        }
         orchestration = getattr(app.state, "orchestration", None)
         if orchestration is not None:
             payload["leader"] = bool(orchestration.leader)
@@ -1656,6 +1667,17 @@ def create_app(
                 payload["status"] = "not_ready"
                 payload["reason"] = "graph query service unreachable"
                 return JSONResponse(status_code=503, content=payload)  # type: ignore[return-value]
+        # Last, and off the loop like the two probes above: reading the
+        # publication record is two syscalls, and a saturated replica must not
+        # pay them on the event loop just to label itself. A failure here is
+        # not an unready pod -- it is a missing label -- so it degrades to the
+        # in-memory half rather than to a 503.
+        try:
+            payload["graph_generation"] = await asyncio.wait_for(
+                asyncio.to_thread(_graph_generation), timeout=2.0
+            )
+        except Exception:  # noqa: BLE001 - a label must never fail a probe
+            payload["graph_generation"] = _loaded_generation()
         return payload
 
     def _authorize_worker(authorization: str | None) -> None:
@@ -1825,6 +1847,19 @@ def create_app(
             "pheasant_threadpool_tokens_total": pool.total_tokens,
             "pheasant_threadpool_tokens_available": pool.available_tokens,
         }
+        # Only where this process is the commit authority. On an api replica
+        # the meter would report a confident 0.0 from a process that publishes
+        # index work rather than running it — a reading that looks like "there
+        # is headroom" and means "this is not the tier with the ceiling".
+        if role_policy.indexes_locally:
+            saturation = engine.commit_meter.saturation()
+            if saturation is not None:
+                sample["pheasant_commit_authority_saturation"] = saturation
+        published_at = getattr(engine, "loaded_graph_published_at", None)
+        if published_at is not None:
+            sample["pheasant_graph_generation_age_seconds"] = max(
+                0.0, time.time() - float(published_at)
+            )
         sample.update(jobs.metrics_sample())
         # With the durable queue on, the backlog outlives this process, so
         # the in-memory job registry is no longer the whole truth — an HPA
@@ -2128,12 +2163,9 @@ def create_app(
 
     @app.get("/sources/{source_id}/repo-map")
     def repo_map(source_id: str) -> dict:
-        rows = state.rows(
-            "SELECT relative_path,type,size_bytes FROM artifacts "
-            "WHERE source_id=? ORDER BY relative_path",
-            (source_id,),
-        )
-        return {"source_name": source_id, "files": [dict(row) for row in rows]}
+        """Transport adapter. The operation is `services.graph.repo_map`."""
+
+        return graph_service.repo_map(services, source_id)
 
     @app.get("/sources/{source_id}/history")
     def source_history(source_id: str, limit: int = 100, offset: int = 0) -> dict:
@@ -3688,65 +3720,35 @@ def create_app(
 
     @app.post("/search")
     def search_context(req: SearchRequest, request: Request) -> dict:
-        from pheasant.search.criteria import (
-            apply_retrieval_criteria,
-            criteria_active,
-            criteria_dict,
-        )
+        """Transport adapter. The operation is `services.retrieval.search`.
 
-        # Over-fetch when a post-filter will drop rows, so `max_results` keeps
-        # meaning "give me this many" — the same bookkeeping the MCP tool does.
-        filtering = criteria_active(
-            req.exclude_sources,
-            req.node_types,
-            req.min_score,
-            req.source_types,
-            req.exclude_source_types,
-        )
-        started = time.perf_counter()
-        try:
-            payload = search.search_context(
-                req.knowledge_base or config.knowledge_base_id,
-                req.query,
-                req.mode,
-                req.max_results * 4 if filtering else req.max_results,
-                req.source_name,
-                graph=serving_graph,
+        Everything that decides *what* a search returns — over-fetch, criteria,
+        the memory policy, the metric, the graph generation — lives there, so
+        the MCP tool of the same name cannot answer differently. What is left
+        here is the two things that are genuinely HTTP's: turning a request
+        model into the service's request, and recording the interaction against
+        the `Request` that carried it.
+        """
+
+        payload = retrieval_service.search(
+            services,
+            retrieval_service.SearchRequest(
+                query=req.query,
+                knowledge_base=req.knowledge_base,
+                mode=req.mode,
+                max_results=req.max_results,
+                source_name=req.source_name,
+                section=req.section,
                 principal=req.principal,
                 principal_groups=req.principal_groups,
-                security=config.security,
-                section=req.section,
                 memory=req.memory,
-            )
-        except Exception:
-            metrics.REGISTRY.inc("pheasant_search_total", mode=req.mode, outcome="error")
-            raise
-        finally:
-            # Timed around retrieval only. Wrapping the post-filter too would
-            # fold criteria bookkeeping into what reads as retrieval latency.
-            metrics.REGISTRY.observe(
-                "pheasant_search_duration_seconds", time.perf_counter() - started, mode=req.mode
-            )
-        metrics.REGISTRY.inc("pheasant_search_total", mode=req.mode, outcome="ok")
-        if filtering:
-            payload = dict(payload)
-            payload["results"] = apply_retrieval_criteria(
-                payload.get("results") or [],
                 exclude_sources=req.exclude_sources,
                 node_types=req.node_types,
                 min_score=req.min_score,
                 source_types=req.source_types,
                 exclude_source_types=req.exclude_source_types,
-            )[: req.max_results]
-            payload["criteria"] = criteria_dict(
-                req.source_name,
-                req.exclude_sources,
-                req.node_types,
-                req.min_score,
-                req.memory,
-                req.source_types,
-                req.exclude_source_types,
-            )
+            ),
+        )
         record_retrieval(
             request,
             query=req.query,
@@ -3757,35 +3759,21 @@ def create_app(
 
     @app.post("/relevant-files")
     def relevant_files(req: SearchRequest, request: Request) -> dict:
-        # Same retrieval as /search, so it must run under the same ACL
-        # enforcement: dropping `security`/`principal` here silently returned
-        # unfiltered results for every caller whenever acl_enforced was on.
-        # No `graph=` on purpose — this route projects to *files*, and graph
-        # nodes (concepts, symbols) carry no relative_path, so admitting them
-        # would crowd file hits out of the merge and return an empty list.
-        payload = search.search_context(
-            req.knowledge_base or config.knowledge_base_id,
-            req.query,
-            "hybrid",
-            req.max_results,
-            req.source_name,
-            principal=req.principal,
-            principal_groups=req.principal_groups,
-            security=config.security,
-            section=req.section,
-            # Same reasoning as the ACL note above: this is the same retrieval,
-            # so it owes the caller the same memory policy. Omitting it would
-            # leave one route still serving corrected records.
-            memory=req.memory,
+        """Transport adapter. The operation is `services.retrieval.relevant_files`."""
+
+        answer = retrieval_service.relevant_files(
+            services,
+            retrieval_service.FilesRequest(
+                task=req.query,
+                knowledge_base=req.knowledge_base,
+                max_files=req.max_results,
+                source_name=req.source_name,
+                section=req.section,
+                principal=req.principal,
+                principal_groups=req.principal_groups,
+                memory=req.memory,
+            ),
         )
-        seen = set()
-        files = []
-        for result in payload["results"]:
-            relative_path = result.get("relative_path")
-            if relative_path and relative_path not in seen:
-                seen.add(relative_path)
-                files.append(result)
-        answer = {"files": files}
         record_retrieval(request, query=req.query, payload=answer, criteria={"mode": "hybrid"})
         return answer
 
@@ -3794,31 +3782,15 @@ def create_app(
         principal: str | None,
         principal_groups: list[str] | None = None,
     ) -> None:
-        """403 unless ``principal`` may read ``artifact_id`` (Step 32.2).
+        """Adapter for `services.graph.require_readable`.
 
-        The content endpoints hand back whole artifact bodies by id or path,
-        which bypasses the filtering ``search_context`` does — an ACL-enforcing
-        region that filters search results but serves the same bytes from
-        /files/summary or /nodes/content has not enforced anything. No-op when
-        ``security.acl_enforced`` is off, so pre-32 behavior is unchanged.
+        The rule itself moved to the service layer so the MCP surface enforces
+        it too. This wrapper stays only because the remaining `/nodes/content`
+        callers are HTTP-only operations not yet extracted; the refusal it
+        raises is translated by the handler above, like every other.
         """
-        if not config.security.acl_enforced:
-            return
-        from pheasant.security.acl import expand_principal, is_allowed
 
-        identities = expand_principal(principal, principal_groups, config.security.groups)
-        if identities is not None and principal:
-            from pheasant.security.idp import fresh_idp_groups
-
-            identities |= fresh_idp_groups(state, principal, config.security.idp)
-        default_public = config.security.default_visibility != "private"
-        acls = state.artifact_acls([artifact_id]) if artifact_id else {}
-        if artifact_id not in acls:
-            # Not resolvable to an artifact row: deny, matching the
-            # conservative rule the search path applies to bare graph nodes.
-            raise HTTPException(status_code=403, detail="Not permitted")
-        if not is_allowed(acls[artifact_id], identities, default_public=default_public):
-            raise HTTPException(status_code=403, detail="Not permitted")
+        graph_service.require_readable(services, artifact_id, principal, principal_groups)
 
     @app.get("/files/summary")
     def file_summary(
@@ -3826,26 +3798,13 @@ def create_app(
         source_name: str | None = None,
         principal: str | None = None,
     ) -> dict:
-        # GROUP_CONCAT order is arbitrary unless the input rows are ordered,
-        # so concatenate over ordered scalar subqueries to keep summaries and
-        # content in chunk order.
-        rows = state.rows(
-            """SELECT artifacts.*,
-            (SELECT GROUP_CONCAT(summary, '\n') FROM
-                (SELECT summary FROM chunks WHERE artifact_id=artifacts.id
-                 ORDER BY chunk_index)) AS summary,
-            (SELECT GROUP_CONCAT(text, '\n\n') FROM
-                (SELECT text FROM chunks WHERE artifact_id=artifacts.id
-                 ORDER BY chunk_index)) AS content
-            FROM artifacts
-            WHERE artifacts.relative_path=? AND (? IS NULL OR artifacts.source_id=?)
-            LIMIT 1""",
-            (path, source_name, source_name),
-        )
-        if not rows:
-            return {"path": path, "summary": None}
-        _acl_guard(str(rows[0]["id"]), principal)
-        return dict(rows[0])
+        """Transport adapter. The operation is `services.graph.file_summary`.
+
+        The ACL check moved with it: it was an HTTP-only guard, so the MCP tool
+        of the same name served artifact rows without one.
+        """
+
+        return graph_service.file_summary(services, path, source_name, principal)
 
     @app.get("/nodes/content")
     def node_content(node_id: str, principal: str | None = None) -> dict:
@@ -4134,19 +4093,9 @@ def create_app(
 
     @app.get("/nodes/explain")
     def explain_node(node_id: str) -> dict:
-        g = serving_graph
-        attrs = g.nodes.get(node_id)
-        if attrs is None:
-            return {"node_id": node_id, "explanation": "Node is not present in the current graph."}
-        node = dict(attrs)
-        return {
-            "node_id": node_id,
-            "type": node.get("type"),
-            "label": node.get("label"),
-            "explanation": f"{node.get('label')} is a {node.get('type')} node indexed by pheasant.",
-            "provenance": node.get("provenance"),
-            "node": node,
-        }
+        """Transport adapter. The operation is `services.graph.explain_node`."""
+
+        return graph_service.explain_node(services, node_id)
 
     def _authorize_graph_query(authorization: str | None) -> None:
         """Keep the graph service private even on a flat container network."""
@@ -4180,7 +4129,12 @@ def create_app(
 
         _authorize_graph_query(authorization)
         parameters = dict(req.parameters or {})
-        graph_obj = engine.graph_builder.graph
+        # Through the serving graph, not `graph_builder.graph`. This endpoint
+        # *is* the graph service, and on the row backend a graph replica holds
+        # no working set at all — reaching for the builder's copy answered
+        # every query from an empty graph, with a plausible-looking zero.
+        # `force_local` above already guarantees this cannot proxy to itself.
+        graph_obj = serving_graph
         operation = req.operation.strip().lower()
 
         if operation == "stats":

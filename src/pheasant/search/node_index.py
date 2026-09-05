@@ -234,17 +234,20 @@ class NodeIndex:
             self._populated = True
         return len(upserts)
 
-    def candidates(
+    def candidate_query(
         self,
         tokens: list[str],
         source_name: str | None = None,
         limit: int = 2000,
-    ) -> list[str] | None:
-        """Node ids whose text matches any token. None = index cannot answer.
+    ) -> tuple[str, list[Any]] | None:
+        """The candidate ``SELECT``, unexecuted. ``None`` = cannot answer.
 
-        ``None`` (rather than an empty list) when the index is unavailable or
-        empty, so the caller can fall back to scanning instead of concluding
-        that nothing matched.
+        Split out from :meth:`candidates` so a caller holding the graph rows
+        in the *same database* can run it as a subquery instead of shipping
+        thousands of ids up to Python and straight back down as bind
+        parameters — see
+        :meth:`~pheasant.persistence.graph_rows.GraphRowStore.nodes_matching`.
+        One definition of what a candidate is, two ways to spend it.
         """
 
         if not self.ensure():
@@ -273,6 +276,38 @@ class NodeIndex:
             params.append(source_name)
         sql += " LIMIT ?"
         params.append(int(limit))
+        return sql, params
+
+    def still_populated(self) -> bool:
+        """Re-probe rather than trust the sticky flag.
+
+        A query that found nothing is ambiguous: either nothing matches, or
+        the index was emptied behind our back (a wipe, a fresh state dir).
+        ``_populated`` only ever flips false→true, so it has to be cleared
+        before the probe can mean anything. Both readers of an empty result
+        ask this, so the reset and the probe stay one step.
+        """
+
+        self._populated = False
+        return self.populated()
+
+    def candidates(
+        self,
+        tokens: list[str],
+        source_name: str | None = None,
+        limit: int = 2000,
+    ) -> list[str] | None:
+        """Node ids whose text matches any token. None = index cannot answer.
+
+        ``None`` (rather than an empty list) when the index is unavailable or
+        empty, so the caller can fall back to scanning instead of concluding
+        that nothing matched.
+        """
+
+        built = self.candidate_query(tokens, source_name, limit)
+        if built is None:
+            return None
+        sql, params = built
         try:
             found = [str(row["node_id"]) for row in self.state.rows(sql, tuple(params))]
         except Exception as exc:  # a malformed MATCH must not fail the search
@@ -280,12 +315,7 @@ class NodeIndex:
             return None
         if found:
             return found
-        # No hits is ambiguous: either nothing matches, or the index was
-        # emptied behind our back (a wipe, a fresh state dir). Distinguish the
-        # two with one cheap row probe, so an emptied index degrades to
-        # scanning instead of silently answering "nothing found".
-        self._populated = False
-        return found if self.populated() else None
+        return found if self.still_populated() else None
 
 
 def _match_expression(tokens: list[str]) -> str:

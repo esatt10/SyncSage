@@ -11,7 +11,7 @@ index. Treat it as **user data** and back it up.
 | Item | Notes |
 |---|---|
 | `pheasant.db` | A **consistent** SQLite snapshot via `VACUUM INTO` (never a raw copy; survives WAL). |
-| `graphs/` | `graph.latest.json` plus all `graph.<ts>.json.zst` snapshots. |
+| `graphs/` | Graph snapshots (`graph.<ts>.json.zst`), plus `graph.latest.json.zst` on `storage.graph_format: node_link_json`. On the default `rows` backend the published graph is in the database, so it is covered by the row above. |
 | `contract.latest.json` | The published Synapse contract, when present. |
 | `events/` | The append-only NDJSON sync-event stream, when present. |
 | `vectors/` | The per-region vector index, when present. |
@@ -80,12 +80,14 @@ pheasant sync --config pheasant.yaml --source <name> --mode full
 
 Independently of explicit backups, pheasant writes zstd-compressed, timestamped
 graph snapshots after a successful sync
-(`graphs/<kb_id>/graph.<utc-ts>.json.zst`), beside the uncompressed
-`graph.latest.json`. They are:
+(`graphs/<kb_id>/graph.<utc-ts>.json.zst`). Snapshots are files on both
+`storage.graph_format` backends — on `rows` the snapshot is materialized from
+the rows, so a history file is the same document whichever backend produced it.
+They are:
 
 - **Throttled** by `storage.graph_snapshot_interval_seconds` (default 900s).
 - **Bounded** by `storage.max_state_size_gb` — when the cap is exceeded, the
-  oldest snapshots are evicted first; `graph.latest.json`, the SQLite DB, and
+  oldest snapshots are evicted first; the published graph, the SQLite DB, and
   the contract are **never** evicted.
 
 ```yaml

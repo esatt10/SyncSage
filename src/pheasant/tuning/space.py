@@ -212,10 +212,12 @@ DEFAULT_PARAMETERS: tuple[Parameter, ...] = (
         cost_class=REQUERY,
         candidates=(1.0, 2.0, 3.0, 4.0, 6.0),
         rationale=(
-            "How far past `max_results` the arms fetch when ACL, memory-policy or "
-            "section filtering will remove candidates afterwards. Under-fetching "
-            "here shows up as a `filters` miss that no amount of ranking fixes: "
-            "the document was never in the window the filter ran over."
+            "How far past `max_results` the arms fetch when a post-filter will "
+            "remove candidates afterwards — ACL, memory policy, section, and the "
+            "retrieval criteria a caller passes (`exclude_sources`, `node_types`, "
+            "`min_score`, `source_types`). Under-fetching here shows up as a "
+            "`filters` miss that no amount of ranking fixes: the document was "
+            "never in the window the filter ran over."
         ),
     ),
 )

@@ -1126,6 +1126,9 @@ def test_a_queued_sync_carries_the_trace_of_the_request_that_asked_for_it(
     # the hand-off actually is, which is the fleet.
     config = _config(tmp_path, state_name="traced", sources=1, queue={"enabled": True})
     config.observability.interactions.enabled = True
+    # In-process: this binds nothing, so loopback is what it actually is. A
+    # fleet role on a routable bind refuses to start unauthenticated.
+    config.server.host = "127.0.0.1"
     app = create_app(config, role="api")
     inbound = "00-" + "a" * 32 + "-" + "b" * 16 + "-01"
 
@@ -1156,6 +1159,7 @@ def test_an_untraced_sync_queues_a_task_with_no_traceparent(tmp_path: Path) -> N
     from pheasant.api.app import create_app
 
     config = _config(tmp_path, state_name="untraced", sources=1, queue={"enabled": True})
+    config.server.host = "127.0.0.1"
     app = create_app(config, role="api")
     with TestClient(app) as client:
         response = client.post("/sync", json={"wait": False})

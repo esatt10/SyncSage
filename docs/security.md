@@ -14,10 +14,11 @@ pheasant indexes local content for agents, so it must be conservative about path
 
 ## Trust model for the HTTP API
 
-**The HTTP API has no authentication of its own.** Every route — including
-the ones that write config, register sources and trigger syncs — is open to
-anything that can reach the port. That is a deliberate local-first choice,
-and it makes two controls load-bearing:
+**One container: no authentication, and the bind address is the control.**
+Every route — including the ones that write config, register sources and
+trigger syncs — is open to anything that can reach the port. That is a
+deliberate local-first choice for a tool running on somebody's own machine
+behind their own perimeter, and it makes two controls load-bearing:
 
 - **Bind address.** Loopback by default on both paths: `pheasant up`
   generates `host: 127.0.0.1`, and compose publishes
@@ -38,6 +39,73 @@ and it makes two controls load-bearing:
 
 Anything reachable over that API is reachable by whoever can reach the port.
 Treat "who can open :8765" as the real authorization boundary.
+
+### A fleet is the other case, and it is enforced
+
+That posture does not survive the role split, and until Phase 35.8 it shipped
+into it unchanged. In a fleet the API is a multi-replica Service; the pods bind
+`0.0.0.0` because a Service cannot reach a loopback-bound pod, so the bind
+address stops being a control at all — and the surface behind it can register a
+source over any allow-listed path and read what it finds. "Unauthenticated"
+plus "can mount anything" plus "one port-publishing decision away from the
+network" is a combination that stays safe by luck.
+
+So every role **but `all`** refuses to start on a routable bind unless one of
+two things is true:
+
+| Setting | Means |
+|---|---|
+| `security.api_auth.token_env` resolves to a value | Callers send `Authorization: Bearer <value>`. Everything outside `security.api_auth.public_paths` (`/health`, `/ready`, `/metrics`) is refused with `401`. |
+| `security.api_auth.behind_authenticating_proxy: true` | "Something in front of this authenticates callers." Explicit, because the failure it suppresses is silent. |
+
+`all` is exempt, and that exemption is the point: a laptop, a `pheasant up`
+and every existing standalone container keep starting with no configuration at
+all. The token is deliberately a static shared secret and nothing more — enough
+to make "behind an authenticating ingress" the default rather than the
+instruction, and small enough that it cannot rot into a half-built identity
+system. Richer authentication belongs to the ingress.
+
+`/internal/*` is exempt from the API token structurally, not by configuration:
+those routes already enforce a token for their own boundary (the worker token,
+the graph token), and requiring a second would mean handing the region's
+front-door credential to every preparation worker.
+
+The fleet profiles also turn `security.acl_enforced` on with
+`default_visibility: public`, so ACLs are honoured where they exist without
+requiring every artifact to carry one first.
+
+### One secret per boundary
+
+The fleet has three, and they must be three distinct values:
+
+| Variable | Boundary |
+|---|---|
+| `PHEASANT_API_TOKEN` | callers → the region's API |
+| `PHEASANT_GRAPH_SERVICE_TOKEN` | API/MCP replicas → the internal graph API |
+| `PHEASANT_INDEX_WORKER_TOKEN` | the indexer → the preparation workers |
+
+The shipped Compose file used to wire the graph token to the worker token's
+value. Workers are the least-trusted tier — no database, no keys, no volumes,
+and the one place third-party parse code runs — and they hold the indexing
+token by necessity, so one value meant compromising any worker also yielded the
+credential for the internal graph API. A serving process now refuses to start
+when the two resolve to the same value, or when both settings name one
+variable.
+
+### What a role may hold
+
+`validate_role` is a per-role allow-list, not just a set of "can it work"
+checks. A worker refuses to start holding a database DSN, any model provider
+key, the IdP token, the graph-service token, a source list, or a non-SQLite
+state backend — none of which it can use, since it is handed bytes and returns
+chunks. The refusal names the variable and says where to put it instead
+(a worker's own `environment:` block, or its own Secret).
+
+A worker also serves no knowledge-base API: `server.api.enabled: false` is
+enforced rather than declared, so such a process answers `/health`, `/ready`,
+`/metrics` and its own `/internal` preparation routes and `404`s everything
+else. That flag had been in `deploy/compose/worker.yaml` since the tier
+existed, and nothing read it.
 
 ## Path and write policy
 

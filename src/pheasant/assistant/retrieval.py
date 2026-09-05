@@ -39,8 +39,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from pheasant.api.app import graph_neighbors as _graph_neighbors
-from pheasant.api.app import graph_slice as _graph_slice
+from pheasant.graph.traversal import neighbors as _graph_neighbors
+from pheasant.graph.traversal import slice_ as _graph_slice
 from pheasant.ingestion.content_types import ARTIFACT_TYPES
 
 VALID_MODES = ("hybrid", "text", "graph", "vector")
@@ -482,11 +482,20 @@ class PheasantRetriever:
         if cache_key in self._cache:
             return self._cache[cache_key]
 
+        # The same over-fetch the two surfaces do, for the same reason and
+        # through the same parameter. This path had none at all: it filtered
+        # by source type *after* retrieval and returned whatever survived, so
+        # a grounded answer built on a type-filtered corpus silently had fewer
+        # passages to work from than the caller asked for — the failure mode
+        # is a thinner answer, which reads as the corpus being thin.
+        filtering = bool(self.source_types or self.exclude_source_types)
+        resolve = getattr(self.search_engine, "ranking_parameters", None)
+        fetch = resolve().overfetch(limit, filtering=filtering) if callable(resolve) else limit
         payload = self.search_engine.search_context(
             self.knowledge_base,
             query,
             mode,
-            limit,
+            fetch,
             source_name,
             graph=self.graph,
             principal=principal,
@@ -495,14 +504,14 @@ class PheasantRetriever:
             memory=self.memory,
         )
         hits = payload.get("results", [])
-        if self.source_types or self.exclude_source_types:
+        if filtering:
             from pheasant.search.criteria import apply_retrieval_criteria
 
             hits = apply_retrieval_criteria(
                 hits,
                 source_types=self.source_types,
                 exclude_source_types=self.exclude_source_types,
-            )
+            )[:limit]
         passages = [self._passage(item, mode) for item in hits]
         self._cache[cache_key] = passages
         return passages

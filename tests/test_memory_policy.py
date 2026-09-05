@@ -839,3 +839,61 @@ def test_steering_rules_are_machinery_not_content() -> None:
     loaded = load_steering(records, MemoryPolicy(), now=NOW, enabled=True)
     assert loaded.aliases, "excluding rules from results must not disable steering"
     assert "fileservice" in loaded.expand(["filewatch", "daemon"])
+
+
+def test_the_rule_has_one_definition_and_two_renderers() -> None:
+    """Every clause carries both spellings, so neither can be edited alone.
+
+    The two halves used to be independent transcriptions compared afterwards
+    by the parity test above. They are now `clauses()` rendered two ways —
+    and the assertion is structural: each clause must supply a SQL fragment
+    *and* a Python predicate, because a clause with only one is exactly the
+    drift that was possible before.
+    """
+
+    from pheasant.memory.policy import MemoryPolicy, clauses
+
+    policy = MemoryPolicy(
+        scopes=("user",), subject="deploy", as_of="2026-01-01T00:00:00Z", include_rules=False
+    )
+    rule = clauses(policy, now="2026-06-01T00:00:00Z")
+
+    assert {clause.name for clause in rule} == {
+        "steering",
+        "tier",
+        "scope",
+        "subject",
+        "valid_from",
+        "valid_until",
+    }
+    for clause in rule:
+        fragment, params = clause.sql("memory_records")
+        assert fragment.strip(), f"{clause.name} renders no SQL"
+        assert fragment.count("?") == len(params), (
+            f"{clause.name} renders {fragment.count('?')} placeholders for {len(params)} params"
+        )
+        assert callable(clause.holds), f"{clause.name} has no Python rendering"
+
+
+def test_each_clause_binds_its_own_placeholders() -> None:
+    """A regression, and the reason the parity test is still worth having.
+
+    Both the steering and scope clauses build a placeholder string; sharing
+    one local made the lambdas close over the *name*, so the steering fragment
+    rendered with the scope clause's placeholder count and SQLite refused the
+    statement. One definition removes the drift between the two renderings; it
+    does not make a single renderer correct.
+    """
+
+    from pheasant.memory.policy import MemoryPolicy, clauses, sql_predicate
+
+    # Both clauses present, with different cardinalities: three steering kinds
+    # against two scopes is what makes a shared placeholder string visible.
+    policy = MemoryPolicy(scopes=("user", "session"), include_rules=False)
+    rule = clauses(policy, now="2026-06-01T00:00:00Z")
+    for clause in rule:
+        fragment, params = clause.sql("m")
+        assert fragment.count("?") == len(params), clause.name
+
+    condition, params = sql_predicate(policy, now="2026-06-01T00:00:00Z")
+    assert condition.count("?") == len(params)

@@ -92,14 +92,47 @@ remote-safe and each binary document gets its own bounded task envelope. Images,
 audio, taxonomy-enabled sources and repair passes still prepare locally because
 they rely on credentials, sidecars or live graph state.
 
+## What a sync walks, and what it no longer walks
+
+The indexer keeps the graph in memory as its working set — the builder mutates
+it and the enrichment passes walk it. Three of those passes were reading the
+whole graph for a slice of it, which is both sync time and the reason the
+working set has to be as large as it is. Measured at 100k files (630k nodes):
+
+| Pass | Was | Now |
+|---|---|---|
+| Cross-source resolution's node list | 2.95 s, +160 MB (every node copied) | 319 ms, +24 MB (the 15% it reads) |
+| Removing a source or an artifact | 1.16 s snapshot before the filter | iterated under the lock |
+| Similarity edges | a full walk and copy per sync | retired; it emitted nothing |
+
+The similarity pass keyed off `concept_terms`, and concept extraction was
+retired — so it had been building an index over an empty term set and emitting
+zero `similar_to` edges for as long as that has been true. It is a no-op now,
+asserted as one.
+
+One O(total) cost remains on the indexer: removing nodes walks the edge table,
+because an edge goes when *either* endpoint does and only the outgoing
+direction is indexed. It measured ~120 ms at 100k files and fires once per full
+sync and on a memory-maintenance beat; an in-adjacency index would remove it
+for about 15% more working-set memory, which is the wrong trade against a plan
+to stop holding the graph at all.
+
 ## Delta generations and recovery
 
 Unchanged CLI/worker syncs defer graph deserialization. They list and compare
 content-addressed manifest entries, update the checkpoint, and read counts from
-`graph.latest.meta.json`; the full graph is loaded only when a changed artifact
-must mutate it. Changed generations publish graph bytes first, generation
-metadata second, and source manifests last, so a crash causes safe reprocessing
-instead of an ahead-of-graph manifest.
+the publication record; the full graph is loaded only when a changed artifact
+must mutate it. Changed generations publish the graph first and the source
+manifests last, so a crash causes safe reprocessing instead of an
+ahead-of-graph manifest.
+
+On the default `storage.graph_format: rows` a changed generation writes only
+the rows that changed, in the same transaction as the artifacts and chunks — so
+a commit costs what the change costs rather than what the graph weighs
+(measured 1.1 ms versus 6.15 s at 100k files), and the graph can no longer
+disagree with the chunks after a crash between two writes. On
+`node_link_json` every commit re-serializes the whole graph, which is the
+cost `storage.graph_checkpoint_seconds` exists to space out.
 
 A redelivered **full** task resumes as an incremental delta only after a
 graph+manifest checkpoint was durably published. Before that boundary it

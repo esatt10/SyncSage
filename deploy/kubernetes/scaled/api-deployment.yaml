@@ -39,6 +39,11 @@ spec:
           env:
             - name: PHEASANT_CONFIG
               value: /config/pheasant.yaml
+            - name: PHEASANT_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: pheasant-secrets
+                  key: PHEASANT_API_TOKEN
             - name: PHEASANT_DATABASE_URL
               valueFrom:
                 secretKeyRef:

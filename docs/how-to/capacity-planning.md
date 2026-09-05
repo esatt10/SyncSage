@@ -28,6 +28,108 @@ you can interpolate. Do **not** extrapolate far past the top row: a linear
 projection to 250k files predicted 3.8 GB and the measured answer was 4.3 GB,
 12% high.
 
+**The table above is `storage.graph_format: node_link_json`, and it is no
+longer the default.** On `rows` (the default since 35.10) the graph lives in
+the state database, so those three costs land differently:
+
+| Corpus | Nodes | RSS to *serve* | RSS to *index* | Commit | Database |
+|---|---|---|---|---|---|
+| 2,000 files | 12.6k | **0** | 34 MB | 1.0 ms | 23 MB |
+| 20,000 files | 126k | **0** | 314 MB | 1.0 ms | 206 MB |
+| 100,000 files | 630k | **0** | 1.5 GB | 1.1 ms | 1,033 MB |
+
+Two things move. The commit stops growing with the graph — it is the same
+millisecond at every size, because it writes only what changed — and the
+residency is paid by the process that *builds* the graph rather than by every
+process that reads one. An api replica on `rows` holds no graph at all, so the
+"Give the container" table below applies to your indexer; serving replicas size
+from request traffic.
+
+What you pay for it is disk: about **1,640 bytes per node** in the database
+(measured 1,637 at 20k files and 1,639 at 100k), against a compressed file
+roughly 55× smaller. `pheasant scan` includes it.
+
+## Measured against the pre-row-backend baseline
+
+An 8,000-file corpus (24,443 nodes / 72,441 edges), the same corpus driven
+through both versions:
+
+| | before | after | |
+|---|---|---|---|
+| graph publish per commit | 0.82 s | **0.0007 s** | 1,231× faster |
+| incremental sync, one file changed | 4.36 s | **3.32 s** | 1.3× faster |
+| RSS for a replica that answers graph queries | 142 MB | **29 MB** | 4.9× smaller |
+| text search p50 | 49.6 ms | 47.4 ms | unchanged |
+| graph arm p50 | 34.7 ms | 55.9 ms | 1.6× slower |
+| 3-hop walk, ordinary node | 0.24 ms | 1.7 ms | 7× slower |
+| 3-hop walk from a hub (8,040 edges) | 12.6 ms | 46 ms | 3.7× slower |
+| full index | 25.9 s | 27.7 s | 1.1× slower |
+| `/state` on disk | 115 MB | 177 MB | 1.5× larger |
+
+Read it as a trade, not a win: commit cost and residency — the two things that
+decided when a region had to be sharded — moved by three orders of magnitude
+and five times. Graph *read* latency got worse, because reading a graph you do
+not hold means reconstructing what you read. Text search and an unchanged
+re-sync are untouched.
+
+## The same measurement on a fleet: Postgres, five repositories
+
+The table above is one SQLite region with one source — the standalone shape.
+The fleet shape is `storage.backend: postgres` with several repositories in one
+region, so here it is: five repositories of 1,600 files (40,122 nodes / 112,111
+edges / 88,000 cross-repository reference edges), same corpus and same Postgres
+server on both sides.
+
+| | before | after | |
+|---|---|---|---|
+| graph publish per commit | 1.32 s | **0.005 s** | 270× faster |
+| incremental sync, one file changed | 5.02 s | **3.55 s** | 1.4× faster |
+| boot before a replica can answer | 1.08 s | **0.07 s** | 17× faster |
+| RSS for a replica that answers graph queries | 131 MB | **~0** | it holds none |
+| hybrid p95 | 173.3 ms | **77.0 ms** | 2.3× faster |
+| hybrid throughput, 4 threads | 18.6 qps | **20.8 qps** | 1.12× faster |
+| hybrid p50 | 60.4 ms | 61.5 ms | unchanged |
+| text search p50 | 46.4 ms | 47.5 ms | unchanged |
+| cross-source resolution | 2.75 s | 2.75 s | unchanged |
+| graph arm p50 | 45.7 ms | 59.9 ms | 1.31× slower |
+| 3-hop walk from a hub (1,620 edges) | 2.3 ms | 7.6 ms | 3.3× slower |
+| bounded slice | 4.8 ms | 9.8 ms | 2.0× slower |
+| five full indexes | 65.4 s | 69.7 s | 1.07× slower |
+| stored bytes (database + `/state`) | 141 MB | 240 MB | 1.7× larger |
+
+The trade is the same shape it is on SQLite, which is the reason to run it —
+none of it was a SQLite artifact. Two things only the fleet shape shows.
+Cross-source resolution did **not** get more expensive with five repositories
+linking to each other. And the p50/p95 split reverses: the median hybrid query
+is a wash while the tail is 2.3× faster, because the file backend's tail *is*
+the graph it is holding. A serving replica wants that direction.
+
+Graph *reads* are still the side that pays — an arm and a walk that reconstruct
+what they read cannot beat one that already holds it — but the gap is now
+1.3–3.3× rather than the 1.8–5.9× the first row-backed release measured, and
+serving throughput and tail latency are ahead rather than behind.
+
+**Sizing replicas.** Per-process throughput is set by Python, not by the
+backend, so a replica saturates a core before it saturates Postgres. Measured
+as independent processes against one Postgres on a four-core box: before, 13.3
+→ 26.0 → 36.0 → 36.4 qps at 1/2/4/8 processes; after, 13.1 → 25.6 → 32.1 →
+32.0. Both stop where the cores do. So budget roughly the **same throughput per
+core, and no graph residency per replica** — four row-backed replicas hold
+nothing where four file-backed ones hold four copies of the graph (524 MB at
+this size, 6.6 GB at 100k files). Adding a container is the axis; it is the
+axis the file backend priced out of reach.
+
+**One caveat, for standalone SQLite regions serving concurrent graph traffic.**
+Hybrid throughput holds at one thread and falls about 3.7× at four. That is not
+the row backend: concurrent SQLite reads do not scale in a containerised
+filesystem — the same probe against a *pre-change* database reading `chunks`
+fell from 486/s to 13/s across one to four threads. The change moved graph
+reads onto that resource, so the graph paths inherit it. Postgres does not
+share the problem (41 → 86 → 160 qps across one to eight threads), and the
+fleet runs Postgres. If you serve heavily concurrent graph queries from a
+single SQLite container, either put the `graph` role in front of it or keep
+`storage.graph_format: node_link_json`.
+
 ## Sizing a region
 
 | Corpus | Give the container | Notes |
@@ -106,7 +208,14 @@ embedding is a network wait, not CPU.
 
 ## Checkpoint cost, and why it is no longer the ceiling
 
-A checkpoint serializes the entire graph, so its cost grows with the index. The
+On the default `storage.graph_format: rows` this section is largely historical:
+a checkpoint writes the changed rows and costs about a millisecond whatever the
+graph weighs, so the interval below is spacing out something that is no longer
+expensive. Leave the settings alone; they cost nothing and they are what
+`node_link_json` still needs.
+
+On `node_link_json` a checkpoint serializes the entire graph, so its cost grows
+with the index. The
 interval is **derived from that cost**, not fixed — pheasant uses Young's
 formula (`T = sqrt(2 x C x MTBF)`), the standard HPC/ML-training result, which
 minimizes the *sum* of checkpoint overhead and work redone after a crash rather
@@ -160,14 +269,22 @@ graph:
 ```
 
 The `graph` role loads and refreshes the snapshot; API/MCP replicas keep only a
-bounded proxy. This is worth the extra network hop and service when either:
+bounded proxy.
+
+On `storage.graph_format: rows` this is **optional**: an API replica already
+holds no graph, because it queries `graph_nodes` directly. The residency
+arguments below are the `node_link_json` case. Keep the graph service on `rows`
+when you want graph reads on their own connection pool and their own scaling
+curve — not to save memory, which it no longer does.
+
+On `node_link_json` it is worth the extra network hop and service when either:
 
 * API graph residency is regularly above roughly **60-70% of a 3 GiB limit**;
 * two or more API replicas would otherwise duplicate a large graph; or
 * graph-query CPU/latency needs to scale independently from text/vector/API
   traffic.
 
-It does **not** make graph enrichment or snapshot saves faster: those remain in
+It does **not** make graph enrichment or graph commits faster: those remain in
 the single commit authority. If save/enrichment dominates an indexing run,
 split sources into multiple knowledge-base shards below so each indexer and
 graph service owns a smaller snapshot. For one API below the memory threshold,
@@ -234,6 +351,45 @@ one another even when relational rows are source-scoped. Pheasant therefore
 elects one indexer to own watcher, scheduler, queue drain and graph commits per
 shard. Extra indexers are hot standbys. Parallelism stays in multi-source
 preparation inside that authority and in the stateless worker tier.
+
+That ceiling used to be prose, which made it useless at the moment it mattered:
+a team scales workers, watches ingest stop improving, and cannot tell "the
+commit authority is full" from "retrieval is mistuned" — both look like a queue
+draining more slowly than work arrives, with more workers changing nothing.
+It is now a gauge:
+
+```promql
+pheasant_commit_authority_saturation   # 0..1, five-minute rolling window
+```
+
+Sustained **above 0.8**, more workers will not help and the region should be
+split. Below it, a slow queue is a tuning problem. It publishes nothing at all
+before it has seen a minute of wall time — two busy seconds in a pod's first
+four are not 50% saturation, and sharding a region that is doing nothing is
+the most expensive possible response to a misread number — and it is absent
+entirely on a process that is not the commit authority, rather than reporting
+a confident zero from an api replica that could not saturate if it tried.
+
+`pheasant scan` warns before you reach it, from the same measured
+seconds-per-1k-files the rest of this page uses: a corpus whose first index
+would take more than twelve hours on one indexer is one to plan differently,
+and the report says so beside the memory numbers.
+
+### Turning the proposal into files
+
+`pheasant shard plan --emit ./regions` writes what the plan implies: per
+region, a `pheasant.yaml` with its own knowledge-base id and only its own
+sources, a `docker-compose.yml` with its own project name, volume names and
+port, and a `.env.example` with secret stubs. Acting on a split used to mean
+hand-copying all of that and getting every name different from the first —
+with a silent failure at the end of it, because two regions sharing
+`pheasant.name` share a knowledge-base id, and every stable ID in this system
+starts with that.
+
+It applies nothing and moves no data: each region indexes its own sources from
+scratch, and the emitted `README.md` says so. It also refuses to overwrite
+existing files, so re-running against an edited region is a diff rather than a
+loss.
 
 ## Which storage backend
 
